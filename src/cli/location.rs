@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use tabled::{Table, Tabled};
 
 use crate::db::events;

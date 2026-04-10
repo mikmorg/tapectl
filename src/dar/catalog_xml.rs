@@ -52,6 +52,7 @@ pub fn parse_catalog(dar_binary: &str, archive_base: &Path) -> Result<Vec<Catalo
 ///   </File>
 /// </Catalog>
 /// ```
+#[allow(unused_assignments)]
 fn parse_xml_catalog(xml: &str) -> Result<Vec<CatalogEntry>> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;

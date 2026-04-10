@@ -37,6 +37,7 @@ struct MtGet {
 
 /// Tape position info.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct TapePosition {
     pub file_number: i32,
     pub block_number: i32,

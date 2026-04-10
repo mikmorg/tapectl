@@ -3,11 +3,14 @@ use std::process;
 use thiserror::Error;
 
 /// Exit codes per design: 0=success, 1=warnings, 2=errors/violations.
+#[allow(dead_code)]
 pub const EXIT_SUCCESS: i32 = 0;
+#[allow(dead_code)]
 pub const EXIT_WARNING: i32 = 1;
 pub const EXIT_ERROR: i32 = 2;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum TapectlError {
     // Database
     #[error("database error: {0}")]

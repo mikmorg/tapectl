@@ -332,6 +332,7 @@ impl Config {
     }
 
     /// Load config or use defaults if the file doesn't exist yet (for `init`).
+    #[allow(dead_code)]
     pub fn load_or_default(path: &Path) -> Self {
         if path.exists() {
             Self::load(path).unwrap_or_default()

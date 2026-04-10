@@ -39,7 +39,7 @@ pub fn restore_unit(
         )));
     }
 
-    let stage_set_id = positions[0].stage_set_id;
+    let _stage_set_id = positions[0].stage_set_id;
 
     if dry_run {
         return Ok(RestoreReport {
@@ -227,6 +227,7 @@ pub struct RestoreReport {
     pub slices: usize,
     pub destination: String,
     pub dry_run: bool,
+    #[allow(dead_code)]
     pub success: bool,
 }
 

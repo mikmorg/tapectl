@@ -71,6 +71,7 @@ pub fn require_tenant(conn: &Connection, name: &str) -> Result<crate::db::models
 }
 
 /// Get tenant info by id, returning an error if not found.
+#[allow(dead_code)]
 pub fn require_tenant_by_id(conn: &Connection, id: i64) -> Result<crate::db::models::Tenant> {
     queries::get_tenant_by_id(conn, id)?
         .ok_or_else(|| TapectlError::TenantNotFound(format!("id={id}")))

@@ -2,7 +2,7 @@ pub mod clean;
 pub mod validate;
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};

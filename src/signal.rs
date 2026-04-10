@@ -16,6 +16,7 @@ pub fn is_interrupted() -> bool {
 }
 
 /// Reset the interrupted flag (e.g., after handling an interruption).
+#[allow(dead_code)]
 pub fn clear_interrupted() {
     INTERRUPTED.store(false, Ordering::SeqCst);
 }
