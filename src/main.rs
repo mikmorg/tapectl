@@ -104,6 +104,44 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Catalog { ref command } => {
             cli::catalog::run(&conn, command, cli.json)?;
         }
+        Commands::Location { ref command } => {
+            cli::location::run(&conn, command, cli.json)?;
+        }
+        Commands::Cartridge { ref command } => {
+            cli::cartridge::run(&conn, command, cli.json)?;
+        }
+        Commands::Export { ref unit, ref to } => {
+            cli::operations::export_unit(&conn, unit, to, cli.json)?;
+        }
+        Commands::Db { ref command } => match command {
+            cli::DbCommands::Backup { to } => {
+                cli::operations::db_backup(&paths, to)?;
+                if cli.json {
+                    println!("{}", serde_json::json!({"backup": to}));
+                } else {
+                    println!("database backed up to {to}");
+                }
+            }
+            cli::DbCommands::Fsck { repair } => {
+                let report = cli::operations::db_fsck(&conn, *repair)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"integrity_ok": report.integrity_ok, "issues": report.issues, "repaired": report.repaired})
+                    );
+                } else {
+                    println!(
+                        "fsck: integrity={}, issues={}, repaired={}",
+                        if report.integrity_ok { "ok" } else { "FAIL" },
+                        report.issues.len(),
+                        report.repaired,
+                    );
+                    for issue in &report.issues {
+                        println!("  {issue}");
+                    }
+                }
+            }
+        },
         Commands::Init { .. } | Commands::Completions { .. } => {
             unreachable!()
         }

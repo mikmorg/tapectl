@@ -42,6 +42,21 @@ pub enum VolumeCommands {
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
     },
+
+    /// Move a volume to a location
+    Move {
+        /// Volume label
+        label: String,
+        /// Destination location name
+        #[arg(long)]
+        to: String,
+    },
+
+    /// Retire a volume (with impact analysis)
+    Retire {
+        /// Volume label
+        label: String,
+    },
 }
 
 pub fn run(
@@ -99,6 +114,19 @@ pub fn run(
         VolumeCommands::Identify { device } => {
             let id = write::volume_identify(device, DEFAULT_BLOCK_SIZE)?;
             println!("{id}");
+        }
+
+        VolumeCommands::Move { label, to } => {
+            crate::cli::location::move_volume(conn, label, to)?;
+            if json_output {
+                println!("{}", serde_json::json!({"label": label, "location": to}));
+            } else {
+                println!("volume \"{label}\" moved to \"{to}\"");
+            }
+        }
+
+        VolumeCommands::Retire { label } => {
+            crate::cli::operations::volume_retire(conn, label, json_output)?;
         }
     }
     Ok(())

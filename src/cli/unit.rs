@@ -79,6 +79,15 @@ pub enum UnitCommands {
 
     /// Scan watch_roots for .tapectl-unit.toml dotfiles
     Discover,
+
+    /// Mark unit as tape-only (local data can be deleted)
+    MarkTapeOnly {
+        /// Unit name
+        name: String,
+        /// Override copy/location requirements
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Tabled)]
@@ -295,6 +304,10 @@ pub fn run(
                     println!("  error: {err}");
                 }
             }
+        }
+
+        UnitCommands::MarkTapeOnly { name, force } => {
+            crate::cli::operations::unit_mark_tape_only(conn, config, name, *force, json_output)?;
         }
     }
     Ok(())

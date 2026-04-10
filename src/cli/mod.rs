@@ -1,5 +1,8 @@
+pub mod cartridge;
 pub mod catalog;
 pub mod key;
+pub mod location;
+pub mod operations;
 pub mod restore;
 pub mod snapshot;
 pub mod stage;
@@ -89,13 +92,13 @@ pub enum Commands {
         command: volume::VolumeCommands,
     },
 
-    // ── Future milestone stubs ──
     /// Manage physical cartridges
     Cartridge {
         #[command(subcommand)]
-        command: StubCommand,
+        command: cartridge::CartridgeCommands,
     },
 
+    // ── Future milestone stubs ──
     /// Manage archive set policies
     ArchiveSet {
         #[command(subcommand)]
@@ -117,7 +120,7 @@ pub enum Commands {
     /// Manage storage locations
     Location {
         #[command(subcommand)]
-        command: StubCommand,
+        command: location::LocationCommands,
     },
 
     /// Generate reports
@@ -134,8 +137,12 @@ pub enum Commands {
 
     /// Export encrypted slices to directory
     Export {
-        #[command(subcommand)]
-        command: StubCommand,
+        /// Unit name
+        #[arg(long)]
+        unit: String,
+        /// Destination directory
+        #[arg(long)]
+        to: String,
     },
 
     /// Quick archive: create + stage + write in one flow
@@ -147,7 +154,7 @@ pub enum Commands {
     /// Database operations
     Db {
         #[command(subcommand)]
-        command: StubCommand,
+        command: DbCommands,
     },
 
     /// Configuration management
@@ -161,6 +168,23 @@ pub enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+/// Database operations.
+#[derive(Subcommand, Debug)]
+pub enum DbCommands {
+    /// Backup database, keys, and catalogs
+    Backup {
+        /// Destination path
+        #[arg(long)]
+        to: String,
+    },
+    /// Check database integrity
+    Fsck {
+        /// Attempt to repair issues
+        #[arg(long)]
+        repair: bool,
     },
 }
 
