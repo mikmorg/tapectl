@@ -23,6 +23,30 @@ pub enum SnapshotCommands {
         #[arg(long)]
         status: Option<String>,
     },
+
+    /// Compare two snapshot versions of a unit
+    Diff {
+        /// Unit name
+        name: String,
+        /// First version number
+        #[arg(long)]
+        v1: i64,
+        /// Second version number
+        #[arg(long)]
+        v2: i64,
+    },
+
+    /// Delete an unwritten snapshot
+    Delete {
+        /// Unit name
+        name: String,
+        /// Snapshot version to delete
+        #[arg(long)]
+        version: i64,
+        /// Force delete even if staged (but not written)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Tabled)]
@@ -81,6 +105,18 @@ pub fn run(
                     total_size.unwrap_or(0) / (1024 * 1024),
                 );
             }
+        }
+
+        SnapshotCommands::Diff { name, v1, v2 } => {
+            crate::cli::operations::snapshot_diff(conn, name, *v1, *v2, json_output)?;
+        }
+
+        SnapshotCommands::Delete {
+            name,
+            version,
+            force,
+        } => {
+            crate::cli::operations::snapshot_delete(conn, name, *version, *force, json_output)?;
         }
 
         SnapshotCommands::List { unit, status } => {

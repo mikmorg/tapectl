@@ -57,6 +57,22 @@ pub enum VolumeCommands {
         /// Volume label
         label: String,
     },
+
+    /// Clone encrypted slices from one volume to another (no decryption)
+    CloneSlices {
+        /// Source volume label
+        #[arg(long)]
+        from: String,
+        /// Destination volume label
+        #[arg(long)]
+        to: String,
+        /// Unit name to clone
+        #[arg(long)]
+        unit: String,
+        /// Tape device path
+        #[arg(long, default_value = "/dev/nst0")]
+        device: String,
+    },
 }
 
 pub fn run(
@@ -127,6 +143,42 @@ pub fn run(
 
         VolumeCommands::Retire { label } => {
             crate::cli::operations::volume_retire(conn, label, json_output)?;
+        }
+
+        VolumeCommands::CloneSlices {
+            from,
+            to,
+            unit,
+            device,
+        } => {
+            let report = write::clone_slices(
+                conn,
+                paths,
+                config,
+                from,
+                to,
+                unit,
+                device,
+                DEFAULT_BLOCK_SIZE,
+            )?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "from": from, "to": to, "unit": unit,
+                        "slices_cloned": report.slices_cloned,
+                        "bytes_cloned": report.bytes_cloned,
+                    })
+                );
+            } else {
+                println!(
+                    "cloned {} slices ({} MB) from \"{}\" to \"{}\"",
+                    report.slices_cloned,
+                    report.bytes_cloned / (1024 * 1024),
+                    from,
+                    to,
+                );
+            }
         }
     }
     Ok(())

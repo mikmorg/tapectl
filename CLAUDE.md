@@ -10,7 +10,7 @@ The sole implementation reference is `tapectl-design-v4_0.md` — no other desig
 
 ## Current State
 
-Milestone 0 (External Dependency Validation) and Milestone 1 (Foundation) are complete.
+Milestones 0 through 5 are complete.
 
 **Milestone 0:** Full round-trip validated — dar → age encrypt → mhvtl tape → read → decrypt → extract. All criteria passed. Validation programs in `validation/`.
 
@@ -22,7 +22,7 @@ Milestone 0 (External Dependency Validation) and Milestone 1 (Foundation) are co
 
 **Milestone 4:** Working commands: `restore unit/file` (read from tape → decrypt → dar extract), `catalog ls/search/locate/stats`. Full round-trip verified: write → restore → diff -r identical.
 
-**Milestone 5:** Working commands: `location add/list/info/rename`, `volume move/retire`, `cartridge register/list/info/mark-erased`, `unit mark-tape-only`, `export`, `db backup/fsck`. Volume retire shows impact analysis. mark-tape-only enforces min_copies/min_locations.
+**Milestone 5:** Working commands: `location add/list/info/rename`, `volume move/retire/clone-slices`, `cartridge register/list/info/mark-erased`, `unit mark-tape-only`, `snapshot diff/delete`, `stage list/info`, `export`, `db backup/fsck`. Volume retire shows impact analysis. mark-tape-only enforces min_copies/min_locations. clone-slices copies encrypted data between volumes without decryption.
 
 **Next:** Milestone 6 (Policy + Reporting + Compaction).
 
@@ -45,11 +45,11 @@ cargo fmt --check
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
 - **dar integration** (`src/dar/`): subprocess wrapper; minimum dar 2.6.x; XML catalog parsing via quick-xml
 - **Staging** (`src/staging/`): sha256 validation before archiving, age multi-recipient encryption, ephemeral slices
-- **Backend trait** (`src/backend/`): pluggable storage — LTO (`lto.rs`), export directories (`export.rs`), S3 stub (deferred)
-- **Volume management** (`src/volume/`): 8-file self-describing layout, best-fit-decreasing bin packing, ENOSPC recovery, compaction
-- **Tape I/O** (`src/tape/`): kernel st driver via ioctl, MAM chip queries, variable block mode
-- **Crypto** (`src/crypto/`): age/rage multi-recipient encryption, per-tenant key isolation
-- **Policy** (`src/policy/`): archive sets (named policy templates), resolver with inheritance (unit > archive_set > defaults), advisory audit
+- **Volume management** (`src/volume/`): 10-file self-describing layout, write pipeline, verify, clone-slices
+- **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
+- **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
+- **Backend trait** (`src/backend/`): deferred — tape I/O currently direct via `src/tape/`
+- **Policy** (`src/policy/`): deferred to M6 — archive sets, resolver, advisory audit
 
 **Design principles:**
 - Volumes are self-describing — full restore possible without the database or tapectl

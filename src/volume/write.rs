@@ -467,6 +467,237 @@ pub fn volume_identify(device: &str, block_size: usize) -> Result<String> {
     Ok(text.trim_end_matches('\0').to_string())
 }
 
+/// Clone encrypted slices from one volume to another without decryption.
+/// Single-drive workflow: reads from source, prompts for tape swap, writes to destination.
+pub fn clone_slices(
+    conn: &Connection,
+    _paths: &TapectlPaths,
+    config: &Config,
+    from_label: &str,
+    to_label: &str,
+    unit_name: &str,
+    device: &str,
+    block_size: usize,
+) -> Result<CloneReport> {
+    // Look up source volume
+    let from_vol_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![from_label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(from_label.to_string()))?;
+
+    // Look up destination volume
+    let to_vol_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![to_label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(to_label.to_string()))?;
+
+    // Look up unit
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    // Find write positions for this unit on the source volume
+    let mut stmt = conn.prepare(
+        "SELECT wp.position, wp.sha256_on_volume, wp.stage_slice_id,
+                ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id,
+                w.id, w.snapshot_id
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices ss ON ss.id = wp.stage_slice_id
+         JOIN stage_sets sts ON sts.id = w.stage_set_id
+         JOIN snapshots sn ON sn.id = sts.snapshot_id
+         WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
+         ORDER BY CAST(wp.position AS INTEGER)",
+    )?;
+    let source_slices: Vec<(String, String, i64, i64, String, i64, i64, i64)> = stmt
+        .query_map(params![from_vol_id, unit.id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if source_slices.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "no slices for unit \"{unit_name}\" on volume \"{from_label}\""
+        )));
+    }
+
+    let stage_set_id = source_slices[0].5;
+    let snapshot_id = source_slices[0].7;
+
+    info!(
+        unit = unit_name,
+        slices = source_slices.len(),
+        "reading slices from {from_label}"
+    );
+
+    // Phase 1: Read encrypted slices from source tape to staging
+    let staging_dir = &config.staging.directory;
+    let clone_dir =
+        std::path::Path::new(staging_dir).join(format!("clone-{from_label}-{unit_name}"));
+    fs::create_dir_all(&clone_dir)?;
+
+    let mut tape = TapeDevice::open_read(device, block_size)?;
+
+    let mut staged_files: Vec<(String, i64, String, i64)> = Vec::new(); // (path, slice_id, expected_sha, enc_bytes)
+
+    for (pos_str, sha_on_vol, slice_id, enc_bytes, sha_encrypted, ..) in &source_slices {
+        let pos: i32 = pos_str.parse().unwrap_or(0);
+
+        tape.rewind()?;
+        if pos > 0 {
+            tape.forward_space_file(pos)?;
+        }
+
+        let data = tape.read_file()?;
+
+        // Trim padding to encrypted_bytes
+        let trimmed = if (*enc_bytes as usize) < data.len() {
+            &data[..*enc_bytes as usize]
+        } else {
+            &data
+        };
+
+        // Verify checksum
+        let actual_sha = sha256_hex(trimmed);
+        if actual_sha != *sha_on_vol && actual_sha != *sha_encrypted {
+            return Err(TapectlError::Other(format!(
+                "checksum mismatch reading slice at position {pos} from {from_label}"
+            )));
+        }
+
+        let slice_path = clone_dir.join(format!("slice_{slice_id}.dat"));
+        fs::write(&slice_path, trimmed)?;
+        staged_files.push((
+            slice_path.to_string_lossy().to_string(),
+            *slice_id,
+            actual_sha,
+            *enc_bytes,
+        ));
+        info!(
+            position = pos,
+            slice_id = slice_id,
+            "read slice from source"
+        );
+    }
+
+    drop(tape);
+
+    // Phase 2: Prompt for tape swap
+    println!(
+        "Source slices read from \"{from_label}\". Insert destination tape for \"{to_label}\"."
+    );
+    println!("Press Enter when ready...");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+
+    // Phase 3: Write to destination volume
+    // Create write record referencing same stage_set_id
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, started_at)
+         VALUES (?1, ?2, ?3, 'in_progress', datetime('now'))",
+        params![stage_set_id, snapshot_id, to_vol_id],
+    )?;
+    let new_write_id = conn.last_insert_rowid();
+
+    let mut tape = TapeDevice::open(device, block_size)?;
+
+    // Seek to end of existing data on destination
+    tape.rewind()?;
+    tape.seek_eom()?;
+
+    let mut total_bytes: i64 = 0;
+    let mut slices_written = 0;
+
+    for (path, slice_id, sha, enc_bytes) in &staged_files {
+        let data = fs::read(path)?;
+
+        let tape_pos = tape.get_position()?;
+        let pos_num = tape_pos.file_number;
+
+        tape.write_file_with_mark(&data)?;
+        total_bytes += *enc_bytes;
+        slices_written += 1;
+
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status, written_at, sha256_on_volume)
+             VALUES (?1, ?2, ?3, 'written', datetime('now'), ?4)",
+            params![new_write_id, slice_id, pos_num.to_string(), sha],
+        )?;
+
+        info!(
+            slice_id = slice_id,
+            position = pos_num,
+            "wrote cloned slice"
+        );
+    }
+
+    // Finalize
+    conn.execute(
+        "UPDATE writes SET status = 'completed', completed_at = datetime('now')
+         WHERE id = ?1",
+        params![new_write_id],
+    )?;
+
+    conn.execute(
+        "UPDATE volumes SET bytes_written = bytes_written + ?1,
+         num_data_files = num_data_files + ?2,
+         last_write = datetime('now')
+         WHERE id = ?3",
+        params![total_bytes, slices_written, to_vol_id],
+    )?;
+
+    events::log_event(
+        conn,
+        "volume",
+        to_vol_id,
+        Some(to_label),
+        "clone_slices",
+        None,
+        None,
+        Some(&format!(
+            "cloned {slices_written} slices from {from_label} for unit {unit_name}"
+        )),
+        None,
+        None,
+    )?;
+
+    // Clean up staging clone dir
+    let _ = fs::remove_dir_all(&clone_dir);
+
+    info!(
+        from = from_label,
+        to = to_label,
+        unit = unit_name,
+        slices = slices_written,
+        "clone complete"
+    );
+
+    Ok(CloneReport {
+        slices_cloned: slices_written,
+        bytes_cloned: total_bytes,
+    })
+}
+
+#[derive(Debug, Default)]
+pub struct CloneReport {
+    pub slices_cloned: i64,
+    pub bytes_cloned: i64,
+}
+
 // ── Internal helpers ──
 
 struct StagedUnit {

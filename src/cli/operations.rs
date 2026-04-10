@@ -223,6 +223,99 @@ pub fn export_unit(
     Ok(())
 }
 
+/// Delete an unwritten snapshot.
+pub fn snapshot_delete(
+    conn: &Connection,
+    unit_name: &str,
+    version: i64,
+    force: bool,
+    json_output: bool,
+) -> Result<()> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    let (snap_id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+            params![unit.id, version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            TapectlError::Other(format!("snapshot v{version} not found for \"{unit_name}\""))
+        })?;
+
+    // Check if snapshot has been written to tape
+    let write_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         WHERE ss.snapshot_id = ?1 AND w.status = 'completed'",
+        params![snap_id],
+        |row| row.get(0),
+    )?;
+    if write_count > 0 {
+        return Err(TapectlError::Other(format!(
+            "snapshot v{version} has {write_count} completed write(s) — cannot delete"
+        )));
+    }
+
+    // Check if staged (allow with --force)
+    let staged_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND status = 'staged'",
+        params![snap_id],
+        |row| row.get(0),
+    )?;
+    if staged_count > 0 && !force {
+        return Err(TapectlError::Other(format!(
+            "snapshot v{version} has staged data — use --force to delete anyway"
+        )));
+    }
+
+    // Cascade delete: stage_slices -> stage_sets -> manifest_entries -> manifests -> files -> snapshot
+    conn.execute(
+        "DELETE FROM stage_slices WHERE stage_set_id IN
+         (SELECT id FROM stage_sets WHERE snapshot_id = ?1)",
+        params![snap_id],
+    )?;
+    conn.execute(
+        "DELETE FROM stage_sets WHERE snapshot_id = ?1",
+        params![snap_id],
+    )?;
+    conn.execute(
+        "DELETE FROM manifest_entries WHERE manifest_id IN
+         (SELECT id FROM manifests WHERE snapshot_id = ?1)",
+        params![snap_id],
+    )?;
+    conn.execute(
+        "DELETE FROM manifests WHERE snapshot_id = ?1",
+        params![snap_id],
+    )?;
+    conn.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
+    conn.execute("DELETE FROM snapshots WHERE id = ?1", params![snap_id])?;
+
+    events::log_event(
+        conn,
+        "snapshot",
+        snap_id,
+        Some(&format!("{unit_name}/v{version}")),
+        "deleted",
+        None,
+        None,
+        None,
+        None,
+        Some(unit.tenant_id),
+    )?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"unit": unit_name, "version": version, "deleted": true})
+        );
+    } else {
+        println!("snapshot {unit_name} v{version} deleted (was: {status})");
+    }
+    Ok(())
+}
+
 /// Snapshot diff: compare two versions of a unit.
 pub fn snapshot_diff(
     conn: &Connection,

@@ -16,13 +16,7 @@ mod volume;
 mod backend {
     pub mod _stub {}
 }
-mod cartridge {
-    pub mod _stub {}
-}
 mod policy {
-    pub mod _stub {}
-}
-mod verify {
     pub mod _stub {}
 }
 
