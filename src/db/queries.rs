@@ -1,0 +1,464 @@
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::error::Result;
+
+use super::models::{EncryptionKey, Tenant, Unit};
+
+// ── Tenants ──
+
+pub fn insert_tenant(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+    is_operator: bool,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO tenants (name, description, is_operator) VALUES (?1, ?2, ?3)",
+        params![name, description, is_operator],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_tenant_by_name(conn: &Connection, name: &str) -> Result<Option<Tenant>> {
+    conn.query_row(
+        "SELECT id, name, description, is_operator, status, created_at, notes
+         FROM tenants WHERE name = ?1",
+        params![name],
+        |row| {
+            Ok(Tenant {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                is_operator: row.get(3)?,
+                status: row.get(4)?,
+                created_at: row.get(5)?,
+                notes: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_tenant_by_id(conn: &Connection, id: i64) -> Result<Option<Tenant>> {
+    conn.query_row(
+        "SELECT id, name, description, is_operator, status, created_at, notes
+         FROM tenants WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Tenant {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                is_operator: row.get(3)?,
+                status: row.get(4)?,
+                created_at: row.get(5)?,
+                notes: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_tenants(conn: &Connection, include_deleted: bool) -> Result<Vec<Tenant>> {
+    let sql = if include_deleted {
+        "SELECT id, name, description, is_operator, status, created_at, notes
+         FROM tenants ORDER BY name"
+    } else {
+        "SELECT id, name, description, is_operator, status, created_at, notes
+         FROM tenants WHERE status != 'deleted' ORDER BY name"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Tenant {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            is_operator: row.get(3)?,
+            status: row.get(4)?,
+            created_at: row.get(5)?,
+            notes: row.get(6)?,
+        })
+    })?;
+    let mut tenants = Vec::new();
+    for row in rows {
+        tenants.push(row?);
+    }
+    Ok(tenants)
+}
+
+pub fn get_operator_tenant(conn: &Connection) -> Result<Option<Tenant>> {
+    conn.query_row(
+        "SELECT id, name, description, is_operator, status, created_at, notes
+         FROM tenants WHERE is_operator = 1 LIMIT 1",
+        [],
+        |row| {
+            Ok(Tenant {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                is_operator: row.get(3)?,
+                status: row.get(4)?,
+                created_at: row.get(5)?,
+                notes: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+// ── Encryption Keys ──
+
+pub fn insert_key(
+    conn: &Connection,
+    tenant_id: i64,
+    alias: &str,
+    fingerprint: &str,
+    public_key: &str,
+    key_type: &str,
+    description: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![tenant_id, alias, fingerprint, public_key, key_type, description],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<Vec<EncryptionKey>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
+                is_active, created_at, description
+         FROM encryption_keys WHERE tenant_id = ?1 ORDER BY alias",
+    )?;
+    let rows = stmt.query_map(params![tenant_id], |row| {
+        Ok(EncryptionKey {
+            id: row.get(0)?,
+            tenant_id: row.get(1)?,
+            alias: row.get(2)?,
+            fingerprint: row.get(3)?,
+            public_key: row.get(4)?,
+            key_type: row.get(5)?,
+            is_active: row.get(6)?,
+            created_at: row.get(7)?,
+            description: row.get(8)?,
+        })
+    })?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(row?);
+    }
+    Ok(keys)
+}
+
+pub fn get_active_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<Vec<EncryptionKey>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
+                is_active, created_at, description
+         FROM encryption_keys WHERE tenant_id = ?1 AND is_active = 1 ORDER BY alias",
+    )?;
+    let rows = stmt.query_map(params![tenant_id], |row| {
+        Ok(EncryptionKey {
+            id: row.get(0)?,
+            tenant_id: row.get(1)?,
+            alias: row.get(2)?,
+            fingerprint: row.get(3)?,
+            public_key: row.get(4)?,
+            key_type: row.get(5)?,
+            is_active: row.get(6)?,
+            created_at: row.get(7)?,
+            description: row.get(8)?,
+        })
+    })?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(row?);
+    }
+    Ok(keys)
+}
+
+pub fn get_key_by_alias(conn: &Connection, alias: &str) -> Result<Option<EncryptionKey>> {
+    conn.query_row(
+        "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
+                is_active, created_at, description
+         FROM encryption_keys WHERE alias = ?1",
+        params![alias],
+        |row| {
+            Ok(EncryptionKey {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                alias: row.get(2)?,
+                fingerprint: row.get(3)?,
+                public_key: row.get(4)?,
+                key_type: row.get(5)?,
+                is_active: row.get(6)?,
+                created_at: row.get(7)?,
+                description: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+// ── Units ──
+
+pub fn insert_unit(
+    conn: &Connection,
+    uuid: &str,
+    name: &str,
+    tenant_id: i64,
+    current_path: &str,
+    checksum_mode: &str,
+    encrypt: bool,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![uuid, name, tenant_id, current_path, checksum_mode, encrypt],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_unit_by_name(conn: &Connection, name: &str) -> Result<Option<Unit>> {
+    conn.query_row(
+        "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
+                checksum_mode, encrypt, status, created_at, last_scanned, notes
+         FROM units WHERE name = ?1",
+        params![name],
+        |row| {
+            Ok(Unit {
+                id: row.get(0)?,
+                uuid: row.get(1)?,
+                name: row.get(2)?,
+                tenant_id: row.get(3)?,
+                archive_set_id: row.get(4)?,
+                current_path: row.get(5)?,
+                checksum_mode: row.get(6)?,
+                encrypt: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                last_scanned: row.get(10)?,
+                notes: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_unit_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<Unit>> {
+    conn.query_row(
+        "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
+                checksum_mode, encrypt, status, created_at, last_scanned, notes
+         FROM units WHERE uuid = ?1",
+        params![uuid],
+        |row| {
+            Ok(Unit {
+                id: row.get(0)?,
+                uuid: row.get(1)?,
+                name: row.get(2)?,
+                tenant_id: row.get(3)?,
+                archive_set_id: row.get(4)?,
+                current_path: row.get(5)?,
+                checksum_mode: row.get(6)?,
+                encrypt: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                last_scanned: row.get(10)?,
+                notes: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_unit_by_path(conn: &Connection, path: &str) -> Result<Option<Unit>> {
+    conn.query_row(
+        "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
+                checksum_mode, encrypt, status, created_at, last_scanned, notes
+         FROM units WHERE current_path = ?1",
+        params![path],
+        |row| {
+            Ok(Unit {
+                id: row.get(0)?,
+                uuid: row.get(1)?,
+                name: row.get(2)?,
+                tenant_id: row.get(3)?,
+                archive_set_id: row.get(4)?,
+                current_path: row.get(5)?,
+                checksum_mode: row.get(6)?,
+                encrypt: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                last_scanned: row.get(10)?,
+                notes: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_units(
+    conn: &Connection,
+    tenant_id: Option<i64>,
+    status_filter: Option<&str>,
+) -> Result<Vec<Unit>> {
+    let mut sql = String::from(
+        "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
+                checksum_mode, encrypt, status, created_at, last_scanned, notes
+         FROM units WHERE 1=1",
+    );
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(tid) = tenant_id {
+        sql.push_str(" AND tenant_id = ?");
+        param_values.push(Box::new(tid));
+    }
+    if let Some(status) = status_filter {
+        sql.push_str(" AND status = ?");
+        param_values.push(Box::new(status.to_string()));
+    }
+    sql.push_str(" ORDER BY name");
+
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(Unit {
+            id: row.get(0)?,
+            uuid: row.get(1)?,
+            name: row.get(2)?,
+            tenant_id: row.get(3)?,
+            archive_set_id: row.get(4)?,
+            current_path: row.get(5)?,
+            checksum_mode: row.get(6)?,
+            encrypt: row.get(7)?,
+            status: row.get(8)?,
+            created_at: row.get(9)?,
+            last_scanned: row.get(10)?,
+            notes: row.get(11)?,
+        })
+    })?;
+    let mut units = Vec::new();
+    for row in rows {
+        units.push(row?);
+    }
+    Ok(units)
+}
+
+pub fn update_unit_name(conn: &Connection, unit_id: i64, new_name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE units SET name = ?1 WHERE id = ?2",
+        params![new_name, unit_id],
+    )?;
+    Ok(())
+}
+
+pub fn update_unit_path(conn: &Connection, unit_id: i64, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE units SET current_path = ?1 WHERE id = ?2",
+        params![path, unit_id],
+    )?;
+    // Record path history
+    conn.execute(
+        "INSERT INTO unit_path_history (unit_id, path) VALUES (?1, ?2)",
+        params![unit_id, path],
+    )?;
+    Ok(())
+}
+
+// ── Tags ──
+
+pub fn get_or_create_tag(conn: &Connection, name: &str) -> Result<i64> {
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM tags WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+    conn.execute("INSERT INTO tags (name) VALUES (?1)", params![name])?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn add_tag_to_unit(conn: &Connection, unit_id: i64, tag_name: &str) -> Result<()> {
+    let tag_id = get_or_create_tag(conn, tag_name)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO unit_tags (unit_id, tag_id) VALUES (?1, ?2)",
+        params![unit_id, tag_id],
+    )?;
+    Ok(())
+}
+
+pub fn remove_tag_from_unit(conn: &Connection, unit_id: i64, tag_name: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM unit_tags WHERE unit_id = ?1
+         AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+        params![unit_id, tag_name],
+    )?;
+    Ok(())
+}
+
+pub fn get_tags_for_unit(conn: &Connection, unit_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name FROM tags t
+         JOIN unit_tags ut ON ut.tag_id = t.id
+         WHERE ut.unit_id = ?1 ORDER BY t.name",
+    )?;
+    let rows = stmt.query_map(params![unit_id], |row| row.get(0))?;
+    let mut tags = Vec::new();
+    for row in rows {
+        tags.push(row?);
+    }
+    Ok(tags)
+}
+
+// ── Unit count for tenant (used by tenant delete guard) ──
+
+pub fn count_active_units_for_tenant(conn: &Connection, tenant_id: i64) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM units WHERE tenant_id = ?1 AND status = 'active'",
+        params![tenant_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Check if any unit in the database has a path that is a parent or child of the given path.
+pub fn check_nesting_conflict(conn: &Connection, path: &str) -> Result<Option<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name, current_path FROM units WHERE status != 'retired'")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+
+    let check_path = std::path::Path::new(path);
+    for row in rows {
+        let (name, existing_path) = row?;
+        if let Some(existing) = existing_path {
+            let existing = std::path::Path::new(&existing);
+            if check_path.starts_with(existing) {
+                return Ok(Some(format!(
+                    "{path} is inside existing unit \"{name}\" at {}",
+                    existing.display()
+                )));
+            }
+            if existing.starts_with(check_path) {
+                return Ok(Some(format!(
+                    "existing unit \"{name}\" at {} is inside {path}",
+                    existing.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}

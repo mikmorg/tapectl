@@ -10,9 +10,21 @@ The sole implementation reference is `tapectl-design-v4_0.md` — no other desig
 
 ## Current State
 
-The project is in pre-implementation phase. Only the design document exists. Implementation follows a milestone-gated roadmap where Milestone 0 (external dependency validation with a full round-trip: dar → encrypt → tape → read → decrypt → extract) is a hard gate before any further work.
+Milestone 0 (External Dependency Validation) and Milestone 1 (Foundation) are complete.
 
-## Build Commands (once Cargo.toml exists)
+**Milestone 0:** Full round-trip validated — dar → age encrypt → mhvtl tape → read → decrypt → extract. All criteria passed. Validation programs in `validation/`.
+
+**Milestone 1:** Working commands: `init`, `tenant` (add/list/info/delete), `key` (generate/list/export/import), `unit` (init/init-bulk/list/status/tag/rename/discover). Full SQLite schema deployed.
+
+**Milestone 2:** Working commands: `snapshot create/list`, `stage create`, `staging status/clean`. Full pipeline: directory walk → manifest → sha256 validation → dar archive → age multi-recipient encryption → checksums → receipt. dar wrapper with version check, XML catalog parsing, catalog isolation.
+
+**Milestone 3:** Working commands: `volume init/write/verify/identify`. Full 10-file volume layout written to tape via mhvtl: ID thunk, system guide, RESTORE.sh, planning header, encrypted data slices, mini-index, tenant envelopes, dual operator envelopes. Tape ioctl module with fixed block I/O. Verify reads back and validates sha256.
+
+**Milestone 4:** Working commands: `restore unit/file` (read from tape → decrypt → dar extract), `catalog ls/search/locate/stats`. Full round-trip verified: write → restore → diff -r identical.
+
+**Next:** Milestone 5 (Safety + Operations).
+
+## Build Commands
 
 ```bash
 cargo build --release
