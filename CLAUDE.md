@@ -22,7 +22,9 @@ Milestone 0 (External Dependency Validation) and Milestone 1 (Foundation) are co
 
 **Milestone 4:** Working commands: `restore unit/file` (read from tape → decrypt → dar extract), `catalog ls/search/locate/stats`. Full round-trip verified: write → restore → diff -r identical.
 
-**Next:** Milestone 5 (Safety + Operations).
+**Milestone 5:** Working commands: `location add/list/info/rename`, `volume move/retire`, `cartridge register/list/info/mark-erased`, `unit mark-tape-only`, `export`, `db backup/fsck`. Volume retire shows impact analysis. mark-tape-only enforces min_copies/min_locations.
+
+**Next:** Milestone 6 (Policy + Reporting + Compaction).
 
 ## Build Commands
 
