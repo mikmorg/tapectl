@@ -48,6 +48,15 @@ pub enum SnapshotCommands {
         force: bool,
     },
 
+    /// Purge a reclaimable snapshot (remove DB records)
+    Purge {
+        /// Unit name
+        name: String,
+        /// Snapshot version
+        #[arg(long)]
+        version: i64,
+    },
+
     /// Mark a snapshot as reclaimable (with enforced preconditions)
     MarkReclaimable {
         /// Unit name
@@ -129,6 +138,10 @@ pub fn run(
             force,
         } => {
             crate::cli::operations::snapshot_delete(conn, name, *version, *force, json_output)?;
+        }
+
+        SnapshotCommands::Purge { name, version } => {
+            crate::cli::operations::snapshot_purge(conn, name, *version, json_output)?;
         }
 
         SnapshotCommands::MarkReclaimable {

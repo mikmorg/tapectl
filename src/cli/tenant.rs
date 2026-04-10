@@ -30,6 +30,15 @@ pub enum TenantCommands {
         name: String,
     },
 
+    /// Reassign all units from one tenant to another
+    Reassign {
+        /// Source tenant name
+        source: String,
+        /// Destination tenant name
+        #[arg(long)]
+        to: String,
+    },
+
     /// Delete a tenant (soft delete)
     Delete {
         /// Tenant name
@@ -125,6 +134,34 @@ pub fn run(
                         key.is_active,
                     );
                 }
+            }
+        }
+        TenantCommands::Reassign { source, to } => {
+            let src = crate::tenant::require_tenant(conn, source)?;
+            let dst = crate::tenant::require_tenant(conn, to)?;
+            let moved: usize = conn.execute(
+                "UPDATE units SET tenant_id = ?1 WHERE tenant_id = ?2",
+                rusqlite::params![dst.id, src.id],
+            )?;
+            crate::db::events::log_event(
+                conn,
+                "tenant",
+                src.id,
+                Some(source),
+                "reassign",
+                Some("tenant_id"),
+                Some(&src.id.to_string()),
+                Some(&dst.id.to_string()),
+                None,
+                None,
+            )?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"from": source, "to": to, "units_moved": moved})
+                );
+            } else {
+                println!("{moved} unit(s) reassigned from \"{source}\" to \"{to}\"");
             }
         }
         TenantCommands::Delete { name } => {

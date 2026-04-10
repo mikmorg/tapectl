@@ -80,6 +80,12 @@ pub enum UnitCommands {
     /// Scan watch_roots for .tapectl-unit.toml dotfiles
     Discover,
 
+    /// Check file integrity against staged checksums
+    CheckIntegrity {
+        /// Unit name
+        name: String,
+    },
+
     /// Mark unit as tape-only (local data can be deleted)
     MarkTapeOnly {
         /// Unit name
@@ -304,6 +310,10 @@ pub fn run(
                     println!("  error: {err}");
                 }
             }
+        }
+
+        UnitCommands::CheckIntegrity { name } => {
+            crate::cli::operations::unit_check_integrity(conn, name, json_output)?;
         }
 
         UnitCommands::MarkTapeOnly { name, force } => {

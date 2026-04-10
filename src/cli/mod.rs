@@ -153,8 +153,20 @@ pub enum Commands {
 
     /// Quick archive: create + stage + write in one flow
     QuickArchive {
-        #[command(subcommand)]
-        command: StubCommand,
+        /// Path to directory
+        path: String,
+        /// Tenant name
+        #[arg(long)]
+        tenant: String,
+        /// Volume label
+        #[arg(long)]
+        volume: String,
+        /// Tags
+        #[arg(long, short)]
+        tag: Vec<String>,
+        /// Tape device path
+        #[arg(long, default_value = "/dev/nst0")]
+        device: String,
     },
 
     /// Database operations
@@ -166,7 +178,7 @@ pub enum Commands {
     /// Configuration management
     Config {
         #[command(subcommand)]
-        command: StubCommand,
+        command: ConfigCommands,
     },
 
     /// Generate shell completions
@@ -192,12 +204,22 @@ pub enum DbCommands {
         #[arg(long)]
         repair: bool,
     },
+    /// Export database as JSON
+    Export,
+    /// Import database from backup
+    Import {
+        /// Path to backup file
+        path: String,
+    },
+    /// Show database statistics
+    Stats,
 }
 
-/// Placeholder for subcommands not yet implemented.
+/// Configuration management commands.
 #[derive(Subcommand, Debug)]
-pub enum StubCommand {
-    /// Not yet implemented
-    #[command(name = "_stub", hide = true)]
-    Stub,
+pub enum ConfigCommands {
+    /// Show current configuration
+    Show,
+    /// Check configuration validity
+    Check,
 }

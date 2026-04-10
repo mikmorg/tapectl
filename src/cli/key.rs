@@ -40,6 +40,13 @@ pub enum KeyCommands {
         alias: String,
     },
 
+    /// Rotate keys for a tenant (deactivate old, generate new)
+    Rotate {
+        /// Tenant name
+        #[arg(long)]
+        tenant: String,
+    },
+
     /// Import a public key from a file
     Import {
         /// Tenant name
@@ -145,6 +152,52 @@ pub fn run(
             let key = queries::get_key_by_alias(conn, alias)?
                 .ok_or_else(|| TapectlError::KeyNotFound(alias.clone()))?;
             println!("{}", key.public_key);
+        }
+        KeyCommands::Rotate { tenant } => {
+            let t = crate::tenant::require_tenant(conn, tenant)?;
+            // Deactivate all current keys
+            let deactivated: usize = conn.execute(
+                "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1 AND is_active = 1",
+                rusqlite::params![t.id],
+            )?;
+            // Generate new primary + backup
+            let primary = keys::generate_and_save(&paths.keys_dir, tenant, "rotated-primary")?;
+            let p_alias = format!("{tenant}-rotated-primary");
+            let p_id = queries::insert_key(
+                conn,
+                t.id,
+                &p_alias,
+                &primary.fingerprint,
+                &primary.public_key,
+                "primary",
+                None,
+            )?;
+            events::log_created(conn, "encryption_key", p_id, &p_alias, Some(t.id))?;
+
+            let backup = keys::generate_and_save(&paths.keys_dir, tenant, "rotated-backup")?;
+            let b_alias = format!("{tenant}-rotated-backup");
+            let b_id = queries::insert_key(
+                conn,
+                t.id,
+                &b_alias,
+                &backup.fingerprint,
+                &backup.public_key,
+                "backup",
+                None,
+            )?;
+            events::log_created(conn, "encryption_key", b_id, &b_alias, Some(t.id))?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "tenant": tenant, "deactivated": deactivated,
+                        "new_primary": p_alias, "new_backup": b_alias,
+                    })
+                );
+            } else {
+                println!("rotated keys for \"{tenant}\": {deactivated} deactivated, 2 new keys generated");
+            }
         }
         KeyCommands::Import {
             tenant,

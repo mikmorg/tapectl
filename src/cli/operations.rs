@@ -8,6 +8,174 @@ use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 
+/// Purge a reclaimable snapshot (remove files/manifests, mark purged).
+pub fn snapshot_purge(
+    conn: &Connection,
+    unit_name: &str,
+    version: i64,
+    json_output: bool,
+) -> Result<()> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    let (snap_id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+            params![unit.id, version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            TapectlError::Other(format!("snapshot v{version} not found for \"{unit_name}\""))
+        })?;
+
+    if status != "reclaimable" {
+        return Err(TapectlError::Other(format!(
+            "snapshot v{version} status is \"{status}\", must be \"reclaimable\" to purge"
+        )));
+    }
+
+    // Delete files and manifests but keep the snapshot row as 'purged'
+    conn.execute(
+        "DELETE FROM manifest_entries WHERE manifest_id IN
+         (SELECT id FROM manifests WHERE snapshot_id = ?1)",
+        params![snap_id],
+    )?;
+    conn.execute(
+        "DELETE FROM manifests WHERE snapshot_id = ?1",
+        params![snap_id],
+    )?;
+    conn.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
+    conn.execute(
+        "UPDATE snapshots SET status = 'purged' WHERE id = ?1",
+        params![snap_id],
+    )?;
+
+    events::log_field_change(
+        conn,
+        "snapshot",
+        snap_id,
+        &format!("{unit_name}/v{version}"),
+        "purged",
+        "status",
+        Some("reclaimable"),
+        "purged",
+        Some(unit.tenant_id),
+    )?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"unit": unit_name, "version": version, "status": "purged"})
+        );
+    } else {
+        println!("snapshot {unit_name} v{version} purged");
+    }
+    Ok(())
+}
+
+/// Check unit integrity: compare disk files against staged checksums.
+pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: bool) -> Result<()> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    let current_path = unit
+        .current_path
+        .as_deref()
+        .ok_or_else(|| TapectlError::Other("unit has no current path".into()))?;
+
+    // Get latest staged files with sha256
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.size_bytes, f.sha256
+         FROM files f
+         JOIN snapshots s ON s.id = f.snapshot_id
+         WHERE s.unit_id = ?1 AND s.status IN ('current', 'staged', 'created')
+           AND f.is_directory = 0 AND f.sha256 IS NOT NULL
+         ORDER BY s.version DESC",
+    )?;
+    let staged_files: Vec<(String, i64, String)> = stmt
+        .query_map(params![unit.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if staged_files.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "no staged files with checksums for \"{unit_name}\" — stage at least once first"
+        )));
+    }
+
+    let mut ok = 0i64;
+    let mut bitrot = 0i64;
+    let mut missing = 0i64;
+    let mut size_mismatch = 0i64;
+    let mut details: Vec<serde_json::Value> = Vec::new();
+
+    for (rel_path, expected_size, expected_sha) in &staged_files {
+        let full_path = Path::new(current_path).join(rel_path);
+        if !full_path.exists() {
+            missing += 1;
+            details.push(serde_json::json!({"path": rel_path, "status": "MISSING"}));
+            continue;
+        }
+        let meta = fs::metadata(&full_path)?;
+        if meta.len() as i64 != *expected_size {
+            size_mismatch += 1;
+            details.push(serde_json::json!({
+                "path": rel_path, "status": "SIZE_MISMATCH",
+                "expected": expected_size, "actual": meta.len(),
+            }));
+            continue;
+        }
+        // SHA256 check
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let data = fs::read(&full_path)?;
+        hasher.update(&data);
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if actual != *expected_sha {
+            bitrot += 1;
+            details.push(serde_json::json!({"path": rel_path, "status": "BITROT"}));
+        } else {
+            ok += 1;
+        }
+    }
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "unit": unit_name, "ok": ok, "bitrot": bitrot,
+                "missing": missing, "size_mismatch": size_mismatch,
+                "details": details,
+            })
+        );
+    } else {
+        println!("integrity check for \"{unit_name}\":");
+        println!("  OK:            {ok}");
+        if bitrot > 0 {
+            println!("  BITROT:        {bitrot}");
+        }
+        if missing > 0 {
+            println!("  MISSING:       {missing}");
+        }
+        if size_mismatch > 0 {
+            println!("  SIZE_MISMATCH: {size_mismatch}");
+        }
+        for d in &details {
+            println!(
+                "    {} — {}",
+                d["path"].as_str().unwrap_or("?"),
+                d["status"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Retire a volume with impact analysis.
 pub fn volume_retire(conn: &Connection, label: &str, json_output: bool) -> Result<()> {
     let (vol_id, status): (i64, String) = conn

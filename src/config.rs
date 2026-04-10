@@ -115,6 +115,10 @@ pub struct ArchiveSetConfig {
     pub checksum_mode: Option<String>,
     pub verify_interval_days: Option<i32>,
     pub slice_size: Option<String>,
+    pub preserve_xattrs: Option<bool>,
+    pub preserve_acls: Option<bool>,
+    pub preserve_fsa: Option<bool>,
+    pub dirty_on_metadata_change: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

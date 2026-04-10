@@ -121,6 +121,38 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Export { ref unit, ref to } => {
             cli::operations::export_unit(&conn, unit, to, cli.json)?;
         }
+        Commands::QuickArchive {
+            ref path,
+            ref tenant,
+            ref volume,
+            ref tag,
+            ref device,
+        } => {
+            // Step 1: init unit
+            let unit_id = crate::unit::init_unit(&conn, &paths, path, tenant, None, tag, None)?;
+            let unit_name: String = conn.query_row(
+                "SELECT name FROM units WHERE id = ?1",
+                rusqlite::params![unit_id],
+                |row| row.get(0),
+            )?;
+            println!("unit \"{unit_name}\" initialized");
+            // Step 2: snapshot
+            let snap_id = crate::staging::snapshot_create(&conn, &unit_name)?;
+            println!("snapshot created (id={snap_id})");
+            // Step 3: stage
+            let ss_id = crate::staging::stage_create(&conn, &paths, &cfg, snap_id)?;
+            println!("staged (stage_set={ss_id})");
+            // Step 4: write
+            crate::volume::write::volume_write(&conn, &paths, &cfg, volume, device, 512 * 1024)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"})
+                );
+            } else {
+                println!("quick-archive complete: \"{unit_name}\" written to \"{volume}\"");
+            }
+        }
         Commands::Db { ref command } => match command {
             cli::DbCommands::Backup { to } => {
                 cli::operations::db_backup(&paths, to)?;
@@ -149,13 +181,97 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
             }
+            cli::DbCommands::Export => {
+                // Export key table counts as JSON
+                let tables = [
+                    "tenants",
+                    "units",
+                    "snapshots",
+                    "stage_sets",
+                    "volumes",
+                    "writes",
+                    "events",
+                ];
+                let mut counts = serde_json::Map::new();
+                for table in &tables {
+                    let count: i64 =
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })?;
+                    counts.insert(table.to_string(), serde_json::json!(count));
+                }
+                println!("{}", serde_json::to_string_pretty(&counts).unwrap());
+            }
+            cli::DbCommands::Import { path: import_path } => {
+                // Import = restore from backup
+                let src = rusqlite::Connection::open(import_path)?;
+                let mut dst = rusqlite::Connection::open(&paths.db_file)?;
+                let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
+                backup
+                    .run_to_completion(100, std::time::Duration::from_millis(10), None)
+                    .map_err(|e| anyhow::anyhow!("import failed: {e}"))?;
+                println!("database imported from {import_path}");
+            }
+            cli::DbCommands::Stats => {
+                let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                let db_size = page_count * page_size;
+                let table_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"size_bytes": db_size, "tables": table_count, "pages": page_count})
+                    );
+                } else {
+                    println!(
+                        "database: {} KB, {table_count} tables, {page_count} pages",
+                        db_size / 1024
+                    );
+                }
+            }
+        },
+        Commands::Config { ref command } => match command {
+            cli::ConfigCommands::Show => {
+                let toml_str = std::fs::read_to_string(&paths.config_file)?;
+                if cli.json {
+                    let val: toml::Value = toml_str
+                        .parse()
+                        .unwrap_or(toml::Value::String(toml_str.clone()));
+                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                } else {
+                    print!("{toml_str}");
+                }
+            }
+            cli::ConfigCommands::Check => {
+                let toml_str = std::fs::read_to_string(&paths.config_file)?;
+                match toml_str.parse::<toml::Value>() {
+                    Ok(_) => {
+                        let _ = config::Config::load(&paths.config_file)?;
+                        if cli.json {
+                            println!("{}", serde_json::json!({"valid": true}));
+                        } else {
+                            println!("config: valid");
+                        }
+                    }
+                    Err(e) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"valid": false, "error": e.to_string()})
+                            );
+                        } else {
+                            println!("config: INVALID — {e}");
+                        }
+                    }
+                }
+            }
         },
         Commands::Init { .. } | Commands::Completions { .. } => {
             unreachable!()
-        }
-        // Future milestone stubs
-        _ => {
-            bail!("command not yet implemented — see milestone roadmap");
         }
     }
 
