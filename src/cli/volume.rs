@@ -93,6 +93,13 @@ pub enum VolumeCommands {
         device: String,
     },
 
+    /// Show bin-packing plan for pending staged data
+    Plan {
+        /// Number of copies to plan
+        #[arg(long, default_value = "1")]
+        copies: i64,
+    },
+
     /// Retire source volume after compaction (compaction step 3)
     CompactFinish {
         /// Source volume label to retire
@@ -212,6 +219,70 @@ pub fn run(
                     from,
                     to,
                 );
+            }
+        }
+
+        VolumeCommands::Plan { copies } => {
+            // Show what staged data would be written
+            let mut stmt = conn.prepare(
+                "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size
+                 FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE ss.status = 'staged'
+                 ORDER BY ss.total_encrypted_size DESC",
+            )?;
+            let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            if rows.is_empty() {
+                println!("no staged data to plan");
+            } else {
+                let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
+                let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
+
+                if json_output {
+                    let units: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|(name, ver, slices, size)| {
+                            serde_json::json!({"unit": name, "version": ver, "slices": slices, "size": size})
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "copies": copies, "total_slices": total_slices,
+                            "total_bytes": total_bytes, "units": units,
+                        })
+                    );
+                } else {
+                    println!("volume write plan ({copies} copy/copies):");
+                    for (name, ver, slices, size) in &rows {
+                        println!(
+                            "  {name} v{ver}: {} slices, {} MB",
+                            slices.unwrap_or(0),
+                            size.unwrap_or(0) / (1024 * 1024),
+                        );
+                    }
+                    println!(
+                        "\ntotal: {total_slices} slices, {} MB x {copies} = {} MB",
+                        total_bytes / (1024 * 1024),
+                        total_bytes * copies / (1024 * 1024),
+                    );
+                    // Estimate tapes needed
+                    let tape_cap = config
+                        .backends
+                        .lto
+                        .first()
+                        .map(|b| crate::staging::parse_size_to_bytes(&b.nominal_capacity))
+                        .unwrap_or(2_500_000_000_000);
+                    let usable = (tape_cap as f64 * 0.92) as i64;
+                    let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
+                    println!("estimated tapes: {tapes_needed} (at 92% usable capacity)");
+                }
             }
         }
 

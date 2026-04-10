@@ -151,6 +151,25 @@ pub enum Commands {
         to: String,
     },
 
+    /// Import a pre-existing volume into the database
+    Import {
+        /// Volume label
+        #[arg(long)]
+        label: String,
+        /// Backend type
+        #[arg(long, default_value = "lto")]
+        backend: String,
+        /// Media type
+        #[arg(long, default_value = "LTO-6")]
+        media_type: String,
+        /// Capacity (e.g., "2500G")
+        #[arg(long, default_value = "2500G")]
+        capacity: String,
+        /// Notes
+        #[arg(long)]
+        notes: Option<String>,
+    },
+
     /// Quick archive: create + stage + write in one flow
     QuickArchive {
         /// Path to directory

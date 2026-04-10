@@ -49,9 +49,11 @@ fn tapectl_test_db(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .unwrap();
-    // Run migration
+    // Run migrations
     let schema = include_str!("../src/db/migrations/001_initial.sql");
     conn.execute_batch(schema).unwrap();
+    let fts5 = include_str!("../src/db/migrations/002_fts5_catalog.sql");
+    conn.execute_batch(fts5).unwrap();
     conn
 }
 
@@ -609,4 +611,423 @@ fn test_unique_constraints() {
         [],
     );
     assert!(result.is_err(), "unique constraint should have failed");
+}
+
+// ── FTS5 Search Tests ──
+
+#[test]
+fn test_fts5_search() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'movies', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let snap_id = conn.last_insert_rowid();
+
+    // Insert files — triggers should populate FTS
+    conn.execute(
+        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+         VALUES (?1, 'season1/episode01.mkv', 5000000000, 0)",
+        [snap_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+         VALUES (?1, 'season1/episode02.mkv', 4500000000, 0)",
+        [snap_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+         VALUES (?1, 'extras/behind_scenes.mp4', 1000000000, 0)",
+        [snap_id],
+    )
+    .unwrap();
+
+    // FTS5 indexes the full path as a token — search for the whole path segment
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH '\"season1/episode01.mkv\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // Total files indexed
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 3);
+
+    // Prefix search on path segments
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'season1*'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(count >= 2);
+}
+
+// ── Encryption Key Tests ──
+
+#[test]
+fn test_encryption_key_rotation() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    // Create initial keys
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+         VALUES (?1, 'alice-primary', 'fp1', 'pk1', 'primary', 1)",
+        [tid],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+         VALUES (?1, 'alice-backup', 'fp2', 'pk2', 'backup', 1)",
+        [tid],
+    )
+    .unwrap();
+
+    // Rotate: deactivate old, create new
+    conn.execute(
+        "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1 AND is_active = 1",
+        [tid],
+    )
+    .unwrap();
+
+    let active_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_keys WHERE tenant_id = ?1 AND is_active = 1",
+            [tid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_count, 0);
+
+    // New keys
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+         VALUES (?1, 'alice-rotated', 'fp3', 'pk3', 'primary', 1)",
+        [tid],
+    )
+    .unwrap();
+
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_keys WHERE tenant_id = ?1",
+            [tid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 3); // Old keys preserved, never deleted
+}
+
+// ── Policy Resolution Tests ──
+
+#[test]
+fn test_archive_set_policy_inheritance() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    // Create archive set
+    conn.execute(
+        "INSERT INTO archive_sets (name, min_copies, required_locations, checksum_mode)
+         VALUES ('critical', 3, '[\"home\",\"offsite\"]', 'sha256')",
+        [],
+    )
+    .unwrap();
+    let as_id = conn.last_insert_rowid();
+
+    // Create unit referencing archive set
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, archive_set_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'important-data', ?1, ?2, 'mtime_size', 1, 'active')",
+        rusqlite::params![tid, as_id],
+    )
+    .unwrap();
+
+    // Verify unit's archive_set_id is set
+    let unit_as: Option<i64> = conn
+        .query_row(
+            "SELECT archive_set_id FROM units WHERE name = 'important-data'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unit_as, Some(as_id));
+
+    // Verify archive set values
+    let min_copies: i64 = conn
+        .query_row(
+            "SELECT min_copies FROM archive_sets WHERE id = ?1",
+            [as_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(min_copies, 3);
+}
+
+// ── Verification Session Tests ──
+
+#[test]
+fn test_verification_session_tracking() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-0001', 'lto', 'primary', 'LTO-6', 2500000000000, 'active')",
+        [],
+    )
+    .unwrap();
+    let vol_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, verify_type, outcome, slices_checked, slices_passed, slices_failed)
+         VALUES (?1, 'full', 'passed', 10, 10, 0)",
+        [vol_id],
+    )
+    .unwrap();
+    let vs_id = conn.last_insert_rowid();
+
+    let outcome: String = conn
+        .query_row(
+            "SELECT outcome FROM verification_sessions WHERE id = ?1",
+            [vs_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(outcome, "passed");
+}
+
+// ── Multi-Tenant Isolation Test ──
+
+#[test]
+fn test_multi_tenant_isolation() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let alice_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('bob', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let bob_id = conn.last_insert_rowid();
+
+    // Each tenant has their own units
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('a1', 'alice-data', ?1, 'mtime_size', 1, 'active')",
+        [alice_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('b1', 'bob-data', ?1, 'mtime_size', 1, 'active')",
+        [bob_id],
+    )
+    .unwrap();
+
+    // Alice can only see her units
+    let alice_units: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
+            [alice_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(alice_units, 1);
+
+    let bob_units: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
+            [bob_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bob_units, 1);
+}
+
+// ── Tenant Reassignment Test ──
+
+#[test]
+fn test_tenant_reassignment() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let alice_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('bob', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let bob_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'data1', ?1, 'mtime_size', 1, 'active')",
+        [alice_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u2', 'data2', ?1, 'mtime_size', 1, 'active')",
+        [alice_id],
+    )
+    .unwrap();
+
+    // Reassign all units from alice to bob
+    let moved = conn
+        .execute(
+            "UPDATE units SET tenant_id = ?1 WHERE tenant_id = ?2",
+            rusqlite::params![bob_id, alice_id],
+        )
+        .unwrap();
+    assert_eq!(moved, 2);
+
+    let alice_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
+            [alice_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(alice_count, 0);
+
+    let bob_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
+            [bob_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bob_count, 2);
+}
+
+// ── Snapshot Mark-Reclaimable Preconditions Test ──
+
+#[test]
+fn test_snapshot_status_check_constraints() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'test', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+
+    // Invalid status should fail
+    let result = conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'invalid_status', '/tmp')",
+        [uid],
+    );
+    assert!(
+        result.is_err(),
+        "CHECK constraint should reject invalid status"
+    );
+}
+
+// ── Import Volume Test ──
+
+#[test]
+fn test_import_volume() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
+         VALUES ('IMPORTED-001', 'lto', 'lto', 'LTO-6', 2500000000000, 'active', 'Pre-existing tape')",
+        [],
+    )
+    .unwrap();
+    let vol_id = conn.last_insert_rowid();
+
+    let label: String = conn
+        .query_row("SELECT label FROM volumes WHERE id = ?1", [vol_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(label, "IMPORTED-001");
+
+    let notes: Option<String> = conn
+        .query_row("SELECT notes FROM volumes WHERE id = ?1", [vol_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(notes, Some("Pre-existing tape".into()));
+}
+
+// ── Config Parsing Test ──
+
+#[test]
+fn test_config_default_values() {
+    let (_tmp, _conn, home) = setup();
+    let config_path = home.join("config.toml");
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    let parsed: toml::Value = content.parse().unwrap();
+
+    // Verify defaults section exists
+    let defaults = parsed.get("defaults").unwrap();
+    assert_eq!(
+        defaults.get("slice_size").unwrap().as_str().unwrap(),
+        "100M"
+    );
+    assert_eq!(
+        defaults.get("checksum_mode").unwrap().as_str().unwrap(),
+        "mtime_size"
+    );
+    assert!(defaults.get("encrypt").unwrap().as_bool().unwrap());
 }

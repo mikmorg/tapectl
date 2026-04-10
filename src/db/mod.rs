@@ -38,7 +38,10 @@ fn configure(conn: &Connection) -> Result<()> {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!("migrations/001_initial.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("migrations/001_initial.sql")),
+        M::up(include_str!("migrations/002_fts5_catalog.sql")),
+    ])
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {

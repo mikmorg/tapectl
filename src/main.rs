@@ -121,6 +121,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Export { ref unit, ref to } => {
             cli::operations::export_unit(&conn, unit, to, cli.json)?;
         }
+        Commands::Import {
+            ref label,
+            ref backend,
+            ref media_type,
+            ref capacity,
+            ref notes,
+        } => {
+            let cap_bytes = crate::staging::parse_size_to_bytes(capacity);
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
+                 VALUES (?1, ?2, ?2, ?3, ?4, 'active', ?5)",
+                rusqlite::params![label, backend, media_type, cap_bytes, notes],
+            )?;
+            let vol_id = conn.last_insert_rowid();
+            crate::db::events::log_created(&conn, "volume", vol_id, label, None)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"id": vol_id, "label": label, "status": "imported"})
+                );
+            } else {
+                println!("volume \"{label}\" imported (id={vol_id}, {media_type}, {capacity})");
+            }
+        }
         Commands::QuickArchive {
             ref path,
             ref tenant,
