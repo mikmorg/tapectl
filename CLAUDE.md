@@ -26,7 +26,9 @@ Milestones 0 through 5 are complete.
 
 **Milestone 6:** Working commands: `archive-set create/edit/list/info/sync`, `audit` (compliance check with exit codes 0/1/2, --action-plan, --json), `snapshot mark-reclaimable` (enforced preconditions, tape-only 2x multiplier), `volume compact-read/compact-write/compact-finish/compact`, `report summary/fire-risk/copies/tape-only/dirty/pending/verify-status/health/capacity/age/events/compaction-candidates`. Policy resolver: dotfile > archive_set > defaults.
 
-**Next:** Milestone 7 (Hardening + Real Hardware).
+**Post-M6 completions:** All unassigned CLI commands from design doc implemented: `key rotate`, `tenant reassign`, `snapshot purge`, `unit check-integrity`, `quick-archive`, `db export/import/stats`, `config show/check`. Zero compiler warnings, 17 tests (5 unit + 12 integration), zero clippy errors. No StubCommands remain.
+
+**Next:** Milestone 7 — real LTO-6 hardware validation, end-to-end multi-tenant tests, failure mode tests, performance tests, documentation.
 
 ## Build Commands
 
