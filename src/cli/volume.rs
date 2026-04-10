@@ -73,6 +73,40 @@ pub enum VolumeCommands {
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
     },
+
+    /// Read live encrypted slices from a volume to staging (compaction step 1)
+    CompactRead {
+        /// Source volume label
+        label: String,
+        /// Tape device path
+        #[arg(long, default_value = "/dev/nst0")]
+        device: String,
+    },
+
+    /// Write compaction slices from staging to destination (compaction step 2)
+    CompactWrite {
+        /// Destination volume label
+        #[arg(long)]
+        destination: String,
+        /// Tape device path
+        #[arg(long, default_value = "/dev/nst0")]
+        device: String,
+    },
+
+    /// Retire source volume after compaction (compaction step 3)
+    CompactFinish {
+        /// Source volume label to retire
+        label: String,
+    },
+
+    /// Interactive compaction: read + write + finish in one flow
+    Compact {
+        /// Source volume label
+        label: String,
+        /// Tape device path
+        #[arg(long, default_value = "/dev/nst0")]
+        device: String,
+    },
 }
 
 pub fn run(
@@ -178,6 +212,88 @@ pub fn run(
                     from,
                     to,
                 );
+            }
+        }
+
+        VolumeCommands::CompactRead { label, device } => {
+            let report = write::compact_read(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"label": label, "slices_read": report.slices_read, "bytes_read": report.bytes_read})
+                );
+            } else {
+                println!(
+                    "compact-read \"{label}\": {} live slices ({} MB) staged",
+                    report.slices_read,
+                    report.bytes_read / (1024 * 1024),
+                );
+            }
+        }
+
+        VolumeCommands::CompactWrite {
+            destination,
+            device,
+        } => {
+            write::compact_write(conn, paths, config, destination, device, DEFAULT_BLOCK_SIZE)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"destination": destination, "status": "completed"})
+                );
+            } else {
+                println!("compact-write to \"{destination}\" completed");
+            }
+        }
+
+        VolumeCommands::CompactFinish { label } => {
+            write::compact_finish(conn, label)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"label": label, "status": "retired"})
+                );
+            } else {
+                println!("compact-finish \"{label}\": volume retired");
+            }
+        }
+
+        VolumeCommands::Compact { label, device } => {
+            // Interactive: run all 3 steps
+            println!("=== Step 1: Reading live slices from \"{label}\" ===");
+            let report = write::compact_read(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
+            println!(
+                "  Read {} slices ({} MB)",
+                report.slices_read,
+                report.bytes_read / (1024 * 1024),
+            );
+
+            println!("\nInsert destination tape and enter volume label:");
+            let mut dest_label = String::new();
+            std::io::stdin().read_line(&mut dest_label).ok();
+            let dest_label = dest_label.trim();
+
+            if dest_label.is_empty() {
+                return Err(crate::error::TapectlError::Other(
+                    "no destination label provided".into(),
+                ));
+            }
+
+            println!("=== Step 2: Writing compaction slices to \"{dest_label}\" ===");
+            write::compact_write(conn, paths, config, dest_label, device, DEFAULT_BLOCK_SIZE)?;
+            println!("  Write completed");
+
+            println!("=== Step 3: Retiring source volume \"{label}\" ===");
+            write::compact_finish(conn, label)?;
+            println!("  Volume \"{label}\" retired");
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"source": label, "destination": dest_label, "status": "completed"})
+                );
+            } else {
+                println!("\ncompaction complete: {label} → {dest_label}");
             }
         }
     }

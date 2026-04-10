@@ -24,7 +24,9 @@ Milestones 0 through 5 are complete.
 
 **Milestone 5:** Working commands: `location add/list/info/rename`, `volume move/retire/clone-slices`, `cartridge register/list/info/mark-erased`, `unit mark-tape-only`, `snapshot diff/delete`, `stage list/info`, `export`, `db backup/fsck`. Volume retire shows impact analysis. mark-tape-only enforces min_copies/min_locations. clone-slices copies encrypted data between volumes without decryption.
 
-**Next:** Milestone 6 (Policy + Reporting + Compaction).
+**Milestone 6:** Working commands: `archive-set create/edit/list/info/sync`, `audit` (compliance check with exit codes 0/1/2, --action-plan, --json), `snapshot mark-reclaimable` (enforced preconditions, tape-only 2x multiplier), `volume compact-read/compact-write/compact-finish/compact`, `report summary/fire-risk/copies/tape-only/dirty/pending/verify-status/health/capacity/age/events/compaction-candidates`. Policy resolver: dotfile > archive_set > defaults.
+
+**Next:** Milestone 7 (Hardening + Real Hardware).
 
 ## Build Commands
 
@@ -48,8 +50,8 @@ cargo fmt --check
 - **Volume management** (`src/volume/`): 10-file self-describing layout, write pipeline, verify, clone-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
+- **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit
 - **Backend trait** (`src/backend/`): deferred — tape I/O currently direct via `src/tape/`
-- **Policy** (`src/policy/`): deferred to M6 — archive sets, resolver, advisory audit
 
 **Design principles:**
 - Volumes are self-describing — full restore possible without the database or tapectl

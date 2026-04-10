@@ -1,8 +1,11 @@
+pub mod archive_set;
+pub mod audit;
 pub mod cartridge;
 pub mod catalog;
 pub mod key;
 pub mod location;
 pub mod operations;
+pub mod report;
 pub mod restore;
 pub mod snapshot;
 pub mod stage;
@@ -98,17 +101,20 @@ pub enum Commands {
         command: cartridge::CartridgeCommands,
     },
 
-    // ── Future milestone stubs ──
     /// Manage archive set policies
     ArchiveSet {
         #[command(subcommand)]
-        command: StubCommand,
+        command: archive_set::ArchiveSetCommands,
     },
 
     /// Policy compliance audit
     Audit {
-        #[command(subcommand)]
-        command: StubCommand,
+        /// Show remediation commands
+        #[arg(long)]
+        action_plan: bool,
+        /// Filter to a specific unit
+        #[arg(long)]
+        unit: Option<String>,
     },
 
     /// Browse and search file catalog
@@ -126,7 +132,7 @@ pub enum Commands {
     /// Generate reports
     Report {
         #[command(subcommand)]
-        command: StubCommand,
+        command: report::ReportCommands,
     },
 
     /// Restore data from volumes

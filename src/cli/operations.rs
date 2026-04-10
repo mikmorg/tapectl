@@ -316,6 +316,126 @@ pub fn snapshot_delete(
     Ok(())
 }
 
+/// Mark a snapshot as reclaimable with enforced preconditions.
+pub fn snapshot_mark_reclaimable(
+    conn: &Connection,
+    config: &Config,
+    unit_name: &str,
+    version: i64,
+    force: bool,
+    json_output: bool,
+) -> Result<()> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    let (snap_id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+            params![unit.id, version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            TapectlError::Other(format!("snapshot v{version} not found for \"{unit_name}\""))
+        })?;
+
+    if status == "reclaimable" {
+        return Err(TapectlError::Other(format!(
+            "snapshot v{version} is already reclaimable"
+        )));
+    }
+
+    if !force {
+        // Precondition 1: A superseding snapshot must exist and be current
+        let superseding: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT id, version FROM snapshots
+                 WHERE unit_id = ?1 AND version > ?2 AND status = 'current'
+                 ORDER BY version DESC LIMIT 1",
+                params![unit.id, version],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        let superseding = superseding.ok_or_else(|| {
+            TapectlError::Other(format!(
+                "no superseding current snapshot exists for v{version} (use --force to override)"
+            ))
+        })?;
+
+        // Precondition 2: Superseding snapshot meets policy
+        let resolved = crate::policy::resolve(conn, config, &unit);
+        let mut required_copies = resolved.min_copies;
+        let mut required_locations = resolved.required_locations.len() as i64;
+
+        // Precondition 3: tape-only units get multiplied requirements
+        if unit.status == "tape_only" {
+            let multiplier = config.compaction.tape_only_safety_multiplier as i64;
+            required_copies *= multiplier;
+            required_locations *= multiplier;
+        }
+
+        let copy_count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT w.volume_id)
+             FROM writes w
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             WHERE ss.snapshot_id = ?1 AND w.status = 'completed'",
+            params![superseding.0],
+            |row| row.get(0),
+        )?;
+
+        if copy_count < required_copies {
+            return Err(TapectlError::Other(format!(
+                "superseding v{} has {copy_count} copies, needs {required_copies}{} (use --force to override)",
+                superseding.1,
+                if unit.status == "tape_only" { " (tape-only 2x)" } else { "" }
+            )));
+        }
+
+        let location_count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT v.location_id)
+             FROM writes w
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND v.location_id IS NOT NULL",
+            params![superseding.0],
+            |row| row.get(0),
+        )?;
+
+        if required_locations > 0 && location_count < required_locations {
+            return Err(TapectlError::Other(format!(
+                "superseding v{} in {location_count} locations, needs {required_locations} (use --force to override)",
+                superseding.1,
+            )));
+        }
+    }
+
+    conn.execute(
+        "UPDATE snapshots SET status = 'reclaimable' WHERE id = ?1",
+        params![snap_id],
+    )?;
+    events::log_field_change(
+        conn,
+        "snapshot",
+        snap_id,
+        &format!("{unit_name}/v{version}"),
+        "mark_reclaimable",
+        "status",
+        Some(&status),
+        "reclaimable",
+        Some(unit.tenant_id),
+    )?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"unit": unit_name, "version": version, "status": "reclaimable"})
+        );
+    } else {
+        println!("snapshot {unit_name} v{version} marked reclaimable (was: {status})");
+    }
+    Ok(())
+}
+
 /// Snapshot diff: compare two versions of a unit.
 pub fn snapshot_diff(
     conn: &Connection,

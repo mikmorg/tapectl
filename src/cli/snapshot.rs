@@ -47,6 +47,18 @@ pub enum SnapshotCommands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Mark a snapshot as reclaimable (with enforced preconditions)
+    MarkReclaimable {
+        /// Unit name
+        name: String,
+        /// Snapshot version
+        #[arg(long)]
+        version: i64,
+        /// Override preconditions
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Tabled)]
@@ -70,7 +82,7 @@ struct SnapshotRow {
 pub fn run(
     conn: &Connection,
     _paths: &TapectlPaths,
-    _config: &Config,
+    config: &Config,
     command: &SnapshotCommands,
     json_output: bool,
 ) -> Result<()> {
@@ -117,6 +129,21 @@ pub fn run(
             force,
         } => {
             crate::cli::operations::snapshot_delete(conn, name, *version, *force, json_output)?;
+        }
+
+        SnapshotCommands::MarkReclaimable {
+            name,
+            version,
+            force,
+        } => {
+            crate::cli::operations::snapshot_mark_reclaimable(
+                conn,
+                config,
+                name,
+                *version,
+                *force,
+                json_output,
+            )?;
         }
 
         SnapshotCommands::List { unit, status } => {

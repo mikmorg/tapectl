@@ -698,6 +698,168 @@ pub struct CloneReport {
     pub bytes_cloned: i64,
 }
 
+#[derive(Debug, Default)]
+pub struct CompactReadReport {
+    pub slices_read: i64,
+    pub bytes_read: i64,
+}
+
+/// Compact-read: read live encrypted slices from a volume to staging.
+/// "Live" means the snapshot is NOT reclaimable or purged.
+pub fn compact_read(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+) -> Result<CompactReadReport> {
+    let volume_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Find live slices (snapshots not reclaimable/purged)
+    let mut stmt = conn.prepare(
+        "SELECT wp.position, wp.sha256_on_volume, wp.stage_slice_id,
+                ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id, ss.id as slice_id
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices ss ON ss.id = wp.stage_slice_id
+         JOIN stage_sets sts ON sts.id = w.stage_set_id
+         JOIN snapshots s ON s.id = sts.snapshot_id
+         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+           AND s.status NOT IN ('reclaimable', 'purged')
+         ORDER BY CAST(wp.position AS INTEGER)",
+    )?;
+    let live_slices: Vec<(String, String, i64, i64, String, i64, i64)> = stmt
+        .query_map(params![volume_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if live_slices.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "no live slices on volume \"{label}\""
+        )));
+    }
+
+    let staging_dir = &config.staging.directory;
+    let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
+    fs::create_dir_all(&compact_dir)?;
+
+    let mut tape = TapeDevice::open_read(device, block_size)?;
+    let mut total_bytes: i64 = 0;
+    let mut slices_read: i64 = 0;
+
+    for (pos_str, sha_on_vol, _slice_id, enc_bytes, sha_encrypted, _ss_id, slice_db_id) in
+        &live_slices
+    {
+        let pos: i32 = pos_str.parse().unwrap_or(0);
+        tape.rewind()?;
+        if pos > 0 {
+            tape.forward_space_file(pos)?;
+        }
+
+        let data = tape.read_file()?;
+        let trimmed = if (*enc_bytes as usize) < data.len() {
+            &data[..*enc_bytes as usize]
+        } else {
+            &data
+        };
+
+        let actual_sha = sha256_hex(trimmed);
+        if actual_sha != *sha_on_vol && actual_sha != *sha_encrypted {
+            warn!(position = pos, "checksum mismatch — skipping slice");
+            continue;
+        }
+
+        let slice_path = compact_dir.join(format!("slice_{slice_db_id}.dat"));
+        fs::write(&slice_path, trimmed)?;
+
+        // Update staging_path so compact-write can find slices
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+            params![slice_path.to_string_lossy().to_string(), slice_db_id],
+        )?;
+
+        total_bytes += *enc_bytes;
+        slices_read += 1;
+        info!(position = pos, slice_id = slice_db_id, "read live slice");
+    }
+
+    info!(label = label, slices = slices_read, "compact-read complete");
+
+    Ok(CompactReadReport {
+        slices_read,
+        bytes_read: total_bytes,
+    })
+}
+
+/// Compact-write: write staged compaction slices to destination volume.
+/// Reuses the normal write pipeline — staged data from compact-read is
+/// treated the same as any other staged data.
+pub fn compact_write(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    dest_label: &str,
+    device: &str,
+    block_size: usize,
+) -> Result<()> {
+    // The normal volume_write picks up all staged data
+    volume_write(conn, paths, config, dest_label, device, block_size)
+}
+
+/// Compact-finish: retire the source volume after compaction.
+pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
+    let (vol_id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM volumes WHERE label = ?1",
+            params![label],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    conn.execute(
+        "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+        params![vol_id],
+    )?;
+
+    // Mark cartridge as pending_erase if bound
+    conn.execute(
+        "UPDATE cartridges SET status = 'pending_erase'
+         WHERE id IN (SELECT cartridge_id FROM cartridge_volumes
+                      WHERE volume_id = ?1 AND unmounted_at IS NULL)",
+        params![vol_id],
+    )?;
+
+    events::log_field_change(
+        conn,
+        "volume",
+        vol_id,
+        label,
+        "compact_finish",
+        "status",
+        Some(&status),
+        "retired",
+        None,
+    )?;
+
+    info!(label = label, "compact-finish: volume retired");
+    Ok(())
+}
+
 // ── Internal helpers ──
 
 struct StagedUnit {

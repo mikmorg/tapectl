@@ -12,11 +12,10 @@ mod staging;
 mod tape;
 mod volume;
 
+mod policy;
+
 // Stub modules for future milestones
 mod backend {
-    pub mod _stub {}
-}
-mod policy {
     pub mod _stub {}
 }
 
@@ -103,6 +102,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Cartridge { ref command } => {
             cli::cartridge::run(&conn, command, cli.json)?;
+        }
+        Commands::ArchiveSet { ref command } => {
+            cli::archive_set::run(&conn, &cfg, command, cli.json)?;
+        }
+        Commands::Audit {
+            action_plan,
+            ref unit,
+        } => {
+            let exit_code = cli::audit::run(&conn, &cfg, unit.as_deref(), action_plan, cli.json)?;
+            if exit_code > 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Commands::Report { ref command } => {
+            cli::report::run(&conn, &cfg, command, cli.json)?;
         }
         Commands::Export { ref unit, ref to } => {
             cli::operations::export_unit(&conn, unit, to, cli.json)?;
