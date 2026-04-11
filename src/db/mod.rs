@@ -62,6 +62,18 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
             count = updated,
             "recovered orphaned write sessions — marked as aborted"
         );
+        events::log_event(
+            conn,
+            "system",
+            0,
+            None,
+            "crash_recovery",
+            Some("writes.status"),
+            None,
+            Some("aborted"),
+            Some(&format!("{updated} sessions")),
+            None,
+        )?;
     }
 
     let updated = conn.execute(
@@ -74,6 +86,18 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
             count = updated,
             "recovered orphaned staging sessions — marked as failed"
         );
+        events::log_event(
+            conn,
+            "system",
+            0,
+            None,
+            "crash_recovery",
+            Some("stage_sets.status"),
+            None,
+            Some("failed"),
+            Some(&format!("{updated} sessions")),
+            None,
+        )?;
     }
 
     let updated = conn.execute(
@@ -86,6 +110,18 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
             count = updated,
             "recovered orphaned verification sessions — marked as aborted"
         );
+        events::log_event(
+            conn,
+            "system",
+            0,
+            None,
+            "crash_recovery",
+            Some("verification_sessions.outcome"),
+            None,
+            Some("aborted"),
+            Some(&format!("{updated} sessions")),
+            None,
+        )?;
     }
     Ok(())
 }

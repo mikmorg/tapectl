@@ -285,10 +285,23 @@ pub fn stage_create(
     )?;
 
     // Update snapshot status
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE snapshots SET status = 'staged' WHERE id = ?1 AND status = 'created'",
         params![snapshot_id],
     )?;
+    if updated > 0 {
+        events::log_field_change(
+            conn,
+            "snapshot",
+            snapshot_id,
+            &format!("{} v{}", unit.name, snapshot.version),
+            "status_change",
+            "status",
+            Some("created"),
+            "staged",
+            Some(unit.tenant_id),
+        )?;
+    }
 
     // Backfill sha256 into files and manifest_entries (first stage only)
     if !checksums.is_empty() {

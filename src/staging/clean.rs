@@ -4,6 +4,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use tracing::warn;
 
+use crate::db::events;
 use crate::error::Result;
 
 /// Clean staged files from disk and update DB.
@@ -61,10 +62,28 @@ pub fn clean_staging(conn: &Connection, force: bool) -> Result<CleanReport> {
     }
 
     for stage_set_id in &cleaned_sets {
+        let old_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .ok();
         conn.execute(
             "UPDATE stage_sets SET status = 'cleaned', cleaned_at = datetime('now')
              WHERE id = ?1",
             params![stage_set_id],
+        )?;
+        events::log_field_change(
+            conn,
+            "stage_set",
+            *stage_set_id,
+            &format!("stage_set_{stage_set_id}"),
+            "status_change",
+            "status",
+            old_status.as_deref(),
+            "cleaned",
+            None,
         )?;
         report.sets_cleaned += 1;
     }

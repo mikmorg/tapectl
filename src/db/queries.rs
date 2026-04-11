@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
 
+use super::events;
 use super::models::{EncryptionKey, Tenant, Unit};
 
 // ── Tenants ──
@@ -353,14 +354,37 @@ pub fn list_units(
 }
 
 pub fn update_unit_name(conn: &Connection, unit_id: i64, new_name: &str) -> Result<()> {
+    let old_name: Option<String> = conn
+        .query_row(
+            "SELECT name FROM units WHERE id = ?1",
+            params![unit_id],
+            |row| row.get(0),
+        )
+        .optional()?;
     conn.execute(
         "UPDATE units SET name = ?1 WHERE id = ?2",
         params![new_name, unit_id],
+    )?;
+    events::log_field_change(
+        conn,
+        "unit",
+        unit_id,
+        new_name,
+        "rename",
+        "name",
+        old_name.as_deref(),
+        new_name,
+        None,
     )?;
     Ok(())
 }
 
 pub fn update_unit_path(conn: &Connection, unit_id: i64, path: &str) -> Result<()> {
+    let (name, old_path): (String, Option<String>) = conn.query_row(
+        "SELECT name, current_path FROM units WHERE id = ?1",
+        params![unit_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     conn.execute(
         "UPDATE units SET current_path = ?1 WHERE id = ?2",
         params![path, unit_id],
@@ -369,6 +393,17 @@ pub fn update_unit_path(conn: &Connection, unit_id: i64, path: &str) -> Result<(
     conn.execute(
         "INSERT INTO unit_path_history (unit_id, path) VALUES (?1, ?2)",
         params![unit_id, path],
+    )?;
+    events::log_field_change(
+        conn,
+        "unit",
+        unit_id,
+        &name,
+        "path_change",
+        "current_path",
+        old_path.as_deref(),
+        path,
+        None,
     )?;
     Ok(())
 }

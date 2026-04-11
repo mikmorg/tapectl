@@ -1263,6 +1263,139 @@ fn test_duplicate_slice_number_within_stage_set_rejected() {
     );
 }
 
+// ── Audit Trail Tests (Phase 4) ──
+
+fn seed_unit(conn: &Connection) -> i64 {
+    conn.execute(
+        "INSERT INTO tenants (name, description, is_operator, status)
+         VALUES ('t1', '', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (tenant_id, uuid, name, current_path, status)
+         VALUES (?1, 'uuid-u1', 'u1', '/tmp/u1', 'active')",
+        [tid],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+#[test]
+fn test_audit_unit_rename_logs_field_change() {
+    let (_tmp, conn, _home) = setup();
+    let unit_id = seed_unit(&conn);
+
+    tapectl::db::queries::update_unit_name(&conn, unit_id, "u1-renamed").unwrap();
+
+    let (action, field, old, new): (String, String, Option<String>, String) = conn
+        .query_row(
+            "SELECT action, field, old_value, new_value FROM events
+             WHERE entity_type='unit' AND entity_id=?1 AND action='rename'",
+            [unit_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(action, "rename");
+    assert_eq!(field, "name");
+    assert_eq!(old.as_deref(), Some("u1"));
+    assert_eq!(new, "u1-renamed");
+}
+
+#[test]
+fn test_audit_unit_path_change_logs_field_change() {
+    let (_tmp, conn, _home) = setup();
+    let unit_id = seed_unit(&conn);
+
+    tapectl::db::queries::update_unit_path(&conn, unit_id, "/tmp/u1-new").unwrap();
+
+    let (field, old, new): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT field, old_value, new_value FROM events
+             WHERE entity_type='unit' AND entity_id=?1 AND action='path_change'",
+            [unit_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(field, "current_path");
+    assert_eq!(old.as_deref(), Some("/tmp/u1"));
+    assert_eq!(new, "/tmp/u1-new");
+
+    // path history table should also have the new row
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM unit_path_history WHERE unit_id = ?1",
+            [unit_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_audit_crash_recovery_logs_system_event() {
+    // Use tapectl::db::open to run migrations, then seed orphaned rows, then
+    // re-open to trigger the recovery sweep.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('V1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+        [],
+    ).unwrap();
+    let vid = conn.last_insert_rowid();
+    let unit_id = seed_unit(&conn);
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+         VALUES (?1, 1, 'created', '/tmp/u1', 0, 0)",
+        [unit_id],
+    )
+    .unwrap();
+    let sid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+         VALUES (?1, 'staging', 524288)",
+        [sid],
+    )
+    .unwrap();
+    let ssid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO writes (volume_id, stage_set_id, snapshot_id, status)
+         VALUES (?1, ?2, ?3, 'in_progress')",
+        [vid, ssid, sid],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Re-open via the lib entry point so recover_orphaned_sessions runs.
+    let conn = tapectl::db::open(&db_path).unwrap();
+
+    let write_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE entity_type='system' AND action='crash_recovery'
+               AND field='writes.status'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(write_events, 1);
+
+    let stage_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE entity_type='system' AND action='crash_recovery'
+               AND field='stage_sets.status'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stage_events, 1);
+}
+
 #[test]
 fn test_config_default_values() {
     let (_tmp, _conn, home) = setup();
