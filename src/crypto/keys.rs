@@ -114,3 +114,101 @@ pub fn generate_and_save(
 
     Ok(kp)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn generate_keypair_produces_age_keys() {
+        let kp = generate_keypair();
+        assert!(kp.public_key.starts_with("age1"));
+        assert!(kp.secret_key.starts_with("AGE-SECRET-KEY-"));
+        assert_eq!(kp.fingerprint, kp.public_key);
+    }
+
+    #[test]
+    fn generate_keypair_produces_distinct_keys() {
+        let a = generate_keypair();
+        let b = generate_keypair();
+        assert_ne!(a.public_key, b.public_key);
+        assert_ne!(a.secret_key, b.secret_key);
+    }
+
+    #[test]
+    fn public_key_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("k.age.pub");
+        let kp = generate_keypair();
+        save_public_key(&path, &kp.public_key).unwrap();
+        let read = read_public_key(&path).unwrap();
+        assert_eq!(read, kp.public_key);
+    }
+
+    #[test]
+    fn secret_key_round_trip_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("k.age.key");
+        let kp = generate_keypair();
+        save_secret_key(&path, &kp.secret_key).unwrap();
+        let read = read_secret_key(&path).unwrap();
+        assert_eq!(read, kp.secret_key);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret key file must be 0600");
+    }
+
+    #[test]
+    fn read_public_key_rejects_non_age() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bad.pub");
+        fs::write(&path, "not a real key\n").unwrap();
+        assert!(read_public_key(&path).is_err());
+    }
+
+    #[test]
+    fn read_secret_key_rejects_file_without_marker() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bad.key");
+        fs::write(&path, "# comment\nno key here\n").unwrap();
+        let err = read_secret_key(&path).unwrap_err();
+        assert!(matches!(err, TapectlError::Encryption(_)));
+    }
+
+    #[test]
+    fn read_secret_key_on_missing_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ghost.key");
+        assert!(read_secret_key(&path).is_err());
+    }
+
+    #[test]
+    fn read_secret_key_tolerates_surrounding_lines() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wrapped.key");
+        let kp = generate_keypair();
+        let content = format!("# created: now\n# alias: primary\n{}\n", kp.secret_key);
+        fs::write(&path, content).unwrap();
+        let read = read_secret_key(&path).unwrap();
+        assert_eq!(read, kp.secret_key);
+    }
+
+    #[test]
+    fn key_paths_derivation() {
+        let dir = Path::new("/tmp/keys");
+        let (pub_p, sec_p) = key_paths(dir, "alice", "primary");
+        assert_eq!(pub_p, Path::new("/tmp/keys/alice-primary.age.pub"));
+        assert_eq!(sec_p, Path::new("/tmp/keys/alice-primary.age.key"));
+    }
+
+    #[test]
+    fn generate_and_save_refuses_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        generate_and_save(tmp.path(), "alice", "primary").unwrap();
+        let err = generate_and_save(tmp.path(), "alice", "primary")
+            .err()
+            .unwrap();
+        assert!(matches!(err, TapectlError::KeyAlreadyExists(_)));
+    }
+}

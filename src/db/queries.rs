@@ -462,3 +462,128 @@ pub fn check_nesting_conflict(conn: &Connection, path: &str) -> Result<Option<St
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let schema = include_str!("migrations/001_initial.sql");
+        conn.execute_batch(schema).unwrap();
+        conn
+    }
+
+    #[test]
+    fn insert_and_get_tenant_by_name() {
+        let conn = fresh_conn();
+        let id = insert_tenant(&conn, "alice", Some("test user"), false).unwrap();
+        assert!(id > 0);
+        let got = get_tenant_by_name(&conn, "alice").unwrap().unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.name, "alice");
+        assert_eq!(got.description.as_deref(), Some("test user"));
+        assert!(!got.is_operator);
+    }
+
+    #[test]
+    fn get_tenant_by_name_missing() {
+        let conn = fresh_conn();
+        assert!(get_tenant_by_name(&conn, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_operator_tenant_finds_only_operator() {
+        let conn = fresh_conn();
+        insert_tenant(&conn, "alice", None, false).unwrap();
+        let op_id = insert_tenant(&conn, "operator", None, true).unwrap();
+        let op = get_operator_tenant(&conn).unwrap().unwrap();
+        assert_eq!(op.id, op_id);
+        assert!(op.is_operator);
+    }
+
+    #[test]
+    fn update_unit_name_and_path_and_history() {
+        let conn = fresh_conn();
+        let tid = insert_tenant(&conn, "op", None, true).unwrap();
+        let uid =
+            insert_unit(&conn, "u-uuid", "origname", tid, "/old/path", "mtime_size", true).unwrap();
+
+        update_unit_name(&conn, uid, "newname").unwrap();
+        let u = get_unit_by_name(&conn, "newname").unwrap().unwrap();
+        assert_eq!(u.id, uid);
+        assert!(get_unit_by_name(&conn, "origname").unwrap().is_none());
+
+        update_unit_path(&conn, uid, "/new/path").unwrap();
+        let u = get_unit_by_path(&conn, "/new/path").unwrap().unwrap();
+        assert_eq!(u.id, uid);
+
+        let history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM unit_path_history WHERE unit_id = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 1);
+    }
+
+    #[test]
+    fn get_or_create_tag_is_idempotent() {
+        let conn = fresh_conn();
+        let a = get_or_create_tag(&conn, "media").unwrap();
+        let b = get_or_create_tag(&conn, "media").unwrap();
+        assert_eq!(a, b);
+        let c = get_or_create_tag(&conn, "photos").unwrap();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn add_and_remove_tag_for_unit() {
+        let conn = fresh_conn();
+        let tid = insert_tenant(&conn, "op", None, true).unwrap();
+        let uid = insert_unit(&conn, "u1", "u1", tid, "/p", "mtime_size", true).unwrap();
+
+        add_tag_to_unit(&conn, uid, "media").unwrap();
+        add_tag_to_unit(&conn, uid, "media").unwrap(); // idempotent via INSERT OR IGNORE
+        add_tag_to_unit(&conn, uid, "photos").unwrap();
+        let tags = get_tags_for_unit(&conn, uid).unwrap();
+        assert_eq!(tags, vec!["media".to_string(), "photos".to_string()]);
+
+        remove_tag_from_unit(&conn, uid, "media").unwrap();
+        let tags = get_tags_for_unit(&conn, uid).unwrap();
+        assert_eq!(tags, vec!["photos".to_string()]);
+    }
+
+    #[test]
+    fn count_active_units_for_tenant_counts_only_active() {
+        let conn = fresh_conn();
+        let tid = insert_tenant(&conn, "op", None, true).unwrap();
+        insert_unit(&conn, "u1", "u1", tid, "/a", "mtime_size", true).unwrap();
+        insert_unit(&conn, "u2", "u2", tid, "/b", "mtime_size", true).unwrap();
+        // Mark one retired
+        conn.execute(
+            "UPDATE units SET status='retired' WHERE name='u2'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_active_units_for_tenant(&conn, tid).unwrap(), 1);
+    }
+
+    #[test]
+    fn check_nesting_conflict_detects_parent_and_child() {
+        let conn = fresh_conn();
+        let tid = insert_tenant(&conn, "op", None, true).unwrap();
+        insert_unit(&conn, "u1", "u1", tid, "/data/photos", "mtime_size", true).unwrap();
+
+        // Child-of-existing
+        assert!(check_nesting_conflict(&conn, "/data/photos/2024")
+            .unwrap()
+            .is_some());
+        // Parent-of-existing
+        assert!(check_nesting_conflict(&conn, "/data").unwrap().is_some());
+        // Unrelated
+        assert!(check_nesting_conflict(&conn, "/other").unwrap().is_none());
+    }
+}

@@ -52,36 +52,10 @@ pub fn parse_catalog(dar_binary: &str, archive_base: &Path) -> Result<Vec<Catalo
 ///   </File>
 /// </Catalog>
 /// ```
-#[allow(unused_assignments)]
+// dar's XML output is line-oriented and consistent across 2.6/2.7, so a
+// line-based parser is simpler and more robust than a quick-xml state machine.
 fn parse_xml_catalog(xml: &str) -> Result<Vec<CatalogEntry>> {
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_str(xml);
-    let mut entries = Vec::new();
-    let _dir_stack: Vec<String> = Vec::new();
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                let _is_empty = !matches!(reader.read_event(), Ok(Event::End(_)) | Err(_));
-                // Re-parse since we consumed an event incorrectly above.
-                // Let's use a simpler approach:
-                let _ = tag; // handled below
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(TapectlError::Dar(format!("XML parse error: {e}")));
-            }
-            _ => {}
-        }
-    }
-
-    // Simpler line-based approach since dar's XML is simple and consistent
-    entries = parse_xml_line_based(xml)?;
-
-    Ok(entries)
+    parse_xml_line_based(xml)
 }
 
 /// Line-based XML parsing — dar's output is simple enough for this.
@@ -181,4 +155,94 @@ fn parse_dar_size(s: &str) -> Option<i64> {
         _ => 1.0,
     };
     Some((num * multiplier) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_XML: &str = r#"
+<Catalog format="1.2">
+  <Directory name="subdir">
+    <Attributes user="mike" group="mike" permissions=" drwxr-xr-x" mtime="1700000000" />
+    <File name="inside.txt" size="6 o" stored="6 o" crc="076f6c6c">
+      <Attributes data="saved" user="mike" group="mike" mtime="1700000100" />
+    </File>
+  </Directory>
+  <File name="top.bin" size="10 Mio" crc="abcdef01">
+    <Attributes data="saved" user="root" group="wheel" mtime="1700000200" />
+  </File>
+</Catalog>
+"#;
+
+    #[test]
+    fn parse_directory_and_file() {
+        let entries = parse_xml_catalog(SAMPLE_XML).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let subdir = &entries[0];
+        assert!(subdir.is_directory);
+        assert_eq!(subdir.path, "subdir");
+
+        let inside = &entries[1];
+        assert!(!inside.is_directory);
+        assert_eq!(inside.path, "subdir/inside.txt");
+        assert_eq!(inside.size_bytes, 6);
+        assert_eq!(inside.crc.as_deref(), Some("076f6c6c"));
+
+        let top = &entries[2];
+        assert!(!top.is_directory);
+        assert_eq!(top.path, "top.bin");
+        assert_eq!(top.size_bytes, 10 * 1024 * 1024);
+        assert_eq!(top.crc.as_deref(), Some("abcdef01"));
+    }
+
+    #[test]
+    fn parse_empty_catalog() {
+        let xml = r#"<Catalog format="1.2"></Catalog>"#;
+        let entries = parse_xml_catalog(xml).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_dar_size_units() {
+        assert_eq!(parse_dar_size("6 o"), Some(6));
+        assert_eq!(parse_dar_size("1024 o"), Some(1024));
+        assert_eq!(parse_dar_size("10 Mio"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_dar_size("2 Gio"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_dar_size("1 TiB"), Some(1024i64.pow(4)));
+        assert_eq!(parse_dar_size("not a number"), None);
+    }
+
+    #[test]
+    fn extract_attr_basic() {
+        let line = r#"<File name="test.txt" size="6 o" crc="abc" />"#;
+        assert_eq!(extract_attr(line, "name").as_deref(), Some("test.txt"));
+        assert_eq!(extract_attr(line, "size").as_deref(), Some("6 o"));
+        assert_eq!(extract_attr(line, "crc").as_deref(), Some("abc"));
+        assert_eq!(extract_attr(line, "missing"), None);
+    }
+
+    #[test]
+    fn nested_directories() {
+        let xml = r#"
+<Catalog format="1.2">
+  <Directory name="a">
+    <Attributes user="u" group="g" />
+    <Directory name="b">
+      <Attributes user="u" group="g" />
+      <File name="deep.txt" size="1 o">
+        <Attributes user="u" group="g" />
+      </File>
+    </Directory>
+  </Directory>
+</Catalog>
+"#;
+        let entries = parse_xml_catalog(xml).unwrap();
+        let deep = entries
+            .iter()
+            .find(|e| e.path.ends_with("deep.txt"))
+            .expect("deep file present");
+        assert_eq!(deep.path, "a/b/deep.txt");
+    }
 }
