@@ -714,7 +714,7 @@ pub fn db_backup(paths: &TapectlPaths, dest: &str) -> Result<()> {
     let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
     backup
         .run_to_completion(100, std::time::Duration::from_millis(10), None)
-        .map_err(|e| TapectlError::Database(e))?;
+        .map_err(TapectlError::Database)?;
 
     // Also copy keys directory
     let keys_backup = Path::new(dest).with_extension("keys");

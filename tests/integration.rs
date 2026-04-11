@@ -1012,6 +1012,257 @@ fn test_import_volume() {
 
 // ── Config Parsing Test ──
 
+// ── Failure Mode Tests ──
+
+#[test]
+fn test_duplicate_volume_label_rejected() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
+         VALUES ('TAPE001', 'lto', 'lto6', 2500000000000)",
+        [],
+    )
+    .unwrap();
+
+    let result = conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
+         VALUES ('TAPE001', 'lto', 'lto6', 2500000000000)",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "duplicate volume label must be rejected by UNIQUE constraint"
+    );
+}
+
+#[test]
+fn test_duplicate_cartridge_barcode_rejected() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity)
+         VALUES ('BC0001', 'LTO-6', 2500000000000)",
+        [],
+    )
+    .unwrap();
+
+    let result = conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity)
+         VALUES ('BC0001', 'LTO-6', 2500000000000)",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "duplicate cartridge barcode must be rejected"
+    );
+}
+
+#[test]
+fn test_invalid_volume_status_rejected() {
+    let (_tmp, conn, _home) = setup();
+
+    let result = conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+         VALUES ('BAD1', 'lto', 'lto6', 2500000000000, 'bogus_status')",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "CHECK constraint must reject invalid volume status"
+    );
+}
+
+#[test]
+fn test_invalid_cartridge_status_rejected() {
+    let (_tmp, conn, _home) = setup();
+
+    let result = conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+         VALUES ('BC0002', 'LTO-6', 2500000000000, 'not_a_status')",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "CHECK constraint must reject invalid cartridge status"
+    );
+}
+
+#[test]
+fn test_stage_set_requires_existing_snapshot() {
+    let (_tmp, conn, _home) = setup();
+
+    // Reference a snapshot that doesn't exist
+    let result = conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status) VALUES (99999, 'staging')",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "foreign key to snapshots must reject missing snapshot_id"
+    );
+}
+
+#[test]
+fn test_fts5_path_tokenization() {
+    // Verifies the fix in catalog search: FTS5 default tokenizer splits paths
+    // on non-alphanumeric, so a query like `season* episode*` must match
+    // 'season1/episode01.mkv'. This exercises the tokenization path the CLI
+    // search now uses after the FTS5 phrase+prefix bug was fixed.
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'movies', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let snap_id = conn.last_insert_rowid();
+
+    for path in ["season1/episode01.mkv", "season1/episode02.mkv", "other.txt"] {
+        conn.execute(
+            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+             VALUES (?1, ?2, 1000, 0)",
+            rusqlite::params![snap_id, path],
+        )
+        .unwrap();
+    }
+
+    // Two-token prefix query: must match both episodes, not 'other.txt'
+    let mut stmt = conn
+        .prepare("SELECT path FROM files_fts WHERE files_fts MATCH ?1 ORDER BY rank")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map(["season* episode*"], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "expected 2 FTS5 matches, got {rows:?}");
+    assert!(rows.iter().all(|p| p.starts_with("season1/")));
+
+    // Single-token prefix on a path-embedded token
+    let rows2: Vec<String> = stmt
+        .query_map(["episode*"], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows2.len(), 2);
+
+    // Non-matching prefix returns nothing
+    let rows3: Vec<String> = stmt
+        .query_map(["zzzz*"], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(rows3.is_empty());
+}
+
+#[test]
+fn test_nonexistent_lookups_return_none() {
+    let (_tmp, conn, _home) = setup();
+
+    // None-returning SELECTs on missing rows must not panic or error —
+    // the code relies on .optional() / .ok() semantics throughout.
+    let tenant: Option<i64> = conn
+        .query_row("SELECT id FROM tenants WHERE name = ?1", ["ghost"], |r| {
+            r.get(0)
+        })
+        .ok();
+    assert!(tenant.is_none());
+
+    let unit: Option<i64> = conn
+        .query_row("SELECT id FROM units WHERE name = ?1", ["ghost"], |r| {
+            r.get(0)
+        })
+        .ok();
+    assert!(unit.is_none());
+
+    let volume: Option<i64> = conn
+        .query_row("SELECT id FROM volumes WHERE label = ?1", ["GHOST"], |r| {
+            r.get(0)
+        })
+        .ok();
+    assert!(volume.is_none());
+}
+
+#[test]
+fn test_write_requires_existing_volume_and_stage_set() {
+    let (_tmp, conn, _home) = setup();
+
+    // writes FK to volumes and stage_sets
+    let result = conn.execute(
+        "INSERT INTO writes (volume_id, stage_set_id, status) VALUES (99999, 99999, 'planned')",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "writes must not allow orphan volume_id/stage_set_id"
+    );
+}
+
+#[test]
+fn test_duplicate_slice_number_within_stage_set_rejected() {
+    let (_tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'u', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let sid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [sid],
+    )
+    .unwrap();
+    let ss_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+         VALUES (?1, 0, 100, 100, 'a', 'b')",
+        [ss_id],
+    )
+    .unwrap();
+
+    // Second slice with the same slice_number must fail — UNIQUE(stage_set_id, slice_number)
+    let result = conn.execute(
+        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+         VALUES (?1, 0, 100, 100, 'c', 'd')",
+        [ss_id],
+    );
+    assert!(
+        result.is_err(),
+        "duplicate (stage_set_id, slice_number) must be rejected"
+    );
+}
+
 #[test]
 fn test_config_default_values() {
     let (_tmp, _conn, home) = setup();

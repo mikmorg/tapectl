@@ -73,7 +73,7 @@ pub fn run(
                         "in {location_count} locations, needs {needed} ({:?})",
                         resolved.required_locations
                     ),
-                    action: format!("tapectl volume write <LABEL> (at missing location)",),
+                    action: "tapectl volume write <LABEL> (at missing location)".to_string(),
                 });
             }
         }
@@ -97,7 +97,7 @@ pub fn run(
             let overdue = if let Some(ref last) = last_verify {
                 if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
                     let age = chrono::Utc::now().naive_utc() - dt;
-                    age.num_days() > verify_days as i64
+                    age.num_days() > verify_days
                 } else {
                     true
                 }
@@ -113,7 +113,7 @@ pub fn run(
                         "not verified within {verify_days} days (last: {})",
                         last_verify.as_deref().unwrap_or("never")
                     ),
-                    action: format!("tapectl volume verify <LABEL>"),
+                    action: "tapectl volume verify <LABEL>".to_string(),
                 });
             }
         }
