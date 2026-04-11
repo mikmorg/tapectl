@@ -9,6 +9,7 @@ use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::staging;
+use crate::tape::health;
 use crate::tape::ioctl::TapeDevice;
 
 use super::layout;
@@ -371,12 +372,32 @@ pub fn volume_write(
         "volume write complete"
     );
 
+    // Best-effort sg_logs health collection. Never abort the write.
+    // Resolve sg device from the configured LTO backend matching this tape device.
+    let sg_device = config
+        .backends
+        .lto
+        .iter()
+        .find(|b| b.device_tape == device)
+        .map(|b| b.device_sg.clone());
+    if let Some(sg) = sg_device {
+        match health::collect(&sg) {
+            Ok((counters, raw)) => {
+                if let Err(e) = health::record(conn, volume_id, "write", &counters, &raw) {
+                    warn!(err = %e, "health_logs insert failed");
+                }
+            }
+            Err(e) => warn!(sg_device = sg, err = %e, "sg_logs collection failed"),
+        }
+    }
+
     Ok(())
 }
 
 /// Verify a volume by reading slices and checking checksums.
 pub fn volume_verify(
     conn: &Connection,
+    config: &Config,
     label: &str,
     device: &str,
     block_size: usize,
@@ -451,6 +472,21 @@ pub fn volume_verify(
                 actual = &actual[..16],
                 "FAIL — checksum mismatch"
             );
+        }
+    }
+
+    // Best-effort sg_logs collection after verify. Advisory only.
+    let sg_device = config
+        .backends
+        .lto
+        .iter()
+        .find(|b| b.device_tape == device)
+        .map(|b| b.device_sg.clone());
+    if let Some(sg) = sg_device {
+        if let Ok((counters, raw)) = health::collect(&sg) {
+            if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
+                warn!(err = %e, "health_logs insert failed");
+            }
         }
     }
 

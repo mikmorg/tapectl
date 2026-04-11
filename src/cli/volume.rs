@@ -149,7 +149,7 @@ pub fn run(
         }
 
         VolumeCommands::Verify { label, device } => {
-            let report = write::volume_verify(conn, label, device, DEFAULT_BLOCK_SIZE)?;
+            let report = write::volume_verify(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
             if json_output {
                 println!(
                     "{}",
