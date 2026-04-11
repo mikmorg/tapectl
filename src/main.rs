@@ -1,23 +1,4 @@
-mod cli;
-mod config;
-mod crypto;
-mod db;
-mod error;
-mod signal;
-mod tenant;
-mod unit;
-
-mod dar;
-mod staging;
-mod tape;
-mod volume;
-
-mod policy;
-
-// Stub modules for future milestones
-mod backend {
-    pub mod _stub {}
-}
+use tapectl::{cli, config, db, error, signal, staging, tenant, unit, volume};
 
 use anyhow::{bail, Context};
 use clap::Parser;
