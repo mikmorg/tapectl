@@ -272,16 +272,18 @@ pub fn run(
                         total_bytes / (1024 * 1024),
                         total_bytes * copies / (1024 * 1024),
                     );
-                    // Estimate tapes needed
-                    let tape_cap = config
-                        .backends
-                        .lto
-                        .first()
-                        .map(|b| crate::staging::parse_size_to_bytes(&b.nominal_capacity))
-                        .unwrap_or(2_500_000_000_000);
-                    let usable = (tape_cap as f64 * 0.92) as i64;
+                    // Estimate tapes needed from configured LTO backend
+                    let backend = config.backends.lto.first().ok_or_else(|| {
+                        crate::error::TapectlError::Config("no LTO backend configured".into())
+                    })?;
+                    let tape_cap = crate::staging::parse_size_to_bytes(&backend.nominal_capacity);
+                    let factor = backend.usable_capacity_factor;
+                    let usable = (tape_cap as f64 * factor) as i64;
                     let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
-                    println!("estimated tapes: {tapes_needed} (at 92% usable capacity)");
+                    println!(
+                        "estimated tapes: {tapes_needed} (at {}% usable capacity)",
+                        (factor * 100.0).round() as i64
+                    );
                 }
             }
         }

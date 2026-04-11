@@ -124,52 +124,33 @@ pub fn run(conn: &Connection, command: &CatalogCommands, json_output: bool) -> R
         }
 
         CatalogCommands::Search { pattern, limit } => {
-            // Try FTS5 first, fall back to LIKE
-            let has_fts: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files_fts'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
+            // Build an FTS5 MATCH expression: split on non-alphanumeric, prefix-match each
+            // token with AND. FTS5 default tokenizer already splits paths this way, so a
+            // pattern like "foo/bar" becomes `foo* bar*` which matches 'foo/bar.txt'.
+            let tokens: Vec<String> = pattern
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .map(|t| format!("{}*", t.to_lowercase()))
+                .collect();
 
-            let (sql, search_param) = if has_fts {
-                // FTS5: tokenize the pattern for prefix matching
-                let fts_query = format!("\"{}\"*", pattern.replace('"', "\"\""));
-                (
-                    "SELECT f.path, f.size_bytes, u.name, s.version
-                     FROM files_fts fts
-                     JOIN files f ON f.rowid = fts.rowid
-                     JOIN snapshots s ON s.id = f.snapshot_id
-                     JOIN units u ON u.id = s.unit_id
-                     WHERE files_fts MATCH ?1 AND f.is_directory = 0
-                     ORDER BY rank
-                     LIMIT ?2"
-                        .to_string(),
-                    fts_query,
-                )
+            let mut stmt = conn.prepare(
+                "SELECT f.path, f.size_bytes, u.name, s.version
+                 FROM files_fts fts
+                 JOIN files f ON f.rowid = fts.rowid
+                 JOIN snapshots s ON s.id = f.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE files_fts MATCH ?1 AND f.is_directory = 0
+                 ORDER BY rank
+                 LIMIT ?2",
+            )?;
+            let rows: Vec<(String, i64, String, i64)> = if tokens.is_empty() {
+                Vec::new()
             } else {
-                let like = format!("%{pattern}%");
-                (
-                    "SELECT f.path, f.size_bytes, u.name, s.version
-                     FROM files f
-                     JOIN snapshots s ON s.id = f.snapshot_id
-                     JOIN units u ON u.id = s.unit_id
-                     WHERE f.path LIKE ?1 AND f.is_directory = 0
-                     ORDER BY u.name, f.path
-                     LIMIT ?2"
-                        .to_string(),
-                    like,
-                )
-            };
-
-            let mut stmt = conn.prepare(&sql)?;
-            let rows: Vec<(String, i64, String, i64)> = stmt
-                .query_map(params![search_param, limit], |row| {
+                stmt.query_map(params![tokens.join(" "), limit], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            };
 
             if json_output {
                 let json: Vec<serde_json::Value> = rows

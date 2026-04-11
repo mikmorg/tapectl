@@ -129,10 +129,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref notes,
         } => {
             let cap_bytes = crate::staging::parse_size_to_bytes(capacity);
+            // Resolve backend_name from configured backend of this type, else fall back
+            // to the type string so the row remains self-consistent.
+            let backend_name = match backend.as_str() {
+                "lto" => cfg
+                    .backends
+                    .lto
+                    .first()
+                    .map(|b| b.name.clone())
+                    .unwrap_or_else(|| backend.clone()),
+                _ => backend.clone(),
+            };
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
-                 VALUES (?1, ?2, ?2, ?3, ?4, 'active', ?5)",
-                rusqlite::params![label, backend, media_type, cap_bytes, notes],
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+                rusqlite::params![label, backend, backend_name, media_type, cap_bytes, notes],
             )?;
             let vol_id = conn.last_insert_rowid();
             crate::db::events::log_created(&conn, "volume", vol_id, label, None)?;

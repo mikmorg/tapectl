@@ -39,8 +39,6 @@ pub fn restore_unit(
         )));
     }
 
-    let _stage_set_id = positions[0].stage_set_id;
-
     if dry_run {
         return Ok(RestoreReport {
             unit_name: unit_name.to_string(),
@@ -232,7 +230,6 @@ pub struct RestoreReport {
 }
 
 struct WritePositionInfo {
-    stage_set_id: i64,
     slice_number: i64,
     position: String,
     sha256_plain: String,
@@ -246,7 +243,7 @@ fn get_write_positions(
     volume_label: &str,
 ) -> Result<Vec<WritePositionInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT ss.id, sl.slice_number, wp.position, sl.sha256_plain, sl.sha256_encrypted, sl.encrypted_bytes
+        "SELECT sl.slice_number, wp.position, sl.sha256_plain, sl.sha256_encrypted, sl.encrypted_bytes
          FROM write_positions wp
          JOIN writes w ON w.id = wp.write_id
          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
@@ -260,12 +257,11 @@ fn get_write_positions(
     let rows = stmt
         .query_map(params![unit_id, volume_label], |row| {
             Ok(WritePositionInfo {
-                stage_set_id: row.get(0)?,
-                slice_number: row.get(1)?,
-                position: row.get(2)?,
-                sha256_plain: row.get(3)?,
-                sha256_encrypted: row.get(4)?,
-                encrypted_bytes: row.get(5)?,
+                slice_number: row.get(0)?,
+                position: row.get(1)?,
+                sha256_plain: row.get(2)?,
+                sha256_encrypted: row.get(3)?,
+                encrypted_bytes: row.get(4)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
