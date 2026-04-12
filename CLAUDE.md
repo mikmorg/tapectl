@@ -28,7 +28,9 @@ Milestones 0 through 5 are complete.
 
 **Post-M6 completions:** All unassigned CLI commands from design doc implemented: `key rotate`, `tenant reassign`, `snapshot purge`, `unit check-integrity`, `quick-archive`, `db export/import/stats`, `config show/check`. Zero compiler warnings, 17 tests (5 unit + 12 integration), zero clippy errors. No StubCommands remain.
 
-**Next:** Milestone 7 — real LTO-6 hardware validation, end-to-end multi-tenant tests, failure mode tests, performance tests, documentation.
+**Milestone 7 in progress:** Phases 1–7 landed. Lib target (Phase 1), module unit tests (Phase 2), sg_logs health collection (Phase 3), full audit trail wiring (Phase 4), mhvtl-gated E2E round-trip (Phase 5), library failure-mode tests (Phase 6), multi-tenant isolation tests (Phase 7 — crypto cross-decrypt rejection, plaintext-leak scan on raw tape bytes, both-tenants self-restore, tape-device lock for parallel mhvtl tests).
+
+**Next:** M7 Phase 8 — performance test harness (gated on `TAPECTL_PERF_TESTS=1`). Then Phase 9 — README expansion, clap_mangen man pages, LTO-6 validation checklist. Real LTO-6 hardware validation remains user-gated.
 
 ## Build Commands
 
