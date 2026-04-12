@@ -384,11 +384,7 @@ mod tests {
 
     #[test]
     fn mini_index_parses_as_toml_body() {
-        let files = vec![
-            (4, "slice", 1024),
-            (5, "slice", 2048),
-            (6, "envelope", 512),
-        ];
+        let files = vec![(4, "slice", 1024), (5, "slice", 2048), (6, "envelope", 512)];
         let s = generate_mini_index("TEST01", &files);
         let body_start = s.find("[index]").expect("has [index] section");
         let body = &s[body_start..];
@@ -463,10 +459,7 @@ mod tests {
         let slice = &u.get("slices").unwrap().as_array().unwrap()[0];
         assert_eq!(slice.get("number").unwrap().as_integer(), Some(1));
         assert_eq!(slice.get("tape_position").unwrap().as_integer(), Some(4));
-        assert_eq!(
-            slice.get("sha256_plain").unwrap().as_str(),
-            Some("abc")
-        );
+        assert_eq!(slice.get("sha256_plain").unwrap().as_str(), Some("abc"));
     }
 
     #[test]

@@ -542,8 +542,16 @@ mod tests {
     fn update_unit_name_and_path_and_history() {
         let conn = fresh_conn();
         let tid = insert_tenant(&conn, "op", None, true).unwrap();
-        let uid =
-            insert_unit(&conn, "u-uuid", "origname", tid, "/old/path", "mtime_size", true).unwrap();
+        let uid = insert_unit(
+            &conn,
+            "u-uuid",
+            "origname",
+            tid,
+            "/old/path",
+            "mtime_size",
+            true,
+        )
+        .unwrap();
 
         update_unit_name(&conn, uid, "newname").unwrap();
         let u = get_unit_by_name(&conn, "newname").unwrap().unwrap();
@@ -598,11 +606,8 @@ mod tests {
         insert_unit(&conn, "u1", "u1", tid, "/a", "mtime_size", true).unwrap();
         insert_unit(&conn, "u2", "u2", tid, "/b", "mtime_size", true).unwrap();
         // Mark one retired
-        conn.execute(
-            "UPDATE units SET status='retired' WHERE name='u2'",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE units SET status='retired' WHERE name='u2'", [])
+            .unwrap();
         assert_eq!(count_active_units_for_tenant(&conn, tid).unwrap(), 1);
     }
 

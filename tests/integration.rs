@@ -1132,7 +1132,11 @@ fn test_fts5_path_tokenization() {
     .unwrap();
     let snap_id = conn.last_insert_rowid();
 
-    for path in ["season1/episode01.mkv", "season1/episode02.mkv", "other.txt"] {
+    for path in [
+        "season1/episode01.mkv",
+        "season1/episode02.mkv",
+        "other.txt",
+    ] {
         conn.execute(
             "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
              VALUES (?1, ?2, 1000, 0)",

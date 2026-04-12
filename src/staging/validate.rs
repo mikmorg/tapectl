@@ -120,8 +120,7 @@ mod tests {
         std::fs::write(tmp.path().join("b.bin"), b"world!!").unwrap();
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5), ("b.bin", 7)]);
-        let result =
-            validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(result.len(), 2);
         // Sha256 of "hello" is 2cf24d...
         let hello = result
@@ -139,8 +138,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("present.txt"), b"ok").unwrap();
 
-        let (conn, sid) =
-            setup_conn_with_snapshot(&[("present.txt", 2), ("missing.txt", 10)]);
+        let (conn, sid) = setup_conn_with_snapshot(&[("present.txt", 2), ("missing.txt", 10)]);
         let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
             .err()
             .unwrap();
@@ -209,8 +207,7 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "subdir/f.txt");
     }
