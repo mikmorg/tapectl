@@ -158,6 +158,44 @@ src/
   signal.rs     SIGINT handling
 ```
 
+## Testing
+
+Default `cargo test` runs unit tests, integration tests, the tenant-
+isolation crypto tests, and library-level failure-mode tests — none
+require tape hardware or mhvtl:
+
+```bash
+cargo test
+```
+
+Two gated test suites exist for heavier validation:
+
+```bash
+# mhvtl end-to-end round-trip, tenant isolation on real tape layout,
+# health log collection. Requires /dev/nst0 backed by mhvtl.
+TAPECTL_MHVTL=1 cargo test --test mhvtl_e2e -- --ignored --nocapture
+
+# Performance scenarios (many files, many units, large file).
+# Gated because a full run takes ~2 minutes.
+TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
+    --nocapture --test-threads=1
+```
+
+## Documentation
+
+- `docs/operator-guide.md` — day-to-day operations, worked examples
+- `docs/perf-baselines.md` — performance regression baselines
+- `docs/lto6-validation-checklist.md` — real-hardware validation steps
+- `docs/man/` — generated man pages (`man -l docs/man/tapectl.1`)
+- `tapectl-design-v4_0.md` — full design document and implementation
+  reference
+
+Regenerate man pages after any CLI change:
+
+```bash
+cargo run --example gen_man
+```
+
 ## License
 
 See LICENSE file.

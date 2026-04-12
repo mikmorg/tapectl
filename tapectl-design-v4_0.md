@@ -2008,19 +2008,22 @@ tapectl report compaction-candidates
 **Goal:** Production readiness. Real LTO-6 validation.
 
 Tasks:
-- [ ] Full audit trail (every field change with old/new values)
-- [ ] Health trending from sg_logs data
-- [ ] FTS5 search index for catalog
-- [ ] `tapectl import` (pre-existing volumes)
-- [ ] Comprehensive unit tests for every module
-- [ ] Integration tests against mhvtl (automated test suite)
-- [ ] End-to-end tests: init → multi-tenant write → multi-tape restore
-- [ ] Failure mode tests: interrupted writes, corrupted staging, missing keys,
+- [x] Full audit trail (every field change with old/new values)
+- [x] Health trending from sg_logs data
+- [x] FTS5 search index for catalog
+- [x] `tapectl import` (pre-existing volumes)
+- [x] Comprehensive unit tests for every module
+- [x] Integration tests against mhvtl (automated test suite)
+- [x] End-to-end tests: init → multi-tenant write → multi-tape restore
+- [x] Failure mode tests: interrupted writes, corrupted staging, missing keys,
   crashed DB recovery, raw-volume restore, ENOSPC recovery
-- [ ] Performance tests: large units (2+ TB), many units (500+), many files (100K+)
+- [x] Performance tests: large units, many units (500+), many files (5K+) — dev-VM
+  scale; production 2+ TB / 100K+ targets gated on real hardware (see
+  `docs/perf-baselines.md`)
 - [ ] **Real LTO-6 hardware validation** — full write + verify + restore cycle
-- [ ] Multi-tenant isolation validation (tenant A cannot see tenant B's data)
-- [ ] Documentation: README, operator guide, man pages
+  (procedure in `docs/lto6-validation-checklist.md`; user-gated on hardware)
+- [x] Multi-tenant isolation validation (tenant A cannot see tenant B's data)
+- [x] Documentation: README, operator guide, man pages
 
 **Validation:** All automated tests pass. Full round-trip on real LTO-6 tape
 with multi-tenant data. Manual RESTORE.sh recovery works on real hardware.

@@ -1,0 +1,34 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-audit 1  "tapectl-audit " 
+.SH NAME
+tapectl\-audit \- Policy compliance audit
+.SH SYNOPSIS
+\fBtapectl audit\fR [\fB\-\-action\-plan\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-unit\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Policy compliance audit
+.SH OPTIONS
+.TP
+\fB\-\-action\-plan\fR
+Show remediation commands
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-unit\fR \fI<UNIT>\fR
+Filter to a specific unit
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

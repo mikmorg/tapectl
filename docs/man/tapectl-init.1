@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-init 1  "tapectl-init " 
+.SH NAME
+tapectl\-init \- Initialize tapectl (DB, config, operator tenant, keys)
+.SH SYNOPSIS
+\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Initialize tapectl (DB, config, operator tenant, keys)
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-operator\fR \fI<OPERATOR>\fR
+Operator name (defaults to system username)
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

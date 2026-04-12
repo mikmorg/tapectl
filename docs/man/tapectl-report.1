@@ -1,0 +1,68 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-report 1  "tapectl-report " 
+.SH NAME
+tapectl\-report \- Generate reports
+.SH SYNOPSIS
+\fBtapectl report\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Generate reports
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+tapectl\-report\-summary(1)
+Overview: units, tapes, tenants, capacity
+.TP
+tapectl\-report\-fire\-risk(1)
+Units at risk: below min copies/locations
+.TP
+tapectl\-report\-copies(1)
+Copy count distribution per unit
+.TP
+tapectl\-report\-tape\-only(1)
+Tape\-only unit status
+.TP
+tapectl\-report\-dirty(1)
+Units with changes since last snapshot
+.TP
+tapectl\-report\-pending(1)
+Staged data pending write
+.TP
+tapectl\-report\-verify\-status(1)
+Verification recency
+.TP
+tapectl\-report\-health(1)
+Drive error trends
+.TP
+tapectl\-report\-capacity(1)
+Volume capacity utilization
+.TP
+tapectl\-report\-age(1)
+Snapshot age distribution
+.TP
+tapectl\-report\-events(1)
+Audit trail browsing
+.TP
+tapectl\-report\-compaction\-candidates(1)
+Volumes flagged for compaction
+.TP
+tapectl\-report\-help(1)
+Print this message or the help of the given subcommand(s)

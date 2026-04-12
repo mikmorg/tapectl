@@ -1,0 +1,38 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-restore 1  "tapectl-restore " 
+.SH NAME
+tapectl\-restore \- Restore data from volumes
+.SH SYNOPSIS
+\fBtapectl restore\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Restore data from volumes
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+tapectl\-restore\-unit(1)
+Restore a unit from a volume
+.TP
+tapectl\-restore\-file(1)
+Restore a single file from a unit
+.TP
+tapectl\-restore\-help(1)
+Print this message or the help of the given subcommand(s)

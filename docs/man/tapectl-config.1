@@ -1,0 +1,38 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-config 1  "tapectl-config " 
+.SH NAME
+tapectl\-config \- Configuration management
+.SH SYNOPSIS
+\fBtapectl config\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Configuration management
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+tapectl\-config\-show(1)
+Show current configuration
+.TP
+tapectl\-config\-check(1)
+Check configuration validity
+.TP
+tapectl\-config\-help(1)
+Print this message or the help of the given subcommand(s)

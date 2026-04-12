@@ -1,0 +1,50 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-snapshot 1  "tapectl-snapshot " 
+.SH NAME
+tapectl\-snapshot \- Manage snapshots
+.SH SYNOPSIS
+\fBtapectl snapshot\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Manage snapshots
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+tapectl\-snapshot\-create(1)
+Create a snapshot (fast directory walk + manifest)
+.TP
+tapectl\-snapshot\-list(1)
+List snapshots
+.TP
+tapectl\-snapshot\-diff(1)
+Compare two snapshot versions of a unit
+.TP
+tapectl\-snapshot\-delete(1)
+Delete an unwritten snapshot
+.TP
+tapectl\-snapshot\-purge(1)
+Purge a reclaimable snapshot (remove DB records)
+.TP
+tapectl\-snapshot\-mark\-reclaimable(1)
+Mark a snapshot as reclaimable (with enforced preconditions)
+.TP
+tapectl\-snapshot\-help(1)
+Print this message or the help of the given subcommand(s)

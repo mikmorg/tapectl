@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-import 1  "tapectl-import " 
+.SH NAME
+tapectl\-import \- Import a pre\-existing volume into the database
+.SH SYNOPSIS
+\fBtapectl import\fR [\fB\-\-json\fR] <\fB\-\-label\fR> [\fB\-\-backend\fR] [\fB\-\-dry\-run\fR] [\fB\-\-media\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-capacity\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-notes\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Import a pre\-existing volume into the database
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-label\fR \fI<LABEL>\fR
+Volume label
+.TP
+\fB\-\-backend\fR \fI<BACKEND>\fR [default: lto]
+Backend type
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-media\-type\fR \fI<MEDIA_TYPE>\fR [default: LTO\-6]
+Media type
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-capacity\fR \fI<CAPACITY>\fR [default: 2500G]
+Capacity (e.g., "2500G")
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-\-notes\fR \fI<NOTES>\fR
+Notes
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

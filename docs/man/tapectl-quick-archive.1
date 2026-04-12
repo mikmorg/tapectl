@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-quick-archive 1  "tapectl-quick-archive " 
+.SH NAME
+tapectl\-quick\-archive \- Quick archive: create + stage + write in one flow
+.SH SYNOPSIS
+\fBtapectl quick\-archive\fR [\fB\-\-json\fR] <\fB\-\-tenant\fR> [\fB\-\-dry\-run\fR] <\fB\-\-volume\fR> [\fB\-t\fR|\fB\-\-tag\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
+.SH DESCRIPTION
+Quick archive: create + stage + write in one flow
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-tenant\fR \fI<TENANT>\fR
+Tenant name
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-volume\fR \fI<VOLUME>\fR
+Volume label
+.TP
+\fB\-t\fR, \fB\-\-tag\fR \fI<TAG>\fR
+Tags
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
+Tape device path
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPATH\fR>
+Path to directory

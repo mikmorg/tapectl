@@ -1,0 +1,68 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume 1  "tapectl-volume " 
+.SH NAME
+tapectl\-volume \- Manage volumes and tape operations
+.SH SYNOPSIS
+\fBtapectl volume\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Manage volumes and tape operations
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+tapectl\-volume\-init(1)
+Initialize a new volume (write ID thunk to tape)
+.TP
+tapectl\-volume\-write(1)
+Write staged data to volume
+.TP
+tapectl\-volume\-verify(1)
+Verify volume contents against checksums
+.TP
+tapectl\-volume\-identify(1)
+Identify a tape (read ID thunk)
+.TP
+tapectl\-volume\-move(1)
+Move a volume to a location
+.TP
+tapectl\-volume\-retire(1)
+Retire a volume (with impact analysis)
+.TP
+tapectl\-volume\-clone\-slices(1)
+Clone encrypted slices from one volume to another (no decryption)
+.TP
+tapectl\-volume\-compact\-read(1)
+Read live encrypted slices from a volume to staging (compaction step 1)
+.TP
+tapectl\-volume\-compact\-write(1)
+Write compaction slices from staging to destination (compaction step 2)
+.TP
+tapectl\-volume\-plan(1)
+Show bin\-packing plan for pending staged data
+.TP
+tapectl\-volume\-compact\-finish(1)
+Retire source volume after compaction (compaction step 3)
+.TP
+tapectl\-volume\-compact(1)
+Interactive compaction: read + write + finish in one flow
+.TP
+tapectl\-volume\-help(1)
+Print this message or the help of the given subcommand(s)
