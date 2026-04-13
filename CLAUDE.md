@@ -22,7 +22,7 @@ Milestones 0 through 5 are complete.
 
 **Milestone 4:** Working commands: `restore unit/file` (read from tape → decrypt → dar extract), `catalog ls/search/locate/stats`. Full round-trip verified: write → restore → diff -r identical.
 
-**Milestone 5:** Working commands: `location add/list/info/rename`, `volume move/retire/clone-slices`, `cartridge register/list/info/mark-erased`, `unit mark-tape-only`, `snapshot diff/delete`, `stage list/info`, `export`, `db backup/fsck`. Volume retire shows impact analysis. mark-tape-only enforces min_copies/min_locations. clone-slices copies encrypted data between volumes without decryption.
+**Milestone 5:** Working commands: `location add/list/info/rename`, `volume move/retire/read-slices`, `cartridge register/list/info/mark-erased`, `unit mark-tape-only`, `snapshot diff/delete`, `stage list/info`, `export`, `db backup/fsck`. Volume retire shows impact analysis. mark-tape-only enforces min_copies/min_locations. read-slices reads encrypted slices from a volume into staging for writing to another tape via `volume write`.
 
 **Milestone 6:** Working commands: `archive-set create/edit/list/info/sync`, `audit` (compliance check with exit codes 0/1/2, --action-plan, --json), `snapshot mark-reclaimable` (enforced preconditions, tape-only 2x multiplier), `volume compact-read/compact-write/compact-finish/compact`, `report summary/fire-risk/copies/tape-only/dirty/pending/verify-status/health/capacity/age/events/compaction-candidates`. Policy resolver: dotfile > archive_set > defaults.
 
@@ -51,7 +51,7 @@ cargo fmt --check
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
 - **dar integration** (`src/dar/`): subprocess wrapper; minimum dar 2.6.x; XML catalog parsing via quick-xml
 - **Staging** (`src/staging/`): sha256 validation before archiving, age multi-recipient encryption, ephemeral slices
-- **Volume management** (`src/volume/`): 10-file self-describing layout, write pipeline, verify, clone-slices
+- **Volume management** (`src/volume/`): 10-file self-describing layout, write pipeline, verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit

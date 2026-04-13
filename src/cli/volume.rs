@@ -58,15 +58,12 @@ pub enum VolumeCommands {
         label: String,
     },
 
-    /// Clone encrypted slices from one volume to another (no decryption)
-    CloneSlices {
+    /// Read encrypted slices from a volume into staging (then use `volume write` to write them)
+    ReadSlices {
         /// Source volume label
         #[arg(long)]
         from: String,
-        /// Destination volume label
-        #[arg(long)]
-        to: String,
-        /// Unit name to clone
+        /// Unit name to read
         #[arg(long)]
         unit: String,
         /// Tape device path
@@ -186,38 +183,27 @@ pub fn run(
             crate::cli::operations::volume_retire(conn, label, json_output)?;
         }
 
-        VolumeCommands::CloneSlices {
-            from,
-            to,
-            unit,
-            device,
-        } => {
-            let report = write::clone_slices(
-                conn,
-                paths,
-                config,
-                from,
-                to,
-                unit,
-                device,
-                DEFAULT_BLOCK_SIZE,
-            )?;
+        VolumeCommands::ReadSlices { from, unit, device } => {
+            let report = write::read_slices(conn, config, from, unit, device, DEFAULT_BLOCK_SIZE)?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "from": from, "to": to, "unit": unit,
-                        "slices_cloned": report.slices_cloned,
-                        "bytes_cloned": report.bytes_cloned,
+                        "from": from, "unit": unit,
+                        "slices_read": report.slices_read,
+                        "bytes_read": report.bytes_read,
                     })
                 );
             } else {
                 println!(
-                    "cloned {} slices ({} MB) from \"{}\" to \"{}\"",
-                    report.slices_cloned,
-                    report.bytes_cloned / (1024 * 1024),
+                    "read {} slices ({} MB) from \"{}\" into staging",
+                    report.slices_read,
+                    report.bytes_read / (1024 * 1024),
                     from,
-                    to,
+                );
+                println!(
+                    "run `tapectl volume write DEST --device {}` to write to tape",
+                    device
                 );
             }
         }

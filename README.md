@@ -80,7 +80,7 @@ tapectl snapshot                create, list, diff, delete, mark-reclaimable, pu
 tapectl stage                   create, list, info
 tapectl staging                 status, clean
 tapectl volume                  init, write, verify, identify, move, retire,
-                                clone-slices, plan,
+                                read-slices, plan,
                                 compact-read, compact-write, compact-finish, compact
 tapectl cartridge               register, list, info, mark-erased
 tapectl archive-set             create, edit, list, info, sync

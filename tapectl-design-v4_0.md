@@ -415,10 +415,11 @@ tapectl volume compact-finish L6-0012
 **Orchestration wrapper:** `tapectl volume compact L6-0012` walks through all
 three steps interactively, prompting for tape swaps.
 
-**Compaction mechanics:** Compaction reuses clone-slices under the hood — it
-reads encrypted slices without decryption and writes them to the destination.
-The original stage_set is reused, so verification checksums remain valid. Bin
-packing treats compaction slices the same as any other pending staged data.
+**Compaction mechanics:** Compaction reads encrypted slices without decryption
+and re-stages them. The normal `volume write` pipeline then writes them to the
+destination with a full self-describing layout. The original stage_set is
+reused, so verification checksums remain valid. Bin packing treats compaction
+slices the same as any other pending staged data.
 
 **Compaction report:** `tapectl report compaction-candidates` shows per-volume
 utilization breakdown including live data ratio, reclaimable bytes, and
@@ -516,21 +517,27 @@ Checks: copy count, location presence, verification age, encryption compliance,
 dirty status, **compaction candidates**. `--action-plan` shows exact commands.
 `--format json` for scripting. Exit codes: 0=clean, 1=warnings, 2=violations.
 
-### 2.21 Volume Clone (tape-to-tape copy)
+### 2.21 Volume Read-Slices (tape-to-staging for copy)
 
 ```bash
-tapectl volume clone-slices --from L6-0012 --to L6-0025 --unit "tv/bb/s01"
+tapectl volume read-slices --from L6-0012 --unit "tv/bb/s01"
+# swap tape
+tapectl volume write L6-0025
 ```
 
-Reads encrypted slices from source, writes to destination. No decryption.
+Reads encrypted slices from source volume into staging. No decryption. The
+normal `volume write` pipeline then writes them to the destination tape with
+the full self-describing 10-file layout (ID thunk, guide, envelopes, etc.).
 Creates new write record referencing the SAME stage_set. Checksums identical.
 
-**Single-drive workflow:** Read slices to staging → eject → mount dest → write.
+**Two-step workflow:** `read-slices` stages data → swap tape → `volume write`
+writes with full metadata. This ensures the destination tape is always
+self-describing and recoverable without the database.
 
 **Design rationale:** When data is tape-only and a tape approaches end of life,
-you can't re-run dar because the source is gone. Clone copies encrypted bytes
-directly, creating a new write referencing the same stage_set. Checksums remain
-identical and verification still works.
+you can't re-run dar because the source is gone. Read-slices copies encrypted
+bytes directly into staging, and volume write creates a new write referencing
+the same stage_set. Checksums remain identical and verification still works.
 
 ### 2.22 Mark-Tape-Only Enforcement
 
@@ -1204,7 +1211,7 @@ snapshot          Manage snapshots (create, list, diff, delete, mark-reclaimable
 stage             Stage snapshots (create, list, info)
 staging           Manage staging area (status, clean)
 volume            Manage volumes (init, identify, plan, write, append, verify,
-                  move, retire, clone-slices, calibrate,
+                  move, retire, read-slices, calibrate,
                   compact-read, compact-write, compact-finish, compact)
 cartridge         Manage cartridges (register, list, info, mark-erased)
 archive-set       Manage archive set policies (create, edit, list, info, sync)
@@ -1953,7 +1960,7 @@ Tasks:
 - [ ] `tapectl volume move LABEL --to LOCATION`
 - [ ] `tapectl volume retire LABEL` + impact analysis
 - [ ] `tapectl unit mark-tape-only` with min_copies/min_locations enforcement
-- [ ] `tapectl volume clone-slices` (with staging for single drive)
+- [ ] `tapectl volume read-slices` (staging-only, then `volume write` for dest)
 - [ ] `tapectl cartridge register/list/info/mark-erased`
 - [ ] Cartridge ↔ volume relationship tracking
 - [ ] `tapectl db backup` (passphrase + keys + catalogs)
@@ -2135,7 +2142,7 @@ make consistent future decisions.
 | Ctrl+C safe (SIGINT atomic flag) | Write positions only created after confirmed written. DB always consistent. |
 | Policy audit is advisory, never blocking | Exit codes enable scripting without blocking human judgment. |
 | Locations are informational, not enforced | Audit reports compliance gaps; doesn't prevent writes. |
-| Volume clone-slices for tape-only recovery | Encrypted byte-copy without decryption. Same stage_set, same checksums. |
+| Volume read-slices for tape-only recovery | Staging-only read of encrypted bytes; `volume write` handles dest tape with full layout. Same stage_set, same checksums. |
 | Cartridge/volume separation | Enables physical cartridge reuse across volume lifetimes. |
 | Explicit compaction steps (not automatic) | Consistent with three-phase philosophy: explicit steps for control, wrapper for convenience. |
 | Reclaimable gating with preconditions | Never lose data silently. Superseding snapshot must meet policy before old one is reclaimable. |

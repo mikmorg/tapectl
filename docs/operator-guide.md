@@ -139,8 +139,10 @@ tapectl volume move L6-0001 --to parents-house
 tapectl report copies
 tapectl report fire-risk
 
-# Clone data to a second tape (no decryption needed)
-tapectl volume clone-slices --from L6-0001 --to L6-0002 --unit tv/breaking-bad/s01
+# Read slices from tape into staging, then write to a second tape
+tapectl volume read-slices --from L6-0001 --unit tv/breaking-bad/s01
+# Swap tape, then write with full self-describing layout
+tapectl volume write L6-0002
 ```
 
 ### Mark Tape-Only
