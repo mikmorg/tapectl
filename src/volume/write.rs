@@ -329,41 +329,45 @@ pub fn volume_write(
     file_index.push((op_backup_pos, "operator_envelope", op_env_encrypted.len()));
     info!("wrote operator envelope backup");
 
-    // Update DB
-    for (write_id, snapshot_id) in &write_ids {
-        conn.execute(
-            "UPDATE writes SET status = 'completed', completed_at = datetime('now')
-             WHERE id = ?1",
-            params![write_id],
+    // Update DB atomically — all status changes commit together
+    {
+        let tx = conn.unchecked_transaction()?;
+        for (write_id, snapshot_id) in &write_ids {
+            tx.execute(
+                "UPDATE writes SET status = 'completed', completed_at = datetime('now')
+                 WHERE id = ?1",
+                params![write_id],
+            )?;
+            tx.execute(
+                "UPDATE snapshots SET status = 'current'
+                 WHERE id = ?1 AND status IN ('created', 'staged')",
+                params![snapshot_id],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE volumes SET status = 'active', bytes_written = ?1,
+             num_data_files = ?2, has_manifest = 1,
+             first_write = COALESCE(first_write, datetime('now')),
+             last_write = datetime('now')
+             WHERE id = ?3",
+            params![bytes_written, total_slices as i64, volume_id],
         )?;
-        conn.execute(
-            "UPDATE snapshots SET status = 'current'
-             WHERE id = ?1 AND status IN ('created', 'staged')",
-            params![snapshot_id],
+
+        events::log_event(
+            &tx,
+            "volume",
+            volume_id,
+            Some(label),
+            "write_completed",
+            None,
+            None,
+            Some(&format!("{total_slices} slices")),
+            None,
+            None,
         )?;
+        tx.commit()?;
     }
-
-    conn.execute(
-        "UPDATE volumes SET status = 'active', bytes_written = ?1,
-         num_data_files = ?2, has_manifest = 1,
-         first_write = COALESCE(first_write, datetime('now')),
-         last_write = datetime('now')
-         WHERE id = ?3",
-        params![bytes_written, total_slices as i64, volume_id],
-    )?;
-
-    events::log_event(
-        conn,
-        "volume",
-        volume_id,
-        Some(label),
-        "write_completed",
-        None,
-        None,
-        Some(&format!("{total_slices} slices")),
-        None,
-        None,
-    )?;
 
     info!(
         label = label,
@@ -893,13 +897,15 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
         )));
     }
 
-    conn.execute(
+    // Retire volume + update cartridge atomically
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE volumes SET status = 'retired' WHERE id = ?1",
         params![vol_id],
     )?;
 
     // Mark cartridge as pending_erase if bound
-    conn.execute(
+    tx.execute(
         "UPDATE cartridges SET status = 'pending_erase'
          WHERE id IN (SELECT cartridge_id FROM cartridge_volumes
                       WHERE volume_id = ?1 AND unmounted_at IS NULL)",
@@ -907,7 +913,7 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
     )?;
 
     events::log_field_change(
-        conn,
+        &tx,
         "volume",
         vol_id,
         label,
@@ -917,6 +923,7 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
         "retired",
         None,
     )?;
+    tx.commit()?;
 
     info!(label = label, "compact-finish: volume retired");
     Ok(())

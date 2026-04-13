@@ -34,24 +34,25 @@ pub fn snapshot_purge(
         )));
     }
 
-    // Delete files and manifests but keep the snapshot row as 'purged'
-    conn.execute(
+    // Delete files and manifests atomically — keep the snapshot row as 'purged'
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM manifest_entries WHERE manifest_id IN
          (SELECT id FROM manifests WHERE snapshot_id = ?1)",
         params![snap_id],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM manifests WHERE snapshot_id = ?1",
         params![snap_id],
     )?;
-    conn.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
-    conn.execute(
+    tx.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
+    tx.execute(
         "UPDATE snapshots SET status = 'purged' WHERE id = ?1",
         params![snap_id],
     )?;
 
     events::log_field_change(
-        conn,
+        &tx,
         "snapshot",
         snap_id,
         &format!("{unit_name}/v{version}"),
@@ -61,6 +62,7 @@ pub fn snapshot_purge(
         "purged",
         Some(unit.tenant_id),
     )?;
+    tx.commit()?;
 
     if json_output {
         println!(
