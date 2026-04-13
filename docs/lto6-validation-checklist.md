@@ -42,10 +42,26 @@ the full write → verify → restore round-trip.
 
 ## Raw-recovery drill (the killer feature)
 
-- [ ] Using **only** `mt`, `dd`, `age`, and `dar` — no `tapectl` —
-      follow the system guide and `RESTORE.sh` on a freshly-loaded tape
-      and recover one tenant's unit end-to-end. This is the design's
-      strongest claim; if it fails on real hardware, M7 is not done.
+Using **only** `mt`, `dd`, `age`, `dar`, and `sha256sum` — no `tapectl` —
+recover one tenant's unit end-to-end from the freshly-written tape above.
+This is the design's strongest claim; if it fails on real hardware, M7 is
+not done.
+
+- [ ] Extract RESTORE.sh from tape:
+      ```
+      mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
+      dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
+      chmod +x RESTORE.sh
+      ```
+- [ ] `./RESTORE.sh --info` — layout matches what `tapectl volume verify`
+      reported (correct number of data slices, envelope count, etc.).
+- [ ] `./RESTORE.sh --find-envelope --key <tenant-key>.age.key` — decrypts
+      the correct tenant envelope and displays MANIFEST.toml with accurate
+      slice positions and checksums.
+- [ ] `./RESTORE.sh --restore --key <tenant-key>.age.key --to /tmp/recovered`
+      — full restore succeeds: all slice checksums pass, age decryption works,
+      dar extraction completes.
+- [ ] `diff -r <original-source-dir> /tmp/recovered` — byte-identical.
 
 ## ENOSPC drill
 

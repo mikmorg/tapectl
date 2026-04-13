@@ -261,8 +261,19 @@ tapectl db export  # JSON row counts
 Every tape is self-describing. If the database is lost:
 
 1. Read the ID thunk: `tapectl volume identify --device /dev/nst0`
-2. Use RESTORE.sh on the tape (file position 2) for guided recovery
-3. Operator envelope contains a portable catalog.db subset
+2. Extract RESTORE.sh from the tape (file position 2):
+   ```bash
+   mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
+   dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
+   chmod +x RESTORE.sh
+   ```
+3. Use RESTORE.sh for guided recovery (requires mt, dd, age, dar, sha256sum):
+   ```bash
+   ./RESTORE.sh --info                                    # see tape layout
+   ./RESTORE.sh --find-envelope --key your.age.key        # find your data
+   ./RESTORE.sh --restore --key your.age.key --to /dest   # full restore
+   ```
+4. Operator envelope contains a full catalog across all tenants
 
 ## Multi-Tenant Setup
 
