@@ -40,10 +40,11 @@ pub fn clean_staging(conn: &Connection, force: bool) -> Result<CleanReport> {
     for (stage_set_id, _size, staging_path, slice_id) in &rows {
         let path = Path::new(staging_path);
         if path.exists() {
+            let file_size = fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
             match fs::remove_file(path) {
                 Ok(()) => {
                     report.files_removed += 1;
-                    report.bytes_freed += fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+                    report.bytes_freed += file_size;
                 }
                 Err(e) => {
                     warn!(path = %staging_path, error = %e, "failed to remove staged file");
