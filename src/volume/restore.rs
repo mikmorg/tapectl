@@ -54,14 +54,19 @@ pub fn restore_unit(
     let restore_tmp = Path::new(dest_dir).join(".tapectl-restore-tmp");
     fs::create_dir_all(&restore_tmp)?;
 
-    // Find the tenant's secret key for decryption
-    let key_path = paths
-        .keys_dir
-        .join(format!("{}-primary.age.key", tenant.name));
-    let secret_key_str = keys::read_secret_key(&key_path)?;
-    let identity: age::x25519::Identity = secret_key_str
-        .parse()
-        .map_err(|e| TapectlError::Encryption(format!("invalid key: {e}")))?;
+    // Load all secret keys for trial-decryption (tenant + operator)
+    let mut identities = keys::load_all_identities(&paths.keys_dir, &tenant.name)?;
+    if !tenant.is_operator {
+        if let Some(operator) = queries::get_operator_tenant(conn)? {
+            identities.extend(keys::load_all_identities(&paths.keys_dir, &operator.name)?);
+        }
+    }
+    if identities.is_empty() {
+        return Err(TapectlError::Encryption(format!(
+            "no secret keys found for tenant \"{}\"",
+            tenant.name,
+        )));
+    }
 
     // Open tape and read each slice
     let mut tape = TapeDevice::open_read(device, block_size)?;
@@ -105,12 +110,12 @@ pub fn restore_unit(
             )));
         }
 
-        // Decrypt
+        // Decrypt (trial-decryption: age tries each identity until one works)
         let decryptor = age::Decryptor::new(trimmed)
             .map_err(|e| TapectlError::Encryption(format!("decryptor: {e}")))?;
 
         let mut reader = decryptor
-            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .decrypt(identities.iter().map(|id| id as &dyn age::Identity))
             .map_err(|e| TapectlError::Encryption(format!("decrypt: {e}")))?;
 
         let mut plaintext = Vec::new();

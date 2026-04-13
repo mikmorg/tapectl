@@ -94,6 +94,38 @@ pub fn key_paths(
     (pub_path, key_path)
 }
 
+/// Load all secret keys for a tenant from disk as age identities.
+///
+/// Scans `keys_dir` for files matching `{tenant_name}-*.age.key` and parses
+/// each into an `age::x25519::Identity`. Returns an empty vec if no key files
+/// are found — the caller decides whether that's an error.
+pub fn load_all_identities(
+    keys_dir: &Path,
+    tenant_name: &str,
+) -> Result<Vec<age::x25519::Identity>> {
+    let prefix = format!("{tenant_name}-");
+    let mut identities = Vec::new();
+
+    let entries = match fs::read_dir(keys_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(identities),
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&prefix) && name_str.ends_with(".age.key") {
+            let secret_str = read_secret_key(&entry.path())?;
+            let identity: age::x25519::Identity = secret_str.parse().map_err(|e| {
+                TapectlError::Encryption(format!("invalid key in {}: {e}", entry.path().display()))
+            })?;
+            identities.push(identity);
+        }
+    }
+
+    Ok(identities)
+}
+
 /// Generate a keypair, save to disk, and return the generated data.
 pub fn generate_and_save(
     keys_dir: &Path,
@@ -210,5 +242,34 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, TapectlError::KeyAlreadyExists(_)));
+    }
+
+    #[test]
+    fn load_all_identities_finds_multiple_keys() {
+        let tmp = TempDir::new().unwrap();
+        // Simulate pre-rotation + post-rotation keys
+        generate_and_save(tmp.path(), "alice", "primary").unwrap();
+        generate_and_save(tmp.path(), "alice", "backup").unwrap();
+        generate_and_save(tmp.path(), "alice", "rotated-primary").unwrap();
+
+        let ids = load_all_identities(tmp.path(), "alice").unwrap();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn load_all_identities_ignores_other_tenants() {
+        let tmp = TempDir::new().unwrap();
+        generate_and_save(tmp.path(), "alice", "primary").unwrap();
+        generate_and_save(tmp.path(), "bob", "primary").unwrap();
+
+        let ids = load_all_identities(tmp.path(), "alice").unwrap();
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn load_all_identities_empty_for_missing_tenant() {
+        let tmp = TempDir::new().unwrap();
+        let ids = load_all_identities(tmp.path(), "nobody").unwrap();
+        assert!(ids.is_empty());
     }
 }
