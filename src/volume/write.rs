@@ -436,12 +436,20 @@ pub fn volume_verify(
         return Err(TapectlError::Other("no write positions found".into()));
     }
 
+    // Create verification session
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+         VALUES (?1, 'full', 'in_progress')",
+        params![volume_id],
+    )?;
+    let session_id = conn.last_insert_rowid();
+
     let mut tape = TapeDevice::open_read(device, block_size)?;
     tape.rewind()?;
 
     let mut report = VerifyReport::default();
 
-    for (_wp_id, pos_str, expected_hash, orig_hash, slice_id, orig_size) in &positions {
+    for (wp_id, pos_str, expected_hash, orig_hash, slice_id, orig_size) in &positions {
         let pos: i32 = pos_str.parse().unwrap_or(0);
 
         // Seek to position
@@ -462,9 +470,19 @@ pub fn volume_verify(
         report.checked += 1;
         if actual == *expected_hash || actual == *orig_hash {
             report.passed += 1;
+            conn.execute(
+                "INSERT INTO verification_results (session_id, write_position_id, stage_slice_id, result, expected_sha256, actual_sha256)
+                 VALUES (?1, ?2, ?3, 'passed', ?4, ?5)",
+                params![session_id, wp_id, slice_id, expected_hash, actual],
+            )?;
             info!(slice_id = slice_id, position = pos, "PASS");
         } else {
             report.failed += 1;
+            conn.execute(
+                "INSERT INTO verification_results (session_id, write_position_id, stage_slice_id, result, expected_sha256, actual_sha256)
+                 VALUES (?1, ?2, ?3, 'failed_checksum', ?4, ?5)",
+                params![session_id, wp_id, slice_id, expected_hash, actual],
+            )?;
             warn!(
                 slice_id = slice_id,
                 position = pos,
@@ -474,6 +492,26 @@ pub fn volume_verify(
             );
         }
     }
+
+    // Finalize verification session
+    let outcome = if report.failed == 0 {
+        "passed"
+    } else {
+        "failed"
+    };
+    conn.execute(
+        "UPDATE verification_sessions
+         SET completed_at = datetime('now'), outcome = ?1,
+             slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
+         WHERE id = ?5",
+        params![
+            outcome,
+            report.checked as i64,
+            report.passed as i64,
+            report.failed as i64,
+            session_id
+        ],
+    )?;
 
     // Best-effort sg_logs collection after verify. Advisory only.
     let sg_device = config
