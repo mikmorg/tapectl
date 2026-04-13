@@ -793,6 +793,7 @@ pub fn compact_write(
 }
 
 /// Compact-finish: retire the source volume after compaction.
+/// Refuses if any live slice on this volume has no copy on another volume.
 pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
     let (vol_id, status): (i64, String) = conn
         .query_row(
@@ -801,6 +802,43 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Guard: verify all live slices exist on at least one other volume
+    let mut stmt = conn.prepare(
+        "SELECT u.name, sl.slice_number
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+         JOIN stage_sets sts ON sts.id = sl.stage_set_id
+         JOIN snapshots s ON s.id = sts.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+           AND s.status NOT IN ('reclaimable', 'purged')
+           AND NOT EXISTS (
+             SELECT 1 FROM write_positions wp2
+             JOIN writes w2 ON w2.id = wp2.write_id
+             WHERE wp2.stage_slice_id = wp.stage_slice_id
+               AND w2.volume_id != ?1
+               AND w2.status = 'completed'
+               AND wp2.status = 'written'
+           )",
+    )?;
+    let unprotected: Vec<(String, i64)> = stmt
+        .query_map(params![vol_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !unprotected.is_empty() {
+        let examples: Vec<String> = unprotected
+            .iter()
+            .take(5)
+            .map(|(name, num)| format!("{name} slice {num}"))
+            .collect();
+        return Err(TapectlError::Other(format!(
+            "cannot retire \"{label}\": {} live slice(s) have no copy on another volume ({})",
+            unprotected.len(),
+            examples.join(", "),
+        )));
+    }
 
     conn.execute(
         "UPDATE volumes SET status = 'retired' WHERE id = ?1",
