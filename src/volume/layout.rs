@@ -86,7 +86,7 @@ load_count_at_write = {mam_loads}
     )
 }
 
-/// Generate the system guide (File 1) — abbreviated version for M3.
+/// Generate the system guide (File 1).
 pub fn generate_system_guide(label: &str, total_files: i32) -> String {
     format!(
         r#"# tapectl Archival Volume Recovery Guide
@@ -94,7 +94,7 @@ pub fn generate_system_guide(label: &str, total_files: i32) -> String {
 ## Volume: {label}
 
 This document describes how to recover data from this tape without
-tapectl or its database. All you need is: mt, dd, age, and dar.
+tapectl or its database. All you need is: mt, dd, age, dar, and sha256sum.
 
 ## Quick Reference
 
@@ -110,72 +110,438 @@ tapectl or its database. All you need is: mt, dd, age, and dar.
 ## Tools Required
 
 - `mt` (mt-st package) — tape positioning
-- `dd` — reading files from tape
+- `dd` — reading raw data from tape
 - `age` (age-encryption.org) — decryption
 - `dar` (dar.linux.free.fr) — archive extraction
+- `sha256sum` (coreutils) — integrity verification
 
-## Recovery Steps
+## Automated Recovery (recommended)
 
-1. Read the mini-index to find file positions
-2. Read and trial-decrypt tenant envelopes with your key
-3. Follow the MANIFEST.toml in your envelope for exact slice positions
-4. Read each slice from tape with dd, decrypt with age, extract with dar
+The easiest way to recover is the RESTORE.sh script (File 2):
+
+    mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
+    chmod +x RESTORE.sh
+
+    # See what's on the tape
+    ./RESTORE.sh --info
+
+    # Find your encrypted envelope
+    ./RESTORE.sh --find-envelope --key your-key.age.key
+
+    # Full restore to a directory
+    ./RESTORE.sh --restore --key your-key.age.key --to /destination
+
+## Manual Recovery Steps
+
+If RESTORE.sh is not available, follow these steps:
+
+1. Set tape to fixed 512KB block mode: `mt -f /dev/nst0 setblk 524288`
+2. Read the ID thunk (file 0) and note the layout positions
+3. Read the mini-index to get exact byte sizes for each file
+4. Read and trial-decrypt tenant envelopes with your key
+5. Parse the MANIFEST.toml in your envelope for slice positions
+6. For each slice: read from tape, trim to exact size (block padding
+   breaks age decryption), verify sha256, decrypt with age
+7. Reassemble dar slices: `dar -x restore -R /destination -O -Q`
+
+## Important: Block Padding
+
+This tape uses 512KB (524288 byte) fixed block mode. Every file is
+padded with zeros to the next block boundary. Encrypted files (data
+slices, envelopes) MUST be trimmed to their exact byte size before
+decryption — the padding zeros will cause age to reject the ciphertext.
+Exact sizes are in the mini-index (`size_bytes` field).
 
 ## Total files on this tape: {total_files}
-
-For complete instructions, see the RESTORE.sh script (File 2).
 "#
     )
 }
 
-/// Generate RESTORE.sh (File 2) — abbreviated for M3.
+/// Generate RESTORE.sh (File 2) — self-contained emergency restore script.
+///
+/// Three modes:
+/// - `--info`: read ID thunk + mini-index, display tape layout
+/// - `--find-envelope --key KEYFILE`: trial-decrypt tenant/operator envelopes
+/// - `--restore --key KEYFILE --to DIR [--unit U]`: full restore via dar
 pub fn generate_restore_script(label: &str, total_files: i32) -> String {
-    format!(
-        r#"#!/usr/bin/env bash
-# RESTORE.sh — Emergency restore script for tapectl volume {label}
-# This script helps you restore data without tapectl installed.
+    r#"#!/usr/bin/env bash
+# RESTORE.sh — Emergency restore script for tapectl volume __LABEL__
+# This script restores data from this tape WITHOUT tapectl installed.
+# It reads the tape layout, finds your encrypted envelope, decrypts
+# each data slice, and extracts the dar archive to a directory.
 #
 # Usage:
-#   ./RESTORE.sh --info                    Show tape contents
-#   ./RESTORE.sh --find-envelope --key KEY Find your envelope
+#   ./RESTORE.sh --info                                       Show tape layout
+#   ./RESTORE.sh --find-envelope --key KEYFILE                Decrypt your envelope
+#   ./RESTORE.sh --restore --key KEYFILE --to DIR [--unit U]  Full restore
 #
-# Requirements: mt, dd, age, dar
-# Total files on tape: {total_files}
+# Requirements: mt, dd, age, dar, sha256sum
+# Total files on tape: __TOTAL_FILES__
 
 set -euo pipefail
-DEVICE="${{TAPE_DEVICE:-/dev/nst0}}"
-LABEL="{label}"
-TMPDIR="${{TMPDIR:-/tmp}}/tapectl-restore-$$"
-trap "rm -rf $TMPDIR" EXIT
-mkdir -p "$TMPDIR"
 
-case "${{1:-}}" in
+DEVICE="${TAPE_DEVICE:-/dev/nst0}"
+LABEL="__LABEL__"
+BLOCK=524288  # 512 KB — tapectl fixed block size
+
+WORK="${TMPDIR:-/tmp}/tapectl-restore-$$"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK"
+
+die()  { echo "FATAL: $*" >&2; exit 1; }
+info() { echo ">>> $*"; }
+
+# ---- prerequisite check ----
+
+for tool in mt dd age sha256sum dar; do
+  command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
+done
+
+# ---- tape helpers ----
+
+tape_init() {
+  mt -f "$DEVICE" setblk "$BLOCK" 2>/dev/null \
+    || die "cannot set block size — is $DEVICE a tape device?"
+}
+
+# Read a tape file at position $1 into file $2 (raw bytes, block-padded).
+read_tape_raw() {
+  local pos=$1 out=$2
+  mt -f "$DEVICE" rewind
+  [ "$pos" -gt 0 ] && mt -f "$DEVICE" fsf "$pos"
+  dd if="$DEVICE" of="$out" bs="$BLOCK" 2>/dev/null
+}
+
+# Read a tape file at position $1 into file $2, stripping null padding.
+# Use for plaintext files (ID thunk, mini-index) where padding zeros are
+# harmless but would confuse text-processing tools.
+read_tape_text() {
+  local pos=$1 out=$2
+  mt -f "$DEVICE" rewind
+  [ "$pos" -gt 0 ] && mt -f "$DEVICE" fsf "$pos"
+  dd if="$DEVICE" bs="$BLOCK" 2>/dev/null | tr -d '\0' > "$out"
+}
+
+# ---- TOML helpers (flat key = value parsing) ----
+
+# Print the value for a TOML key on a "key = value" line.  Strips quotes.
+toml_val() {
+  local file=$1 key=$2
+  awk -v k="$key" '
+    $1 == k && $2 == "=" {
+      v = $3
+      for (i = 4; i <= NF; i++) v = v " " $i
+      gsub(/^"/, "", v); gsub(/"$/, "", v)
+      print v; exit
+    }
+  ' "$file"
+}
+
+# Parse mini-index [[files]] blocks into lines: position|type|size_bytes
+parse_file_list() {
+  local file=$1
+  awk '
+    /^\[\[files\]\]/ {
+      if (p != "") print p "|" t "|" s
+      p = ""; t = ""; s = ""
+    }
+    /^position = /   { p = $3 }
+    /^type = /       { t = $3; gsub(/"/, "", t) }
+    /^size_bytes = / { s = $3 }
+    END { if (p != "") print p "|" t "|" s }
+  ' "$file"
+}
+
+# Look up size_bytes for a given tape file position.
+file_size_at() {
+  local pos=$1 list=$2
+  awk -F'|' -v p="$pos" '$1 == p { print $3; exit }' "$list"
+}
+
+# ---- read tape layout (ID thunk + mini-index) ----
+
+read_layout() {
+  tape_init
+
+  info "Reading ID thunk (file 0)..."
+  read_tape_text 0 "$WORK/id_thunk.txt"
+
+  # Extract TOML body (starts at [volume] section)
+  sed -n '/^\[volume\]/,$p' "$WORK/id_thunk.txt" > "$WORK/layout.toml"
+
+  DATA_START=$(toml_val "$WORK/layout.toml" data_start)
+  DATA_END=$(toml_val   "$WORK/layout.toml" data_end)
+  MINI_IDX=$(toml_val   "$WORK/layout.toml" mini_index)
+  FIRST_ENV=$(toml_val  "$WORK/layout.toml" first_envelope)
+  NUM_ENV=$(toml_val    "$WORK/layout.toml" num_envelopes)
+  OP_ENV=$(toml_val     "$WORK/layout.toml" operator_envelope)
+  OP_BAK=$(toml_val     "$WORK/layout.toml" operator_envelope_backup)
+
+  [ -n "$MINI_IDX" ] || die "cannot parse layout from ID thunk"
+
+  info "Reading mini-index (file $MINI_IDX)..."
+  read_tape_text "$MINI_IDX" "$WORK/mini_index.txt"
+
+  sed -n '/^\[index\]/,$p' "$WORK/mini_index.txt" > "$WORK/index.toml"
+  parse_file_list "$WORK/index.toml" > "$WORK/files.txt"
+}
+
+# ---- --info ----
+
+do_info() {
+  read_layout
+
+  echo ""
+  echo "=== tapectl volume: $LABEL ==="
+  echo ""
+  echo "Layout:"
+  echo "  Data slices:       files $DATA_START .. $DATA_END"
+  echo "  Mini-index:        file  $MINI_IDX"
+  echo "  Tenant envelopes:  files $FIRST_ENV .. $((FIRST_ENV + NUM_ENV - 1))  ($NUM_ENV total)"
+  echo "  Operator envelope: file  $OP_ENV  (backup: $OP_BAK)"
+  echo ""
+  echo "File map:"
+  while IFS='|' read -r pos type size; do
+    printf "  %3d  %-22s  %s bytes\n" "$pos" "$type" "$size"
+  done < "$WORK/files.txt"
+  echo ""
+  echo "To decrypt your envelope:"
+  echo "  $0 --find-envelope --key YOUR_KEY.age.key"
+}
+
+# ---- --find-envelope ----
+
+do_find_envelope() {
+  local keyfile=$1
+
+  read_layout
+
+  # Collect envelope positions: tenant envelopes, then operator + backup
+  local positions=()
+  local i
+  for i in $(seq "$FIRST_ENV" $((FIRST_ENV + NUM_ENV - 1))); do
+    positions+=("$i")
+  done
+  positions+=("$OP_ENV" "$OP_BAK")
+
+  local found=0
+  for pos in "${positions[@]}"; do
+    info "Trying envelope at file $pos..."
+    read_tape_raw "$pos" "$WORK/envelope.enc"
+
+    # Trim to exact size — block padding breaks age decryption
+    local esize
+    esize=$(file_size_at "$pos" "$WORK/files.txt")
+    if [ -n "$esize" ] && [ "$esize" -gt 0 ]; then
+      truncate -s "$esize" "$WORK/envelope.enc"
+    fi
+
+    # Envelopes are age-encrypted tar archives (MANIFEST.toml + RECOVERY.md)
+    rm -rf "$WORK/env" && mkdir -p "$WORK/env"
+    if age -d -i "$keyfile" < "$WORK/envelope.enc" 2>/dev/null \
+       | tar xf - -C "$WORK/env/" 2>/dev/null; then
+      found=1
+      echo ""
+      info "Decrypted envelope at file $pos"
+      if [ -f "$WORK/env/MANIFEST.toml" ]; then
+        echo ""
+        echo "--- MANIFEST.toml ---"
+        cat "$WORK/env/MANIFEST.toml"
+      fi
+      if [ -f "$WORK/env/RECOVERY.md" ]; then
+        echo ""
+        echo "--- RECOVERY.md ---"
+        cat "$WORK/env/RECOVERY.md"
+      fi
+      break
+    fi
+  done
+
+  [ "$found" -eq 1 ] || die "no envelope matched the provided key"
+  echo ""
+  echo "To restore, run:"
+  echo "  $0 --restore --key $keyfile --to /your/destination"
+}
+
+# ---- --restore ----
+
+do_restore() {
+  local keyfile=$1 destdir=$2 target_unit=$3
+
+  mkdir -p "$destdir"
+
+  read_layout
+
+  # Step 1: find and decrypt envelope
+  local positions=()
+  local i
+  for i in $(seq "$FIRST_ENV" $((FIRST_ENV + NUM_ENV - 1))); do
+    positions+=("$i")
+  done
+  positions+=("$OP_ENV" "$OP_BAK")
+
+  local found=0
+  for pos in "${positions[@]}"; do
+    read_tape_raw "$pos" "$WORK/envelope.enc"
+    local esize
+    esize=$(file_size_at "$pos" "$WORK/files.txt")
+    if [ -n "$esize" ] && [ "$esize" -gt 0 ]; then
+      truncate -s "$esize" "$WORK/envelope.enc"
+    fi
+    rm -rf "$WORK/env" && mkdir -p "$WORK/env"
+    if age -d -i "$keyfile" < "$WORK/envelope.enc" 2>/dev/null \
+       | tar xf - -C "$WORK/env/" 2>/dev/null; then
+      found=1
+      info "Decrypted envelope at file $pos"
+      break
+    fi
+  done
+  [ "$found" -eq 1 ] || die "no envelope matched the provided key"
+  [ -f "$WORK/env/MANIFEST.toml" ] || die "envelope missing MANIFEST.toml"
+
+  local manifest="$WORK/env/MANIFEST.toml"
+
+  # Step 2: identify units in manifest
+  local -a unit_names
+  while IFS= read -r uname; do
+    unit_names+=("$uname")
+  done < <(awk '
+    /^\[\[units\]\]/ { in_u = 1; next }
+    in_u && /^name = / { gsub(/"/, "", $3); print $3; in_u = 0 }
+    /^\[/              { in_u = 0 }
+  ' "$manifest")
+
+  [ ${#unit_names[@]} -gt 0 ] || die "no units in manifest"
+
+  if [ -z "$target_unit" ]; then
+    if [ ${#unit_names[@]} -eq 1 ]; then
+      target_unit="${unit_names[0]}"
+    else
+      echo "Units in this envelope:"
+      for u in "${unit_names[@]}"; do echo "  - $u"; done
+      die "multiple units found — specify one with --unit NAME"
+    fi
+  fi
+
+  # Step 3: parse slices for target unit from MANIFEST.toml
+  info "Parsing slices for unit: $target_unit"
+  awk -v unit="$target_unit" '
+    function flush() {
+      if (in_s && num != "") print num "|" tpos "|" eb "|" sha
+      in_s = 0; num = ""; tpos = ""; eb = ""; sha = ""
+    }
+    /^\[\[units\]\]/               { in_u = 0; flush() }
+    /^name = /                     { gsub(/"/, "", $3); if ($3 == unit) in_u = 1 }
+    in_u && /^\[\[units\.slices\]\]/ { flush(); in_s = 1; next }
+    in_s && /^number = /           { num = $3 }
+    in_s && /^tape_position = /    { tpos = $3 }
+    in_s && /^encrypted_bytes = /  { eb = $3 }
+    in_s && /^sha256_encrypted = / { gsub(/"/, "", $3); sha = $3 }
+    END { flush() }
+  ' "$manifest" > "$WORK/slices.txt"
+
+  local nslices
+  nslices=$(wc -l < "$WORK/slices.txt")
+  [ "$nslices" -gt 0 ] || die "no slices found for unit '$target_unit'"
+  info "$nslices slice(s) to read"
+
+  # Step 4: read, verify, decrypt each slice
+  local dar_dir="$WORK/dar"
+  mkdir -p "$dar_dir"
+  local count=0
+
+  while IFS='|' read -r num tpos eb sha; do
+    count=$((count + 1))
+    info "Slice $count/$nslices — tape file $tpos"
+
+    read_tape_raw "$tpos" "$WORK/slice.enc"
+
+    # Trim to encrypted size — block padding breaks age decryption
+    if [ -n "$eb" ] && [ "$eb" -gt 0 ]; then
+      truncate -s "$eb" "$WORK/slice.enc"
+    fi
+
+    # Verify SHA-256 checksum
+    local actual
+    actual=$(sha256sum "$WORK/slice.enc" | awk '{print $1}')
+    if [ "$actual" != "$sha" ]; then
+      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)"
+    fi
+    info "  checksum verified"
+
+    # Decrypt with age
+    age -d -i "$keyfile" < "$WORK/slice.enc" > "$dar_dir/restore.$num.dar" \
+      || die "cannot decrypt slice $num — wrong key?"
+
+    local bytes
+    bytes=$(wc -c < "$dar_dir/restore.$num.dar")
+    info "  decrypted ($((bytes / 1048576)) MB)"
+    rm -f "$WORK/slice.enc"
+
+  done < "$WORK/slices.txt"
+
+  # Step 5: extract with dar
+  info "Extracting archive to $destdir ..."
+  dar -x "$dar_dir/restore" -R "$destdir" -O -Q \
+    || die "dar extraction failed"
+
+  rm -rf "$dar_dir"
+  echo ""
+  info "RESTORE COMPLETE"
+  info "Unit '$target_unit' restored to: $destdir"
+}
+
+# ---- main ----
+
+case "${1:-}" in
   --info)
-    echo "Reading tape identity..."
-    mt -f "$DEVICE" rewind
-    dd if="$DEVICE" bs=64k 2>/dev/null
-    echo ""
-    echo "--- Mini-index ---"
-    # Skip to mini-index position (read from ID thunk layout section)
+    do_info
     ;;
   --find-envelope)
     shift
-    if [ "${{1:-}}" != "--key" ] || [ -z "${{2:-}}" ]; then
-      echo "Usage: $0 --find-envelope --key KEYFILE" >&2
-      exit 1
-    fi
-    KEY="$2"
-    echo "Searching for your envelope on tape..."
-    echo "(Trial-decrypting each envelope with your key)"
+    [ "${1:-}" = "--key" ] && [ -n "${2:-}" ] \
+      || die "usage: $0 --find-envelope --key KEYFILE"
+    [ -f "$2" ] || die "key file not found: $2"
+    do_find_envelope "$2"
+    ;;
+  --restore)
+    shift
+    key="" dest="" unit=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --key)  key="${2:-}";  shift 2 ;;
+        --to)   dest="${2:-}"; shift 2 ;;
+        --unit) unit="${2:-}"; shift 2 ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+    [ -n "$key" ]  || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U]"
+    [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U]"
+    [ -f "$key" ]  || die "key file not found: $key"
+    do_restore "$key" "$dest" "$unit"
+    ;;
+  --help|-h)
+    echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL"
+    echo ""
+    echo "Usage:"
+    echo "  $0 --info                                       Show tape layout"
+    echo "  $0 --find-envelope --key KEYFILE                Decrypt your envelope"
+    echo "  $0 --restore --key KEYFILE --to DIR [--unit U]  Full restore"
+    echo ""
+    echo "Environment:"
+    echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
+    echo ""
+    echo "Requirements: mt, dd, age, dar, sha256sum"
     ;;
   *)
     echo "RESTORE.sh for tapectl volume $LABEL"
-    echo "Usage: $0 --info | --find-envelope --key KEYFILE"
-    exit 0
+    echo "Run '$0 --help' for usage."
     ;;
 esac
 "#
-    )
+    .replace("__LABEL__", label)
+    .replace("__TOTAL_FILES__", &total_files.to_string())
 }
 
 /// Generate the planning header content (File 3, encrypted to operator).
@@ -475,5 +841,25 @@ mod tests {
         assert!(s.starts_with("#!/usr/bin/env bash"));
         assert!(s.contains("LABEL=\"LAB01\""));
         assert!(s.contains("Total files on tape: 15"));
+    }
+
+    #[test]
+    fn restore_script_has_all_modes() {
+        let s = generate_restore_script("VOL01", 27);
+        // Block size matches tapectl's 512KB fixed block mode
+        assert!(s.contains("BLOCK=524288"));
+        // All three command modes
+        assert!(s.contains("--info)"));
+        assert!(s.contains("--find-envelope)"));
+        assert!(s.contains("--restore)"));
+        // Key operations
+        assert!(s.contains("mt -f \"$DEVICE\" setblk"));
+        assert!(s.contains("age -d -i"));
+        assert!(s.contains("sha256sum"));
+        assert!(s.contains("dar -x"));
+        assert!(s.contains("truncate -s"));
+        // Envelope is tar archive
+        assert!(s.contains("tar xf"));
+        assert!(s.contains("MANIFEST.toml"));
     }
 }
