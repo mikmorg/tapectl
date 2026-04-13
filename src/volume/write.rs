@@ -700,6 +700,7 @@ pub struct ReadSlicesReport {
 pub struct CompactReadReport {
     pub slices_read: i64,
     pub bytes_read: i64,
+    pub slices_skipped: i64,
 }
 
 /// Compact-read: read live encrypted slices from a volume to staging.
@@ -759,6 +760,7 @@ pub fn compact_read(
     let mut tape = TapeDevice::open_read(device, block_size)?;
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
+    let mut slices_skipped: i64 = 0;
     let mut affected_stage_sets = std::collections::HashSet::new();
 
     for (pos_str, sha_on_vol, _slice_id, enc_bytes, sha_encrypted, ss_id, slice_db_id) in
@@ -779,7 +781,12 @@ pub fn compact_read(
 
         let actual_sha = sha256_hex(trimmed);
         if actual_sha != *sha_on_vol && actual_sha != *sha_encrypted {
-            warn!(position = pos, "checksum mismatch — skipping slice");
+            warn!(
+                position = pos,
+                slice_id = slice_db_id,
+                "checksum mismatch — skipping slice"
+            );
+            slices_skipped += 1;
             continue;
         }
 
@@ -807,11 +814,19 @@ pub fn compact_read(
         )?;
     }
 
+    if slices_skipped > 0 {
+        return Err(TapectlError::Other(format!(
+            "compact-read \"{label}\": {slices_skipped} slice(s) skipped due to checksum mismatch \
+             ({slices_read} read successfully) — investigate before proceeding with compact-write",
+        )));
+    }
+
     info!(label = label, slices = slices_read, "compact-read complete");
 
     Ok(CompactReadReport {
         slices_read,
         bytes_read: total_bytes,
+        slices_skipped,
     })
 }
 
