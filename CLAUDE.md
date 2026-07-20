@@ -32,15 +32,65 @@ Milestones 0 through 5 are complete.
 
 **Post-M7 hardening (complete):** Design gap audit identified 3 active bugs + 6 unacknowledged gaps. All 8 items fixed: clone-slices restructured to staging-only read-slices (self-describing invariant preserved), restore trial-decrypts with all tenant+operator keys (key rotation no longer breaks restore), compact-finish refuses retirement if live slices lack copies elsewhere, volume_verify records verification_sessions (audit feedback loop closed), staging cleanup reports actual bytes freed, compact-read errors on checksum mismatch, critical DB operations wrapped in transactions, export writes MANIFEST.toml + RECOVERY.md. RESTORE.sh fleshed out from stub to full emergency recovery script (--info, --find-envelope, --restore modes with sha256 verification and block-padding trimming). 106 tests (60 unit + 46 integration/lib/isolation/failure-mode), zero clippy warnings.
 
-**Next:** Real LTO-6 hardware validation — user-gated on physical drive availability. Procedure is in `docs/lto6-validation-checklist.md`.
+**Renovation (2026-07):** a full renovation stage is planned and triaged — wayfinder
+map at [issue #1](https://github.com/mikmorg/tapectl/issues/1), phased backlog in
+issues #20–#73 (phase:1 = restore trust; the three audits under `docs/audits/` found
+the happy path solid but the heir/emergency and unhappy paths broken). Decision
+records: `docs/adr/0001`–`0006` + `CONTEXT.md`. The milestone claims above describe
+happy-path completeness only — treat them accordingly.
+
+**Next:** execute the process kit (CI #6, mhvtl verify gate #7 — mhvtl needs its
+kernel module rebuilt first, see #7), then phase 1 via the issue loop. Real LTO-6
+hardware validation is deliberately deferred: an LTO-6 drive is owned, but development
+stays mhvtl-first until phases 1–2 land and the verify gate is green (#16's verdict).
+Procedure is in `docs/lto6-validation-checklist.md`.
 
 ## Build Commands
 
+Default to `check`/debug. Release builds (`--release`) are only for publishing or the
+gated performance suite — don't produce release artifacts unless asked.
+
 ```bash
-cargo build --release
-cargo test
-cargo clippy --all-targets
+cargo check --all-targets     # fast compile verification (preferred while iterating)
+cargo build                   # debug binary at target/debug/tapectl
+cargo clippy --all-targets    # must stay warning-clean
 cargo fmt --check
+```
+
+There is no CI; run `clippy`, `fmt --check`, and `cargo test` locally before committing.
+
+The crate is a **dual lib + bin target**: `src/main.rs` is a thin wrapper and all logic
+lives in the `tapectl` library crate (`src/lib.rs`). Integration tests import `tapectl::`
+directly, so keep command logic in library modules, not `main.rs`.
+
+Regenerate man pages after any CLI (clap) change:
+
+```bash
+cargo run --example gen_man   # writes docs/man/*.1
+```
+
+## Testing
+
+Default `cargo test` runs unit + integration + tenant-isolation + failure-mode tests;
+none need tape hardware or mhvtl.
+
+```bash
+cargo test                              # everything ungated
+cargo test --lib                        # unit tests only (in-module)
+cargo test --test integration           # one integration file
+cargo test test_volume_write_positions  # a single test by name (substring match)
+```
+
+Two suites are gated (they skip at runtime unless the env var is set):
+
+```bash
+# mhvtl end-to-end round-trip + on-tape tenant isolation. Needs /dev/nst0 backed by
+# mhvtl. Tests are also #[ignore], so pass --ignored.
+TAPECTL_MHVTL=1 cargo test --test mhvtl_e2e -- --ignored --nocapture
+
+# Performance scenarios (thousands of files, large archives); ~2 min. This is the one
+# case a release build is expected.
+TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- --nocapture --test-threads=1
 ```
 
 ## Architecture
@@ -57,7 +107,7 @@ cargo fmt --check
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit
-- **Backend trait** (`src/backend/`): deferred — tape I/O currently direct via `src/tape/`
+- **Store trait**: decided (ADR-0006) but not yet built — one storage interface with TapeStore/WarehouseStore/ExportStore as peers, carved during the phase-1 Layout work (#71); today tape I/O is still direct via `src/tape/`
 
 **Design principles:**
 - Volumes are self-describing — full restore possible without the database or tapectl
