@@ -6,7 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `rage` crate for age encryption, and SQLite for catalog/inventory/policy/audit.
 
-The sole implementation reference is `tapectl-design-v4_0.md` — no other design documents are required.
+The implementation reference is `tapectl-design-v4_0.md`, read **together with
+`docs/design-errata.md`** (the complete list of superseded/recast sections — ADRs and
+recorded verdicts take precedence over the design doc wherever they disagree),
+`CONTEXT.md` (vocabulary), `docs/adr/` (decisions), and
+`docs/design/layout-session.md` (the normative skeleton for the phase-1
+Layout/WriteSession work, epic #20).
 
 ## Current State
 
