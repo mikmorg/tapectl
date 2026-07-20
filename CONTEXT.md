@@ -78,3 +78,14 @@ A unit's stage_set claim on a sealed, unquarantined, unretired volume — the
 unit of coverage in derivations. Seal status decides eligibility; evidence age
 qualifies presentation (warnings at destructive moments) but never eligibility.
 _Avoid_: backup, replica
+
+### Restoring
+
+**Heir Path**:
+The restore route that must work with only what is on the tape plus a key
+envelope — no database, no tapectl, no operator. What rides it: ID thunk,
+system guide, RESTORE.sh, mini-index, tenant/operator envelopes and their
+RECOVERY.md. Operator conveniences (tapectl restore, catalog queries) are
+not on it.
+_Avoid_: emergency restore (ambiguous — also describes operator disaster
+recovery with tooling), raw recovery
