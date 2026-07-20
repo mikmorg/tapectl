@@ -1,0 +1,95 @@
+# CI for the ungated suite only. The mhvtl e2e gate is deliberately NOT here:
+# it needs an out-of-tree kernel module that GitHub-hosted runners cannot load,
+# and a self-hosted runner is rejected while this repo is public (see the
+# 2026-07-20 tests/CI audit, docs/audits/2026-07-20-tests-ci-operability.md,
+# "CI feasibility verdict"). Restore-path diffs run scripts/mhvtl-verify-gate.sh
+# locally by convention (issue #7). The perf suite is manual (VM-pinned
+# baselines, release build).
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check, Lint & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins 1.94.1; this action reads it. fmt/clippy
+        # results are only meaningful on the pinned toolchain (audit T4).
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        # Debug profile on purpose — release builds are for publishing and the
+        # perf suite only (house build rule). The ungated suite is hermetic:
+        # no external binaries, no $HOME, no devices (audit, measured baseline).
+        run: cargo test --locked
+
+  man-drift:
+    name: Man pages in sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Regenerate and diff
+        # Any clap change must ship its regenerated docs/man (CLAUDE.md rule).
+        run: |
+          cargo run --locked --example gen_man
+          git diff --exit-code docs/man
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Red today by a known cause: quick-xml RUSTSEC-2026-0194/0195, reachable
+    # only via the dead catalog_xml module. Becomes blocking when #42 lands
+    # (remove this line then).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit
+        run: cargo audit
