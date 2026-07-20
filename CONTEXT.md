@@ -107,3 +107,22 @@ to the Escrow Recipient — held in tamper-evident envelopes in at least
 two independent failure domains, refreshed after each production write
 session.
 _Avoid_: escrow package, key envelope (one component, not the kit)
+
+### Storage
+
+**Store**:
+A first-class implementation of the storage interface, selected by a
+location's configuration: it executes a Layout at contact and confirms
+it. Tape, warehouse, and export stores are peers; sealed volumes are the
+interchange unit for all of them.
+_Avoid_: backend (implementation jargon), medium (the physical substance,
+not the implementation)
+
+**Warehouse**:
+A location whose custody is a provider reached through an API rather
+than a shelf: contact is the API, confirm is the deposit receipt, and
+retrieval-contact begins with a restore-request and a wait — the
+load-the-cartridge analog. Warehouse evidence is a deposit receipt plus
+provider attestation; it ages without refresh.
+_Avoid_: cloud (names the vendor sphere, not the custody relationship),
+bucket (one provider's term for the container, not the location concept)
