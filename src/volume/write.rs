@@ -971,7 +971,8 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
          ORDER BY u.name",
     )?;
 
-    let rows: Vec<(i64, i64, String, String, i64, Option<String>, i64)> = stmt
+    type Row = (i64, i64, String, String, i64, Option<String>, i64);
+    let rows: Vec<Row> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,

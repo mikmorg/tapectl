@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so `clippy -D warnings` means the same thing locally and in CI —
+# clippy's lint set moves between releases (audit T4). Bump deliberately,
+# fixing new lints in the same commit.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

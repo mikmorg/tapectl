@@ -17,7 +17,7 @@ tapectl manages the full lifecycle of archiving data to LTO tape: directory scan
 
 ## Prerequisites
 
-- Rust 1.75+ (for building)
+- Rust 1.94+ (for building; pinned via rust-toolchain.toml)
 - `dar` >= 2.6 (recommended 2.7.20+) for archive creation/extraction
 - `mhvtl` for development/testing (virtual tape library)
 - LTO tape drive + `mt-st` for production use

@@ -345,7 +345,8 @@ fn report_pending(conn: &Connection, json_output: bool) -> Result<()> {
          WHERE ss.status = 'staged'
          ORDER BY u.name",
     )?;
-    let rows: Vec<(String, i64, String, Option<i64>, Option<i64>)> = stmt
+    type Row = (String, i64, String, Option<i64>, Option<i64>);
+    let rows: Vec<Row> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -402,7 +403,7 @@ fn report_verify_status(
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(
+    type Row = (
         String,
         Option<String>,
         Option<String>,
@@ -410,7 +411,8 @@ fn report_verify_status(
         Option<i64>,
         Option<i64>,
         Option<i64>,
-    )> = stmt
+    );
+    let rows: Vec<Row> = stmt
         .query_map(params_ref.as_slice(), |row| {
             Ok((
                 row.get(0)?,
@@ -465,14 +467,15 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(
+    type Row = (
         String,
         Option<String>,
         String,
         Option<i64>,
         Option<i64>,
         Option<i64>,
-    )> = stmt
+    );
+    let rows: Vec<Row> = stmt
         .query_map(params_ref.as_slice(), |row| {
             Ok((
                 row.get(0)?,
@@ -641,7 +644,7 @@ fn report_events(
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(
+    type Row = (
         String,
         String,
         Option<String>,
@@ -649,7 +652,8 @@ fn report_events(
         Option<String>,
         Option<String>,
         Option<String>,
-    )> = stmt
+    );
+    let rows: Vec<Row> = stmt
         .query_map(params_ref.as_slice(), |row| {
             Ok((
                 row.get(0)?,

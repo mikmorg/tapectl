@@ -1,4 +1,7 @@
 /// Generate the ID thunk (File 0) content.
+// Signature collapses into the Layout value in #24 (epic #20); not worth a
+// param struct that the Layout replaces.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_id_thunk(
     label: &str,
     media_type: &str,

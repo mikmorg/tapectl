@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Multi-tenant archival storage management for LTO tape and exportable encrypted directories"
 license = "MIT"
+rust-version = "1.94"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }

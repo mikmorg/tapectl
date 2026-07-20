@@ -279,6 +279,19 @@ pub fn run(
         }
 
         ArchiveSetCommands::Info { name } => {
+            type Row = (
+                i64,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                String,
+                String,
+            );
             let (
                 id,
                 desc,
@@ -291,19 +304,7 @@ pub fn run(
                 verify_days,
                 created,
                 updated,
-            ): (
-                i64,
-                Option<String>,
-                Option<i64>,
-                Option<String>,
-                Option<i64>,
-                Option<String>,
-                Option<String>,
-                Option<i64>,
-                Option<i64>,
-                String,
-                String,
-            ) = conn
+            ): Row = conn
                 .query_row(
                     "SELECT id, description, min_copies, required_locations, encrypt,
                             compression, checksum_mode, slice_size, verify_interval_days,

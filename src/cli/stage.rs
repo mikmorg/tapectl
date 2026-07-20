@@ -119,7 +119,7 @@ pub fn run(
             let unit = crate::db::queries::get_unit_by_name(conn, name)?
                 .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
 
-            let (ss_id, status, dar_ver, dar_cmd, num_slices, dar_size, enc_size, staged_at): (
+            type Row = (
                 i64,
                 String,
                 Option<String>,
@@ -128,8 +128,9 @@ pub fn run(
                 Option<i64>,
                 Option<i64>,
                 Option<String>,
-            ) = conn
-                .query_row(
+            );
+            let (ss_id, status, dar_ver, dar_cmd, num_slices, dar_size, enc_size, staged_at): Row =
+                conn.query_row(
                     "SELECT ss.id, ss.status, ss.dar_version, ss.dar_command,
                             ss.num_slices, ss.total_dar_size, ss.total_encrypted_size, ss.staged_at
                      FROM stage_sets ss

@@ -34,7 +34,7 @@ fn wrong_key_cannot_decrypt() {
     let mallory = keys::generate_keypair();
 
     let plaintext = b"secret archive data";
-    let ct = encrypt_data(plaintext, &[alice.public_key.clone()]).unwrap();
+    let ct = encrypt_data(plaintext, std::slice::from_ref(&alice.public_key)).unwrap();
 
     assert_eq!(decrypt_with(&ct, &alice.secret_key).unwrap(), plaintext);
     assert!(
@@ -47,7 +47,7 @@ fn wrong_key_cannot_decrypt() {
 fn tampered_ciphertext_fails_decrypt() {
     let kp = keys::generate_keypair();
     let plaintext = vec![42u8; 4096];
-    let mut ct = encrypt_data(&plaintext, &[kp.public_key.clone()]).unwrap();
+    let mut ct = encrypt_data(&plaintext, std::slice::from_ref(&kp.public_key)).unwrap();
 
     // Flip a byte in the payload region (skip the header — header corruption
     // produces a parse error rather than the authentication failure we want

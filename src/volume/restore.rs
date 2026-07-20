@@ -14,6 +14,8 @@ use crate::error::{Result, TapectlError};
 use crate::tape::ioctl::TapeDevice;
 
 /// Restore a unit from a volume to a destination directory.
+// Signature moves onto the store read seam in #71 (epic #20); interim allow.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_unit(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -176,6 +178,8 @@ pub fn restore_unit(
 }
 
 /// Restore a single file from a unit on a volume.
+// Signature moves onto the store read seam in #71 (epic #20); interim allow.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_file(
     conn: &Connection,
     paths: &TapectlPaths,
