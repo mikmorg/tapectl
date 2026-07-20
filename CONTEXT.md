@@ -89,3 +89,21 @@ RECOVERY.md. Operator conveniences (tapectl restore, catalog queries) are
 not on it.
 _Avoid_: emergency restore (ambiguous — also describes operator disaster
 recovery with tooling), raw recovery
+
+### Custody
+
+**Escrow Recipient**:
+The one identity that participates in every write and is never rotated.
+Its secret half lives on paper in physical custody, not on the machine;
+its presence is a precondition for key rotation. The stable line every
+future decrypt can fall back to.
+_Avoid_: backup key (collides with the operator's rotating backup alias),
+master key (implies it derives others; it doesn't)
+
+**Heir Kit**:
+The physical artifact set that survives the machine: the printed Escrow
+Recipient identity, cover instructions, and a catalog snapshot encrypted
+to the Escrow Recipient — held in tamper-evident envelopes in at least
+two independent failure domains, refreshed after each production write
+session.
+_Avoid_: escrow package, key envelope (one component, not the kit)
