@@ -9,12 +9,28 @@
 sudo apt install dar
 # or build from source for 2.7.20+
 
-# For virtual tape testing
-sudo apt install mhvtl lsscsi mt-st sg3-utils
+# For virtual tape testing — mhvtl is NOT packaged in Ubuntu; build from source
+sudo apt install lsscsi mt-st sg3-utils mtx
+git clone https://github.com/markh794/mhvtl.git && cd mhvtl
+make && sudo make install          # userspace daemons + systemd units
+
+# The kernel module must be registered with DKMS or every kernel update
+# silently kills mhvtl (module gone, /dev/nst0 disappears, gated tests
+# skip quietly). Copy kernel/ + include/ to /usr/src/mhvtl-<ver>/ with a
+# dkms.conf and run: dkms add/build/install -m mhvtl -v <ver>
+# This VM's working setup: /usr/src/mhvtl-1.8.0 (built 2026-07-20).
 
 # For real LTO hardware
 sudo apt install mt-st sg3-utils
 ```
+
+**After any kernel update:** DKMS rebuilds mhvtl automatically if registered
+(verify with `dkms status`). If `/dev/nst0` is missing, check
+`lsmod | grep mhvtl`, then `systemctl start mhvtl.target`. Note that SCSI
+enumeration can shuffle across module reloads — discover the changer with
+`lsscsi -g` (look for `mediumx`) rather than assuming `/dev/sg0`, and load a
+media-type-compatible cartridge for the drive (an L6 tape for a TD6 drive:
+`mtx -f <changer-sg> load <slot> <dte>`).
 
 ### 2. Initialize tapectl
 
