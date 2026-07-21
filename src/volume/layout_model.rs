@@ -25,11 +25,17 @@ pub enum ZoneKind {
     IdThunk,
     SystemGuide,
     RestoreSh,
+    /// The plaintext front index (File 3, layout v2 — ADR-0007). Replaces the
+    /// v1 mid-tape `MiniIndex`; carries per-file position/type/size and
+    /// ciphertext hashes.
+    FrontIndex,
     PlanningHeader,
     /// An encrypted data slice, keyed by `stage_slices.id`.
     Slice {
         stage_slice_id: i64,
     },
+    /// The v1 mid-tape mini-index. Retained for the v1 reader stub until the
+    /// write path flips to v2 (#22); superseded by `FrontIndex`.
     MiniIndex,
     /// A tenant envelope, keyed by `tenants.id`.
     TenantEnvelope {
@@ -37,6 +43,9 @@ pub enum ZoneKind {
     },
     OperatorEnvelope,
     OperatorEnvelopeBackup,
+    /// The plaintext trailing seal marker (last file, layout v2 — ADR-0007).
+    /// Its presence asserts completeness and binds the front index.
+    SealMarker,
 }
 
 impl ZoneKind {
@@ -46,12 +55,14 @@ impl ZoneKind {
             ZoneKind::IdThunk => "id_thunk",
             ZoneKind::SystemGuide => "system_guide",
             ZoneKind::RestoreSh => "restore_sh",
+            ZoneKind::FrontIndex => "front_index",
             ZoneKind::PlanningHeader => "planning_header",
             ZoneKind::Slice { .. } => "data_slice",
             ZoneKind::MiniIndex => "mini_index",
             ZoneKind::TenantEnvelope { .. } => "tenant_envelope",
             ZoneKind::OperatorEnvelope => "operator_envelope",
             ZoneKind::OperatorEnvelopeBackup => "operator_envelope",
+            ZoneKind::SealMarker => "seal_marker",
         }
     }
 

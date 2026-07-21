@@ -662,6 +662,99 @@ layout_version = 1
     s
 }
 
+/// One entry in the plaintext **front index** (File 3, layout v2). Navigation is
+/// total — every file has `position` and `type` — but `size_bytes` is `None` for
+/// the front index's own entry (its length is self-referential), and
+/// `sha256_encrypted` is `None` for both the front index itself (self-reference)
+/// and the seal marker (not yet written when File 3 is generated). See
+/// `docs/design/volume-format-v2.md` §3-4 and ADR-0007.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontIndexFile {
+    pub position: i32,
+    pub type_label: &'static str,
+    pub size_bytes: Option<u64>,
+    /// sha256 of the file's on-tape bytes (ciphertext for encrypted zones, the
+    /// plaintext bytes for Files 0-2). Hex; `None` where excluded (above).
+    pub sha256_encrypted: Option<String>,
+}
+
+/// Generate the plaintext **front index** (File 3, layout v2). It maps every
+/// tape position to its type and on-tape byte size, and carries the sha256 of
+/// every file's on-tape (encrypted) bytes except its own and the seal marker's —
+/// giving an heir keyless navigation and keyless byte-integrity with only `dd`
+/// and `sha256sum` (ADR-0007). It carries NO content metadata: no filenames, no
+/// plaintext-content hashes, no tenant/unit names — the isolation invariant of
+/// `volume-format-v2.md` §2. The ciphertext hashes are safe in plaintext because
+/// they hash pseudorandom age output and are non-attributable (D4).
+pub fn generate_front_index(label: &str, files: &[FrontIndexFile]) -> String {
+    let mut s = format!(
+        r#"================================================================
+                    TAPECTL FRONT INDEX
+================================================================
+
+Volume: {label}
+This file maps every tape position to its type, on-tape byte size, and
+the sha256 of its on-tape (encrypted) bytes. It contains NO content
+metadata: no filenames, no plaintext checksums, no tenant or unit names.
+The trailing seal marker binds this index by hash; see the system guide.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[index]
+volume = "{label}"
+layout_version = 2
+"#
+    );
+
+    for f in files {
+        s.push_str("\n[[files]]\n");
+        s.push_str(&format!("position = {}\n", f.position));
+        s.push_str(&format!("type = \"{}\"\n", f.type_label));
+        if let Some(sz) = f.size_bytes {
+            s.push_str(&format!("size_bytes = {sz}\n"));
+        }
+        if let Some(h) = &f.sha256_encrypted {
+            s.push_str(&format!("sha256_encrypted = \"{h}\"\n"));
+        }
+    }
+
+    s
+}
+
+/// Generate the plaintext **seal marker** (the last file, layout v2). Its
+/// presence is the completeness assertion — "every file before me is present" —
+/// and its `front_index_sha256` binds the front index, making the seal marker
+/// the unhashed root of the keyless integrity chain (seal marker → front index →
+/// every content file; ADR-0007, `volume-format-v2.md` §4). Its absence means
+/// the tape is legitimately unsealed (interrupted or EOT-aborted).
+pub fn generate_seal_marker(label: &str, file_count: i32, front_index_sha256: &str) -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    format!(
+        r#"================================================================
+                    TAPECTL SEAL MARKER
+================================================================
+
+Volume: {label}
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+It binds the front index by the sha256 below.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[seal]
+volume = "{label}"
+layout_version = 2
+file_count = {file_count}
+sealed_at = "{now}"
+front_index_sha256 = "{front_index_sha256}"
+"#
+    )
+}
+
 /// Generate MANIFEST.toml for a tenant envelope.
 pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestUnit]) -> String {
     let now = chrono::Utc::now().to_rfc3339();
@@ -883,6 +976,108 @@ mod tests {
             parsed.get("index").unwrap().get("volume").unwrap().as_str(),
             Some("EMPTY")
         );
+    }
+
+    #[test]
+    fn front_index_lists_every_file_with_hashes() {
+        let files = vec![
+            FrontIndexFile {
+                position: 0,
+                type_label: "id_thunk",
+                size_bytes: Some(500),
+                sha256_encrypted: Some("aa00".into()),
+            },
+            FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: None, // self: length is self-referential
+                sha256_encrypted: None, // self: cannot hash itself
+            },
+            FrontIndexFile {
+                position: 4,
+                type_label: "data_slice",
+                size_bytes: Some(524288),
+                sha256_encrypted: Some("bb11".into()),
+            },
+            FrontIndexFile {
+                position: 5,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None, // not yet written when File 3 is built
+            },
+        ];
+        let s = generate_front_index("TEST01", &files);
+        let body = &s[s.find("[index]").expect("has [index]")..];
+        let parsed: toml::Value = body.parse().expect("TOML parses");
+        let idx = parsed.get("index").unwrap();
+        assert_eq!(idx.get("volume").unwrap().as_str(), Some("TEST01"));
+        assert_eq!(idx.get("layout_version").unwrap().as_integer(), Some(2));
+
+        let arr = parsed.get("files").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        // File 0 carries size + hash.
+        assert_eq!(arr[0].get("position").unwrap().as_integer(), Some(0));
+        assert_eq!(arr[0].get("size_bytes").unwrap().as_integer(), Some(500));
+        assert_eq!(
+            arr[0].get("sha256_encrypted").unwrap().as_str(),
+            Some("aa00")
+        );
+        // The slice carries size + hash.
+        assert_eq!(arr[2].get("size_bytes").unwrap().as_integer(), Some(524288));
+        assert_eq!(
+            arr[2].get("sha256_encrypted").unwrap().as_str(),
+            Some("bb11")
+        );
+    }
+
+    #[test]
+    fn front_index_omits_self_and_seal_marker_hashes() {
+        // The hash-chain rule (ADR-0007): the front index carries no hash of
+        // itself (self-reference) or the seal marker (not yet written).
+        let files = vec![
+            FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: None,
+                sha256_encrypted: None,
+            },
+            FrontIndexFile {
+                position: 5,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None,
+            },
+        ];
+        let s = generate_front_index("TEST01", &files);
+        let body = &s[s.find("[index]").unwrap()..];
+        let parsed: toml::Value = body.parse().expect("TOML parses");
+        let arr = parsed.get("files").unwrap().as_array().unwrap();
+        // Both entries are navigable (position + type) but carry neither a
+        // size nor a hash.
+        for e in arr {
+            assert!(e.get("position").is_some());
+            assert!(e.get("type").is_some());
+            assert!(e.get("size_bytes").is_none());
+            assert!(e.get("sha256_encrypted").is_none());
+        }
+    }
+
+    #[test]
+    fn seal_marker_binds_front_index() {
+        let s = generate_seal_marker("TEST01", 7, "deadbeefcafe");
+        let body = &s[s.find("[seal]").expect("has [seal]")..];
+        let parsed: toml::Value = body.parse().expect("TOML parses");
+        let seal = parsed.get("seal").unwrap();
+        assert_eq!(seal.get("volume").unwrap().as_str(), Some("TEST01"));
+        assert_eq!(seal.get("layout_version").unwrap().as_integer(), Some(2));
+        assert_eq!(seal.get("file_count").unwrap().as_integer(), Some(7));
+        assert_eq!(
+            seal.get("front_index_sha256").unwrap().as_str(),
+            Some("deadbeefcafe")
+        );
+        // sealed_at is present and RFC3339-parseable.
+        let sealed_at = seal.get("sealed_at").unwrap().as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
     }
 
     #[test]
