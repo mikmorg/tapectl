@@ -47,24 +47,26 @@ claims until an operator reconciles them at contact.
 ### Writing
 
 **Layout**:
-The complete enumeration of every file a volume will hold — ID thunk through
-operator envelopes, with positions, sizes, and checksums. A value, constructed
-and validated before the first byte is written; all on-tape metadata is
-generated from it.
+The complete enumeration of every file a volume will hold — ID thunk and front
+index through the data slices and seal marker, with positions, sizes, and
+checksums. A value, constructed and validated before the first byte is written;
+all on-tape metadata is generated from it.
 _Avoid_: plan (collides with `volume plan` capacity preview), file list
 
 **Write Session**:
 One execution of a Layout onto a cartridge at contact, tracked by a cursor.
-Interruption and end-of-tape recovery are Layout transitions, not accidents;
-a session ends with the tape truthfully describing itself, or with the
-catalog knowing exactly why not.
+Interruption is a Layout transition, not an accident, and a real end-of-tape is
+a clean abort to an unsealed tape (a capacity mis-estimate, defended pre-flight);
+a session ends with the tape truthfully describing itself, or with the catalog
+knowing exactly why not.
 _Avoid_: write (the verb), job
 
 **Sealed**:
-The volume state after a session's confirm readback passes: the tape ends with
-valid metadata describing everything before it, and will never be written
-again. Only sealed volumes contribute claims to derivations. Sealed volumes
-are immutable; there is no append.
+The volume state after a session's confirm readback passes: the tape begins with
+a front index describing everything after it and ends with a seal marker
+asserting completeness, and it will never be written again. Only sealed volumes
+contribute claims to derivations. Sealed volumes are immutable; there is no
+append.
 _Avoid_: closed, finalized
 
 **Unsealed**:
@@ -84,9 +86,9 @@ _Avoid_: backup, replica
 **Heir Path**:
 The restore route that must work with only what is on the tape plus a key
 envelope — no database, no tapectl, no operator. What rides it: ID thunk,
-system guide, RESTORE.sh, mini-index, tenant/operator envelopes and their
-RECOVERY.md. Operator conveniences (tapectl restore, catalog queries) are
-not on it.
+system guide, RESTORE.sh, front index, seal marker, tenant/operator envelopes
+and their RECOVERY.md. Operator conveniences (tapectl restore, catalog queries)
+are not on it.
 _Avoid_: emergency restore (ambiguous — also describes operator disaster
 recovery with tooling), raw recovery
 
