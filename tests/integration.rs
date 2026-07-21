@@ -691,63 +691,61 @@ fn test_fts5_search() {
 
 // ── Encryption Key Tests ──
 
+/// Rotate the SAME tenant twice through the real `key rotate` code path (not a
+/// SQL simulation — replaces the old masking test per #31/T3). Before the H13
+/// fix the second rotation errored on the hardcoded `rotated-primary` filename
+/// collision *after* committing the deactivation, stranding the tenant with
+/// zero active keys.
 #[test]
-fn test_encryption_key_rotation() {
-    let (_tmp, conn, _home) = setup();
+fn test_key_rotate_twice_keeps_tenant_active() {
+    use tapectl::cli::key::KeyCommands;
+    let (_tmp, conn, home) = setup();
+    let paths = tapectl::config::TapectlPaths::new(home);
+    paths.ensure_dirs().unwrap();
 
-    conn.execute(
-        "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
-        [],
-    )
-    .unwrap();
-    let tid = conn.last_insert_rowid();
+    // Real setup: operator + tenant, each with generated primary + backup keys.
+    tapectl::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+    tapectl::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
 
-    // Create initial keys
-    conn.execute(
-        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
-         VALUES (?1, 'alice-primary', 'fp1', 'pk1', 'primary', 1)",
-        [tid],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
-         VALUES (?1, 'alice-backup', 'fp2', 'pk2', 'backup', 1)",
-        [tid],
-    )
-    .unwrap();
-
-    // Rotate: deactivate old, create new
-    conn.execute(
-        "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1 AND is_active = 1",
-        [tid],
-    )
-    .unwrap();
-
-    let active_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM encryption_keys WHERE tenant_id = ?1 AND is_active = 1",
-            [tid],
+    let active = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE t.name = ?1 AND k.is_active = 1",
+            [name],
             |r| r.get(0),
         )
-        .unwrap();
-    assert_eq!(active_count, 0);
-
-    // New keys
-    conn.execute(
-        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
-         VALUES (?1, 'alice-rotated', 'fp3', 'pk3', 'primary', 1)",
-        [tid],
-    )
-    .unwrap();
-
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM encryption_keys WHERE tenant_id = ?1",
-            [tid],
+        .unwrap()
+    };
+    let total = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE t.name = ?1",
+            [name],
             |r| r.get(0),
         )
-        .unwrap();
-    assert_eq!(total, 3); // Old keys preserved, never deleted
+        .unwrap()
+    };
+    assert_eq!(active("alice"), 2, "initial primary + backup active");
+
+    let rotate = KeyCommands::Rotate {
+        tenant: "alice".to_string(),
+    };
+    tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap();
+    assert_eq!(
+        active("alice"),
+        2,
+        "exactly one active pair after 1st rotation"
+    );
+
+    // The H13 reproduction: a second rotation must not strand the tenant.
+    tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap();
+    assert_eq!(
+        active("alice"),
+        2,
+        "tenant must keep an active key pair after a second rotation (H13)"
+    );
+    // Old keys are deactivated, never deleted (decrypt pre-rotation data).
+    assert_eq!(total("alice"), 6, "2 initial + 2 + 2 rotated, all retained");
 }
 
 // ── Policy Resolution Tests ──

@@ -155,16 +155,37 @@ pub fn run(
         }
         KeyCommands::Rotate { tenant } => {
             let t = crate::tenant::require_tenant(conn, tenant)?;
-            // Deactivate all current keys
-            let deactivated: usize = conn.execute(
+
+            // Serial suffix keeps every rotation's aliases (and key filenames)
+            // unique, so a repeat rotation never hits KeyAlreadyExists. That
+            // collision was the H13 bug: it failed *after* the deactivation had
+            // already committed, stranding the tenant with zero active keys.
+            // Key count only grows (rotation deactivates, never deletes), so
+            // this is monotonic and collision-free.
+            let seq: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM encryption_keys WHERE tenant_id = ?1",
+                rusqlite::params![t.id],
+                |r| r.get(0),
+            )?;
+            let p_suffix = format!("rotated-primary-{seq}");
+            let b_suffix = format!("rotated-backup-{seq}");
+            let p_alias = format!("{tenant}-{p_suffix}");
+            let b_alias = format!("{tenant}-{b_suffix}");
+
+            // Generate the key files first (filesystem side effects live outside
+            // the DB transaction; the unique suffixes guarantee no collision).
+            let primary = keys::generate_and_save(&paths.keys_dir, tenant, &p_suffix)?;
+            let backup = keys::generate_and_save(&paths.keys_dir, tenant, &b_suffix)?;
+
+            // Deactivate + insert atomically: a failure anywhere rolls the whole
+            // rotation back rather than leaving the tenant keyless.
+            let tx = conn.unchecked_transaction()?;
+            let deactivated: usize = tx.execute(
                 "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1 AND is_active = 1",
                 rusqlite::params![t.id],
             )?;
-            // Generate new primary + backup
-            let primary = keys::generate_and_save(&paths.keys_dir, tenant, "rotated-primary")?;
-            let p_alias = format!("{tenant}-rotated-primary");
             let p_id = queries::insert_key(
-                conn,
+                &tx,
                 t.id,
                 &p_alias,
                 &primary.fingerprint,
@@ -172,12 +193,9 @@ pub fn run(
                 "primary",
                 None,
             )?;
-            events::log_created(conn, "encryption_key", p_id, &p_alias, Some(t.id))?;
-
-            let backup = keys::generate_and_save(&paths.keys_dir, tenant, "rotated-backup")?;
-            let b_alias = format!("{tenant}-rotated-backup");
+            events::log_created(&tx, "encryption_key", p_id, &p_alias, Some(t.id))?;
             let b_id = queries::insert_key(
-                conn,
+                &tx,
                 t.id,
                 &b_alias,
                 &backup.fingerprint,
@@ -185,7 +203,8 @@ pub fn run(
                 "backup",
                 None,
             )?;
-            events::log_created(conn, "encryption_key", b_id, &b_alias, Some(t.id))?;
+            events::log_created(&tx, "encryption_key", b_id, &b_alias, Some(t.id))?;
+            tx.commit()?;
 
             if json_output {
                 println!(
