@@ -205,12 +205,26 @@ DEVICE="${TAPE_DEVICE:-/dev/nst0}"
 LABEL="__LABEL__"
 BLOCK=524288  # 512 KB — tapectl fixed block size
 
-WORK="${TMPDIR:-/tmp}/tapectl-restore-$$"
+umask 077  # decrypted plaintext and temp files must not be world-readable
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tapectl-restore.XXXXXX")" \
+  || { echo "FATAL: cannot create temporary directory" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK"
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 info() { echo ">>> $*"; }
+
+# Reject a value read from the plaintext ID thunk / mini-index that is not a
+# plain non-negative integer, BEFORE it is used in `$(( ))` arithmetic, `fsf`,
+# or `seq`. Those tape zones are unauthenticated; a crafted value such as
+# 'a[$(cmd)]' would otherwise execute inside arithmetic expansion. Called in
+# the current shell (not a subshell) so `die` halts the whole script.
+require_uint() {
+  local name=$1 val=$2
+  case "$val" in
+    ""|*[!0-9]*)
+      die "tape layout value '$name' is not a non-negative integer: '$val' — the tape may be damaged or tampered" ;;
+  esac
+}
 
 # ---- prerequisite check ----
 
@@ -297,8 +311,18 @@ read_layout() {
   NUM_ENV=$(toml_val    "$WORK/layout.toml" num_envelopes)
   OP_ENV=$(toml_val     "$WORK/layout.toml" operator_envelope)
   OP_BAK=$(toml_val     "$WORK/layout.toml" operator_envelope_backup)
+  CREATED=$(toml_val    "$WORK/layout.toml" created_at)
 
-  [ -n "$MINI_IDX" ] || die "cannot parse layout from ID thunk"
+  # Validate every value from the unauthenticated plaintext zones before any
+  # of them reaches arithmetic, `fsf`, or `seq` (S2 — tamper must refuse, not
+  # execute). MINI_IDX is used just below, so this must run first.
+  require_uint data_start "$DATA_START"
+  require_uint data_end "$DATA_END"
+  require_uint mini_index "$MINI_IDX"
+  require_uint first_envelope "$FIRST_ENV"
+  require_uint num_envelopes "$NUM_ENV"
+  require_uint operator_envelope "$OP_ENV"
+  require_uint operator_envelope_backup "$OP_BAK"
 
   info "Reading mini-index (file $MINI_IDX)..."
   read_tape_text "$MINI_IDX" "$WORK/mini_index.txt"
@@ -320,6 +344,10 @@ do_info() {
   echo "  Mini-index:        file  $MINI_IDX"
   echo "  Tenant envelopes:  files $FIRST_ENV .. $((FIRST_ENV + NUM_ENV - 1))  ($NUM_ENV total)"
   echo "  Operator envelope: file  $OP_ENV  (backup: $OP_BAK)"
+  echo "  Sealed:            ${CREATED:-unknown}"
+  echo ""
+  echo "This tape was sealed on ${CREATED:-an unknown date}. If newer backups"
+  echo "of the same data exist, they may hold more recent versions than this tape."
   echo ""
   echo "File map:"
   while IFS='|' read -r pos type size; do
@@ -967,5 +995,53 @@ mod tests {
         // Envelope is tar archive
         assert!(s.contains("tar xf"));
         assert!(s.contains("MANIFEST.toml"));
+    }
+
+    #[test]
+    fn restore_script_is_valid_bash() {
+        // T1 floor: the generated emergency script must at least parse.
+        let s = generate_restore_script("SYN01", 20);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, s.as_bytes()).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(f.path())
+            .output()
+            .expect("run bash -n");
+        assert!(
+            out.status.success(),
+            "RESTORE.sh failed bash -n: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn restore_script_is_hardened() {
+        let s = generate_restore_script("HARD1", 20);
+        // S2: every plaintext-tape value is integer-validated before use.
+        assert!(s.contains("require_uint()"));
+        for key in [
+            "data_start",
+            "data_end",
+            "mini_index",
+            "first_envelope",
+            "num_envelopes",
+            "operator_envelope",
+            "operator_envelope_backup",
+        ] {
+            assert!(
+                s.contains(&format!("require_uint {key} ")),
+                "missing require_uint for {key}"
+            );
+        }
+        // S7: no predictable temp path; mktemp + restrictive umask instead.
+        assert!(s.contains("mktemp -d"));
+        assert!(s.contains("umask 077"));
+        assert!(
+            !s.contains("tapectl-restore-$$"),
+            "predictable /tmp path leaked"
+        );
+        // S10 (cheap half): --info discloses the sealed date.
+        assert!(s.contains("This tape was sealed on"));
     }
 }
