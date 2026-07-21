@@ -121,8 +121,9 @@ check() { # check <name> <fn>
 EXPECTED_FAIL=(
     stage_symlink_unit        # H7  (#33): symlinks break staging
     restore_multislice_unit   # H8  (#34): >=10 slices mis-numbered on restore
-    heir_find_envelope        # H1  (#24): mini-index omits envelope entries
-    heir_restore              # H1  (#24)
+    # H1 fixed in #24: the mini-index is generated from the complete Layout, so
+    # it now lists the envelopes and the no-tapectl heir path works end-to-end
+    # (find-envelope + full restore, byte-identical).
 )
 
 # ---------- fixtures ----------
@@ -261,8 +262,11 @@ step_heir_extract() {
 step_heir_info() { (cd "$HEIR" && ./RESTORE.sh --info); }
 step_heir_find() { (cd "$HEIR" && ./RESTORE.sh --find-envelope --key "$HOME_DIR/keys/alice-primary.age.key"); }
 step_heir_restore() {
+    # RESTORE.sh extracts the unit's contents directly into --to (dar restores
+    # the unit's own tree), so compare that tree to the source directly — same
+    # shape as the tapectl restore_diff leg.
     (cd "$HEIR" && ./RESTORE.sh --restore --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered") \
-    && diff -r "$SRC/unitA" "$HEIR/recovered"/*unitA* 2>/dev/null
+    && diff -r "$SRC/unitA" "$HEIR/recovered"
 }
 echo "gate: leg 2 — heir leg (RESTORE.sh, no tapectl)"
 check heir_extract_script step_heir_extract

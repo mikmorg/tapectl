@@ -13,6 +13,34 @@ use crate::tape::health;
 use crate::tape::ioctl::TapeDevice;
 
 use super::layout;
+use super::layout_model::{ContentSource, LayoutEntry, ZoneKind};
+
+/// A generated (non-slice) zone entry for the Layout enumeration.
+fn gen_entry(position: i32, kind: ZoneKind, size: usize) -> LayoutEntry {
+    LayoutEntry {
+        position,
+        kind,
+        size_bytes: Some(size as u64),
+        sha256: None,
+        source: ContentSource::Generated,
+    }
+}
+
+/// Map the Layout enumeration to the mini-index generator's input. The
+/// mini-index is generated from this complete list — every file including the
+/// envelopes — so an heir can trim block padding on any of them (fixes H1).
+fn mini_index_tuples(entries: &[LayoutEntry]) -> Vec<(i32, &'static str, usize)> {
+    entries
+        .iter()
+        .map(|e| {
+            (
+                e.position,
+                e.kind.type_label(),
+                e.size_bytes.unwrap_or(0) as usize,
+            )
+        })
+        .collect()
+}
 
 /// Initialize a volume: create DB record and write ID thunk to tape.
 pub fn volume_init(
@@ -228,11 +256,18 @@ pub fn volume_write(
     }
 
     // == Files 4..N: Data slices ==
-    let mut file_index: Vec<(i32, &str, usize)> = vec![
-        (0, "id_thunk", id_thunk.len()),
-        (1, "system_guide", guide.len()),
-        (2, "restore_script", script.len()),
-        (3, "planning_header", planning_enc.len()),
+    // ADR-0002: all on-tape metadata (mini-index, envelope manifests) is
+    // generated from the complete Layout below, never from write order. So we
+    // record every file as a LayoutEntry as it is produced, encrypt the
+    // envelopes *before* the mini-index (to fix their sizes), then generate the
+    // mini-index from the full enumeration — which now includes the envelopes
+    // (fixes H1: the old mini-index was generated before the envelope entries
+    // existed, so RESTORE.sh could never trim their block padding).
+    let mut entries: Vec<LayoutEntry> = vec![
+        gen_entry(0, ZoneKind::IdThunk, id_thunk.len()),
+        gen_entry(1, ZoneKind::SystemGuide, guide.len()),
+        gen_entry(2, ZoneKind::RestoreSh, script.len()),
+        gen_entry(3, ZoneKind::PlanningHeader, planning_enc.len()),
     ];
 
     let mut bytes_written: i64 = 0;
@@ -267,7 +302,15 @@ pub fn volume_write(
         let written = tape.write_file_with_mark(&slice_data)?;
         bytes_written += written as i64;
 
-        file_index.push((tape_pos, "data_slice", slice_data.len()));
+        entries.push(LayoutEntry {
+            position: tape_pos,
+            kind: ZoneKind::Slice {
+                stage_slice_id: slice.slice_id,
+            },
+            size_bytes: Some(slice_data.len() as u64),
+            sha256: Some(actual_hash.clone()),
+            source: ContentSource::Staged(slice.staging_path.clone().into()),
+        });
         slice_write_map.insert(slice.slice_id, (slice.write_id, tape_pos));
 
         // Record write position
@@ -285,13 +328,11 @@ pub fn volume_write(
         );
     }
 
-    // == File N+1: Mini-index ==
-    let mini = layout::generate_mini_index(label, &file_index);
-    let _mini_written = tape.write_file_with_mark(mini.as_bytes())?;
-    file_index.push((mini_index_pos, "mini_index", mini.len()));
-    info!("wrote mini-index");
+    // == Encrypt all envelopes up front (fixes their sizes for the mini-index) ==
+    // (position, sync_mark, encrypted_bytes) — written after the mini-index, in
+    // position order.
+    let mut envelopes: Vec<(i32, bool, Vec<u8>)> = Vec::new();
 
-    // == Tenant envelopes ==
     for (env_idx, &tenant_id) in unique_tenants.iter().enumerate() {
         let tenant = queries::get_tenant_by_id(conn, tenant_id)?
             .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
@@ -308,26 +349,62 @@ pub fn volume_write(
         let encrypted = staging::encrypt_data(&tar_data, &all_keys)?;
 
         let env_pos = first_envelope_pos + env_idx as i32;
-        tape.write_file_with_mark(&encrypted)?;
-        file_index.push((env_pos, "tenant_envelope", encrypted.len()));
-        info!(tenant = %tenant.name, "wrote tenant envelope");
+        entries.push(LayoutEntry {
+            position: env_pos,
+            kind: ZoneKind::TenantEnvelope { tenant_id },
+            size_bytes: Some(encrypted.len() as u64),
+            sha256: None,
+            source: ContentSource::Generated,
+        });
+        envelopes.push((env_pos, false, encrypted));
     }
 
-    // == Operator envelope ==
     let all_manifest_units = build_manifest_units_all(&staged, &slice_write_map);
     let op_manifest = layout::generate_manifest_toml(label, "operator", &all_manifest_units);
     let op_recovery = layout::generate_recovery_md(label, "operator", &all_manifest_units);
     let op_tar = build_envelope_tar(&op_manifest, &op_recovery)?;
     let op_env_encrypted = staging::encrypt_data(&op_tar, &op_pubkeys)?;
+    entries.push(LayoutEntry {
+        position: op_envelope_pos,
+        kind: ZoneKind::OperatorEnvelope,
+        size_bytes: Some(op_env_encrypted.len() as u64),
+        sha256: None,
+        source: ContentSource::Generated,
+    });
+    entries.push(LayoutEntry {
+        position: op_backup_pos,
+        kind: ZoneKind::OperatorEnvelopeBackup,
+        size_bytes: Some(op_env_encrypted.len() as u64),
+        sha256: None,
+        source: ContentSource::Generated,
+    });
+    envelopes.push((op_envelope_pos, true, op_env_encrypted.clone()));
+    envelopes.push((op_backup_pos, true, op_env_encrypted));
 
-    tape.write_file_with_sync_mark(&op_env_encrypted)?;
-    file_index.push((op_envelope_pos, "operator_envelope", op_env_encrypted.len()));
-    info!("wrote operator envelope");
+    // == File N+1: Mini-index, generated from the complete Layout ==
+    // Include the mini-index's own entry, sized by a two-pass. Its self-size is
+    // informational (RESTORE.sh reads the mini-index by filemark, not by size);
+    // envelope and slice sizes — which the two-pass leaves exact — are what an
+    // heir consumes to trim block padding.
+    entries.push(gen_entry(mini_index_pos, ZoneKind::MiniIndex, 0));
+    entries.sort_by_key(|e| e.position);
+    let mini_len = layout::generate_mini_index(label, &mini_index_tuples(&entries)).len();
+    if let Some(mi) = entries.iter_mut().find(|e| e.kind == ZoneKind::MiniIndex) {
+        mi.size_bytes = Some(mini_len as u64);
+    }
+    let mini = layout::generate_mini_index(label, &mini_index_tuples(&entries));
+    tape.write_file_with_mark(mini.as_bytes())?;
+    info!("wrote mini-index");
 
-    // == Operator envelope backup ==
-    tape.write_file_with_sync_mark(&op_env_encrypted)?;
-    file_index.push((op_backup_pos, "operator_envelope", op_env_encrypted.len()));
-    info!("wrote operator envelope backup");
+    // == Write the pre-encrypted envelopes, in position order ==
+    for (pos, sync_mark, bytes) in &envelopes {
+        if *sync_mark {
+            tape.write_file_with_sync_mark(bytes)?;
+        } else {
+            tape.write_file_with_mark(bytes)?;
+        }
+        info!(position = pos, "wrote envelope");
+    }
 
     // Update DB atomically — all status changes commit together
     {
