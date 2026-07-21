@@ -54,10 +54,14 @@ gracefully if a v1 tape is ever found):
 **Ratified operator decisions (2026-07-21):**
 - **Ciphertext hashes in the plaintext front index — YES.** This relaxes the stated
   "zero checksums in plaintext" rule, ratified because `sha256_encrypted` is a hash of
-  age ciphertext (pseudorandom output, revealing nothing about content),
-  non-attributable to a tenant (slices unlabeled, envelopes shuffled), and computable
-  by anyone holding the tape — so it leaks nothing an observer couldn't derive, and the
-  format already shipped plaintext per-file sizes. `sha256_plain` (hash of decrypted
+  age ciphertext (pseudorandom output, revealing nothing about content) and
+  non-attributable to a tenant — no plaintext file carries any tenant identity, so a
+  slice or envelope entry is labeled only by kind — and computable by anyone holding
+  the tape, so it leaks nothing an observer couldn't derive, and the format already
+  shipped plaintext per-file sizes. (To also defeat *positional* correlation now that
+  hashes are published per position, the v2 write path orders tenant envelopes by a
+  deterministic `volume_uuid`-seeded permutation — `volume-format-v2.md` §2; the
+  non-attributability argument does not depend on it.) `sha256_plain` (hash of decrypted
   content) stays encrypted-only. The isolation invariant is retightened accordingly:
   no plaintext file reveals filenames, tenant/unit names, content sizes,
   plaintext-content hashes, or key fingerprints; on-tape byte sizes and ciphertext

@@ -41,7 +41,7 @@ filemark), in this fixed order:
 │ File 5  Tenant envelope enc(t+op+esc) ┐ MANIFEST.toml (filenames,            │
 │  ...    Tenant envelope enc(t+op+esc) │ sha256_plain, dar command, slice      │
 │ File j   Operator env    enc(op+esc)  │ positions), RECOVERY.md, catalogs/.   │
-│ File j+1 Operator backup enc(op+esc)  ┘ Tenant envelopes in shuffled order.   │
+│ File j+1 Operator backup enc(op+esc)  ┘ Tenant envelopes in position order.   │
 ├──── BULK: encrypted data (the mass of the tape) ──────────────────────────────┤
 │ File j+2 Data slice     enc(t+op+esc) ┐ age(dar base.N.dar). One unit's       │
 │  ...     Data slice     enc(t+op+esc) │ slices contiguous. The ONLY zone a    │
@@ -81,9 +81,21 @@ filemark), in this fixed order:
 **Isolation invariant (v2, normative).** No plaintext file on the tape may reveal:
 filenames, tenant or unit names, plaintext-content sizes, plaintext-content hashes
 (`sha256_plain`), or key fingerprints. Permitted in plaintext, because they are
-structural and non-attributable to any tenant (slices are unlabeled, envelopes are
-shuffled) and computable by anyone holding the tape: per-file **on-tape byte sizes**
+structural and non-attributable to any tenant — no plaintext file carries a tenant
+identity, so a `data_slice` or `tenant_envelope` entry is labeled only by kind, and
+the value is computable by anyone holding the tape: per-file **on-tape byte sizes**
 and per-file **ciphertext hashes** (`sha256_encrypted`).
+
+**Envelope ordering.** Because the front index publishes a ciphertext hash *per
+position*, envelope order must not become a side channel that re-attaches a hash to
+a tenant. Non-attributability holds regardless (no tenant identity is in plaintext,
+and each hash is over pseudorandom age output), but to also defeat positional
+correlation the write path SHOULD order the tenant envelopes by a **deterministic
+permutation seeded by `volume_uuid`** — deterministic so Layout construction stays
+reproducible (layout-session.md), UUID-seeded so the order is not the raw
+`tenant_id` sequence. *Status:* the shipped v1 write path orders by `tenant_id`; the
+permutation lands with the v2 write flip (#22/#24). Until then the invariant above
+still holds — the drift is positional-correlation hardening, not a plaintext leak.
 
 This tightens — and deliberately relaxes one clause of — the v1 rule ("no
 sizes/hashes in plaintext"), which the v1 format already violated by shipping
