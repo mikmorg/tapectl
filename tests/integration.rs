@@ -1542,3 +1542,94 @@ fn test_export_selects_single_stage_set() {
         "placeholder leaked into RECOVERY.md"
     );
 }
+
+// ── Capacity gate (#28, #8 silent-bad-copy fix) ──
+
+/// `volume_write` must refuse before writing when the staged data won't fit the
+/// tape — the #8 dry-run showed the old path wrote past end-of-tape, reported
+/// success, and left dead slices with the snapshot marked current.
+#[test]
+fn test_volume_write_refuses_over_capacity() {
+    use tapectl::config::{Config, LtoBackendConfig, TapectlPaths};
+    let (tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'big', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let snap = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap],
+    )
+    .unwrap();
+    let ss = conn.last_insert_rowid();
+    // One 5 MB encrypted slice — far larger than the 1 MB volume below.
+    conn.execute(
+        "INSERT INTO stage_slices
+            (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+         VALUES (?1, 1, 5000000, 5242880, 'p', 'e', '/nonexistent/slice.dar.age')",
+        [ss],
+    )
+    .unwrap();
+
+    // A 1 MB volume — the staged 5 MB cannot fit.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-CAP', 'lto', 'p', 'LTO-6', 1048576, 'initialized')",
+        [],
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.backends.lto.push(LtoBackendConfig {
+        name: "p".into(),
+        device_tape: "/dev/null".into(),
+        device_sg: "/dev/null".into(),
+        media_type: "LTO-6".into(),
+        nominal_capacity: "1M".into(),
+        usable_capacity_factor: 1.0,
+        manifest_reserve: "0".into(),
+        enospc_buffer: "0".into(),
+        block_size: "512K".into(),
+        hardware_compression: false,
+    });
+    let paths = TapectlPaths::new(tmp.path().to_path_buf());
+
+    // The gate fires before the store is opened, so the bogus device is never touched.
+    let err = tapectl::volume::write::volume_write(
+        &conn,
+        &paths,
+        &config,
+        "L6-CAP",
+        "/dev/null",
+        512 * 1024,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("capacity"),
+        "expected a capacity refusal, got: {msg}"
+    );
+
+    // Nothing was written: no write rows, volume still 'initialized'.
+    let writes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(writes, 0, "capacity refusal must not create write records");
+}

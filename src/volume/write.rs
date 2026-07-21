@@ -141,6 +141,50 @@ pub fn volume_write(
         ));
     }
 
+    // Pre-write capacity gate (§2.8): refuse if the staged data will not fit,
+    // rather than writing past end-of-tape and silently producing an incomplete
+    // copy (the failure the #8 dry-run reproduced — the write reported success
+    // with dead slices and the snapshot marked current). mhvtl reports
+    // non-physical MAM capacity, so gate on the configured nominal capacity,
+    // which is reliable; MAM is populated below for the record only.
+    {
+        let capacity_bytes: i64 = conn
+            .query_row(
+                "SELECT capacity_bytes FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let (reserve, block) = config
+            .backends
+            .lto
+            .first()
+            .map(|b| {
+                (
+                    staging::parse_size_to_bytes(&b.manifest_reserve)
+                        + staging::parse_size_to_bytes(&b.enospc_buffer),
+                    block_size as u64,
+                )
+            })
+            .unwrap_or((0, block_size as u64));
+        let staged_on_tape: i64 = staged
+            .iter()
+            .flat_map(|u| &u.slices)
+            .map(|s| {
+                super::layout_model::pad_to_blocks(s.encrypted_bytes.max(0) as u64, block) as i64
+            })
+            .sum();
+        if capacity_bytes > 0 && staged_on_tape + reserve > capacity_bytes {
+            return Err(TapectlError::Other(format!(
+                "staged data ({} MB, block-padded) + reserve ({} MB) exceeds volume \"{label}\" \
+                 capacity ({} MB) — it will not fit; use a larger tape or split the write",
+                staged_on_tape / (1024 * 1024),
+                reserve / (1024 * 1024),
+                capacity_bytes / (1024 * 1024),
+            )));
+        }
+    }
+
     // Create write records and assign write_ids to staged units
     let mut write_ids: Vec<(i64, i64)> = Vec::new();
     for ss in &mut staged {
@@ -163,8 +207,24 @@ pub fn volume_write(
         "writing to volume {label}"
     );
 
-    // Open the store (rewinds to BOT) — writes go through the ADR-0006 seam.
+    // Open the store (rewinds to BOT, disables compression) — writes go through
+    // the ADR-0006 seam.
     let mut store = TapeStore::open(device, block_size)?;
+
+    // Record the cartridge's MAM (informational; mhvtl reports non-physical
+    // values). Best-effort — a read failure never blocks the write.
+    if let Some(bk) = config.backends.lto.first() {
+        match crate::tape::mam::read_mam(&bk.device_sg) {
+            Ok(mam) => {
+                let _ = conn.execute(
+                    "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
+                     WHERE id = ?3",
+                    params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
+                );
+            }
+            Err(e) => warn!(err = %e, "MAM read failed (continuing)"),
+        }
+    }
 
     // Collect all slices in order for writing
     let all_slices: Vec<&SliceInfo> = staged.iter().flat_map(|s| &s.slices).collect();

@@ -27,10 +27,15 @@ pub struct TapeStore {
 }
 
 impl TapeStore {
-    /// Open the drive and rewind to BOT, ready to write File 0.
+    /// Open the drive and rewind to BOT, ready to write File 0. Hardware
+    /// compression is disabled best-effort (encrypted data is incompressible;
+    /// §2.8) — a drive that rejects the op is only logged, not failed.
     pub fn open(device: &str, block_size: usize) -> Result<Self> {
         let dev = TapeDevice::open(device, block_size)?;
         dev.rewind()?;
+        if let Err(e) = dev.disable_compression() {
+            tracing::warn!(err = %e, "could not disable hardware compression (continuing)");
+        }
         Ok(Self { dev })
     }
 }
