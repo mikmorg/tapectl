@@ -189,6 +189,17 @@ pub fn stage_create(
     // Step 4: Encrypt slices
     info!("encrypting slices");
     let tenant_keys = queries::get_active_keys_for_tenant(conn, unit.tenant_id)?;
+    // Refuse rather than silently encrypt operator-only: a tenant with zero
+    // active keys (e.g. an interrupted rotation, pre-H13 fix) would otherwise
+    // produce slices the tenant can never decrypt themselves.
+    if tenant_keys.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "tenant for unit \"{}\" has no active keys — refusing to encrypt \
+             (the tenant could not decrypt its own data); run `tapectl key rotate` \
+             or restore the tenant's keys first",
+            unit.name
+        )));
+    }
     let operator = queries::get_operator_tenant(conn)?
         .ok_or_else(|| TapectlError::Other("no operator tenant".into()))?;
     let operator_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
