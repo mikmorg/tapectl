@@ -15,6 +15,7 @@ const MTWEOFI: i16 = 35;
 const MTSETBLK: i16 = 20;
 const MTFSF: i16 = 1;
 const MTEOM: i16 = 12;
+const MTCOMP: i16 = 32; // MTCOMPRESSION
 
 #[repr(C)]
 struct MtOp {
@@ -105,6 +106,13 @@ impl TapeDevice {
     /// Rewind tape to beginning.
     pub fn rewind(&self) -> Result<()> {
         self.mt_ioctl(MTREW, 0)
+    }
+
+    /// Disable the drive's hardware compression. Encrypted data is
+    /// incompressible, so compression only wastes drive effort; the design
+    /// (§2.8) requires it off. Best-effort — some drives/mhvtl reject the op.
+    pub fn disable_compression(&self) -> Result<()> {
+        self.mt_ioctl(MTCOMP, 0)
     }
 
     /// Write a file mark (immediate, no flush).
