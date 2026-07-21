@@ -1519,4 +1519,26 @@ fn test_export_selects_single_stage_set() {
         copied.iter().all(|n| n.starts_with("new_")),
         "leaked old stage set: {copied:?}"
     );
+
+    // The RECOVERY.md verification recipe (#29) must actually work: run the
+    // exact `sha256sum -c SHA256SUMS` step an heir would, in the export dir.
+    let sums = dest.join("SHA256SUMS");
+    assert!(sums.exists(), "SHA256SUMS must be written");
+    let status = std::process::Command::new("sha256sum")
+        .arg("-c")
+        .arg("SHA256SUMS")
+        .current_dir(&dest)
+        .status()
+        .expect("run sha256sum -c");
+    assert!(
+        status.success(),
+        "sha256sum -c SHA256SUMS must pass on the export"
+    );
+
+    let recovery = std::fs::read_to_string(dest.join("RECOVERY.md")).unwrap();
+    assert!(recovery.contains("sha256sum -c SHA256SUMS"));
+    assert!(
+        !recovery.contains("ARCHIVE_BASE"),
+        "placeholder leaked into RECOVERY.md"
+    );
 }
