@@ -558,18 +558,20 @@ pub fn generate_planning_header(
 status = "planned"
 volume = "{label}"
 planned_at = "{now}"
-
-[[units]]
 "#
     );
 
+    // One `[[units]]` header per unit — emitting it once before the loop put
+    // every unit's keys into the same table, producing duplicate-key invalid
+    // TOML for any multi-unit volume (T14).
     for (name, uuid, slices, bytes) in units {
         s.push_str(&format!(
-            r#"name = "{name}"
+            r#"
+[[units]]
+name = "{name}"
 uuid = "{uuid}"
 num_slices = {slices}
 total_bytes = {bytes}
-
 "#
         ));
     }
@@ -793,12 +795,18 @@ mod tests {
             ("beta".to_string(), "uuid-b".to_string(), 1, 500),
         ];
         let s = generate_planning_header("LAB01", &units);
-        assert!(s.contains("volume = \"LAB01\""));
-        assert!(s.contains("name = \"alpha\""));
-        assert!(s.contains("uuid = \"uuid-a\""));
-        assert!(s.contains("num_slices = 3"));
-        assert!(s.contains("total_bytes = 10000"));
-        assert!(s.contains("name = \"beta\""));
+        // Must be valid TOML with TWO distinct [[units]] entries — the old
+        // single-[[units]] form produced duplicate keys and failed to parse
+        // for any multi-unit volume (T14).
+        let parsed: toml::Value = s.parse().expect("planning header must be valid TOML");
+        assert_eq!(parsed["planning"]["volume"].as_str(), Some("LAB01"));
+        let units_arr = parsed["units"].as_array().expect("units array");
+        assert_eq!(units_arr.len(), 2);
+        assert_eq!(units_arr[0]["name"].as_str(), Some("alpha"));
+        assert_eq!(units_arr[0]["num_slices"].as_integer(), Some(3));
+        assert_eq!(units_arr[0]["total_bytes"].as_integer(), Some(10_000));
+        assert_eq!(units_arr[1]["name"].as_str(), Some("beta"));
+        assert_eq!(units_arr[1]["uuid"].as_str(), Some("uuid-b"));
     }
 
     #[test]
