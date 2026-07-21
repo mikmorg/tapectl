@@ -12,6 +12,8 @@ use crate::staging;
 use crate::tape::health;
 use crate::tape::ioctl::TapeDevice;
 
+use crate::store::{Store, TapeStore};
+
 use super::layout;
 use super::layout_model::{ContentSource, LayoutEntry, ZoneKind};
 
@@ -82,9 +84,8 @@ pub fn volume_init(
     )?;
     let volume_id = conn.last_insert_rowid();
 
-    // Write ID thunk to tape
-    let mut tape = TapeDevice::open(device, block_size)?;
-    tape.rewind()?;
+    // Write ID thunk to tape through the store seam (ADR-0006).
+    let mut store = TapeStore::open(device, block_size)?;
 
     let id_thunk = layout::generate_id_thunk(
         label,
@@ -107,7 +108,7 @@ pub fn volume_init(
         0,
     );
 
-    tape.write_file_with_mark(id_thunk.as_bytes())?;
+    store.execute(id_thunk.as_bytes(), false)?;
     info!(label = label, "volume initialized");
 
     events::log_created(conn, "volume", volume_id, label, None)?;
@@ -162,9 +163,8 @@ pub fn volume_write(
         "writing to volume {label}"
     );
 
-    // Open tape and rewind
-    let mut tape = TapeDevice::open(device, block_size)?;
-    tape.rewind()?;
+    // Open the store (rewinds to BOT) — writes go through the ADR-0006 seam.
+    let mut store = TapeStore::open(device, block_size)?;
 
     // Collect all slices in order for writing
     let all_slices: Vec<&SliceInfo> = staged.iter().flat_map(|s| &s.slices).collect();
@@ -211,17 +211,17 @@ pub fn volume_write(
         0,
         0,
     );
-    tape.write_file_with_mark(id_thunk.as_bytes())?;
+    store.execute(id_thunk.as_bytes(), false)?;
     info!("wrote file 0: ID thunk");
 
     // == File 1: System guide ==
     let guide = layout::generate_system_guide(label, total_files);
-    tape.write_file_with_mark(guide.as_bytes())?;
+    store.execute(guide.as_bytes(), false)?;
     info!("wrote file 1: system guide");
 
     // == File 2: RESTORE.sh ==
     let script = layout::generate_restore_script(label, total_files);
-    tape.write_file_with_mark(script.as_bytes())?;
+    store.execute(script.as_bytes(), false)?;
     info!("wrote file 2: RESTORE.sh");
 
     // == File 3: Planning header (encrypted to operator) ==
@@ -243,7 +243,7 @@ pub fn volume_write(
         .collect();
     let planning = layout::generate_planning_header(label, &plan_units);
     let planning_enc = staging::encrypt_data(planning.as_bytes(), &op_pubkeys)?;
-    tape.write_file_with_mark(&planning_enc)?;
+    store.execute(&planning_enc, false)?;
     info!("wrote file 3: planning header");
 
     // Update write status
@@ -299,7 +299,7 @@ pub fn volume_write(
         }
 
         // Write to tape
-        let written = tape.write_file_with_mark(&slice_data)?;
+        let written = store.execute(&slice_data, false)?;
         bytes_written += written as i64;
 
         entries.push(LayoutEntry {
@@ -393,16 +393,12 @@ pub fn volume_write(
         mi.size_bytes = Some(mini_len as u64);
     }
     let mini = layout::generate_mini_index(label, &mini_index_tuples(&entries));
-    tape.write_file_with_mark(mini.as_bytes())?;
+    store.execute(mini.as_bytes(), false)?;
     info!("wrote mini-index");
 
     // == Write the pre-encrypted envelopes, in position order ==
     for (pos, sync_mark, bytes) in &envelopes {
-        if *sync_mark {
-            tape.write_file_with_sync_mark(bytes)?;
-        } else {
-            tape.write_file_with_mark(bytes)?;
-        }
+        store.execute(bytes, *sync_mark)?;
         info!(position = pos, "wrote envelope");
     }
 

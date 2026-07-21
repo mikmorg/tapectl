@@ -13,3 +13,4 @@ pub mod tape;
 pub mod volume;
 
 pub mod policy;
+pub mod store;
