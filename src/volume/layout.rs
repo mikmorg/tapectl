@@ -39,14 +39,16 @@ an open-source archival storage tool.
 
 To read the next file (the full recovery guide):
 
+    mt -f /dev/nst0 setblk 524288
     mt -f /dev/nst0 fsf 1
-    dd if=/dev/nst0 bs=64k > GUIDE.md
+    dd if=/dev/nst0 bs=512k | tr -d '\\0' > GUIDE.md
     less GUIDE.md
 
 If you just read this file and the tape is already positioned
 past it, read the next file directly:
 
-    dd if=/dev/nst0 bs=64k > GUIDE.md
+    mt -f /dev/nst0 setblk 524288
+    dd if=/dev/nst0 bs=512k | tr -d '\\0' > GUIDE.md
 
 The guide explains everything: what tools you need, how to find
 your encryption key, and how to recover your data step by step.
@@ -155,6 +157,21 @@ padded with zeros to the next block boundary. Encrypted files (data
 slices, envelopes) MUST be trimmed to their exact byte size before
 decryption — the padding zeros will cause age to reject the ciphertext.
 Exact sizes are in the mini-index (`size_bytes` field).
+
+## What the unencrypted parts of this tape reveal
+
+Files 0-3 (except the encrypted planning header), the mini-index, and the
+tape's block structure are plaintext. Anyone holding the physical tape can
+therefore learn a limited set of *structural* facts — but no content:
+
+- the volume label, creation date, and tapectl version;
+- how many tenants share this tape (the number of envelopes);
+- how many data slices there are, and the exact byte size of every slice
+  and envelope (needed so an heir can trim block padding).
+
+They CANNOT learn filenames, unit or tenant names, file sizes, checksums,
+ownership, or any file content — all of that lives only inside the
+age-encrypted slices and envelopes.
 
 ## Total files on this tape: {total_files}
 "#
@@ -658,33 +675,78 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
         "# Recovery Guide for {tenant_name}\n\n\
          Volume: {label}\n\
          Date: {now}\n\n\
-         ## Units on this tape\n\n"
+         This tape holds age-encrypted `dar` archives. With your age key and the\n\
+         standard tools (`mt`, `dd`, `truncate`, `age`, `dar`, `sha256sum`) you can\n\
+         recover your data by hand — no tapectl required. The automated `RESTORE.sh`\n\
+         (tape file 2) does exactly these steps for you; use it if you can.\n\n\
+         ## Units in this envelope\n\n\
+         | Unit | Snapshot | Slices | Tape files |\n\
+         |------|----------|--------|------------|\n"
     );
+    for unit in units {
+        let (first, last) = match (unit.slices.first(), unit.slices.last()) {
+            (Some(f), Some(l)) => (f.tape_position, l.tape_position),
+            _ => (0, 0),
+        };
+        s.push_str(&format!(
+            "| {} | v{} | {} | {}..{} |\n",
+            unit.name,
+            unit.snapshot_version,
+            unit.slices.len(),
+            first,
+            last,
+        ));
+    }
+    s.push('\n');
 
     for unit in units {
         s.push_str(&format!(
-            "### {}\n\n\
-             UUID: {}\n\
-             Snapshot version: {}\n\
-             Slices: {}\n\n\
-             To restore:\n\n\
-             ```bash\n",
-            unit.name,
-            unit.uuid,
-            unit.snapshot_version,
-            unit.slices.len(),
+            "## {}\n\n\
+             UUID: `{}`  ·  snapshot v{}\n\n\
+             Put the drive in fixed 512KB block mode, then read, trim, verify and\n\
+             decrypt each slice:\n\n\
+             ```bash\n\
+             mt -f /dev/nst0 setblk 524288\n\n",
+            unit.name, unit.uuid, unit.snapshot_version,
         ));
         for slice in &unit.slices {
+            // The number in `restore.N.dar` MUST be dar's slice number, and the
+            // slices MUST share the base name `restore` — this is dar's required
+            // `base.N.dar` convention. `truncate` trims the 512KB block padding
+            // that would otherwise make age reject the ciphertext.
             s.push_str(&format!(
-                "# Slice {} (tape file {})\n\
-                 mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {}\n\
-                 dd if=/dev/nst0 bs=512k > slice_{}.dar.age\n\
-                 age -d -i YOUR_KEY.age.key slice_{0}.dar.age > slice_{0}.dar\n\n",
-                slice.number, slice.tape_position, slice.tape_position, slice.number,
+                "# Slice {n} — tape file {pos}, {eb} bytes\n\
+                 mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {pos}\n\
+                 dd if=/dev/nst0 bs=512k of=restore.{n}.dar.age\n\
+                 truncate -s {eb} restore.{n}.dar.age\n\
+                 echo \"{sha}  restore.{n}.dar.age\" | sha256sum -c -\n\
+                 age -d -i YOUR_KEY.age.key restore.{n}.dar.age > restore.{n}.dar\n\n",
+                n = slice.number,
+                pos = slice.tape_position,
+                eb = slice.encrypted_bytes,
+                sha = slice.sha256_encrypted,
             ));
         }
-        s.push_str("# Reassemble and extract:\ndar -x ARCHIVE_BASE -R /destination -O\n```\n\n");
+        s.push_str(
+            "# Reassemble and extract all slices (they share the base name `restore`):\n\
+             dar -x restore -R /destination -O -Q\n\
+             ```\n\n\
+             `-O` ignores stored ownership, needed when restoring as a non-root user.\n\n",
+        );
     }
+
+    s.push_str(
+        "## Troubleshooting\n\n\
+         - **age: \"unexpected data\" / decryption fails** — the slice still has 512KB\n\
+           block padding. Re-run `truncate -s <bytes>` to the exact size shown above.\n\
+         - **dar: cannot open the archive** — the decrypted slices must be named\n\
+           `restore.1.dar`, `restore.2.dar`, … with no gaps, and extracted with\n\
+           `dar -x restore` (base name `restore`, no `.N.dar` suffix in the command).\n\
+         - **sha256 mismatch** — re-read the slice from tape; a short read or the wrong\n\
+           block mode (must be 512KB fixed) is the usual cause.\n\
+         - **wrong key** — `age` decryption silently fails with a foreign key; use the\n\
+           key issued for this tenant (or the operator key, which can read every unit).\n",
+    );
 
     s
 }
@@ -807,6 +869,39 @@ mod tests {
         assert_eq!(units_arr[0]["total_bytes"].as_integer(), Some(10_000));
         assert_eq!(units_arr[1]["name"].as_str(), Some("beta"));
         assert_eq!(units_arr[1]["uuid"].as_str(), Some("uuid-b"));
+    }
+
+    #[test]
+    fn tenant_recovery_md_has_working_dar_recipe() {
+        // The generated manual recipe must match what the (gate-verified)
+        // RESTORE.sh does: truncate to encrypted_bytes, restore.N.dar naming,
+        // `dar -x restore`. The old recipe (H2) had none of these.
+        let units = vec![ManifestUnit {
+            name: "alpha".into(),
+            uuid: "uuid-a".into(),
+            snapshot_version: 2,
+            dar_version: Some("2.7.20".into()),
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: 4,
+                size_bytes: 1_048_576,
+                encrypted_bytes: 1_049_000,
+                sha256_plain: "abc".into(),
+                sha256_encrypted: "def456".into(),
+            }],
+        }];
+        let s = generate_recovery_md("LAB01", "alice", &units);
+        // Correct commands present:
+        assert!(s.contains("mt -f /dev/nst0 setblk 524288"));
+        assert!(s.contains("dd if=/dev/nst0 bs=512k of=restore.1.dar.age"));
+        assert!(s.contains("truncate -s 1049000 restore.1.dar.age"));
+        assert!(s.contains("def456  restore.1.dar.age")); // sha256sum -c line
+        assert!(s.contains("> restore.1.dar"));
+        assert!(s.contains("dar -x restore -R /destination -O -Q"));
+        // Broken forms from H2 must be gone:
+        assert!(!s.contains("slice_1.dar"), "old slice_N naming leaked");
+        assert!(!s.contains("ARCHIVE_BASE"), "placeholder leaked");
+        assert!(!s.contains("bs=64k"));
     }
 
     #[test]

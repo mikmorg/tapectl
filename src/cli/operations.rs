@@ -428,6 +428,29 @@ pub fn export_unit(
     }
     fs::write(Path::new(dest_dir).join("MANIFEST.toml"), &manifest)?;
 
+    // SHA256SUMS in the exact format `sha256sum -c` expects — "<hash>  <file>",
+    // two spaces. The old awk-in-RECOVERY.md recipe emitted three spaces, which
+    // sha256sum rejects, so the documented verification step always failed.
+    let mut sums = String::new();
+    for (_num, filename, _size, sha256) in &manifest_entries {
+        sums.push_str(&format!("{sha256}  {filename}\n"));
+    }
+    fs::write(Path::new(dest_dir).join("SHA256SUMS"), &sums)?;
+
+    // Archive base = the common `base.N.dar` prefix of the exported slices
+    // (strip the `.N.dar.age` suffix), so RECOVERY.md can name the exact
+    // `dar -x` argument instead of an ARCHIVE_BASE placeholder.
+    let archive_base = manifest_entries
+        .first()
+        .map(|(_, f, _, _)| {
+            let stem = f.strip_suffix(".dar.age").unwrap_or(f);
+            stem.rsplit_once('.')
+                .map(|(b, _)| b)
+                .unwrap_or(stem)
+                .to_string()
+        })
+        .unwrap_or_else(|| "archive".to_string());
+
     // Write RECOVERY.md
     let recovery = format!(
         "# Recovery Instructions\n\n\
@@ -438,11 +461,9 @@ pub fn export_unit(
          - `dar` >= 2.6\n\
          - The age secret key used to encrypt this data\n\n\
          ### Steps\n\n\
-         1. Verify checksums against MANIFEST.toml:\n\
+         1. Verify the encrypted slices against their checksums:\n\
          ```bash\n\
-         sha256sum -c <(grep sha256 MANIFEST.toml | sed 's/.*= \"//;s/\"$//' | \\\n\
-           paste - <(grep 'file = ' MANIFEST.toml | sed 's/.*= \"//;s/\"$//') | \\\n\
-           awk '{{print $1, \" \", $2}}')\n\
+         sha256sum -c SHA256SUMS\n\
          ```\n\n\
          2. Decrypt each slice:\n\
          ```bash\n\
@@ -450,12 +471,11 @@ pub fn export_unit(
            age -d -i YOUR_KEY.age.key -o \"${{f%.age}}\" \"$f\"\n\
          done\n\
          ```\n\n\
-         3. Extract with dar:\n\
+         3. Extract with dar (the slices share the base name `{archive_base}`):\n\
          ```bash\n\
-         dar -x ARCHIVE_BASE -R /destination/path\n\
+         dar -x {archive_base} -R /destination/path -O -Q\n\
          ```\n\
-         Where ARCHIVE_BASE is the common prefix of the .N.dar files\n\
-         (e.g., if files are `archive.1.dar`, `archive.2.dar`, use `archive`).\n",
+         `-O` ignores stored ownership, needed when restoring as a non-root user.\n",
     );
     fs::write(Path::new(dest_dir).join("RECOVERY.md"), &recovery)?;
 
