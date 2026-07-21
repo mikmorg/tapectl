@@ -342,25 +342,37 @@ pub fn export_unit(
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
-    // Find latest staged slices with checksums for manifest
+    // Select a SINGLE stage_set — the latest staged one for this unit — so the
+    // export never interleaves slices from two dar runs (H11). Two stage sets
+    // staged simultaneously (a re-stage, or two versions) would otherwise land
+    // duplicate slice numbers in one directory and an heir following
+    // RECOVERY.md would get an ambiguous, unrestorable set.
+    let (stage_set_id, snapshot_version): (i64, i64) = conn
+        .query_row(
+            "SELECT ss.id, s.version
+             FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             WHERE s.unit_id = ?1 AND ss.status = 'staged'
+             ORDER BY ss.created_at DESC, ss.id DESC
+             LIMIT 1",
+            params![unit.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            TapectlError::Other(format!(
+                "no staged slices for unit \"{unit_name}\" — run `tapectl stage create` first"
+            ))
+        })?;
+
     let mut stmt = conn.prepare(
-        "SELECT sl.staging_path, sl.slice_number, sl.encrypted_bytes,
-                sl.sha256_encrypted, s.version
+        "SELECT sl.staging_path, sl.slice_number, sl.encrypted_bytes, sl.sha256_encrypted
          FROM stage_slices sl
-         JOIN stage_sets ss ON ss.id = sl.stage_set_id
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         WHERE s.unit_id = ?1 AND ss.status = 'staged' AND sl.staging_path IS NOT NULL
+         WHERE sl.stage_set_id = ?1 AND sl.staging_path IS NOT NULL
          ORDER BY sl.slice_number",
     )?;
-    let slices: Vec<(String, i64, i64, String, i64)> = stmt
-        .query_map(params![unit.id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
+    let slices: Vec<(String, i64, i64, String)> = stmt
+        .query_map(params![stage_set_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -373,9 +385,8 @@ pub fn export_unit(
     fs::create_dir_all(dest_dir)?;
     let mut total = 0i64;
     let mut manifest_entries = Vec::new();
-    let snapshot_version = slices[0].4;
 
-    for (src, num, size, sha256, _ver) in &slices {
+    for (src, num, size, sha256) in &slices {
         let src_path = Path::new(src);
         let file_name = src_path
             .file_name()
@@ -396,6 +407,7 @@ pub fn export_unit(
          [export]\n\
          unit = \"{unit_name}\"\n\
          snapshot_version = {snapshot_version}\n\
+         stage_set_id = {stage_set_id}\n\
          total_slices = {}\n\
          total_bytes = {total}\n\
          exported_at = \"{}\"\n\n\

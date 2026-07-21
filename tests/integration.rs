@@ -1419,3 +1419,106 @@ fn test_config_default_values() {
     );
     assert!(defaults.get("encrypt").unwrap().as_bool().unwrap());
 }
+
+// ── Export (H11 regression, #37) ──
+
+/// With two stage sets staged for the same unit, `export_unit` must select
+/// exactly ONE (the latest) — never interleave slices from both, which would
+/// produce duplicate slice numbers and an ambiguous, unrestorable directory.
+#[test]
+fn test_export_selects_single_stage_set() {
+    use sha2::{Digest, Sha256};
+    let (tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+
+    // Two staged stage sets: v1 (older) and v2 (newer), each with two slices,
+    // with real files on disk so the copy succeeds.
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let mk_stage_set = |version: i64, tag: &str| -> i64 {
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, ?2, 'full', 'current', '/tmp')",
+            rusqlite::params![uid, version],
+        )
+        .unwrap();
+        let snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+            [snap],
+        )
+        .unwrap();
+        let ss = conn.last_insert_rowid();
+        for num in 1..=2i64 {
+            let fname = format!("{tag}_v{version}.{num}.dar.age");
+            let path = staging.join(&fname);
+            let bytes = format!("{tag}-slice-{num}").into_bytes();
+            std::fs::write(&path, &bytes).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let sha = format!("{:x}", hasher.finalize());
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, ?2, 100, ?3, 'p', ?4, ?5)",
+                rusqlite::params![ss, num, bytes.len() as i64, sha, path.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        ss
+    };
+    mk_stage_set(1, "old");
+    let ss2 = mk_stage_set(2, "new");
+
+    let dest = tmp.path().join("export-out");
+    tapectl::cli::operations::export_unit(&conn, "unit1", dest.to_str().unwrap(), false).unwrap();
+
+    let manifest = std::fs::read_to_string(dest.join("MANIFEST.toml")).unwrap();
+    let parsed: toml::Value = manifest.parse().expect("MANIFEST.toml must be valid TOML");
+    let export = parsed.get("export").unwrap();
+
+    // Exactly the latest stage set (v2), exactly its two slices — not four.
+    assert_eq!(
+        export.get("snapshot_version").unwrap().as_integer(),
+        Some(2)
+    );
+    assert_eq!(export.get("stage_set_id").unwrap().as_integer(), Some(ss2));
+    assert_eq!(export.get("total_slices").unwrap().as_integer(), Some(2));
+
+    let slices = parsed.get("slices").unwrap().as_array().unwrap();
+    assert_eq!(
+        slices.len(),
+        2,
+        "must export one stage set's slices, not both"
+    );
+    let nums: Vec<i64> = slices
+        .iter()
+        .map(|s| s.get("number").unwrap().as_integer().unwrap())
+        .collect();
+    assert_eq!(nums, vec![1, 2], "no duplicate slice numbers");
+
+    // Only the v2 files were copied; no old_* files leaked in.
+    let copied: Vec<String> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".dar.age"))
+        .collect();
+    assert_eq!(copied.len(), 2);
+    assert!(
+        copied.iter().all(|n| n.starts_with("new_")),
+        "leaked old stage set: {copied:?}"
+    );
+}
