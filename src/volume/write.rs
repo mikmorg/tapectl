@@ -405,7 +405,13 @@ pub fn volume_write(
         let recovery = layout::generate_recovery_md(label, &tenant.name, &manifest_units);
 
         // Build tar archive with MANIFEST.toml + RECOVERY.md
-        let tar_data = build_envelope_tar(&manifest, &recovery)?;
+        let catalogs: Vec<(String, Vec<u8>)> = staged
+            .iter()
+            .filter(|s| s.tenant_id == tenant_id)
+            .filter_map(|s| s.catalog_path.as_deref())
+            .flat_map(read_catalog_files)
+            .collect();
+        let tar_data = build_envelope_tar(&manifest, &recovery, &catalogs)?;
         let encrypted = staging::encrypt_data(&tar_data, &all_keys)?;
 
         let env_pos = first_envelope_pos + env_idx as i32;
@@ -422,7 +428,12 @@ pub fn volume_write(
     let all_manifest_units = build_manifest_units_all(&staged, &slice_write_map);
     let op_manifest = layout::generate_manifest_toml(label, "operator", &all_manifest_units);
     let op_recovery = layout::generate_recovery_md(label, "operator", &all_manifest_units);
-    let op_tar = build_envelope_tar(&op_manifest, &op_recovery)?;
+    let all_catalogs: Vec<(String, Vec<u8>)> = staged
+        .iter()
+        .filter_map(|s| s.catalog_path.as_deref())
+        .flat_map(read_catalog_files)
+        .collect();
+    let op_tar = build_envelope_tar(&op_manifest, &op_recovery, &all_catalogs)?;
     let op_env_encrypted = staging::encrypt_data(&op_tar, &op_pubkeys)?;
     entries.push(LayoutEntry {
         position: op_envelope_pos,
@@ -1071,6 +1082,8 @@ struct StagedUnit {
     unit_uuid: String,
     tenant_id: i64,
     dar_version: Option<String>,
+    dar_command: Option<String>,
+    catalog_path: Option<String>,
     snapshot_version: i64,
     slices: Vec<SliceInfo>,
 }
@@ -1096,7 +1109,7 @@ pub struct VerifyReport {
 fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
-                ss.dar_version, s.version
+                ss.dar_version, ss.dar_command, ss.catalog_path, s.version
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
@@ -1104,7 +1117,17 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
          ORDER BY u.name",
     )?;
 
-    type Row = (i64, i64, String, String, i64, Option<String>, i64);
+    type Row = (
+        i64,
+        i64,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+    );
     let rows: Vec<Row> = stmt
         .query_map([], |row| {
             Ok((
@@ -1115,12 +1138,14 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut units = Vec::new();
-    for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, snap_ver) in rows {
+    for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, dar_cmd, catalog_path, snap_ver) in rows {
         // Get write_id for this stage_set (created in the caller — check if exists)
         let write_id: i64 = conn
             .query_row(
@@ -1158,6 +1183,8 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
                 unit_uuid: uuid,
                 tenant_id,
                 dar_version: dar_ver,
+                dar_command: dar_cmd,
+                catalog_path,
                 snapshot_version: snap_ver,
                 slices,
             });
@@ -1178,7 +1205,9 @@ fn build_manifest_units(
             name: s.unit_name.clone(),
             uuid: s.unit_uuid.clone(),
             snapshot_version: s.snapshot_version,
+            stage_set_id: s.stage_set_id,
             dar_version: s.dar_version.clone(),
+            dar_command: s.dar_command.clone(),
             slices: s
                 .slices
                 .iter()
@@ -1208,7 +1237,9 @@ fn build_manifest_units_all(
             name: s.unit_name.clone(),
             uuid: s.unit_uuid.clone(),
             snapshot_version: s.snapshot_version,
+            stage_set_id: s.stage_set_id,
             dar_version: s.dar_version.clone(),
+            dar_command: s.dar_command.clone(),
             slices: s
                 .slices
                 .iter()
@@ -1228,7 +1259,34 @@ fn build_manifest_units_all(
         .collect()
 }
 
-fn build_envelope_tar(manifest: &str, recovery: &str) -> Result<Vec<u8>> {
+/// Read a unit's isolated dar catalogue slice files (catalog_base.N.dar) for
+/// inclusion in an envelope. Best-effort: a missing catalogue yields no files.
+fn read_catalog_files(catalog_path: &str) -> Vec<(String, Vec<u8>)> {
+    let base = std::path::Path::new(catalog_path);
+    let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|f| f.to_str())) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.");
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if fname.starts_with(&prefix) && fname.ends_with(".dar") {
+                if let Ok(bytes) = fs::read(e.path()) {
+                    out.push((fname, bytes));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn build_envelope_tar(
+    manifest: &str,
+    recovery: &str,
+    catalogs: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>> {
     let mut tar_buf = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_buf);
@@ -1251,6 +1309,18 @@ fn build_envelope_tar(manifest: &str, recovery: &str) -> Result<Vec<u8>> {
         header.set_cksum();
         builder.append(&header, recovery_bytes).unwrap();
 
+        // Per-unit isolated dar catalogues under catalogs/ — an heir can list
+        // contents (`dar -l`) and selectively restore without the database (#39).
+        for (name, bytes) in catalogs {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(format!("catalogs/{name}")).unwrap();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(chrono::Utc::now().timestamp() as u64);
+            header.set_cksum();
+            builder.append(&header, bytes.as_slice()).unwrap();
+        }
+
         builder.finish().unwrap();
     }
     Ok(tar_buf)
@@ -1259,4 +1329,28 @@ fn build_envelope_tar(manifest: &str, recovery: &str) -> Result<Vec<u8>> {
 fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_tar_includes_catalogues() {
+        // #39: per-unit dar catalogues ride the envelope under catalogs/.
+        let cats = vec![("abcd_v1.1.dar".to_string(), b"catalogue-bytes".to_vec())];
+        let tar = build_envelope_tar("[manifest]\n", "# recovery\n", &cats).unwrap();
+        let mut ar = tar::Archive::new(std::io::Cursor::new(tar));
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"MANIFEST.toml".to_string()));
+        assert!(names.contains(&"RECOVERY.md".to_string()));
+        assert!(
+            names.contains(&"catalogs/abcd_v1.1.dar".to_string()),
+            "catalogue missing from envelope: {names:?}"
+        );
+    }
 }

@@ -677,11 +677,16 @@ layout_version = 1
 
     for unit in units {
         s.push_str(&format!(
-            "[[units]]\nname = \"{}\"\nuuid = \"{}\"\nsnapshot_version = {}\n",
-            unit.name, unit.uuid, unit.snapshot_version,
+            "[[units]]\nname = \"{}\"\nuuid = \"{}\"\nsnapshot_version = {}\nstage_set_id = {}\n",
+            unit.name, unit.uuid, unit.snapshot_version, unit.stage_set_id,
         ));
         if let Some(ref dar_ver) = unit.dar_version {
             s.push_str(&format!("dar_version = \"{dar_ver}\"\n"));
+        }
+        if let Some(ref cmd) = unit.dar_command {
+            // TOML basic-string escape for the command line.
+            let esc = cmd.replace('\\', "\\\\").replace('"', "\\\"");
+            s.push_str(&format!("dar_command = \"{esc}\"\n"));
         }
         s.push('\n');
         for slice in &unit.slices {
@@ -783,7 +788,9 @@ pub struct ManifestUnit {
     pub name: String,
     pub uuid: String,
     pub snapshot_version: i64,
+    pub stage_set_id: i64,
     pub dar_version: Option<String>,
+    pub dar_command: Option<String>,
     pub slices: Vec<ManifestSlice>,
 }
 
@@ -908,7 +915,9 @@ mod tests {
             name: "alpha".into(),
             uuid: "uuid-a".into(),
             snapshot_version: 2,
+            stage_set_id: 7,
             dar_version: Some("2.7.20".into()),
+            dar_command: Some("dar -c base -R /src".into()),
             slices: vec![ManifestSlice {
                 number: 1,
                 tape_position: 4,
@@ -938,7 +947,9 @@ mod tests {
             name: "alpha".into(),
             uuid: "uuid-a".into(),
             snapshot_version: 1,
+            stage_set_id: 7,
             dar_version: Some("2.7.20".into()),
+            dar_command: Some("dar -c base -R /src".into()),
             slices: vec![ManifestSlice {
                 number: 1,
                 tape_position: 4,
@@ -956,6 +967,12 @@ mod tests {
         let u = &parsed.get("units").unwrap().as_array().unwrap()[0];
         assert_eq!(u.get("name").unwrap().as_str(), Some("alpha"));
         assert_eq!(u.get("dar_version").unwrap().as_str(), Some("2.7.20"));
+        // #39: provenance fields for selective restore.
+        assert_eq!(u.get("stage_set_id").unwrap().as_integer(), Some(7));
+        assert_eq!(
+            u.get("dar_command").unwrap().as_str(),
+            Some("dar -c base -R /src")
+        );
         let slice = &u.get("slices").unwrap().as_array().unwrap()[0];
         assert_eq!(slice.get("number").unwrap().as_integer(), Some(1));
         assert_eq!(slice.get("tape_position").unwrap().as_integer(), Some(4));
