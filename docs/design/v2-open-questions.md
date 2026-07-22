@@ -9,6 +9,14 @@ cited from the tree were verified 2026-07-22 (schema in
 `src/db/migrations/001_initial.sql`; navigation in `src/volume/restore.rs`,
 `src/volume/write.rs`).
 
+**Working mode (operator directive, 2026-07-22): R&D phase.** Nothing on this
+sheet converts to backlog issues while the redesign is fluid — this sheet plus
+the design notes (`volume-format-v2.md`, `layout-session.md`) are the
+authoritative surface, iterated first-principles. The pre-existing session
+issues (#22–#28) are synced to the settled design **once, at R&D exit**, not
+continuously. Production staging disk is confirmed ample (operator);
+development-scale validation uses the §8 microcosm.
+
 ---
 
 ## 0. Already settled — do NOT reopen
@@ -306,15 +314,19 @@ stale data (§3.2's physics assumption).
 
 ## 6. Definition of ready — updated
 
-1. Operator answers §1.1 / §1.2 / §1.3 (one word each; leans are argued above).
-2. Fold §1 answers + §2 resolutions into `volume-format-v2.md` /
-   `layout-session.md` (§2.4 is already committed); re-spec stale issues
-   #22/#23/#25/#26/#27/#28 to v2 (round-1 §2.2 list, unchanged).
-3. Write migration 003 per §3.6; land #68 escrow against it.
-4. Stand up §4.1 + §4.2 harnesses (failing) — then build #22 against them.
+1. ~~Operator answers §1.1 / §1.2 / §1.3~~ **DONE 2026-07-22** (embedded copy /
+   integrity default / 10G), plus the §7 rulings (F1 accepted, folder=unit,
+   alphabetical first-fit).
+2. Fold remaining §2 resolutions into the design notes as they are built
+   (§2.4 committed; §2.1/2.2/2.3/2.5/2.6 fold in with the #22 work that
+   implements them). Stale-issue re-spec is **deferred to R&D exit** (working
+   mode, above) — the build targets this sheet + the spec directly.
+3. Write migration 003 per §3.6; escrow (#68's substance) lands against it.
+4. Stand up §4.1 + §4.2 harnesses (failing), at §8 microcosm scale — then
+   build the write-path flip against them.
 
-Everything else on this sheet is done on paper. After step 1, nothing awaits a
-human until the #22 PR review.
+Everything else on this sheet is done on paper; nothing awaits a human until
+the flip is reviewable.
 
 ---
 
@@ -363,3 +375,52 @@ as a unit (~1,900 units / ~280 per tape / ~14 cartridges at 2 copies).
 - Scale sanity (holds fine): ~450 tape files/tape, front index ~54 KB, padding
   ~72 MB/tape (0.003%), operator envelope single-digit MB, SQLite tens of
   thousands of rows, ~280 dar spawns per batch. S = 10 G stands for this class.
+
+---
+
+## 8. Microcosm test model — ~1/1024 scale (adopted 2026-07-22)
+
+R&D validation emulates production as a byte-scaled microcosm: **bytes shrink
+1024×, counts stay 1:1**. The combinatorics — where the bugs live: hundreds of
+units per tape, batch boundaries, selector fills, catalog scale, heir search
+among hundreds of folders — remain production-realistic, while a **full-fleet
+drill fits in ~34 G** on mhvtl and current /scratch. It is a *config + fixture
+profile only*: no mhvtl changes (virtual media just needs ≥2.4 G backing; the
+capacity gate reads tapectl config, and mhvtl cannot enforce physical capacity
+anyway).
+
+| Quantity | Production | Microcosm | Rule |
+|---|---|---|---|
+| Nominal tape capacity | 2400 G | **2400 M** | ÷1024 |
+| Usable-capacity factor | 0.92 | 0.92 | dimensionless |
+| Slice size | 10 G | **10 M** | ÷1024 |
+| Unit (folder) sizes | 2–15 G | **2–15 M** | ÷1024 |
+| Units per tape | ~280 | **~280** | counts preserved |
+| Tape files per tape | ~290 | ~290 | counts preserved |
+| ENOSPC buffer | 50 M | **8 M** | NOT ÷1024 (50 K < one block); a few blocks |
+| Block size | 512 K | **512 K** | **format constant — never scales** |
+| Two-copy fleet (15 T library) | ~14 cartridges | ~14 virtual tapes ≈ 34 G | ÷1024 |
+| Batch staging footprint | ~2.2 T | ~2.2 G | ÷1024 |
+
+**Known distortions — all accepted, none load-bearing:**
+- **Block padding ≈ 3% of tape vs 0.003%** (fixed 512 K blocks against 1024×
+  smaller files). Conservative: the padded-size capacity math and the trim
+  contract get exercised *harder*, not weaker.
+- **Metadata fraction ~0.3% vs 0.0003%** — harmless.
+- **Timing/throughput are meaningless** (mhvtl runs at RAM speed): performance
+  claims stay with the gated perf suite and real hardware only.
+- **Physical EOT remains untestable** (mhvtl silently corrupts overflow instead
+  of ENOSPC): microcosm capacity tests exercise the pre-flight gate's *math*
+  (config-driven); the clean-abort trigger stays on the LTO-6 checklist.
+- Per-object constants (age header ~hundreds of bytes, dar headers) do not
+  scale — at 2–15 M objects they are ~0.01%, still noise.
+
+**Fixture generator** (lands with the §4 harness, which runs at this scale):
+seeded and deterministic — N folders with sizes drawn 2–15 M, media-shaped
+contents (one dominant file ≈ 90% plus small sidecars; avoid default-excluded
+patterns like `*.nfo`/`*.tmp`), content bytes derived from the seed so restore
+verification is an exact diff. Consumers: the §4.1 MemStore synthetic-heir
+harness (small N), the mhvtl e2e v2 legs (~280 units/tape, full front-index +
+seal-marker chain walk), and multi-tape selector drills (~600 units → 2+ tapes;
+assert alphabetical first-fit produces name-ordered tape spines and ~99%+ fill
+net of the padding distortion).
