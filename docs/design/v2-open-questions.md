@@ -315,3 +315,51 @@ stale data (§3.2's physics assumption).
 
 Everything else on this sheet is done on paper. After step 1, nothing awaits a
 human until the #22 PR review.
+
+---
+
+## 7. Media-library workload probe (2026-07-22) — findings & rulings
+
+Adversarial probe: thousands of folder-units, 2–15 G each, each folder restorable
+as a unit (~1,900 units / ~280 per tape / ~14 cartridges at 2 copies).
+
+- **Mapping ruling: folder = unit.** Mega-units die on full-only re-stage
+  economics (append-mostly library: one new folder must not re-archive 2 TB) and
+  on heir granularity (RESTORE.sh restores units). Middle groupings inherit both
+  problems. Bonus: alphabetical unit ordering ≈ meaningful adjacency for flat
+  folder libraries.
+- **F1 size-fingerprint channel: ACCEPTED (operator ruling).** One-slice-per-unit
+  makes the front index's size column ≈ per-folder content sizes — a correlation
+  fingerprint against publicly known media. Ruled out of threat model; invariant
+  reworded in `volume-format-v2.md` §2 (plaintext hashes are tape-integrity-only;
+  size disclosure stated and accepted; guide disclosure line rides #22).
+  Quantized padding declined.
+- **Hash boundary confirmed as already-shipped design:** `sha256_encrypted` in
+  plaintext for tape integrity only; `sha256_plain` and all content metadata
+  encrypted-only (envelope manifests + catalog); the catalog itself rides each
+  volume encrypted (#83) and survives the machine via the Heir Kit (#69), which
+  at this unit granularity is the heir's primary "which tape holds folder X"
+  index.
+- **F2+F3 → the "Library" concept (proposed, not yet filed):** one config block
+  per library root instead of per-folder ceremony —
+  `[[libraries]] name/root/tenant/unit_depth` (+ excludes, archive_set binding).
+  `library sync` = walk root at `unit_depth`, auto-register new child folders as
+  units, then batch-snapshot/stage dirty+new, then fill tape-sized batches.
+  Identity stays dotfile-anchored (uuid in the sidecar is what already makes
+  `discover` rename-proof); an optional dotfile-less mode (path-keyed identity)
+  for read-only sources trades away rename robustness. `unit_depth` per library
+  handles shapes like TV (`depth 2` = season-units, which finish and freeze,
+  vs. show-units, which grow forever under full-only).
+- **Packing ruling: alphabetical first-fit; full BFD rejected.** Unit contiguity
+  is inviolate regardless (a movie folder is never split across tapes). At 2–15 G
+  units vs 2.2 TB bins, any greedy fill wastes ≈ avg_unit/2 ≈ 4 G ≈ 0.2% per tape
+  (worst 0.7%); size-ordered BFD recovers ≤ 0.6% (~0.04 tapes across the fleet)
+  while destroying name-ordered "tape spines" (tape 9 = M–P), which have real
+  operational value. Optional tail-plug (fill the final gap with the next units
+  that fit, slightly out of order) recovers most of the remainder if ever wanted.
+- **F4:** staging GC retention extends to "until *every planned copy* is sealed"
+  (§3.5 wording), and real batches need staging space (a 2.2 TB batch does not
+  fit today's /scratch).
+- Scale sanity (holds fine): ~450 tape files/tape, front index ~54 KB, padding
+  ~72 MB/tape (0.003%), operator envelope single-digit MB, SQLite tens of
+  thousands of rows, ~280 dar spawns per batch. S = 10 G stands for this class.

@@ -80,12 +80,29 @@ filemark), in this fixed order:
 | **Seal marker (File M)** | **plaintext** | structural completeness assertion; its `front_index_sha256` is a hash of a plaintext file |
 
 **Isolation invariant (v2, normative).** No plaintext file on the tape may reveal:
-filenames, tenant or unit names, plaintext-content sizes, plaintext-content hashes
-(`sha256_plain`), or key fingerprints. Permitted in plaintext, because they are
-structural and non-attributable to any tenant — no plaintext file carries a tenant
-identity, so a `data_slice` or `tenant_envelope` entry is labeled only by kind, and
-the value is computable by anyone holding the tape: per-file **on-tape byte sizes**
-and per-file **ciphertext hashes** (`sha256_encrypted`).
+filenames, tenant or unit names, plaintext-content hashes (`sha256_plain`), or key
+fingerprints. Permitted in plaintext: per-file **on-tape byte sizes** and per-file
+**ciphertext hashes** (`sha256_encrypted`) — structural facts, not attributable to
+any tenant (no plaintext file carries a tenant identity; a `data_slice` or
+`tenant_envelope` entry is labeled only by kind) and computable by anyone holding
+the tape. Roles are strict: the plaintext hashes exist **solely to verify tape
+integrity** (the keyless chain, §4–§5) and are never content claims; content hashes
+and all content metadata live only inside the encrypted envelopes and the catalog —
+which itself rides each volume encrypted (the operator envelope's catalog snapshot,
+#83) and survives the machine via the Heir Kit (#69).
+
+**Accepted disclosure (operator ruling, 2026-07-22).** Encryption overhead is
+deterministic and compression is off, so an on-tape size approximates the content
+size it encloses — and at fine unit granularity (one folder = one unit = one slice,
+the media-library shape) the size column effectively discloses per-unit content
+sizes and unit boundaries, which a correlator could in principle match against
+publicly known media sizes. The operator reviewed this size-fingerprint channel and
+**accepted it** (out of threat model; quantized padding was considered and declined
+as weak mitigation for real capacity cost). The system guide's disclosure section
+must state the inference plainly (rides the #22 guide regeneration). An earlier
+wording of this invariant forbade "plaintext-content sizes" while permitting
+"on-tape sizes" — a distinction that collapses at one-slice-per-unit; this ruling
+replaces it.
 
 **Envelope ordering.** Because the front index publishes a ciphertext hash *per
 position*, envelope order must not become a side channel that re-attaches a hash to
