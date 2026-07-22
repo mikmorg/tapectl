@@ -527,14 +527,12 @@ mod tests {
         let generated = generate_front_index("RT01", &files);
         let parsed = parse_front_index(&generated).unwrap();
         let violations = validate_consistency(&parsed);
-        assert!(violations.iter().any(|v| *v
-            == ConsistencyViolation::MissingSize {
-                position: victim_pos
-            }));
-        assert!(violations.iter().any(|v| *v
-            == ConsistencyViolation::MissingHash {
-                position: victim_pos
-            }));
+        assert!(violations.contains(&ConsistencyViolation::MissingSize {
+            position: victim_pos
+        }));
+        assert!(violations.contains(&ConsistencyViolation::MissingHash {
+            position: victim_pos
+        }));
         // The two self-referential exclusions stay exempt: the untouched
         // fixture (front_index entry bare, seal entry hash-less) is clean.
         let clean = validate_consistency(
