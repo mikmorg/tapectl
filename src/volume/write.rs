@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -84,8 +85,13 @@ pub fn volume_init(
     )?;
     let volume_id = conn.last_insert_rowid();
 
-    // Write ID thunk to tape through the store seam (ADR-0006).
-    let mut store = TapeStore::open(device, block_size)?;
+    // Write ID thunk to tape through the store seam (ADR-0006). usable_bytes
+    // (the T4 capacity oracle) is nominal capacity x the configured usable
+    // factor; volume_init only ever writes the provisional identity thunk,
+    // so this is informational at this stage (real capacity gating happens
+    // in volume_write).
+    let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     let id_thunk = layout::generate_id_thunk(
         label,
@@ -108,7 +114,11 @@ pub fn volume_init(
         0,
     );
 
-    store.execute(id_thunk.as_bytes(), false)?;
+    store.execute(
+        &mut Cursor::new(id_thunk.as_bytes()),
+        id_thunk.len() as u64,
+        false,
+    )?;
     info!(label = label, "volume initialized");
 
     events::log_created(conn, "volume", volume_id, label, None)?;
@@ -208,8 +218,19 @@ pub fn volume_write(
     );
 
     // Open the store (rewinds to BOT, disables compression) — writes go through
-    // the ADR-0006 seam.
-    let mut store = TapeStore::open(device, block_size)?;
+    // the ADR-0006 seam. usable_bytes is the T4 capacity oracle's answer
+    // (nominal capacity x the configured usable factor); the inline
+    // capacity gate above is the real pre-write defense today.
+    let usable_bytes = config
+        .backends
+        .lto
+        .first()
+        .map(|b| {
+            (staging::parse_size_to_bytes(&b.nominal_capacity) as f64 * b.usable_capacity_factor)
+                as u64
+        })
+        .unwrap_or(0);
+    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     // Record the cartridge's MAM (informational; mhvtl reports non-physical
     // values). Best-effort — a read failure never blocks the write.
@@ -271,17 +292,29 @@ pub fn volume_write(
         0,
         0,
     );
-    store.execute(id_thunk.as_bytes(), false)?;
+    store.execute(
+        &mut Cursor::new(id_thunk.as_bytes()),
+        id_thunk.len() as u64,
+        false,
+    )?;
     info!("wrote file 0: ID thunk");
 
     // == File 1: System guide ==
     let guide = layout::generate_system_guide(label, total_files);
-    store.execute(guide.as_bytes(), false)?;
+    store.execute(
+        &mut Cursor::new(guide.as_bytes()),
+        guide.len() as u64,
+        false,
+    )?;
     info!("wrote file 1: system guide");
 
     // == File 2: RESTORE.sh ==
     let script = layout::generate_restore_script(label, total_files);
-    store.execute(script.as_bytes(), false)?;
+    store.execute(
+        &mut Cursor::new(script.as_bytes()),
+        script.len() as u64,
+        false,
+    )?;
     info!("wrote file 2: RESTORE.sh");
 
     // == File 3: Planning header (encrypted to operator) ==
@@ -303,7 +336,11 @@ pub fn volume_write(
         .collect();
     let planning = layout::generate_planning_header(label, &plan_units);
     let planning_enc = staging::encrypt_data(planning.as_bytes(), &op_pubkeys)?;
-    store.execute(&planning_enc, false)?;
+    store.execute(
+        &mut Cursor::new(planning_enc.as_slice()),
+        planning_enc.len() as u64,
+        false,
+    )?;
     info!("wrote file 3: planning header");
 
     // Update write status
@@ -359,7 +396,11 @@ pub fn volume_write(
         }
 
         // Write to tape
-        let written = store.execute(&slice_data, false)?;
+        let written = store.execute(
+            &mut Cursor::new(slice_data.as_slice()),
+            slice_data.len() as u64,
+            false,
+        )?;
         bytes_written += written as i64;
 
         entries.push(LayoutEntry {
@@ -464,12 +505,16 @@ pub fn volume_write(
         mi.size_bytes = Some(mini_len as u64);
     }
     let mini = layout::generate_mini_index(label, &mini_index_tuples(&entries));
-    store.execute(mini.as_bytes(), false)?;
+    store.execute(&mut Cursor::new(mini.as_bytes()), mini.len() as u64, false)?;
     info!("wrote mini-index");
 
     // == Write the pre-encrypted envelopes, in position order ==
     for (pos, sync_mark, bytes) in &envelopes {
-        store.execute(bytes, *sync_mark)?;
+        store.execute(
+            &mut Cursor::new(bytes.as_slice()),
+            bytes.len() as u64,
+            *sync_mark,
+        )?;
         info!(position = pos, "wrote envelope");
     }
 

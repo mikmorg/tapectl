@@ -213,4 +213,83 @@ impl TapeDevice {
         self.write_filemark_sync()?;
         Ok(written)
     }
+
+    /// Stream-write `len` bytes from `src` in `block_size` chunks, zero-padding
+    /// the final partial block to the block boundary, followed by a file mark
+    /// (synchronous if `sync`). Unlike `write_data`/`write_file_with_mark`
+    /// (whole-buffer, kept intact for the v1 read/write paths), peak memory
+    /// here is one block, never `len` (the H9 streaming requirement,
+    /// `docs/design/volume-format-v2.md` §7 / layout-session.md's Store seam).
+    /// Returns the number of bytes committed to the medium including padding
+    /// (`layout_model::pad_to_blocks(len, block_size)`).
+    pub fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        let bs = self.block_size.max(1);
+        let mut buf = vec![0u8; bs];
+        let mut remaining = len;
+        let mut committed = 0u64;
+
+        while remaining > 0 {
+            let want = remaining.min(bs as u64) as usize;
+            let mut got = 0usize;
+            while got < want {
+                let n = src
+                    .read(&mut buf[got..want])
+                    .map_err(|e| TapectlError::TapeIo(format!("read source: {e}")))?;
+                if n == 0 {
+                    return Err(TapectlError::TapeIo(format!(
+                        "source exhausted after {got} of {want} bytes wanted \
+                         (declared length {len}, {remaining} remaining)"
+                    )));
+                }
+                got += n;
+            }
+            if want < bs {
+                for b in &mut buf[want..] {
+                    *b = 0;
+                }
+            }
+            self.file
+                .write_all(&buf[..bs])
+                .map_err(|e| TapectlError::TapeIo(format!("write: {e}")))?;
+            committed += bs as u64;
+            remaining -= want as u64;
+        }
+
+        if sync {
+            self.write_filemark_sync()?;
+        } else {
+            self.write_filemark_immediate()?;
+        }
+        Ok(committed)
+    }
+
+    /// Stream-read one "file" from tape (all data until the next file mark),
+    /// writing each block straight to `sink` as it arrives instead of
+    /// accumulating in memory (unlike `read_file`, kept intact for the v1
+    /// paths). Returns the total bytes read — the on-tape (padded) length;
+    /// trimming to the true size is the caller's job, since only the front
+    /// index knows it. Same block-mode / ENOSPC-as-filemark reading
+    /// convention as `read_file`.
+    pub fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<u64> {
+        let mut total = 0u64;
+        let read_size = if self.block_size > 0 {
+            self.block_size
+        } else {
+            1024 * 1024
+        };
+        let mut buf = vec![0u8; read_size];
+        loop {
+            match self.file.read(&mut buf) {
+                Ok(0) => break, // file mark
+                Ok(n) => {
+                    sink.write_all(&buf[..n])
+                        .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
+                    total += n as u64;
+                }
+                Err(e) if e.raw_os_error() == Some(28) => break, // ENOSPC
+                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
+            }
+        }
+        Ok(total)
+    }
 }
