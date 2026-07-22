@@ -708,6 +708,16 @@ layout_version = 2
 "#
     );
 
+    append_files_entries(&mut s, files);
+
+    s
+}
+
+/// Emit `[[files]]` entries in the line-oriented grammar shared by the front
+/// index and the seal marker's embedded copy (one `key = value` per line — the
+/// shell-parseable contract RESTORE.sh depends on). One emitter so the two
+/// cannot drift.
+fn append_files_entries(s: &mut String, files: &[FrontIndexFile]) {
     for f in files {
         s.push_str("\n[[files]]\n");
         s.push_str(&format!("position = {}\n", f.position));
@@ -719,8 +729,6 @@ layout_version = 2
             s.push_str(&format!("sha256_encrypted = \"{h}\"\n"));
         }
     }
-
-    s
 }
 
 /// Generate the plaintext **seal marker** (the last file, layout v2). Its
@@ -729,9 +737,23 @@ layout_version = 2
 /// the unhashed root of the keyless integrity chain (seal marker → front index →
 /// every content file; ADR-0007, `volume-format-v2.md` §4). Its absence means
 /// the tape is legitimately unsealed (interrupted or EOT-aborted).
-pub fn generate_seal_marker(label: &str, file_count: i32, front_index_sha256: &str) -> String {
+///
+/// `files` is the **embedded full copy of the front index** (ratified
+/// 2026-07-22): two-ended redundancy — front-of-tape damage recovers the map
+/// from the tail; tail damage reads as unsealed but stays navigable from the
+/// front. By seal time File 3's bytes are known, so the caller fills in File 3's
+/// own `size_bytes` + `sha256_encrypted` (more complete than File 3 itself);
+/// only the seal marker's own entry stays hash-less (self-reference). The copy
+/// is not hash-protected by anything on the tape — readers validate its per-file
+/// claims by hashing the files they describe (`volume-format-v2.md` §4).
+pub fn generate_seal_marker(
+    label: &str,
+    file_count: i32,
+    front_index_sha256: &str,
+    files: &[FrontIndexFile],
+) -> String {
     let now = chrono::Utc::now().to_rfc3339();
-    format!(
+    let mut s = format!(
         r#"================================================================
                     TAPECTL SEAL MARKER
 ================================================================
@@ -739,7 +761,9 @@ pub fn generate_seal_marker(label: &str, file_count: i32, front_index_sha256: &s
 Volume: {label}
 This file seals the tape: its presence means every file before it is
 present. Its absence means the tape is unsealed (interrupted or aborted).
-It binds the front index by the sha256 below.
+It binds the front index by the sha256 below. The [[files]] entries are
+a full copy of the front index (File 3), usable if File 3 is damaged —
+verify any entry by hashing the file it describes.
 
 ================================================================
               MACHINE-READABLE DATA (TOML)
@@ -752,7 +776,9 @@ file_count = {file_count}
 sealed_at = "{now}"
 front_index_sha256 = "{front_index_sha256}"
 "#
-    )
+    );
+    append_files_entries(&mut s, files);
+    s
 }
 
 /// Generate MANIFEST.toml for a tenant envelope.
@@ -990,7 +1016,7 @@ mod tests {
             FrontIndexFile {
                 position: 3,
                 type_label: "front_index",
-                size_bytes: None, // self: length is self-referential
+                size_bytes: None,       // self: length is self-referential
                 sha256_encrypted: None, // self: cannot hash itself
             },
             FrontIndexFile {
@@ -1064,7 +1090,7 @@ mod tests {
 
     #[test]
     fn seal_marker_binds_front_index() {
-        let s = generate_seal_marker("TEST01", 7, "deadbeefcafe");
+        let s = generate_seal_marker("TEST01", 7, "deadbeefcafe", &[]);
         let body = &s[s.find("[seal]").expect("has [seal]")..];
         let parsed: toml::Value = body.parse().expect("TOML parses");
         let seal = parsed.get("seal").unwrap();
@@ -1078,6 +1104,54 @@ mod tests {
         // sealed_at is present and RFC3339-parseable.
         let sealed_at = seal.get("sealed_at").unwrap().as_str().unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
+    }
+
+    #[test]
+    fn seal_marker_embeds_front_index_copy() {
+        // The embedded copy (ratified 2026-07-22) is MORE complete than File 3:
+        // by seal time File 3's own size + hash are known, so its entry is
+        // filled in; only the seal marker's own entry stays hash-less.
+        let files = vec![
+            FrontIndexFile {
+                position: 0,
+                type_label: "id_thunk",
+                size_bytes: Some(500),
+                sha256_encrypted: Some("aa00".into()),
+            },
+            FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: Some(2048),                // known at seal time
+                sha256_encrypted: Some("fi99".into()), // known at seal time
+            },
+            FrontIndexFile {
+                position: 4,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None, // self-reference: never hashable
+            },
+        ];
+        let s = generate_seal_marker("TEST01", 5, "fi99", &files);
+        let body = &s[s.find("[seal]").unwrap()..];
+        let parsed: toml::Value = body.parse().expect("TOML parses");
+        let arr = parsed.get("files").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        // File 3's entry in the COPY carries size + hash (unlike in File 3).
+        assert_eq!(arr[1].get("type").unwrap().as_str(), Some("front_index"));
+        assert_eq!(arr[1].get("size_bytes").unwrap().as_integer(), Some(2048));
+        assert_eq!(
+            arr[1].get("sha256_encrypted").unwrap().as_str(),
+            Some("fi99")
+        );
+        // The seal marker's own entry stays hash-less.
+        assert_eq!(arr[2].get("type").unwrap().as_str(), Some("seal_marker"));
+        assert!(arr[2].get("sha256_encrypted").is_none());
+        // The embedded copy's grammar matches the front index's byte-for-byte
+        // (same emitter): the [[files]] tail of both documents is identical.
+        let fi = generate_front_index("TEST01", &files);
+        let fi_tail = &fi[fi.find("\n[[files]]").unwrap()..];
+        let seal_tail = &s[s.find("\n[[files]]").unwrap()..];
+        assert_eq!(fi_tail, seal_tail);
     }
 
     #[test]
