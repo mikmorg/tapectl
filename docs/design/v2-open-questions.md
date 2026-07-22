@@ -364,7 +364,10 @@ stale data (§3.2's physics assumption).
    build the write-path flip against them.
 
 Everything else on this sheet is done on paper; nothing awaits a human until
-the flip is reviewable.
+the flip is reviewable. **The build sequence is scripted for execution in
+`docs/design/v2-implementation-plan.md`** — an executor playbook (T0–T11) with
+per-task anchors, traps, and verification recipes; an implementing agent should
+work from that plan, with this sheet and the two normative notes as authority.
 
 ---
 
