@@ -257,16 +257,54 @@ a `writes` row not in a terminal-success state, and add the test. (A GC that
 reaps an interrupted session's slices silently converts "resumable" into
 "aborted, data must be re-staged" — or worse if the source changed since.)
 
-### 3.6 Escrow schema — concrete shape (grounds round-1 §2.3)
-`encryption_keys` already has `key_type CHECK('primary','backup')`. SQLite can't
-alter a CHECK without a table rebuild, so: **`ALTER TABLE encryption_keys ADD
-COLUMN is_escrow INTEGER NOT NULL DEFAULT 0`** (no rebuild), leaving `key_type`
-untouched. Migration 003 then contains exactly two operations:
-1. `volumes` table rebuild (12-step) extending the status CHECK
-   (`'blank','initialized','active','full','sealed','quarantined',…` — legacy
-   `full` retained, read as sealed-equivalent per `layout-session.md`).
-2. The `is_escrow` ADD COLUMN.
-No `verification_sessions` change (§1.2 maps tiers onto `verify_type`).
+### 3.6 Migration 003 — drafted DDL (recon-grounded 2026-07-22)
+Facts from `001_initial.sql`: `volumes.status` CHECK is
+`('blank','initialized','active','full','retired','missing','erased')` — richer
+than earlier notes assumed; **five** child tables FK-reference `volumes(id)`
+(writes, cartridge_volumes ×2 contexts, verification_sessions, health_logs) and
+**two indexes** sit on volumes (`idx_volumes_location`, `idx_volumes_status`).
+No triggers. `encryption_keys` has `key_type CHECK('primary','backup')` — left
+untouched; escrow is an added flag.
+
+```sql
+-- 003_v2_lifecycle.sql  (ADR-0007 sealed/quarantined + ADR-0005 escrow flag)
+-- volumes: CHECK cannot be altered in place -> rebuild + rename swap.
+CREATE TABLE volumes_new (
+    -- columns identical to volumes except the extended CHECK:
+    ...
+    status TEXT NOT NULL DEFAULT 'blank'
+        CHECK(status IN ('blank','initialized','active','full','retired',
+                         'missing','erased','sealed','quarantined')),
+    ...
+);
+INSERT INTO volumes_new SELECT * FROM volumes;
+DROP TABLE volumes;
+ALTER TABLE volumes_new RENAME TO volumes;
+CREATE INDEX idx_volumes_location ON volumes(location_id);
+CREATE INDEX idx_volumes_status   ON volumes(status);
+-- escrow (ADR-0005): plain ADD COLUMN, no rebuild
+ALTER TABLE encryption_keys ADD COLUMN is_escrow INTEGER NOT NULL DEFAULT 0;
+```
+
+Notes that make this safe, and one build-time verify:
+- Child FK clauses reference the *name* `volumes`; after the rename swap they
+  bind to the new table. Run `PRAGMA foreign_key_check` after.
+- **Verify at build time:** the runner is `rusqlite_migration` (each `M::up` in
+  a transaction) and `configure()` sets `foreign_keys=ON` at open. The rebuild
+  needs FKs off around the DROP (children hold rows) — rusqlite_migration's
+  documented behavior is the SQLite-recommended FK-off-during-migrations dance;
+  confirm, else wrap 003 manually.
+- Legacy `full` retained in the CHECK, read as sealed-equivalent
+  (`layout-session.md`). New code writes `sealed`.
+- `write_positions.status` keeps its dead `'sacrificed'` value as inert reserve
+  (EOT salvage deleted; not worth a second rebuild). Same for
+  `writes.eot_recovery`/`sacrificed_slice_id` (already ruled inert).
+- No `verification_sessions` change (§1.2 maps tiers onto `verify_type`).
+- Escrow storage: **public key only** in the row (`is_escrow=1`, `is_active=1`);
+  the secret half lives on paper (ADR-0005). Wiring: every recipient-list
+  assembly appends the escrow public key; `key rotate` refuses if no
+  `is_escrow=1` row; `Layout` validation flips `escrow_recipient_present` from
+  `None` (skip) to `Some(row exists)`.
 
 ---
 
@@ -424,3 +462,148 @@ harness (small N), the mhvtl e2e v2 legs (~280 units/tape, full front-index +
 seal-marker chain walk), and multi-tape selector drills (~600 units → 2+ tapes;
 assert alphabetical first-fit produces name-ordered tape spines and ~99%+ fill
 net of the padding distortion).
+
+---
+
+## 9. Write-path v2 module design (designed 2026-07-22)
+
+The Rust-level shape of the flip, so the build is mechanical. New module
+`src/volume/session.rs`; `write.rs` shrinks to CLI orchestration; v1 helpers
+(`mini_index_tuples`, the two-pass, position arithmetic) die.
+
+**Typestate flow** (ADR-0002 phases as types — a phase's operations exist only
+on its type):
+
+```text
+Layout::build(conn, cfg, label, batch)  -> BuiltLayout
+    generators run ONCE; every generated zone materialized to the session
+    staging dir (frozen bytes, §2.2); envelope permutation applied (§2.1);
+    front index emitted with all hashes; entry order = format order.
+BuiltLayout::validate(keys, oracle)     -> ValidatedLayout | Vec<LayoutError>
+    tri-layer L1: full-hash staged slices; size/hash-check frozen zones;
+    capacity = Σ block-padded + enospc_buffer vs oracle; keys + escrow.
+ValidatedLayout::plan(conn)             -> PlannedSession
+    writes rows 'planned' + write_positions 'pending' (slices only — schema).
+PlannedSession::execute(store)          -> Executing… -> ReadyToSeal
+    rewind; per entry: SIGINT check (between entries only; mid-file kill =
+    crash = startup sweep); stream from disk via a hashing tee reader;
+    store.execute(src, len, sync); slice entries update their cursor row
+    ('written' + sha256_on_volume). Inline-hash mismatch (tri-layer L2) or
+    ENOSPC  =>  Abort: tape stays UNSEALED, writes 'aborted', staging kept.
+ReadyToSeal::seal(store)                -> SealedPending
+    regenerate the seal marker with the real sealed_at; write it (sync mark).
+SealedPending::confirm(store, tier)     -> SessionEnd
+    store.confirm (chain walk, §10); verification_sessions row (verify_type =
+    full|quick); pass => ONE transaction: writes 'completed', snapshots
+    'current', volumes 'sealed'. fail => volumes 'quarantined', session
+    aborted, staging kept.
+```
+
+**Store trait v2** (grows the #71 seam; MemStore implements all four, so the
+§4.1 harness exercises the *real* confirm code):
+
+```rust
+pub enum Tier { Navigable, Integrity }
+pub struct Evidence { tier: Tier, files_checked: u32, mismatches: Vec<Mismatch> }
+
+pub trait Store {
+    fn capacity(&mut self) -> Result<CapacityReport>;              // validate oracle (#28 math)
+    fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64>; // stream + filemark (H9)
+    fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence>; // tape: forward chain walk; warehouse: deposit receipt
+    fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64>;    // restore/verify leg
+}
+```
+
+Micro-decisions (resolved here so the build doesn't discover them):
+- **Seal-marker sizing at build:** its `sealed_at` must be truthful (seal
+  time), but validate needs its size. RFC 3339 UTC is fixed-width and
+  `file_count` is known, so build generates it with a placeholder timestamp for
+  sizing and seal regenerates with the real one — byte-length identical, and
+  nothing hashes the seal marker (it is the unhashed root), so regeneration is
+  free. (The embedded index copy crosses one 512 K block only above ~4,000
+  files — the sizing handles it either way.)
+- **Hashing tee reader:** a small `Read` adapter (sha256 of bytes as they
+  stream) — one disk read serves hash + tape write; lives in `staging` or a
+  util module. Also reused by restore-side streaming later (#35's substance).
+- **DB timing:** `planned` at plan; `in_progress` + `started_at` at first
+  execute; per-slice cursor rows as written; terminal states only via the
+  confirm/abort transactions. Resume reuses rows (the UNIQUE stays
+  load-bearing).
+- **ContentSource** becomes a path in both arms (`Staged(PathBuf)` /
+  `Materialized(PathBuf)`); no bytes in the Layout. `ZoneKind::PlanningHeader`
+  and `ZoneKind::MiniIndex` are deleted at the flip (planning content →
+  PLAN.toml member; the v1 reader stub parses old test tapes without needing
+  the enum). `generate_planning_header` survives as the PLAN.toml member
+  generator.
+- **volume_init** keeps writing the provisional identity thunk; the session
+  rewrites File 0 from BOT (§2.3 ruling).
+
+---
+
+## 10. One chain walk, three consumers + RESTORE.sh v2 modes (designed 2026-07-22)
+
+The chain-walk algorithm is defined once (`volume-format-v2.md` §5) and
+consumed three ways — same algorithm, different trust contexts:
+
+| Consumer | Language | Context | Records |
+|---|---|---|---|
+| Session confirm (§9) | Rust, `Store::confirm` | seals the volume | `verification_sessions` + status flip |
+| `volume verify [--full\|--quick]` | Rust, same fn, any later contact | operator re-verification / bit-rot pass | `verification_sessions` (evidence refresh) |
+| `RESTORE.sh --verify` (**new mode**) | bash, hand-written | keyless — heir or anyone, no tapectl, no DB | terminal verdict only |
+
+The bash reimplementation is deliberate duplication — heir independence *is*
+the property — pinned by an mhvtl e2e leg asserting the Rust and bash walks
+agree on a good tape and both catch one injected corruption.
+
+**RESTORE.sh v2 modes:**
+- `--info` — read File 0 + File 3 + seal marker; print the layout table and an
+  explicit **SEALED / UNSEALED / DAMAGED (ends disagree)** verdict (§2.5
+  precedence; never trust marker presence alone, §2.6).
+- `--verify` — the keyless integrity walk: hash every file against File 3, and
+  File 3 against the seal binding. A new capability v2 enables.
+- `--find-envelope --key K` — trial-decrypt envelope positions (found in
+  File 3 by type), as today.
+- `--restore --key K --to DIR [--unit U]` — manifest positions cross-checked
+  against front-index sizes/hashes, trim, decrypt, dar extract.
+- Degradation-ladder wiring (§3.4): File 3 unparseable → read the map from the
+  seal marker's embedded copy (rung 2, automated); both ends gone → print the
+  guide's zero-strip manual procedure (rung 3, documented not automated).
+
+---
+
+## 11. Library design — completed (2026-07-22; finishes the §7 sketch)
+
+```toml
+[[libraries]]
+name        = "movies"
+root        = "/media/movies"
+tenant      = "media"
+unit_depth  = 1              # child folders at this depth = atomic units
+exclude     = ["*.partial"]  # walk-level excludes (on top of global_excludes)
+archive_set = "bulk-media"   # policy binding (slice size, min_copies, …)
+dotfiles    = true           # false = path-keyed identity (read-only sources)
+```
+
+- **`library sync [--dry-run]`** — walk `root` at `unit_depth`: new directory →
+  `unit init` (dotfile with fresh uuid, unless `dotfiles=false`); vanished
+  directory → unit status **`missing`** (existing status value; never
+  auto-delete or retire — those are operator acts); moved/renamed → resolved by
+  dotfile uuid exactly as `discover` does today. Then detect pending work:
+  units with no snapshot, or whose latest snapshot's walk fingerprint
+  (checksum_mode, default mtime_size) differs. Media immutability means
+  pending ≈ new folders in practice.
+- **`library status`** — pending / dirty / missing / under-copied counts
+  (copies < min_copies, from the audit derivations).
+- **`library plan [--copies N]`** — the selector, formal: sort pending units by
+  name; greedily fill a batch while Σ block-padded sizes ≤ usable −
+  enospc_buffer; close batch, continue. Alphabetical first-fit per the §7
+  ruling (tail-plug variant deferred until the ~0.2% ever matters). Emits batch
+  manifests for review.
+- **Batch execution** (per batch): snapshot + stage each unit once → session
+  (§9) on cartridge A → seal + confirm → session on cartridge B → seal +
+  confirm → release staging (GC rule §3.5: only after **every planned copy**
+  is sealed). Stage once, write N times.
+- **Out of scope, deliberately:** filesystem watching/daemons (rejected, #13
+  verdict), scheduled sync (timers-for-advisory-ops later), any dedup across
+  libraries (full-only stands, #12). The Library is a *factory + batch driver*
+  over existing unit machinery — units remain first-class underneath.

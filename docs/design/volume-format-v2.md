@@ -36,12 +36,10 @@ filemark), in this fixed order:
 │                                     every file EXCEPT File 3 and the seal      │
 │                                     marker. ZERO content metadata.            │
 ├──── MIDDLE: encrypted decryption metadata (all known pre-write) ──────────────┤
-│ File 4  Planning header enc(op+esc) planned packing list (optional; may fold  │
-│                                     into the operator envelope).              │
-│ File 5  Tenant envelope enc(t+op+esc) ┐ MANIFEST.toml (filenames,            │
+│ File 4  Tenant envelope enc(t+op+esc) ┐ MANIFEST.toml (filenames,             │
 │  ...    Tenant envelope enc(t+op+esc) │ sha256_plain, dar command, slice      │
-│ File j   Operator env    enc(op+esc)  │ positions), RECOVERY.md, catalogs/.   │
-│ File j+1 Operator backup enc(op+esc)  ┘ Tenant envelopes in position order.   │
+│ File j   Operator env    enc(op+esc)  │ positions), RECOVERY.md, catalogs/,   │
+│ File j+1 Operator backup enc(op+esc)  ┘ PLAN.toml (op only). Order per §2.    │
 ├──── BULK: encrypted data (the mass of the tape) ──────────────────────────────┤
 │ File j+2 Data slice     enc(t+op+esc) ┐ age(dar base.N.dar). One unit's       │
 │  ...     Data slice     enc(t+op+esc) │ slices contiguous. The ONLY zone a    │
@@ -76,7 +74,7 @@ filemark), in this fixed order:
 |---|---|---|
 | ID thunk, system guide, RESTORE.sh | plaintext | heir reads them with no key |
 | **Front index (File 3)** | **plaintext** | navigation must work with no key; carries position/type/size and ciphertext hashes only |
-| Planning header, tenant/operator envelopes, data slices | age-encrypted | *all* content metadata (filenames, content sizes, `sha256_plain`, dar catalogs) lives here and nowhere else |
+| Tenant/operator envelopes, data slices | age-encrypted | *all* content metadata (filenames, content sizes, `sha256_plain`, dar catalogs, the packing plan) lives here and nowhere else |
 | **Seal marker (File M)** | **plaintext** | structural completeness assertion; its `front_index_sha256` is a hash of a plaintext file |
 
 **Isolation invariant (v2, normative).** No plaintext file on the tape may reveal:
@@ -140,7 +138,7 @@ Plaintext TOML. One entry per tape file, in position order:
 - `position` — tape file number (0..M). Present for **every** file (navigation is
   total: the heir can jump straight to any file, including the seal marker).
 - `type` — on-tape zone kind: `id_thunk`, `system_guide`, `restore_sh`,
-  `front_index`, `planning_header`, `tenant_envelope`, `operator_envelope`,
+  `front_index`, `tenant_envelope`, `operator_envelope`,
   `operator_envelope_backup`, `data_slice`, `seal_marker`. **No** tenant/unit
   identity — a `data_slice` and a `tenant_envelope` entry are unlabeled beyond kind.
 - `size_bytes` — the true (pre-block-padding) byte length, so the heir can
@@ -275,4 +273,11 @@ LTO-6 validation session, not a format question.
   just the small ENOSPC buffer (a margin against MAM over-reporting remaining
   capacity). This is an active code change (config `manifest_reserve` →
   `enospc_buffer`), not doc-only.
+- **The planning header as a separate tape file** (resolved 2026-07-22 — the
+  "may fold" option in earlier drafts of this spec, taken). Its unique v1 value
+  was being written *early*, before the slices; envelopes-first supersedes that,
+  and its content (the planned packing list) duplicates what the operator
+  envelope carries. It survives as a **`PLAN.toml` member of the operator
+  envelope** (same recipients: op + escrow); the standalone zone, its generator
+  position, and `ZoneKind::PlanningHeader` are removed at the write flip.
 - **Appendix D tape append** — already rejected by ADR-0003; reaffirmed.
