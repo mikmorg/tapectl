@@ -261,7 +261,7 @@ reaps an interrupted session's slices silently converts "resumable" into
 Facts from `001_initial.sql`: `volumes.status` CHECK is
 `('blank','initialized','active','full','retired','missing','erased')` — richer
 than earlier notes assumed; **five** child tables FK-reference `volumes(id)`
-(writes, cartridge_volumes ×2 contexts, verification_sessions, health_logs) and
+(writes, cartridge_volumes, volume_movements, verification_sessions, health_logs) and
 **two indexes** sit on volumes (`idx_volumes_location`, `idx_volumes_status`).
 No triggers. `encryption_keys` has `key_type CHECK('primary','backup')` — left
 untouched; escrow is an added flag.
