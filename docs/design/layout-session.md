@@ -34,10 +34,16 @@ total, not an end-reservation).
 1. Capacity: Σ block-padded sizes + ENOSPC buffer ≤ available (per-store
    capacity oracle; tape = §2.8 formula via #28, until then nominal-capacity
    config). This pre-flight gate is the sole capacity defense (ADR-0007).
-2. Every staged slice exists on disk and matches its recorded **size**. The
-   stage-time `sha256_encrypted` is trusted — it becomes the front-index hash,
-   and confirm's readback (tape bytes vs that hash) is the byte-integrity gate,
-   so validate does not re-read the slice bulk (finding ③: no double read).
+2. Every staged slice exists on disk and matches its recorded sha256 (a full
+   streamed hash). This is the first layer of the **tri-layer integrity model**:
+   *validate* full-hashes from disk (cheap read insurance against wasting a
+   3.5 h tape write on a stale/rotted slice), *execute* re-hashes inline on the
+   same streaming read that feeds the tape and cleanly aborts to unsealed on
+   mismatch (closes the validate→write TOCTOU window at zero extra I/O), and
+   *confirm* (#23) hashes the tape readback against the front index. Each layer
+   catches a window the others cannot. Finding ③'s "no double read" applies to
+   front-index generation only — it reuses the stage-time `sha256_encrypted`
+   verbatim rather than re-reading slices a third time.
 3. Keys resolvable: every tenant on the volume has ≥1 active key; operator
    keys present; **escrow recipient present** (once #68 lands — its absence
    fails validation the same way rotate refuses).
