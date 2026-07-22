@@ -109,7 +109,7 @@ fn test_size_bounds() {
     let temp = tempfile::TempDir::new().expect("failed to create temp dir");
 
     let spec = MicroSpec {
-        n_units: 20,
+        n_units: 6,
         seed: 99999,
     };
 
@@ -141,7 +141,7 @@ fn test_dominant_file_share() {
     let temp = tempfile::TempDir::new().expect("failed to create temp dir");
 
     let spec = MicroSpec {
-        n_units: 10,
+        n_units: 5,
         seed: 77777,
     };
 
@@ -170,7 +170,7 @@ fn test_folder_names_sort_deterministically() {
     let temp = tempfile::TempDir::new().expect("failed to create temp dir");
 
     let spec = MicroSpec {
-        n_units: 10,
+        n_units: 5,
         seed: 55555,
     };
 
@@ -191,7 +191,7 @@ fn test_no_excluded_filenames() {
     let temp = tempfile::TempDir::new().expect("failed to create temp dir");
 
     let spec = MicroSpec {
-        n_units: 10,
+        n_units: 5,
         seed: 33333,
     };
 

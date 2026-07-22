@@ -54,9 +54,11 @@ pub struct UnitFixture {
 /// # Derivation scheme
 /// - Unit i's size: `2M + (u64::from_le_bytes(sha256(seed || i)[0:8])) % 13M`
 ///   ⇒ range [2 MiB, 15 MiB)
-/// - File content: `sha256(seed || i || block_no)` repeated to fill length
+/// - File content: per 64 KB block, `sha256(seed || i || filename || block_no)`
+///   tiled to fill the block (filename in the derivation so a unit's files are
+///   distinct streams; one digest per 64 KB keeps debug-mode generation fast)
 /// - Media shape: one dominant file (~90% of unit size) + small sidecars
-///   (cover.jpg 1 MiB, subtitles 50 KiB)
+///   (cover.jpg 200 KB, movie.srt 50 KB)
 /// - Folder names: zero-padded index + theme (sort deterministically)
 ///
 /// # Returns
@@ -136,10 +138,10 @@ fn write_deterministic_file(dir: &Path, filename: &str, seed: u64, unit_idx: usi
     let mut block_counter: u64 = 0;
 
     while bytes_written < size {
-        let chunk = generate_content_chunk(seed, unit_idx, block_counter);
-        let to_write = std::cmp::min(chunk.len() as u64, size - bytes_written) as usize;
+        let block = generate_content_block(seed, unit_idx, filename, block_counter);
+        let to_write = std::cmp::min(block.len() as u64, size - bytes_written) as usize;
         writer
-            .write_all(&chunk[..to_write])
+            .write_all(&block[..to_write])
             .expect("failed to write file");
         bytes_written += to_write as u64;
         block_counter += 1;
@@ -148,11 +150,26 @@ fn write_deterministic_file(dir: &Path, filename: &str, seed: u64, unit_idx: usi
     writer.flush().expect("failed to flush file");
 }
 
-/// Generate one content chunk: sha256(seed || unit_idx || block_counter).
-fn generate_content_chunk(seed: u64, unit_idx: usize, block_counter: u64) -> Vec<u8> {
+/// One 64 KB content block: sha256(seed || unit_idx || filename || block_counter)
+/// tiled. One digest per 64 KB (not per 32 bytes) keeps generation fast in
+/// debug builds while staying fully deterministic.
+fn generate_content_block(
+    seed: u64,
+    unit_idx: usize,
+    filename: &str,
+    block_counter: u64,
+) -> Vec<u8> {
+    const BLOCK: usize = 64 * 1024;
     let mut hasher = Sha256::new();
     hasher.update(seed.to_le_bytes());
     hasher.update((unit_idx as u64).to_le_bytes());
+    hasher.update(filename.as_bytes());
     hasher.update(block_counter.to_le_bytes());
-    hasher.finalize().to_vec()
+    let digest = hasher.finalize();
+    let mut block = Vec::with_capacity(BLOCK);
+    while block.len() < BLOCK {
+        block.extend_from_slice(&digest);
+    }
+    block.truncate(BLOCK);
+    block
 }
