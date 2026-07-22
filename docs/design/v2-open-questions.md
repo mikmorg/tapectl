@@ -25,9 +25,15 @@ identity; sizes + ciphertext hashes permitted).
 
 ## 1. Operator ratification sheet
 
-**Status 2026-07-22: §1.1 RATIFIED (embedded copy — "write both") and §1.2
-RATIFIED (integrity default, `--quick` optional) — both folded into
-`volume-format-v2.md` §4/§5/§6. §1.3 (slice size) is in discussion.**
+**Status 2026-07-22: ALL THREE RATIFIED — §1.1 embedded copy ("write both"),
+§1.2 integrity default (`--quick` optional), §1.3 slice size = 10G. §1.1/§1.2
+are folded into `volume-format-v2.md` §4/§5/§6 and the seal-marker generator;
+§1.3's default lands in config on the regear branch (policy-chain resolution
+rides #35). Discussion note for §1.3: dar's `-s` is an exact per-slice cut
+(every non-final slice is exactly S; the last is the remainder), a per-unit
+max — units smaller than S make one natural-size slice — and S ≡ 0 mod 512 KB
+means full slices carry zero block padding. Nothing on this sheet awaits a
+human until the #22 PR (§6 steps 2-4 remain).**
 
 ### 1.1 Seal marker: minimal vs **embedded full front-index copy**  ·  RATIFIED: EMBEDDED COPY
 Round 1 leaned "minimal." The robustness pass flips the lean. Failure analysis:
@@ -68,7 +74,7 @@ and is recorded honestly. Schema note: **no new column needed** — the existing
 `verification_sessions.verify_type CHECK('full','quick')` maps integrity→`full`,
 navigable→`quick` (#23's honesty requirement lands on the existing column).
 
-### 1.3 Slice-size default  ·  lean: **25G**, policy-resolved
+### 1.3 Slice-size default  ·  RATIFIED: **10G**, policy-resolved
 The shipped default is `2400G` (`config.rs:155`) — one slice per tape: OOM under
 the current buffering glue, a whole-tape blast radius on damage, and no
 per-slice retry quantum. Sizing analysis for LTO-6 (2.5 TB):
