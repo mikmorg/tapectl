@@ -132,7 +132,7 @@ pub fn insert_key(
 pub fn list_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<Vec<EncryptionKey>> {
     let mut stmt = conn.prepare(
         "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
-                is_active, created_at, description
+                is_active, created_at, description, is_escrow
          FROM encryption_keys WHERE tenant_id = ?1 ORDER BY alias",
     )?;
     let rows = stmt.query_map(params![tenant_id], |row| {
@@ -146,6 +146,7 @@ pub fn list_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<Vec<Enc
             is_active: row.get(6)?,
             created_at: row.get(7)?,
             description: row.get(8)?,
+            is_escrow: row.get(9)?,
         })
     })?;
     let mut keys = Vec::new();
@@ -155,11 +156,21 @@ pub fn list_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<Vec<Enc
     Ok(keys)
 }
 
+/// Active, ordinary (non-escrow) keys for a tenant. The permanent escrow
+/// recipient (ADR-0005) is deliberately excluded here even when its row's
+/// `tenant_id` happens to be the operator's: this is the set that `key
+/// rotate` deactivates and that recipient-list assembly starts from before
+/// `recipient_list_with_escrow` appends the escrow key exactly once. Without
+/// this exclusion the escrow key would ride along silently whenever it
+/// shares a tenant_id with the operator, and `key rotate --tenant <operator>`
+/// would deactivate it.
 pub fn get_active_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<Vec<EncryptionKey>> {
     let mut stmt = conn.prepare(
         "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
-                is_active, created_at, description
-         FROM encryption_keys WHERE tenant_id = ?1 AND is_active = 1 ORDER BY alias",
+                is_active, created_at, description, is_escrow
+         FROM encryption_keys
+         WHERE tenant_id = ?1 AND is_active = 1 AND is_escrow = 0
+         ORDER BY alias",
     )?;
     let rows = stmt.query_map(params![tenant_id], |row| {
         Ok(EncryptionKey {
@@ -172,6 +183,7 @@ pub fn get_active_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<V
             is_active: row.get(6)?,
             created_at: row.get(7)?,
             description: row.get(8)?,
+            is_escrow: row.get(9)?,
         })
     })?;
     let mut keys = Vec::new();
@@ -184,7 +196,7 @@ pub fn get_active_keys_for_tenant(conn: &Connection, tenant_id: i64) -> Result<V
 pub fn get_key_by_alias(conn: &Connection, alias: &str) -> Result<Option<EncryptionKey>> {
     conn.query_row(
         "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
-                is_active, created_at, description
+                is_active, created_at, description, is_escrow
          FROM encryption_keys WHERE alias = ?1",
         params![alias],
         |row| {
@@ -198,11 +210,79 @@ pub fn get_key_by_alias(conn: &Connection, alias: &str) -> Result<Option<Encrypt
                 is_active: row.get(6)?,
                 created_at: row.get(7)?,
                 description: row.get(8)?,
+                is_escrow: row.get(9)?,
             })
         },
     )
     .optional()
     .map_err(Into::into)
+}
+
+// ── Escrow recipient (ADR-0005) ──
+
+/// Insert the escrow key row: public key only, `is_escrow=1`, `is_active=1`.
+/// The secret half is never passed here — it must never touch the database.
+/// Callers must check `escrow_key_exists` first; ADR-0005 permits exactly one
+/// permanent escrow identity for the life of the archive.
+pub fn insert_escrow_key(
+    conn: &Connection,
+    tenant_id: i64,
+    alias: &str,
+    fingerprint: &str,
+    public_key: &str,
+    description: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO encryption_keys
+            (tenant_id, alias, fingerprint, public_key, key_type, is_active, is_escrow, description)
+         VALUES (?1, ?2, ?3, ?4, 'primary', 1, 1, ?5)",
+        params![tenant_id, alias, fingerprint, public_key, description],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Whether an escrow row already exists, active or not. Used by `key
+/// generate --escrow` / `key import --escrow` to refuse a second
+/// registration (ADR-0005: exactly one permanent escrow identity, ever —
+/// replacing it is a deliberate, separate, documented act, not a re-run of
+/// this command). Deliberately independent of `is_active` so a
+/// hypothetically-deactivated escrow row still blocks minting a second one.
+pub fn escrow_key_exists(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM encryption_keys WHERE is_escrow = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// The permanent escrow recipient's public key (ADR-0005), if one is
+/// registered and active — the single `is_escrow=1 AND is_active=1` row.
+/// Used both to build recipient lists (`recipient_list_with_escrow`) and as
+/// `key rotate`'s precondition (rotation refuses when this is `None`).
+pub fn escrow_public_key(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT public_key FROM encryption_keys WHERE is_escrow = 1 AND is_active = 1 LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Append the escrow recipient's public key to `base` if one is registered
+/// and not already present (idempotent — safe to call more than once on the
+/// same list). This is the single choke point every recipient-list assembly
+/// must route through (ADR-0005) so a future call site can't forget: the
+/// staging slice encryption path (`src/staging/mod.rs`) and every envelope
+/// encryption in `src/volume/write.rs`.
+pub fn recipient_list_with_escrow(conn: &Connection, mut base: Vec<String>) -> Result<Vec<String>> {
+    if let Some(pk) = escrow_public_key(conn)? {
+        if !base.contains(&pk) {
+            base.push(pk);
+        }
+    }
+    Ok(base)
 }
 
 // ── Units ──
@@ -625,5 +705,108 @@ mod tests {
         assert!(check_nesting_conflict(&conn, "/data").unwrap().is_some());
         // Unrelated
         assert!(check_nesting_conflict(&conn, "/other").unwrap().is_none());
+    }
+
+    // ── Escrow recipient (ADR-0005) ──
+    // `encryption_keys.is_escrow` only exists from migration 003 on, so these
+    // need the full schema rather than `fresh_conn`'s 001-only snapshot.
+
+    fn fresh_conn_full() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(include_str!("migrations/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("migrations/002_fts5_catalog.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("migrations/003_v2_lifecycle.sql"))
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn escrow_public_key_and_exists_are_none_when_absent() {
+        let conn = fresh_conn_full();
+        assert_eq!(escrow_public_key(&conn).unwrap(), None);
+        assert!(!escrow_key_exists(&conn).unwrap());
+    }
+
+    #[test]
+    fn escrow_public_key_found_after_insert() {
+        let conn = fresh_conn_full();
+        let op_id = insert_tenant(&conn, "op", None, true).unwrap();
+        insert_escrow_key(&conn, op_id, "op-escrow", "age1fake", "age1fake", None).unwrap();
+
+        assert!(escrow_key_exists(&conn).unwrap());
+        assert_eq!(
+            escrow_public_key(&conn).unwrap(),
+            Some("age1fake".to_string())
+        );
+    }
+
+    #[test]
+    fn recipient_list_with_escrow_appends_when_present_and_no_ops_when_absent() {
+        let conn = fresh_conn_full();
+        let base = vec!["age1tenant".to_string()];
+
+        // No escrow registered yet: list passes through unchanged.
+        let unchanged = recipient_list_with_escrow(&conn, base.clone()).unwrap();
+        assert_eq!(unchanged, base);
+
+        let op_id = insert_tenant(&conn, "op", None, true).unwrap();
+        insert_escrow_key(&conn, op_id, "op-escrow", "age1esc", "age1esc", None).unwrap();
+
+        let augmented = recipient_list_with_escrow(&conn, base).unwrap();
+        assert_eq!(
+            augmented,
+            vec!["age1tenant".to_string(), "age1esc".to_string()]
+        );
+    }
+
+    #[test]
+    fn recipient_list_with_escrow_does_not_duplicate() {
+        let conn = fresh_conn_full();
+        let op_id = insert_tenant(&conn, "op", None, true).unwrap();
+        insert_escrow_key(&conn, op_id, "op-escrow", "age1esc", "age1esc", None).unwrap();
+
+        // Base already contains the escrow key (e.g. a caller re-running the
+        // helper on an already-augmented list) — must not duplicate it.
+        let base = vec!["age1tenant".to_string(), "age1esc".to_string()];
+        let result = recipient_list_with_escrow(&conn, base.clone()).unwrap();
+        assert_eq!(result, base);
+    }
+
+    /// The regression this fix exists for: the escrow row's `tenant_id` is
+    /// the operator's, so a naive "active keys for tenant" query would
+    /// silently include it — doubling it up when `recipient_list_with_escrow`
+    /// also appends it, and exposing it to `key rotate --tenant <operator>`'s
+    /// deactivation UPDATE. It must be invisible to this query.
+    #[test]
+    fn get_active_keys_for_tenant_excludes_escrow_row_even_under_operator_tenant() {
+        let conn = fresh_conn_full();
+        let op_id = insert_tenant(&conn, "op", None, true).unwrap();
+        insert_key(
+            &conn,
+            op_id,
+            "op-primary",
+            "fp1",
+            "age1primary",
+            "primary",
+            None,
+        )
+        .unwrap();
+        insert_escrow_key(&conn, op_id, "op-escrow", "age1esc", "age1esc", None).unwrap();
+
+        let active = get_active_keys_for_tenant(&conn, op_id).unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "escrow row must not appear here: {active:?}"
+        );
+        assert_eq!(active[0].alias, "op-primary");
+
+        // But it IS visible via list_keys_for_tenant (badged in `key list`).
+        let all = list_keys_for_tenant(&conn, op_id).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|k| k.is_escrow));
     }
 }

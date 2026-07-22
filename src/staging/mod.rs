@@ -209,12 +209,16 @@ pub fn stage_create(
         .chain(operator_keys.iter())
         .map(|k| k.public_key.clone())
         .collect();
+    // ADR-0005: every recipient list gets the escrow public key appended
+    // (no-op if none is registered yet, or if it's already present).
+    let all_pubkeys = queries::recipient_list_with_escrow(conn, all_pubkeys)?;
 
-    let key_fingerprints: Vec<String> = tenant_keys
-        .iter()
-        .chain(operator_keys.iter())
-        .map(|k| k.fingerprint.clone())
-        .collect();
+    // fingerprint == public_key by construction for every key in this system
+    // (see crypto::keys::generate_keypair and `key import`), so the recorded
+    // fingerprints are exactly the (now escrow-augmented) recipient list —
+    // keeping this audit record honest about who can actually decrypt the
+    // slices it describes, rather than a second, silently-divergent list.
+    let key_fingerprints = all_pubkeys.clone();
 
     let mut total_dar_size: i64 = 0;
     let mut total_encrypted_size: i64 = 0;

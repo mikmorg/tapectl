@@ -26,6 +26,9 @@ pub struct EncryptionKey {
     pub is_active: bool,
     pub created_at: String,
     pub description: Option<String>,
+    /// The permanent escrow recipient (ADR-0005). At most one row across the
+    /// whole database ever has this set.
+    pub is_escrow: bool,
 }
 
 // ── Units ──

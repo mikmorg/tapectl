@@ -54,6 +54,12 @@ fn tapectl_test_db(path: &std::path::Path) -> Connection {
     conn.execute_batch(schema).unwrap();
     let fts5 = include_str!("../src/db/migrations/002_fts5_catalog.sql");
     conn.execute_batch(fts5).unwrap();
+    // Needed from here on for encryption_keys.is_escrow (ADR-0005 / T2) and
+    // the sealed/quarantined volume statuses (ADR-0007). Applying this to a
+    // fresh, still-empty DB is safe: DROP TABLE volumes has no referencing
+    // rows yet, so FK enforcement (already ON above) doesn't block it.
+    let v2_lifecycle = include_str!("../src/db/migrations/003_v2_lifecycle.sql");
+    conn.execute_batch(v2_lifecycle).unwrap();
     conn
 }
 
@@ -707,6 +713,17 @@ fn test_key_rotate_twice_keeps_tenant_active() {
     tapectl::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
     tapectl::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
 
+    // `key rotate` refuses without a registered escrow recipient (ADR-0005 /
+    // T2) — register one first, same as a real operator would have to.
+    let gen_escrow = KeyCommands::Generate {
+        tenant: None,
+        alias: None,
+        key_type: "primary".to_string(),
+        description: None,
+        escrow: true,
+    };
+    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap();
+
     let active = |name: &str| -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
@@ -746,6 +763,227 @@ fn test_key_rotate_twice_keeps_tenant_active() {
     );
     // Old keys are deactivated, never deleted (decrypt pre-rotation data).
     assert_eq!(total("alice"), 6, "2 initial + 2 + 2 rotated, all retained");
+}
+
+// ── Escrow Recipient Tests (ADR-0005 / T2) ──
+
+/// The whole point of the wiring: a fresh ciphertext produced through the
+/// real recipient-list helper (`recipient_list_with_escrow`) must be
+/// decryptable by the escrow identity alone, not just the tenant it was
+/// nominally encrypted for. The escrow identity is generated in-test with
+/// the age crate directly (same style as `tests/tenant_isolation.rs`) and
+/// never touches tapectl's key store — exactly how the real secret only
+/// ever lives on paper.
+#[test]
+fn escrow_identity_can_decrypt_a_staging_ciphertext() {
+    use age::x25519::Identity;
+    use std::io::Read;
+    use tapectl::db::queries;
+    use tapectl::staging::encrypt_data;
+
+    let (_tmp, conn, home) = setup();
+    let paths = tapectl::config::TapectlPaths::new(home);
+    paths.ensure_dirs().unwrap();
+
+    tapectl::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+    let op_id: i64 = conn
+        .query_row("SELECT id FROM tenants WHERE name = 'op'", [], |r| r.get(0))
+        .unwrap();
+
+    // Stand-in for a tenant's own recipient in a slice's base recipient list.
+    let alice_pub = Identity::generate().to_public().to_string();
+
+    let escrow_id = Identity::generate();
+    let escrow_pub = escrow_id.to_public().to_string();
+    queries::insert_escrow_key(&conn, op_id, "op-escrow", &escrow_pub, &escrow_pub, None).unwrap();
+
+    let recipients = queries::recipient_list_with_escrow(&conn, vec![alice_pub.clone()]).unwrap();
+    assert!(recipients.contains(&escrow_pub), "escrow key not appended");
+    assert!(recipients.contains(&alice_pub), "original recipient lost");
+
+    let plaintext = b"unit contents that only alice+escrow should read";
+    let ciphertext = encrypt_data(plaintext, &recipients).unwrap();
+
+    let decryptor = age::Decryptor::new(&ciphertext[..]).unwrap();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&escrow_id as &dyn age::Identity))
+        .unwrap();
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).unwrap();
+    assert_eq!(out, plaintext, "escrow identity could not decrypt");
+}
+
+#[test]
+fn key_rotate_refuses_without_escrow() {
+    use tapectl::cli::key::KeyCommands;
+    let (_tmp, conn, home) = setup();
+    let paths = tapectl::config::TapectlPaths::new(home);
+    paths.ensure_dirs().unwrap();
+
+    tapectl::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+
+    let active_count = || -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE t.name = 'alice' AND k.is_active = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(active_count(), 2, "initial primary + backup active");
+
+    let rotate = KeyCommands::Rotate {
+        tenant: "alice".to_string(),
+    };
+    let err = tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap_err();
+    assert!(
+        format!("{err}").contains("escrow"),
+        "expected an escrow-related refusal, got: {err}"
+    );
+
+    // The refusal must be a true no-op.
+    assert_eq!(
+        active_count(),
+        2,
+        "rotate must not deactivate anything when it refuses"
+    );
+}
+
+/// The regression this design protects against: the escrow row lives under
+/// the operator tenant, so rotating the OPERATOR's own keys is exactly the
+/// case that would deactivate the escrow row too without the dedicated
+/// `is_escrow = 0` exclusions in `get_active_keys_for_tenant` and the
+/// rotate UPDATE.
+#[test]
+fn key_rotate_with_escrow_present_leaves_escrow_row_untouched() {
+    use tapectl::cli::key::KeyCommands;
+    let (_tmp, conn, home) = setup();
+    let paths = tapectl::config::TapectlPaths::new(home);
+    paths.ensure_dirs().unwrap();
+
+    tapectl::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+
+    let gen_escrow = KeyCommands::Generate {
+        tenant: None,
+        alias: None,
+        key_type: "primary".to_string(),
+        description: None,
+        escrow: true,
+    };
+    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap();
+
+    let (escrow_id, escrow_pubkey_before): (i64, String) = conn
+        .query_row(
+            "SELECT id, public_key FROM encryption_keys WHERE is_escrow = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let op_id: i64 = conn
+        .query_row("SELECT id FROM tenants WHERE name = 'op'", [], |r| r.get(0))
+        .unwrap();
+
+    let rotate = KeyCommands::Rotate {
+        tenant: "op".to_string(),
+    };
+    tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap();
+
+    let (escrow_active, escrow_pubkey_after): (bool, String) = conn
+        .query_row(
+            "SELECT is_active, public_key FROM encryption_keys WHERE id = ?1",
+            [escrow_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(escrow_active, "rotate must never deactivate the escrow row");
+    assert_eq!(
+        escrow_pubkey_after, escrow_pubkey_before,
+        "escrow row must be byte-for-byte untouched by rotation"
+    );
+
+    // Meanwhile the operator's own (non-escrow) primary+backup pair WAS
+    // rotated: the original 2 deactivated, a fresh 2 active.
+    let deactivated_normal: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_keys
+             WHERE tenant_id = ?1 AND is_escrow = 0 AND is_active = 0",
+            [op_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deactivated_normal, 2,
+        "operator's original primary+backup should be deactivated by rotation"
+    );
+    let active_normal: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_keys
+             WHERE tenant_id = ?1 AND is_escrow = 0 AND is_active = 1",
+            [op_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        active_normal, 2,
+        "operator should have a fresh active primary+backup pair"
+    );
+}
+
+#[test]
+fn second_escrow_registration_refuses() {
+    use tapectl::cli::key::KeyCommands;
+    let (_tmp, conn, home) = setup();
+    let paths = tapectl::config::TapectlPaths::new(home);
+    paths.ensure_dirs().unwrap();
+
+    tapectl::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+
+    let gen_escrow = KeyCommands::Generate {
+        tenant: None,
+        alias: None,
+        key_type: "primary".to_string(),
+        description: None,
+        escrow: true,
+    };
+    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap();
+
+    let err = tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap_err();
+    assert!(
+        format!("{err}").contains("already registered"),
+        "expected an already-registered refusal, got: {err}"
+    );
+
+    let escrow_count = || -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM encryption_keys WHERE is_escrow = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(escrow_count(), 1, "must still be exactly one escrow row");
+
+    // `key import --escrow` must refuse under the same rule, even with a
+    // syntactically valid, freshly-generated public key.
+    let fresh_pub = age::x25519::Identity::generate().to_public().to_string();
+    let import = KeyCommands::Import {
+        tenant: None,
+        alias: None,
+        path: fresh_pub,
+        key_type: "primary".to_string(),
+        escrow: true,
+    };
+    let err2 = tapectl::cli::key::run(&conn, &paths, &import, false).unwrap_err();
+    assert!(
+        format!("{err2}").contains("already registered"),
+        "expected an already-registered refusal, got: {err2}"
+    );
+    assert_eq!(
+        escrow_count(),
+        1,
+        "still exactly one escrow row after the import refusal too"
+    );
 }
 
 // ── Policy Resolution Tests ──

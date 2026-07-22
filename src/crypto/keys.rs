@@ -55,6 +55,20 @@ pub fn save_secret_key(path: &Path, secret_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a public key argument that may be either a literal `age1...`
+/// string or a path to a file containing one. `key import --escrow <pubkey>`
+/// accepts both: an operator retyping a printed key has no file to point at,
+/// while the common case (a `.pub` file from another tool) should still
+/// work. Falls back to `read_public_key`'s file-based path and its
+/// validation (and its error) when the value doesn't look like a literal key.
+pub fn read_or_parse_public_key(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with("age1") {
+        return Ok(trimmed.to_string());
+    }
+    read_public_key(Path::new(value))
+}
+
 /// Read a public key from a file.
 pub fn read_public_key(path: &Path) -> Result<String> {
     let content = fs::read_to_string(path)?;
@@ -189,6 +203,38 @@ mod tests {
         assert_eq!(read, kp.secret_key);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret key file must be 0600");
+    }
+
+    #[test]
+    fn read_or_parse_public_key_accepts_literal_string() {
+        let kp = generate_keypair();
+        let resolved = read_or_parse_public_key(&kp.public_key).unwrap();
+        assert_eq!(resolved, kp.public_key);
+    }
+
+    #[test]
+    fn read_or_parse_public_key_trims_whitespace_on_literal() {
+        let kp = generate_keypair();
+        let padded = format!("  {}  \n", kp.public_key);
+        let resolved = read_or_parse_public_key(&padded).unwrap();
+        assert_eq!(resolved, kp.public_key);
+    }
+
+    #[test]
+    fn read_or_parse_public_key_accepts_file_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("k.age.pub");
+        let kp = generate_keypair();
+        save_public_key(&path, &kp.public_key).unwrap();
+        let resolved = read_or_parse_public_key(path.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, kp.public_key);
+    }
+
+    #[test]
+    fn read_or_parse_public_key_errors_on_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ghost.pub");
+        assert!(read_or_parse_public_key(path.to_str().unwrap()).is_err());
     }
 
     #[test]

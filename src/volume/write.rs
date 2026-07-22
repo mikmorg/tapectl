@@ -322,6 +322,10 @@ pub fn volume_write(
         .ok_or_else(|| TapectlError::Other("no operator".into()))?;
     let op_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
     let op_pubkeys: Vec<String> = op_keys.iter().map(|k| k.public_key.clone()).collect();
+    // ADR-0005: appended to every recipient list this volume write encrypts
+    // to — the planning header (below) and the operator envelope + backup
+    // (further down) both use `op_pubkeys` directly.
+    let op_pubkeys = queries::recipient_list_with_escrow(conn, op_pubkeys)?;
 
     let plan_units: Vec<(String, String, i64, i64)> = staged
         .iter()
@@ -440,6 +444,11 @@ pub fn volume_write(
         let tenant_keys = queries::get_active_keys_for_tenant(conn, tenant_id)?;
         let mut all_keys: Vec<String> = tenant_keys.iter().map(|k| k.public_key.clone()).collect();
         all_keys.extend(op_pubkeys.iter().cloned());
+        // ADR-0005: `op_pubkeys` is already escrow-augmented, so this is a
+        // harmless no-op in practice — routed explicitly anyway so this
+        // tenant-envelope assembly is correct on its own terms, without a
+        // reader having to trace `op_pubkeys`' provenance to be sure.
+        let all_keys = queries::recipient_list_with_escrow(conn, all_keys)?;
 
         let manifest_units = build_manifest_units(&staged, tenant_id, &slice_write_map);
         let manifest = layout::generate_manifest_toml(label, &tenant.name, &manifest_units);
