@@ -61,7 +61,15 @@ impl ZoneKind {
             ZoneKind::MiniIndex => "mini_index",
             ZoneKind::TenantEnvelope { .. } => "tenant_envelope",
             ZoneKind::OperatorEnvelope => "operator_envelope",
-            ZoneKind::OperatorEnvelopeBackup => "operator_envelope",
+            // Distinct from OperatorEnvelope per volume-format-v2.md §3's type
+            // enum ("...operator_envelope, operator_envelope_backup..."), and
+            // matched literally by RESTORE.sh's v1 *and* v2 --find-envelope
+            // awk pattern (layout.rs, `$2=="operator_envelope_backup"`). Fixed
+            // here (plan T5b) — previously collapsed to the same label as the
+            // primary envelope, which is a bug relative to the normative
+            // format, not a deliberate v1/v2 difference; no test pinned the
+            // old value (it only affects the plaintext front/mini index).
+            ZoneKind::OperatorEnvelopeBackup => "operator_envelope_backup",
             ZoneKind::SealMarker => "seal_marker",
         }
     }
@@ -71,15 +79,37 @@ impl ZoneKind {
     }
 }
 
-/// Where an entry's bytes come from. Staged slices already exist on disk with
-/// a recorded checksum; generated zones are produced from the Layout at write
-/// time (#24) and carry their computed bytes' size/hash once generated.
+/// Where an entry's bytes come from.
+///
+/// v2 (plan T5b, sheet §2.2 "materialize-to-staging"): every generated zone
+/// is written to the session's staging directory *once*, at `build()` time,
+/// and thereafter is a disk path + size + hash exactly like a staged slice —
+/// no `Vec<u8>` ever lives in a `Layout`. This is what lets `execute` stream
+/// uniformly from disk in position order, and what fixes resume: the ID
+/// thunk and seal marker embed real timestamps, so regenerating them on
+/// resume would silently produce different bytes than what is already on
+/// tape; materializing once and re-reading the frozen file avoids that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentSource {
-    /// An ephemeral staged slice file (`stage_slices.staging_path`).
+    /// An ephemeral staged slice file (`stage_slices.staging_path`). Never
+    /// regenerated or re-encrypted by the Layout — it arrives already
+    /// encrypted from stage time; the Layout only records its existing size
+    /// and `sha256_encrypted` verbatim (no third read of the slice bulk,
+    /// `volume-format-v2.md` §3).
     Staged(PathBuf),
-    /// Bytes generated from the Layout (ID thunk, guide, RESTORE.sh, planning
-    /// header, mini-index, envelopes).
+    /// A generated zone (ID thunk, guide, RESTORE.sh, front index, envelopes,
+    /// seal marker) frozen to a file under the session staging directory at
+    /// `build()` time (v2-open-questions.md §2.2). `size_bytes`/`sha256` on
+    /// the owning `LayoutEntry` describe these exact on-disk bytes.
+    Materialized(PathBuf),
+    /// v1-only: bytes generated in memory by `write.rs`'s v1 pipeline and
+    /// written straight to tape, with no on-disk staging file and (today) no
+    /// size/hash recorded on the entry. Kept, unused by any v2 code, only
+    /// because `write.rs`'s v1 path (out of scope for T5b; T8 deletes it per
+    /// `docs/design/v2-implementation-plan.md`) still constructs entries with
+    /// this variant via its own `gen_entry` helper. `build()` (T5b, the v2
+    /// path) never produces `Generated` — every one of its generated zones is
+    /// `Materialized`.
     Generated,
 }
 
@@ -166,6 +196,34 @@ pub enum LayoutError {
     EscrowRecipientMissing,
     #[error("i/o hashing {path}: {message}")]
     Io { path: PathBuf, message: String },
+    #[error("materialized zone at position {position} missing from disk: {path}")]
+    MaterializedZoneMissing { position: i32, path: PathBuf },
+    #[error(
+        "materialized zone at position {position} size mismatch: recorded {expected}, on-disk {actual}"
+    )]
+    MaterializedZoneSizeMismatch {
+        position: i32,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "materialized zone at position {position} hash mismatch: recorded {expected}, on-disk {actual}"
+    )]
+    MaterializedZoneHashMismatch {
+        position: i32,
+        expected: String,
+        actual: String,
+    },
+    #[error("generated zone at position {position} ({label}) failed to parse: {message}")]
+    GeneratedZoneUnparseable {
+        position: i32,
+        label: &'static str,
+        message: String,
+    },
+    #[error("generated zone at position {position} is internally inconsistent: {message}")]
+    GeneratedZoneInconsistent { position: i32, message: String },
+    #[error("RESTORE.sh failed `bash -n`: {0}")]
+    RestoreScriptSyntaxError(String),
 }
 
 /// The complete file plan for one volume.
@@ -203,15 +261,24 @@ impl Layout {
         }
     }
 
-    /// The full pre-write predicate (ADR-0002 / design note point 1-3): every
-    /// entry sized; on-tape total + reserve fits the budget; every staged
-    /// slice exists on disk with a matching sha256; keys resolvable. Points 4
-    /// (generated-zone parse) and 5 (padding is enforced structurally here)
-    /// land with #24. Returns every failure found.
+    /// The full pre-write predicate (ADR-0002 / `layout-session.md`
+    /// validation points 1-3+5): every entry sized; on-tape total + reserve
+    /// fits the budget; every staged slice exists on disk with a matching
+    /// sha256 (tri-layer L1 — sacred invariant 2, never weakened to
+    /// size-only); every *materialized* zone exists on disk and matches its
+    /// recorded size (and hash, where one was recorded — the placeholder
+    /// seal marker deliberately carries none, see `build::build`); keys
+    /// resolvable. Point 4 (generated-zone TOML/consistency/`bash -n`
+    /// parsing, which needs `format::` and a subprocess) is composed on top
+    /// by `build::BuiltLayout::validate` (plan T5b) rather than living here,
+    /// so this module stays free of a `format`/process dependency. Returns
+    /// every failure found, never stops at the first (this is a pre-flight
+    /// report).
     pub fn validate(&self, keys: &KeyAvailability) -> Result<(), Vec<LayoutError>> {
         let mut errs = Vec::new();
         self.check_capacity(&mut errs);
         self.check_staged_slices(&mut errs);
+        self.check_materialized_zones(&mut errs);
         self.check_keys(keys, &mut errs);
         if errs.is_empty() {
             Ok(())
@@ -266,6 +333,62 @@ impl Layout {
         }
     }
 
+    /// Every `ContentSource::Materialized` entry must exist on disk with the
+    /// exact recorded size; if a hash was also recorded, it must match too.
+    /// The seal marker's placeholder bytes deliberately record `sha256:
+    /// None` (its real on-tape bytes will differ once `seal()` substitutes
+    /// the true `sealed_at`, so hashing the placeholder would record a claim
+    /// the eventual tape bytes can never satisfy) — `None` skips the hash
+    /// half of this check for that entry without a `ZoneKind` special case.
+    fn check_materialized_zones(&self, errs: &mut Vec<LayoutError>) {
+        for e in &self.entries {
+            let ContentSource::Materialized(path) = &e.source else {
+                continue;
+            };
+            let meta = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    errs.push(LayoutError::MaterializedZoneMissing {
+                        position: e.position,
+                        path: path.clone(),
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    errs.push(LayoutError::Io {
+                        path: path.clone(),
+                        message: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if let Some(expected_size) = e.size_bytes {
+                let actual_size = meta.len();
+                if actual_size != expected_size {
+                    errs.push(LayoutError::MaterializedZoneSizeMismatch {
+                        position: e.position,
+                        expected: expected_size,
+                        actual: actual_size,
+                    });
+                }
+            }
+            if let Some(expected_hash) = &e.sha256 {
+                match hash_file(path) {
+                    Ok(actual) if &actual == expected_hash => {}
+                    Ok(actual) => errs.push(LayoutError::MaterializedZoneHashMismatch {
+                        position: e.position,
+                        expected: expected_hash.clone(),
+                        actual,
+                    }),
+                    Err(err) => errs.push(LayoutError::Io {
+                        path: path.clone(),
+                        message: err.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
     fn check_keys(&self, keys: &KeyAvailability, errs: &mut Vec<LayoutError>) {
         for t in &keys.tenant_ids {
             if !keys.tenants_with_active_key.contains(t) {
@@ -283,8 +406,9 @@ impl Layout {
 }
 
 /// Streamed sha256 of a file (never buffers the whole file — respects the H9
-/// streaming direction).
-fn hash_file(path: &Path) -> std::io::Result<String> {
+/// streaming direction). `pub(crate)` so `build.rs` can reuse it rather than
+/// duplicating a streaming-hash loop (plan T5b).
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 128 * 1024];
@@ -531,5 +655,115 @@ mod tests {
             .iter()
             .any(|e| matches!(e, LayoutError::SliceFileMissing(_))));
         assert!(errs.contains(&LayoutError::TenantHasNoActiveKey(9)));
+    }
+
+    fn materialized_entry(
+        position: i32,
+        path: PathBuf,
+        size: u64,
+        sha256: Option<String>,
+    ) -> LayoutEntry {
+        LayoutEntry {
+            position,
+            kind: ZoneKind::FrontIndex,
+            size_bytes: Some(size),
+            sha256,
+            source: ContentSource::Materialized(path),
+        }
+    }
+
+    #[test]
+    fn materialized_zone_missing_file_reported() {
+        let entry = materialized_entry(
+            3,
+            PathBuf::from("/nonexistent/tapectl/front_index.toml"),
+            10,
+            Some("deadbeef".into()),
+        );
+        let errs = layout_with(vec![entry], 10 * BS, 0)
+            .validate(&keys_ok(&[]))
+            .unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, LayoutError::MaterializedZoneMissing { position: 3, .. })));
+    }
+
+    #[test]
+    fn materialized_zone_size_mismatch_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("front_index.toml");
+        let bytes = b"front index bytes";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+
+        // Recorded size is wrong (one byte too many) — the hash is left
+        // correct so this isolates the size-mismatch branch.
+        let entry = materialized_entry(3, path, bytes.len() as u64 + 1, Some(sha_hex(bytes)));
+        let errs = layout_with(vec![entry], 10 * BS, 0)
+            .validate(&keys_ok(&[]))
+            .unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            LayoutError::MaterializedZoneSizeMismatch { position: 3, .. }
+        )));
+    }
+
+    #[test]
+    fn materialized_zone_hash_mismatch_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("front_index.toml");
+        let bytes = b"front index bytes";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+
+        let entry = materialized_entry(3, path, bytes.len() as u64, Some(sha_hex(b"corrupted")));
+        let errs = layout_with(vec![entry], 10 * BS, 0)
+            .validate(&keys_ok(&[]))
+            .unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            LayoutError::MaterializedZoneHashMismatch { position: 3, .. }
+        )));
+    }
+
+    #[test]
+    fn materialized_zone_without_recorded_hash_skips_hash_check() {
+        // The placeholder seal marker deliberately records sha256: None
+        // (build.rs) — validate must still check its size, but not fail it
+        // over a hash it was never given, no matter what the file contains.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seal_marker.toml");
+        let bytes = b"placeholder seal bytes, timestamp will differ later";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+
+        let entry = materialized_entry(9, path, bytes.len() as u64, None);
+        assert!(layout_with(vec![entry], 10 * BS, 0)
+            .validate(&keys_ok(&[]))
+            .is_ok());
+    }
+
+    #[test]
+    fn operator_envelope_backup_has_a_distinct_type_label() {
+        // volume-format-v2.md §3's type enum lists operator_envelope and
+        // operator_envelope_backup as distinct values, and RESTORE.sh's
+        // --find-envelope awk pattern (layout.rs) matches the literal
+        // "operator_envelope_backup" string separately from
+        // "operator_envelope" — the two must not collapse to the same label.
+        assert_eq!(ZoneKind::OperatorEnvelope.type_label(), "operator_envelope");
+        assert_eq!(
+            ZoneKind::OperatorEnvelopeBackup.type_label(),
+            "operator_envelope_backup"
+        );
+        assert_ne!(
+            ZoneKind::OperatorEnvelope.type_label(),
+            ZoneKind::OperatorEnvelopeBackup.type_label()
+        );
     }
 }
