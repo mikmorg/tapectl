@@ -48,7 +48,8 @@ filemark), in this fixed order:
 │ File M-1 Data slice     enc(t+op+esc) ┘ short/damaged tape can truncate.      │
 ├──── TAIL: the completeness assertion ─────────────────────────────────────────┤
 │ File M   SEAL MARKER    plaintext   {layout_version, file_count = M+1,        │
-│                                     sealed_at, front_index_sha256}. Its        │
+│                                     sealed_at, front_index_sha256} + a full   │
+│                                     embedded copy of the front index. Its     │
 │                                     presence = "everything before me is here."│
 └────────────────────────────────────────────────────────────────────────────────┘
     esc = the permanent Escrow Recipient (ADR-0005) — in every encryption.
@@ -145,10 +146,23 @@ directly when the index is built.
 
 ## 4. The seal marker (File M) and the integrity chain
 
-Plaintext TOML, one tape file, written last: `{ layout_version, file_count = M+1,
-sealed_at (RFC 3339), front_index_sha256 }`. Its **presence** is the assertion
-"every file before me is present and this is a sealed volume"; its **absence** means
-the tape is self-evidently unsealed (interrupted or aborted — see layout-session.md).
+Plaintext TOML, one tape file, written last: a `[seal]` section — `{ layout_version,
+file_count = M+1, sealed_at (RFC 3339), front_index_sha256 }` — followed by a **full
+embedded copy of the front index** (`[[files]]` entries in the same grammar as
+File 3). Its **presence** is the assertion "every file before me is present and this
+is a sealed volume"; its **absence** means the tape is self-evidently unsealed
+(interrupted or aborted — see layout-session.md).
+
+**The embedded copy** (ratified 2026-07-22) mirrors LTFS's front-copy-plus-end-index
+redundancy without partitioning: damage at either end of the tape is survivable —
+front damage → recover the whole map from the tail; tail damage → the tape reads as
+unsealed (fail-safe) but stays fully navigable from the front. The copy is strictly
+*more* complete than File 3: by seal time File 3's bytes are known, so the copy
+carries File 3's own `size_bytes` + `sha256_encrypted` (only the seal marker's own
+entry stays hash-less — self-reference). The copy is not itself hash-protected
+(nothing on the tape hashes the last file); its per-file claims are validated the
+same way File 3's are — by hashing the files they describe — and it must pass the
+§5 self-consistency checks before being trusted.
 
 The seal marker is the **unhashed root of trust**. Nothing on the tape carries the
 seal marker's own hash (it is last, tiny, and self-delimiting). From it, integrity is
@@ -180,11 +194,19 @@ index is at the front):
 4. For every file except File 3 and the seal marker, read and hash it, compare to
    File 3's `sha256_encrypted[i]` ⇒ **integrity** tier.
 
-The `verification_sessions` row records **which tier** was achieved (navigable vs
-integrity), per ADR-0001 (recorded strength must match what ran). Drive-level
-Logical Block Protection is not part of this chain — the Linux `st` data path does
-not expose it (ADR-0007); if enabled out of band it is recorded only as
-supplementary evidence, never as the basis of the seal.
+**The integrity tier is the seal default** (ratified 2026-07-22): at seal time the
+staged slices still exist on disk, so a failed confirm costs a fresh cartridge and
+hours — discovered years later, the source may be gone; and with LBP unreachable
+through `st`, the readback hash is the only control spanning host RAM → HBA → drive
+→ medium. `--quick` opts down to the navigable tier and is recorded honestly. The
+tiers map onto the existing `verification_sessions.verify_type` column: integrity →
+`full`, navigable → `quick` (no schema change).
+
+The `verification_sessions` row records **which tier** was achieved, per ADR-0001
+(recorded strength must match what ran). Drive-level Logical Block Protection is
+not part of this chain — the Linux `st` data path does not expose it (ADR-0007); if
+enabled out of band it is recorded only as supplementary evidence, never as the
+basis of the seal.
 
 ## 6. Heir path — end to end with only `mt`, `dd`, `age`, `dar`, `sha256sum`
 
@@ -198,7 +220,9 @@ RESTORE.sh and the system guide implement it literally.
 3. *(completeness)* space to the last file and read the **seal marker**; check
    `file_count` and that `front_index_sha256` matches File 3's hash. Absent or
    mismatched ⇒ the tape is unsealed or damaged — proceed knowing some trailing
-   *slices* may be missing (the front index still says exactly which).
+   *slices* may be missing (the front index still says exactly which). If File 3
+   itself is unreadable, the seal marker's **embedded copy** provides the same
+   map (validate its per-file hashes against the files themselves before trust).
 4. For each envelope position: `dd` it out, `age -d -i KEY` — the one that decrypts
    is yours ⇒ `MANIFEST.toml` + `RECOVERY.md` + `catalogs/`.
 5. For each slice position in your manifest: `dd bs=512k` it out; `sha256sum` vs the

@@ -23,12 +23,13 @@ identity; sizes + ciphertext hashes permitted).
 
 ---
 
-## 1. Operator ratification sheet (the only items still awaiting a human call)
+## 1. Operator ratification sheet
 
-Re-analyzed this round; each lean is now robustness-argued, with the change it
-implies. A one-word answer per row unblocks everything.
+**Status 2026-07-22: §1.1 RATIFIED (embedded copy — "write both") and §1.2
+RATIFIED (integrity default, `--quick` optional) — both folded into
+`volume-format-v2.md` §4/§5/§6. §1.3 (slice size) is in discussion.**
 
-### 1.1 Seal marker: minimal vs **embedded full front-index copy**  ·  new lean: EMBEDDED COPY
+### 1.1 Seal marker: minimal vs **embedded full front-index copy**  ·  RATIFIED: EMBEDDED COPY
 Round 1 leaned "minimal." The robustness pass flips the lean. Failure analysis:
 - The front index is a **single point of failure at BOT** — and LTFS keeps index
   copies at *both* ends of the tape for exactly this reason (front copy + the
@@ -48,7 +49,7 @@ Round 1 leaned "minimal." The robustness pass flips the lean. Failure analysis:
 `volume-format-v2.md` §4 gains the two-ended-redundancy rationale; the heir
 degradation ladder (§3.4) gets its second rung.
 
-### 1.2 Confirm default at seal: navigable vs **integrity**  ·  new lean: INTEGRITY
+### 1.2 Confirm default at seal: navigable vs **integrity**  ·  RATIFIED: INTEGRITY (opt-down `--quick`)
 Round 1 leaned "navigable default, `--full` opt-in." Flipped by two arguments:
 - **The asymmetry of when a bad copy is discovered.** At seal time the staged
   slices are still on disk — a failed confirm costs a fresh cartridge and hours.
