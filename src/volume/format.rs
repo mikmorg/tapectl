@@ -160,6 +160,17 @@ pub enum ConsistencyViolation {
     SealMarkerCount { found: usize },
     /// The (single) `seal_marker` entry must be the last entry in the list.
     SealMarkerNotLast { position: i32, last_index: usize },
+    /// Every entry except the front index's own and the seal marker's must
+    /// carry `size_bytes` (format §3 — the heir's padding-trim contract; the
+    /// two plaintext tail files are filemark-delimited and NUL-strip-parsed,
+    /// so neither needs a trim size, and listing the seal's size in File 3
+    /// while the seal embeds File 3's size would be a needless mutual-
+    /// reference fixpoint). A map that omits a content file's size is
+    /// hollow, not merely terse.
+    MissingSize { position: i32 },
+    /// Every entry except the front index's own and the seal marker's must
+    /// carry `sha256_encrypted` (format §3 — the keyless integrity chain).
+    MissingHash { position: i32 },
 }
 
 /// Run the §2.5 self-consistency checks over a parsed `[[files]]` list
@@ -210,6 +221,26 @@ pub fn validate_consistency(entries: &[ParsedIndexEntry]) -> Vec<ConsistencyViol
             }
         }
         found => violations.push(ConsistencyViolation::SealMarkerCount { found }),
+    }
+
+    // Completeness (format §3 presence rules): a structurally ordered map
+    // that omits a content file's size or hash would pass the shape checks
+    // above yet be useless to the heir (no padding trim) or to the keyless
+    // chain (no hash to verify). Flag every omission — except the two
+    // self-referential exclusions the format defines.
+    for e in entries {
+        let is_front_index = e.type_label == "front_index";
+        let is_seal_marker = e.type_label == "seal_marker";
+        if !is_front_index && !is_seal_marker && e.size_bytes.is_none() {
+            violations.push(ConsistencyViolation::MissingSize {
+                position: e.position,
+            });
+        }
+        if !is_front_index && !is_seal_marker && e.sha256_encrypted.is_none() {
+            violations.push(ConsistencyViolation::MissingHash {
+                position: e.position,
+            });
+        }
     }
 
     violations
@@ -476,5 +507,39 @@ mod tests {
             .iter()
             .any(|v| matches!(v, ConsistencyViolation::FrontIndexCount { found: 2 })));
         assert!(violations.len() >= 2);
+    }
+
+    #[test]
+    fn hollow_map_entries_are_flagged() {
+        // Completeness (format §3): a content entry missing size_bytes or
+        // sha256_encrypted must be flagged — a map that parses and is
+        // well-ordered but omits a slice's size/hash is hollow (no padding
+        // trim for the heir, nothing for the keyless chain to verify) and
+        // must fail loudly at the Navigable tier, not only at Integrity.
+        let mut files = sample_files();
+        let victim = files
+            .iter_mut()
+            .find(|f| f.type_label == "data_slice")
+            .expect("fixture has a slice");
+        let victim_pos = victim.position;
+        victim.size_bytes = None;
+        victim.sha256_encrypted = None;
+        let generated = generate_front_index("RT01", &files);
+        let parsed = parse_front_index(&generated).unwrap();
+        let violations = validate_consistency(&parsed);
+        assert!(violations.iter().any(|v| *v
+            == ConsistencyViolation::MissingSize {
+                position: victim_pos
+            }));
+        assert!(violations.iter().any(|v| *v
+            == ConsistencyViolation::MissingHash {
+                position: victim_pos
+            }));
+        // The two self-referential exclusions stay exempt: the untouched
+        // fixture (front_index entry bare, seal entry hash-less) is clean.
+        let clean = validate_consistency(
+            &parse_front_index(&generate_front_index("RT01", &sample_files())).unwrap(),
+        );
+        assert_eq!(clean, Vec::new());
     }
 }

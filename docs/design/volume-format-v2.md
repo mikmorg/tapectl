@@ -143,9 +143,14 @@ Plaintext TOML. One entry per tape file, in position order:
   identity — a `data_slice` and a `tenant_envelope` entry are unlabeled beyond kind.
 - `size_bytes` — the true (pre-block-padding) byte length, so the heir can
   `head -c $size_bytes` to trim the 512 KB block padding before decrypting. Present
-  for every file **except File 3 itself** (its length is self-referential; the heir
-  recovers File 3 by reading the whole filemark-bounded tape file and parsing the
-  TOML, whose trailing zero-padding the parser ignores).
+  for every file **except File 3 itself and the seal marker** (corrected
+  2026-07-22: an earlier draft excluded only File 3). File 3's length is
+  self-referential, and listing the seal marker's size here while the seal's
+  embedded copy lists File 3's size would create a needless mutual-reference
+  fixpoint (each size depends on the other's digit count). Neither exclusion
+  costs a reader anything: both tail files are plaintext, filemark-delimited,
+  and recovered by reading the whole tape file and stripping trailing zero
+  padding — the trim contract exists for the *encrypted* files.
 - `sha256_encrypted` — hex sha256 of the file's **on-tape bytes** (ciphertext for
   encrypted zones; the plaintext bytes for File 0/1/2). Present for every file
   **except File 3 itself** (self-reference) **and the seal marker** (not yet written
