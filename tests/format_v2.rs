@@ -496,6 +496,26 @@ fn keyless_chain_walk(files: &[Vec<u8>], fi_pos: usize, fi_true_len: usize) -> C
     }
 }
 
+/// Parse File 3 from recorded bytes alone (using only the one Layout fact
+/// above). Does not verify the seal binding or any content hash — that is
+/// `keyless_chain_walk`'s job; this is the minimal "what does the map say"
+/// step assertions 2, 3, and 7 build on, so a hash-chain regression doesn't
+/// also fail unrelated properties.
+fn parse_front_index_from_recorded_bytes(
+    files: &[Vec<u8>],
+    fi_pos: usize,
+    fi_true_len: usize,
+) -> Vec<format::ParsedIndexEntry> {
+    let padded = &files[fi_pos];
+    assert!(
+        fi_true_len <= padded.len(),
+        "recorded front index shorter than its true length"
+    );
+    let true_bytes = &padded[..fi_true_len];
+    format::parse_front_index(&String::from_utf8_lossy(true_bytes))
+        .expect("front index must parse from recorded bytes")
+}
+
 // ── the 7 required assertions ──
 
 /// Assertion 1 (plan T7 / sheet §4.1): parse File 3, verify the seal marker
@@ -518,4 +538,125 @@ fn keyless_chain_walk_from_recorded_bytes_verifies_every_file() {
             panic!("expected Sealed on a freshly-sealed harness, got Unsealed: {reason}")
         }
     }
+}
+
+/// Assertion 2 (§2.5): front-index self-consistency on the PARSED index, plus
+/// the seal's `file_count` matching both the parsed entry count and the
+/// actual number of recorded files.
+#[test]
+fn front_index_self_consistency_and_seal_file_count_match() {
+    let h = shared_harness();
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+    let parsed = parse_front_index_from_recorded_bytes(&h.store.files, fi_pos, fi_true_len);
+
+    let violations = format::validate_consistency(&parsed);
+    assert!(
+        violations.is_empty(),
+        "front index has consistency violations: {violations:?}"
+    );
+
+    // Positions strictly increasing from 0 — validate_consistency already
+    // enforces this, asserted again explicitly since the task names it as a
+    // required property in its own right, not just an implementation detail.
+    for (i, e) in parsed.iter().enumerate() {
+        assert_eq!(
+            e.position, i as i32,
+            "position out of sequence at index {i}"
+        );
+    }
+
+    let front_indexes: Vec<_> = parsed
+        .iter()
+        .filter(|e| e.type_label == "front_index")
+        .collect();
+    assert_eq!(
+        front_indexes.len(),
+        1,
+        "exactly one front_index entry required"
+    );
+    assert_eq!(
+        front_indexes[0].position, 3,
+        "front_index must sit at position 3"
+    );
+
+    let seal_markers: Vec<_> = parsed
+        .iter()
+        .filter(|e| e.type_label == "seal_marker")
+        .collect();
+    assert_eq!(
+        seal_markers.len(),
+        1,
+        "exactly one seal_marker entry required"
+    );
+    assert_eq!(
+        seal_markers[0].position as usize,
+        parsed.len() - 1,
+        "seal_marker must be the last entry"
+    );
+
+    let seal = format::parse_seal_marker(&String::from_utf8_lossy(h.store.files.last().unwrap()))
+        .expect("seal marker parses");
+    assert_eq!(
+        seal.file_count as usize,
+        parsed.len(),
+        "seal's file_count must match the front index's entry count"
+    );
+    assert_eq!(
+        seal.file_count as usize,
+        h.store.files.len(),
+        "seal's file_count must match the actual number of recorded files"
+    );
+}
+
+/// Assertion 3 (§1): v2 zone order — the fixed front files, envelopes
+/// strictly before slices, seal marker strictly last, and no
+/// `planning_header` entry anywhere (folded into the operator envelope's
+/// PLAN.toml — v2 removes it as a standalone tape file).
+#[test]
+fn v2_zone_order_envelopes_precede_slices_no_planning_header() {
+    let h = shared_harness();
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+    let parsed = parse_front_index_from_recorded_bytes(&h.store.files, fi_pos, fi_true_len);
+
+    assert_eq!(parsed[0].type_label, "id_thunk");
+    assert_eq!(parsed[1].type_label, "system_guide");
+    assert_eq!(parsed[2].type_label, "restore_sh");
+    assert_eq!(parsed[3].type_label, "front_index");
+
+    let last_envelope_idx = parsed
+        .iter()
+        .rposition(|e| {
+            matches!(
+                e.type_label.as_str(),
+                "tenant_envelope" | "operator_envelope" | "operator_envelope_backup"
+            )
+        })
+        .expect("harness must have at least one envelope");
+    let first_slice_idx = parsed
+        .iter()
+        .position(|e| e.type_label == "data_slice")
+        .expect("harness must have at least one data slice");
+    assert!(
+        last_envelope_idx < first_slice_idx,
+        "every envelope must precede every data slice"
+    );
+
+    assert_eq!(parsed.last().unwrap().type_label, "seal_marker");
+
+    assert!(
+        parsed.iter().all(|e| e.type_label != "planning_header"),
+        "v2 must never emit a planning_header entry on tape (folded into the \
+         operator envelope's PLAN.toml, volume-format-v2.md §8)"
+    );
+
+    // 2 tenants => 2 distinct tenant_envelope entries, proving the
+    // permutation-exercise setup actually produced multiple envelopes here.
+    let tenant_envelope_count = parsed
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .count();
+    assert_eq!(
+        tenant_envelope_count, 2,
+        "harness must use exactly 2 tenants"
+    );
 }
