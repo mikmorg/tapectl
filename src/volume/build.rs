@@ -412,31 +412,27 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         fi_list_entry.sha256_encrypted = Some(fi_hash.clone());
     }
 
-    // §9 micro-decision: the seal is generated once here with whatever
-    // timestamp `generate_seal_marker` embeds (there is no injectable
-    // override — see the module doc), serving as a size placeholder for a
-    // future seal() to regenerate with the real `sealed_at`. That trick is
-    // only sound if RFC 3339 renders at a FIXED width; empirically (T5b) it
-    // does NOT in general — chrono's `to_rfc3339()` is
-    // `SecondsFormat::AutoSi`, which drops trailing-zero fractional digits
-    // (observed 25/29/32/35-byte outputs; over 2M `Utc::now()` samples on
-    // the dev VM, ~99.89% landed at 35 bytes, ~0.11% at 32, ~0.0002% at 29).
-    // This regenerate-and-compare is a low-power canary: it only catches two
-    // adjacent `now()` calls landing in different width classes, which is
-    // rare. It is NOT a fix for the real gap (a much later real reseal could
-    // still land on a different width) — see the T5b report for the actual
-    // fix needed in `generate_seal_marker` before a future seal step depends
-    // on this.
+    // §9 micro-decision, as corrected 2026-07-22: the seal is generated once
+    // here as a SIZE PLACEHOLDER; a later seal() regenerates it with the real
+    // `sealed_at` and must produce byte-identical length. That holds because
+    // `generate_seal_marker` renders its timestamp at fixed width
+    // (SecondsFormat::Secs + use_z -> exactly 20 bytes) — see the comment on
+    // that function for why plain `to_rfc3339()` (AutoSi, variable-width) was
+    // wrong and would have failed a real reseal roughly once per ~900 writes.
+    // The regenerate-and-compare below is now a genuine invariant check
+    // rather than a probabilistic canary: with a fixed-width timestamp ANY
+    // length difference is a real defect (a changed generator, a non-UTC
+    // clock), so failing the build here is correct.
     let seal_bytes =
         layout::generate_seal_marker(&inputs.label, total_files, &fi_hash, &seal_files);
     let seal_bytes_recheck =
         layout::generate_seal_marker(&inputs.label, total_files, &fi_hash, &seal_files);
     if seal_bytes.len() != seal_bytes_recheck.len() {
         return Err(TapectlError::Other(format!(
-            "build: seal marker placeholder-timestamp sizing assumption broke: two \
-             generate_seal_marker calls produced different byte lengths ({} vs {}) — RFC 3339 \
-             is not fixed-width for the timestamps chrono just emitted. A later real reseal \
-             would fail its own byte-length-identity check. See the T5b report.",
+            "build: seal marker placeholder sizing broke — two generate_seal_marker calls \
+             produced different byte lengths ({} vs {}). The seal timestamp must render at \
+             fixed width (SecondsFormat::Secs); a later reseal would fail its length-identity \
+             check. See generate_seal_marker in layout.rs.",
             seal_bytes.len(),
             seal_bytes_recheck.len()
         )));

@@ -1777,7 +1777,20 @@ pub fn generate_seal_marker(
     front_index_sha256: &str,
     files: &[FrontIndexFile],
 ) -> String {
-    let now = chrono::Utc::now().to_rfc3339();
+    // FIXED-WIDTH timestamp, deliberately: the build step sizes the seal
+    // marker with a placeholder and the seal step regenerates it with the
+    // real `sealed_at`, which is only sound if both render at identical
+    // byte length (`v2-open-questions.md` §9). `to_rfc3339()` does NOT
+    // guarantee that — it is `SecondsFormat::AutoSi`, which drops
+    // trailing-zero fractional digits, so it emits 25/29/32/35-byte strings
+    // depending on the nanosecond value (measured on this VM: ~99.89% at
+    // 35 bytes, ~0.11% at 32, ~0.0002% at 29). Under that format a real
+    // reseal would land on a different width roughly once per ~900 writes
+    // and fail its own length-identity check. `SecondsFormat::Secs` with
+    // `use_z = true` renders exactly 20 bytes ("2026-07-22T20:09:00Z"),
+    // always — second precision is ample for an audit timestamp, and
+    // fixed width is what the sizing trick actually requires.
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut s = format!(
         r#"================================================================
                     TAPECTL SEAL MARKER
@@ -2128,6 +2141,47 @@ mod tests {
         );
         // sealed_at is present and RFC3339-parseable.
         let sealed_at = seal.get("sealed_at").unwrap().as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
+    }
+
+    #[test]
+    fn seal_marker_timestamp_is_fixed_width() {
+        // Load-bearing for the build/seal placeholder-sizing trick
+        // (v2-open-questions.md §9): build sizes the seal with a placeholder
+        // timestamp, seal() regenerates with the real sealed_at, and the two
+        // MUST be byte-length identical. chrono's plain to_rfc3339() is
+        // AutoSi (drops trailing-zero fractional digits -> 25/29/32/35-byte
+        // outputs), which would break that ~1 write in 900. SecondsFormat::Secs
+        // + use_z renders exactly 20 bytes, always.
+        let files = vec![FrontIndexFile {
+            position: 0,
+            type_label: "id_thunk",
+            size_bytes: Some(10),
+            sha256_encrypted: Some("aa".into()),
+        }];
+        let first = generate_seal_marker("TEST01", 2, "fi", &files);
+        for _ in 0..64 {
+            let again = generate_seal_marker("TEST01", 2, "fi", &files);
+            assert_eq!(
+                first.len(),
+                again.len(),
+                "seal marker length varies between generations — the placeholder \
+                 sizing trick (and therefore seal()) is broken"
+            );
+        }
+        // Pin the exact rendering too, so a future edit to the format is a
+        // deliberate act rather than an accident.
+        let body = &first[first.find("[seal]").unwrap()..];
+        let parsed: toml::Value = body.parse().expect("TOML parses");
+        let sealed_at = parsed
+            .get("seal")
+            .unwrap()
+            .get("sealed_at")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(sealed_at.len(), 20, "sealed_at must be exactly 20 bytes");
+        assert!(sealed_at.ends_with('Z'), "sealed_at must be Z-suffixed UTC");
         assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
     }
 

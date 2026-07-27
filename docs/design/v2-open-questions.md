@@ -519,11 +519,19 @@ pub trait Store {
 
 Micro-decisions (resolved here so the build doesn't discover them):
 - **Seal-marker sizing at build:** its `sealed_at` must be truthful (seal
-  time), but validate needs its size. RFC 3339 UTC is fixed-width and
-  `file_count` is known, so build generates it with a placeholder timestamp for
-  sizing and seal regenerates with the real one — byte-length identical, and
-  nothing hashes the seal marker (it is the unhashed root), so regeneration is
-  free. (The embedded index copy crosses one 512 K block only above ~4,000
+  time), but validate needs its size. Build generates it with a placeholder
+  timestamp for sizing and seal regenerates with the real one — byte-length
+  identical, and nothing hashes the seal marker (it is the unhashed root), so
+  regeneration is free. **Correction (2026-07-22, T5b):** an earlier wording of
+  this bullet asserted "RFC 3339 UTC is fixed-width" — it is not. chrono's
+  `to_rfc3339()` is `SecondsFormat::AutoSi`, which drops trailing-zero
+  fractional digits and so emits 25/29/32/35-byte strings depending on the
+  nanosecond value (measured: ~99.89% at 35 bytes, ~0.11% at 32). A real reseal
+  would therefore have failed its own length-identity check roughly once per
+  ~900 writes — a rare production flake that every test would pass. The
+  generator now renders `SecondsFormat::Secs` with `use_z = true` (exactly 20
+  bytes, always); `generate_seal_marker` carries the rationale and
+  `seal_marker_timestamp_is_fixed_width` pins it. (The embedded index copy crosses one 512 K block only above ~4,000
   files — the sizing handles it either way.)
 - **Hashing tee reader:** a small `Read` adapter (sha256 of bytes as they
   stream) — one disk read serves hash + tape write; lives in `staging` or a
