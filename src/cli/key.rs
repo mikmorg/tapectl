@@ -112,12 +112,7 @@ pub fn run(
             if *escrow {
                 generate_escrow_key(conn, paths, description.as_deref(), json_output)?;
             } else {
-                let tenant = tenant.as_deref().ok_or_else(|| {
-                    TapectlError::Other("--tenant is required (or pass --escrow)".into())
-                })?;
-                let alias = alias.as_deref().ok_or_else(|| {
-                    TapectlError::Other("--alias is required (or pass --escrow)".into())
-                })?;
+                let (tenant, alias) = require_tenant_and_alias(tenant, alias)?;
 
                 let t = crate::tenant::require_tenant(conn, tenant)?;
                 let kp = keys::generate_and_save(&paths.keys_dir, tenant, alias)?;
@@ -280,12 +275,7 @@ pub fn run(
             if *escrow {
                 import_escrow_key(conn, paths, path, json_output)?;
             } else {
-                let tenant = tenant.as_deref().ok_or_else(|| {
-                    TapectlError::Other("--tenant is required (or pass --escrow)".into())
-                })?;
-                let alias = alias.as_deref().ok_or_else(|| {
-                    TapectlError::Other("--alias is required (or pass --escrow)".into())
-                })?;
+                let (tenant, alias) = require_tenant_and_alias(tenant, alias)?;
 
                 let t = crate::tenant::require_tenant(conn, tenant)?;
                 let pub_key = keys::read_public_key(Path::new(path))?;
@@ -439,6 +429,26 @@ fn import_escrow_key(
         println!("  public: {pub_key}");
     }
     Ok(())
+}
+
+/// Resolve `--tenant`/`--alias` for a non-escrow `Generate`/`Import`, with a
+/// consistent error if either is missing. clap's `required_unless_present`
+/// enforces this at the CLI-parse level in the common case, but both fields
+/// are still `Option<String>` here (they're genuinely optional when
+/// `--escrow` is set), so this runtime check is still load-bearing, not
+/// redundant. Extracted since `Generate` and `Import`'s non-escrow arms
+/// repeated this identical pair of checks verbatim (T6 review finding #3).
+fn require_tenant_and_alias<'a>(
+    tenant: &'a Option<String>,
+    alias: &'a Option<String>,
+) -> Result<(&'a str, &'a str)> {
+    let tenant = tenant
+        .as_deref()
+        .ok_or_else(|| TapectlError::Other("--tenant is required (or pass --escrow)".into()))?;
+    let alias = alias
+        .as_deref()
+        .ok_or_else(|| TapectlError::Other("--alias is required (or pass --escrow)".into()))?;
+    Ok((tenant, alias))
 }
 
 fn escrow_already_registered_error() -> TapectlError {
