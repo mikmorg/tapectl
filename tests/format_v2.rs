@@ -29,7 +29,7 @@ use common::{generate_library, MicroSpec, UnitFixture, MICRO_BLOCK};
 use tapectl::crypto::keys::generate_keypair;
 use tapectl::db;
 use tapectl::staging;
-use tapectl::store::{MemStore, Tier};
+use tapectl::store::{MemStore, MismatchKind, Store, Tier};
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, BuiltLayout, TenantInfo};
 use tapectl::volume::format;
 use tapectl::volume::layout_model::{KeyAvailability, Layout, ZoneKind};
@@ -853,4 +853,47 @@ fn frozen_deterministic_zones_are_byte_identical_across_two_builds() {
             "{kind:?} hash differs across builds -- byte-identity proof"
         );
     }
+}
+
+/// Assertion 6 (§2.5 fail-safe precedence): dropping the seal marker from
+/// the recorded bytes must verdict UNSEALED — never "sealed", never a panic
+/// — both from this suite's own independent reader (`keyless_chain_walk`)
+/// AND from the real production `Store::confirm`, which must report the
+/// failure via `Evidence.mismatches` rather than an `Err`.
+#[test]
+fn dropping_the_seal_marker_yields_unsealed_never_a_panic() {
+    let h = shared_harness();
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+
+    let mut truncated_files = h.store.files.clone();
+    let dropped = truncated_files.pop();
+    assert!(
+        dropped.is_some(),
+        "harness must have recorded a seal marker to drop"
+    );
+
+    match keyless_chain_walk(&truncated_files, fi_pos, fi_true_len) {
+        ChainWalkVerdict::Unsealed { .. } => {}
+        ChainWalkVerdict::Sealed { .. } => {
+            panic!("dropping the seal marker must never verify as Sealed")
+        }
+    }
+
+    let mut truncated_store = MemStore::new(BS as usize);
+    truncated_store.files = truncated_files;
+    let evidence = truncated_store
+        .confirm(&h.layout, Tier::Integrity)
+        .expect("Store::confirm must report failure via Evidence.mismatches, never Err");
+    assert!(
+        !evidence.mismatches.is_empty(),
+        "dropping the seal marker must produce at least one mismatch"
+    );
+    assert!(
+        evidence
+            .mismatches
+            .iter()
+            .any(|m| m.kind == MismatchKind::SealUnreadable),
+        "expected a SealUnreadable mismatch, got {:?}",
+        evidence.mismatches
+    );
 }
