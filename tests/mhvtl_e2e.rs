@@ -209,8 +209,21 @@ fn mhvtl_full_round_trip() {
     let label = "MHVTLA";
     let h = write_volume("round-trip", label, &[("alice", "alice-unit", 5)]);
 
-    let verify =
-        volume::write::volume_verify(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
+    // T8 mechanical caller-update only (volume_verify gained a required
+    // `tier` parameter) — NOT an assertion fix. This whole suite is the
+    // sanctioned T8->T9 red window (v2-implementation-plan.md T8): its
+    // assertions below still assume v1 tape positions/behavior and are
+    // expected to fail when actually run under TAPECTL_MHVTL=1 --ignored
+    // until T9 updates them.
+    let verify = volume::write::volume_verify(
+        &h.conn,
+        &h.config,
+        label,
+        TAPE_DEV,
+        BLOCK_SIZE,
+        tapectl::store::Tier::default(),
+    )
+    .unwrap();
     assert_eq!(verify.failed, 0, "verify had failures: {verify:?}");
     assert!(verify.passed > 0, "verify found no slices");
 

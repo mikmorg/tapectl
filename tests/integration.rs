@@ -1797,6 +1797,19 @@ fn test_volume_write_refuses_over_capacity() {
     )
     .unwrap();
     let tid = conn.last_insert_rowid();
+    // T8: volume_write now resolves tenant/operator keys (to assemble
+    // BuildInputs) BEFORE the pre-flight validate that carries the capacity
+    // check, so a keyless tenant/operator would refuse earlier than capacity
+    // does — this fixture's tenant doubles as the operator, so one real key
+    // covers both lookups and lets the flow reach the capacity gate this
+    // test actually probes.
+    let key = tapectl::crypto::keys::generate_keypair();
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+         VALUES (?1, 'op-primary', ?2, ?3, 'primary', 1)",
+        rusqlite::params![tid, key.fingerprint, key.public_key],
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
          VALUES ('u1', 'big', ?1, 'mtime_size', 1, 'active')",
@@ -1847,9 +1860,15 @@ fn test_volume_write_refuses_over_capacity() {
         block_size: "512K".into(),
         hardware_compression: false,
     });
+    // build() materializes the Layout's generated zones under
+    // config.staging.directory before validate ever runs — the default
+    // ("/mnt/staging") isn't writable in a test sandbox, so point it at this
+    // test's own tmp dir.
+    config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
     let paths = TapectlPaths::new(tmp.path().to_path_buf());
 
-    // The gate fires before the store is opened, so the bogus device is never touched.
+    // The pre-flight validate (which carries the capacity check) runs before
+    // the store is opened, so the bogus device is never touched.
     let err = tapectl::volume::write::volume_write(
         &conn,
         &paths,
@@ -1870,4 +1889,203 @@ fn test_volume_write_refuses_over_capacity() {
         .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(writes, 0, "capacity refusal must not create write records");
+}
+
+/// T8: `volume_write` refuses fast (before touching the device or calling
+/// `ValidatedLayout::plan`) when this volume already has a non-terminal
+/// `writes` row — this is what turns what would otherwise be a raw
+/// `UNIQUE(stage_set_id, volume_id)` constraint violation into a clear,
+/// actionable error (automatic cross-process resume is not wired; see the
+/// T8 report).
+#[test]
+fn test_volume_write_refuses_when_an_unresolved_write_session_already_exists() {
+    use tapectl::config::{Config, LtoBackendConfig, TapectlPaths};
+    let (tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'staged', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let snap = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap],
+    )
+    .unwrap();
+    let ss = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-BUSY', 'lto', 'p', 'LTO-6', 2_500_000_000_000, 'active')",
+        [],
+    )
+    .unwrap();
+    let vol_id = conn.last_insert_rowid();
+
+    // Simulate a prior attempt left interrupted (e.g. SIGINT, or a crash
+    // swept by `recover_orphaned_sessions`).
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'interrupted')",
+        rusqlite::params![ss, snap, vol_id],
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.backends.lto.push(LtoBackendConfig {
+        name: "p".into(),
+        device_tape: "/dev/null".into(),
+        device_sg: "/dev/null".into(),
+        media_type: "LTO-6".into(),
+        nominal_capacity: "2500G".into(),
+        usable_capacity_factor: 1.0,
+        manifest_reserve: "0".into(),
+        enospc_buffer: "0".into(),
+        block_size: "512K".into(),
+        hardware_compression: false,
+    });
+    config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
+    let paths = TapectlPaths::new(tmp.path().to_path_buf());
+
+    let err = tapectl::volume::write::volume_write(
+        &conn,
+        &paths,
+        &config,
+        "L6-BUSY",
+        "/dev/null",
+        512 * 1024,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unresolved write session"),
+        "expected a clear refusal naming the unresolved session, got: {msg}"
+    );
+
+    // Refused before ever calling plan(): still exactly the one pre-existing
+    // writes row, not a second one.
+    let writes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(writes, 1, "the guard must not insert a second writes row");
+}
+
+/// T8: a tenant with staged data but no active encryption key must refuse
+/// clearly (naming the tenant) before `build()` ever attempts to encrypt an
+/// envelope to an empty recipient list.
+#[test]
+fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
+    use tapectl::config::{Config, LtoBackendConfig, TapectlPaths};
+    let (tmp, conn, _home) = setup();
+
+    // Operator, WITH a key.
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let op_id = conn.last_insert_rowid();
+    let op_key = tapectl::crypto::keys::generate_keypair();
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+         VALUES (?1, 'op-primary', ?2, ?3, 'primary', 1)",
+        rusqlite::params![op_id, op_key.fingerprint, op_key.public_key],
+    )
+    .unwrap();
+
+    // Content tenant, deliberately WITHOUT any key.
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('keyless', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let tenant_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+        [tenant_id],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'staged', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let snap = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap],
+    )
+    .unwrap();
+    let ss = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_slices
+            (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+         VALUES (?1, 1, 100, 110, 'p', 'e', '/nonexistent/slice.dar.age')",
+        [ss],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-NOKEY', 'lto', 'p', 'LTO-6', 2_500_000_000_000, 'active')",
+        [],
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.backends.lto.push(LtoBackendConfig {
+        name: "p".into(),
+        device_tape: "/dev/null".into(),
+        device_sg: "/dev/null".into(),
+        media_type: "LTO-6".into(),
+        nominal_capacity: "2500G".into(),
+        usable_capacity_factor: 1.0,
+        manifest_reserve: "0".into(),
+        enospc_buffer: "0".into(),
+        block_size: "512K".into(),
+        hardware_compression: false,
+    });
+    config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
+    let paths = TapectlPaths::new(tmp.path().to_path_buf());
+
+    let err = tapectl::volume::write::volume_write(
+        &conn,
+        &paths,
+        &config,
+        "L6-NOKEY",
+        "/dev/null",
+        512 * 1024,
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("keyless") && msg.contains("no active key"),
+        "expected a refusal naming the keyless tenant, got: {msg}"
+    );
+
+    let writes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a keyless-tenant refusal must not create write records"
+    );
 }

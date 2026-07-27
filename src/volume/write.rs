@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::fs;
 use std::io::Cursor;
+use std::path::PathBuf;
+use std::{collections::HashSet, fs};
 
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
@@ -12,40 +13,68 @@ use crate::error::{Result, TapectlError};
 use crate::staging;
 use crate::tape::health;
 use crate::tape::ioctl::TapeDevice;
+use crate::tape::mam::MamInfo;
 
-use crate::store::{Store, TapeStore};
+use crate::store::{Store, TapeStore, Tier};
 
+use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
+use super::format;
 use super::layout;
-use super::layout_model::{ContentSource, LayoutEntry, ZoneKind};
+use super::layout_model::{
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, ZoneKind,
+};
+use super::session::{ConfirmOutcome, ExecuteOutcome, QuarantineReason};
 
-/// A generated (non-slice) zone entry for the Layout enumeration.
-fn gen_entry(position: i32, kind: ZoneKind, size: usize) -> LayoutEntry {
-    LayoutEntry {
-        position,
-        kind,
-        size_bytes: Some(size as u64),
-        sha256: None,
-        source: ContentSource::Generated,
-    }
+/// STOP-GAP pending an explicit operator/schema decision — see the T8 report.
+///
+/// Every `Layout` needs a `volume_uuid` (the v2 ID thunk's `[volume] uuid`
+/// field, and the §2.1 tenant-envelope permutation seed,
+/// `docs/design/v2-open-questions.md` §2.1/§2.3), but the `volumes` table
+/// (`001_initial.sql`) has no `uuid` column — unlike `units.uuid`, which is
+/// generated once at `unit init` and persisted (`src/unit/mod.rs`). No task
+/// from T1 through T7 added one (verified: no `volumes.uuid` anywhere in the
+/// schema or migrations, and the existing integration-test suite's `INSERT
+/// INTO volumes` statements omit a uuid column and pass).
+///
+/// This derives a stable, deterministic placeholder from the volume's
+/// `label` (`UNIQUE NOT NULL` on `volumes`, and volumes have no rename
+/// command) via `sha256("tapectl-volume-uuid-placeholder-v1\0" || label)`,
+/// keeping the first 16 bytes as the UUID — no schema change, no new
+/// dependency (reuses `sha2`, already a dep, per the plan's guidance to
+/// derive deterministic pseudo-randomness from `sha2` in counter mode rather
+/// than add `rand`/`uuid`'s `v5` feature). It is stable across `volume_init`
+/// and every `volume_write` attempt for the same label, so the identity
+/// check in `session::InterruptedSession::resume` and the envelope
+/// permutation both stay internally consistent.
+///
+/// What this is NOT: a substitute for a real per-volume identity an operator
+/// could look up independently of recomputing it from the label, or for
+/// genuine cross-process resume (reconstructing a `BuiltLayout` from a prior
+/// session's frozen files without recalling `build()` — a separate, larger
+/// gap; see the report). Two real fixes were considered: (a) a persisted
+/// `volumes.uuid` column generated once at `volume_init`, mirroring
+/// `units.uuid` (recommended: DB-correlatable, precedented; costs a
+/// migration + touches every `INSERT INTO volumes` fixture), or (b)
+/// formalizing this derivation as the permanent design (zero schema cost,
+/// but an operator can never look up a tape's on-tape uuid from the database
+/// independently of recomputing it). This function exists so the rest of
+/// the T8 flip could be implemented and tested without that decision
+/// blocking everything downstream of `build()` — flagged, not decided.
+fn derive_placeholder_volume_uuid(label: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tapectl-volume-uuid-placeholder-v1\0");
+    hasher.update(label.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes).to_string()
 }
 
-/// Map the Layout enumeration to the mini-index generator's input. The
-/// mini-index is generated from this complete list — every file including the
-/// envelopes — so an heir can trim block padding on any of them (fixes H1).
-fn mini_index_tuples(entries: &[LayoutEntry]) -> Vec<(i32, &'static str, usize)> {
-    entries
-        .iter()
-        .map(|e| {
-            (
-                e.position,
-                e.kind.type_label(),
-                e.size_bytes.unwrap_or(0) as usize,
-            )
-        })
-        .collect()
-}
-
-/// Initialize a volume: create DB record and write ID thunk to tape.
+/// Initialize a volume: create the DB record and write the provisional v2 ID
+/// thunk to tape. Positions are unknown at init time
+/// (`docs/design/v2-open-questions.md` §2.3) — the write session rewrites
+/// File 0 from BOT with the real `total_files`/`seal_marker` once the Layout
+/// is built; this call must not try to preserve init's File 0.
 pub fn volume_init(
     conn: &Connection,
     config: &Config,
@@ -53,7 +82,6 @@ pub fn volume_init(
     device: &str,
     block_size: usize,
 ) -> Result<i64> {
-    // Check label not already used
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM volumes WHERE label = ?1",
@@ -67,7 +95,6 @@ pub fn volume_init(
         )));
     }
 
-    // Determine backend info from config
     let backend = config
         .backends
         .lto
@@ -77,7 +104,6 @@ pub fn volume_init(
     let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
     let media_type = &backend.media_type;
 
-    // Insert volume record
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
          VALUES (?1, 'lto', ?2, ?3, ?4, 'initialized')",
@@ -85,34 +111,34 @@ pub fn volume_init(
     )?;
     let volume_id = conn.last_insert_rowid();
 
-    // Write ID thunk to tape through the store seam (ADR-0006). usable_bytes
-    // (the T4 capacity oracle) is nominal capacity x the configured usable
-    // factor; volume_init only ever writes the provisional identity thunk,
-    // so this is informational at this stage (real capacity gating happens
-    // in volume_write).
+    // usable_bytes (the T4 capacity oracle) is informational at this stage —
+    // volume_init only ever writes the provisional identity thunk; real
+    // capacity gating happens in volume_write's pre-open validate.
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    let id_thunk = layout::generate_id_thunk(
+    let volume_uuid = derive_placeholder_volume_uuid(label);
+    // Provisional total_files: unknown until the write session builds the
+    // real Layout. Format §1's minimum shape is 4 front files + >=1 tenant
+    // envelope + operator + backup + >=1 slice + the seal marker; 8 is a
+    // representative placeholder, thrown away wholesale (not preserved, not
+    // interpreted) when the write session rewrites File 0 from BOT.
+    const PROVISIONAL_TOTAL_FILES: i32 = 8;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let id_thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
         label,
+        uuid: &volume_uuid,
         media_type,
-        env!("CARGO_PKG_VERSION"),
-        "lto",
+        tapectl_version: env!("CARGO_PKG_VERSION"),
         nominal_capacity,
-        0, // mam_capacity — filled on write
-        4, // data_start (placeholder)
-        4, // data_end (placeholder)
-        5, // mini_index (placeholder)
-        6, // first_envelope (placeholder)
-        0, // num_envelopes (placeholder)
-        6, // op_envelope (placeholder)
-        7, // op_backup (placeholder)
-        8, // total_files (placeholder)
-        "",
-        "",
-        0,
-        0,
-    );
+        mam_capacity: 0,
+        total_files: PROVISIONAL_TOTAL_FILES,
+        mam_manufacturer: "",
+        mam_serial: "",
+        mam_length: 0,
+        mam_loads: 0,
+        created_at: &created_at,
+    });
 
     store.execute(
         &mut Cursor::new(id_thunk.as_bytes()),
@@ -125,7 +151,13 @@ pub fn volume_init(
     Ok(volume_id)
 }
 
-/// Full volume write pipeline.
+/// Full volume write pipeline (`docs/design/v2-implementation-plan.md` T8):
+/// orchestration only. Gather the staged batch, assemble `BuildInputs` from
+/// the DB, `build()` the Layout, then drive the §9 typestate session —
+/// `validate -> plan -> execute -> seal -> confirm`
+/// (`docs/design/v2-open-questions.md` §9). Every on-tape byte comes from
+/// `build::build` + `session.rs` now; no hand-rolled layout logic (mini-index,
+/// manual position arithmetic) remains here.
 pub fn volume_write(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -134,7 +166,6 @@ pub fn volume_write(
     device: &str,
     block_size: usize,
 ) -> Result<()> {
-    // Look up volume
     let volume_id: i64 = conn
         .query_row(
             "SELECT id FROM volumes WHERE label = ?1",
@@ -143,84 +174,388 @@ pub fn volume_write(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    // Find staged data to write
-    let mut staged = find_staged_data(conn)?;
-    if staged.is_empty() {
+    // Refuse fast, before any real work, if this volume already has an
+    // unresolved write session. `ValidatedLayout::plan` would otherwise hit
+    // `writes`' `UNIQUE(stage_set_id, volume_id)` with a raw constraint
+    // error on the retry. Cross-process resume — reconstructing a
+    // `BuiltLayout` from a prior session's frozen files without recalling
+    // `build()`, per `session::InterruptedSession::resume_checking`'s own
+    // doc comment ("the CLI orchestrator's job (T8)") — is not wired into
+    // this orchestrator (see the T8 report); this guard only turns what
+    // would otherwise be an opaque SQL error into a clear, honest refusal.
+    let existing_sessions: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM writes WHERE volume_id = ?1 AND status IN ('planned','in_progress','interrupted')",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if existing_sessions > 0 {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\" already has an unresolved write session \
+             (status planned/in_progress/interrupted) — automatic cross-process resume \
+             is not yet wired; inspect the `writes`/`write_positions` rows for volume_id \
+             {volume_id} before retrying"
+        )));
+    }
+
+    let units = find_staged_data(conn)?;
+    if units.is_empty() {
         return Err(TapectlError::Other(
             "no staged data to write — run `tapectl stage create` first".into(),
         ));
     }
 
-    // Pre-write capacity gate (§2.8): refuse if the staged data will not fit,
-    // rather than writing past end-of-tape and silently producing an incomplete
-    // copy (the failure the #8 dry-run reproduced — the write reported success
-    // with dead slices and the snapshot marked current). mhvtl reports
-    // non-physical MAM capacity, so gate on the configured nominal capacity,
-    // which is reliable; MAM is populated below for the record only.
-    {
-        let capacity_bytes: i64 = conn
-            .query_row(
-                "SELECT capacity_bytes FROM volumes WHERE id = ?1",
-                params![volume_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        let (reserve, block) = config
-            .backends
-            .lto
-            .first()
-            .map(|b| {
-                (
-                    staging::parse_size_to_bytes(&b.manifest_reserve)
-                        + staging::parse_size_to_bytes(&b.enospc_buffer),
-                    block_size as u64,
-                )
-            })
-            .unwrap_or((0, block_size as u64));
-        let staged_on_tape: i64 = staged
-            .iter()
-            .flat_map(|u| &u.slices)
-            .map(|s| {
-                super::layout_model::pad_to_blocks(s.encrypted_bytes.max(0) as u64, block) as i64
-            })
-            .sum();
-        if capacity_bytes > 0 && staged_on_tape + reserve > capacity_bytes {
+    let backend = config
+        .backends
+        .lto
+        .first()
+        .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
+    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
+    let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+    // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
+    // (`volume-format-v2.md` §8) — `manifest_reserve` is no longer read here
+    // (the field itself is removed in T10, once nothing reads it; this is
+    // that "nothing" for the write path).
+    let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer).max(0) as u64;
+
+    // Tenants + keys: one TenantInfo per distinct tenant_id in this batch,
+    // its own active (non-escrow) keys only — build() appends operator and
+    // escrow keys itself (`with_escrow`).
+    let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
+    distinct_tenant_ids.sort_unstable();
+    distinct_tenant_ids.dedup();
+
+    let mut tenants = Vec::with_capacity(distinct_tenant_ids.len());
+    let mut tenants_with_active_key = HashSet::new();
+    for &tenant_id in &distinct_tenant_ids {
+        let tenant = queries::get_tenant_by_id(conn, tenant_id)?
+            .ok_or_else(|| TapectlError::Other(format!("tenant {tenant_id} not found")))?;
+        let keys = queries::get_active_keys_for_tenant(conn, tenant_id)?;
+        if keys.is_empty() {
             return Err(TapectlError::Other(format!(
-                "staged data ({} MB, block-padded) + reserve ({} MB) exceeds volume \"{label}\" \
-                 capacity ({} MB) — it will not fit; use a larger tape or split the write",
-                staged_on_tape / (1024 * 1024),
-                reserve / (1024 * 1024),
-                capacity_bytes / (1024 * 1024),
+                "tenant \"{}\" (id={tenant_id}) has no active key — cannot encrypt its envelope",
+                tenant.name
             )));
         }
+        tenants_with_active_key.insert(tenant_id);
+        tenants.push(TenantInfo {
+            tenant_id,
+            tenant_name: tenant.name,
+            public_keys: keys.into_iter().map(|k| k.public_key).collect(),
+        });
     }
 
-    // Create write records and assign write_ids to staged units
-    let mut write_ids: Vec<(i64, i64)> = Vec::new();
-    for ss in &mut staged {
-        conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
-             VALUES (?1, ?2, ?3, 'planned')",
-            params![ss.stage_set_id, ss.snapshot_id, volume_id],
-        )?;
-        let write_id = conn.last_insert_rowid();
-        write_ids.push((write_id, ss.snapshot_id));
-        // Update all slices with the correct write_id
-        for slice in &mut ss.slices {
-            slice.write_id = write_id;
+    let operator = queries::get_operator_tenant(conn)?
+        .ok_or_else(|| TapectlError::Other("no operator tenant configured".into()))?;
+    let operator_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
+    if operator_keys.is_empty() {
+        return Err(TapectlError::Other("operator has no active key".into()));
+    }
+    let operator_public_keys: Vec<String> =
+        operator_keys.into_iter().map(|k| k.public_key).collect();
+
+    // ADR-0005: the permanent escrow recipient. `None` fails validation via
+    // `KeyAvailability.escrow_recipient_present = Some(false)` below, the
+    // same way `key rotate` refuses without one.
+    let escrow_public_key = queries::escrow_public_key(conn)?;
+
+    let keys = KeyAvailability {
+        tenant_ids: distinct_tenant_ids,
+        tenants_with_active_key,
+        operator_key_present: true,
+        escrow_recipient_present: Some(escrow_public_key.is_some()),
+    };
+
+    // MAM (best-effort, informational; never gates the write — the pre-flight
+    // capacity gate below reads the configured nominal capacity, which is
+    // reliable, per `layout-session.md`'s validation point 1). Read before
+    // the tape stream itself is touched, so real values (where available)
+    // land in the ID thunk instead of the placeholder zeros/blanks v1 always
+    // wrote regardless of what MAM reported.
+    let mam = match crate::tape::mam::read_mam(&backend.device_sg) {
+        Ok(mam) => {
+            let _ = conn.execute(
+                "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
+                 WHERE id = ?3",
+                params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
+            );
+            mam
+        }
+        Err(e) => {
+            warn!(err = %e, "MAM read failed (continuing)");
+            MamInfo::default()
+        }
+    };
+
+    let volume_uuid = derive_placeholder_volume_uuid(label);
+    let created_at = chrono::Utc::now().to_rfc3339();
+    // Session directory: materialize-to-staging (`v2-open-questions.md`
+    // §2.2) lives under the configured staging directory, namespaced per
+    // volume label + a fresh session uuid (so a later attempt never collides
+    // with an earlier one's frozen files).
+    let session_dir = PathBuf::from(&config.staging.directory)
+        .join("sessions")
+        .join(format!("{label}-{}", Uuid::new_v4()));
+
+    let inputs = BuildInputs {
+        label: label.to_string(),
+        volume_uuid,
+        media_type: backend.media_type.clone(),
+        tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at,
+        block_size: block_size as u64,
+        usable_bytes,
+        enospc_buffer,
+        nominal_capacity,
+        mam_capacity: mam.max_capacity_bytes.unwrap_or(0),
+        mam_manufacturer: String::new(),
+        mam_serial: mam.serial.clone().unwrap_or_default(),
+        mam_length: 0,
+        mam_loads: mam.load_count.unwrap_or(0),
+        units,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+    };
+
+    let built = build::build(&inputs, &session_dir)?;
+    // Snapshot the Layout before the typestate chain consumes `built` — the
+    // terminal `SealedSession` only exposes `volume_id`/`label`, not the
+    // entries, and `bytes_written`/`num_data_files` bookkeeping (below) needs
+    // them after confirm succeeds.
+    let layout_snapshot = built.layout.clone();
+
+    // Pre-flight validate — run BEFORE the tape device is opened. This is
+    // what replaces the old inline capacity-only gate: an over-capacity (or
+    // keyless, or corrupt-staged-slice) refusal here never touches the
+    // drive, exactly like the gate it replaces
+    // (`docs/design/v2-implementation-plan.md` T8's trap: "do NOT leave two
+    // capacity gates"). Sacred invariant 2 (full-hash staged slices from
+    // disk) runs here, not a size-only shortcut.
+    if let Err(errs) = built.validate(&keys) {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\" failed pre-write validation: {}",
+            errs.iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+
+    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+
+    let validated = built.into_validated(&keys, &mut store).map_err(|errs| {
+        TapectlError::Other(format!(
+            "volume \"{label}\" failed validation at contact: {}",
+            errs.iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    })?;
+
+    let planned = validated.plan(conn, volume_id, &inputs.units)?;
+    let execute_outcome = planned.execute(conn, &mut store)?;
+
+    let result: Result<()> = match execute_outcome {
+        ExecuteOutcome::Ready(ready) => {
+            let sealed_pending = ready.seal(&mut store)?;
+            match sealed_pending.confirm(conn, &mut store, Tier::default())? {
+                ConfirmOutcome::Sealed(sealed) => {
+                    record_write_bookkeeping(conn, volume_id, &layout_snapshot, block_size as u64)?;
+                    events::log_event(
+                        conn,
+                        "volume",
+                        volume_id,
+                        Some(label),
+                        "write_completed",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    info!(label = sealed.label, volume_id, "volume write sealed");
+                    Ok(())
+                }
+                ConfirmOutcome::Quarantined(q) => {
+                    let reason = describe_quarantine(&q.reason);
+                    events::log_event(
+                        conn,
+                        "volume",
+                        volume_id,
+                        Some(label),
+                        "write_quarantined",
+                        None,
+                        None,
+                        Some(&reason),
+                        None,
+                        None,
+                    )?;
+                    Err(TapectlError::Other(format!(
+                        "volume \"{label}\" quarantined at confirm: {reason}"
+                    )))
+                }
+            }
+        }
+        ExecuteOutcome::Interrupted(_) => {
+            events::log_event(
+                conn,
+                "volume",
+                volume_id,
+                Some(label),
+                "write_interrupted",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Err(TapectlError::Other(format!(
+                "volume \"{label}\" write interrupted (SIGINT) — the tape is left unsealed and \
+                 resumable in principle (`writes`/`write_positions` were left in the \
+                 `interrupted` state), but automatic cross-process resume is not yet wired into \
+                 this CLI (see the T8 report)"
+            )))
+        }
+        ExecuteOutcome::Aborted(a) => {
+            events::log_event(
+                conn,
+                "volume",
+                volume_id,
+                Some(label),
+                "write_aborted",
+                None,
+                None,
+                Some(&a.reason),
+                None,
+                None,
+            )?;
+            Err(TapectlError::Other(format!(
+                "volume \"{label}\" write aborted: {}",
+                a.reason
+            )))
+        }
+    };
+
+    // Best-effort sg_logs health collection. Never let a collection failure
+    // shadow the real outcome above (matching v1: always attempted, its own
+    // errors only logged).
+    if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
+        match health::collect(&bk.device_sg) {
+            Ok((counters, raw)) => {
+                if let Err(e) = health::record(conn, volume_id, "write", &counters, &raw) {
+                    warn!(err = %e, "health_logs insert failed");
+                }
+            }
+            Err(e) => warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed"),
         }
     }
 
-    info!(
-        slices = staged.iter().map(|s| s.slices.len()).sum::<usize>(),
-        units = staged.len(),
-        "writing to volume {label}"
-    );
+    result
+}
 
-    // Open the store (rewinds to BOT, disables compression) — writes go through
-    // the ADR-0006 seam. usable_bytes is the T4 capacity oracle's answer
-    // (nominal capacity x the configured usable factor); the inline
-    // capacity gate above is the real pre-write defense today.
+/// Populate `volumes`' write-summary columns (`bytes_written`,
+/// `num_data_files`, `has_manifest`, `first_write`, `last_write`) —
+/// informational fields `report capacity`/`report age`/`audit` all read
+/// (verified: `grep -rn "bytes_written" src/cli`), but that
+/// `session::SealedPending::confirm`'s own transaction (T6) does not touch —
+/// it only flips `status`. v1 populated these inline as part of the write
+/// loop; this restores that parity for v2-sealed volumes. Deliberately never
+/// touches `status` (confirm's transaction already set it to `sealed`).
+fn record_write_bookkeeping(
+    conn: &Connection,
+    volume_id: i64,
+    layout: &Layout,
+    block_size: u64,
+) -> Result<()> {
+    let slice_entries: Vec<&LayoutEntry> = layout
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+        .collect();
+    let bytes_written: i64 = slice_entries
+        .iter()
+        .filter_map(|e| e.on_tape_bytes(block_size))
+        .sum::<u64>() as i64;
+    let num_data_files = slice_entries.len() as i64;
+    conn.execute(
+        "UPDATE volumes SET bytes_written = ?1, num_data_files = ?2, has_manifest = 1,
+         first_write = COALESCE(first_write, datetime('now')), last_write = datetime('now')
+         WHERE id = ?3",
+        params![bytes_written, num_data_files, volume_id],
+    )?;
+    Ok(())
+}
+
+/// A one-line, human-readable summary of why a session quarantined —
+/// `volume_write`'s fresh (non-resumed) path only ever reaches
+/// `QuarantineReason::ConfirmFailed`; `IdentityMismatch`/`AlreadySealed` are
+/// resume-only outcomes this orchestrator doesn't produce (it never calls
+/// `InterruptedSession::resume`), but are handled here anyway so this stays
+/// exhaustive if that changes.
+fn describe_quarantine(reason: &QuarantineReason) -> String {
+    match reason {
+        QuarantineReason::ConfirmFailed(evidence) => format!(
+            "confirm chain-walk found {} mismatch(es) at tier {:?}: {:?}",
+            evidence.mismatches.len(),
+            evidence.tier,
+            evidence.mismatches
+        ),
+        QuarantineReason::IdentityMismatch {
+            expected_label,
+            expected_uuid,
+            found,
+        } => format!(
+            "identity mismatch: expected label={expected_label:?} uuid={expected_uuid:?}, found {found:?}"
+        ),
+        QuarantineReason::AlreadySealed { seal_position } => format!(
+            "tape already carries a seal marker at position {seal_position} \
+             (ADR-0003: sealed volumes are immutable)"
+        ),
+    }
+}
+
+/// Verify a volume via the v2 keyless chain walk
+/// (`docs/design/volume-format-v2.md` §5) — the same algorithm
+/// `session::SealedPending::confirm` runs at seal time and `RESTORE.sh
+/// --verify` reimplements independently in bash
+/// (`docs/design/v2-open-questions.md` §10: "one chain walk, three
+/// consumers"; this is consumer 2). `tier` selects `Tier::Integrity`
+/// (default, `--full`: hash every content file against the front index's
+/// ciphertext hashes) or `Tier::Navigable` (`--quick`: seal binding + front
+/// index self-consistency only); the tier actually achieved is recorded
+/// honestly in `verification_sessions.verify_type` (`full`/`quick`,
+/// ADR-0001).
+///
+/// There is no in-memory session `Layout` to diff against here — this can
+/// run long after (possibly years after) the write session that sealed the
+/// volume, and no serialized Layout is persisted anywhere. So the `Layout`
+/// `Store::confirm` checks against is reconstructed FROM the just-read front
+/// index itself: this makes `chain_walk`'s step-3 "diff against the Layout"
+/// a tautology by construction, but the seal-binding hash (step 2) and the
+/// per-file content hash (step 4, Integrity tier) still independently verify
+/// the tape against itself — exactly what a keyless heir running `RESTORE.sh
+/// --verify` can do, and (today) no more: this function has DB access but
+/// nothing to cross-check the front index's claims against, since
+/// metadata-file sizes/hashes are not recorded anywhere in the DB — only
+/// slice cursor rows are (`write_positions.stage_slice_id` is `NOT NULL`).
+/// See the T8 report for this as a known, accepted limitation.
+pub fn volume_verify(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    tier: Tier,
+) -> Result<VerifyReport> {
+    let volume_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
     let usable_bytes = config
         .backends
         .lto
@@ -232,520 +567,141 @@ pub fn volume_write(
         .unwrap_or(0);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    // Record the cartridge's MAM (informational; mhvtl reports non-physical
-    // values). Best-effort — a read failure never blocks the write.
-    if let Some(bk) = config.backends.lto.first() {
-        match crate::tape::mam::read_mam(&bk.device_sg) {
-            Ok(mam) => {
-                let _ = conn.execute(
-                    "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
-                     WHERE id = ?3",
-                    params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
-                );
-            }
-            Err(e) => warn!(err = %e, "MAM read failed (continuing)"),
-        }
-    }
+    // Read File 3 (front index) raw; its true (pre-padding) length is
+    // recovered by stripping trailing NUL padding — the same trick
+    // `volume_identify` already uses for File 0, and the sanctioned
+    // cross-tool byte contract for File 3 specifically
+    // (`volume-format-v2.md` §4: "a reader recovering File 3 from a padded
+    // tape read obtains the same bytes by stripping trailing NUL padding").
+    let mut fi_raw = Vec::new();
+    store.read_file(3, &mut fi_raw)?;
+    let fi_text = String::from_utf8_lossy(&fi_raw);
+    let fi_trimmed = fi_text.trim_end_matches('\0');
+    let fi_true_len = fi_trimmed.len() as u64;
 
-    // Collect all slices in order for writing
-    let all_slices: Vec<&SliceInfo> = staged.iter().flat_map(|s| &s.slices).collect();
-    let total_slices = all_slices.len();
+    let parsed_fi = format::parse_front_index(fi_trimmed).map_err(|e| {
+        TapectlError::Other(format!(
+            "volume \"{label}\": front index (File 3) unparseable: {e}"
+        ))
+    })?;
 
-    // Compute file positions
-    let data_start = 4i32; // files 0-3 are metadata
-    let data_end = data_start + total_slices as i32 - 1;
-    let mini_index_pos = data_end + 1;
-
-    // Count unique tenants
-    let tenant_ids: Vec<i64> = staged.iter().map(|s| s.tenant_id).collect();
-    let unique_tenants: Vec<i64> = {
-        let mut t = tenant_ids.clone();
-        t.sort();
-        t.dedup();
-        t
-    };
-    let num_tenant_envelopes = unique_tenants.len() as i32;
-    let first_envelope_pos = mini_index_pos + 1;
-    let op_envelope_pos = first_envelope_pos + num_tenant_envelopes;
-    let op_backup_pos = op_envelope_pos + 1;
-    let total_files = op_backup_pos + 1;
-
-    // == File 0: ID thunk ==
-    let backend = config.backends.lto.first().unwrap();
-    let id_thunk = layout::generate_id_thunk(
-        label,
-        &backend.media_type,
-        env!("CARGO_PKG_VERSION"),
-        "lto",
-        staging::parse_size_to_bytes(&backend.nominal_capacity),
-        0,
-        data_start,
-        data_end,
-        mini_index_pos,
-        first_envelope_pos,
-        num_tenant_envelopes,
-        op_envelope_pos,
-        op_backup_pos,
-        total_files,
-        "",
-        "",
-        0,
-        0,
-    );
-    store.execute(
-        &mut Cursor::new(id_thunk.as_bytes()),
-        id_thunk.len() as u64,
-        false,
-    )?;
-    info!("wrote file 0: ID thunk");
-
-    // == File 1: System guide ==
-    let guide = layout::generate_system_guide(label, total_files);
-    store.execute(
-        &mut Cursor::new(guide.as_bytes()),
-        guide.len() as u64,
-        false,
-    )?;
-    info!("wrote file 1: system guide");
-
-    // == File 2: RESTORE.sh ==
-    let script = layout::generate_restore_script(label, total_files);
-    store.execute(
-        &mut Cursor::new(script.as_bytes()),
-        script.len() as u64,
-        false,
-    )?;
-    info!("wrote file 2: RESTORE.sh");
-
-    // == File 3: Planning header (encrypted to operator) ==
-    let operator = queries::get_operator_tenant(conn)?
-        .ok_or_else(|| TapectlError::Other("no operator".into()))?;
-    let op_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
-    let op_pubkeys: Vec<String> = op_keys.iter().map(|k| k.public_key.clone()).collect();
-    // ADR-0005: appended to every recipient list this volume write encrypts
-    // to — the planning header (below) and the operator envelope + backup
-    // (further down) both use `op_pubkeys` directly.
-    let op_pubkeys = queries::recipient_list_with_escrow(conn, op_pubkeys)?;
-
-    let plan_units: Vec<(String, String, i64, i64)> = staged
-        .iter()
-        .map(|s| {
-            (
-                s.unit_name.clone(),
-                s.unit_uuid.clone(),
-                s.slices.len() as i64,
-                s.slices.iter().map(|sl| sl.encrypted_bytes).sum(),
-            )
-        })
-        .collect();
-    let planning = layout::generate_planning_header(label, &plan_units);
-    let planning_enc = staging::encrypt_data(planning.as_bytes(), &op_pubkeys)?;
-    store.execute(
-        &mut Cursor::new(planning_enc.as_slice()),
-        planning_enc.len() as u64,
-        false,
-    )?;
-    info!("wrote file 3: planning header");
-
-    // Update write status
-    for (write_id, _) in &write_ids {
-        conn.execute(
-            "UPDATE writes SET status = 'in_progress', started_at = datetime('now')
-             WHERE id = ?1",
-            params![write_id],
-        )?;
-    }
-
-    // == Files 4..N: Data slices ==
-    // ADR-0002: all on-tape metadata (mini-index, envelope manifests) is
-    // generated from the complete Layout below, never from write order. So we
-    // record every file as a LayoutEntry as it is produced, encrypt the
-    // envelopes *before* the mini-index (to fix their sizes), then generate the
-    // mini-index from the full enumeration — which now includes the envelopes
-    // (fixes H1: the old mini-index was generated before the envelope entries
-    // existed, so RESTORE.sh could never trim their block padding).
-    let mut entries: Vec<LayoutEntry> = vec![
-        gen_entry(0, ZoneKind::IdThunk, id_thunk.len()),
-        gen_entry(1, ZoneKind::SystemGuide, guide.len()),
-        gen_entry(2, ZoneKind::RestoreSh, script.len()),
-        gen_entry(3, ZoneKind::PlanningHeader, planning_enc.len()),
-    ];
-
-    let mut bytes_written: i64 = 0;
-    let mut slice_write_map: HashMap<i64, (i64, i32)> = HashMap::new(); // slice_id -> (write_id, tape_pos)
-
-    for (i, slice) in all_slices.iter().enumerate() {
-        // Check SIGINT
-        if crate::signal::is_interrupted() {
-            warn!("interrupted by signal — writing metadata and stopping");
-            break;
-        }
-
-        let tape_pos = data_start + i as i32;
-
-        // Read encrypted slice from staging
-        let slice_data = fs::read(&slice.staging_path).map_err(|e| {
-            TapectlError::Other(format!("read staged slice {}: {e}", slice.staging_path))
+    let mut entries: Vec<LayoutEntry> = Vec::with_capacity(parsed_fi.len());
+    for p in &parsed_fi {
+        let kind = ZoneKind::from_type_label(&p.type_label).ok_or_else(|| {
+            TapectlError::Other(format!(
+                "volume \"{label}\": front index position {} has an unrecognized type \"{}\"",
+                p.position, p.type_label
+            ))
         })?;
-
-        // Verify checksum
-        let actual_hash = sha256_hex(&slice_data);
-        if actual_hash != slice.sha256_encrypted {
-            return Err(TapectlError::Other(format!(
-                "slice {} checksum mismatch: expected {}, got {}",
-                slice.slice_id,
-                &slice.sha256_encrypted[..16],
-                &actual_hash[..16],
-            )));
-        }
-
-        // Write to tape
-        let written = store.execute(
-            &mut Cursor::new(slice_data.as_slice()),
-            slice_data.len() as u64,
-            false,
-        )?;
-        bytes_written += written as i64;
-
         entries.push(LayoutEntry {
-            position: tape_pos,
-            kind: ZoneKind::Slice {
-                stage_slice_id: slice.slice_id,
+            position: p.position,
+            // File 3's own true length is the one fact this reconstruction
+            // takes from a source other than the parsed entry (its own
+            // entry omits it, self-referentially, by design).
+            size_bytes: if p.position == 3 {
+                Some(fi_true_len)
+            } else {
+                p.size_bytes
             },
-            size_bytes: Some(slice_data.len() as u64),
-            sha256: Some(actual_hash.clone()),
-            source: ContentSource::Staged(slice.staging_path.clone().into()),
-        });
-        slice_write_map.insert(slice.slice_id, (slice.write_id, tape_pos));
-
-        // Record write position
-        conn.execute(
-            "INSERT INTO write_positions (write_id, stage_slice_id, position, status, written_at, sha256_on_volume)
-             VALUES (?1, ?2, ?3, 'written', datetime('now'), ?4)",
-            params![slice.write_id, slice.slice_id, tape_pos.to_string(), actual_hash],
-        )?;
-
-        info!(
-            slice = i + 1,
-            total = total_slices,
-            mb = slice_data.len() / (1024 * 1024),
-            "wrote data slice"
-        );
-    }
-
-    // == Encrypt all envelopes up front (fixes their sizes for the mini-index) ==
-    // (position, sync_mark, encrypted_bytes) — written after the mini-index, in
-    // position order.
-    let mut envelopes: Vec<(i32, bool, Vec<u8>)> = Vec::new();
-
-    for (env_idx, &tenant_id) in unique_tenants.iter().enumerate() {
-        let tenant = queries::get_tenant_by_id(conn, tenant_id)?
-            .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
-        let tenant_keys = queries::get_active_keys_for_tenant(conn, tenant_id)?;
-        let mut all_keys: Vec<String> = tenant_keys.iter().map(|k| k.public_key.clone()).collect();
-        all_keys.extend(op_pubkeys.iter().cloned());
-        // ADR-0005: `op_pubkeys` is already escrow-augmented, so this is a
-        // harmless no-op in practice — routed explicitly anyway so this
-        // tenant-envelope assembly is correct on its own terms, without a
-        // reader having to trace `op_pubkeys`' provenance to be sure.
-        let all_keys = queries::recipient_list_with_escrow(conn, all_keys)?;
-
-        let manifest_units = build_manifest_units(&staged, tenant_id, &slice_write_map);
-        let manifest = layout::generate_manifest_toml(label, &tenant.name, &manifest_units);
-        let recovery = layout::generate_recovery_md(label, &tenant.name, &manifest_units);
-
-        // Build tar archive with MANIFEST.toml + RECOVERY.md
-        let catalogs: Vec<(String, Vec<u8>)> = staged
-            .iter()
-            .filter(|s| s.tenant_id == tenant_id)
-            .filter_map(|s| s.catalog_path.as_deref())
-            .flat_map(read_catalog_files)
-            .collect();
-        let tar_data = build_envelope_tar(&manifest, &recovery, &catalogs)?;
-        let encrypted = staging::encrypt_data(&tar_data, &all_keys)?;
-
-        let env_pos = first_envelope_pos + env_idx as i32;
-        entries.push(LayoutEntry {
-            position: env_pos,
-            kind: ZoneKind::TenantEnvelope { tenant_id },
-            size_bytes: Some(encrypted.len() as u64),
-            sha256: None,
+            sha256: p.sha256_encrypted.clone(),
+            kind,
+            // Not read by `chain_walk` (position/kind/size_bytes/sha256
+            // only) — this reconstruction has no real backing file per
+            // entry, so there is nothing truer to put here.
             source: ContentSource::Generated,
         });
-        envelopes.push((env_pos, false, encrypted));
     }
 
-    let all_manifest_units = build_manifest_units_all(&staged, &slice_write_map);
-    let op_manifest = layout::generate_manifest_toml(label, "operator", &all_manifest_units);
-    let op_recovery = layout::generate_recovery_md(label, "operator", &all_manifest_units);
-    let all_catalogs: Vec<(String, Vec<u8>)> = staged
-        .iter()
-        .filter_map(|s| s.catalog_path.as_deref())
-        .flat_map(read_catalog_files)
-        .collect();
-    let op_tar = build_envelope_tar(&op_manifest, &op_recovery, &all_catalogs)?;
-    let op_env_encrypted = staging::encrypt_data(&op_tar, &op_pubkeys)?;
-    entries.push(LayoutEntry {
-        position: op_envelope_pos,
-        kind: ZoneKind::OperatorEnvelope,
-        size_bytes: Some(op_env_encrypted.len() as u64),
-        sha256: None,
-        source: ContentSource::Generated,
-    });
-    entries.push(LayoutEntry {
-        position: op_backup_pos,
-        kind: ZoneKind::OperatorEnvelopeBackup,
-        size_bytes: Some(op_env_encrypted.len() as u64),
-        sha256: None,
-        source: ContentSource::Generated,
-    });
-    envelopes.push((op_envelope_pos, true, op_env_encrypted.clone()));
-    envelopes.push((op_backup_pos, true, op_env_encrypted));
+    let layout = Layout {
+        label: label.to_string(),
+        volume_uuid: String::new(),
+        media_type: String::new(),
+        block_size: block_size as u64,
+        // Unused by `chain_walk` (capacity is a build/validate-time concern).
+        budget: CapacityBudget {
+            available_bytes: 0,
+            reserve_bytes: 0,
+        },
+        entries,
+    };
 
-    // == File N+1: Mini-index, generated from the complete Layout ==
-    // Include the mini-index's own entry, sized by a two-pass. Its self-size is
-    // informational (RESTORE.sh reads the mini-index by filemark, not by size);
-    // envelope and slice sizes — which the two-pass leaves exact — are what an
-    // heir consumes to trim block padding.
-    entries.push(gen_entry(mini_index_pos, ZoneKind::MiniIndex, 0));
-    entries.sort_by_key(|e| e.position);
-    let mini_len = layout::generate_mini_index(label, &mini_index_tuples(&entries)).len();
-    if let Some(mi) = entries.iter_mut().find(|e| e.kind == ZoneKind::MiniIndex) {
-        mi.size_bytes = Some(mini_len as u64);
-    }
-    let mini = layout::generate_mini_index(label, &mini_index_tuples(&entries));
-    store.execute(&mut Cursor::new(mini.as_bytes()), mini.len() as u64, false)?;
-    info!("wrote mini-index");
+    let evidence = store.confirm(&layout, tier)?;
 
-    // == Write the pre-encrypted envelopes, in position order ==
-    for (pos, sync_mark, bytes) in &envelopes {
-        store.execute(
-            &mut Cursor::new(bytes.as_slice()),
-            bytes.len() as u64,
-            *sync_mark,
-        )?;
-        info!(position = pos, "wrote envelope");
-    }
-
-    // Update DB atomically — all status changes commit together
-    {
-        let tx = conn.unchecked_transaction()?;
-        for (write_id, snapshot_id) in &write_ids {
-            tx.execute(
-                "UPDATE writes SET status = 'completed', completed_at = datetime('now')
-                 WHERE id = ?1",
-                params![write_id],
-            )?;
-            tx.execute(
-                "UPDATE snapshots SET status = 'current'
-                 WHERE id = ?1 AND status IN ('created', 'staged')",
-                params![snapshot_id],
-            )?;
-        }
-
-        tx.execute(
-            "UPDATE volumes SET status = 'active', bytes_written = ?1,
-             num_data_files = ?2, has_manifest = 1,
-             first_write = COALESCE(first_write, datetime('now')),
-             last_write = datetime('now')
-             WHERE id = ?3",
-            params![bytes_written, total_slices as i64, volume_id],
-        )?;
-
-        events::log_event(
-            &tx,
-            "volume",
-            volume_id,
-            Some(label),
-            "write_completed",
-            None,
-            None,
-            Some(&format!("{total_slices} slices")),
-            None,
-            None,
-        )?;
-        tx.commit()?;
-    }
-
-    info!(
-        label = label,
-        slices = total_slices,
-        bytes = bytes_written,
-        "volume write complete"
-    );
-
-    // Best-effort sg_logs health collection. Never abort the write.
-    // Resolve sg device from the configured LTO backend matching this tape device.
-    let sg_device = config
-        .backends
-        .lto
-        .iter()
-        .find(|b| b.device_tape == device)
-        .map(|b| b.device_sg.clone());
-    if let Some(sg) = sg_device {
-        match health::collect(&sg) {
-            Ok((counters, raw)) => {
-                if let Err(e) = health::record(conn, volume_id, "write", &counters, &raw) {
-                    warn!(err = %e, "health_logs insert failed");
-                }
-            }
-            Err(e) => warn!(sg_device = sg, err = %e, "sg_logs collection failed"),
-        }
-    }
-
-    Ok(())
-}
-
-/// Verify a volume by reading slices and checking checksums.
-pub fn volume_verify(
-    conn: &Connection,
-    config: &Config,
-    label: &str,
-    device: &str,
-    block_size: usize,
-) -> Result<VerifyReport> {
-    let volume_id: i64 = conn
-        .query_row(
-            "SELECT id FROM volumes WHERE label = ?1",
-            params![label],
-            |row| row.get(0),
-        )
-        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
-
-    // Get write positions
-    let mut stmt = conn.prepare(
-        "SELECT wp.id, wp.position, wp.sha256_on_volume, ss.sha256_encrypted, wp.stage_slice_id, ss.encrypted_bytes
-         FROM write_positions wp
-         JOIN stage_slices ss ON ss.id = wp.stage_slice_id
-         JOIN writes w ON w.id = wp.write_id
-         WHERE w.volume_id = ?1 AND wp.status = 'written'
-         ORDER BY CAST(wp.position AS INTEGER)",
-    )?;
-    let positions: Vec<(i64, String, String, String, i64, i64)> = stmt
-        .query_map(params![volume_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    if positions.is_empty() {
-        return Err(TapectlError::Other("no write positions found".into()));
-    }
-
-    // Create verification session
-    conn.execute(
-        "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
-         VALUES (?1, 'full', 'in_progress')",
-        params![volume_id],
-    )?;
-    let session_id = conn.last_insert_rowid();
-
-    let mut tape = TapeDevice::open_read(device, block_size)?;
-    tape.rewind()?;
-
-    let mut report = VerifyReport::default();
-
-    for (wp_id, pos_str, expected_hash, orig_hash, slice_id, orig_size) in &positions {
-        let pos: i32 = pos_str.parse().unwrap_or(0);
-
-        // Seek to position
-        tape.rewind()?;
-        if pos > 0 {
-            tape.forward_space_file(pos)?;
-        }
-
-        let data = tape.read_file()?;
-        // In fixed block mode, data may be padded — trim to original size
-        let trimmed = if (*orig_size as usize) < data.len() {
-            &data[..*orig_size as usize]
-        } else {
-            &data
-        };
-        let actual = sha256_hex(trimmed);
-
-        report.checked += 1;
-        if actual == *expected_hash || actual == *orig_hash {
-            report.passed += 1;
-            conn.execute(
-                "INSERT INTO verification_results (session_id, write_position_id, stage_slice_id, result, expected_sha256, actual_sha256)
-                 VALUES (?1, ?2, ?3, 'passed', ?4, ?5)",
-                params![session_id, wp_id, slice_id, expected_hash, actual],
-            )?;
-            info!(slice_id = slice_id, position = pos, "PASS");
-        } else {
-            report.failed += 1;
-            conn.execute(
-                "INSERT INTO verification_results (session_id, write_position_id, stage_slice_id, result, expected_sha256, actual_sha256)
-                 VALUES (?1, ?2, ?3, 'failed_checksum', ?4, ?5)",
-                params![session_id, wp_id, slice_id, expected_hash, actual],
-            )?;
-            warn!(
-                slice_id = slice_id,
-                position = pos,
-                expected = &expected_hash[..16],
-                actual = &actual[..16],
-                "FAIL — checksum mismatch"
-            );
-        }
-    }
-
-    // Finalize verification session
-    let outcome = if report.failed == 0 {
+    let verify_type = match tier {
+        Tier::Integrity => "full",
+        Tier::Navigable => "quick",
+    };
+    let outcome = if evidence.mismatches.is_empty() {
         "passed"
     } else {
         "failed"
     };
     conn.execute(
-        "UPDATE verification_sessions
-         SET completed_at = datetime('now'), outcome = ?1,
-             slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
-         WHERE id = ?5",
+        "INSERT INTO verification_sessions
+            (volume_id, verify_type, outcome, completed_at, slices_checked, slices_passed, slices_failed)
+         VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5, ?6)",
         params![
+            volume_id,
+            verify_type,
             outcome,
-            report.checked as i64,
-            report.passed as i64,
-            report.failed as i64,
-            session_id
+            evidence.files_checked as i64,
+            if evidence.mismatches.is_empty() {
+                evidence.files_checked as i64
+            } else {
+                0
+            },
+            evidence.mismatches.len() as i64,
         ],
     )?;
 
-    // Best-effort sg_logs collection after verify. Advisory only.
-    let sg_device = config
-        .backends
-        .lto
-        .iter()
-        .find(|b| b.device_tape == device)
-        .map(|b| b.device_sg.clone());
-    if let Some(sg) = sg_device {
-        if let Ok((counters, raw)) = health::collect(&sg) {
+    for m in &evidence.mismatches {
+        warn!(
+            position = m.position,
+            kind = ?m.kind,
+            expected = %m.expected,
+            actual = %m.actual,
+            "verify mismatch"
+        );
+    }
+
+    // Best-effort sg_logs health collection. Advisory only.
+    if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
+        if let Ok((counters, raw)) = health::collect(&bk.device_sg) {
             if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
                 warn!(err = %e, "health_logs insert failed");
             }
         }
     }
 
-    Ok(report)
+    Ok(VerifyReport {
+        checked: evidence.files_checked as usize,
+        passed: (evidence.files_checked as usize).saturating_sub(evidence.mismatches.len()),
+        failed: evidence.mismatches.len(),
+    })
 }
 
-/// Read and display the ID thunk from a tape.
+/// Read and display the ID thunk from a tape. Reads File 0 as raw text
+/// (magic + label, whatever version) — no version-dispatch logic needed
+/// here: v1 and v2 thunks are both plain text an heir reads with `dd | tr -d
+/// '\0'`, and the v2 magic (`tapectl-volume-v2`) already self-identifies
+/// within that text (`v2-open-questions.md` §2.7: "volume_identify reads
+/// File 0 only... needs the v2 magic accepted alongside v1" — true by
+/// construction, since this never parses the magic at all).
 pub fn volume_identify(device: &str, block_size: usize) -> Result<String> {
     let mut tape = TapeDevice::open_read(device, block_size)?;
     tape.rewind()?;
     let data = tape.read_file()?;
     let text = String::from_utf8_lossy(&data).to_string();
-    // Trim padding zeros
     Ok(text.trim_end_matches('\0').to_string())
 }
 
 /// Read encrypted slices for a unit from a volume into staging.
 /// After this, use `volume write` to write them to a destination tape
-/// with the full self-describing 10-file layout.
+/// with the full self-describing volume layout.
+///
+/// Position-based, driven entirely from `write_positions` (DB), not the
+/// on-tape index — unaffected by the v2 index relocation
+/// (`v2-open-questions.md` §2.7).
 pub fn read_slices(
     conn: &Connection,
     config: &Config,
@@ -815,7 +771,7 @@ pub fn read_slices(
     let mut tape = TapeDevice::open_read(device, block_size)?;
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
-    let mut affected_stage_sets = std::collections::HashSet::new();
+    let mut affected_stage_sets = HashSet::new();
 
     for (
         pos_str,
@@ -963,7 +919,7 @@ pub fn compact_read(
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
     let mut slices_skipped: i64 = 0;
-    let mut affected_stage_sets = std::collections::HashSet::new();
+    let mut affected_stage_sets = HashSet::new();
 
     for (pos_str, sha_on_vol, _slice_id, enc_bytes, sha_encrypted, ss_id, slice_db_id) in
         &live_slices
@@ -1129,30 +1085,6 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
 
 // ── Internal helpers ──
 
-struct StagedUnit {
-    stage_set_id: i64,
-    snapshot_id: i64,
-    unit_name: String,
-    unit_uuid: String,
-    tenant_id: i64,
-    dar_version: Option<String>,
-    dar_command: Option<String>,
-    catalog_path: Option<String>,
-    snapshot_version: i64,
-    slices: Vec<SliceInfo>,
-}
-
-struct SliceInfo {
-    slice_id: i64,
-    write_id: i64,
-    slice_number: i64,
-    size_bytes: i64,
-    encrypted_bytes: i64,
-    sha256_plain: String,
-    sha256_encrypted: String,
-    staging_path: String,
-}
-
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub checked: usize,
@@ -1160,7 +1092,11 @@ pub struct VerifyReport {
     pub failed: usize,
 }
 
-fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
+/// Gather the staged batch as `BuildUnit`s, ready for `build::build`.
+/// `ORDER BY u.name` stays — the alphabetical first-fit ordering ruled in
+/// sheet §7 (`docs/design/v2-open-questions.md`); `build()` never reorders
+/// its input, so this is where unit order is decided.
+fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
                 ss.dar_version, ss.dar_command, ss.catalog_path, s.version
@@ -1200,37 +1136,28 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
 
     let mut units = Vec::new();
     for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, dar_cmd, catalog_path, snap_ver) in rows {
-        // Get write_id for this stage_set (created in the caller — check if exists)
-        let write_id: i64 = conn
-            .query_row(
-                "SELECT id FROM writes WHERE stage_set_id = ?1 ORDER BY id DESC LIMIT 1",
-                params![ss_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
         let mut slice_stmt = conn.prepare(
             "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path
              FROM stage_slices WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
              ORDER BY slice_number",
         )?;
-        let slices: Vec<SliceInfo> = slice_stmt
+        let slices: Vec<BuildSlice> = slice_stmt
             .query_map(params![ss_id], |row| {
-                Ok(SliceInfo {
+                let staging_path: String = row.get(6)?;
+                Ok(BuildSlice {
                     slice_id: row.get(0)?,
-                    write_id,
                     slice_number: row.get(1)?,
                     size_bytes: row.get(2)?,
                     encrypted_bytes: row.get(3)?,
                     sha256_plain: row.get(4)?,
                     sha256_encrypted: row.get(5)?,
-                    staging_path: row.get(6)?,
+                    staging_path: PathBuf::from(staging_path),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         if !slices.is_empty() {
-            units.push(StagedUnit {
+            units.push(BuildUnit {
                 stage_set_id: ss_id,
                 snapshot_id: snap_id,
                 unit_name: name,
@@ -1247,139 +1174,6 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<StagedUnit>> {
     Ok(units)
 }
 
-fn build_manifest_units(
-    staged: &[StagedUnit],
-    tenant_id: i64,
-    positions: &HashMap<i64, (i64, i32)>,
-) -> Vec<layout::ManifestUnit> {
-    staged
-        .iter()
-        .filter(|s| s.tenant_id == tenant_id)
-        .map(|s| layout::ManifestUnit {
-            name: s.unit_name.clone(),
-            uuid: s.unit_uuid.clone(),
-            snapshot_version: s.snapshot_version,
-            stage_set_id: s.stage_set_id,
-            dar_version: s.dar_version.clone(),
-            dar_command: s.dar_command.clone(),
-            slices: s
-                .slices
-                .iter()
-                .map(|sl| {
-                    let (_, tape_pos) = positions.get(&sl.slice_id).copied().unwrap_or((0, 0));
-                    layout::ManifestSlice {
-                        number: sl.slice_number,
-                        tape_position: tape_pos,
-                        size_bytes: sl.size_bytes,
-                        encrypted_bytes: sl.encrypted_bytes,
-                        sha256_plain: sl.sha256_plain.clone(),
-                        sha256_encrypted: sl.sha256_encrypted.clone(),
-                    }
-                })
-                .collect(),
-        })
-        .collect()
-}
-
-fn build_manifest_units_all(
-    staged: &[StagedUnit],
-    positions: &HashMap<i64, (i64, i32)>,
-) -> Vec<layout::ManifestUnit> {
-    staged
-        .iter()
-        .map(|s| layout::ManifestUnit {
-            name: s.unit_name.clone(),
-            uuid: s.unit_uuid.clone(),
-            snapshot_version: s.snapshot_version,
-            stage_set_id: s.stage_set_id,
-            dar_version: s.dar_version.clone(),
-            dar_command: s.dar_command.clone(),
-            slices: s
-                .slices
-                .iter()
-                .map(|sl| {
-                    let (_, tape_pos) = positions.get(&sl.slice_id).copied().unwrap_or((0, 0));
-                    layout::ManifestSlice {
-                        number: sl.slice_number,
-                        tape_position: tape_pos,
-                        size_bytes: sl.size_bytes,
-                        encrypted_bytes: sl.encrypted_bytes,
-                        sha256_plain: sl.sha256_plain.clone(),
-                        sha256_encrypted: sl.sha256_encrypted.clone(),
-                    }
-                })
-                .collect(),
-        })
-        .collect()
-}
-
-/// Read a unit's isolated dar catalogue slice files (catalog_base.N.dar) for
-/// inclusion in an envelope. Best-effort: a missing catalogue yields no files.
-fn read_catalog_files(catalog_path: &str) -> Vec<(String, Vec<u8>)> {
-    let base = std::path::Path::new(catalog_path);
-    let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|f| f.to_str())) else {
-        return Vec::new();
-    };
-    let prefix = format!("{stem}.");
-    let mut out = Vec::new();
-    if let Ok(rd) = fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let fname = e.file_name().to_string_lossy().into_owned();
-            if fname.starts_with(&prefix) && fname.ends_with(".dar") {
-                if let Ok(bytes) = fs::read(e.path()) {
-                    out.push((fname, bytes));
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-fn build_envelope_tar(
-    manifest: &str,
-    recovery: &str,
-    catalogs: &[(String, Vec<u8>)],
-) -> Result<Vec<u8>> {
-    let mut tar_buf = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_buf);
-
-        let manifest_bytes = manifest.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_path("MANIFEST.toml").unwrap();
-        header.set_size(manifest_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(chrono::Utc::now().timestamp() as u64);
-        header.set_cksum();
-        builder.append(&header, manifest_bytes).unwrap();
-
-        let recovery_bytes = recovery.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_path("RECOVERY.md").unwrap();
-        header.set_size(recovery_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(chrono::Utc::now().timestamp() as u64);
-        header.set_cksum();
-        builder.append(&header, recovery_bytes).unwrap();
-
-        // Per-unit isolated dar catalogues under catalogs/ — an heir can list
-        // contents (`dar -l`) and selectively restore without the database (#39).
-        for (name, bytes) in catalogs {
-            let mut header = tar::Header::new_gnu();
-            header.set_path(format!("catalogs/{name}")).unwrap();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_mtime(chrono::Utc::now().timestamp() as u64);
-            header.set_cksum();
-            builder.append(&header, bytes.as_slice()).unwrap();
-        }
-
-        builder.finish().unwrap();
-    }
-    Ok(tar_buf)
-}
-
 fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
@@ -1388,23 +1182,261 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Evidence, Mismatch, MismatchKind};
 
     #[test]
-    fn envelope_tar_includes_catalogues() {
-        // #39: per-unit dar catalogues ride the envelope under catalogs/.
-        let cats = vec![("abcd_v1.1.dar".to_string(), b"catalogue-bytes".to_vec())];
-        let tar = build_envelope_tar("[manifest]\n", "# recovery\n", &cats).unwrap();
-        let mut ar = tar::Archive::new(std::io::Cursor::new(tar));
-        let names: Vec<String> = ar
-            .entries()
-            .unwrap()
-            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.contains(&"MANIFEST.toml".to_string()));
-        assert!(names.contains(&"RECOVERY.md".to_string()));
+    fn derive_placeholder_volume_uuid_is_deterministic_and_label_sensitive() {
+        let a1 = derive_placeholder_volume_uuid("L6-0001");
+        let a2 = derive_placeholder_volume_uuid("L6-0001");
+        let b = derive_placeholder_volume_uuid("L6-0002");
+        assert_eq!(
+            a1, a2,
+            "same label must give the same placeholder uuid every time (stable across \
+             volume_init and every volume_write attempt)"
+        );
+        assert_ne!(
+            a1, b,
+            "different labels must give different placeholder uuids"
+        );
+        // build() hard-requires this to parse (Uuid::parse_str) before anything else runs.
         assert!(
-            names.contains(&"catalogs/abcd_v1.1.dar".to_string()),
-            "catalogue missing from envelope: {names:?}"
+            Uuid::parse_str(&a1).is_ok(),
+            "placeholder must parse as a UUID: {a1}"
+        );
+    }
+
+    #[test]
+    fn find_staged_data_returns_units_in_name_order_with_their_slices() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+
+        // Inserted zeta-then-alpha, deliberately reverse-alphabetical, to
+        // prove `ORDER BY u.name` (sheet §7's alphabetical first-fit) is what
+        // actually orders the result, not insertion order.
+        for name in ["zeta", "alpha"] {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                params![name, tenant_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, 'staged', '/tmp', 1, 10)",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, 1, 10, 10, 'a', 'b', '/tmp/x')",
+                params![ss_id],
+            )
+            .unwrap();
+        }
+
+        let units = find_staged_data(&conn).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            units[0].unit_name, "alpha",
+            "ORDER BY u.name must sort alphabetically regardless of insertion order"
+        );
+        assert_eq!(units[1].unit_name, "zeta");
+        assert_eq!(units[0].slices.len(), 1);
+        assert_eq!(units[0].slices[0].sha256_encrypted, "b");
+    }
+
+    #[test]
+    fn find_staged_data_skips_stage_sets_with_no_staged_slices() {
+        // A stage_set whose only slice has staging_path = NULL (never
+        // actually staged to disk, or already cleaned) must not surface as
+        // a unit to write — `find_staged_data`'s slice query filters
+        // `staging_path IS NOT NULL`, and an empty slice list drops the unit
+        // entirely (mirrors v1's `if !slices.is_empty()` guard).
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'u1', ?1, 'mtime_size', 1, 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'a', 'b', NULL)",
+            params![ss_id],
+        )
+        .unwrap();
+
+        let units = find_staged_data(&conn).unwrap();
+        assert!(
+            units.is_empty(),
+            "a stage_set with no on-disk slices must not surface as staged data"
+        );
+    }
+
+    #[test]
+    fn record_write_bookkeeping_sums_only_padded_slice_entries() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('BKTEST', 'lto', 'lto0', 1000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+
+        let bs = 512 * 1024u64;
+        let layout = Layout {
+            label: "BKTEST".to_string(),
+            volume_uuid: "u".to_string(),
+            media_type: "LTO-6".to_string(),
+            block_size: bs,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+            },
+            entries: vec![
+                LayoutEntry {
+                    position: 0,
+                    kind: ZoneKind::IdThunk,
+                    size_bytes: Some(100),
+                    sha256: None,
+                    source: ContentSource::Generated,
+                },
+                // 1 byte pads to one whole block.
+                LayoutEntry {
+                    position: 1,
+                    kind: ZoneKind::Slice { stage_slice_id: 1 },
+                    size_bytes: Some(1),
+                    sha256: None,
+                    source: ContentSource::Generated,
+                },
+                // block_size + 1 pads to two whole blocks.
+                LayoutEntry {
+                    position: 2,
+                    kind: ZoneKind::Slice { stage_slice_id: 2 },
+                    size_bytes: Some(bs + 1),
+                    sha256: None,
+                    source: ContentSource::Generated,
+                },
+            ],
+        };
+
+        record_write_bookkeeping(&conn, volume_id, &layout, bs).unwrap();
+
+        let (bytes_written, num_data_files, has_manifest): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT bytes_written, num_data_files, has_manifest FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            num_data_files, 2,
+            "only Slice entries count toward num_data_files, not id_thunk"
+        );
+        assert_eq!(
+            bytes_written,
+            (bs + 2 * bs) as i64,
+            "must sum block-PADDED (on-tape) slice bytes, not the true size_bytes"
+        );
+        assert_eq!(has_manifest, 1);
+    }
+
+    #[test]
+    fn record_write_bookkeeping_never_touches_status() {
+        // confirm()'s own transaction already set status = 'sealed' before
+        // this runs (session::SealedPending::confirm) — this bookkeeping
+        // step must not clobber it back to some other value.
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('BKTEST2', 'lto', 'lto0', 1000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        let layout = Layout {
+            label: "BKTEST2".to_string(),
+            volume_uuid: "u".to_string(),
+            media_type: "LTO-6".to_string(),
+            block_size: 4096,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+            },
+            entries: vec![],
+        };
+        record_write_bookkeeping(&conn, volume_id, &layout, 4096).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "sealed");
+    }
+
+    #[test]
+    fn describe_quarantine_confirm_failed_mentions_mismatch_count_and_tier() {
+        let evidence = Evidence {
+            tier: Tier::Integrity,
+            files_checked: 5,
+            mismatches: vec![Mismatch {
+                position: 4,
+                kind: MismatchKind::ContentHashMismatch,
+                expected: "aa".into(),
+                actual: "bb".into(),
+            }],
+        };
+        let msg = describe_quarantine(&QuarantineReason::ConfirmFailed(evidence));
+        assert!(msg.contains('1'), "expected the mismatch count in: {msg}");
+        assert!(msg.contains("Integrity"), "expected the tier in: {msg}");
+    }
+
+    #[test]
+    fn describe_quarantine_already_sealed_mentions_position_and_adr() {
+        let msg = describe_quarantine(&QuarantineReason::AlreadySealed { seal_position: 12 });
+        assert!(msg.contains("12"), "expected the seal position in: {msg}");
+        assert!(
+            msg.contains("ADR-0003"),
+            "expected the ADR citation in: {msg}"
         );
     }
 }

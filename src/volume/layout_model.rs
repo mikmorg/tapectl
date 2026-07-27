@@ -17,26 +17,25 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// Which zone of the 10-file volume layout an entry is. Slice and envelope
-/// variants carry the id they map to so metadata generation (#24) and the
-/// session cursor (#22) can tie an entry back to its source.
+/// Which zone of the volume layout (v2, ADR-0007) an entry is. Slice and
+/// envelope variants carry the id they map to so metadata generation (#24)
+/// and the session cursor (#22) can tie an entry back to its source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZoneKind {
     IdThunk,
     SystemGuide,
     RestoreSh,
-    /// The plaintext front index (File 3, layout v2 — ADR-0007). Replaces the
-    /// v1 mid-tape `MiniIndex`; carries per-file position/type/size and
-    /// ciphertext hashes.
+    /// The plaintext front index (File 3, layout v2 — ADR-0007): carries
+    /// per-file position/type/size and ciphertext hashes for every file. The
+    /// v1 mid-tape mini-index and the standalone planning-header zone are
+    /// both gone (`volume-format-v2.md` §8) — the mini-index's facts moved
+    /// here, and the planning header survives only as the operator
+    /// envelope's `PLAN.toml` tar member (`generate_planning_header`).
     FrontIndex,
-    PlanningHeader,
     /// An encrypted data slice, keyed by `stage_slices.id`.
     Slice {
         stage_slice_id: i64,
     },
-    /// The v1 mid-tape mini-index. Retained for the v1 reader stub until the
-    /// write path flips to v2 (#22); superseded by `FrontIndex`.
-    MiniIndex,
     /// A tenant envelope, keyed by `tenants.id`.
     TenantEnvelope {
         tenant_id: i64,
@@ -49,16 +48,14 @@ pub enum ZoneKind {
 }
 
 impl ZoneKind {
-    /// The plaintext `type` label written into the mini-index for this zone.
+    /// The plaintext `type` label written into the front index for this zone.
     pub fn type_label(&self) -> &'static str {
         match self {
             ZoneKind::IdThunk => "id_thunk",
             ZoneKind::SystemGuide => "system_guide",
             ZoneKind::RestoreSh => "restore_sh",
             ZoneKind::FrontIndex => "front_index",
-            ZoneKind::PlanningHeader => "planning_header",
             ZoneKind::Slice { .. } => "data_slice",
-            ZoneKind::MiniIndex => "mini_index",
             ZoneKind::TenantEnvelope { .. } => "tenant_envelope",
             ZoneKind::OperatorEnvelope => "operator_envelope",
             // Distinct from OperatorEnvelope per volume-format-v2.md §3's type
@@ -72,6 +69,34 @@ impl ZoneKind {
             ZoneKind::OperatorEnvelopeBackup => "operator_envelope_backup",
             ZoneKind::SealMarker => "seal_marker",
         }
+    }
+
+    /// The reverse of [`Self::type_label`]: reconstruct a `ZoneKind` from a
+    /// front-index `type` string. `Slice`/`TenantEnvelope` carry an id in a
+    /// production `Layout`, but a front index's plaintext `type` field is
+    /// only ever the bare label — no id travels with it (isolation
+    /// invariant, `volume-format-v2.md` §2) — so a caller reconstructing a
+    /// `Layout` from a *parsed* front index alone (rather than from the
+    /// original build inputs) has no id to supply and uses `0` as a dummy
+    /// payload. `write.rs::volume_verify`'s post-hoc reconstruction is the
+    /// motivating caller: it only ever calls `.type_label()` on the result,
+    /// never inspects the dummy id. Returns `None` for an unrecognized
+    /// label — callers should treat that as a hard error (an unrecognized
+    /// type string is a caller/format problem, not a tape-content mismatch
+    /// `Store::confirm`'s `Evidence` is designed to report).
+    pub fn from_type_label(label: &str) -> Option<ZoneKind> {
+        Some(match label {
+            "id_thunk" => ZoneKind::IdThunk,
+            "system_guide" => ZoneKind::SystemGuide,
+            "restore_sh" => ZoneKind::RestoreSh,
+            "front_index" => ZoneKind::FrontIndex,
+            "data_slice" => ZoneKind::Slice { stage_slice_id: 0 },
+            "tenant_envelope" => ZoneKind::TenantEnvelope { tenant_id: 0 },
+            "operator_envelope" => ZoneKind::OperatorEnvelope,
+            "operator_envelope_backup" => ZoneKind::OperatorEnvelopeBackup,
+            "seal_marker" => ZoneKind::SealMarker,
+            _ => return None,
+        })
     }
 
     fn is_slice(&self) -> bool {
@@ -102,14 +127,18 @@ pub enum ContentSource {
     /// `build()` time (v2-open-questions.md §2.2). `size_bytes`/`sha256` on
     /// the owning `LayoutEntry` describe these exact on-disk bytes.
     Materialized(PathBuf),
-    /// v1-only: bytes generated in memory by `write.rs`'s v1 pipeline and
-    /// written straight to tape, with no on-disk staging file and (today) no
-    /// size/hash recorded on the entry. Kept, unused by any v2 code, only
-    /// because `write.rs`'s v1 path (out of scope for T5b; T8 deletes it per
-    /// `docs/design/v2-implementation-plan.md`) still constructs entries with
-    /// this variant via its own `gen_entry` helper. `build()` (T5b, the v2
-    /// path) never produces `Generated` — every one of its generated zones is
-    /// `Materialized`.
+    /// No real backing file at all — used only where a `LayoutEntry` must be
+    /// constructed but nothing ever reads `source` for it. `build()` (the v2
+    /// path) never produces this for a real write session; every one of its
+    /// generated zones is `Materialized`. The one v2 caller today is
+    /// `write.rs::volume_verify`'s post-hoc reconstruction: it rebuilds a
+    /// synthetic `Layout` directly from a *parsed* front index (there is no
+    /// on-disk session to point at, possibly years after the write), and
+    /// `Store::confirm`'s chain walk never reads `entry.source` — only
+    /// `position`/`kind`/`size_bytes`/`sha256` — so this variant is a safe
+    /// "don't care" placeholder there. (Formerly also v1's variant for bytes
+    /// generated in memory by the pre-T8 write pipeline; that pipeline is
+    /// gone.)
     Generated,
 }
 
@@ -492,7 +521,7 @@ mod tests {
         // Two generated metadata files, comfortably under budget.
         let entries = vec![
             gen_entry(0, ZoneKind::IdThunk, 1000),
-            gen_entry(1, ZoneKind::MiniIndex, 1000),
+            gen_entry(1, ZoneKind::SystemGuide, 1000),
         ];
         let l = layout_with(entries, 10 * BS, BS);
         assert!(l.validate(&keys_ok(&[])).is_ok());
@@ -504,7 +533,7 @@ mod tests {
         let entries = vec![
             gen_entry(0, ZoneKind::IdThunk, 1),
             gen_entry(1, ZoneKind::SystemGuide, 1),
-            gen_entry(2, ZoneKind::MiniIndex, 1),
+            gen_entry(2, ZoneKind::RestoreSh, 1),
         ];
         assert_eq!(
             layout_with(entries.clone(), 100 * BS, BS)
@@ -776,5 +805,44 @@ mod tests {
             ZoneKind::OperatorEnvelope.type_label(),
             ZoneKind::OperatorEnvelopeBackup.type_label()
         );
+    }
+
+    #[test]
+    fn from_type_label_round_trips_every_kind_type_label_produces() {
+        // Every string type_label() can produce must round-trip through
+        // from_type_label() back to a kind with the SAME type_label() (the
+        // id/tenant_id payload is necessarily lost for Slice/TenantEnvelope,
+        // since a front index's plaintext `type` field never carries one —
+        // volume_verify's post-hoc reconstruction depends on exactly this).
+        let samples = [
+            ZoneKind::IdThunk,
+            ZoneKind::SystemGuide,
+            ZoneKind::RestoreSh,
+            ZoneKind::FrontIndex,
+            ZoneKind::Slice { stage_slice_id: 42 },
+            ZoneKind::TenantEnvelope { tenant_id: 7 },
+            ZoneKind::OperatorEnvelope,
+            ZoneKind::OperatorEnvelopeBackup,
+            ZoneKind::SealMarker,
+        ];
+        for kind in samples {
+            let label = kind.type_label();
+            let round_tripped = ZoneKind::from_type_label(label)
+                .unwrap_or_else(|| panic!("from_type_label(\"{label}\") returned None"));
+            assert_eq!(
+                round_tripped.type_label(),
+                label,
+                "round-trip through from_type_label changed the type_label for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_type_label_rejects_unrecognized_strings() {
+        assert_eq!(ZoneKind::from_type_label("not_a_real_type"), None);
+        assert_eq!(ZoneKind::from_type_label(""), None);
+        // Case-sensitive: the format is a fixed lower-case vocabulary
+        // (`volume-format-v2.md` §3), not case-insensitive matching.
+        assert_eq!(ZoneKind::from_type_label("Seal_Marker"), None);
     }
 }
