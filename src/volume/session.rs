@@ -578,14 +578,13 @@ impl SealedPending {
 /// "stream an entry, update its cursor row." Never includes the seal marker
 /// entry — that is `ReadyToSeal::seal`'s job alone (sacred invariant 1).
 ///
-/// Status: cycles 1-2 landed (happy path; tri-layer L2 hash verification
-/// with a clean abort on mismatch). Still pending: cycle 3's graceful
-/// handling of a `store.execute` error (currently propagated via `?`, i.e.
-/// NOT yet a clean abort — ENOSPC would surface as a hard `Err`, not
-/// `Ok(ExecuteOutcome::Aborted(..))`); cycle 4's `is_interrupted` check
-/// (currently unused — accepted but not called, since the public
-/// `execute_checking`/`resume_checking` signatures are already the final
-/// ones the four behaviors need).
+/// Status: cycles 1-3 landed (happy path; tri-layer L2 hash verification
+/// with a clean abort on mismatch; a `store.execute` error — ENOSPC being
+/// the expected one, but any of them — is caught and produces the same
+/// clean abort, never a hard `Err` out of the whole session). Still
+/// pending: cycle 4's `is_interrupted` check (currently unused — accepted
+/// but not called, since the public `execute_checking`/`resume_checking`
+/// signatures are already the final ones the four behaviors need).
 #[allow(clippy::too_many_arguments)]
 fn run_entries(
     conn: &Connection,
@@ -614,15 +613,23 @@ fn run_entries(
             ))
         })?;
 
-        let file = File::open(path).map_err(|e| {
-            TapectlError::Other(format!(
-                "execute: open entry at position {}: {e}",
-                entry.position
-            ))
-        })?;
-        let mut reader = HashingReader::new(file);
-        store.execute(&mut reader, size, false)?;
-        let actual_hash = reader.finalize_hex();
+        // Stream the entry through the hashing tee reader into the store.
+        // Any store-level failure here — ENOSPC being the expected one,
+        // but this treats any of them alike (device gone, I/O error, ...) —
+        // is caught rather than propagated: a full medium has no salvage
+        // path (ADR-0007), so it becomes the same clean abort as a hash
+        // mismatch, not a hard `Err` out of the whole session.
+        let stream_result: Result<String> = (|| {
+            let file = File::open(path).map_err(|e| {
+                TapectlError::Other(format!(
+                    "execute: open entry at position {}: {e}",
+                    entry.position
+                ))
+            })?;
+            let mut reader = HashingReader::new(file);
+            store.execute(&mut reader, size, false)?;
+            Ok(reader.finalize_hex())
+        })();
 
         // Tri-layer L2 (`v2-open-questions.md` §2.4): re-hash inline on the
         // same streaming read that fed the store, and clean-abort on
@@ -630,36 +637,57 @@ fn run_entries(
         // — `validate` already full-hashed this same file from disk, but a
         // rot between then and now would otherwise land on tape unnoticed.
         let expected_hash = entry.sha256.as_deref();
-        let mismatch = expected_hash != Some(actual_hash.as_str());
+        let abort_reason = match &stream_result {
+            Err(e) => Some(format!(
+                "execute failed at position {}: {e}",
+                entry.position
+            )),
+            Ok(actual_hash) if expected_hash != Some(actual_hash.as_str()) => Some(format!(
+                "hash mismatch at position {}: expected {expected_hash:?}, got {actual_hash}",
+                entry.position
+            )),
+            Ok(_) => None,
+        };
 
         if let ZoneKind::Slice { stage_slice_id } = entry.kind {
             let write_id = *slice_write_id
                 .get(&stage_slice_id)
                 .expect("plan() populated slice_write_id for every slice entry");
-            if mismatch {
-                conn.execute(
-                    "UPDATE write_positions SET status = 'failed', sha256_on_volume = ?1
-                     WHERE write_id = ?2 AND stage_slice_id = ?3",
-                    params![actual_hash, write_id, stage_slice_id],
-                )?;
-            } else {
-                conn.execute(
-                    "UPDATE write_positions
-                     SET status = 'written', written_at = datetime('now'), sha256_on_volume = ?1
-                     WHERE write_id = ?2 AND stage_slice_id = ?3",
-                    params![actual_hash, write_id, stage_slice_id],
-                )?;
+            match (&stream_result, &abort_reason) {
+                (Ok(actual_hash), None) => {
+                    conn.execute(
+                        "UPDATE write_positions
+                         SET status = 'written', written_at = datetime('now'),
+                             sha256_on_volume = ?1
+                         WHERE write_id = ?2 AND stage_slice_id = ?3",
+                        params![actual_hash, write_id, stage_slice_id],
+                    )?;
+                }
+                (Ok(actual_hash), Some(_)) => {
+                    // Streamed, but the hash didn't match.
+                    conn.execute(
+                        "UPDATE write_positions SET status = 'failed', sha256_on_volume = ?1
+                         WHERE write_id = ?2 AND stage_slice_id = ?3",
+                        params![actual_hash, write_id, stage_slice_id],
+                    )?;
+                }
+                (Err(_), _) => {
+                    // Never streamed at all (open failed or store.execute
+                    // errored) — no sha256_on_volume to record.
+                    conn.execute(
+                        "UPDATE write_positions SET status = 'failed'
+                         WHERE write_id = ?1 AND stage_slice_id = ?2",
+                        params![write_id, stage_slice_id],
+                    )?;
+                }
             }
         }
 
-        if mismatch {
+        if let Some(reason) = abort_reason {
             mark_writes(conn, &write_ids, "aborted")?;
             return Ok(ExecuteOutcome::Aborted(AbortedSession {
                 volume_id,
-                reason: format!(
-                    "hash mismatch at position {}: expected {expected_hash:?}, got {actual_hash}",
-                    entry.position
-                ),
+                reason,
             }));
         }
     }
@@ -1089,5 +1117,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wp_status, "failed");
+    }
+
+    // --- behavior 3: ENOSPC mid-execute cleanly aborts (same as mismatch) -
+
+    #[test]
+    fn enospc_mid_execute_aborts_unsealed_same_as_hash_mismatch() {
+        let f = make_fixture();
+        // A budget that lets a few entries land, then fails — MemStore has
+        // no other way to simulate a full medium
+        // (`MemStore::with_enospc_after`'s own doc comment).
+        let mut store = MemStore::new(BS as usize).with_enospc_after(2 * BS);
+        let seal_position = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("fixture layout always has a seal marker");
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        let outcome = planned.execute(&f.conn, &mut store).expect(
+            "execute should not hard-error on ENOSPC — it's a clean abort, same as a hash mismatch",
+        );
+
+        let aborted = match outcome {
+            ExecuteOutcome::Aborted(a) => a,
+            ExecuteOutcome::Ready(_) => panic!("expected Aborted on ENOSPC, got Ready"),
+            ExecuteOutcome::Interrupted(_) => {
+                panic!("expected Aborted on ENOSPC, got Interrupted")
+            }
+        };
+        assert_eq!(aborted.volume_id, f.volume_id);
+
+        // Same clean-abort shape as the hash-mismatch behavior: unsealed
+        // (no seal marker reached), writes 'aborted', volume not 'sealed'.
+        assert!(
+            store.files.len() <= seal_position,
+            "MemStore must not contain a seal marker entry after an ENOSPC abort; \
+             files.len()={}, seal position={seal_position}",
+            store.files.len(),
+        );
+
+        let write_statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(write_statuses, vec!["aborted".to_string()]);
+
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(volume_status, "sealed");
     }
 }
