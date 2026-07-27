@@ -1,14 +1,16 @@
-//! Parsers for the plaintext front index (File 3) and seal marker (File M) —
-//! the reader half of `layout.rs`'s `generate_front_index` /
-//! `generate_seal_marker` writer half. Normative grammar:
-//! `docs/design/volume-format-v2.md` §3–4; self-consistency rules:
+//! Parsers for the plaintext front index (File 3), seal marker (File M), and
+//! ID thunk (File 0) — the reader half of `layout.rs`'s `generate_front_index`
+//! / `generate_seal_marker` / `generate_id_thunk_v2` writer half. Normative
+//! grammar: `docs/design/volume-format-v2.md` §3–4; self-consistency rules:
 //! `docs/design/v2-open-questions.md` §2.5.
 //!
-//! Both documents share one shape: a human-readable header, then a
-//! `[index]` or `[seal]` TOML table, then zero or more `[[files]]` entries in
-//! the line-oriented grammar §3.1 fixes as a contract (so RESTORE.sh's
-//! grep/awk parsing stays sound). Tape reads come block-padded with trailing
-//! zero bytes, which these parsers strip before handing the body to the TOML
+//! All three documents share one shape: a human-readable header, then one or
+//! more TOML tables (`[volume]`/`[layout]`/`[media]` for the ID thunk,
+//! `[index]` for the front index, `[seal]` for the seal marker), the first
+//! two of which also carry zero or more `[[files]]` entries in the
+//! line-oriented grammar §3.1 fixes as a contract (so RESTORE.sh's grep/awk
+//! parsing stays sound). Tape reads come block-padded with trailing zero
+//! bytes, which these parsers strip before handing the body to the TOML
 //! parser.
 
 use serde::Deserialize;
@@ -138,6 +140,52 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
     })
 }
 
+/// The two identity fields of the ID thunk (File 0) that resume compares
+/// against the Layout it is about to continue — `docs/design/layout-session.md`:
+/// "rewind, read file 0, require ID-thunk identity match (label + uuid) —
+/// mismatch = divergence = quarantine, not overwrite." Everything else in
+/// the ID thunk (`layout::generate_id_thunk_v2`'s `magic`, `layout_version`,
+/// `tapectl_version`, capacities, `created_at`, and the whole `[layout]`/
+/// `[media]` tables) is either provisional or not part of this specific
+/// check, so this struct deliberately carries only what resume needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdThunkIdentity {
+    pub label: String,
+    pub uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeHeader {
+    label: String,
+    uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdThunkDoc {
+    volume: VolumeHeader,
+}
+
+/// Parse the ID thunk (File 0)'s `[volume]` identity. Absent/malformed input
+/// is a normal `Err`, matching `parse_front_index`/`parse_seal_marker`'s
+/// convention — a caller that cannot read or parse File 0 has NOT thereby
+/// confirmed a mismatch (that would wrongly quarantine a session crashed
+/// before File 0 ever landed); see `session::InterruptedSession::resume`'s
+/// doc comment for how the two cases are told apart. The `[volume]` table
+/// carries several other fields (`magic`, `layout_version`, capacities,
+/// `created_at`, ...) and the document continues with `[layout]`/`[media]`
+/// tables after it — all silently ignored here (no
+/// `#[serde(deny_unknown_fields)]`), since this parser only ever needs
+/// `label` + `uuid`.
+pub fn parse_id_thunk_identity(raw: &str) -> Result<IdThunkIdentity> {
+    let body = toml_body(raw, "[volume]", "id thunk")?;
+    let doc: IdThunkDoc = toml::from_str(body)
+        .map_err(|e| TapectlError::Other(format!("id thunk: TOML parse failed: {e}")))?;
+    Ok(IdThunkIdentity {
+        label: doc.volume.label,
+        uuid: doc.volume.uuid,
+    })
+}
+
 /// A violation of the §2.5 front-index self-consistency rules. Cheap checks
 /// that turn "subtly wrong map" into a loud, structured report rather than a
 /// silent bad read — every violation present is returned, not just the
@@ -249,7 +297,10 @@ pub fn validate_consistency(entries: &[ParsedIndexEntry]) -> Vec<ConsistencyViol
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::volume::layout::{generate_front_index, generate_seal_marker, FrontIndexFile};
+    use crate::volume::layout::{
+        generate_front_index, generate_id_thunk_v2, generate_seal_marker, FrontIndexFile,
+        IdThunkV2Params,
+    };
 
     /// A well-formed 6-file layout: id_thunk, guide, restore_sh, front_index,
     /// one data slice, seal_marker — used as the shared fixture for
@@ -399,6 +450,62 @@ mod tests {
     fn missing_marker_is_an_err_not_a_panic() {
         assert!(parse_front_index("no toml here at all").is_err());
         assert!(parse_seal_marker("no toml here either").is_err());
+        assert!(parse_id_thunk_identity("no toml here at all either").is_err());
+    }
+
+    // --- id thunk identity (resume's File-0 check) -----------------------
+
+    fn sample_id_thunk_params<'a>(label: &'a str, uuid: &'a str) -> IdThunkV2Params<'a> {
+        IdThunkV2Params {
+            label,
+            uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.2.0",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 12,
+            mam_manufacturer: "IBM",
+            mam_serial: "SERIAL1",
+            mam_length: 846,
+            mam_loads: 5,
+            created_at: "2026-07-22T20:09:00Z",
+        }
+    }
+
+    #[test]
+    fn id_thunk_identity_round_trips_through_the_parser() {
+        let params = sample_id_thunk_params("RT01", "11111111-2222-3333-4444-555555555555");
+        let generated = generate_id_thunk_v2(&params);
+
+        let parsed = parse_id_thunk_identity(&generated).expect("parses");
+        assert_eq!(parsed.label, "RT01");
+        assert_eq!(parsed.uuid, "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn id_thunk_identity_parser_ignores_the_layout_and_media_tables() {
+        // The document continues with [layout] and [media] tables (plus
+        // several other [volume] keys) after the two fields this parser
+        // cares about — none of that may cause a parse failure.
+        let params = sample_id_thunk_params("RT02", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let generated = generate_id_thunk_v2(&params);
+        assert!(generated.contains("[layout]"));
+        assert!(generated.contains("[media]"));
+
+        assert!(parse_id_thunk_identity(&generated).is_ok());
+    }
+
+    #[test]
+    fn id_thunk_identity_parser_is_tolerant_of_trailing_block_padding_nuls() {
+        let params = sample_id_thunk_params("RT03", "cccccccc-dddd-eeee-ffff-000000000000");
+        let generated = generate_id_thunk_v2(&params);
+
+        let mut padded = generated.into_bytes();
+        padded.resize(padded.len() + 4096, 0);
+        let padded_str = String::from_utf8(padded).unwrap();
+
+        let parsed = parse_id_thunk_identity(&padded_str).expect("parses despite NUL padding");
+        assert_eq!(parsed.label, "RT03");
     }
 
     #[test]
