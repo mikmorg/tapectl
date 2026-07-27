@@ -21,8 +21,10 @@
 //! heir-readable with no catalog and no tapectl.
 mod common;
 
+use std::io::Read;
 use std::sync::OnceLock;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use common::{generate_library, MicroSpec, UnitFixture, MICRO_BLOCK};
@@ -54,18 +56,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// (assertion 7) can decrypt — mirrors what a real heir would hold (their own
 /// age secret key), nothing else.
 struct TenantFixture {
-    #[allow(dead_code)] // read starting with assertion 7 (keyed heir restore)
     tenant_id: i64,
-    #[allow(dead_code)] // read starting with assertion 7
     name: String,
     public_key: String,
-    #[allow(dead_code)] // read starting with assertion 7
     secret_key: String,
 }
 
 /// One unit's ground truth, kept so the final assertions can check restored
 /// bytes against what the fixture generator actually produced.
-#[allow(dead_code)] // fields read starting with assertion 7 (keyed heir restore)
 struct UnitPlain {
     unit_name: String,
     unit_uuid: String,
@@ -83,9 +81,7 @@ struct Harness {
     /// by its own production signature).
     layout: Layout,
     store: MemStore,
-    #[allow(dead_code)] // read starting with assertion 7
     tenants: Vec<TenantFixture>,
-    #[allow(dead_code)] // read starting with assertion 7
     units: Vec<UnitPlain>,
 }
 
@@ -613,6 +609,25 @@ fn parse_front_index_from_recorded_bytes(
         .expect("front index must parse from recorded bytes")
 }
 
+// ── MANIFEST.toml parsing (assertion 7 — the heir has only this + a key) ──
+
+#[derive(Deserialize)]
+struct ManifestSliceDoc {
+    tape_position: i32,
+}
+
+#[derive(Deserialize)]
+struct ManifestUnitDoc {
+    uuid: String,
+    #[serde(default)]
+    slices: Vec<ManifestSliceDoc>,
+}
+
+#[derive(Deserialize)]
+struct ManifestDoc {
+    units: Vec<ManifestUnitDoc>,
+}
+
 // ── the 7 required assertions ──
 
 /// Assertion 1 (plan T7 / sheet §4.1): parse File 3, verify the seal marker
@@ -896,4 +911,145 @@ fn dropping_the_seal_marker_yields_unsealed_never_a_panic() {
         "expected a SealUnreadable mismatch, got {:?}",
         evidence.mismatches
     );
+}
+
+/// Assertion 7 (§6, the Heir Path): pick one tenant, trial-decrypt the
+/// (permuted) tenant-envelope positions with that tenant's fixture identity
+/// to find theirs, parse its MANIFEST.toml, use it to locate that unit's
+/// slice position(s), decrypt those slices from the recorded bytes, and
+/// assert the plaintext matches the fixture generator's original bytes
+/// exactly. This is the end-to-end proof: keyless verification (assertions
+/// 1-3, 6) first, then keyed recovery.
+#[test]
+fn keyed_heir_restore_matches_original_plaintext_exactly() {
+    let h = shared_harness();
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+    let parsed = parse_front_index_from_recorded_bytes(&h.store.files, fi_pos, fi_true_len);
+
+    // The heir has exactly this: their own age secret key, nothing else.
+    let tenant = &h.tenants[0];
+    let identity: age::x25519::Identity = tenant
+        .secret_key
+        .parse()
+        .expect("fixture secret key parses as an age identity");
+
+    let envelope_positions: Vec<i32> = parsed
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .map(|e| e.position)
+        .collect();
+    assert!(!envelope_positions.is_empty(), "no tenant envelopes found");
+
+    // Trial-decrypt: try every tenant envelope position with THIS tenant's
+    // key; the one that decrypts is theirs. This is exactly why an heir
+    // cannot just assume "my envelope is at position 4" — the §2.1
+    // permutation means they must try each in turn.
+    let mut found_tar: Option<Vec<u8>> = None;
+    for pos in &envelope_positions {
+        let entry = parsed.iter().find(|e| e.position == *pos).unwrap();
+        let size = entry.size_bytes.expect("envelope entry must be sized") as usize;
+        let padded = &h.store.files[*pos as usize];
+        assert!(
+            size <= padded.len(),
+            "envelope at {pos} shorter than recorded size"
+        );
+        let true_bytes = &padded[..size];
+        let Ok(decryptor) = age::Decryptor::new(true_bytes) else {
+            continue;
+        };
+        let Ok(mut reader) = decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity))
+        else {
+            continue;
+        };
+        let mut tar_bytes = Vec::new();
+        if reader.read_to_end(&mut tar_bytes).is_ok() {
+            found_tar = Some(tar_bytes);
+            break;
+        }
+    }
+    let tar_bytes = found_tar.unwrap_or_else(|| {
+        panic!(
+            "tenant {}'s own envelope must be found among the {} permuted tenant_envelope positions",
+            tenant.name,
+            envelope_positions.len()
+        )
+    });
+
+    // Extract MANIFEST.toml from the decrypted tar.
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut manifest_str = None;
+    for entry in archive.entries().expect("tar entries") {
+        let mut entry = entry.expect("tar entry");
+        let path = entry
+            .path()
+            .expect("tar entry path")
+            .to_string_lossy()
+            .into_owned();
+        if path == "MANIFEST.toml" {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).expect("read MANIFEST.toml");
+            manifest_str = Some(s);
+            break;
+        }
+    }
+    let manifest_str = manifest_str.expect("envelope tar must contain MANIFEST.toml");
+    let manifest: ManifestDoc = toml::from_str(&manifest_str).expect("MANIFEST.toml parses");
+
+    // This tenant's units per the harness's own ground truth (an heir
+    // wouldn't have this — they'd just trust the manifest — but the test
+    // needs it to know what plaintext to expect back).
+    let expected: Vec<&UnitPlain> = h
+        .units
+        .iter()
+        .filter(|u| u.tenant_id == tenant.tenant_id)
+        .collect();
+    assert!(!expected.is_empty(), "tenant {} owns no units", tenant.name);
+    assert_eq!(
+        manifest.units.len(),
+        expected.len(),
+        "manifest must list exactly this tenant's units, no more, no fewer"
+    );
+
+    for exp_unit in &expected {
+        let manifest_unit = manifest
+            .units
+            .iter()
+            .find(|u| u.uuid == exp_unit.unit_uuid)
+            .unwrap_or_else(|| panic!("manifest missing unit {}", exp_unit.unit_uuid));
+        assert_eq!(
+            manifest_unit.slices.len(),
+            1,
+            "harness uses exactly one slice per unit"
+        );
+        let slice_pos = manifest_unit.slices[0].tape_position;
+
+        let fi_claim = parsed
+            .iter()
+            .find(|e| e.position == slice_pos)
+            .unwrap_or_else(|| panic!("front index missing position {slice_pos}"));
+        assert_eq!(fi_claim.type_label, "data_slice");
+        let size = fi_claim.size_bytes.expect("slice entry must be sized") as usize;
+        let padded = &h.store.files[slice_pos as usize];
+        assert!(
+            size <= padded.len(),
+            "slice at {slice_pos} shorter than recorded size"
+        );
+        let ciphertext = &padded[..size];
+
+        let decryptor = age::Decryptor::new(ciphertext).expect("slice decryptor");
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .expect("tenant's own key must decrypt their own slice");
+        let mut plaintext = Vec::new();
+        reader
+            .read_to_end(&mut plaintext)
+            .expect("read decrypted slice");
+
+        assert_eq!(
+            plaintext, exp_unit.plaintext,
+            "restored plaintext must exactly match the fixture generator's original \
+             bytes for unit {}",
+            exp_unit.unit_name
+        );
+    }
 }
