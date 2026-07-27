@@ -248,8 +248,9 @@ pub struct AbortedSession {
 /// check found this isn't the same tape
 /// (`docs/design/layout-session.md`: "mismatch = divergence = quarantine,
 /// not overwrite"). These are different kinds of evidence — a chain walk
-/// report vs. a label/uuid disagreement — so they are not forced into the
-/// same shape.
+/// report vs. a label/uuid disagreement vs. an already-sealed tape — so they
+/// are not forced into the same shape.
+#[derive(Debug)]
 pub enum QuarantineReason {
     ConfirmFailed(Evidence),
     IdentityMismatch {
@@ -258,6 +259,15 @@ pub enum QuarantineReason {
         /// `None` if File 0 was present but did not even parse as a valid
         /// ID thunk (still a mismatch — never overwrite on ambiguity).
         found: Option<format::IdThunkIdentity>,
+    },
+    /// Resume found a parseable seal marker at the tape's last position: the
+    /// volume is already SEALED, and sealed volumes are immutable (ADR-0003 —
+    /// there is no append). Resuming would rewrite a finished tape, so the
+    /// session refuses. The catalog and the tape disagree about this volume's
+    /// state, which is a divergence (ADR-0001) — hence quarantine rather than
+    /// a plain abort.
+    AlreadySealed {
+        seal_position: u32,
     },
 }
 
@@ -413,6 +423,47 @@ impl InterruptedSession {
                         found: identity.ok(),
                     },
                 }));
+            }
+        }
+
+        // 2b. Seal-marker absence check. layout-session.md's Resume rule ends
+        // "The absent seal marker confirms the tape is legitimately unsealed
+        // (safe to resume, not an append to a sealed volume)" — so a seal
+        // marker that IS present means this tape is finished and resuming
+        // would append to a sealed volume, which ADR-0003 forbids outright.
+        // This is not hypothetical: `recover_orphaned_sessions` sweeps a
+        // crashed `in_progress` session to `interrupted` (resumable), and a
+        // crash during confirm — i.e. AFTER seal() wrote the marker — lands
+        // exactly here. The File-0 identity check above cannot catch it: the
+        // identity genuinely matches, because it genuinely is the same tape.
+        // Read the last position and refuse if it parses as a seal marker; an
+        // unsealed tape has nothing readable there (past EOD), so a read
+        // failure is the expected, safe case.
+        if let Some(seal_entry) = self
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+        {
+            let seal_pos = seal_entry.position as u32;
+            let mut seal_bytes = Vec::new();
+            if store.read_file(seal_pos, &mut seal_bytes).is_ok() {
+                let text = String::from_utf8_lossy(&seal_bytes);
+                if format::parse_seal_marker(&text).is_ok() {
+                    conn.execute(
+                        "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                        params![self.volume_id],
+                    )?;
+                    mark_writes(conn, &self.write_ids, "aborted")?;
+                    return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
+                        volume_id: self.volume_id,
+                        label: self.built.layout.label.clone(),
+                        reason: QuarantineReason::AlreadySealed {
+                            seal_position: seal_pos,
+                        },
+                    }));
+                }
             }
         }
 
@@ -1084,7 +1135,7 @@ mod tests {
                 "expected Sealed on a happy-path MemStore run, got Quarantined: {:?}",
                 match q.reason {
                     QuarantineReason::ConfirmFailed(e) => format!("{:?}", e.mismatches),
-                    QuarantineReason::IdentityMismatch { .. } => "identity mismatch".to_string(),
+                    other => format!("{other:?}"),
                 }
             ),
         };
@@ -1476,6 +1527,104 @@ mod tests {
     /// critically the session never reaches `run_entries` at all (no risk of
     /// silently overwriting the wrong tape).
     #[test]
+    fn resume_refuses_a_tape_that_already_carries_a_seal_marker() {
+        // layout-session.md's Resume rule: "The absent seal marker confirms
+        // the tape is legitimately unsealed (safe to resume, not an append to
+        // a sealed volume)." A seal marker that IS present means the tape is
+        // finished, and ADR-0003 forbids appending to a sealed volume.
+        //
+        // The live path: seal() writes the marker, confirm crashes, then
+        // recover_orphaned_sessions sweeps the in_progress row to
+        // 'interrupted' (resumable) and resume is handed an already-sealed
+        // tape. The File-0 identity check cannot catch this — the identity
+        // matches, because it genuinely IS the same tape. Only the seal
+        // marker distinguishes "crashed mid-write" from "already finished".
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let label = f.built.layout.label.clone();
+        let uuid = f.built.layout.volume_uuid.clone();
+        let seal_pos = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("layout has a seal marker")
+            .position as u32;
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+
+        // Put a real, parseable seal marker at the tape's seal position — the
+        // state a crash-after-seal leaves behind. Everything up to it is
+        // whatever the interrupted execute wrote (or nothing), which is
+        // exactly what the sweep would hand back.
+        let seal_bytes = layout::generate_seal_marker("SESSTEST", 1, "deadbeef", &[]).into_bytes();
+        let mut padded = seal_bytes;
+        padded.resize(BS as usize, 0);
+        if store.files.len() <= seal_pos as usize {
+            store.files.resize(seal_pos as usize + 1, Vec::new());
+            store.syncs.resize(seal_pos as usize + 1, false);
+        }
+        store.files[seal_pos as usize] = padded;
+
+        // File 0 must carry the CORRECT identity: this is the same tape, so
+        // the identity check legitimately passes. That is the whole point —
+        // only the seal marker can distinguish "crashed mid-write" from
+        // "already finished", and this test would pass vacuously if the
+        // identity check fired instead.
+        let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label: &label,
+            uuid: &uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: seal_pos as i32 + 1,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-22T20:09:00Z",
+        });
+        let mut thunk_padded = thunk.into_bytes();
+        thunk_padded.resize(BS as usize, 0);
+        store.files[0] = thunk_padded;
+
+        let quarantined = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error on a sealed tape")
+        {
+            ResumeOutcome::Quarantined(q) => q,
+            _ => panic!("expected Quarantined — resume must refuse a sealed tape (ADR-0003)"),
+        };
+        match quarantined.reason {
+            QuarantineReason::AlreadySealed { seal_position } => {
+                assert_eq!(seal_position, seal_pos);
+            }
+            other => panic!("expected AlreadySealed, got {other:?}"),
+        }
+
+        let status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "quarantined");
+    }
+
+    #[test]
     fn resume_quarantines_on_id_thunk_identity_mismatch() {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
@@ -1543,7 +1692,7 @@ mod tests {
                 assert_eq!(expected_label, "SESSTEST");
                 assert_eq!(found.unwrap().label, "WRONGVOL");
             }
-            QuarantineReason::ConfirmFailed(_) => panic!("expected IdentityMismatch"),
+            other => panic!("expected IdentityMismatch, got {other:?}"),
         }
 
         let volume_status: String = f
@@ -1628,9 +1777,7 @@ mod tests {
                 );
                 assert_eq!(evidence.mismatches[0].position, slice_position as u32);
             }
-            QuarantineReason::IdentityMismatch { .. } => {
-                panic!("expected ConfirmFailed, got IdentityMismatch")
-            }
+            other => panic!("expected ConfirmFailed, got {other:?}"),
         }
 
         let volume_status: String = f
