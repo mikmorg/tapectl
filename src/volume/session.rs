@@ -45,9 +45,10 @@
 //! *names* match `layout-session.md`'s table exactly; only the Rust-level
 //! packaging is invented here.
 //!
-//! Status: skeleton under TDD (T6). Types and phase signatures below are
-//! real; bodies land behavior-by-behavior in `#[cfg(test)]`-driven commits —
-//! see the module's test section for the four required red-green cycles.
+//! Status: all four T6-required behaviors landed test-first (happy path;
+//! hash-mismatch clean abort; ENOSPC clean abort; SIGINT interrupt +
+//! resume), plus two bonus resume-path tests (restart-from-BOT; the File-0
+//! identity check's quarantine branch) — see the module's test section.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -71,7 +72,6 @@ use super::layout_model::{ContentSource, KeyAvailability, LayoutEntry, LayoutErr
 /// validation predicate. Produced only by [`BuiltLayout::into_validated`];
 /// its only operation is [`Self::plan`].
 pub struct ValidatedLayout {
-    #[allow(dead_code)]
     built: BuiltLayout,
 }
 
@@ -125,17 +125,13 @@ impl BuiltLayout {
 /// `writes` rows 'planned' + `write_positions` 'pending' rows exist; nothing
 /// has touched the store yet. Its only operation is [`Self::execute`].
 pub struct PlannedSession {
-    #[allow(dead_code)]
     built: BuiltLayout,
-    #[allow(dead_code)]
     volume_id: i64,
     /// One (write_id, snapshot_id) pair per `BuildUnit` passed to `plan` —
     /// mirrors `write.rs`'s v1 `write_ids: Vec<(i64, i64)>` shape.
-    #[allow(dead_code)]
     write_ids: Vec<(i64, i64)>,
     /// `stage_slice_id -> write_id`, so `execute` knows which `writes` row's
     /// `write_positions` cursor row to update for each slice entry.
-    #[allow(dead_code)]
     slice_write_id: HashMap<i64, i64>,
 }
 
@@ -225,24 +221,17 @@ impl From<ExecuteOutcome> for ResumeOutcome {
 /// [`Self::seal`] — no code path outside `seal` can ever write a
 /// `SealMarker` entry (sacred invariant 1).
 pub struct ReadyToSeal {
-    #[allow(dead_code)]
     built: BuiltLayout,
-    #[allow(dead_code)]
     volume_id: i64,
-    #[allow(dead_code)]
     write_ids: Vec<(i64, i64)>,
 }
 
 /// SIGINT (or a startup-sweep-detected crash) stopped execution between
 /// entries. Resumable: its only operation is [`Self::resume`].
 pub struct InterruptedSession {
-    #[allow(dead_code)]
     built: BuiltLayout,
-    #[allow(dead_code)]
     volume_id: i64,
-    #[allow(dead_code)]
     write_ids: Vec<(i64, i64)>,
-    #[allow(dead_code)]
     slice_write_id: HashMap<i64, i64>,
 }
 
@@ -380,8 +369,98 @@ impl InterruptedSession {
         store: &mut dyn Store,
         mut is_interrupted: impl FnMut() -> bool,
     ) -> Result<ResumeOutcome> {
-        let _ = (conn, keys, store, &mut is_interrupted);
-        todo!("T6 cycle 4: InterruptedSession::resume_checking")
+        // 1. Revalidate: staged slices unchanged, frozen zones re-hash
+        // byte-identical (re-runs the same tri-layer-L1 + materialized-zone
+        // checks `into_validated` ran originally). Failure here is
+        // unrecoverable — Aborted, not Quarantined (this isn't "wrong tape,"
+        // it's "this tape's own inputs no longer check out").
+        if let Err(errs) = self.built.validate(keys) {
+            mark_writes(conn, &self.write_ids, "aborted")?;
+            return Ok(ResumeOutcome::Aborted(AbortedSession {
+                volume_id: self.volume_id,
+                reason: format!("resume: revalidation failed: {errs:?}"),
+            }));
+        }
+
+        // 2. File-0 identity check. A read failure (nothing recorded at
+        // position 0 at all) means legitimately nothing was written yet —
+        // NOT a mismatch, since a session crashed before File 0 landed is
+        // exactly the "zero slices written" cursor case below, which
+        // restarts from BOT anyway. Only a File 0 that IS readable but
+        // disagrees (or fails to parse — ambiguous, so treated as a
+        // mismatch: never overwrite on ambiguity) is a divergence.
+        let mut id_thunk_bytes = Vec::new();
+        if store.read_file(0, &mut id_thunk_bytes).is_ok() {
+            let text = String::from_utf8_lossy(&id_thunk_bytes);
+            let identity = format::parse_id_thunk_identity(&text);
+            let matches = matches!(
+                &identity,
+                Ok(id) if id.label == self.built.layout.label
+                    && id.uuid == self.built.layout.volume_uuid
+            );
+            if !matches {
+                conn.execute(
+                    "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                    params![self.volume_id],
+                )?;
+                mark_writes(conn, &self.write_ids, "aborted")?;
+                return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
+                    volume_id: self.volume_id,
+                    label: self.built.layout.label.clone(),
+                    reason: QuarantineReason::IdentityMismatch {
+                        expected_label: self.built.layout.label.clone(),
+                        expected_uuid: self.built.layout.volume_uuid.clone(),
+                        found: identity.ok(),
+                    },
+                }));
+            }
+        }
+
+        // 3. Two-case cursor rule (`write_positions.stage_slice_id` is NOT
+        // NULL, so only slice entries ever have a cursor row): zero slices
+        // written => restart from BOT (index 0); >=1 written => reposition
+        // to front_zone_len + written_slices (both terms exact — the first
+        // slice's Layout position, and the DB's own count of 'written' rows).
+        let written_slices = count_written_slices(conn, &self.write_ids)?;
+        let content_entries: Vec<&LayoutEntry> = self
+            .built
+            .layout
+            .entries
+            .iter()
+            .filter(|e| !matches!(e.kind, ZoneKind::SealMarker))
+            .collect();
+        let first_slice_index = content_entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .ok_or_else(|| {
+                TapectlError::Other("resume: layout has no slice entries".to_string())
+            })?;
+        let start_index = if written_slices == 0 {
+            0
+        } else {
+            first_slice_index + written_slices
+        };
+
+        store.reposition_for_resume(start_index as u32)?;
+
+        for (write_id, _) in &self.write_ids {
+            conn.execute(
+                "UPDATE writes SET status = 'in_progress' WHERE id = ?1",
+                params![write_id],
+            )?;
+        }
+
+        let outcome = run_entries(
+            conn,
+            store,
+            self.built,
+            self.volume_id,
+            self.write_ids,
+            self.slice_write_id,
+            start_index,
+            &mut is_interrupted,
+        )?;
+        Ok(outcome.into())
     }
 }
 
@@ -472,11 +551,8 @@ impl ReadyToSeal {
 /// The seal marker is on tape; confirm has not run yet. Its only operation
 /// is [`Self::confirm`].
 pub struct SealedPending {
-    #[allow(dead_code)]
     built: BuiltLayout,
-    #[allow(dead_code)]
     volume_id: i64,
-    #[allow(dead_code)]
     write_ids: Vec<(i64, i64)>,
 }
 
@@ -594,7 +670,7 @@ fn run_entries(
     write_ids: Vec<(i64, i64)>,
     slice_write_id: HashMap<i64, i64>,
     start_index: usize,
-    _is_interrupted: &mut dyn FnMut() -> bool,
+    is_interrupted: &mut dyn FnMut() -> bool,
 ) -> Result<ExecuteOutcome> {
     let content_entries: Vec<&LayoutEntry> = built
         .layout
@@ -604,6 +680,22 @@ fn run_entries(
         .collect();
 
     for entry in &content_entries[start_index..] {
+        // Checked BETWEEN entries only — a mid-file kill is a crash, handled
+        // by the startup sweep (`crate::db::recover_orphaned_sessions`), not
+        // here. Checking before every entry (including the very first of
+        // this call) is still "between entries": on a fresh execute there is
+        // nothing before entry 0 to interrupt; on a resumed call it is
+        // between the previous call's last entry and this one's first.
+        if is_interrupted() {
+            mark_writes(conn, &write_ids, "interrupted")?;
+            return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
+                built,
+                volume_id,
+                write_ids,
+                slice_write_id,
+            }));
+        }
+
         let path = entry_path(entry)?;
         let size = entry.size_bytes.ok_or_else(|| {
             TapectlError::Other(format!(
@@ -720,6 +812,23 @@ fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Res
     Ok(())
 }
 
+/// The two-case cursor rule's slice count: how many `write_positions` rows
+/// across this session's `writes` rows are already `'written'`. Zero means
+/// restart from BOT; any other value feeds `front_zone_len + written_slices`
+/// (`docs/design/layout-session.md`'s Resume rule).
+fn count_written_slices(conn: &Connection, write_ids: &[(i64, i64)]) -> Result<usize> {
+    let mut total: i64 = 0;
+    for (write_id, _) in write_ids {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM write_positions WHERE write_id = ?1 AND status = 'written'",
+            params![write_id],
+            |r| r.get(0),
+        )?;
+        total += n;
+    }
+    Ok(total as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +839,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::Write;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     const BS: u64 = 512 * 1024;
 
@@ -1180,5 +1290,280 @@ mod tests {
             )
             .unwrap();
         assert_ne!(volume_status, "sealed");
+    }
+
+    // --- behavior 4: SIGINT between entries -> Interrupted + resumable ---
+
+    #[test]
+    fn sigint_between_entries_interrupts_and_resume_completes_the_session() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        // The fixture's content entries (seal excluded) are, in order:
+        // id_thunk, guide, restore_sh, front_index, tenant_envelope,
+        // operator_envelope, operator_envelope_backup, slice_1, slice_2 —
+        // 9 entries, slice_1 at index 7. Fire "interrupted" starting on the
+        // 9th check (0-indexed call count >= 8), i.e. AFTER slice_1 (index 7)
+        // has been fully processed but BEFORE slice_2 (index 8) is even
+        // opened — exercising the two-case cursor rule's more interesting
+        // branch (>=1 slice written) rather than the zero-slices/BOT case.
+        let calls = AtomicU32::new(0);
+        let is_interrupted = move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            n >= 8
+        };
+
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, is_interrupted)
+            .expect("execute_checking should not error on a clean interruption")
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            ExecuteOutcome::Ready(_) => panic!("expected Interrupted, got Ready"),
+            ExecuteOutcome::Aborted(a) => panic!("expected Interrupted, got Aborted: {}", a.reason),
+        };
+
+        // DB state right after interruption: writes 'interrupted', slice_1
+        // recorded 'written', slice_2 still 'pending' (never touched).
+        let write_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_status, "interrupted");
+
+        let slice_1_id = f.units[0].slices[0].slice_id;
+        let slice_2_id = f.units[0].slices[1].slice_id;
+        let slice_1_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM write_positions WHERE stage_slice_id = ?1",
+                params![slice_1_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(slice_1_status, "written");
+        let slice_2_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM write_positions WHERE stage_slice_id = ?1",
+                params![slice_2_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(slice_2_status, "pending");
+
+        // The store itself only has the 8 entries written before the
+        // interruption fired (id_thunk..slice_1), definitely no seal marker.
+        assert_eq!(store.files.len(), 8);
+
+        // --- Resume, with a predicate that never interrupts ---
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume_checking should not error")
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => {
+                panic!("expected Ready after a clean resume to completion, got a different outcome")
+            }
+        };
+        let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+        let outcome = sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not error");
+        match outcome {
+            ConfirmOutcome::Sealed(_) => {}
+            ConfirmOutcome::Quarantined(_) => panic!("expected Sealed after a completed resume"),
+        }
+
+        // Final DB state matches the ordinary happy path exactly.
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "sealed");
+        let write_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_status, "completed");
+        let written_positions: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions WHERE status = 'written'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(written_positions, 2, "both slices written after resume");
+    }
+
+    /// Bonus coverage beyond the four required TDD behaviors: the two-case
+    /// cursor rule's OTHER branch. The SIGINT test above exercises ">=1
+    /// slice written -> reposition"; this exercises "zero slices written ->
+    /// restart from BOT" by interrupting before even the first entry lands.
+    /// Not written test-first (the same `resume_checking` implementation
+    /// cycle 4 built already covers this branch), but still a real
+    /// assertion of `docs/design/layout-session.md`'s cursor rule, not a
+    /// change to it.
+    #[test]
+    fn resume_after_interrupt_before_any_entry_restarts_from_bot() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        // Interrupt on the very first check, before entry 0 (id_thunk) is
+        // even opened.
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+        assert_eq!(store.files.len(), 0, "nothing written before interruption");
+
+        let written_slices = count_written_slices(&f.conn, &interrupted.write_ids).unwrap();
+        assert_eq!(written_slices, 0);
+
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected Ready after resuming from BOT"),
+        };
+        let sealed_pending = ready.seal(&mut store).unwrap();
+        match sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            ConfirmOutcome::Quarantined(_) => panic!("expected Sealed"),
+        }
+
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "sealed");
+    }
+
+    /// Bonus coverage: the File-0 identity check's divergence path. Simulates
+    /// "wrong cartridge in the drive" — after an interruption, File 0 on the
+    /// (mock) tape disagrees with the Layout being resumed — and asserts
+    /// `docs/design/layout-session.md`'s "mismatch = divergence = quarantine,
+    /// not overwrite": the volume is quarantined, the session is aborted, and
+    /// critically the session never reaches `run_entries` at all (no risk of
+    /// silently overwriting the wrong tape).
+    #[test]
+    fn resume_quarantines_on_id_thunk_identity_mismatch() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+
+        // Overwrite whatever landed at position 0 with a DIFFERENT volume's
+        // id thunk — as if this tape actually belongs to a different,
+        // unrelated session (e.g. the wrong cartridge got loaded).
+        let wrong_params = layout::IdThunkV2Params {
+            label: "WRONGVOL",
+            uuid: "00000000-0000-0000-0000-000000000000",
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: 1,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-22T20:09:00Z",
+        };
+        let wrong_bytes = layout::generate_id_thunk_v2(&wrong_params).into_bytes();
+        let mut padded = wrong_bytes;
+        padded.resize(BS as usize, 0);
+        if store.files.is_empty() {
+            store.files.push(padded);
+            store.syncs.push(false);
+        } else {
+            store.files[0] = padded;
+        }
+
+        let quarantined = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume_checking should not hard-error on a divergent tape")
+        {
+            ResumeOutcome::Quarantined(q) => q,
+            other => panic!(
+                "expected Quarantined on an id-thunk identity mismatch, got a different outcome \
+                 ({} entries recorded)",
+                match other {
+                    ResumeOutcome::Ready(_) => "Ready",
+                    ResumeOutcome::Interrupted(_) => "Interrupted",
+                    ResumeOutcome::Aborted(_) => "Aborted",
+                    ResumeOutcome::Quarantined(_) => unreachable!(),
+                }
+            ),
+        };
+        assert_eq!(quarantined.volume_id, f.volume_id);
+        match quarantined.reason {
+            QuarantineReason::IdentityMismatch {
+                expected_label,
+                found,
+                ..
+            } => {
+                assert_eq!(expected_label, "SESSTEST");
+                assert_eq!(found.unwrap().label, "WRONGVOL");
+            }
+            QuarantineReason::ConfirmFailed(_) => panic!("expected IdentityMismatch"),
+        }
+
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "quarantined");
+
+        let write_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_status, "aborted");
     }
 }
