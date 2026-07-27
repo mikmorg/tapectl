@@ -261,7 +261,9 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         let recovery =
             layout::generate_recovery_md(&inputs.label, &tenant.tenant_name, &manifest_units);
         let catalogs = catalogs_for_tenant(inputs, tenant_id);
-        let tar = build_envelope_tar(&manifest, &recovery, &catalogs)?;
+        // PLAN.toml is operator-only (`volume-format-v2.md` §1's middle-zone
+        // table: "PLAN.toml (op only)") — tenant envelopes never carry it.
+        let tar = build_envelope_tar(&manifest, &recovery, &catalogs, None)?;
 
         let mut recipients: Vec<String> = tenant.public_keys.clone();
         recipients.extend(inputs.operator_public_keys.iter().cloned());
@@ -298,7 +300,13 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         layout::generate_manifest_toml(&inputs.label, "operator", &all_manifest_units);
     let op_recovery = layout::generate_recovery_md(&inputs.label, "operator", &all_manifest_units);
     let all_catalogs = catalogs_for_all(inputs);
-    let op_tar = build_envelope_tar(&op_manifest, &op_recovery, &all_catalogs)?;
+    // PLAN.toml survives the standalone v1 planning-header zone as an
+    // operator-envelope tar member (`volume-format-v2.md` §8's "What v2
+    // removes": "the standalone zone... [is] removed at the write flip"; the
+    // generator itself, `generate_planning_header`, is unchanged — only its
+    // caller and packaging change here).
+    let plan_toml = layout::generate_planning_header(&inputs.label, &plan_units_all(inputs));
+    let op_tar = build_envelope_tar(&op_manifest, &op_recovery, &all_catalogs, Some(&plan_toml))?;
 
     let op_recipients = with_escrow(
         inputs.operator_public_keys.clone(),
@@ -726,6 +734,25 @@ fn catalogs_for_all(inputs: &BuildInputs) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+/// `(unit_name, uuid, num_slices, total_bytes)` for every unit in this batch —
+/// `generate_planning_header`'s input shape, mirroring v1's `write.rs`
+/// `plan_units` construction. Operator-only (the whole-batch view), never
+/// per-tenant.
+fn plan_units_all(inputs: &BuildInputs) -> Vec<(String, String, i64, i64)> {
+    inputs
+        .units
+        .iter()
+        .map(|u| {
+            (
+                u.unit_name.clone(),
+                u.unit_uuid.clone(),
+                u.slices.len() as i64,
+                u.slices.iter().map(|sl| sl.encrypted_bytes).sum(),
+            )
+        })
+        .collect()
+}
+
 /// Read a unit's isolated dar catalogue slice files (`catalog_base.N.dar`)
 /// for inclusion in an envelope tar. Mirrors `write.rs::read_catalog_files`
 /// (private there — replicated here per the T5b scope fence rather than
@@ -751,22 +778,25 @@ fn read_catalog_files(catalog_path: &str) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Minimal envelope tar builder: MANIFEST.toml + RECOVERY.md + `catalogs/*`.
-/// Mirrors `write.rs::build_envelope_tar` (private there — replicated here
-/// per the T5b scope fence). Deliberately omits PLAN.toml (the planning
-/// header surviving as an operator-envelope tar member,
-/// `volume-format-v2.md` §8) — see the T5b report for why, and what it means
-/// for whoever wires PLAN.toml in next.
+/// Envelope tar builder: MANIFEST.toml + RECOVERY.md + `catalogs/*`, plus
+/// PLAN.toml when `plan_toml` is `Some` (T8: the operator envelope only,
+/// `volume-format-v2.md` §1/§8 — tenant envelope call sites pass `None`).
+/// Mirrors `write.rs::build_envelope_tar` (private there, and now deleted —
+/// the v1 write pipeline this replicated is gone per the T8 flip).
 fn build_envelope_tar(
     manifest: &str,
     recovery: &str,
     catalogs: &[(String, Vec<u8>)],
+    plan_toml: Option<&str>,
 ) -> Result<Vec<u8>> {
     let mut tar_buf = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_buf);
         append_tar_member(&mut builder, "MANIFEST.toml", manifest.as_bytes())?;
         append_tar_member(&mut builder, "RECOVERY.md", recovery.as_bytes())?;
+        if let Some(plan) = plan_toml {
+            append_tar_member(&mut builder, "PLAN.toml", plan.as_bytes())?;
+        }
         for (name, bytes) in catalogs {
             append_tar_member(&mut builder, &format!("catalogs/{name}"), bytes)?;
         }
@@ -1357,6 +1387,119 @@ mod tests {
                 .any(|e| matches!(e, LayoutError::GeneratedZoneInconsistent { .. })),
             "expected the hollow data_slice entry (missing size/hash) to trip \
              format::validate_consistency; got {errs:?}"
+        );
+    }
+
+    // ── PLAN.toml wiring (T8, format §8) ──
+
+    /// Decrypt the (single) materialized envelope entry matching `kind_matches`
+    /// with `secret_key`, returning the decrypted tar bytes.
+    fn decrypt_envelope_tar(
+        built: &BuiltLayout,
+        kind_matches: impl Fn(&ZoneKind) -> bool,
+        secret_key: &str,
+    ) -> Vec<u8> {
+        let entry = built
+            .layout
+            .entries
+            .iter()
+            .find(|e| kind_matches(&e.kind))
+            .expect("no matching envelope entry");
+        let ContentSource::Materialized(path) = &entry.source else {
+            panic!("expected Materialized");
+        };
+        let ciphertext = std::fs::read(path).unwrap();
+        let identity: age::x25519::Identity = secret_key.parse().expect("valid age identity");
+        let decryptor = age::Decryptor::new(ciphertext.as_slice()).expect("valid age ciphertext");
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .expect("this identity decrypts the envelope");
+        let mut tar_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut tar_bytes).unwrap();
+        tar_bytes
+    }
+
+    fn tar_member_names(tar_bytes: Vec<u8>) -> Vec<String> {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn operator_envelope_contains_plan_toml_but_tenant_envelope_does_not() {
+        // volume-format-v2.md §1/§8: PLAN.toml is an operator-only tar
+        // member (the planning header folded in, not a standalone tape
+        // file) — tenant envelopes must never carry it. This needs a
+        // self-contained fixture (both key halves retained) rather than
+        // `two_tenant_inputs`/`fake_tenant_and_unit` above, which only keep
+        // the public half on `TenantInfo` — decryption needs the secret.
+        let src = tempfile::tempdir().unwrap();
+        let tenant_kp = crate::crypto::keys::generate_keypair();
+        let op_kp = crate::crypto::keys::generate_keypair();
+        let slice = fake_slice(src.path(), 1, 1, b"slice bytes for the plan.toml test");
+        let unit = BuildUnit {
+            stage_set_id: 1,
+            snapshot_id: 1,
+            unit_name: "unit-alpha".to_string(),
+            unit_uuid: Uuid::new_v4().to_string(),
+            tenant_id: 1,
+            dar_version: Some("2.7.20".to_string()),
+            dar_command: Some("dar -c base -R /src".to_string()),
+            catalog_path: None,
+            snapshot_version: 1,
+            slices: vec![slice],
+        };
+        let inputs = BuildInputs {
+            label: "PLANTEST".to_string(),
+            volume_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            media_type: "LTO-6".to_string(),
+            tapectl_version: "0.1.0-test".to_string(),
+            created_at: "2026-07-22T20:09:00Z".to_string(),
+            block_size: BS,
+            usable_bytes: 100 * BS,
+            enospc_buffer: BS,
+            nominal_capacity: 2_400_000_000_000,
+            mam_capacity: 0,
+            mam_manufacturer: String::new(),
+            mam_serial: String::new(),
+            mam_length: 0,
+            mam_loads: 0,
+            units: vec![unit],
+            tenants: vec![TenantInfo {
+                tenant_id: 1,
+                tenant_name: "alpha".to_string(),
+                public_keys: vec![tenant_kp.public_key.clone()],
+            }],
+            operator_public_keys: vec![op_kp.public_key.clone()],
+            escrow_public_key: None,
+        };
+        let session = tempfile::tempdir().unwrap();
+        let built = build(&inputs, session.path()).unwrap();
+
+        let tenant_tar = decrypt_envelope_tar(
+            &built,
+            |k| matches!(k, ZoneKind::TenantEnvelope { .. }),
+            &tenant_kp.secret_key,
+        );
+        let tenant_members = tar_member_names(tenant_tar);
+        assert!(tenant_members.contains(&"MANIFEST.toml".to_string()));
+        assert!(
+            !tenant_members.contains(&"PLAN.toml".to_string()),
+            "tenant envelope must not carry PLAN.toml: {tenant_members:?}"
+        );
+
+        let op_tar = decrypt_envelope_tar(
+            &built,
+            |k| matches!(k, ZoneKind::OperatorEnvelope),
+            &op_kp.secret_key,
+        );
+        let op_members = tar_member_names(op_tar);
+        assert!(
+            op_members.contains(&"PLAN.toml".to_string()),
+            "operator envelope must carry PLAN.toml: {op_members:?}"
         );
     }
 }
