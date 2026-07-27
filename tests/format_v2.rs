@@ -30,7 +30,7 @@ use tapectl::crypto::keys::generate_keypair;
 use tapectl::db;
 use tapectl::staging;
 use tapectl::store::{MemStore, Tier};
-use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
+use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, BuiltLayout, TenantInfo};
 use tapectl::volume::format;
 use tapectl::volume::layout_model::{KeyAvailability, Layout, ZoneKind};
 use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
@@ -359,6 +359,103 @@ fn shared_harness() -> &'static Harness {
     HARNESS.get_or_init(|| build_sealed_harness(SEED_MAIN, N_UNITS_MAIN, VOLUME_UUID_MAIN))
 }
 
+// ── build()-only helper for content-independent properties (assertions 4-5) ──
+
+/// Build a tiny 2-tenant, 2-unit `BuiltLayout` with NO session run — for
+/// properties that live entirely in `build()`: envelope permutation order
+/// (§2.1) and frozen-zone byte-identity (§2.2). Deliberately uses tiny
+/// literal slice content rather than the MB-scale T3 fixture generator:
+/// neither property depends on slice content or size at all (permutation is
+/// a function of `volume_uuid`/`tenant_id`; the frozen zones checked are
+/// id_thunk/system_guide/restore_sh, none of which touch slice bytes), and
+/// real age-encrypting fixture-scale content here would pay the same
+/// debug-mode crypto cost as the main harness for zero additional coverage —
+/// mirrors `build.rs`'s own `two_tenant_inputs` test fixture for the same
+/// reason.
+///
+/// Tenant ids are hardcoded 1 and 2 (not DB-assigned — this helper touches no
+/// DB) because the probe `volume_uuid`s the permutation test uses are
+/// precomputed against exactly this pair, matching build.rs's own
+/// `tenant_envelope_permutation_is_deterministic_and_uuid_sensitive` test.
+fn build_layout_only(volume_uuid: &str, created_at: &str) -> BuiltLayout {
+    let tenant_a_key = generate_keypair();
+    let tenant_b_key = generate_keypair();
+    let op_key = generate_keypair();
+
+    let slices_dir = tempfile::tempdir().unwrap();
+    let mut units = Vec::new();
+    for (i, (tenant_id, pubkey, content)) in [
+        (1i64, &tenant_a_key.public_key, &b"alpha unit content"[..]),
+        (
+            2i64,
+            &tenant_b_key.public_key,
+            &b"bravo unit content, a bit longer"[..],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let encrypted = staging::encrypt_data(content, std::slice::from_ref(pubkey)).unwrap();
+        let path = slices_dir.path().join(format!("slice_{i}.age"));
+        std::fs::write(&path, &encrypted).unwrap();
+        units.push(BuildUnit {
+            stage_set_id: i as i64 + 1,
+            snapshot_id: i as i64 + 1,
+            unit_name: format!("unit-{i}"),
+            unit_uuid: format!("perm-unit-uuid-{i}"),
+            tenant_id,
+            dar_version: None,
+            dar_command: None,
+            catalog_path: None,
+            snapshot_version: 1,
+            slices: vec![BuildSlice {
+                slice_id: i as i64 + 1,
+                slice_number: 1,
+                size_bytes: content.len() as i64,
+                encrypted_bytes: encrypted.len() as i64,
+                sha256_plain: sha256_hex(content),
+                sha256_encrypted: sha256_hex(&encrypted),
+                staging_path: path,
+            }],
+        });
+    }
+
+    let inputs = BuildInputs {
+        label: "PERMTEST".to_string(),
+        volume_uuid: volume_uuid.to_string(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: "0.1.0-test".to_string(),
+        created_at: created_at.to_string(),
+        block_size: BS,
+        usable_bytes: 100 * BS,
+        enospc_buffer: BS,
+        nominal_capacity: 2_400_000_000,
+        mam_capacity: 0,
+        mam_manufacturer: String::new(),
+        mam_serial: String::new(),
+        mam_length: 0,
+        mam_loads: 0,
+        units,
+        tenants: vec![
+            TenantInfo {
+                tenant_id: 1,
+                tenant_name: "alpha".to_string(),
+                public_keys: vec![tenant_a_key.public_key],
+            },
+            TenantInfo {
+                tenant_id: 2,
+                tenant_name: "bravo".to_string(),
+                public_keys: vec![tenant_b_key.public_key],
+            },
+        ],
+        operator_public_keys: vec![op_key.public_key],
+        escrow_public_key: None,
+    };
+
+    let session_dir = tempfile::tempdir().unwrap();
+    build::build(&inputs, session_dir.path()).expect("build succeeds")
+}
+
 // ── the keyless reader (assertions 1 and 6) ──
 
 /// The ONE fact this suite is allowed to take from the in-memory `Layout`
@@ -659,4 +756,101 @@ fn v2_zone_order_envelopes_precede_slices_no_planning_header() {
         tenant_envelope_count, 2,
         "harness must use exactly 2 tenants"
     );
+}
+
+/// Assertion 4 (§2.1): the envelope permutation is a deterministic function
+/// of `volume_uuid` (same uuid => same order every build) that is NOT the
+/// raw `tenant_id` sequence (a different uuid changes the order) — proving
+/// permutation actually happened rather than the test passing vacuously.
+/// uuids and the expected orders are precomputed against the §2.1 algorithm
+/// (sha256(volume_uuid_bytes || 0x00 || le64(tenant_id)), hex-sorted) for
+/// tenant_ids [1, 2] — the same values `build.rs`'s own equivalent test
+/// cross-checked via Python hashlib.
+#[test]
+fn tenant_envelope_permutation_is_deterministic_and_uuid_sensitive() {
+    let uuid_a = "11111111-1111-1111-1111-111111111111"; // -> [2, 1]
+    let uuid_b = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"; // -> [1, 2]
+    let created_at = "2026-07-22T20:09:00Z";
+
+    let envelope_order = |built: &BuiltLayout| -> Vec<i64> {
+        built
+            .layout
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                ZoneKind::TenantEnvelope { tenant_id } => Some(tenant_id),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let order_a1 = envelope_order(&build_layout_only(uuid_a, created_at));
+    let order_a2 = envelope_order(&build_layout_only(uuid_a, created_at));
+    let order_b = envelope_order(&build_layout_only(uuid_b, created_at));
+
+    assert_eq!(
+        order_a1,
+        vec![2, 1],
+        "permutation must match the §2.1 hex-sort algorithm"
+    );
+    assert_ne!(
+        order_a1,
+        vec![1, 2],
+        "must not be a no-op identity permutation for this fixture (proves \
+         permutation actually happened, not just tenant_id order by coincidence)"
+    );
+    assert_eq!(
+        order_a1, order_a2,
+        "same volume_uuid must give the same order every build"
+    );
+    assert_eq!(order_b, vec![1, 2]);
+    assert_ne!(
+        order_a1, order_b,
+        "a different volume_uuid must change the order"
+    );
+}
+
+/// Assertion 5 (§2.2 "materialize-to-staging"): building twice from
+/// identical inputs (including the injected `created_at`) yields
+/// byte-identical frozen zones for id_thunk/system_guide/restore_sh — this
+/// is what makes resume safe (frozen zones are re-read, never regenerated).
+/// Checked via `(size_bytes, sha256)` equality rather than re-reading bytes
+/// from disk: sha256 equality IS the byte-identity proof (the same
+/// reasoning the whole keyless chain relies on). Envelopes are age-encrypted
+/// (`age::Encryptor` is randomized per call — a fresh ephemeral key exchange
+/// each time) and therefore NOT deterministic; excluded here, as build.rs's
+/// own equivalent test also documents empirically.
+#[test]
+fn frozen_deterministic_zones_are_byte_identical_across_two_builds() {
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let created_at = "2026-07-22T20:09:00Z";
+    let built1 = build_layout_only(uuid, created_at);
+    let built2 = build_layout_only(uuid, created_at);
+
+    for kind in [
+        ZoneKind::IdThunk,
+        ZoneKind::SystemGuide,
+        ZoneKind::RestoreSh,
+    ] {
+        let e1 = built1
+            .layout
+            .entries
+            .iter()
+            .find(|e| e.kind == kind)
+            .unwrap();
+        let e2 = built2
+            .layout
+            .entries
+            .iter()
+            .find(|e| e.kind == kind)
+            .unwrap();
+        assert_eq!(
+            e1.size_bytes, e2.size_bytes,
+            "{kind:?} size differs across builds"
+        );
+        assert_eq!(
+            e1.sha256, e2.sha256,
+            "{kind:?} hash differs across builds -- byte-identity proof"
+        );
+    }
 }
