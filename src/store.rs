@@ -34,6 +34,18 @@ pub enum Tier {
     Integrity,
 }
 
+impl Default for Tier {
+    /// Integrity is the ratified seal-time default (`--quick` opts down to
+    /// Navigable) — `docs/design/v2-open-questions.md` §1.2: at seal time
+    /// the staged slices still exist on disk, so a failed confirm costs a
+    /// fresh cartridge and hours, not an unrecoverable loss; skipping the
+    /// full readback would mean no end-to-end host-to-medium check ever ran
+    /// on the sealed artifact.
+    fn default() -> Self {
+        Tier::Integrity
+    }
+}
+
 /// What kind of disagreement a [`Mismatch`] reports. Each variant maps to a
 /// distinct step of the `volume-format-v2.md` §5 chain walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,13 +131,57 @@ pub trait Store {
     /// §2.5). An `Err` here means `layout` itself is malformed (no
     /// front-index or seal-marker entry) — a caller bug, not a tape
     /// condition.
-    fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence>;
+    ///
+    /// Provided by [`chain_walk`] via [`Self::read_file`] — the algorithm is
+    /// medium-agnostic (the walk only needs to read a file at a position),
+    /// so every impl gets the identical, real chain-walk code for free
+    /// (T6 review finding #1: `TapeStore` and `MemStore` previously
+    /// duplicated this exact body). Override only if a medium needs a
+    /// genuinely different confirm strategy (e.g. a future `WarehouseStore`'s
+    /// deposit receipt, `layout-session.md`'s Store seam) — TapeStore and
+    /// MemStore both take the default.
+    fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence> {
+        chain_walk(layout, tier, |position| {
+            let mut buf = Vec::new();
+            self.read_file(position, &mut buf)?;
+            Ok(buf)
+        })
+    }
 
     /// Read the tape file at `position` (0-indexed), streaming its bytes
     /// into `sink` as they are read rather than buffering the whole file.
     /// Returns the total bytes read (the on-tape length, padding included —
     /// trimming to the true size is the caller's job).
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64>;
+
+    /// Position the store for a resumed write session immediately before
+    /// tape file `file_index` (0-indexed): the next `execute()` call becomes
+    /// that file. Anything previously recorded at or after `file_index` is
+    /// discarded — a resumed session repositions only to what its own DB
+    /// cursor already confirms is durably written
+    /// (`docs/design/layout-session.md`'s two-case cursor rule: BOT if zero
+    /// slices were written, else `front_zone_len + written_slices`), never
+    /// forward past it. A fresh (non-resumed) session never calls this — it
+    /// starts writing from position 0 implicitly, by virtue of never having
+    /// written anything yet.
+    ///
+    /// No pre-T6 caller needed this (nothing could resume a session before
+    /// now), so this is an additive method on an existing trait, not a
+    /// behavior change to `execute`/`confirm`/`read_file`/`capacity`.
+    ///
+    /// For `TapeStore`: rewind + forward-space `file_index` filemarks. On
+    /// real tape, writing after forward-spacing to a filemark boundary
+    /// begins a new recording there; the exact hardware behavior (does a
+    /// fresh EOD orphan what was physically beyond the old one, per
+    /// `v2-open-questions.md` §3.2's "stale-tail unreachability"?) is
+    /// deferred to the LTO-6 validation session
+    /// (`docs/lto6-validation-checklist.md`) like the rest of real
+    /// EOT/EOD behavior — mhvtl cannot exercise this either. For `MemStore`:
+    /// truncates `files`/`syncs` to `file_index` entries, which is exactly
+    /// "discard anything at or after this position" for an in-memory
+    /// recording, and is what makes the resume cursor rule unit-testable
+    /// with no tape anywhere.
+    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()>;
 }
 
 /// The §5 chain walk, shared by every `Store` impl's `confirm` so the exact
@@ -421,13 +477,8 @@ impl Store for TapeStore {
         self.dev.write_stream(src, len, sync)
     }
 
-    fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence> {
-        chain_walk(layout, tier, |position| {
-            let mut buf = Vec::new();
-            self.read_file(position, &mut buf)?;
-            Ok(buf)
-        })
-    }
+    // confirm: default trait method (T6 finding #1) — identical to what this
+    // impl used to define directly.
 
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
         self.dev.rewind()?;
@@ -435,6 +486,14 @@ impl Store for TapeStore {
             self.dev.forward_space_file(position as i32)?;
         }
         self.dev.read_file_streaming(sink)
+    }
+
+    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+        self.dev.rewind()?;
+        if file_index > 0 {
+            self.dev.forward_space_file(file_index as i32)?;
+        }
+        Ok(())
     }
 }
 
@@ -451,6 +510,10 @@ pub struct MemStore {
     pub syncs: Vec<bool>,
     block_size: usize,
     usable_bytes: u64,
+    /// If set, `execute()` fails with a simulated ENOSPC once the
+    /// cumulative padded bytes already recorded plus this call's would
+    /// exceed the budget. See [`Self::with_enospc_after`].
+    enospc_after_bytes: Option<u64>,
 }
 
 impl MemStore {
@@ -463,12 +526,30 @@ impl MemStore {
             syncs: Vec::new(),
             block_size,
             usable_bytes: u64::MAX,
+            enospc_after_bytes: None,
         }
     }
 
     /// Override the capacity `capacity()` reports.
     pub fn with_usable_bytes(mut self, usable_bytes: u64) -> Self {
         self.usable_bytes = usable_bytes;
+        self
+    }
+
+    /// Simulate a medium that runs out of space after `budget` cumulative
+    /// padded bytes have been written: the next `execute()` call whose
+    /// write would cross that budget fails with a simulated ENOSPC instead
+    /// of succeeding, mirroring a real full medium
+    /// (`docs/design/layout-session.md`: "on write ENOSPC, stop, leave the
+    /// tape unsealed, mark the session aborted"). Without this, `execute()`
+    /// can only fail via a genuinely truncated source — this is what makes
+    /// the session's ENOSPC clean-abort path unit-testable with no tape
+    /// hardware (T6 behavior 3). Distinct from [`Self::with_usable_bytes`]:
+    /// that changes what `capacity()` *reports* (the pre-flight validate-time
+    /// oracle); this changes what `execute()` *does* mid-write (the rare-miss
+    /// backstop past that pre-flight gate, ADR-0007).
+    pub fn with_enospc_after(mut self, budget: u64) -> Self {
+        self.enospc_after_bytes = Some(budget);
         self
     }
 }
@@ -481,6 +562,16 @@ impl Store for MemStore {
     }
 
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        let padded_len = pad_to_blocks(len, self.block_size as u64);
+        if let Some(budget) = self.enospc_after_bytes {
+            let already_written: u64 = self.files.iter().map(|f| f.len() as u64).sum();
+            if already_written + padded_len > budget {
+                return Err(TapectlError::Other(format!(
+                    "MemStore: simulated ENOSPC — writing {padded_len} more bytes would exceed \
+                     the {budget}-byte budget ({already_written} already recorded)"
+                )));
+            }
+        }
         let mut buf = Vec::with_capacity(len as usize);
         src.take(len)
             .read_to_end(&mut buf)
@@ -491,20 +582,14 @@ impl Store for MemStore {
                 buf.len()
             )));
         }
-        let padded_len = pad_to_blocks(len, self.block_size as u64);
         buf.resize(padded_len as usize, 0);
         self.files.push(buf);
         self.syncs.push(sync);
         Ok(padded_len)
     }
 
-    fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence> {
-        chain_walk(layout, tier, |position| {
-            let mut buf = Vec::new();
-            self.read_file(position, &mut buf)?;
-            Ok(buf)
-        })
-    }
+    // confirm: default trait method (T6 finding #1) — identical to what this
+    // impl used to define directly.
 
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
         let bytes = self.files.get(position as usize).ok_or_else(|| {
@@ -513,6 +598,12 @@ impl Store for MemStore {
         sink.write_all(bytes)
             .map_err(|e| TapectlError::Other(format!("sink write: {e}")))?;
         Ok(bytes.len() as u64)
+    }
+
+    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+        self.files.truncate(file_index as usize);
+        self.syncs.truncate(file_index as usize);
+        Ok(())
     }
 }
 
@@ -588,6 +679,79 @@ mod tests {
         assert_eq!(n, 4096);
         assert_eq!(sink.len(), 4096);
         assert_eq!(&sink[..5], b"hello");
+    }
+
+    // --- reposition_for_resume (T6) -------------------------------------
+
+    #[test]
+    fn reposition_for_resume_truncates_files_and_syncs_to_the_given_index() {
+        let mut store = MemStore::new(4096);
+        for b in [b'a', b'b', b'c', b'd'] {
+            store.execute(&mut Cursor::new(vec![b]), 1, false).unwrap();
+        }
+        assert_eq!(store.files.len(), 4);
+
+        store.reposition_for_resume(2).unwrap();
+        assert_eq!(store.files.len(), 2, "files at/after index 2 discarded");
+        assert_eq!(store.syncs.len(), 2, "syncs at/after index 2 discarded");
+        assert_eq!(store.files[0][0], b'a');
+        assert_eq!(store.files[1][0], b'b');
+
+        // Writing after reposition continues from that index — the next
+        // execute() becomes the new "file 2", exactly like a fresh session
+        // starting there.
+        store
+            .execute(&mut Cursor::new(vec![b'X']), 1, false)
+            .unwrap();
+        assert_eq!(store.files.len(), 3);
+        assert_eq!(store.files[2][0], b'X');
+    }
+
+    #[test]
+    fn reposition_for_resume_to_zero_discards_everything_restart_from_bot() {
+        // The "zero slices written" cursor-rule case: restart from BOT means
+        // discarding anything the crashed attempt had written, even front-zone
+        // metadata that happened to land before the crash.
+        let mut store = MemStore::new(4096);
+        store
+            .execute(&mut Cursor::new(vec![1u8]), 1, false)
+            .unwrap();
+        store
+            .execute(&mut Cursor::new(vec![2u8]), 1, false)
+            .unwrap();
+        store.reposition_for_resume(0).unwrap();
+        assert!(store.files.is_empty());
+        assert!(store.syncs.is_empty());
+    }
+
+    // --- ENOSPC injection (T6 behavior 3 support) ------------------------
+
+    #[test]
+    fn with_enospc_after_lets_writes_succeed_under_budget() {
+        let mut store = MemStore::new(4096).with_enospc_after(4096 * 3);
+        for _ in 0..3 {
+            assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn with_enospc_after_fails_the_write_that_would_cross_the_budget() {
+        let mut store = MemStore::new(4096).with_enospc_after(4096 * 2);
+        // Each 1-byte write pads to a full 4096-byte block, so the third
+        // call would push cumulative bytes to 3*4096 > the 2*4096 budget.
+        assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
+        assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
+        let err = store.execute(&mut Cursor::new(vec![1u8]), 1, false);
+        assert!(err.is_err(), "third write must simulate ENOSPC");
+        // The failed call must not have recorded a partial/corrupt entry.
+        assert_eq!(store.files.len(), 2);
+    }
+
+    // --- Tier::default (T6) ----------------------------------------------
+
+    #[test]
+    fn tier_defaults_to_integrity() {
+        assert_eq!(Tier::default(), Tier::Integrity);
     }
 
     // --- confirm / chain_walk, via MemStore -----------------------------
