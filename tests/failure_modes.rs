@@ -139,7 +139,18 @@ fn db_crash_recovery_sweeps_orphaned_rows() {
     let _ = fs::remove_file(db_path.with_extension("db-wal"));
     let _ = fs::remove_file(db_path.with_extension("db-shm"));
 
-    // Second open: the recovery sweep should promote orphan rows.
+    // Second open: the recovery sweep should promote orphan rows. A
+    // crash-orphaned write goes to 'interrupted', not 'aborted' —
+    // docs/design/layout-session.md's state table: "startup sweep found
+    // orphaned in_progress (crash). Resumable while the Layout revalidates."
+    // A crash is not proof of data loss; 'aborted' is reserved for an
+    // explicit operator abandonment, an unrecoverable resume-revalidation
+    // failure, or a real EOT (all decided in session.rs, never by this
+    // sweep). stage_sets orphaned mid-`stage_create` are a separate,
+    // non-overlapping pipeline phase and still fail outright: a stage_set
+    // only reaches 'staged' (and so becomes eligible for a write session) once
+    // stage_create finishes, so this sweep's two halves never compete over
+    // the same row.
     let conn = db::open(&db_path).unwrap();
     let write_status: String = conn
         .query_row("SELECT status FROM writes", [], |r| r.get(0))
@@ -147,6 +158,6 @@ fn db_crash_recovery_sweeps_orphaned_rows() {
     let stage_status: String = conn
         .query_row("SELECT status FROM stage_sets", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(write_status, "aborted");
+    assert_eq!(write_status, "interrupted");
     assert_eq!(stage_status, "failed");
 }

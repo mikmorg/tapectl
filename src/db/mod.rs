@@ -76,17 +76,33 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     result
 }
 
-/// On startup: detect orphaned in_progress/interrupted sessions and mark aborted.
+/// On startup: detect write sessions orphaned by a crash and mark them
+/// resumable, per `docs/design/layout-session.md`'s state table: "Interrupted
+/// | SIGINT (clean mark) **or** startup sweep found orphaned `in_progress`
+/// (crash). Resumable while the Layout revalidates." A crash is not data
+/// loss — the tape may still be fully resumable per the two-case cursor rule
+/// (`session::InterruptedSession::resume`) — so this sweep targets
+/// `interrupted`, never `aborted` (CONTEXT.md: "Interruption is a Layout
+/// transition, not an accident"). `Aborted` is reserved for an explicit
+/// operator abandonment, an unrecoverable resume-revalidation failure, or a
+/// real EOT — all decided later, inside `session.rs`, never here.
+///
+/// Only `in_progress` rows are matched (not also `interrupted`, as a
+/// pre-T6 version of this sweep did): a row already `interrupted` — from a
+/// clean SIGINT mark or a previous run of this same sweep — needs no further
+/// action, and re-matching it on every `db::open()` would log a spurious
+/// "recovered N sessions" event each time an unresolved interrupted session
+/// simply sits there.
 fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
     let updated = conn.execute(
-        "UPDATE writes SET status = 'aborted'
-         WHERE status IN ('in_progress', 'interrupted')",
+        "UPDATE writes SET status = 'interrupted'
+         WHERE status = 'in_progress'",
         [],
     )?;
     if updated > 0 {
         warn!(
             count = updated,
-            "recovered orphaned write sessions — marked as aborted"
+            "recovered orphaned write sessions — marked as interrupted (resumable)"
         );
         events::log_event(
             conn,
@@ -96,7 +112,7 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
             "crash_recovery",
             Some("writes.status"),
             None,
-            Some("aborted"),
+            Some("interrupted"),
             Some(&format!("{updated} sessions")),
             None,
         )?;
