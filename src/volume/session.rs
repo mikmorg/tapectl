@@ -578,10 +578,11 @@ impl SealedPending {
 /// "stream an entry, update its cursor row." Never includes the seal marker
 /// entry — that is `ReadyToSeal::seal`'s job alone (sacred invariant 1).
 ///
-/// T6 cycle 1 (this version): the happy path only. Cycle 2 adds hash
-/// verification with a clean abort on mismatch; cycle 3 adds graceful
-/// handling of a `store.execute` error (currently propagated via `?`,
-/// i.e. NOT yet a clean abort); cycle 4 adds the `is_interrupted` check
+/// Status: cycles 1-2 landed (happy path; tri-layer L2 hash verification
+/// with a clean abort on mismatch). Still pending: cycle 3's graceful
+/// handling of a `store.execute` error (currently propagated via `?`, i.e.
+/// NOT yet a clean abort — ENOSPC would surface as a hard `Err`, not
+/// `Ok(ExecuteOutcome::Aborted(..))`); cycle 4's `is_interrupted` check
 /// (currently unused — accepted but not called, since the public
 /// `execute_checking`/`resume_checking` signatures are already the final
 /// ones the four behaviors need).
@@ -623,16 +624,43 @@ fn run_entries(
         store.execute(&mut reader, size, false)?;
         let actual_hash = reader.finalize_hex();
 
+        // Tri-layer L2 (`v2-open-questions.md` §2.4): re-hash inline on the
+        // same streaming read that fed the store, and clean-abort on
+        // mismatch. This is what closes the validate->execute TOCTOU window
+        // — `validate` already full-hashed this same file from disk, but a
+        // rot between then and now would otherwise land on tape unnoticed.
+        let expected_hash = entry.sha256.as_deref();
+        let mismatch = expected_hash != Some(actual_hash.as_str());
+
         if let ZoneKind::Slice { stage_slice_id } = entry.kind {
             let write_id = *slice_write_id
                 .get(&stage_slice_id)
                 .expect("plan() populated slice_write_id for every slice entry");
-            conn.execute(
-                "UPDATE write_positions
-                 SET status = 'written', written_at = datetime('now'), sha256_on_volume = ?1
-                 WHERE write_id = ?2 AND stage_slice_id = ?3",
-                params![actual_hash, write_id, stage_slice_id],
-            )?;
+            if mismatch {
+                conn.execute(
+                    "UPDATE write_positions SET status = 'failed', sha256_on_volume = ?1
+                     WHERE write_id = ?2 AND stage_slice_id = ?3",
+                    params![actual_hash, write_id, stage_slice_id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE write_positions
+                     SET status = 'written', written_at = datetime('now'), sha256_on_volume = ?1
+                     WHERE write_id = ?2 AND stage_slice_id = ?3",
+                    params![actual_hash, write_id, stage_slice_id],
+                )?;
+            }
+        }
+
+        if mismatch {
+            mark_writes(conn, &write_ids, "aborted")?;
+            return Ok(ExecuteOutcome::Aborted(AbortedSession {
+                volume_id,
+                reason: format!(
+                    "hash mismatch at position {}: expected {expected_hash:?}, got {actual_hash}",
+                    entry.position
+                ),
+            }));
         }
     }
 
@@ -975,5 +1003,91 @@ mod tests {
 
         // The store actually holds every entry, seal marker included.
         assert_eq!(store.files.len(), expected_file_count);
+    }
+
+    // --- behavior 2: injected hash mismatch mid-execute -------------------
+
+    #[test]
+    fn hash_mismatch_mid_execute_aborts_unsealed_with_no_seal_marker_written() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let seal_position = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("fixture layout always has a seal marker");
+
+        // validate + plan while the staged slice is still good (this is the
+        // TOCTOU window tri-layer L2 exists to close: the file rots AFTER
+        // validate/plan, not before — corrupting it before validate would
+        // just make validate itself reject it, never reaching execute).
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        // Corrupt one staged slice's on-disk bytes now, after plan.
+        let slice_path = f.units[0].slices[0].staging_path.clone();
+        let mut bytes = std::fs::read(&slice_path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&slice_path, bytes).unwrap();
+        let corrupted_slice_id = f.units[0].slices[0].slice_id;
+
+        let outcome = planned
+            .execute(&f.conn, &mut store)
+            .expect("execute should not hard-error on a hash mismatch — it's a clean abort");
+
+        let aborted = match outcome {
+            ExecuteOutcome::Aborted(a) => a,
+            ExecuteOutcome::Ready(_) => panic!("expected Aborted on a hash mismatch, got Ready"),
+            ExecuteOutcome::Interrupted(_) => {
+                panic!("expected Aborted on a hash mismatch, got Interrupted")
+            }
+        };
+        assert_eq!(aborted.volume_id, f.volume_id);
+
+        // The tape stays UNSEALED: no seal marker was ever written, because
+        // seal() was never called (sacred invariant 1 — only seal() can
+        // produce that entry, and this abort happens well before it).
+        assert!(
+            store.files.len() <= seal_position,
+            "MemStore must not contain a seal marker entry after an aborted execute; \
+             files.len()={}, seal position={seal_position}",
+            store.files.len(),
+        );
+
+        // writes rows: 'aborted', never 'completed'.
+        let write_statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(write_statuses, vec!["aborted".to_string()]);
+
+        // volumes.status must NOT be 'sealed' — the tape stays unsealed.
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(volume_status, "sealed");
+
+        // The specific corrupted slice's cursor row reflects the failure,
+        // not a false 'written'.
+        let wp_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM write_positions WHERE stage_slice_id = ?1",
+                params![corrupted_slice_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wp_status, "failed");
     }
 }
