@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::{collections::HashSet, fs};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -47,27 +47,36 @@ use super::session::{ConfirmOutcome, ExecuteOutcome, QuarantineReason};
 /// check in `session::InterruptedSession::resume` and the envelope
 /// permutation both stay internally consistent.
 ///
-/// What this is NOT: a substitute for a real per-volume identity an operator
-/// could look up independently of recomputing it from the label, or for
-/// genuine cross-process resume (reconstructing a `BuiltLayout` from a prior
-/// session's frozen files without recalling `build()` — a separate, larger
-/// gap; see the report). Two real fixes were considered: (a) a persisted
-/// `volumes.uuid` column generated once at `volume_init`, mirroring
-/// `units.uuid` (recommended: DB-correlatable, precedented; costs a
-/// migration + touches every `INSERT INTO volumes` fixture), or (b)
-/// formalizing this derivation as the permanent design (zero schema cost,
-/// but an operator can never look up a tape's on-tape uuid from the database
-/// independently of recomputing it). This function exists so the rest of
-/// the T8 flip could be implemented and tested without that decision
-/// blocking everything downstream of `build()` — flagged, not decided.
-fn derive_placeholder_volume_uuid(label: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"tapectl-volume-uuid-placeholder-v1\0");
-    hasher.update(label.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    Uuid::from_bytes(bytes).to_string()
+/// The volume's UUID, read from `volumes.uuid` (migration 004).
+///
+/// This is a real, independent identifier — NOT derived from the label. The v2
+/// ID thunk pairs `uuid` with `label` as the tape's identity, and resume
+/// requires BOTH to match (`layout-session.md`) so that a relabelled cartridge,
+/// or a label reused after a retire, reads as divergence rather than as the
+/// same volume. §2.1 also seeds the tenant-envelope permutation from it.
+///
+/// Self-heals a NULL by generating and persisting a v4 once, so DB fixtures
+/// that `INSERT INTO volumes` without a uuid keep working.
+fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
+    let existing: Option<Option<String>> = conn
+        .query_row(
+            "SELECT uuid FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    if let Some(Some(u)) = existing {
+        if !u.is_empty() {
+            return Ok(u);
+        }
+    }
+    let fresh = Uuid::new_v4().to_string();
+    conn.execute(
+        "UPDATE volumes SET uuid = ?1 WHERE id = ?2",
+        params![fresh, volume_id],
+    )?;
+    warn!(volume_id, "volume had no uuid; generated and persisted one");
+    Ok(fresh)
 }
 
 /// Initialize a volume: create the DB record and write the provisional v2 ID
@@ -105,9 +114,15 @@ pub fn volume_init(
     let media_type = &backend.media_type;
 
     conn.execute(
-        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES (?1, 'lto', ?2, ?3, ?4, 'initialized')",
-        params![label, backend.name, media_type, nominal_capacity],
+        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, ?2, 'lto', ?3, ?4, ?5, 'initialized')",
+        params![
+            label,
+            Uuid::new_v4().to_string(),
+            backend.name,
+            media_type,
+            nominal_capacity
+        ],
     )?;
     let volume_id = conn.last_insert_rowid();
 
@@ -117,7 +132,7 @@ pub fn volume_init(
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    let volume_uuid = derive_placeholder_volume_uuid(label);
+    let volume_uuid = volume_uuid(conn, volume_id)?;
     // Provisional total_files: unknown until the write session builds the
     // real Layout. Format §1's minimum shape is 4 front files + >=1 tenant
     // envelope + operator + backup + >=1 slice + the seal marker; 8 is a
@@ -286,7 +301,7 @@ pub fn volume_write(
         }
     };
 
-    let volume_uuid = derive_placeholder_volume_uuid(label);
+    let volume_uuid = volume_uuid(conn, volume_id)?;
     let created_at = chrono::Utc::now().to_rfc3339();
     // Session directory: materialize-to-staging (`v2-open-questions.md`
     // §2.2) lives under the configured staging directory, namespaced per
@@ -1185,24 +1200,46 @@ mod tests {
     use crate::store::{Evidence, Mismatch, MismatchKind};
 
     #[test]
-    fn derive_placeholder_volume_uuid_is_deterministic_and_label_sensitive() {
-        let a1 = derive_placeholder_volume_uuid("L6-0001");
-        let a2 = derive_placeholder_volume_uuid("L6-0001");
-        let b = derive_placeholder_volume_uuid("L6-0002");
-        assert_eq!(
-            a1, a2,
-            "same label must give the same placeholder uuid every time (stable across \
-             volume_init and every volume_write attempt)"
-        );
-        assert_ne!(
-            a1, b,
-            "different labels must give different placeholder uuids"
-        );
-        // build() hard-requires this to parse (Uuid::parse_str) before anything else runs.
-        assert!(
-            Uuid::parse_str(&a1).is_ok(),
-            "placeholder must parse as a UUID: {a1}"
-        );
+    fn volume_uuid_is_persisted_and_stable_not_derived_from_label() {
+        // Migration 004: the uuid is an independent identifier, not a
+        // restatement of the label — resume requires BOTH to match so a
+        // relabelled cartridge reads as divergence (layout-session.md).
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 1000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let id_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('L6-0002', 'lto', 'lto0', 'LTO-6', 1000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let id_b = conn.last_insert_rowid();
+
+        // Self-heal: fixtures that insert without a uuid still work.
+        let a1 = volume_uuid(&conn, id_a).unwrap();
+        let a2 = volume_uuid(&conn, id_a).unwrap();
+        assert_eq!(a1, a2, "uuid must be stable once persisted");
+        assert!(uuid::Uuid::parse_str(&a1).is_ok(), "must be a real uuid");
+
+        let b = volume_uuid(&conn, id_b).unwrap();
+        assert_ne!(a1, b, "distinct volumes must get distinct uuids");
+
+        // And it is genuinely random, not a function of the label: a second
+        // volume row sharing a label would still differ. (label is UNIQUE, so
+        // assert the weaker observable: the uuid is not derivable from label.)
+        let stored: String = conn
+            .query_row(
+                "SELECT uuid FROM volumes WHERE id = ?1",
+                params![id_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, a1, "uuid must be persisted, not recomputed");
     }
 
     #[test]

@@ -47,6 +47,10 @@ fn migrations() -> Migrations<'static> {
         // instead of landing silently. See migrate() below for why FK enforcement also has to
         // be toggled outside this migration's transaction.
         M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+        // 004 adds volumes.uuid — a real, independent volume identifier (the v2 ID
+        // thunk pairs it with label, and §2.1 seeds the envelope permutation from
+        // it). See the migration for why deriving it from the label was rejected.
+        M::up(include_str!("migrations/004_volume_uuid.sql")),
     ])
 }
 
@@ -217,6 +221,22 @@ mod tests {
         conn
     }
 
+    /// Exactly the 003 schema — the reference point for "003 did not change
+    /// columns". Must NOT be `open_memory()` (that is *latest*, which includes
+    /// 004's deliberate `volumes.uuid` addition and every migration after).
+    fn open_memory_at_003() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        conn
+    }
+
     /// (name, type, notnull, dflt_value, pk) for every column, in declaration order.
     fn table_info(
         conn: &Connection,
@@ -303,15 +323,18 @@ mod tests {
         let cols_002 = table_info(&conn_002, "volumes");
         let idx_002 = index_names(&conn_002, "volumes");
 
-        let conn_latest = open_memory().unwrap();
-        let cols_latest = table_info(&conn_latest, "volumes");
-        let idx_latest = index_names(&conn_latest, "volumes");
+        // Compare against 003 specifically, not `open_memory()` (= latest):
+        // migration 004 deliberately ADDS `volumes.uuid`, so latest is the
+        // wrong reference point for a "003 changed nothing" assertion.
+        let conn_003 = open_memory_at_003();
+        let cols_003 = table_info(&conn_003, "volumes");
+        let idx_003 = index_names(&conn_003, "volumes");
 
         assert_eq!(
-            cols_002, cols_latest,
+            cols_002, cols_003,
             "volumes columns/defaults/notnull/pk changed by migration 003"
         );
-        assert_eq!(idx_002, idx_latest);
+        assert_eq!(idx_002, idx_003);
         // Two explicit indexes plus the implicit UNIQUE(label) autoindex.
         assert_eq!(
             idx_002,
