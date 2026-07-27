@@ -1138,19 +1138,26 @@ mod tests {
 
     #[test]
     fn seal_marker_placeholder_and_real_timestamp_regeneration_match_length() {
-        // §9 micro-decision: build() sizes the seal marker with whatever
-        // timestamp `generate_seal_marker` embeds "now", trusting a later
-        // real reseal to regenerate at an identical byte length (RFC 3339
-        // claimed fixed-width). Empirically (T5b) this does NOT hold in
-        // general: chrono's `to_rfc3339()` is `SecondsFormat::AutoSi`, which
-        // renders 25/29/32/35 bytes depending on the timestamp's trailing
-        // zero fractional digits (observed distribution over 2M samples:
-        // ~99.89% at 35 bytes, ~0.11% at 32, ~0.0002% at 29 — see the T5b
-        // report). This test exercises the same regenerate-and-compare
-        // build() does internally; it is expected to pass the overwhelming
-        // majority of runs and is not a substitute for forcing a fixed
-        // width inside `generate_seal_marker` (out of this task's file
-        // scope — flagged to the PM).
+        // §9 micro-decision: build() sizes the seal marker with a placeholder
+        // timestamp, trusting a later real reseal (T6's `session::seal`) to
+        // regenerate at an identical byte length. This USED to be unsound:
+        // chrono's `to_rfc3339()` is `SecondsFormat::AutoSi`, which renders
+        // 25/29/32/35 bytes depending on the timestamp's trailing-zero
+        // fractional digits (observed over 2M samples: ~99.89% at 35 bytes,
+        // ~0.11% at 32, ~0.0002% at 29 — see the T5b report), so a real
+        // reseal would have failed its own length-identity check roughly
+        // once per ~900 writes.
+        //
+        // Fixed in commit 5d4f27c: `generate_seal_marker` (layout.rs) now
+        // renders `sealed_at` via `SecondsFormat::Secs` with `use_z = true`,
+        // which is exactly 20 bytes ("2026-07-22T20:09:00Z") for every
+        // possible instant — there is no trailing-fraction case left to
+        // vary. This test's assertion is therefore no longer a probabilistic
+        // canary that happens to pass almost always; it is a genuine
+        // invariant check (any length difference here would mean the
+        // generator regressed to a variable-width format or stopped
+        // rendering UTC) — exactly what T6's `seal()` step depends on when
+        // it asserts the real reseal's length matches this placeholder's.
         let files = vec![FrontIndexFile {
             position: 0,
             type_label: "id_thunk",
@@ -1162,8 +1169,9 @@ mod tests {
         assert_eq!(
             a.len(),
             b.len(),
-            "two back-to-back generate_seal_marker calls produced different byte lengths; \
-             the placeholder-sizing trick is not reliable right now (see this test's doc comment)"
+            "two back-to-back generate_seal_marker calls produced different byte lengths — \
+             the fixed-width sealed_at rendering (SecondsFormat::Secs) regressed; the \
+             placeholder-sizing trick T6's seal() depends on requires this to always hold"
         );
     }
 
