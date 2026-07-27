@@ -161,8 +161,16 @@ pub struct KeyAvailability {
     pub tenants_with_active_key: HashSet<i64>,
     /// The operator's keys are present in the key store.
     pub operator_key_present: bool,
-    /// The escrow recipient (ADR-0005). `None` until #68 lands, in which case
-    /// the check is skipped; `Some(false)` fails validation.
+    /// The escrow recipient (ADR-0005). A production caller assembles this
+    /// from `queries::escrow_key_exists`/`escrow_public_key`: `Some(true)`
+    /// when a registered escrow row exists, `Some(false)` when it does not
+    /// (fails validation, `LayoutError::EscrowRecipientMissing`). `None`
+    /// skips the check entirely — meant for a caller that has no escrow
+    /// concept in its context, not a routine choice; every real orchestrator
+    /// wiring this struct up (T8's job — none exists in this tree yet, since
+    /// the v1 write path this is meant to replace doesn't call `validate` at
+    /// all) should pass `Some(..)`, now that escrow wiring landed in T2
+    /// (ADR-0005).
     pub escrow_recipient_present: Option<bool>,
 }
 
@@ -398,7 +406,10 @@ impl Layout {
         if !keys.operator_key_present {
             errs.push(LayoutError::OperatorKeyMissing);
         }
-        // Escrow recipient is only checked once #68 makes it a real concept.
+        // `None` means the caller opted out of the check entirely (see
+        // `KeyAvailability.escrow_recipient_present`'s doc comment); only an
+        // explicit `Some(false)` — a registered-escrow check that came back
+        // negative — fails validation.
         if keys.escrow_recipient_present == Some(false) {
             errs.push(LayoutError::EscrowRecipientMissing);
         }

@@ -129,12 +129,12 @@ pub struct BuildInputs {
     pub tenants: Vec<TenantInfo>,
     pub operator_public_keys: Vec<String>,
     /// The permanent Escrow Recipient (ADR-0005), appended to every
-    /// encryption's recipient list when present. `None` before #68/T2 lands
-    /// (the concept doesn't exist yet) or if the caller intentionally omits
-    /// it; `BuiltLayout::validate`'s `KeyAvailability.escrow_recipient_present`
-    /// is a separate, independent check (matching the existing
-    /// `Layout::validate` design — it does not re-derive from what `build()`
-    /// actually used).
+    /// encryption's recipient list when present. Escrow wiring landed in T2;
+    /// `None` here now means only "the caller intentionally omits it" (e.g.
+    /// no orchestrator wires this up yet — T8's job). `BuiltLayout::validate`'s
+    /// `KeyAvailability.escrow_recipient_present` is a separate, independent
+    /// check (matching the existing `Layout::validate` design — it does not
+    /// re-derive from what `build()` actually used).
     pub escrow_public_key: Option<String>,
 }
 
