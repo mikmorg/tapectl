@@ -3,6 +3,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::Result;
+use crate::store::Tier;
 use crate::volume::write;
 
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024; // 512 KB
@@ -27,13 +28,24 @@ pub enum VolumeCommands {
         device: String,
     },
 
-    /// Verify volume contents against checksums
+    /// Verify volume contents via the keyless chain walk (seal -> front index
+    /// -> content). Default tier is `--full` (integrity: hashes every
+    /// content file); `--quick` opts down to navigable (seal binding + front
+    /// index self-consistency only, no per-file content hashing).
     Verify {
         /// Volume label
         label: String,
         /// Tape device path
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
+        /// Full integrity chain walk (default): hash every content file
+        /// against the front index's ciphertext hashes.
+        #[arg(long, conflicts_with = "quick")]
+        full: bool,
+        /// Quick navigable-only chain walk: seal binding + front index
+        /// self-consistency, no per-file content hashing.
+        #[arg(long)]
+        quick: bool,
     },
 
     /// Identify a tape (read ID thunk)
@@ -145,13 +157,26 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Verify { label, device } => {
-            let report = write::volume_verify(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
+        VolumeCommands::Verify {
+            label,
+            device,
+            full: _,
+            quick,
+        } => {
+            let tier = if *quick {
+                Tier::Navigable
+            } else {
+                Tier::default()
+            };
+            let tier_name = if *quick { "quick" } else { "full" };
+            let report =
+                write::volume_verify(conn, config, label, device, DEFAULT_BLOCK_SIZE, tier)?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({
                         "label": label,
+                        "tier": tier_name,
                         "checked": report.checked,
                         "passed": report.passed,
                         "failed": report.failed,
@@ -159,7 +184,7 @@ pub fn run(
                 );
             } else {
                 println!(
-                    "verify {label}: {} checked, {} passed, {} failed",
+                    "verify {label} ({tier_name} tier): {} checked, {} passed, {} failed",
                     report.checked, report.passed, report.failed,
                 );
             }

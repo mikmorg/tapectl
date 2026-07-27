@@ -35,7 +35,7 @@ tapectl\-volume\-write(1)
 Write staged data to volume
 .TP
 tapectl\-volume\-verify(1)
-Verify volume contents against checksums
+Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
 .TP
 tapectl\-volume\-identify(1)
 Identify a tape (read ID thunk)
