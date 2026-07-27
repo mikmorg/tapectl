@@ -32,6 +32,51 @@ enumeration can shuffle across module reloads — discover the changer with
 media-type-compatible cartridge for the drive (an L6 tape for a TD6 drive:
 `mtx -f <changer-sg> load <slot> <dte>`).
 
+#### Virtual tape storage must NOT live on `/` (2026-07-27)
+
+mhvtl defaults to `/opt/mhvtl`, which on this VM is the 22 GB root partition.
+Each virtual tape grows to `CAPACITY` (500 MB here), so a handful of full tapes
+fills `/` and breaks the machine — the gated suites write real volumes, so this
+is a live risk, not a theoretical one. Tape storage now lives on `/scratch`
+(the partition designated for anything that needs no backup):
+
+```bash
+/scratch/mhvtl                      # actual tape images
+/opt/mhvtl -> /scratch/mhvtl        # symlink (see "why a symlink" below)
+/etc/mhvtl/mhvtl.conf               # MHVTL_HOME_PATH=/scratch/mhvtl
+/etc/mhvtl/device.conf              # ' Home directory: /scratch/mhvtl' (BOTH library stanzas)
+```
+
+**Why a symlink is required, not just config.** `MHVTL_HOME_PATH` is a
+**compile-time `#define`** in the mhvtl userspace binaries, not a runtime
+setting — `strings /usr/bin/vtltape` contains the fully-formed message
+`Unable to change directory to /opt/mhvtl`, and `vtltape` accepts no `-H`
+override (unlike `mktape`). Each `vtltape` daemon `chdir()`s to that baked-in
+path at startup and **exits 255 if it does not exist**, no matter what the
+config files say. `vtllibrary` is unaffected (it does not chdir), so the
+symptom is: libraries start, all four tape daemons fail, no `/dev/nst*`
+appears. Editing both config files is still necessary — that is what actually
+relocates the media — but the symlink is what lets the daemons start.
+
+**Verifying the relocation really took effect** (a clean `systemctl start` is
+not sufficient evidence — the symlink means either path resolves):
+
+```bash
+# Load a tape, then confirm the daemon's open files are under /scratch:
+for p in $(pgrep -f 'vtltape -F'); do sudo ls -l /proc/$p/fd; done | grep mhvtl
+# Expect: /scratch/mhvtl/<PCL>/data.0 — never /opt/mhvtl/...
+```
+
+**Reinstall/upgrade risk:** `make install` or a package upgrade may rewrite
+`/etc/mhvtl/*.conf` back to `/opt/mhvtl` and could replace the symlink with a
+real directory. After any mhvtl reinstall, re-check all three items above —
+otherwise tapes silently start filling `/` again with no error until the disk
+is full.
+
+Note: loading a tape rewrites its `mam` and `mhvtl_data` files (mount counter,
+last-mount timestamp) while `data.0`/`indx.0`/`meta.0` stay byte-identical —
+expected, not corruption, when comparing tape trees before and after a mount.
+
 ### 2. Initialize tapectl
 
 ```bash
