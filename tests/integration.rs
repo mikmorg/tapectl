@@ -46,21 +46,11 @@ min_locations_for_tape_only = 2
 }
 
 fn tapectl_test_db(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-        .unwrap();
-    // Run migrations
-    let schema = include_str!("../src/db/migrations/001_initial.sql");
-    conn.execute_batch(schema).unwrap();
-    let fts5 = include_str!("../src/db/migrations/002_fts5_catalog.sql");
-    conn.execute_batch(fts5).unwrap();
-    // Needed from here on for encryption_keys.is_escrow (ADR-0005 / T2) and
-    // the sealed/quarantined volume statuses (ADR-0007). Applying this to a
-    // fresh, still-empty DB is safe: DROP TABLE volumes has no referencing
-    // rows yet, so FK enforcement (already ON above) doesn't block it.
-    let v2_lifecycle = include_str!("../src/db/migrations/003_v2_lifecycle.sql");
-    conn.execute_batch(v2_lifecycle).unwrap();
-    conn
+    // Use the REAL migration path (db::open runs configure + every registered
+    // migration + the orphan sweep). A hand-maintained list of include_str!'d
+    // migrations silently rots: it stopped at 003 and broke the moment 004
+    // added volumes.uuid. This helper now cannot drift from production.
+    tapectl::db::open(path).unwrap()
 }
 
 // ── Tenant Tests ──
