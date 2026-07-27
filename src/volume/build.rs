@@ -265,9 +265,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
 
         let mut recipients: Vec<String> = tenant.public_keys.clone();
         recipients.extend(inputs.operator_public_keys.iter().cloned());
-        if let Some(escrow) = &inputs.escrow_public_key {
-            recipients.push(escrow.clone());
-        }
+        let recipients = with_escrow(recipients, &inputs.escrow_public_key);
         let encrypted = staging::encrypt_data(&tar, &recipients)?;
 
         let pos = first_envelope_pos + i as i32;
@@ -302,10 +300,10 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     let all_catalogs = catalogs_for_all(inputs);
     let op_tar = build_envelope_tar(&op_manifest, &op_recovery, &all_catalogs)?;
 
-    let mut op_recipients: Vec<String> = inputs.operator_public_keys.clone();
-    if let Some(escrow) = &inputs.escrow_public_key {
-        op_recipients.push(escrow.clone());
-    }
+    let op_recipients = with_escrow(
+        inputs.operator_public_keys.clone(),
+        &inputs.escrow_public_key,
+    );
     let op_encrypted = staging::encrypt_data(&op_tar, &op_recipients)?;
 
     let (op_path, op_size, op_hash) = materialize(
@@ -614,6 +612,23 @@ impl BuiltLayout {
 }
 
 // ── helpers ──
+
+/// Append the escrow public key to `recipients` if one is present — every
+/// recipient list `build()` assembles (tenant envelopes, the operator
+/// envelope) ends with it when it exists (`volume-format-v2.md` §1: "esc =
+/// the permanent Escrow Recipient (ADR-0005) — in every encryption").
+/// Extracted so the tenant-envelope and operator-envelope recipient
+/// assemblies can't drift on this (T6 review finding #2: both previously
+/// repeated this identical 3-liner). `build.rs` stays DB-free by design
+/// (no `conn`), so this can't reuse `queries::recipient_list_with_escrow`
+/// (which does its own DB lookup) — it operates on the already-resolved
+/// `Option<String>` `BuildInputs.escrow_public_key` instead.
+fn with_escrow(mut recipients: Vec<String>, escrow_public_key: &Option<String>) -> Vec<String> {
+    if let Some(escrow) = escrow_public_key {
+        recipients.push(escrow.clone());
+    }
+    recipients
+}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
