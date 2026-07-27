@@ -1566,4 +1566,115 @@ mod tests {
             .unwrap();
         assert_eq!(write_status, "aborted");
     }
+
+    // --- bonus: confirm's failure branch (never hit by behaviors 1-4) -----
+
+    /// The four TDD-mandated behaviors never reach `confirm()`'s own fail
+    /// branch: the happy-path test reaches `confirm()` only to pass, and the
+    /// mismatch/ENOSPC/interrupt tests (plus
+    /// `resume_quarantines_on_id_thunk_identity_mismatch`) all abort or
+    /// quarantine before `confirm()` is ever called. None of them exercise
+    /// what happens when a clean `execute`+`seal` is followed by tape bytes
+    /// rotting (or a readback error) strictly between seal and confirm —
+    /// caught only by the §5 chain walk itself, since that corruption
+    /// happens after both L1 (validate) and L2 (execute's inline re-hash)
+    /// have already passed. Added after the fact (like the two resume bonus
+    /// tests above) because it covers already-implemented `confirm()` logic
+    /// rather than driving new logic into existence — not a TDD red/green
+    /// cycle.
+    #[test]
+    fn confirm_failure_quarantines_volume_and_aborts_writes_without_touching_staging() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+
+        // Tape rots strictly AFTER seal(), so L1 (validate) and L2 (execute's
+        // inline re-hash) never see it — only the §5 chain walk inside
+        // confirm() can catch this. Flip a byte at offset 0 of a slice entry;
+        // both fixture slices are >= 24 bytes, so offset 0 is always inside
+        // the true (unpadded) region MemStore hashes.
+        let slice_position = sealed_pending
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .expect("fixture layout always has at least one slice entry");
+        store.files[slice_position][0] ^= 0xFF;
+
+        let outcome = sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not hard-error on a chain-walk mismatch");
+
+        let quarantined = match outcome {
+            ConfirmOutcome::Quarantined(q) => q,
+            ConfirmOutcome::Sealed(_) => {
+                panic!("expected Quarantined on a post-seal content mismatch, got Sealed")
+            }
+        };
+        assert_eq!(quarantined.volume_id, f.volume_id);
+        match quarantined.reason {
+            QuarantineReason::ConfirmFailed(evidence) => {
+                assert!(
+                    !evidence.mismatches.is_empty(),
+                    "expected at least one chain-walk mismatch"
+                );
+                assert_eq!(evidence.mismatches[0].position, slice_position as u32);
+            }
+            QuarantineReason::IdentityMismatch { .. } => {
+                panic!("expected ConfirmFailed, got IdentityMismatch")
+            }
+        }
+
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "quarantined");
+
+        // ALL writes rows abort, not just the one touching the corrupted
+        // slice — confirm operates per-volume, not per-write.
+        let write_statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!write_statuses.is_empty());
+        assert!(write_statuses.iter().all(|s| s == "aborted"));
+
+        // Confirm never touches staging either way (it only ever reads the
+        // store, never the staging directory) — the corrupted slice's
+        // ORIGINAL staged input file is untouched and still on disk.
+        let staged_path = &f.units[0].slices[0].staging_path;
+        assert!(
+            staged_path.exists(),
+            "confirm() must never delete/modify staging inputs"
+        );
+
+        // The audit feedback loop closes even on failure: a 'failed'
+        // verification_sessions row is recorded, not just silently dropped.
+        let vs_outcome: String = f
+            .conn
+            .query_row(
+                "SELECT outcome FROM verification_sessions WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vs_outcome, "failed");
+    }
 }
