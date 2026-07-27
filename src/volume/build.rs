@@ -99,6 +99,13 @@ pub struct BuildInputs {
     pub volume_uuid: String,
     pub media_type: String,
     pub tapectl_version: String,
+    /// RFC 3339 generation timestamp for the ID thunk's `created_at` (T6
+    /// review finding #5). The caller renders this once (normally
+    /// `chrono::Utc::now().to_rfc3339()`) rather than `build()` reading the
+    /// clock, so a test can hold it constant across two `build()` calls and
+    /// check the ID thunk for byte-identity like every other deterministic
+    /// zone — see `IdThunkV2Params::created_at`'s doc comment.
+    pub created_at: String,
 
     // --- capacity (becomes Layout::budget) ---
     pub block_size: u64,
@@ -189,9 +196,9 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     let mut entries: Vec<LayoutEntry> = Vec::with_capacity(total_files as usize);
 
     // Files 0-2: identity + guide + heir tool. `system_guide`/`restore_sh`
-    // are pure functions of (label, total_files); the ID thunk embeds a real
-    // `created_at` with no injectable override in `IdThunkV2Params` as of
-    // T5a — see the module-level note in the T5b report.
+    // are pure functions of (label, total_files); the ID thunk's `created_at`
+    // is injected from `inputs` (T6 review finding #5) rather than read from
+    // the clock in here, so build-twice byte-identity is testable for it too.
     let id_thunk_params = IdThunkV2Params {
         label: &inputs.label,
         uuid: &inputs.volume_uuid,
@@ -204,6 +211,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         mam_serial: &inputs.mam_serial,
         mam_length: inputs.mam_length,
         mam_loads: inputs.mam_loads,
+        created_at: &inputs.created_at,
     };
     let id_thunk_bytes = layout::generate_id_thunk_v2(&id_thunk_params);
     let (id_thunk_path, id_thunk_size, id_thunk_hash) =
@@ -851,6 +859,7 @@ mod tests {
             volume_uuid: volume_uuid.to_string(),
             media_type: "LTO-6".to_string(),
             tapectl_version: "0.1.0-test".to_string(),
+            created_at: "2026-07-22T20:09:00Z".to_string(),
             block_size: BS,
             usable_bytes: 100 * BS,
             enospc_buffer: BS,
@@ -1011,16 +1020,22 @@ mod tests {
 
     #[test]
     fn deterministic_zones_are_byte_identical_across_two_builds() {
-        // Only system_guide and restore_sh are pure functions of (label,
-        // total_files) with no clock read and no cryptographic randomness,
-        // so only these two are expected byte-identical across two
-        // independent build() calls with the same logical inputs.
+        // system_guide and restore_sh are pure functions of (label,
+        // total_files) with no clock read and no cryptographic randomness.
+        // id_thunk is ALSO now covered (T6 review finding #5): its
+        // `created_at` is injected via `BuildInputs.created_at` rather than
+        // read from the clock inside the generator, and `two_tenant_inputs`
+        // below builds one `inputs` value reused for both `build()` calls —
+        // so with the same injected timestamp, the ID thunk is a pure
+        // function of `inputs` too. This is what makes
+        // layout-session.md's "same inputs + same generation timestamp ⇒
+        // reproducible Layout" clause checkable for 3 of ~9 zone kinds
+        // instead of 2 — the resume path depends on exactly this (frozen
+        // zones must re-read byte-identical, never regenerate).
         //
         // Everything else materialized is NOT expected to match
         // byte-for-byte across separate builds, for reasons verified
         // empirically during T5b (see the report):
-        //   - id_thunk: embeds a real `created_at` with no injectable
-        //     override (`IdThunkV2Params` has no such field as of T5a).
         //   - tenant/operator envelopes: `age::Encryptor` is randomized per
         //     call (fresh ephemeral key exchange) — encrypting IDENTICAL
         //     plaintext to the IDENTICAL recipient twice produces different
@@ -1031,7 +1046,10 @@ mod tests {
         //     sizes and hashes.
         // This is narrower than plan T5b's literal wording ("build-twice
         // byte-identity for every materialized zone except the id thunk")
-        // assumed — flagged to the PM in the T5b report.
+        // assumed — flagged to the PM in the T5b report. Finding #5 closes
+        // the id_thunk half of that gap; the envelope/front-index/seal
+        // non-determinism is inherent to age's randomized encryption, not a
+        // missing injection point, and stands as-is.
         let (inputs, _src) = two_tenant_inputs("550e8400-e29b-41d4-a716-446655440000");
 
         let session1 = tempfile::tempdir().unwrap();
@@ -1039,7 +1057,7 @@ mod tests {
         let session2 = tempfile::tempdir().unwrap();
         let built2 = build(&inputs, session2.path()).unwrap();
 
-        for kind in [ZoneKind::SystemGuide, ZoneKind::RestoreSh] {
+        for kind in [ZoneKind::IdThunk, ZoneKind::SystemGuide, ZoneKind::RestoreSh] {
             let e1 = built1
                 .layout
                 .entries

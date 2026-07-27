@@ -110,6 +110,16 @@ pub struct IdThunkV2Params<'a> {
     pub mam_serial: &'a str,
     pub mam_length: i64,
     pub mam_loads: i64,
+    /// RFC 3339 generation timestamp, rendered by the caller (`build()`) and
+    /// injected rather than read from the clock in here (v2-implementation-plan
+    /// T6 review finding #5). Without this, only `system_guide`/`restore_sh`
+    /// were testable for build-twice byte-identity — the ID thunk's `created_at`
+    /// varied on every call and could never be held constant across two builds
+    /// in a test, leaving `layout-session.md`'s "same inputs + same generation
+    /// timestamp ⇒ reproducible Layout" clause unverified for this zone. This
+    /// also matters for resume, which depends on frozen (not regenerated)
+    /// bytes — see `ContentSource::Materialized`'s doc comment.
+    pub created_at: &'a str,
 }
 
 /// Generate the v2 ID thunk (File 0) content. Per sheet §2.3 and
@@ -128,7 +138,6 @@ pub struct IdThunkV2Params<'a> {
 /// the real `total_files`/`seal_marker` once the layout is built (sheet
 /// §2.3 — resume must not try to preserve init's File 0).
 pub fn generate_id_thunk_v2(params: &IdThunkV2Params) -> String {
-    let now = chrono::Utc::now().to_rfc3339();
     let IdThunkV2Params {
         label,
         uuid,
@@ -141,6 +150,7 @@ pub fn generate_id_thunk_v2(params: &IdThunkV2Params) -> String {
         mam_serial,
         mam_length,
         mam_loads,
+        created_at: now,
     } = *params;
     let seal_marker = total_files - 1;
     format!(
@@ -2424,6 +2434,7 @@ mod tests {
             mam_serial: "SERIAL1",
             mam_length: 846,
             mam_loads: 5,
+            created_at: "2026-07-22T20:09:00Z",
         };
         let s = generate_id_thunk_v2(&params);
         let toml_start = s.find("[volume]").expect("has [volume] section");
@@ -2474,6 +2485,37 @@ mod tests {
         assert_eq!(
             media.get("cartridge_serial").unwrap().as_str(),
             Some("SERIAL1")
+        );
+    }
+
+    #[test]
+    fn id_thunk_v2_is_byte_identical_across_two_calls_given_the_same_created_at() {
+        // T6 review finding #5: before `created_at` was injectable, the ID
+        // thunk read the clock internally, so two `generate_id_thunk_v2`
+        // calls could never be compared for byte-identity in a test — only
+        // `system_guide`/`restore_sh` (2 of ~9 zone kinds) were checkable,
+        // leaving layout-session.md's "same inputs + same generation
+        // timestamp ⇒ reproducible Layout" clause unverified for this zone.
+        // With the timestamp injected, this now holds directly.
+        let params = IdThunkV2Params {
+            label: "DETERM1",
+            uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            media_type: "LTO-6",
+            tapectl_version: "0.2.0",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 12,
+            mam_manufacturer: "IBM",
+            mam_serial: "SERIAL9",
+            mam_length: 846,
+            mam_loads: 1,
+            created_at: "2026-07-22T20:09:00Z",
+        };
+        let a = generate_id_thunk_v2(&params);
+        let b = generate_id_thunk_v2(&params);
+        assert_eq!(
+            a, b,
+            "id thunk must be byte-identical across two calls with the same created_at"
         );
     }
 
