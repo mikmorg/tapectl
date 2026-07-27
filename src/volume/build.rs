@@ -1057,7 +1057,11 @@ mod tests {
         let session2 = tempfile::tempdir().unwrap();
         let built2 = build(&inputs, session2.path()).unwrap();
 
-        for kind in [ZoneKind::IdThunk, ZoneKind::SystemGuide, ZoneKind::RestoreSh] {
+        for kind in [
+            ZoneKind::IdThunk,
+            ZoneKind::SystemGuide,
+            ZoneKind::RestoreSh,
+        ] {
             let e1 = built1
                 .layout
                 .entries
