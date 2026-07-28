@@ -19,8 +19,12 @@ the normative design set named in the Policy block below.
 - **Mode: phase-2 hardening (from 2026-07-28).** R&D has exited: the v2 regear
   is merged to master and the design docs are settled reference, not fluid.
   Issue work is live again — re-spec, close, and file as needed.
-- **Queue:** open `phase:2` issues in mikmorg/tapectl. **Highs first** (#32,
-  #33, #34, #35, #36, #38, #69), then mediums. **#35 leads** — staging still
+- **Queue:** **#27 first** (phase 1, re-spec'd 2026-07-28) — the fresh-write
+  path has no contact discipline, so loading the wrong or an already-sealed
+  cartridge and running `volume init` silently overwrites it. Silent data loss
+  outranks everything; #25's CLI-resume wiring shares the same orchestration
+  seam and follows it. Then open `phase:2`: **highs first** (#32, #33, #34,
+  #35, #36, #38, #69), then mediums. **Among phase-2, #35 leads** — staging still
   buffers whole slices (`fs::read(slice_path)` + `encrypt_data`), so at the
   ratified 10 G slice size it needs ~20 G RAM on a 7 G machine. Nothing else
   goes in front of it. Exit: phase 2 empty AND the gate's EXPECTED_FAIL
