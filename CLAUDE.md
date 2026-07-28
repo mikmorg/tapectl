@@ -6,12 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `rage` crate for age encryption, and SQLite for catalog/inventory/policy/audit.
 
-The implementation reference is `tapectl-design-v4_0.md`, read **together with
-`docs/design-errata.md`** (the complete list of superseded/recast sections — ADRs and
-recorded verdicts take precedence over the design doc wherever they disagree),
-`CONTEXT.md` (vocabulary), `docs/adr/` (decisions), and
-`docs/design/layout-session.md` (the normative skeleton for the phase-1
-Layout/WriteSession work, epic #20).
+**The on-tape format is Layout Version 2** (ADR-0007). For anything touching tape
+bytes or the write path, the normative set is, in authority order:
+`docs/design/volume-format-v2.md` (the byte format) → `docs/design/layout-session.md`
+(session state machine) → `docs/design/v2-open-questions.md` (resolved decisions,
+§§1–11) → `docs/design/v2-implementation-plan.md` (the T0–T11 build playbook).
+`docs/adr/0001`–`0007` govern all of them.
+
+`tapectl-design-v4_0.md` remains the reference for everything those do NOT cover,
+read **together with `docs/design-errata.md`** (the complete list of
+superseded/recast sections — note §2.6/§8.1–§8.8 are superseded wholesale by v2,
+and §2.9/Appendix C end-of-tape salvage is rejected outright). `CONTEXT.md` is the
+vocabulary.
 
 ## Current State
 
@@ -37,18 +43,40 @@ Milestones 0 through 5 are complete.
 
 **Post-M7 hardening (complete):** Design gap audit identified 3 active bugs + 6 unacknowledged gaps. All 8 items fixed: clone-slices restructured to staging-only read-slices (self-describing invariant preserved), restore trial-decrypts with all tenant+operator keys (key rotation no longer breaks restore), compact-finish refuses retirement if live slices lack copies elsewhere, volume_verify records verification_sessions (audit feedback loop closed), staging cleanup reports actual bytes freed, compact-read errors on checksum mismatch, critical DB operations wrapped in transactions, export writes MANIFEST.toml + RECOVERY.md. RESTORE.sh fleshed out from stub to full emergency recovery script (--info, --find-envelope, --restore modes with sha256 verification and block-padding trimming). 106 tests (60 unit + 46 integration/lib/isolation/failure-mode), zero clippy warnings.
 
-**Renovation (2026-07):** a full renovation stage is planned and triaged — wayfinder
-map at [issue #1](https://github.com/mikmorg/tapectl/issues/1), phased backlog in
-issues #20–#73 (phase:1 = restore trust; the three audits under `docs/audits/` found
-the happy path solid but the heir/emergency and unhappy paths broken). Decision
-records: `docs/adr/0001`–`0006` + `CONTEXT.md`. The milestone claims above describe
+**Renovation (2026-07):** a full renovation stage, charted as a wayfinder map at
+[issue #1](https://github.com/mikmorg/tapectl/issues/1) with a phased backlog in
+issues #20–#73. The three audits under `docs/audits/` found the happy path solid but
+the heir/emergency and unhappy paths broken. The milestone claims above describe
 happy-path completeness only — treat them accordingly.
 
-**Next:** execute the process kit (CI #6, mhvtl verify gate #7 — mhvtl needs its
-kernel module rebuilt first, see #7), then phase 1 via the issue loop. Real LTO-6
-hardware validation is deliberately deferred: an LTO-6 drive is owned, but development
-stays mhvtl-first until phases 1–2 land and the verify gate is green (#16's verdict).
-Procedure is in `docs/lto6-validation-checklist.md`.
+**Format v2 regear (complete, 2026-07-28).** Holistic R&D
+(`docs/research/2026-07-21-ontape-format-and-write-design.md`) established that a
+plan-first, write-once medium should not imitate a streaming format. The whole
+write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
+
+- **On tape:** a plaintext **front index** (File 3) carrying every file's
+  position/type/size + ciphertext sha256; **envelopes before slices**; a trailing
+  plaintext **seal marker** binding the front index. End-of-tape salvage is gone —
+  a real EOT is a clean abort to an unsealed tape, and the pre-flight capacity gate
+  is the sole capacity defense.
+- **In code:** a typestate **write session** (`src/volume/session.rs`:
+  build → validate → plan → execute → seal → confirm), a **Store trait** with a
+  shared chain walk (`src/store.rs`), Layout build/materialize (`src/volume/build.rs`),
+  format parsers (`src/volume/format.rs`), and a **Library** layer
+  (`src/library/`, `library sync|status|plan|run`) for folder-per-unit archiving.
+- **Verified:** 270 ungated tests; `tests/format_v2.rs` is a keyless synthetic-heir
+  acceptance suite (proves the byte layout from recorded bytes alone); mhvtl e2e 9/9
+  on real tape including Rust-vs-bash chain-walk parity on both a good and a
+  corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN with exactly the two ticketed
+  EXPECTED_FAIL entries (H7 #33, H8 #34 — both phase-2).
+
+**Next:** issues #22–#28 describe the *pre-v2* design and must be read against the
+normative set above, not implemented literally. Phase 2 next (#33/#34 would empty
+the gate manifest). Real LTO-6 hardware validation stays deferred by choice — an
+LTO-6 drive is owned, but development is mhvtl-first; the open hardware questions
+(block size 512K vs 1M, LBP acceptance, MAM over-report bounds) are recorded in
+`docs/design/v2-open-questions.md` §5 and the procedure is in
+`docs/lto6-validation-checklist.md`.
 
 ## Build Commands
 
@@ -108,11 +136,12 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- --nocapture --te
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
 - **dar integration** (`src/dar/`): subprocess wrapper; minimum dar 2.6.x; XML catalog parsing via quick-xml
 - **Staging** (`src/staging/`): sha256 validation before archiving, age multi-recipient encryption, ephemeral slices
-- **Volume management** (`src/volume/`): 10-file self-describing layout, write pipeline, verify, read-slices
+- **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal parsers (`format.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit
-- **Store trait**: decided (ADR-0006) but not yet built — one storage interface with TapeStore/WarehouseStore/ExportStore as peers, carved during the phase-1 Layout work (#71); today tape I/O is still direct via `src/tape/`
+- **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` are the remaining peers (#72/#73)
+- **Library** (`src/library/`): `[[libraries]]` config → `library sync|status|plan|run`; folder-per-unit registration, alphabetical first-fit batch selector, stage-once/write-N-copies/release
 
 **Design principles:**
 - Volumes are self-describing — full restore possible without the database or tapectl
