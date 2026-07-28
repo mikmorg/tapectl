@@ -16,28 +16,38 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **Mode: R&D (2026-07).** The redesign is fluid and lives in the design docs,
-  NOT the issue tracker. Do not file GitHub issues, do not open PRs, do not
-  close or re-spec issues #22–#28 — they are synced once, at R&D exit, by the
-  CTO's call. When R&D exits, replace this block with the issue-queue policy
-  (git history has it).
-- **Queue:** `docs/design/v2-implementation-plan.md`, tasks T0–T11 in its DAG
-  order. One task per iteration. The playbook's per-task Traps and Done-when
-  are binding. Parallelize only tasks with disjoint file sets, and only when
-  the DAG allows.
+- **Mode: phase-2 hardening (from 2026-07-28).** R&D has exited: the v2 regear
+  is merged to master and the design docs are settled reference, not fluid.
+  Issue work is live again — re-spec, close, and file as needed.
+- **Queue:** open `phase:2` issues in mikmorg/tapectl. **Highs first** (#32,
+  #33, #34, #35, #36, #38, #69), then mediums. **#35 leads** — staging still
+  buffers whole slices (`fs::read(slice_path)` + `encrypt_data`), so at the
+  ratified 10 G slice size it needs ~20 G RAM on a 7 G machine. Nothing else
+  goes in front of it. Exit: phase 2 empty AND the gate's EXPECTED_FAIL
+  manifest empty. Skip `epic`-labeled issues, `wontfix`, `needs-human`.
+- **Issues predate the v2 regear** — every one was written against the old
+  write path. Read them against the normative set below, never literally; a
+  re-triage pass has re-spec'd them, but if an issue still contradicts the
+  shipped design, the design wins and the issue is wrong.
 - **Normative set (authority order):** `docs/design/volume-format-v2.md`
   (on-tape bytes) → `docs/design/layout-session.md` (session state machine) →
-  `docs/design/v2-open-questions.md` (resolved decisions, §§1–11) →
-  `docs/design/v2-implementation-plan.md` (the playbook). ADRs
-  (`docs/adr/0001`–`0007`) govern all of them. Genuine conflict between two
-  normative docs is a CTO escalation, not a judgment call.
+  `docs/design/v2-open-questions.md` (resolved decisions) →
+  `docs/design-errata.md` (superseded v4.0 sections). ADRs
+  (`docs/adr/0001`–`0007`) govern all of them. `CONTEXT.md` is the vocabulary —
+  note **Collection** (source roots) vs **Tape Library** (the changer): never
+  write a bare "library".
 - **The three sacred invariants** (playbook preamble — a violation is
   stop-the-line): the seal marker is written only inside the session
   lifecycle; `Layout::validate` full-hashes staged slices; no plaintext file
   carries tenant/unit names, filenames, `sha256_plain`, or key fingerprints.
-- **Integration authority:** cherry-pick onto the feature branch after review.
-  No PRs, no merge-on-green, no pushing — the CTO decides when the branch
-  leaves the machine. Gate after EVERY integration:
+- **Integration authority: PM review + cherry-pick onto master, then push.**
+  Chosen deliberately over merge-on-green: during the v2 regear, CI-green code
+  still carried a hollow-map gap, a ~1-in-900 seal-timestamp flake, and a
+  resume path that would rewrite a SEALED tape — all three passed
+  fmt/clippy/test and were caught only by reading a flagged residual and
+  deciding it was unacceptable. So: no PRs, no merge-on-green. Push master
+  after each land so CI runs as an independent man-page/build check (it cannot
+  run the mhvtl gate — that stays with you). Gate after EVERY integration:
   `cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings &&
   cargo test`. Never pipe clippy through `tail` (warnings print above
   "Finished").
