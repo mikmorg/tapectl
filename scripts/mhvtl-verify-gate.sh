@@ -171,7 +171,17 @@ open(cfg, 'w').write(t)
 PY
     mkdir -p "$RUN/staging"
 }
-step_tenants() { TCTL tenant add alice && TCTL tenant add bob; }
+step_tenants() {
+    TCTL tenant add alice && TCTL tenant add bob \
+    && step_escrow
+}
+
+# ADR-0005: a permanent escrow recipient participates in every encryption, and
+# pre-write validation REFUSES without one — so this is a precondition of any
+# volume write, not optional setup. `key generate --escrow` prints the secret
+# once for paper transcription; here it lands in the throwaway gate log, which
+# is fine for a disposable test identity under /scratch.
+step_escrow() { TCTL key generate --escrow; }
 step_units() {
     TCTL unit init "$SRC/unitA" --tenant alice --name unitA \
     && TCTL unit init "$SRC/unitB" --tenant bob --name unitB \
