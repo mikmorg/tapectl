@@ -190,8 +190,19 @@ step_units() {
 step_snapshots() { TCTL snapshot create unitA && TCTL snapshot create unitB && TCTL snapshot create unitC; }
 step_stage_main() { TCTL stage create unitA && TCTL stage create unitB; }
 step_stage_symlinks() { TCTL stage create unitC; }
-step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV"; }
-step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV"; }
+# --force (issue #27's contact-discipline check): this gate reuses whatever
+# generation-matching cartridge `mtx` finds already loaded/in the library
+# (see the device-discovery block above) and never erases it between runs,
+# so a rerun against the same physical tape finds File 0 already carrying
+# the previous run's now-SEALED "$LABEL" volume (same label, different
+# uuid — `volume_init` always generates a fresh one). That is exactly the
+# scratch-media reuse case --force exists for; it cannot mask a genuinely
+# different failure, since AlreadySealed is never forceable — if THAT fires
+# here, the cartridge needs a real `mt erase` before the gate can pass again.
+# NOT exercised in the change that added this flag (guardrail: no tape
+# device access) — first real run after #27 should confirm this holds.
+step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV" --force; }
+step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV" --force; }
 step_vol_verify() {
     TCTL volume verify "$LABEL" --device "$TAPE_DEV" --json | tee "$RUN/verify.json"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify.json"

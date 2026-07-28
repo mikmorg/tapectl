@@ -277,8 +277,28 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
     for (tenant, unit, n) in units {
         add_unit(&mut h, tenant, false, unit, *n);
     }
-    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
-    volume::write::volume_write(&h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
+    // force=true: `mhvtl_load()` only loads slot 1 (`mtx load`) — it does NOT
+    // erase the virtual tape's contents (confirmed: `mhvtl_load`'s own
+    // comment above says "volume_init rewinds anyway", i.e. this harness
+    // already relied on volume_init's former unconditional overwrite). Every
+    // gated test in this file funnels through this one helper, sequentially,
+    // against the SAME physical/virtual cartridge, with no erase step
+    // between them — so by the second test, File 0 legitimately carries a
+    // DIFFERENT, already-SEALED label from the previous test's run. That is
+    // exactly the reuse case `--force` exists for: this harness knows the
+    // cartridge is scratch media and explicitly asserts it is safe to
+    // overwrite (issue #27's contact check would otherwise correctly refuse
+    // it as a wrong/sealed tape). This does not weaken the check itself —
+    // `force` still cannot defeat `AlreadySealed` for a genuinely different
+    // failure mode (see `decide_fresh_write_contact`); if that ever fires
+    // here, the mhvtl cartridge needs a real `mt erase` before the suite can
+    // run again. NOT verified against real mhvtl hardware in this change
+    // (guardrail: no tape device access) — flagged for the coordinator.
+    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, true).unwrap();
+    volume::write::volume_write(
+        &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
+    )
+    .unwrap();
     h
 }
 
@@ -648,8 +668,28 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     forbidden.extend(slice_plaintext_hashes(&h.conn, u_alpha));
     forbidden.extend(slice_plaintext_hashes(&h.conn, u_bravo));
 
-    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
-    volume::write::volume_write(&h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
+    // force=true: `mhvtl_load()` only loads slot 1 (`mtx load`) — it does NOT
+    // erase the virtual tape's contents (confirmed: `mhvtl_load`'s own
+    // comment above says "volume_init rewinds anyway", i.e. this harness
+    // already relied on volume_init's former unconditional overwrite). Every
+    // gated test in this file funnels through this one helper, sequentially,
+    // against the SAME physical/virtual cartridge, with no erase step
+    // between them — so by the second test, File 0 legitimately carries a
+    // DIFFERENT, already-SEALED label from the previous test's run. That is
+    // exactly the reuse case `--force` exists for: this harness knows the
+    // cartridge is scratch media and explicitly asserts it is safe to
+    // overwrite (issue #27's contact check would otherwise correctly refuse
+    // it as a wrong/sealed tape). This does not weaken the check itself —
+    // `force` still cannot defeat `AlreadySealed` for a genuinely different
+    // failure mode (see `decide_fresh_write_contact`); if that ever fires
+    // here, the mhvtl cartridge needs a real `mt erase` before the suite can
+    // run again. NOT verified against real mhvtl hardware in this change
+    // (guardrail: no tape device access) — flagged for the coordinator.
+    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, true).unwrap();
+    volume::write::volume_write(
+        &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
+    )
+    .unwrap();
 
     // Pull layout info from the ID thunk (File 0) — it's plaintext TOML. v2's
     // [layout] table carries only front_index/seal_marker/total_files (the
