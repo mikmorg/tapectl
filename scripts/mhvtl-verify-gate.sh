@@ -194,13 +194,24 @@ step_stage_symlinks() { TCTL stage create unitC; }
 # generation-matching cartridge `mtx` finds already loaded/in the library
 # (see the device-discovery block above) and never erases it between runs,
 # so a rerun against the same physical tape finds File 0 already carrying
-# the previous run's now-SEALED "$LABEL" volume (same label, different
-# uuid — `volume_init` always generates a fresh one). That is exactly the
-# scratch-media reuse case --force exists for; it cannot mask a genuinely
-# different failure, since AlreadySealed is never forceable — if THAT fires
-# here, the cartridge needs a real `mt erase` before the gate can pass again.
-# NOT exercised in the change that added this flag (guardrail: no tape
-# device access) — first real run after #27 should confirm this holds.
+# the previous run's identity under "$LABEL" (same label, different uuid --
+# `volume_init` always generates a fresh one).
+#
+# IMPORTANT: --force only rescues this on a run whose target cartridge was
+# NEVER sealed (a fresh/blank tape, or a leftover from an aborted prior
+# run). check_tape_contact (session.rs) deliberately makes AlreadySealed
+# un-overridable (ADR-0003) by probing a foreign tape's own self-reported
+# seal position on an identity mismatch -- so a SECOND gate run against a
+# tape the FIRST run actually sealed will hit AlreadySealed, which --force
+# cannot defeat, and this step will fail. That is correct, expected
+# behavior, not a bug: the sanctioned path past a sealed cartridge is a
+# real erase (e.g. `mt -f "$TAPE_DEV" erase`), not a wider override, and
+# this script does not currently perform one. NOT exercised in the change
+# that added this flag (guardrail: no tape device access) -- the
+# coordinator should expect the gate to need a freshly-erased (or
+# never-yet-sealed) cartridge on the first run after #27, and add an
+# explicit erase step here if repeat runs against the same media are
+# wanted.
 step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV" --force; }
 step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV" --force; }
 step_vol_verify() {

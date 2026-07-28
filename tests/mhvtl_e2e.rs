@@ -283,17 +283,28 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
     // already relied on volume_init's former unconditional overwrite). Every
     // gated test in this file funnels through this one helper, sequentially,
     // against the SAME physical/virtual cartridge, with no erase step
-    // between them — so by the second test, File 0 legitimately carries a
-    // DIFFERENT, already-SEALED label from the previous test's run. That is
-    // exactly the reuse case `--force` exists for: this harness knows the
-    // cartridge is scratch media and explicitly asserts it is safe to
-    // overwrite (issue #27's contact check would otherwise correctly refuse
-    // it as a wrong/sealed tape). This does not weaken the check itself —
-    // `force` still cannot defeat `AlreadySealed` for a genuinely different
-    // failure mode (see `decide_fresh_write_contact`); if that ever fires
-    // here, the mhvtl cartridge needs a real `mt erase` before the suite can
-    // run again. NOT verified against real mhvtl hardware in this change
-    // (guardrail: no tape device access) — flagged for the coordinator.
+    // between them.
+    //
+    // IMPORTANT — this flag does NOT make the suite reuse-safe by itself,
+    // and it is weaker than an earlier version of this comment claimed.
+    // check_tape_contact (session.rs) now probes a foreign tape's own
+    // self-reported seal position on an identity mismatch, specifically so
+    // --force can never be used to overwrite an already-SEALED volume
+    // (ADR-0003) — see the "critical fix" commit after this one. That means:
+    // for the FIRST test in a run (blank tape, or a leftover that never got
+    // sealed), force=true correctly lets an otherwise-mismatched File 0
+    // through. But from the SECOND test that runs against a cartridge a
+    // PRIOR test actually sealed, File 0 legitimately names a different,
+    // now-SEALED label — that is AlreadySealed, not IdentityMismatch, and
+    // force cannot touch it (by design). The `.unwrap()` below WILL panic in
+    // that case. This is expected and correct per ADR-0001/0003, not a
+    // regression to paper over: the real fix is a genuine tape erase
+    // between runs (e.g. `mt -f /dev/nst0 erase`, unverified against mhvtl
+    // in this change — guardrail: no tape device access), not a wider
+    // override. NOT verified end-to-end (mhvtl is reportedly non-functional
+    // on this VM as of this writing per project notes, independent of this
+    // change) — flagged for the coordinator to resolve before the next real
+    // mhvtl run, most likely by erasing the scratch cartridge first.
     volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, true).unwrap();
     volume::write::volume_write(
         &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
@@ -674,17 +685,28 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     // already relied on volume_init's former unconditional overwrite). Every
     // gated test in this file funnels through this one helper, sequentially,
     // against the SAME physical/virtual cartridge, with no erase step
-    // between them — so by the second test, File 0 legitimately carries a
-    // DIFFERENT, already-SEALED label from the previous test's run. That is
-    // exactly the reuse case `--force` exists for: this harness knows the
-    // cartridge is scratch media and explicitly asserts it is safe to
-    // overwrite (issue #27's contact check would otherwise correctly refuse
-    // it as a wrong/sealed tape). This does not weaken the check itself —
-    // `force` still cannot defeat `AlreadySealed` for a genuinely different
-    // failure mode (see `decide_fresh_write_contact`); if that ever fires
-    // here, the mhvtl cartridge needs a real `mt erase` before the suite can
-    // run again. NOT verified against real mhvtl hardware in this change
-    // (guardrail: no tape device access) — flagged for the coordinator.
+    // between them.
+    //
+    // IMPORTANT — this flag does NOT make the suite reuse-safe by itself,
+    // and it is weaker than an earlier version of this comment claimed.
+    // check_tape_contact (session.rs) now probes a foreign tape's own
+    // self-reported seal position on an identity mismatch, specifically so
+    // --force can never be used to overwrite an already-SEALED volume
+    // (ADR-0003) — see the "critical fix" commit after this one. That means:
+    // for the FIRST test in a run (blank tape, or a leftover that never got
+    // sealed), force=true correctly lets an otherwise-mismatched File 0
+    // through. But from the SECOND test that runs against a cartridge a
+    // PRIOR test actually sealed, File 0 legitimately names a different,
+    // now-SEALED label — that is AlreadySealed, not IdentityMismatch, and
+    // force cannot touch it (by design). The `.unwrap()` below WILL panic in
+    // that case. This is expected and correct per ADR-0001/0003, not a
+    // regression to paper over: the real fix is a genuine tape erase
+    // between runs (e.g. `mt -f /dev/nst0 erase`, unverified against mhvtl
+    // in this change — guardrail: no tape device access), not a wider
+    // override. NOT verified end-to-end (mhvtl is reportedly non-functional
+    // on this VM as of this writing per project notes, independent of this
+    // change) — flagged for the coordinator to resolve before the next real
+    // mhvtl run, most likely by erasing the scratch cartridge first.
     volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, true).unwrap();
     volume::write::volume_write(
         &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
