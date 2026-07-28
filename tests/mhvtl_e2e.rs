@@ -99,6 +99,15 @@ fn mhvtl_load() {
     } else {
         eprintln!("warning: no responding media changer found via lsscsi -g");
     }
+    // Bulk-erase the scratch cartridge — the test equivalent of the production
+    // reuse procedure (#27: retire, bulk-erase, `cartridge mark-erased`). The
+    // gated suite reuses ONE cartridge across many writes, so from the second
+    // run onward it carries a SEALED volume, and contact discipline correctly
+    // refuses to overwrite it (ADR-0003 — `--force` cannot and must not defeat
+    // that). Erasing here means the fixtures exercise the DEFAULT no-force
+    // path, which is the one production uses. Instant on mhvtl (~20ms).
+    let _ = Command::new("mt").args(["-f", TAPE_DEV, "rewind"]).status();
+    let _ = Command::new("mt").args(["-f", TAPE_DEV, "erase"]).status();
 }
 
 /// sha256 hex digest. `src/store.rs` and `src/volume/write.rs` each have a
@@ -305,7 +314,7 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
     // on this VM as of this writing per project notes, independent of this
     // change) — flagged for the coordinator to resolve before the next real
     // mhvtl run, most likely by erasing the scratch cartridge first.
-    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, true).unwrap();
+    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, false).unwrap();
     volume::write::volume_write(
         &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
     )
@@ -707,7 +716,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     // on this VM as of this writing per project notes, independent of this
     // change) — flagged for the coordinator to resolve before the next real
     // mhvtl run, most likely by erasing the scratch cartridge first.
-    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, true).unwrap();
+    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, false).unwrap();
     volume::write::volume_write(
         &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
     )

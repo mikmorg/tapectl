@@ -212,8 +212,18 @@ step_stage_symlinks() { TCTL stage create unitC; }
 # never-yet-sealed) cartridge on the first run after #27, and add an
 # explicit erase step here if repeat runs against the same media are
 # wanted.
-step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV" --force; }
-step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV" --force; }
+# Bulk-erase the scratch cartridge first — the gate reuses one cartridge across
+# runs, so from the second run onward it carries a SEALED volume and contact
+# discipline (#27) correctly refuses to overwrite it. `--force` cannot defeat
+# AlreadySealed by design (ADR-0003), so the honest fix is a real erase, which
+# mirrors the production reuse procedure (retire, bulk-erase, mark-erased) and
+# is instant on mhvtl. Erasing lets the gate exercise the DEFAULT no-force
+# path, which is the one an operator actually runs.
+step_erase_scratch_tape() {
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+}
+step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV"; }
+step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV"; }
 step_vol_verify() {
     TCTL volume verify "$LABEL" --device "$TAPE_DEV" --json | tee "$RUN/verify.json"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify.json"
@@ -241,6 +251,7 @@ check units           step_units
 check snapshots       step_snapshots
 check stage_main      step_stage_main
 check stage_symlink_unit step_stage_symlinks
+check erase_scratch   step_erase_scratch_tape
 check volume_init     step_vol_init
 check volume_write    step_vol_write
 check volume_verify   step_vol_verify
