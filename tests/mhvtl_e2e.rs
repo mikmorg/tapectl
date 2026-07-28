@@ -21,6 +21,8 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use tapectl::config::{Config, LtoBackendConfig, StagingConfig, TapectlPaths};
+use tapectl::store::Tier;
+use tapectl::volume::format::{self, ParsedIndexEntry};
 use tapectl::{db, staging, tenant, unit, volume};
 
 const TAPE_DEV: &str = "/dev/nst0";
@@ -209,19 +211,20 @@ fn mhvtl_full_round_trip() {
     let label = "MHVTLA";
     let h = write_volume("round-trip", label, &[("alice", "alice-unit", 5)]);
 
-    // T8 mechanical caller-update only (volume_verify gained a required
-    // `tier` parameter) — NOT an assertion fix. This whole suite is the
-    // sanctioned T8->T9 red window (v2-implementation-plan.md T8): its
-    // assertions below still assume v1 tape positions/behavior and are
-    // expected to fail when actually run under TAPECTL_MHVTL=1 --ignored
-    // until T9 updates them.
+    // Restore leg (v2-implementation-plan.md T9): intent unchanged from
+    // before the v2 flip — write, verify, restore, byte-identical diff. Only
+    // the `tier` parameter (T8) changed mechanically; the v2 STRUCTURAL
+    // positions (front index at File 3, envelopes from File 4, seal last) are
+    // asserted separately in `mhvtl_v2_layout_positions_derived_from_front_index`
+    // below, so a restore-path regression and a layout regression fail two
+    // distinguishable tests rather than one entangled one.
     let verify = volume::write::volume_verify(
         &h.conn,
         &h.config,
         label,
         TAPE_DEV,
         BLOCK_SIZE,
-        tapectl::store::Tier::default(),
+        Tier::default(),
     )
     .unwrap();
     assert_eq!(verify.failed, 0, "verify had failures: {verify:?}");
@@ -234,6 +237,89 @@ fn mhvtl_full_round_trip() {
         diff_recursive(h.source(1), &dest),
         "restored content differs from source"
     );
+}
+
+/// Leg 1 (v2-implementation-plan.md T9): v2 positions, derived entirely from
+/// the front index itself (File 3) — never hardcoded arithmetic. Front index
+/// at File 3; envelopes from File 4; every envelope precedes every data
+/// slice; seal marker last (`volume-format-v2.md` sec 1). Kept separate from
+/// `mhvtl_full_round_trip` so a restore-path failure and a layout-derivation
+/// failure are diagnosable independently.
+#[test]
+#[ignore]
+fn mhvtl_v2_layout_positions_derived_from_front_index() {
+    if !mhvtl_enabled() {
+        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        return;
+    }
+    let _g = tape_lock();
+    let label = "MHVTLH";
+    let h = write_volume(
+        "v2-positions",
+        label,
+        &[("dana", "dana-u", 2), ("erin", "erin-u", 2)],
+    );
+
+    let parsed = read_front_index(TAPE_DEV, BLOCK_SIZE);
+    let violations = format::validate_consistency(&parsed);
+    assert!(
+        violations.is_empty(),
+        "front index self-consistency violations: {violations:?}"
+    );
+
+    assert_eq!(parsed[0].type_label, "id_thunk");
+    assert_eq!(parsed[1].type_label, "system_guide");
+    assert_eq!(parsed[2].type_label, "restore_sh");
+    assert_eq!(parsed[3].type_label, "front_index");
+    assert_eq!(parsed[3].position, 3, "front index must sit at File 3");
+
+    let envelope_positions: Vec<i32> = parsed
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.type_label.as_str(),
+                "tenant_envelope" | "operator_envelope" | "operator_envelope_backup"
+            )
+        })
+        .map(|e| e.position)
+        .collect();
+    assert!(
+        !envelope_positions.is_empty(),
+        "expected at least one envelope"
+    );
+    assert_eq!(
+        *envelope_positions.iter().min().unwrap(),
+        4,
+        "the first envelope must sit at File 4 (volume-format-v2.md sec 1)"
+    );
+
+    let slice_positions: Vec<i32> = parsed
+        .iter()
+        .filter(|e| e.type_label == "data_slice")
+        .map(|e| e.position)
+        .collect();
+    assert!(
+        !slice_positions.is_empty(),
+        "expected at least one data slice"
+    );
+    assert!(
+        *envelope_positions.iter().max().unwrap() < *slice_positions.iter().min().unwrap(),
+        "every envelope must precede every data slice (v2 order)"
+    );
+
+    let seal = parsed.last().unwrap();
+    assert_eq!(seal.type_label, "seal_marker");
+    assert_eq!(
+        seal.position as usize,
+        parsed.len() - 1,
+        "seal marker must be the last file"
+    );
+    assert!(
+        *slice_positions.iter().max().unwrap() < seal.position,
+        "seal marker must come after every data slice"
+    );
+
+    drop(h); // keep temp dir alive until after tape reads
 }
 
 #[test]
@@ -304,6 +390,18 @@ fn parse_i32_field(text: &str, key: &str) -> Option<i32> {
     let rest = &text[idx + needle.len()..];
     let end = rest.find('\n').unwrap_or(rest.len());
     rest[..end].trim().parse().ok()
+}
+
+/// Read and parse the v2 front index (File 3) off the tape — the single
+/// source of truth for on-tape positions from File 4 onward
+/// (`docs/design/v2-implementation-plan.md` T9: "derive positions from the
+/// front index... not hardcoded arithmetic"). Shared by every leg that needs
+/// v2 structural positions.
+fn read_front_index(device: &str, block_size: usize) -> Vec<ParsedIndexEntry> {
+    let raw = read_tape_file_at(device, block_size, 3);
+    let text = String::from_utf8_lossy(&raw);
+    let trimmed = text.trim_end_matches('\0');
+    format::parse_front_index(trimmed).expect("front index (File 3) must parse")
 }
 
 #[test]
