@@ -77,12 +77,31 @@ pub fn validate_source(
         .collect();
     new_files.sort_unstable();
     if !new_files.is_empty() {
-        return Err(TapectlError::Other(format!(
-            "NEW: file(s) on disk not present in the snapshot manifest: {} — \
-             dar would archive content the catalog has never seen; take a new \
-             snapshot before staging (see #32)",
-            new_files.join(", ")
-        )));
+        // WARN, not error — deliberately weaker than BITROT/MISSING/DIRTY.
+        //
+        // Two reasons. (1) The design doc (§2.13) files NEW as a
+        // `check-integrity` REPORT status, not a stage-time gate; hard-failing
+        // here would be tapectl inventing a stricter contract than its own spec.
+        // (2) More decisively, this check has a KNOWN false-positive source:
+        // `walk_directory` applies no exclusion filtering at all, while
+        // `stage_create` passes `global_excludes` to dar. So an incidentally
+        // excluded file appearing between `snapshot create` and `stage create`
+        // — an editor swap file, .DS_Store, a cache entry — would block staging
+        // outright for content dar was never going to archive.
+        //
+        // A gate whose false positives halt legitimate work is worse than no
+        // gate: operators learn to bypass it. The real cost of NEW is a catalog
+        // that under-reports a file dar did archive — a wart, not data loss.
+        //
+        // Upgrade this to a hard error once #49 wires excludes through
+        // `walk_directory`, at which point the false-positive source is gone.
+        tracing::warn!(
+            files = %new_files.join(", "),
+            "NEW: file(s) on disk are absent from the snapshot manifest; dar will \
+             archive content the catalog has not recorded. Re-run `snapshot create` \
+             before staging if these should be catalogued (design §2.13; hard-fails \
+             once #49 makes exclusion-aware detection possible)"
+        );
     }
 
     let total_files = files.len();
@@ -511,31 +530,27 @@ mod tests {
     }
 
     #[test]
-    fn new_file_on_disk_not_in_manifest_is_classified_new_and_refused() {
-        // NEW (issue #32's own remediation text: "diff walked set vs
-        // manifest for NEW/MISSING"): dar would silently archive
-        // `extra.txt` even though the catalog has never seen it, breaking
-        // the "two stage_sets of one snapshot are logically identical"
-        // invariant the finding names — refuse to stage rather than let
-        // that happen quietly.
+    fn new_file_on_disk_not_in_manifest_warns_but_does_not_refuse() {
+        // NEW is a WARNING, not a gate — see the rationale at the check itself.
+        // The design doc (§2.13) files NEW as a check-integrity report status,
+        // and this detection has a known false-positive source (walk_directory
+        // applies no excludes, dar does), so blocking staging on it would halt
+        // legitimate work over files dar was never going to archive.
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("keep.txt"), b"hello").unwrap();
-        std::fs::write(tmp.path().join("extra.txt"), b"surprise").unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        std::fs::write(tmp.path().join("stray.tmp"), b"appeared after snapshot").unwrap();
+        let baseline = direct_hash(b"hello");
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline.as_str()))]);
 
-        let (conn, sid) = setup_conn_with_snapshot(&[("keep.txt", 5, None)]);
-        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
-            .err()
-            .unwrap();
-        let msg = format!("{err}");
-
-        assert!(msg.contains("NEW"), "must name it NEW, got: {msg}");
+        let out = validate_source(&conn, sid, tmp.path().to_str().unwrap());
         assert!(
-            msg.contains("extra.txt"),
-            "must name the untracked file, got: {msg}"
+            out.is_ok(),
+            "a NEW file must warn, not refuse staging: {out:?}"
         );
+        let checksums = out.unwrap();
         assert!(
-            !msg.contains("keep.txt"),
-            "must not implicate the tracked file, got: {msg}"
+            checksums.iter().any(|(p, _)| p == "a.txt"),
+            "the manifest's own file must still be hashed and returned: {checksums:?}"
         );
     }
 
