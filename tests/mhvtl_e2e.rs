@@ -620,10 +620,22 @@ fn mhvtl_no_plaintext_tenant_metadata() {
         .filter(|e| e.type_label == "tenant_envelope")
         .map(|e| e.position)
         .collect();
+    // 3, not 2: `add_unit(&mut h, "op", true, "op-unit", 1)` makes the
+    // operator tenant a genuine unit-owning tenant in this batch too (the
+    // planning-header/operator-envelope path's pre-existing convention —
+    // see write_volume's doc comment), and write.rs's distinct_tenant_ids
+    // has no operator exclusion (`units.iter().map(|u| u.tenant_id)`,
+    // deduped) — so build.rs's tenant-envelope loop, which iterates every
+    // distinct tenant_id among the units, emits one TenantEnvelope each for
+    // op, alpha, and bravo, in addition to the separate OperatorEnvelope/
+    // OperatorEnvelopeBackup pair generated unconditionally afterward. This
+    // matches the v1 code this test replaces, whose own envelope-range
+    // check counted the same three (`op_envelope >= first_envelope + 3; //
+    // op, alpha, bravo`).
     assert_eq!(
         tenant_envelope_positions.len(),
-        2,
-        "alpha and bravo must each get exactly one tenant envelope"
+        3,
+        "op, alpha, and bravo must each get their own tenant envelope"
     );
     assert_eq!(
         *tenant_envelope_positions.iter().min().unwrap(),
