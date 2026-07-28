@@ -13,16 +13,23 @@
 //! `--test-threads=1` at the command line.
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use tapectl::config::{Config, LtoBackendConfig, StagingConfig, TapectlPaths};
-use tapectl::store::Tier;
+use tapectl::store::{Evidence, MismatchKind, Store, TapeStore, Tier};
 use tapectl::volume::format::{self, ParsedIndexEntry};
+use tapectl::volume::layout::{
+    generate_front_index, generate_id_thunk_v2, generate_restore_script_v2, generate_seal_marker,
+    generate_system_guide_v2, FrontIndexFile, IdThunkV2Params,
+};
+use tapectl::volume::layout_model::{CapacityBudget, ContentSource, Layout, LayoutEntry, ZoneKind};
 use tapectl::{db, staging, tenant, unit, volume};
 
 const TAPE_DEV: &str = "/dev/nst0";
@@ -59,6 +66,15 @@ fn mhvtl_load() {
     let _ = Command::new("mtx")
         .args(["-f", "/dev/sg0", "load", "1"])
         .status();
+}
+
+/// sha256 hex digest. `src/store.rs` and `src/volume/write.rs` each have a
+/// private helper of the same name (not reachable from an integration test);
+/// this one backs the hand-corrupted-volume builder (T9 leg 4).
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 struct Harness {
@@ -697,4 +713,425 @@ fn mhvtl_health_logs_populated() {
         .unwrap();
     assert!(count >= 1, "no health_logs row after write");
     assert!(raw_len > 0, "raw_log empty");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Leg 3/4 (v2-implementation-plan.md T9, `v2-open-questions.md` sec 10):
+// "one chain walk, three consumers." Session confirm and `volume verify` are
+// exercised by every test above; these two legs additionally exercise
+// consumer 3 — RESTORE.sh's own, independently hand-written bash
+// reimplementation of the SAME keyless chain walk — and assert it agrees
+// with the Rust implementation both on a good tape (leg 3) and on exactly
+// WHICH position disagrees on a corrupted one (leg 4).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reconstruct a `Layout` purely from the tape's own front index (File 3) —
+/// mirrors `volume::write::volume_verify`'s internal reconstruction exactly
+/// (same public building blocks: `format::parse_front_index` +
+/// `ZoneKind::from_type_label`) — then run the SAME production
+/// `Store::confirm` chain walk. Exists only because `VerifyReport`
+/// (`volume_verify`'s own return type) carries counts only; leg 4 needs the
+/// full per-position `Evidence.mismatches` to assert WHICH position a
+/// corruption is implicated at, not just that a failure occurred. No `src/`
+/// change was needed for this — every piece here (`Store`, `TapeStore`,
+/// `Evidence`, `format::parse_front_index`, `ZoneKind::from_type_label`,
+/// `Layout`/`LayoutEntry`) was already `pub`.
+fn tape_confirm_evidence(device: &str, block_size: usize, tier: Tier) -> Evidence {
+    let mut store = TapeStore::open(device, block_size, u64::MAX).unwrap();
+
+    let mut fi_raw = Vec::new();
+    store.read_file(3, &mut fi_raw).unwrap();
+    let fi_text = String::from_utf8_lossy(&fi_raw);
+    let fi_trimmed = fi_text.trim_end_matches('\0');
+    let fi_true_len = fi_trimmed.len() as u64;
+
+    let parsed_fi = format::parse_front_index(fi_trimmed).expect("front index parses");
+    let mut entries = Vec::with_capacity(parsed_fi.len());
+    for p in &parsed_fi {
+        let kind = ZoneKind::from_type_label(&p.type_label)
+            .unwrap_or_else(|| panic!("unrecognized front-index type {}", p.type_label));
+        entries.push(LayoutEntry {
+            position: p.position,
+            // File 3's own true length is self-referential and excluded from
+            // its own entry (volume-format-v2.md sec 3) — recovered here the
+            // same way `volume_verify` recovers it, by NUL-stripping the raw
+            // read, not from the parsed entry.
+            size_bytes: if p.position == 3 {
+                Some(fi_true_len)
+            } else {
+                p.size_bytes
+            },
+            sha256: p.sha256_encrypted.clone(),
+            kind,
+            source: ContentSource::Generated,
+        });
+    }
+
+    let layout = Layout {
+        label: String::new(),
+        volume_uuid: String::new(),
+        media_type: String::new(),
+        block_size: block_size as u64,
+        // Unused by `chain_walk`/`confirm` (capacity is a build/validate-time
+        // concern) — same placeholder `volume_verify` uses.
+        budget: CapacityBudget {
+            available_bytes: 0,
+            reserve_bytes: 0,
+        },
+        entries,
+    };
+
+    store.confirm(&layout, tier).unwrap()
+}
+
+/// Extract RESTORE.sh (File 2, position-invariant between v1 and v2 —
+/// `volume-format-v2.md` sec 1) off the tape, strip block-padding NULs (the
+/// generated text has no interior NULs, so this recovers the exact generated
+/// bytes — the same trick `layout.rs`'s own `read_tape_text` uses), and write
+/// it to `dest`. Returns the script's text for a quick sanity check by the
+/// caller.
+fn extract_restore_sh(device: &str, block_size: usize, dest: &Path) -> String {
+    let script_bytes = read_tape_file_at(device, block_size, 2);
+    let script_text: String = String::from_utf8_lossy(&script_bytes)
+        .chars()
+        .filter(|&c| c != '\0')
+        .collect();
+    fs::write(dest, &script_text).unwrap();
+    script_text
+}
+
+/// Run the extracted RESTORE.sh with `--verify` against `device`, invoked via
+/// `bash <path>` (sidesteps chmod/noexec questions on the scratch tempdir —
+/// the shebang line is irrelevant either way) with `TAPE_DEVICE` set so the
+/// script targets the same tape this test just wrote/corrupted.
+fn run_restore_sh_verify(script_path: &Path, device: &str) -> std::process::Output {
+    Command::new("bash")
+        .arg(script_path)
+        .arg("--verify")
+        .env("TAPE_DEVICE", device)
+        .output()
+        .expect("failed to spawn RESTORE.sh --verify")
+}
+
+/// Leg 3 (`v2-open-questions.md` sec 10): write a good microcosm volume, then
+/// verify it TWO independent ways — the real production Rust chain walk
+/// (`volume verify --full`) and RESTORE.sh's own hand-written bash
+/// reimplementation of the SAME algorithm. Both must PASS. Deliberate
+/// duplication: heir independence — the bash walk agreeing with the Rust one
+/// with no tapectl, no DB, no key — IS the property this proves.
+#[test]
+#[ignore]
+fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
+    if !mhvtl_enabled() {
+        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        return;
+    }
+    let _g = tape_lock();
+    let label = "MHVTLK";
+    let h = write_volume("verify-parity-good", label, &[("carol", "carol-u", 2)]);
+
+    // (a) consumer 2: tapectl volume verify --full, the real production Rust
+    // code path.
+    let report = volume::write::volume_verify(
+        &h.conn,
+        &h.config,
+        label,
+        TAPE_DEV,
+        BLOCK_SIZE,
+        Tier::default(),
+    )
+    .expect("volume_verify must not Err on a good tape");
+    assert_eq!(
+        report.failed, 0,
+        "rust `volume verify --full` must PASS on a good tape: {report:?}"
+    );
+    assert!(report.passed > 0, "rust verify must have checked something");
+
+    // (b) consumer 3: RESTORE.sh's own bash chain walk.
+    let script_path = h.root.path().join("RESTORE.sh");
+    let script_text = extract_restore_sh(TAPE_DEV, BLOCK_SIZE, &script_path);
+    assert!(
+        script_text.contains("--verify"),
+        "extracted File 2 does not look like RESTORE.sh v2 (no --verify mode found)"
+    );
+
+    let output = run_restore_sh_verify(&script_path, TAPE_DEV);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "RESTORE.sh --verify must PASS on a good tape\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("VERIFY: PASS"),
+        "expected a VERIFY: PASS line, got:\n{stdout}"
+    );
+}
+
+/// Hand-build a MINIMAL, self-consistent v2 volume directly through
+/// `TapeStore` — bypassing `Layout`/the write session entirely. This is the
+/// only way to get a genuinely corrupt tape for the parity leg: the
+/// tri-layer (`layout-session.md` validation point 2, sacred invariant 2)
+/// would refuse to write slice bytes that disagree with their own recorded
+/// hash, so a real session can never produce this tape. Seven files:
+/// id_thunk, system_guide, restore_sh, front_index, TWO data slices,
+/// seal_marker — no envelopes (not needed for a keyless chain walk,
+/// `volume-format-v2.md` sec 5; `--verify` never attempts decryption). Returns
+/// the tape position of the ONE data slice whose ON-TAPE bytes are made to
+/// disagree with what the front index claims for it (`sha256_encrypted`) —
+/// the position both chain-walk implementations must implicate.
+fn write_hand_corrupted_volume(device: &str, block_size: usize, label: &str) -> i32 {
+    const TOTAL_FILES: i32 = 7;
+    const CORRUPTED_POSITION: i32 = 5;
+
+    let created_at = "2026-07-28T00:00:00Z";
+    let id_thunk_text = generate_id_thunk_v2(&IdThunkV2Params {
+        label,
+        uuid: "11111111-2222-3333-4444-555555555555",
+        media_type: "LTO-6",
+        tapectl_version: env!("CARGO_PKG_VERSION"),
+        nominal_capacity: 2_500_000_000,
+        mam_capacity: 0,
+        total_files: TOTAL_FILES,
+        mam_manufacturer: "",
+        mam_serial: "",
+        mam_length: 0,
+        mam_loads: 0,
+        created_at,
+    });
+    let guide_text = generate_system_guide_v2(label, TOTAL_FILES);
+    let restore_text = generate_restore_script_v2(label, TOTAL_FILES);
+
+    // Two data slices; arbitrary bytes are fine — `--verify`/`chain_walk`
+    // never attempts decryption, only ciphertext-hash comparison
+    // (`volume-format-v2.md` sec 5), so this leg needs no real age/tenant
+    // setup at all.
+    let slice_a = vec![0xABu8; 300_000];
+    let slice_b_claimed = vec![0xCDu8; 250_000];
+    let mut slice_b_actual = slice_b_claimed.clone();
+    slice_b_actual[0] ^= 0xFF; // the ON-TAPE bytes now disagree with the claim below
+
+    let id_hash = sha256_hex(id_thunk_text.as_bytes());
+    let guide_hash = sha256_hex(guide_text.as_bytes());
+    let restore_hash = sha256_hex(restore_text.as_bytes());
+    let slice_a_hash = sha256_hex(&slice_a);
+    // The front index claims the hash of the UNFLIPPED bytes — what a
+    // correctly-written tape would have. The actual on-tape bytes
+    // (`slice_b_actual`, written below) are the flipped ones.
+    let slice_b_claimed_hash = sha256_hex(&slice_b_claimed);
+
+    let fi_files = vec![
+        FrontIndexFile {
+            position: 0,
+            type_label: "id_thunk",
+            size_bytes: Some(id_thunk_text.len() as u64),
+            sha256_encrypted: Some(id_hash),
+        },
+        FrontIndexFile {
+            position: 1,
+            type_label: "system_guide",
+            size_bytes: Some(guide_text.len() as u64),
+            sha256_encrypted: Some(guide_hash),
+        },
+        FrontIndexFile {
+            position: 2,
+            type_label: "restore_sh",
+            size_bytes: Some(restore_text.len() as u64),
+            sha256_encrypted: Some(restore_hash),
+        },
+        FrontIndexFile {
+            position: 3,
+            type_label: "front_index",
+            size_bytes: None,
+            sha256_encrypted: None,
+        },
+        FrontIndexFile {
+            position: 4,
+            type_label: "data_slice",
+            size_bytes: Some(slice_a.len() as u64),
+            sha256_encrypted: Some(slice_a_hash),
+        },
+        FrontIndexFile {
+            position: 5,
+            type_label: "data_slice",
+            size_bytes: Some(slice_b_claimed.len() as u64),
+            sha256_encrypted: Some(slice_b_claimed_hash),
+        },
+        FrontIndexFile {
+            position: 6,
+            type_label: "seal_marker",
+            size_bytes: None,
+            sha256_encrypted: None,
+        },
+    ];
+    assert_eq!(fi_files.len(), TOTAL_FILES as usize);
+    assert_eq!(
+        fi_files[CORRUPTED_POSITION as usize].position,
+        CORRUPTED_POSITION
+    );
+    assert_eq!(
+        fi_files[CORRUPTED_POSITION as usize].type_label,
+        "data_slice"
+    );
+
+    let front_index_text = generate_front_index(label, &fi_files);
+    let fi_hash = sha256_hex(front_index_text.as_bytes());
+
+    // The seal marker's embedded copy fills in File 3's own size+hash (known
+    // now, at "seal" time); its own entry (position 6) stays hash-and-size-
+    // less, self-reference (`volume-format-v2.md` sec 4).
+    let mut seal_files = fi_files.clone();
+    seal_files[3].size_bytes = Some(front_index_text.len() as u64);
+    seal_files[3].sha256_encrypted = Some(fi_hash.clone());
+    let seal_text = generate_seal_marker(label, TOTAL_FILES, &fi_hash, &seal_files);
+
+    let mut store = TapeStore::open(device, block_size, 1_000_000_000).unwrap();
+    store
+        .execute(
+            &mut Cursor::new(id_thunk_text.as_bytes()),
+            id_thunk_text.len() as u64,
+            false,
+        )
+        .unwrap();
+    store
+        .execute(
+            &mut Cursor::new(guide_text.as_bytes()),
+            guide_text.len() as u64,
+            false,
+        )
+        .unwrap();
+    store
+        .execute(
+            &mut Cursor::new(restore_text.as_bytes()),
+            restore_text.len() as u64,
+            false,
+        )
+        .unwrap();
+    store
+        .execute(
+            &mut Cursor::new(front_index_text.as_bytes()),
+            front_index_text.len() as u64,
+            false,
+        )
+        .unwrap();
+    store
+        .execute(
+            &mut Cursor::new(slice_a.clone()),
+            slice_a.len() as u64,
+            false,
+        )
+        .unwrap();
+    store
+        .execute(
+            &mut Cursor::new(slice_b_actual.clone()),
+            slice_b_actual.len() as u64,
+            false,
+        )
+        .unwrap();
+    store
+        .execute(
+            &mut Cursor::new(seal_text.as_bytes()),
+            seal_text.len() as u64,
+            true,
+        )
+        .unwrap();
+
+    CORRUPTED_POSITION
+}
+
+/// Leg 4 (`v2-open-questions.md` sec 10): a hand-corrupted tape must make
+/// BOTH chain-walk implementations FAIL, and both must implicate the SAME
+/// position — not merely "some" failure. Proves the bash reimplementation
+/// doesn't just agree on pass/fail but on WHICH file, the load-bearing half
+/// of heir independence.
+#[test]
+#[ignore]
+fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
+    if !mhvtl_enabled() {
+        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        return;
+    }
+    let _g = tape_lock();
+    mhvtl_load();
+    let label = "MHVTLM";
+
+    let h = setup_mhvtl("corruption-parity");
+    h.conn
+        .execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES (?1, 'lto', 'mhvtl', 'LTO-6', 2500000000, 'active')",
+            rusqlite::params![label],
+        )
+        .unwrap();
+
+    let corrupted_position = write_hand_corrupted_volume(TAPE_DEV, BLOCK_SIZE, label);
+
+    // (a) Rust: the SAME production `Store::confirm` chain walk must FAIL —
+    // never an `Err` (fail-safe reporting via `Evidence.mismatches`,
+    // `volume-format-v2.md` sec 5) — and implicate exactly
+    // `corrupted_position`.
+    let evidence = tape_confirm_evidence(TAPE_DEV, BLOCK_SIZE, Tier::Integrity);
+    assert!(
+        !evidence.mismatches.is_empty(),
+        "rust chain walk must FAIL on the hand-corrupted tape"
+    );
+    assert!(
+        evidence
+            .mismatches
+            .iter()
+            .any(|m| m.position == corrupted_position as u32
+                && m.kind == MismatchKind::ContentHashMismatch),
+        "expected a ContentHashMismatch at position {corrupted_position}, got {:?}",
+        evidence.mismatches
+    );
+
+    // The production entry point must agree without erroring — same
+    // property, via the actual CLI-facing function rather than the
+    // position-preserving helper above.
+    let report = volume::write::volume_verify(
+        &h.conn,
+        &h.config,
+        label,
+        TAPE_DEV,
+        BLOCK_SIZE,
+        Tier::Integrity,
+    )
+    .expect("volume_verify must report failure via VerifyReport, not Err");
+    assert!(
+        report.failed > 0,
+        "volume_verify must report a failure on the corrupted tape: {report:?}"
+    );
+
+    // (b) bash: RESTORE.sh --verify must ALSO fail and print a FAIL line at
+    // the SAME position.
+    let script_path = h.root.path().join("RESTORE.sh");
+    extract_restore_sh(TAPE_DEV, BLOCK_SIZE, &script_path);
+
+    let output = run_restore_sh_verify(&script_path, TAPE_DEV);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "RESTORE.sh --verify must FAIL on the hand-corrupted tape\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("VERIFY: PASS"),
+        "must not print VERIFY: PASS on a corrupted tape:\n{stdout}"
+    );
+
+    // Per-file lines are `printf "FAIL  file %3d  %-24s  ..."` — token 0 is
+    // "FAIL", token 1 is "file", token 2 is the position. Parsed rather than
+    // matched as an exact-width substring so this isn't brittle to printf's
+    // padding.
+    let fail_positions: Vec<i32> = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("FAIL"))
+        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter_map(|s| s.parse::<i32>().ok())
+        .collect();
+    assert!(
+        fail_positions.contains(&corrupted_position),
+        "expected a FAIL line for position {corrupted_position}, got FAIL lines at \
+         {fail_positions:?}\nfull output:\n{stdout}"
+    );
 }
