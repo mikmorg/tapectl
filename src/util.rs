@@ -1,6 +1,6 @@
 //! Small shared utilities that don't belong to any one subsystem.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
@@ -44,6 +44,65 @@ impl<R: Read> Read for HashingReader<R> {
             self.hasher.update(&buf[..n]);
         }
         Ok(n)
+    }
+}
+
+/// A `Write` adapter that computes the sha256 of every byte written through
+/// it, and counts them. The writer-side counterpart to `HashingReader` —
+/// added for the staging H9 fix (issue #35): wrap an output file with this
+/// so the ciphertext hash and size are known from the same streaming pass
+/// that writes it (e.g. sitting between `age::Encryptor::wrap_output` and
+/// the on-disk `.age` file), never a second read-back of the whole file.
+/// Wrap any `Write` sink; drive it to completion through the normal `Write`
+/// interface (including whatever finalizes the wrapped format, e.g.
+/// `age::stream::StreamWriter::finish`, which hands the wrapped writer back
+/// out), then call `finalize_hex()` / `bytes_written()`.
+pub struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    bytes_written: u64,
+}
+
+impl<W: Write> HashingWriter<W> {
+    /// Wrap `inner`, starting from a fresh hash state and a zero byte count.
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+        }
+    }
+
+    /// The hex sha256 of every byte written through this adapter so far.
+    ///
+    /// Non-consuming (clones the internal hasher state), matching
+    /// `HashingReader::finalize_hex` — safe to call after the wrapped
+    /// writer has been driven to completion without giving up ownership.
+    pub fn finalize_hex(&self) -> String {
+        format!("{:x}", self.hasher.clone().finalize())
+    }
+
+    /// Total bytes written through this adapter so far.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            // Hash/count exactly the `n` bytes the inner writer actually
+            // accepted, not the whole `buf` — mirrors `HashingReader`'s
+            // same care for a short read, here for a short write.
+            self.hasher.update(&buf[..n]);
+            self.bytes_written += n as u64;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -105,5 +164,55 @@ mod tests {
         let mut sink = Vec::new();
         reader.read_to_end(&mut sink).unwrap();
         assert_eq!(reader.finalize_hex(), reader.finalize_hex());
+    }
+
+    #[test]
+    fn hashing_writer_matches_direct_hash_on_write_all() {
+        let data = b"the quick brown fox jumps over the lazy dog, repeated to exceed one buffer, \
+                     the quick brown fox jumps over the lazy dog, repeated to exceed one buffer";
+        let mut writer = HashingWriter::new(Vec::new());
+        writer.write_all(data).unwrap();
+
+        assert_eq!(writer.finalize_hex(), direct_hash(data));
+        assert_eq!(writer.bytes_written(), data.len() as u64);
+    }
+
+    #[test]
+    fn hashing_writer_accumulates_across_small_partial_writes() {
+        // Write in chunks smaller than any real buffer to exercise partial
+        // writes landing in the hasher exactly once each.
+        let data: Vec<u8> = (0..=255u8).collect();
+        let mut writer = HashingWriter::new(Vec::new());
+        for chunk in data.chunks(7) {
+            writer.write_all(chunk).unwrap();
+        }
+        assert_eq!(writer.finalize_hex(), direct_hash(&data));
+        assert_eq!(writer.bytes_written(), data.len() as u64);
+    }
+
+    #[test]
+    fn empty_sink_hashes_to_the_empty_digest() {
+        let writer = HashingWriter::new(Vec::new());
+        assert_eq!(writer.finalize_hex(), direct_hash(&[]));
+        assert_eq!(writer.bytes_written(), 0);
+    }
+
+    #[test]
+    fn hashing_writer_finalize_hex_is_stable_when_called_more_than_once() {
+        // Non-consuming: calling it twice must not change state or crash.
+        let mut writer = HashingWriter::new(Vec::new());
+        writer.write_all(b"stable").unwrap();
+        assert_eq!(writer.finalize_hex(), writer.finalize_hex());
+    }
+
+    #[test]
+    fn hashing_writer_passes_bytes_through_to_the_inner_writer_unchanged() {
+        // The adapter must be transparent — what comes out the inner
+        // writer is exactly what went in, not just a hash side-channel.
+        let data = b"payload bytes must reach the inner writer untouched";
+        let mut writer = HashingWriter::new(Vec::new());
+        writer.write_all(data).unwrap();
+        let inner = writer.inner;
+        assert_eq!(inner, data);
     }
 }
