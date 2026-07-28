@@ -62,8 +62,10 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
 - **In code:** a typestate **write session** (`src/volume/session.rs`:
   build → validate → plan → execute → seal → confirm), a **Store trait** with a
   shared chain walk (`src/store.rs`), Layout build/materialize (`src/volume/build.rs`),
-  format parsers (`src/volume/format.rs`), and a **Library** layer
-  (`src/library/`, `library sync|status|plan|run`) for folder-per-unit archiving.
+  format parsers (`src/volume/format.rs`), and a **Collection** layer
+  (`src/collection/`, `collection sync|status|plan|run`) for folder-per-unit
+  archiving (CONTEXT.md: "Collection" is the source-root concept; "library" is
+  reserved for the tape library / changer).
 - **Verified:** 270 ungated tests; `tests/format_v2.rs` is a keyless synthetic-heir
   acceptance suite (proves the byte layout from recorded bytes alone); mhvtl e2e 9/9
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
@@ -141,7 +143,7 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- --nocapture --te
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit
 - **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` are the remaining peers (#72/#73)
-- **Library** (`src/library/`): `[[libraries]]` config → `library sync|status|plan|run`; folder-per-unit registration, alphabetical first-fit batch selector, stage-once/write-N-copies/release
+- **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical first-fit batch selector, stage-once/write-N-copies/release
 
 **Design principles:**
 - Volumes are self-describing — full restore possible without the database or tapectl
