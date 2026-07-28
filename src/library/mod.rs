@@ -21,7 +21,7 @@ pub mod selector;
 pub mod status;
 pub mod sync;
 
-use crate::config::LibraryConfig;
+use crate::config::{Config, LibraryConfig};
 use crate::db::models::Unit;
 use crate::error::{Result, TapectlError};
 
@@ -61,6 +61,18 @@ pub fn canonical_root(lib: &LibraryConfig) -> Result<String> {
                 lib.name, lib.root
             ))
         })
+}
+
+/// Look up a configured library by name — the one CLI surface (`library
+/// run`) that isn't spec'd in §11 as operating over every configured
+/// library at once, since executing a batch inherently targets one library
+/// (see the T10 report's "Deviations" section).
+pub fn find_library<'a>(config: &'a Config, name: &str) -> Result<&'a LibraryConfig> {
+    config
+        .libraries
+        .iter()
+        .find(|l| l.name == name)
+        .ok_or_else(|| TapectlError::Other(format!("no library named \"{name}\" is configured")))
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cartridge;
 pub mod catalog;
 pub mod key;
+pub mod library;
 pub mod location;
 pub mod operations;
 pub mod report;
@@ -69,6 +70,12 @@ pub enum Commands {
     Unit {
         #[command(subcommand)]
         command: unit::UnitCommands,
+    },
+
+    /// Manage media libraries (folder=unit factory + batch tape driver)
+    Library {
+        #[command(subcommand)]
+        command: library::LibraryCommands,
     },
 
     /// Manage snapshots
