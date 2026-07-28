@@ -60,12 +60,45 @@ fn find_dar() -> String {
     "dar".into()
 }
 
-// mhvtl library element numbers are canned; "load 1" is a best-effort no-op
-// on VMs where the drive is already loaded, and volume_init rewinds anyway.
+/// Discover the media changer instead of hardcoding it (issue #67).
+///
+/// SCSI enumeration shuffles across mhvtl module reloads — `/dev/sg0` was the
+/// changer once and is the CD-ROM today, which silently broke every gated test
+/// (the `mtx` call is best-effort, so the failure only surfaced downstream as
+/// `volume_init` finding no media). Ask `lsscsi -g` for the `mediumx` devices
+/// and use the first that actually answers `mtx status`.
+fn discover_changer() -> Option<String> {
+    let out = Command::new("lsscsi").arg("-g").output().ok()?;
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for line in listing.lines().filter(|l| l.contains("mediumx")) {
+        if let Some(sg) = line
+            .split_whitespace()
+            .rev()
+            .find(|f| f.starts_with("/dev/sg"))
+        {
+            let ok = Command::new("mtx")
+                .args(["-f", sg, "status"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(sg.to_string());
+            }
+        }
+    }
+    None
+}
+
+// "load 1" is a best-effort no-op on VMs where the drive is already loaded, and
+// volume_init rewinds anyway. The changer is discovered, never assumed.
 fn mhvtl_load() {
-    let _ = Command::new("mtx")
-        .args(["-f", "/dev/sg0", "load", "1"])
-        .status();
+    if let Some(changer) = discover_changer() {
+        let _ = Command::new("mtx")
+            .args(["-f", &changer, "load", "1"])
+            .status();
+    } else {
+        eprintln!("warning: no responding media changer found via lsscsi -g");
+    }
 }
 
 /// sha256 hex digest. `src/store.rs` and `src/volume/write.rs` each have a
