@@ -162,6 +162,29 @@ fn setup_mhvtl(name: &str) -> Harness {
         hardware_compression: false,
     });
 
+    // Register the permanent escrow recipient (ADR-0005). Pre-write validation
+    // REFUSES without one, so this is not optional fixture decoration — it is
+    // the state every real volume write requires. The harness predates T2's
+    // escrow work; without this every gated test dies at volume_write with
+    // "escrow recipient missing". Public key only, exactly as production does
+    // (the secret half never touches the DB).
+    {
+        tenant::add_tenant(&conn, &paths, "escrow-holder", None, false).unwrap();
+        let holder = tapectl::db::queries::get_tenant_by_name(&conn, "escrow-holder")
+            .unwrap()
+            .expect("escrow holder tenant");
+        let kp = tapectl::crypto::keys::generate_keypair();
+        tapectl::db::queries::insert_escrow_key(
+            &conn,
+            holder.id,
+            "mhvtl-escrow",
+            &kp.fingerprint,
+            &kp.public_key,
+            Some("test escrow recipient (ADR-0005)"),
+        )
+        .unwrap();
+    }
+
     Harness {
         root,
         paths,
@@ -410,6 +433,29 @@ fn mhvtl_v2_layout_positions_derived_from_front_index() {
     drop(h); // keep temp dir alive until after tape reads
 }
 
+/// Remove EVERY secret key belonging to `tenant` (`<tenant>-*.age.key`).
+///
+/// Each tenant gets both a `primary` and a `backup` keypair, and staging
+/// encrypts to every ACTIVE key, so deleting only `<tenant>-primary.age.key`
+/// leaves the backup able to decrypt — which silently defeats any
+/// "key is gone" assertion. Leaves `.age.pub` files alone: only the secret
+/// half determines what can be decrypted.
+fn remove_secret_keys(keys_dir: &Path, tenant: &str) {
+    let prefix = format!("{tenant}-");
+    let mut removed = 0;
+    for entry in fs::read_dir(keys_dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && name.ends_with(".age.key") {
+            fs::remove_file(entry.path()).unwrap();
+            removed += 1;
+        }
+    }
+    assert!(
+        removed > 0,
+        "expected at least one secret key for tenant {tenant} to remove"
+    );
+}
+
 #[test]
 #[ignore]
 fn mhvtl_tenant_isolation() {
@@ -424,12 +470,45 @@ fn mhvtl_tenant_isolation() {
         &[("alice", "alice-u", 3), ("bob", "bob-u", 3)],
     );
 
-    // Remove bob's secret key — restoring bob-u must fail cleanly while
-    // alice-u still succeeds. Exercises tenant-envelope trial-decrypt isolation.
-    fs::remove_file(h.paths.keys_dir.join("bob-primary.age.key")).unwrap();
+    // Two properties, both true of the SHIPPED design (the previous single
+    // assertion here — "bob restore must fail once bob's key is gone" — was
+    // stale, diagnosed during the 2026-07-20 mhvtl repair and filed under #43):
+    //
+    // Every slice is encrypted to its tenant AND the operator
+    // (`staging/mod.rs`'s `all_pubkeys`), and restore deliberately
+    // trial-decrypts with tenant + operator identities (commit edc634e). That
+    // is the point of the operator envelope: tenants are one operator's data
+    // classes, not separate principals, so the operator can recover anything.
+    // Asserting bob's restore FAILS while the operator key is present asserted
+    // the opposite of the design.
+    //
+    // Real tenant-vs-tenant crypto isolation is covered by
+    // `tests/tenant_isolation.rs` (cross-decrypt rejection) and by the leak
+    // scan; what belongs HERE is the on-tape key-availability behaviour.
+    remove_secret_keys(&h.paths.keys_dir, "bob");
 
     restore_to(&h, "alice-u", label, &h.root.path().join("restored-alice"));
 
+    // (1) bob's own key is gone, but the operator's remains: restore SUCCEEDS,
+    //     because the operator is a recipient on every slice.
+    let bob_via_op = h.root.path().join("restored-bob-via-operator");
+    fs::create_dir_all(&bob_via_op).unwrap();
+    volume::restore::restore_unit(
+        &h.conn,
+        &h.paths,
+        &h.config,
+        "bob-u",
+        label,
+        &bob_via_op.to_string_lossy(),
+        TAPE_DEV,
+        BLOCK_SIZE,
+        false,
+    )
+    .expect("operator key must still recover bob-u — operator is a recipient on every slice");
+
+    // (2) remove the operator key too: now NO usable identity exists for
+    //     bob-u, and restore must fail cleanly rather than produce garbage.
+    remove_secret_keys(&h.paths.keys_dir, "op");
     let bob_dest = h.root.path().join("restored-bob");
     fs::create_dir_all(&bob_dest).unwrap();
     let res = volume::restore::restore_unit(
@@ -443,7 +522,10 @@ fn mhvtl_tenant_isolation() {
         BLOCK_SIZE,
         false,
     );
-    assert!(res.is_err(), "bob restore must fail with missing key");
+    assert!(
+        res.is_err(),
+        "with neither bob's nor the operator's key present, bob-u restore must fail cleanly"
+    );
 }
 
 #[test]
