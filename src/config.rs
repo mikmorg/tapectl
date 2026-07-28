@@ -37,6 +37,9 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
 
     #[serde(default)]
+    pub libraries: Vec<LibraryConfig>,
+
+    #[serde(default)]
     pub packing: PackingConfig,
 
     #[serde(default)]
@@ -82,8 +85,6 @@ pub struct LtoBackendConfig {
     pub nominal_capacity: String,
     #[serde(default = "default_usable_capacity_factor")]
     pub usable_capacity_factor: f64,
-    #[serde(default = "default_manifest_reserve")]
-    pub manifest_reserve: String,
     #[serde(default = "default_enospc_buffer")]
     pub enospc_buffer: String,
     #[serde(default = "default_block_size")]
@@ -94,9 +95,6 @@ pub struct LtoBackendConfig {
 
 fn default_usable_capacity_factor() -> f64 {
     0.92
-}
-fn default_manifest_reserve() -> String {
-    "200M".to_string()
 }
 fn default_enospc_buffer() -> String {
     "50M".to_string()
@@ -229,6 +227,44 @@ impl Default for StagingConfig {
 pub struct DiscoveryConfig {
     #[serde(default)]
     pub watch_roots: Vec<String>,
+}
+
+/// One media-library root (`docs/design/v2-open-questions.md` §11): a
+/// folder=unit factory over existing unit machinery, batch-synced and
+/// batch-written instead of ceremonially `unit init`'d one at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryConfig {
+    /// Library name — also the unit-name prefix library sync assigns
+    /// (`"{name}/{relative_path}"`), so units stay unique across libraries.
+    pub name: String,
+    /// Root directory to walk.
+    pub root: String,
+    /// Tenant new units are registered under.
+    pub tenant: String,
+    /// Depth at which child folders become atomic units (1 = immediate
+    /// children; 2 = grandchildren, e.g. show/season shapes).
+    #[serde(default = "default_unit_depth")]
+    pub unit_depth: usize,
+    /// Walk-level excludes (glob, matched against the unit folder's own
+    /// basename) — on top of `defaults.global_excludes`, which apply inside
+    /// units at stage time. E.g. `"*.partial"` to skip an in-flight copy.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Policy binding (slice size, min_copies, …) for units this library
+    /// registers. `None` falls through to system defaults, same as manual
+    /// `unit init` without `--archive-set`.
+    #[serde(default)]
+    pub archive_set: Option<String>,
+    /// `true` (default): register new units with a `.tapectl-unit.toml`
+    /// (uuid identity, rename-proof). `false`: path-keyed identity for
+    /// read-only sources that can't be written to — trades away rename
+    /// robustness for zero on-disk footprint.
+    #[serde(default = "default_true")]
+    pub dotfiles: bool,
+}
+
+fn default_unit_depth() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

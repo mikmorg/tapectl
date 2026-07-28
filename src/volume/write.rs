@@ -227,9 +227,9 @@ pub fn volume_write(
     let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
-    // (`volume-format-v2.md` §8) — `manifest_reserve` is no longer read here
-    // (the field itself is removed in T10, once nothing reads it; this is
-    // that "nothing" for the write path).
+    // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
+    // gone (T10 config cleanup: nothing read it after this path stopped, and
+    // this was that "nothing").
     let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer).max(0) as u64;
 
     // Tenants + keys: one TenantInfo per distinct tenant_id in this batch,

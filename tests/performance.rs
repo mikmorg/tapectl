@@ -83,7 +83,6 @@ fn setup(name: &str) -> PerfHarness {
         media_type: "LTO-6".into(),
         nominal_capacity: "2400G".into(),
         usable_capacity_factor: 0.92,
-        manifest_reserve: "200M".into(),
         enospc_buffer: "50M".into(),
         block_size: "512K".into(),
         hardware_compression: false,
