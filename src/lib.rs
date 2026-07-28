@@ -8,6 +8,7 @@ pub mod tenant;
 pub mod unit;
 
 pub mod dar;
+pub mod library;
 pub mod staging;
 pub mod tape;
 pub mod volume;
