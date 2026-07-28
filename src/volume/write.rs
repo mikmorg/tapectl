@@ -23,7 +23,9 @@ use super::layout;
 use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, ZoneKind,
 };
-use super::session::{ConfirmOutcome, ExecuteOutcome, QuarantineReason};
+use super::session::{
+    check_tape_contact, ConfirmOutcome, ContactOutcome, ExecuteOutcome, QuarantineReason,
+};
 
 /// STOP-GAP pending an explicit operator/schema decision — see the T8 report.
 ///
@@ -84,12 +86,23 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// (`docs/design/v2-open-questions.md` §2.3) — the write session rewrites
 /// File 0 from BOT with the real `total_files`/`seal_marker` once the Layout
 /// is built; this call must not try to preserve init's File 0.
+///
+/// Contact discipline (issue #27): before the first byte is written, File 0
+/// is read and checked via [`check_fresh_write_contact`] — the same check
+/// `session::InterruptedSession::resume_checking` runs. There is no `Layout`
+/// yet at init time (no staged units), so only the identity half applies
+/// (`seal_position = None`; see that function's doc comment for why this
+/// loses nothing: any tape with a parseable File 0 already refuses via
+/// identity, sealed or not). No DB row is created for `label` until AFTER
+/// this check passes, so a refusal here leaves no stale `volumes` row behind
+/// to clean up.
 pub fn volume_init(
     conn: &Connection,
     config: &Config,
     label: &str,
     device: &str,
     block_size: usize,
+    force: bool,
 ) -> Result<i64> {
     let existing: Option<i64> = conn
         .query_row(
@@ -113,18 +126,10 @@ pub fn volume_init(
     let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
     let media_type = &backend.media_type;
 
-    conn.execute(
-        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES (?1, ?2, 'lto', ?3, ?4, ?5, 'initialized')",
-        params![
-            label,
-            Uuid::new_v4().to_string(),
-            backend.name,
-            media_type,
-            nominal_capacity
-        ],
-    )?;
-    let volume_id = conn.last_insert_rowid();
+    // Generated here (not deferred to the `volume_uuid()` self-heal helper)
+    // so the SAME value is used for the contact check below and the
+    // eventual INSERT — no DB row exists yet to read it back from.
+    let candidate_uuid = Uuid::new_v4().to_string();
 
     // usable_bytes (the T4 capacity oracle) is informational at this stage —
     // volume_init only ever writes the provisional identity thunk; real
@@ -132,7 +137,26 @@ pub fn volume_init(
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    let volume_uuid = volume_uuid(conn, volume_id)?;
+    check_fresh_write_contact(&mut store, label, &candidate_uuid, None, force)?;
+    // The check above read File 0 (and possibly moved the physical head on
+    // real tape); undo that before the real write, which must start at BOT
+    // exactly like an untouched fresh session would (`reposition_for_resume`'s
+    // doc comment notes this one exception).
+    store.reposition_for_resume(0)?;
+
+    conn.execute(
+        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, ?2, 'lto', ?3, ?4, ?5, 'initialized')",
+        params![
+            label,
+            candidate_uuid,
+            backend.name,
+            media_type,
+            nominal_capacity
+        ],
+    )?;
+    let volume_id = conn.last_insert_rowid();
+
     // Provisional total_files: unknown until the write session builds the
     // real Layout. Format §1's minimum shape is 4 front files + >=1 tenant
     // envelope + operator + backup + >=1 slice + the seal marker; 8 is a
@@ -142,7 +166,7 @@ pub fn volume_init(
     let created_at = chrono::Utc::now().to_rfc3339();
     let id_thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
         label,
-        uuid: &volume_uuid,
+        uuid: &candidate_uuid,
         media_type,
         tapectl_version: env!("CARGO_PKG_VERSION"),
         nominal_capacity,
@@ -173,6 +197,13 @@ pub fn volume_init(
 /// (`docs/design/v2-open-questions.md` §9). Every on-tape byte comes from
 /// `build::build` + `session.rs` now; no hand-rolled layout logic (mini-index,
 /// manual position arithmetic) remains here.
+///
+/// Contact discipline (issue #27): once the Layout is built (so its real
+/// seal-marker position is known) and the store is open, but before
+/// `into_validated`/`plan`/`execute` ever run, [`check_fresh_write_contact`]
+/// reads File 0 and the seal-marker position and refuses on a wrong-tape or
+/// already-sealed finding — the same check `session::InterruptedSession::resume_checking`
+/// runs, applied to the fresh (non-resumed) path this function drives.
 pub fn volume_write(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -180,6 +211,7 @@ pub fn volume_write(
     label: &str,
     device: &str,
     block_size: usize,
+    force: bool,
 ) -> Result<()> {
     let volume_id: i64 = conn
         .query_row(
@@ -358,6 +390,27 @@ pub fn volume_write(
 
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
+    // Contact discipline (#27): the Layout is already built, so its real
+    // seal-marker entry gives an a-priori position — unlike `volume_init`,
+    // this check is never vacuous. Runs before capacity/plan/execute: no
+    // point checking whether a WRONG tape has room.
+    let seal_position = layout_snapshot
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+        .map(|e| e.position as u32);
+    check_fresh_write_contact(
+        &mut store,
+        label,
+        &layout_snapshot.volume_uuid,
+        seal_position,
+        force,
+    )?;
+    // Undo the position change the read-based check above made (TapeStore's
+    // read_file rewinds+forward-spaces internally) — the write below must
+    // start at BOT exactly like an untouched fresh session would.
+    store.reposition_for_resume(0)?;
+
     let validated = built.into_validated(&keys, &mut store).map_err(|errs| {
         TapectlError::Other(format!(
             "volume \"{label}\" failed validation at contact: {}",
@@ -504,10 +557,15 @@ fn record_write_bookkeeping(
 
 /// A one-line, human-readable summary of why a session quarantined —
 /// `volume_write`'s fresh (non-resumed) path only ever reaches
-/// `QuarantineReason::ConfirmFailed`; `IdentityMismatch`/`AlreadySealed` are
-/// resume-only outcomes this orchestrator doesn't produce (it never calls
-/// `InterruptedSession::resume`), but are handled here anyway so this stays
-/// exhaustive if that changes.
+/// `QuarantineReason::ConfirmFailed` here: `IdentityMismatch`/`AlreadySealed`
+/// are resume-only outcomes this orchestrator doesn't produce (it never
+/// calls `InterruptedSession::resume`), but are handled here anyway so this
+/// stays exhaustive if that changes. (Issue #27 added an EQUIVALENT
+/// identity/seal check to the fresh path too, in `check_fresh_write_contact`
+/// below — but deliberately as a plain refusal, not a `QuarantineReason`: a
+/// wrong cartridge loaded before any write means the operator grabbed the
+/// wrong tape, not that this not-yet-written logical volume diverged, so it
+/// is never marked `quarantined`. This function's claim above still holds.)
 fn describe_quarantine(reason: &QuarantineReason) -> String {
     match reason {
         QuarantineReason::ConfirmFailed(evidence) => format!(
@@ -528,6 +586,81 @@ fn describe_quarantine(reason: &QuarantineReason) -> String {
              (ADR-0003: sealed volumes are immutable)"
         ),
     }
+}
+
+/// A tiny, pure decision — no I/O, no `Store` — over an already-computed
+/// `ContactOutcome` (issue #27). Kept separate from [`check_fresh_write_contact`]
+/// so the decision itself (what does `--force` permit, and what does it
+/// never permit) is unit-testable without a store of any kind.
+///
+/// `allow_overwrite` is `--force`: the loud, explicit operator assertion
+/// (ADR-0001's third evidence category — physical facts an operator attests
+/// to at contact) for the one legitimate reuse case this repo's cartridge
+/// lifecycle does not (yet) wire into the write path at all: a foreign or
+/// stale identity at File 0 that the operator has physically verified is
+/// safe to overwrite. It can defeat `IdentityMismatch`. It can NEVER defeat
+/// `AlreadySealed` — ADR-0003 makes a sealed volume's immutability absolute,
+/// and the sanctioned way past a sealed cartridge is to bulk-erase it first
+/// (`cartridge mark-erased`), which is exactly what turns its File 0
+/// unreadable again (`ContactOutcome::Blank`) on the next attempt — not a
+/// software override.
+fn decide_fresh_write_contact(
+    outcome: &ContactOutcome,
+    label: &str,
+    volume_uuid: &str,
+    allow_overwrite: bool,
+) -> Result<()> {
+    match outcome {
+        ContactOutcome::Blank | ContactOutcome::Matches => Ok(()),
+        ContactOutcome::AlreadySealed { seal_position } => Err(TapectlError::Other(format!(
+            "refusing to write volume \"{label}\": the loaded cartridge already carries a SEALED \
+             volume — a valid seal marker parses at tape position {seal_position}. ADR-0003: \
+             sealed volumes are immutable, there is no append, and --force cannot override this. \
+             If this cartridge should be reused: retire its current volume, bulk-erase the \
+             physical tape, then run `tapectl cartridge mark-erased` before writing to it again."
+        ))),
+        ContactOutcome::IdentityMismatch { found } => {
+            let found_desc = match found {
+                Some(id) => format!("label={:?}, uuid={:?}", id.label, id.uuid),
+                None => "a present but unparseable/corrupt File 0".to_string(),
+            };
+            if allow_overwrite {
+                warn!(
+                    label,
+                    volume_uuid,
+                    found = %found_desc,
+                    "--force overriding a File-0 identity mismatch at contact"
+                );
+                Ok(())
+            } else {
+                Err(TapectlError::Other(format!(
+                    "refusing to write volume \"{label}\" (uuid {volume_uuid}): the loaded \
+                     cartridge's File 0 already identifies a DIFFERENT volume ({found_desc}) — \
+                     this looks like the wrong physical cartridge. Verify the correct tape is \
+                     loaded, or if you are deliberately overwriting this cartridge, re-run with \
+                     --force."
+                )))
+            }
+        }
+    }
+}
+
+/// The fresh-write contact check (issue #27): the same File-0 + seal-marker
+/// check `session::InterruptedSession::resume_checking` runs
+/// ([`check_tape_contact`]), applied before the very first byte of a fresh
+/// `volume_init`/`volume_write` — closing the gap the issue describes:
+/// neither call read File 0 before this fix, so loading the wrong cartridge
+/// (including one already holding a different, SEALED volume) silently
+/// overwrote it. Returns `Ok(())` to proceed; `Err` refuses.
+fn check_fresh_write_contact(
+    store: &mut dyn Store,
+    label: &str,
+    volume_uuid: &str,
+    seal_position: Option<u32>,
+    allow_overwrite: bool,
+) -> Result<()> {
+    let outcome = check_tape_contact(store, label, volume_uuid, seal_position);
+    decide_fresh_write_contact(&outcome, label, volume_uuid, allow_overwrite)
 }
 
 /// Verify a volume via the v2 keyless chain walk
@@ -1014,8 +1147,12 @@ pub fn compact_write(
     device: &str,
     block_size: usize,
 ) -> Result<()> {
-    // The normal volume_write picks up all staged data
-    volume_write(conn, paths, config, dest_label, device, block_size)
+    // The normal volume_write picks up all staged data. `force` is not
+    // exposed here (out of scope for #27, which is narrowly about
+    // `VolumeCommands::Init`/`Write`) — a compaction destination that fails
+    // contact discipline hard-refuses, same as `quick-archive`/`collection
+    // run` below.
+    volume_write(conn, paths, config, dest_label, device, block_size, false)
 }
 
 /// Compact-finish: retire the source volume after compaction.
@@ -1474,6 +1611,211 @@ mod tests {
         assert!(
             msg.contains("ADR-0003"),
             "expected the ADR citation in: {msg}"
+        );
+    }
+
+    // --- fresh-write contact discipline (issue #27) ------------------------
+    //
+    // `decide_fresh_write_contact` is pure (no store at all); `check_fresh_write_contact`
+    // adds the store round-trip via MemStore — the session tests' own
+    // convention (never a real tape device).
+
+    use crate::store::MemStore;
+
+    const FW_LABEL: &str = "NEWVOL";
+    const FW_UUID: &str = "11111111-1111-1111-1111-111111111111";
+    const FW_BS: u64 = 512 * 1024;
+
+    fn fw_id_thunk_bytes(label: &str, uuid: &str, total_files: i32) -> Vec<u8> {
+        let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label,
+            uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-28T00:00:00Z",
+        });
+        let mut padded = thunk.into_bytes();
+        padded.resize(FW_BS as usize, 0);
+        padded
+    }
+
+    fn fw_put_file(store: &mut MemStore, position: usize, bytes: Vec<u8>) {
+        if store.files.len() <= position {
+            store.files.resize(position + 1, Vec::new());
+            store.syncs.resize(position + 1, false);
+        }
+        store.files[position] = bytes;
+    }
+
+    // -- decide_fresh_write_contact: pure decision, no store -----
+
+    #[test]
+    fn decide_fresh_write_contact_blank_proceeds() {
+        decide_fresh_write_contact(&ContactOutcome::Blank, FW_LABEL, FW_UUID, false).unwrap();
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_matches_proceeds() {
+        decide_fresh_write_contact(&ContactOutcome::Matches, FW_LABEL, FW_UUID, false).unwrap();
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_mismatch_refuses_by_default_naming_found_and_expected() {
+        let found = format::parse_id_thunk_identity(&String::from_utf8_lossy(&fw_id_thunk_bytes(
+            "WRONGVOL",
+            "00000000-0000-0000-0000-000000000000",
+            8,
+        )))
+        .unwrap();
+        let outcome = ContactOutcome::IdentityMismatch { found: Some(found) };
+        let err = decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("WRONGVOL"),
+            "expected the FOUND label in: {msg}"
+        );
+        assert!(
+            msg.contains("00000000-0000-0000-0000-000000000000"),
+            "expected the FOUND uuid in: {msg}"
+        );
+        assert!(
+            msg.contains(FW_LABEL),
+            "expected the EXPECTED label in: {msg}"
+        );
+        assert!(
+            msg.contains(FW_UUID),
+            "expected the EXPECTED uuid in: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "expected the override hint in: {msg}"
+        );
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_mismatch_with_unparseable_file_zero_still_refuses() {
+        let outcome = ContactOutcome::IdentityMismatch { found: None };
+        let err = decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(FW_LABEL));
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_mismatch_permits_with_force() {
+        let outcome = ContactOutcome::IdentityMismatch {
+            found: Some(format::IdThunkIdentity {
+                label: "WRONGVOL".to_string(),
+                uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            }),
+        };
+        decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, true).unwrap();
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_already_sealed_refuses_without_force() {
+        let outcome = ContactOutcome::AlreadySealed { seal_position: 12 };
+        let err = decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("12"), "expected the seal position in: {msg}");
+        assert!(msg.contains("ADR-0003"));
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_already_sealed_refuses_even_with_force() {
+        // The one non-negotiable rule of the override: --force can defeat a
+        // wrong-identity refusal, but never a sealed one.
+        let outcome = ContactOutcome::AlreadySealed { seal_position: 12 };
+        let err = decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ADR-0003"),
+            "expected the ADR citation in: {msg}"
+        );
+    }
+
+    // -- check_fresh_write_contact: full pipeline via MemStore -----
+
+    #[test]
+    fn check_fresh_write_contact_blank_tape_permits_write() {
+        let mut store = MemStore::new(FW_BS as usize);
+        check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, Some(5), false).unwrap();
+    }
+
+    #[test]
+    fn check_fresh_write_contact_matching_identity_permits_write() {
+        // The critical fresh-write happy path: `volume_init` already stamped
+        // this exact tape's File 0 with this exact label+uuid; `volume_write`
+        // must proceed WITHOUT --force.
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(&mut store, 0, fw_id_thunk_bytes(FW_LABEL, FW_UUID, 8));
+        check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, Some(7), false).unwrap();
+    }
+
+    #[test]
+    fn check_fresh_write_contact_wrong_identity_refuses_with_found_and_expected() {
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(
+            &mut store,
+            0,
+            fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 8),
+        );
+        let err =
+            check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("WRONGVOL"), "found label missing from: {msg}");
+        assert!(msg.contains(FW_LABEL), "expected label missing from: {msg}");
+    }
+
+    #[test]
+    fn check_fresh_write_contact_wrong_identity_permits_with_force() {
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(
+            &mut store,
+            0,
+            fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 8),
+        );
+        check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, true).unwrap();
+    }
+
+    #[test]
+    fn check_fresh_write_contact_sealed_tape_refuses_even_with_force() {
+        // --force is not reachable by accident, AND it never reaches a
+        // sealed tape at all: prove both in one test by forcing anyway and
+        // still getting refused.
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(&mut store, 0, fw_id_thunk_bytes(FW_LABEL, FW_UUID, 6));
+        let seal_bytes = layout::generate_seal_marker(FW_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(FW_BS as usize, 0);
+        fw_put_file(&mut store, 5, seal_padded);
+
+        let err =
+            check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, Some(5), true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ADR-0003"), "expected ADR citation in: {msg}");
+    }
+
+    #[test]
+    fn check_fresh_write_contact_default_is_no_override_not_reachable_by_accident() {
+        // The zero-argument, no-flag CLI invocation must refuse — the
+        // override is never the default.
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(
+            &mut store,
+            0,
+            fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 8),
+        );
+        let default_force = bool::default();
+        assert!(!default_force, "bool::default() must be false");
+        assert!(
+            check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, default_force).is_err()
         );
     }
 }

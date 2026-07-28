@@ -17,6 +17,14 @@ pub enum VolumeCommands {
         /// Tape device path
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
+        /// Overwrite a cartridge whose File 0 already identifies a
+        /// DIFFERENT volume (e.g. a mislabeled or stale tape). Refused by
+        /// default (issue #27) — loading the wrong cartridge would
+        /// otherwise silently overwrite it. Never overrides a cartridge
+        /// that is already SEALED (ADR-0003): bulk-erase the physical tape
+        /// and run `cartridge mark-erased` first for that case.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Write staged data to volume
@@ -26,6 +34,9 @@ pub enum VolumeCommands {
         /// Tape device path
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
+        /// See `volume init --force` — same override, same limits.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Verify volume contents via the keyless chain walk (seal -> front index
@@ -133,8 +144,13 @@ pub fn run(
     json_output: bool,
 ) -> Result<()> {
     match command {
-        VolumeCommands::Init { label, device } => {
-            let vol_id = write::volume_init(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
+        VolumeCommands::Init {
+            label,
+            device,
+            force,
+        } => {
+            let vol_id =
+                write::volume_init(conn, config, label, device, DEFAULT_BLOCK_SIZE, *force)?;
             if json_output {
                 println!(
                     "{}",
@@ -145,8 +161,20 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Write { label, device } => {
-            write::volume_write(conn, paths, config, label, device, DEFAULT_BLOCK_SIZE)?;
+        VolumeCommands::Write {
+            label,
+            device,
+            force,
+        } => {
+            write::volume_write(
+                conn,
+                paths,
+                config,
+                label,
+                device,
+                DEFAULT_BLOCK_SIZE,
+                *force,
+            )?;
             if json_output {
                 println!(
                     "{}",

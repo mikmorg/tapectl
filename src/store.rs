@@ -161,9 +161,19 @@ pub trait Store {
     /// cursor already confirms is durably written
     /// (`docs/design/layout-session.md`'s two-case cursor rule: BOT if zero
     /// slices were written, else `front_zone_len + written_slices`), never
-    /// forward past it. A fresh (non-resumed) session never calls this — it
-    /// starts writing from position 0 implicitly, by virtue of never having
-    /// written anything yet.
+    /// forward past it. A fresh (non-resumed) session that never reads
+    /// anything first would not need this either — it would start writing
+    /// from position 0 implicitly, by virtue of never having written
+    /// anything yet.
+    ///
+    /// Issue #27 adds one exception: `write::check_fresh_write_contact`
+    /// reads File 0 (and possibly a seal-marker position) before a fresh
+    /// `volume_init`/`volume_write`'s first write, which moves `TapeStore`'s
+    /// physical head. Both callers therefore call `reposition_for_resume(0)`
+    /// once, immediately after a passing check, to undo that probe and
+    /// land back at BOT before `execute` ever runs — `file_index = 0` is a
+    /// pure "go to BOT" for both `Store` impls, identical to what a fresh
+    /// session that skipped the check would have started at anyway.
     ///
     /// No pre-T6 caller needed this (nothing could resume a session before
     /// now), so this is an additive method on an existing trait, not a
