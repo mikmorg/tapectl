@@ -162,7 +162,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let ss_id = crate::staging::stage_create(&conn, &paths, &cfg, snap_id)?;
             println!("staged (stage_set={ss_id})");
             // Step 4: write
-            crate::volume::write::volume_write(&conn, &paths, &cfg, volume, device, 512 * 1024)?;
+            // force=false: quick-archive writes to a caller-provided volume
+            // label with no override surface of its own (issue #27 scopes
+            // --force to `volume init`/`volume write` only).
+            crate::volume::write::volume_write(
+                &conn,
+                &paths,
+                &cfg,
+                volume,
+                device,
+                512 * 1024,
+                false,
+            )?;
             if cli.json {
                 println!(
                     "{}",

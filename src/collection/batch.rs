@@ -91,9 +91,13 @@ pub fn execute_batch(
     }
 
     // Session per copy — sequential, abort-on-first-failure (see doc
-    // comment above).
+    // comment above). `force=false`: each `label` is documented as "already
+    // `volume init`'d on its own cartridge" (`CollectionCommands::Run`'s own
+    // doc comment) — a contact-check refusal here means the wrong physical
+    // cartridge got loaded for this batch, which must hard-refuse, not
+    // silently override (issue #27).
     for label in copy_labels {
-        crate::volume::write::volume_write(conn, paths, config, label, device, block_size)?;
+        crate::volume::write::volume_write(conn, paths, config, label, device, block_size, false)?;
     }
 
     // Release staging: only reachable once every copy above sealed.
