@@ -157,6 +157,45 @@ fn add_unit(
     staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
 }
 
+/// Like `add_unit`, but also drops one distinctively-named file into the
+/// unit's source directory before staging. The v2 leak-scan leg (T9 leg 2,
+/// `volume-format-v2.md` sec 2's isolation invariant) needs a real source
+/// FILENAME to travel through dar's catalog so it can assert that filename
+/// never surfaces in plaintext — not just tenant/unit names. `.pdf` is
+/// deliberate: it must not collide with the default staging excludes
+/// (`*.nfo`, `*.tmp`, `Thumbs.db`, `.DS_Store`) or it would silently vanish
+/// from the snapshot and the needle would never have a chance to appear
+/// anywhere, making the assertion vacuous.
+fn add_unit_with_sentinel_file(
+    h: &mut Harness,
+    tenant_name: &str,
+    is_operator: bool,
+    unit_name: &str,
+    n_files: usize,
+    sentinel_filename: &str,
+) {
+    tenant::add_tenant(&h.conn, &h.paths, tenant_name, None, is_operator).unwrap();
+    let src = make_source(h.root.path(), unit_name, n_files);
+    fs::write(
+        src.join(sentinel_filename),
+        b"sentinel file content for the v2 leak-scan leg; only its NAME is the needle",
+    )
+    .unwrap();
+    unit::init_unit(
+        &h.conn,
+        &h.paths,
+        &src.to_string_lossy(),
+        tenant_name,
+        Some(unit_name),
+        &[],
+        None,
+    )
+    .unwrap();
+    h.source_dirs.push(src);
+    let sid = staging::snapshot_create(&h.conn, unit_name).unwrap();
+    staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
+}
+
 /// Build a harness and write a freshly-initialized volume with the given units.
 /// The first unit is always under the operator tenant "op" (required for the
 /// planning-header / operator-envelope encryption path).
@@ -404,6 +443,41 @@ fn read_front_index(device: &str, block_size: usize) -> Vec<ParsedIndexEntry> {
     format::parse_front_index(trimmed).expect("front index (File 3) must parse")
 }
 
+/// Every `sha256_plain` recorded for a unit's staged slices — the
+/// plaintext-CONTENT hash that `volume-format-v2.md` sec 2 says must never
+/// appear outside an encrypted envelope. Strengthens the leak-scan needle set
+/// (T9 leg 2) beyond tenant/unit names. The emptiness assert guards against
+/// this needle silently becoming a no-op if the join ever stops matching.
+fn slice_plaintext_hashes(conn: &Connection, unit_name: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT sl.sha256_plain FROM stage_slices sl
+             JOIN stage_sets ss ON ss.id = sl.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE u.name = ?1",
+        )
+        .unwrap();
+    let hashes: Vec<String> = stmt
+        .query_map(rusqlite::params![unit_name], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        !hashes.is_empty(),
+        "expected at least one staged slice for unit {unit_name}"
+    );
+    hashes
+}
+
+/// Leg 2 (v2-implementation-plan.md T9, `volume-format-v2.md` sec 2's
+/// isolation invariant, D4's real enforcement): plaintext positions are
+/// `{0, 1, 2, 3, seal_marker}` — everything else must start with the age
+/// magic. The needle set is strengthened beyond tenant/unit names: sentinel
+/// source FILENAMES and the expected `sha256_plain` hex digests must also be
+/// absent from every plaintext file. `sha256_encrypted` values and on-tape
+/// sizes are the accepted disclosure (format sec 2) and are deliberately
+/// NOT asserted absent.
 #[test]
 #[ignore]
 fn mhvtl_no_plaintext_tenant_metadata() {
@@ -413,37 +487,80 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     }
     let _g = tape_lock();
 
-    // Use names with no plausible substring collision against the volume
-    // label, tapectl boilerplate, or dar/age headers. If any of these strings
-    // show up in a plaintext file on tape, isolation is broken.
+    // Use names/filenames with no plausible substring collision against the
+    // volume label, tapectl boilerplate, or dar/age headers. If any of these
+    // strings (or an expected sha256_plain digest) show up in a plaintext
+    // file on tape, isolation is broken.
     let label = "MHVTLI";
     let t_alpha = "tnt-alpha-xyzzy";
     let t_bravo = "tnt-bravo-plover";
     let u_alpha = "unit-alpha-xyzzy";
     let u_bravo = "unit-bravo-plover";
-    let forbidden = [t_alpha, t_bravo, u_alpha, u_bravo];
+    let f_alpha = "secret-report-xyzzy-alpha.pdf";
+    let f_bravo = "secret-report-plover-bravo.pdf";
 
-    let h = write_volume(
-        "plaintext-leak",
-        label,
-        &[(t_alpha, u_alpha, 2), (t_bravo, u_bravo, 2)],
-    );
+    mhvtl_load();
+    let mut h = setup_mhvtl("plaintext-leak");
+    add_unit(&mut h, "op", true, "op-unit", 1);
+    add_unit_with_sentinel_file(&mut h, t_alpha, false, u_alpha, 2, f_alpha);
+    add_unit_with_sentinel_file(&mut h, t_bravo, false, u_bravo, 2, f_bravo);
 
-    // Pull layout info from the ID thunk (File 0) — it's plaintext TOML.
+    // Collected from the DB BEFORE the write — the plaintext-content hashes
+    // that must never appear outside an encrypted envelope.
+    let mut forbidden: Vec<String> = vec![
+        t_alpha.to_string(),
+        t_bravo.to_string(),
+        u_alpha.to_string(),
+        u_bravo.to_string(),
+        f_alpha.to_string(),
+        f_bravo.to_string(),
+    ];
+    forbidden.extend(slice_plaintext_hashes(&h.conn, u_alpha));
+    forbidden.extend(slice_plaintext_hashes(&h.conn, u_bravo));
+
+    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
+    volume::write::volume_write(&h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE).unwrap();
+
+    // Pull layout info from the ID thunk (File 0) — it's plaintext TOML. v2's
+    // [layout] table carries only front_index/seal_marker/total_files (the
+    // v1 mini_index/first_envelope/operator_envelope fields are gone,
+    // `volume-format-v2.md` sec 1/sec 8) — the envelope/slice RANGE now comes
+    // from the front index itself (File 3), never from ID-thunk position
+    // fields.
     let id_thunk = read_tape_file_at(TAPE_DEV, BLOCK_SIZE, 0);
     let id_text = std::str::from_utf8(&id_thunk).expect("id thunk utf8");
     assert!(id_text.contains(label));
+    assert!(
+        id_text.contains("tapectl-volume-v2"),
+        "id thunk must carry the v2 magic"
+    );
     let total_files = parse_i32_field(id_text, "total_files").expect("total_files");
-    let mini_index = parse_i32_field(id_text, "mini_index").expect("mini_index");
-    let first_envelope = parse_i32_field(id_text, "first_envelope").expect("first_envelope");
-    let op_envelope = parse_i32_field(id_text, "operator_envelope").expect("operator_envelope");
+    let front_index_pos = parse_i32_field(id_text, "front_index").expect("front_index");
+    let seal_marker_pos = parse_i32_field(id_text, "seal_marker").expect("seal_marker");
+    assert_eq!(
+        front_index_pos, 3,
+        "v2 front index must always sit at File 3 (volume-format-v2.md sec 1)"
+    );
 
-    // Classify every file on the tape and scan plaintext files.
-    // Plaintext-by-design positions: 0 (ID thunk), 1 (system guide),
-    //                                2 (RESTORE.sh), mini_index.
-    // Everything else must be age-encrypted.
+    // The front index (File 3) itself — the only source of the v2
+    // envelope/slice range now that the v1 ID-thunk position fields are gone.
+    let parsed = read_front_index(TAPE_DEV, BLOCK_SIZE);
+    let violations = format::validate_consistency(&parsed);
+    assert!(
+        violations.is_empty(),
+        "front index self-consistency violations: {violations:?}"
+    );
+    assert_eq!(
+        seal_marker_pos as usize,
+        parsed.len() - 1,
+        "ID thunk's seal_marker pointer must agree with the front index's own last entry"
+    );
+
+    // Plaintext-by-design positions (volume-format-v2.md sec 2): 0 (ID
+    // thunk), 1 (system guide), 2 (RESTORE.sh), 3 (front index), and the seal
+    // marker (last file). Everything else must be age-encrypted.
     let age_magic = b"age-encryption.org/v1";
-    let plaintext_positions = [0i32, 1, 2, mini_index];
+    let plaintext_positions = [0i32, 1, 2, front_index_pos, seal_marker_pos];
 
     for pos in 0..total_files {
         let data = read_tape_file_at(TAPE_DEV, BLOCK_SIZE, pos);
@@ -453,7 +570,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
             let s = String::from_utf8_lossy(&data);
             for needle in &forbidden {
                 assert!(
-                    !s.contains(needle),
+                    !s.contains(needle.as_str()),
                     "plaintext leak at file {pos}: contains {needle:?}"
                 );
             }
@@ -471,19 +588,64 @@ fn mhvtl_no_plaintext_tenant_metadata() {
             let s = String::from_utf8_lossy(&data);
             for needle in &forbidden {
                 assert!(
-                    !s.contains(needle),
+                    !s.contains(needle.as_str()),
                     "encrypted file {pos} contains plaintext {needle:?}"
                 );
             }
         }
     }
 
-    // Sanity-check the envelope range: between mini_index and op_envelope we
-    // should see at least one tenant envelope per tenant, and op_envelope
-    // plus its backup at the end.
-    assert!(first_envelope == mini_index + 1);
-    assert!(op_envelope >= first_envelope + 3); // op, alpha, bravo
-    assert!(op_envelope + 1 < total_files);
+    // Envelope-range sanity block, v2 order (volume-format-v2.md sec 1):
+    // envelopes start at File 4 and every envelope precedes every data slice.
+    // Derived entirely from the parsed front index, never hardcoded
+    // arithmetic.
+    let tenant_envelope_positions: Vec<i32> = parsed
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .map(|e| e.position)
+        .collect();
+    assert_eq!(
+        tenant_envelope_positions.len(),
+        2,
+        "alpha and bravo must each get exactly one tenant envelope"
+    );
+    assert_eq!(
+        *tenant_envelope_positions.iter().min().unwrap(),
+        4,
+        "the first envelope must sit at File 4 (volume-format-v2.md sec 1)"
+    );
+    let op_envelope_pos = parsed
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .map(|e| e.position)
+        .expect("operator envelope present");
+    let op_backup_pos = parsed
+        .iter()
+        .find(|e| e.type_label == "operator_envelope_backup")
+        .map(|e| e.position)
+        .expect("operator envelope backup present");
+    assert!(
+        op_envelope_pos > *tenant_envelope_positions.iter().max().unwrap(),
+        "operator envelope must follow every tenant envelope"
+    );
+    assert_eq!(
+        op_backup_pos,
+        op_envelope_pos + 1,
+        "operator envelope backup must immediately follow the operator envelope"
+    );
+    let slice_positions: Vec<i32> = parsed
+        .iter()
+        .filter(|e| e.type_label == "data_slice")
+        .map(|e| e.position)
+        .collect();
+    assert!(
+        !slice_positions.is_empty(),
+        "expected at least one data slice"
+    );
+    assert!(
+        op_backup_pos < *slice_positions.iter().min().unwrap(),
+        "every envelope must precede every data slice (v2 order, format sec 1)"
+    );
 
     drop(h); // keep temp dir alive until after tape reads
 }
