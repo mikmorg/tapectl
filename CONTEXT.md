@@ -110,6 +110,25 @@ two independent failure domains, refreshed after each production write
 session.
 _Avoid_: escrow package, key envelope (one component, not the kit)
 
+### Sourcing
+
+**Collection**:
+A configured source root whose child directories at a fixed depth each become
+one unit, bound to a single tenant and one policy. It is a factory and batch
+driver over units, never a storage concept: syncing a collection registers
+what is new and marks what has vanished, planning one fills tape-sized batches
+in name order. Units stay first-class underneath — a collection creates and
+tracks them, it does not replace them.
+_Avoid_: library (collides with the **Tape Library** below — this project runs
+mhvtl, whose config literally declares `Library: 10`), folder set, watch root
+
+**Tape Library**:
+The changer that holds cartridges and loads them into drives — virtual under
+mhvtl, an autoloader or a human hand otherwise. Always written in full; a bare
+"library" is ambiguous in this codebase and should not be used for either
+sense.
+_Avoid_: library (unqualified), robot, jukebox
+
 ### Storage
 
 **Store**:

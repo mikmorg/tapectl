@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use walkdir::WalkDir;
 
-use crate::config::LibraryConfig;
+use crate::config::CollectionConfig;
 use crate::db::models::Unit;
 use crate::error::Result;
 
@@ -154,13 +154,13 @@ pub fn classify(conn: &Connection, unit: &Unit) -> Result<Option<PendingUnit>> {
     }))
 }
 
-/// All pending units for one library: active units under its root, each
+/// All pending units for one collection: active units under its root, each
 /// classified. Only `'active'` units are considered — `missing` units have
 /// no directory to walk, and `tape_only`/`retired` are deliberate operator
 /// states this module never second-guesses.
-pub fn pending_units_for_library(
+pub fn pending_units_for_collection(
     conn: &Connection,
-    lib: &LibraryConfig,
+    lib: &CollectionConfig,
 ) -> Result<Vec<PendingUnit>> {
     let root = super::canonical_root(lib)?;
     let units = super::units_under_root(conn, &root)?;
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn a_unit_whose_directory_has_vanished_is_not_pending() {
         // classify() must not be sync's vanished-detector — that lives in
-        // `library::sync` and marks the unit `missing` instead.
+        // `collection::sync` and marks the unit `missing` instead.
         let conn = db::open_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("gone");

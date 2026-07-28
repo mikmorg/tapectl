@@ -93,7 +93,7 @@ pub enum TapectlError {
     Other(String),
 }
 
-/// Convenience type alias for library results.
+/// Convenience type alias for collection results.
 pub type Result<T> = std::result::Result<T, TapectlError>;
 
 /// Exit the process with the appropriate code for the given error.

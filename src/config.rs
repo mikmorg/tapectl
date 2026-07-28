@@ -37,7 +37,7 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
 
     #[serde(default)]
-    pub libraries: Vec<LibraryConfig>,
+    pub collections: Vec<CollectionConfig>,
 
     #[serde(default)]
     pub packing: PackingConfig,
@@ -229,13 +229,13 @@ pub struct DiscoveryConfig {
     pub watch_roots: Vec<String>,
 }
 
-/// One media-library root (`docs/design/v2-open-questions.md` §11): a
+/// One media-collection root (`docs/design/v2-open-questions.md` §11): a
 /// folder=unit factory over existing unit machinery, batch-synced and
 /// batch-written instead of ceremonially `unit init`'d one at a time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LibraryConfig {
-    /// Library name — also the unit-name prefix library sync assigns
-    /// (`"{name}/{relative_path}"`), so units stay unique across libraries.
+pub struct CollectionConfig {
+    /// Collection name — also the unit-name prefix collection sync assigns
+    /// (`"{name}/{relative_path}"`), so units stay unique across collections.
     pub name: String,
     /// Root directory to walk.
     pub root: String,
@@ -250,7 +250,7 @@ pub struct LibraryConfig {
     /// units at stage time. E.g. `"*.partial"` to skip an in-flight copy.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Policy binding (slice size, min_copies, …) for units this library
+    /// Policy binding (slice size, min_copies, …) for units this collection
     /// registers. `None` falls through to system defaults, same as manual
     /// `unit init` without `--archive-set`.
     #[serde(default)]

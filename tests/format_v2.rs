@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use common::{generate_library, MicroSpec, UnitFixture, MICRO_BLOCK};
+use common::{generate_collection, MicroSpec, UnitFixture, MICRO_BLOCK};
 use tapectl::crypto::keys::generate_keypair;
 use tapectl::db;
 use tapectl::staging;
@@ -136,7 +136,7 @@ fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> 
 /// file bytes directly via `staging::encrypt_data`.
 fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness {
     let root = tempfile::tempdir().unwrap();
-    let fixtures = generate_library(root.path(), &MicroSpec { n_units, seed });
+    let fixtures = generate_collection(root.path(), &MicroSpec { n_units, seed });
 
     // `db::open_memory` is `#[cfg(test)]`-gated (unit-test-only), so it does
     // not exist in the normal rlib an integration test links against. A real

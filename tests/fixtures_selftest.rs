@@ -3,7 +3,7 @@
 /// Validates determinism, size bounds, and media shape conformance.
 mod common;
 
-use common::{generate_library, MicroSpec};
+use common::{generate_collection, MicroSpec};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -49,8 +49,8 @@ fn test_determinism_same_seed_same_tree() {
         seed: 12345,
     };
 
-    let fixtures1 = generate_library(temp1.path(), &spec);
-    let fixtures2 = generate_library(temp2.path(), &spec);
+    let fixtures1 = generate_collection(temp1.path(), &spec);
+    let fixtures2 = generate_collection(temp2.path(), &spec);
 
     // Both should have 5 units
     assert_eq!(fixtures1.len(), 5);
@@ -88,8 +88,8 @@ fn test_determinism_different_seed_different_tree() {
         seed: 54321,
     };
 
-    let fixtures1 = generate_library(temp1.path(), &spec1);
-    let fixtures2 = generate_library(temp2.path(), &spec2);
+    let fixtures1 = generate_collection(temp1.path(), &spec1);
+    let fixtures2 = generate_collection(temp2.path(), &spec2);
 
     // Compare tree hashes (should be different)
     let hash1 = hash_tree(temp1.path());
@@ -113,7 +113,7 @@ fn test_size_bounds() {
         seed: 99999,
     };
 
-    let fixtures = generate_library(temp.path(), &spec);
+    let fixtures = generate_collection(temp.path(), &spec);
 
     let min_size = 2 * 1024 * 1024; // 2 MiB
     let max_size = 15 * 1024 * 1024; // 15 MiB
@@ -145,7 +145,7 @@ fn test_dominant_file_share() {
         seed: 77777,
     };
 
-    let fixtures = generate_library(temp.path(), &spec);
+    let fixtures = generate_collection(temp.path(), &spec);
 
     for fixture in &fixtures {
         if fixture.files.is_empty() {
@@ -174,7 +174,7 @@ fn test_folder_names_sort_deterministically() {
         seed: 55555,
     };
 
-    let fixtures = generate_library(temp.path(), &spec);
+    let fixtures = generate_collection(temp.path(), &spec);
 
     let names: Vec<_> = fixtures.iter().map(|f| f.folder_name.clone()).collect();
     let mut sorted_names = names.clone();
@@ -195,7 +195,7 @@ fn test_no_excluded_filenames() {
         seed: 33333,
     };
 
-    let fixtures = generate_library(temp.path(), &spec);
+    let fixtures = generate_collection(temp.path(), &spec);
 
     let excluded_patterns = ["*.nfo", "*.tmp", "Thumbs.db", ".DS_Store"];
 
@@ -232,7 +232,7 @@ fn test_media_shape_sidecars_present() {
         seed: 11111,
     };
 
-    let fixtures = generate_library(temp.path(), &spec);
+    let fixtures = generate_collection(temp.path(), &spec);
 
     for fixture in &fixtures {
         // Each fixture should have movie.mkv (dominant file)

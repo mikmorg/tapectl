@@ -1,5 +1,5 @@
-//! `library plan` (`docs/design/v2-open-questions.md` §11): batches one
-//! library's pending units against its resolved LTO backend capacity, using
+//! `collection plan` (`docs/design/v2-open-questions.md` §11): batches one
+//! collection's pending units against its resolved LTO backend capacity, using
 //! the pure `selector::plan_batches`.
 //!
 //! This is the seam between "planning numbers as pure arithmetic"
@@ -18,7 +18,7 @@
 
 use rusqlite::Connection;
 
-use crate::config::{Config, LibraryConfig};
+use crate::config::{CollectionConfig, Config};
 use crate::error::{Result, TapectlError};
 
 use super::selector::{self, Batch};
@@ -32,13 +32,13 @@ use super::selector::{self, Batch};
 /// that rather than reading the unread field.
 const BLOCK_SIZE: u64 = 512 * 1024;
 
-/// Compute one library's batches against its resolved LTO backend capacity.
-pub fn plan_for_library(
+/// Compute one collection's batches against its resolved LTO backend capacity.
+pub fn plan_for_collection(
     conn: &Connection,
     config: &Config,
-    lib: &LibraryConfig,
+    lib: &CollectionConfig,
 ) -> Result<Vec<Batch>> {
-    let pending = super::fingerprint::pending_units_for_library(conn, lib)?;
+    let pending = super::fingerprint::pending_units_for_collection(conn, lib)?;
     let synthetic: Vec<selector::PendingUnit> = pending
         .iter()
         .map(|p| selector::PendingUnit {
@@ -59,7 +59,7 @@ pub fn plan_for_library(
 
     selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
         TapectlError::Other(format!(
-            "library \"{}\": {} unit(s) exceed the per-tape budget and can never be \
+            "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
              batched (units are never split across tapes): {}",
             lib.name,
             oversized.len(),
@@ -110,7 +110,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
         }
-        let lib = LibraryConfig {
+        let lib = CollectionConfig {
             name: "testlib".into(),
             root: root.path().to_string_lossy().to_string(),
             tenant: "media".into(),
@@ -120,10 +120,10 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_library(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
 
         let config = config_with_tiny_backend();
-        let batches = plan_for_library(&conn, &config, &lib).unwrap();
+        let batches = plan_for_collection(&conn, &config, &lib).unwrap();
         assert_eq!(batches.len(), 1, "two 3 MiB units must fit one 10 MiB tape");
         assert_eq!(
             batches[0].unit_names(),
@@ -147,7 +147,7 @@ mod tests {
         // buffer, per `config_with_tiny_backend`) — must refuse, not split.
         std::fs::write(dir.join("f.dat"), vec![0u8; 20 * 1024 * 1024]).unwrap();
 
-        let lib = LibraryConfig {
+        let lib = CollectionConfig {
             name: "testlib".into(),
             root: root.path().to_string_lossy().to_string(),
             tenant: "media".into(),
@@ -157,10 +157,10 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_library(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_library(&conn, &config, &lib).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib).unwrap_err();
         assert!(
             err.to_string().contains("testlib/huge"),
             "error must name the offending unit: {err}"

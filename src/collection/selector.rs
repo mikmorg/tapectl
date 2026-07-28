@@ -17,7 +17,7 @@ use crate::volume::layout_model::pad_to_blocks;
 
 /// One pending unit as the selector sees it: a name (the sort key) and a
 /// size in bytes. Sourcing the size is the caller's concern — see
-/// `library::sizing` for the real (on-disk, plaintext-walk estimate) source;
+/// `collection::sizing` for the real (on-disk, plaintext-walk estimate) source;
 /// tests drive this struct with synthetic sizes directly, per the plan's
 /// instruction not to stage hundreds of real fixtures just to drill the
 /// selector's arithmetic.
@@ -249,7 +249,7 @@ mod tests {
         // Microcosm parameters (docs/design/v2-open-questions.md §8):
         // nominal 2400M tape, 0.92 usable factor, 8M ENOSPC buffer (NOT
         // ÷1024 — a few 512K blocks), 512K block size (format constant,
-        // never scales). Sizes drawn 2-15M like `tests/common::generate_library`,
+        // never scales). Sizes drawn 2-15M like `tests/common::generate_collection`,
         // but generated in-memory here — no directories, no bytes on disk.
         const MIB: u64 = 1024 * 1024;
         const BLOCK: u64 = 512 * 1024;
@@ -261,7 +261,7 @@ mod tests {
         let n_units = 600usize;
         let units: Vec<PendingUnit> = (0..n_units)
             .map(|i| {
-                // Same derivation shape as tests/common::generate_library's
+                // Same derivation shape as tests/common::generate_collection's
                 // compute_unit_size (sha256(seed||i) folded into [2M,15M)),
                 // reimplemented locally so this test has zero dependency on
                 // any filesystem fixture.

@@ -1,22 +1,22 @@
-//! `library status` (`docs/design/v2-open-questions.md` §11): pending /
+//! `collection status` (`docs/design/v2-open-questions.md` §11): pending /
 //! dirty / missing / under-copied counts.
 
 use rusqlite::{params, Connection};
 
-use crate::config::{Config, LibraryConfig};
+use crate::config::{CollectionConfig, Config};
 use crate::error::Result;
 
 use super::fingerprint::PendingReason;
 
-/// One library's readiness snapshot.
+/// One collection's readiness snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LibraryStatus {
+pub struct CollectionStatus {
     /// Units with no snapshot at all yet.
     pub pending: usize,
     /// Units with a snapshot, but whose on-disk fingerprint has since
     /// changed.
     pub dirty: usize,
-    /// Units whose directory has vanished (`library sync` sets this; never
+    /// Units whose directory has vanished (`collection sync` sets this; never
     /// auto-deleted or retired).
     pub missing: usize,
     /// Active units with fewer completed tape copies than their resolved
@@ -24,15 +24,15 @@ pub struct LibraryStatus {
     pub under_copied: usize,
 }
 
-/// Compute one library's status.
-pub fn status_for_library(
+/// Compute one collection's status.
+pub fn status_for_collection(
     conn: &Connection,
     config: &Config,
-    lib: &LibraryConfig,
-) -> Result<LibraryStatus> {
-    let mut status = LibraryStatus::default();
+    lib: &CollectionConfig,
+) -> Result<CollectionStatus> {
+    let mut status = CollectionStatus::default();
 
-    for p in super::fingerprint::pending_units_for_library(conn, lib)? {
+    for p in super::fingerprint::pending_units_for_collection(conn, lib)? {
         match p.reason {
             PendingReason::New => status.pending += 1,
             PendingReason::Dirty => status.dirty += 1,
@@ -83,7 +83,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
-        let lib = LibraryConfig {
+        let lib = CollectionConfig {
             name: "testlib".into(),
             root: root.path().to_string_lossy().to_string(),
             tenant: "media".into(),
@@ -93,10 +93,10 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_library(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
 
         let config = Config::default();
-        let status = status_for_library(&conn, &config, &lib).unwrap();
+        let status = status_for_collection(&conn, &config, &lib).unwrap();
         assert_eq!(status.pending, 1, "freshly synced unit has no snapshot yet");
         assert_eq!(status.dirty, 0);
         assert_eq!(status.missing, 0);
@@ -118,7 +118,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
-        let lib = LibraryConfig {
+        let lib = CollectionConfig {
             name: "testlib".into(),
             root: root.path().to_string_lossy().to_string(),
             tenant: "media".into(),
@@ -128,12 +128,12 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_library(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
-        super::super::sync::sync_library(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
 
         let config = Config::default();
-        let status = status_for_library(&conn, &config, &lib).unwrap();
+        let status = status_for_collection(&conn, &config, &lib).unwrap();
         assert_eq!(status.missing, 1);
         assert_eq!(
             status.pending, 0,

@@ -1,7 +1,7 @@
-//! The Library concept (`docs/design/v2-open-questions.md` §11, finishing
-//! the §7 media-library workload sketch): a factory + batch driver over
+//! The Collection concept (`docs/design/v2-open-questions.md` §11, finishing
+//! the §7 media-collection workload sketch): a factory + batch driver over
 //! existing unit machinery for append-mostly media roots (thousands of
-//! folder-units), so the operator configures one `[[libraries]]` block per
+//! folder-units), so the operator configures one `[[collections]]` block per
 //! root instead of `unit init`-ing each folder by hand.
 //!
 //! Units remain first-class underneath — this module only automates
@@ -10,7 +10,7 @@
 //! stage/write pipeline once per batch (`batch`).
 //!
 //! Deliberately out of scope (§11): filesystem watching/daemons (#13
-//! verdict), scheduled sync, any cross-library dedup (#12 — full-only
+//! verdict), scheduled sync, any cross-collection dedup (#12 — full-only
 //! stands), and best-fit-decreasing packing (§7 — alphabetical first-fit
 //! preserves the name-ordered "tape spine").
 
@@ -21,13 +21,13 @@ pub mod selector;
 pub mod status;
 pub mod sync;
 
-use crate::config::{Config, LibraryConfig};
+use crate::config::{CollectionConfig, Config};
 use crate::db::models::Unit;
 use crate::error::{Result, TapectlError};
 
-/// All units currently registered under a library's root, any status —
+/// All units currently registered under a collection's root, any status —
 /// membership is determined by path prefix against the (canonicalized)
-/// root, since units carry no `library_id` (no schema change in T10; see
+/// root, since units carry no `collection_id` (no schema change in T10; see
 /// the T10 report). Both `sync`'s vanished-detection and `status`/`plan`'s
 /// pending-scan build on this.
 pub fn units_under_root(conn: &rusqlite::Connection, root_canonical: &str) -> Result<Vec<Unit>> {
@@ -49,30 +49,30 @@ pub fn is_under_root(path: &str, root_canonical: &str) -> bool {
     path == root_canonical || path.starts_with(&format!("{root_canonical}/"))
 }
 
-/// Canonicalize a library's configured root. Returns the plain
+/// Canonicalize a collection's configured root. Returns the plain
 /// `TapectlError::Other` the callers (`sync`/`status`/`plan`) already
-/// surface per-library rather than aborting a multi-library run.
-pub fn canonical_root(lib: &LibraryConfig) -> Result<String> {
+/// surface per-collection rather than aborting a multi-collection run.
+pub fn canonical_root(lib: &CollectionConfig) -> Result<String> {
     std::fs::canonicalize(&lib.root)
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| {
             TapectlError::Other(format!(
-                "library \"{}\": root \"{}\" does not exist or is not readable: {e}",
+                "collection \"{}\": root \"{}\" does not exist or is not readable: {e}",
                 lib.name, lib.root
             ))
         })
 }
 
-/// Look up a configured library by name — the one CLI surface (`library
+/// Look up a configured collection by name — the one CLI surface (`collection
 /// run`) that isn't spec'd in §11 as operating over every configured
-/// library at once, since executing a batch inherently targets one library
+/// collection at once, since executing a batch inherently targets one collection
 /// (see the T10 report's "Deviations" section).
-pub fn find_library<'a>(config: &'a Config, name: &str) -> Result<&'a LibraryConfig> {
+pub fn find_collection<'a>(config: &'a Config, name: &str) -> Result<&'a CollectionConfig> {
     config
-        .libraries
+        .collections
         .iter()
         .find(|l| l.name == name)
-        .ok_or_else(|| TapectlError::Other(format!("no library named \"{name}\" is configured")))
+        .ok_or_else(|| TapectlError::Other(format!("no collection named \"{name}\" is configured")))
 }
 
 #[cfg(test)]

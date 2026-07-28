@@ -313,7 +313,7 @@ padding can be defeated without knowing the exact size:
 /// plaintext tape metadata zone goes through `require_uint` before it
 /// reaches arithmetic, `fsf`, or `seq` (S2 hardening, carried over from v1).
 /// Tools used: mt, dd, age, dar, sha256sum, head, truncate, plus standard
-/// coreutils (awk/sed/grep/tr) — no TOML library, per the grammar contract.
+/// coreutils (awk/sed/grep/tr) — no TOML collection, per the grammar contract.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     r#"#!/usr/bin/env bash
 # RESTORE.sh — Emergency restore script for tapectl volume __LABEL__ (layout v2)

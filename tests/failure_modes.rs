@@ -1,6 +1,6 @@
 //! Failure-mode tests. Fast, pure-Rust, no mhvtl required.
 //!
-//! These complement the inline unit tests by exercising library-level
+//! These complement the inline unit tests by exercising collection-level
 //! failure paths end-to-end: age encryption misuse, ciphertext tampering,
 //! and DB crash recovery via the real `tapectl::db::open` entry point.
 

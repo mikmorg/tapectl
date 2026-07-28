@@ -1,9 +1,9 @@
 use clap::Subcommand;
 use rusqlite::Connection;
 
+use crate::collection;
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
-use crate::library;
 
 /// Batch execution writes with the same fixed block size every other write
 /// path uses (`cli::volume::DEFAULT_BLOCK_SIZE`) — 512 KiB, the format
@@ -11,8 +11,8 @@ use crate::library;
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 
 #[derive(Subcommand, Debug)]
-pub enum LibraryCommands {
-    /// Sync every configured library: register new unit folders, resolve
+pub enum CollectionCommands {
+    /// Sync every configured collection: register new unit folders, resolve
     /// moved/renamed ones by dotfile uuid, mark vanished ones `missing`
     /// (never deleted or retired — those are operator acts).
     Sync {
@@ -22,11 +22,11 @@ pub enum LibraryCommands {
     },
 
     /// Show pending/dirty/missing/under-copied counts for every configured
-    /// library.
+    /// collection.
     Status,
 
     /// Show the batch plan (alphabetical first-fit, §7) for every
-    /// configured library's pending units.
+    /// configured collection's pending units.
     Plan {
         /// Copies to plan for — informational only (batches don't change;
         /// this scales the printed cartridge-count estimate).
@@ -36,14 +36,14 @@ pub enum LibraryCommands {
 
     /// Execute one batch: stage every unit in it once, write one session
     /// per destination label, then release staging. Targets a single
-    /// library (unlike `sync`/`status`/`plan`, which sweep every
-    /// configured library) since a batch write is a real, one-shot tape
+    /// collection (unlike `sync`/`status`/`plan`, which sweep every
+    /// configured collection) since a batch write is a real, one-shot tape
     /// action.
     Run {
-        /// Library name.
+        /// Collection name.
         #[arg(long)]
-        library: String,
-        /// Which batch from `library plan`'s ordering to execute (0 =
+        collection: String,
+        /// Which batch from `collection plan`'s ordering to execute (0 =
         /// first).
         #[arg(long, default_value = "0")]
         batch: usize,
@@ -62,15 +62,17 @@ pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
-    command: &LibraryCommands,
+    command: &CollectionCommands,
     json_output: bool,
 ) -> Result<()> {
     match command {
-        LibraryCommands::Sync { dry_run } => cmd_sync(conn, paths, config, *dry_run, json_output),
-        LibraryCommands::Status => cmd_status(conn, config, json_output),
-        LibraryCommands::Plan { copies } => cmd_plan(conn, config, *copies, json_output),
-        LibraryCommands::Run {
-            library: name,
+        CollectionCommands::Sync { dry_run } => {
+            cmd_sync(conn, paths, config, *dry_run, json_output)
+        }
+        CollectionCommands::Status => cmd_status(conn, config, json_output),
+        CollectionCommands::Plan { copies } => cmd_plan(conn, config, *copies, json_output),
+        CollectionCommands::Run {
+            collection: name,
             batch,
             labels,
             device,
@@ -89,9 +91,9 @@ pub fn run(
 
 fn no_libraries_configured(json_output: bool) {
     if json_output {
-        println!("{}", serde_json::json!({"libraries": []}));
+        println!("{}", serde_json::json!({"collections": []}));
     } else {
-        println!("no libraries configured — add a [[libraries]] block to config.toml");
+        println!("no collections configured — add a [[collections]] block to config.toml");
     }
 }
 
@@ -102,14 +104,14 @@ fn cmd_sync(
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
-    if config.libraries.is_empty() {
+    if config.collections.is_empty() {
         no_libraries_configured(json_output);
         return Ok(());
     }
 
     let mut rows = Vec::new();
-    for lib in &config.libraries {
-        let (report, errors) = library::sync::sync_library(conn, paths, lib, dry_run)?;
+    for lib in &config.collections {
+        let (report, errors) = collection::sync::sync_collection(conn, paths, lib, dry_run)?;
         rows.push((lib.name.clone(), report, errors));
     }
 
@@ -118,7 +120,7 @@ fn cmd_sync(
             .iter()
             .map(|(name, r, errors)| {
                 serde_json::json!({
-                    "library": name,
+                    "collection": name,
                     "dry_run": dry_run,
                     "created": r.created,
                     "moved": r.moved,
@@ -135,7 +137,7 @@ fn cmd_sync(
         for (name, r, errors) in &rows {
             let mode = if dry_run { " (dry-run)" } else { "" };
             println!(
-                "library \"{name}\"{mode}: {} created, {} moved, {} reactivated, \
+                "collection \"{name}\"{mode}: {} created, {} moved, {} reactivated, \
                  {} missing, {} pending, {} dirty",
                 r.created, r.moved, r.reactivated, r.missing, r.pending, r.dirty
             );
@@ -148,14 +150,14 @@ fn cmd_sync(
 }
 
 fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    if config.libraries.is_empty() {
+    if config.collections.is_empty() {
         no_libraries_configured(json_output);
         return Ok(());
     }
 
     let mut rows = Vec::new();
-    for lib in &config.libraries {
-        let status = library::status::status_for_library(conn, config, lib)?;
+    for lib in &config.collections {
+        let status = collection::status::status_for_collection(conn, config, lib)?;
         rows.push((lib.name.clone(), status));
     }
 
@@ -164,7 +166,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<(
             .iter()
             .map(|(name, s)| {
                 serde_json::json!({
-                    "library": name,
+                    "collection": name,
                     "pending": s.pending,
                     "dirty": s.dirty,
                     "missing": s.missing,
@@ -176,7 +178,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<(
     } else {
         for (name, s) in &rows {
             println!(
-                "library \"{name}\": {} pending, {} dirty, {} missing, {} under-copied",
+                "collection \"{name}\": {} pending, {} dirty, {} missing, {} under-copied",
                 s.pending, s.dirty, s.missing, s.under_copied
             );
         }
@@ -185,14 +187,14 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<(
 }
 
 fn cmd_plan(conn: &Connection, config: &Config, copies: i64, json_output: bool) -> Result<()> {
-    if config.libraries.is_empty() {
+    if config.collections.is_empty() {
         no_libraries_configured(json_output);
         return Ok(());
     }
 
     let mut rows = Vec::new();
-    for lib in &config.libraries {
-        let batches = library::plan::plan_for_library(conn, config, lib)?;
+    for lib in &config.collections {
+        let batches = collection::plan::plan_for_collection(conn, config, lib)?;
         rows.push((lib.name.clone(), batches));
     }
 
@@ -213,7 +215,7 @@ fn cmd_plan(conn: &Connection, config: &Config, copies: i64, json_output: bool) 
                     })
                     .collect();
                 serde_json::json!({
-                    "library": name,
+                    "collection": name,
                     "copies": copies,
                     "batches": batch_json,
                     "cartridges_needed": batches.len() as i64 * copies,
@@ -224,10 +226,10 @@ fn cmd_plan(conn: &Connection, config: &Config, copies: i64, json_output: bool) 
     } else {
         for (name, batches) in &rows {
             if batches.is_empty() {
-                println!("library \"{name}\": nothing pending");
+                println!("collection \"{name}\": nothing pending");
                 continue;
             }
-            println!("library \"{name}\" plan ({copies} copy/copies):");
+            println!("collection \"{name}\" plan ({copies} copy/copies):");
             for (i, b) in batches.iter().enumerate() {
                 println!(
                     "  batch {i}: {} units, {} MB raw, {} MB on-tape (padded)",
@@ -254,23 +256,23 @@ fn cmd_run(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
-    library_name: &str,
+    collection_name: &str,
     batch_idx: usize,
     labels: &[String],
     device: &str,
     json_output: bool,
 ) -> Result<()> {
-    let lib = library::find_library(config, library_name)?;
-    let batches = library::plan::plan_for_library(conn, config, lib)?;
+    let lib = collection::find_collection(config, collection_name)?;
+    let batches = collection::plan::plan_for_collection(conn, config, lib)?;
     let batch = batches.get(batch_idx).ok_or_else(|| {
         TapectlError::Other(format!(
-            "library \"{library_name}\": batch {batch_idx} does not exist \
-             ({} batch(es) currently pending — run `library plan` to see them)",
+            "collection \"{collection_name}\": batch {batch_idx} does not exist \
+             ({} batch(es) currently pending — run `collection plan` to see them)",
             batches.len()
         ))
     })?;
 
-    let report = library::batch::execute_batch(
+    let report = collection::batch::execute_batch(
         conn,
         paths,
         config,
@@ -284,7 +286,7 @@ fn cmd_run(
         println!(
             "{}",
             serde_json::json!({
-                "library": library_name,
+                "collection": collection_name,
                 "batch": batch_idx,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
@@ -293,7 +295,7 @@ fn cmd_run(
         );
     } else {
         println!(
-            "library \"{library_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
+            "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
              written, {} stage set(s) released",
             report.units_staged, report.copies_written, report.cleaned.sets_cleaned,
         );

@@ -1,5 +1,5 @@
-//! `library sync` (`docs/design/v2-open-questions.md` §11): walk a
-//! library's root at `unit_depth`, registering new unit directories,
+//! `collection sync` (`docs/design/v2-open-questions.md` §11): walk a
+//! collection's root at `unit_depth`, registering new unit directories,
 //! resolving moved/renamed ones by dotfile uuid (exactly as
 //! `unit::discovery` already does), and marking vanished ones `missing` —
 //! never deleting or retiring; those stay operator acts.
@@ -10,12 +10,12 @@ use rusqlite::{params, Connection};
 use tracing::warn;
 use walkdir::WalkDir;
 
-use crate::config::{LibraryConfig, TapectlPaths};
+use crate::config::{CollectionConfig, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::unit::dotfile;
 
-/// Outcome of one `library sync` run.
+/// Outcome of one `collection sync` run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SyncReport {
     /// Newly registered units (fresh directories, or orphaned dotfiles the
@@ -34,7 +34,7 @@ pub struct SyncReport {
     pub dirty: usize,
 }
 
-/// Sync one library. `dry_run` computes and reports every count above
+/// Sync one collection. `dry_run` computes and reports every count above
 /// without mutating anything (no DB writes, no dotfile writes, no `unit
 /// init` calls) — the same detection logic runs either way; only the
 /// mutation step is gated per finding.
@@ -42,10 +42,10 @@ pub struct SyncReport {
 /// Errors from individual directories (e.g. a dotfile naming an unknown
 /// tenant) are collected rather than aborting the whole sync, same spirit
 /// as `unit::discovery::discover`.
-pub fn sync_library(
+pub fn sync_collection(
     conn: &Connection,
     paths: &TapectlPaths,
-    lib: &LibraryConfig,
+    lib: &CollectionConfig,
     dry_run: bool,
 ) -> Result<(SyncReport, Vec<String>)> {
     let mut report = SyncReport::default();
@@ -91,13 +91,13 @@ pub fn sync_library(
                     "unit",
                     unit.id,
                     &unit.name,
-                    "library_sync_vanished",
+                    "collection_sync_vanished",
                     "status",
                     Some("active"),
                     "missing",
                     Some(unit.tenant_id),
                 )?;
-                warn!(unit = %unit.name, path, "library sync: directory vanished, marked missing");
+                warn!(unit = %unit.name, path, "collection sync: directory vanished, marked missing");
             }
         }
     }
@@ -106,7 +106,7 @@ pub fn sync_library(
     // dry-run mode this is the PRE-sync state, since nothing above was
     // actually written — newly-would-be-created units correctly don't
     // appear here yet, they're already counted via `report.created`).
-    for p in super::fingerprint::pending_units_for_library(conn, lib)? {
+    for p in super::fingerprint::pending_units_for_collection(conn, lib)? {
         match p.reason {
             super::fingerprint::PendingReason::New => report.pending += 1,
             super::fingerprint::PendingReason::Dirty => report.dirty += 1,
@@ -119,7 +119,7 @@ pub fn sync_library(
 /// Directories at exactly `unit_depth` below `root`, excluding any whose
 /// basename matches one of `lib.exclude`'s glob patterns (e.g. `*.partial`,
 /// so an in-flight copy isn't registered as a unit mid-transfer).
-fn candidate_unit_dirs(root: &Path, lib: &LibraryConfig) -> Vec<PathBuf> {
+fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> Vec<PathBuf> {
     let depth = lib.unit_depth.max(1);
     let patterns: Vec<glob::Pattern> = lib
         .exclude
@@ -142,9 +142,9 @@ fn candidate_unit_dirs(root: &Path, lib: &LibraryConfig) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The unit name library sync assigns: `"{library}/{path relative to
-/// root}"`, unique across libraries and stable across `unit_depth`.
-fn library_unit_name(lib: &LibraryConfig, root: &str, abs_str: &str) -> String {
+/// The unit name collection sync assigns: `"{collection}/{path relative to
+/// root}"`, unique across collections and stable across `unit_depth`.
+fn collection_unit_name(lib: &CollectionConfig, root: &str, abs_str: &str) -> String {
     let rel = Path::new(abs_str)
         .strip_prefix(root)
         .map(|p| p.to_string_lossy().to_string())
@@ -155,7 +155,7 @@ fn library_unit_name(lib: &LibraryConfig, root: &str, abs_str: &str) -> String {
 fn sync_one_directory(
     conn: &Connection,
     paths: &TapectlPaths,
-    lib: &LibraryConfig,
+    lib: &CollectionConfig,
     root: &str,
     dir: &Path,
     dry_run: bool,
@@ -186,7 +186,7 @@ fn sync_one_directory(
             // dotfiles=true (`init_unit` always writes one) — a fresh
             // directory.
             if !dry_run {
-                let name = library_unit_name(lib, root, &abs_str);
+                let name = collection_unit_name(lib, root, &abs_str);
                 crate::unit::init_unit(
                     conn,
                     paths,
@@ -235,7 +235,7 @@ fn resolve_existing(
                 "unit",
                 existing.id,
                 &existing.name,
-                "library_sync_path_update",
+                "collection_sync_path_update",
                 "current_path",
                 existing.current_path.as_deref(),
                 abs_str,
@@ -256,7 +256,7 @@ fn resolve_existing(
                 "unit",
                 existing.id,
                 &existing.name,
-                "library_sync_reactivated",
+                "collection_sync_reactivated",
                 "status",
                 Some("missing"),
                 "active",
@@ -295,12 +295,12 @@ fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -
 /// skip-and-report.
 fn insert_path_keyed_unit(
     conn: &Connection,
-    lib: &LibraryConfig,
+    lib: &CollectionConfig,
     root: &str,
     abs_str: &str,
 ) -> Result<()> {
     let tenant = crate::tenant::require_tenant(conn, &lib.tenant)?;
-    let name = library_unit_name(lib, root, abs_str);
+    let name = collection_unit_name(lib, root, abs_str);
     if queries::get_unit_by_name(conn, &name)?.is_some() {
         return Err(TapectlError::UnitAlreadyExists(name));
     }
@@ -325,8 +325,8 @@ mod tests {
         conn.last_insert_rowid()
     }
 
-    fn test_lib(root: &Path, tenant: &str) -> LibraryConfig {
-        LibraryConfig {
+    fn test_lib(root: &Path, tenant: &str) -> CollectionConfig {
+        CollectionConfig {
             name: "testlib".to_string(),
             root: root.to_string_lossy().to_string(),
             tenant: tenant.to_string(),
@@ -350,7 +350,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        let (report, errors) = sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
 
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(report.created, 1);
@@ -371,7 +371,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("beta")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        let (report, errors) = sync_library(&conn, &paths_in(home.path()), &lib, true).unwrap();
+        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, true).unwrap();
 
         assert!(errors.is_empty());
         assert_eq!(report.created, 2, "must detect both new directories");
@@ -396,14 +396,14 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         let unit_before = queries::get_unit_by_name(&conn, "testlib/alpha")
             .unwrap()
             .unwrap();
         assert_eq!(unit_before.status, "active");
 
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
-        let (report, errors) = sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.missing, 1);
         assert_eq!(report.created, 0, "must not re-create the vanished unit");
@@ -425,7 +425,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         let unit_before = queries::get_unit_by_name(&conn, "testlib/alpha")
             .unwrap()
             .unwrap();
@@ -434,7 +434,7 @@ mod tests {
         // directory, exactly like `unit::discovery`'s rename-proofing).
         std::fs::rename(root.path().join("alpha"), root.path().join("alpha-renamed")).unwrap();
 
-        let (report, errors) = sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.moved, 1);
         assert_eq!(
@@ -466,12 +466,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
         let lib = test_lib(root.path(), "media");
-        sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
 
         // Simulate an external drive going away: directory removed, then a
         // sync runs and marks it missing.
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
-        sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         assert_eq!(
             queries::get_unit_by_name(&conn, "testlib/alpha")
                 .unwrap()
@@ -508,7 +508,7 @@ mod tests {
         )
         .unwrap();
 
-        let (report, errors) = sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.reactivated, 1);
         assert_eq!(
@@ -530,7 +530,8 @@ mod tests {
         std::fs::create_dir_all(root.path().join("beta.partial")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        let (report, _errors) = sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, _errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
 
         assert_eq!(report.created, 1, "only the non-excluded directory");
         assert!(queries::get_unit_by_name(&conn, "testlib/alpha")
@@ -552,7 +553,7 @@ mod tests {
         let mut lib = test_lib(root.path(), "media");
         lib.dotfiles = false;
 
-        let (report, errors) = sync_library(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.created, 1);
         assert!(

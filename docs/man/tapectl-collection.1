@@ -1,0 +1,44 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-collection 1  "tapectl-collection " 
+.SH NAME
+tapectl\-collection \- Manage media collections (folder=unit factory + batch tape driver)
+.SH SYNOPSIS
+\fBtapectl collection\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Manage media collections (folder=unit factory + batch tape driver)
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+tapectl\-collection\-sync(1)
+Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
+.TP
+tapectl\-collection\-status(1)
+Show pending/dirty/missing/under\-copied counts for every configured collection
+.TP
+tapectl\-collection\-plan(1)
+Show the batch plan (alphabetical first\-fit, §7) for every configured collection\*(Aqs pending units
+.TP
+tapectl\-collection\-run(1)
+Execute one batch: stage every unit in it once, write one session per destination label, then release staging. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
+.TP
+tapectl\-collection\-help(1)
+Print this message or the help of the given subcommand(s)

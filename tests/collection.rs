@@ -1,10 +1,10 @@
-/// Integration coverage for `library sync --dry-run` against a real,
-/// generated microcosm library — `docs/design/v2-implementation-plan.md`
-/// T10's test list: "`library sync --dry-run` against a small generated
-/// microcosm library (use `tests/common/mod.rs`) reports sensibly: new
+/// Integration coverage for `collection sync --dry-run` against a real,
+/// generated microcosm collection — `docs/design/v2-implementation-plan.md`
+/// T10's test list: "`collection sync --dry-run` against a small generated
+/// microcosm collection (use `tests/common/mod.rs`) reports sensibly: new
 /// units detected, nothing mutated in dry-run mode."
 ///
-/// The selector's own multi-tape drill (src/library/selector.rs) is the
+/// The selector's own multi-tape drill (src/collection/selector.rs) is the
 /// place synthetic ~600-unit size lists exercise the packing arithmetic at
 /// scale; this file's job is the opposite end of the spec — a small, real
 /// fixture tree proving the sync/CLI plumbing around it.
@@ -12,14 +12,14 @@ mod common;
 
 use clap::Parser;
 
-use common::{generate_library, MicroSpec};
-use tapectl::cli::library::LibraryCommands;
+use common::{generate_collection, MicroSpec};
+use tapectl::cli::collection::CollectionCommands;
 use tapectl::cli::{Cli, Commands};
-use tapectl::config::{LibraryConfig, TapectlPaths};
-use tapectl::library::sync::sync_library;
+use tapectl::collection::sync::sync_collection;
+use tapectl::config::{CollectionConfig, TapectlPaths};
 
 #[test]
-fn library_sync_dry_run_against_a_generated_microcosm_library_reports_sensibly() {
+fn collection_sync_dry_run_against_a_generated_microcosm_collection_reports_sensibly() {
     let home = tempfile::tempdir().unwrap();
     let conn = tapectl::db::open(&home.path().join("tapectl.db")).unwrap();
     conn.execute(
@@ -30,7 +30,7 @@ fn library_sync_dry_run_against_a_generated_microcosm_library_reports_sensibly()
 
     let root = tempfile::tempdir().unwrap();
 
-    // Small N on purpose: generate_library tiles real MiB-scale file
+    // Small N on purpose: generate_collection tiles real MiB-scale file
     // content per unit (2-15 M each per the microcosm spec), so this stays
     // a plumbing check, not a scale drill — the selector's own test
     // exercises ~600 units, but via synthetic sizes, never real fixtures.
@@ -38,7 +38,7 @@ fn library_sync_dry_run_against_a_generated_microcosm_library_reports_sensibly()
         n_units: 3,
         seed: 7,
     };
-    let fixtures = generate_library(root.path(), &spec);
+    let fixtures = generate_collection(root.path(), &spec);
     assert_eq!(fixtures.len(), 3);
     for fixture in &fixtures {
         // Sanity-check the generator actually produced microcosm-shaped
@@ -53,7 +53,7 @@ fn library_sync_dry_run_against_a_generated_microcosm_library_reports_sensibly()
         assert_eq!(fixture.files.len(), 3, "movie + cover + subtitle");
     }
 
-    let lib = LibraryConfig {
+    let lib = CollectionConfig {
         name: "microlib".to_string(),
         root: root.path().to_string_lossy().to_string(),
         tenant: "media".to_string(),
@@ -64,7 +64,7 @@ fn library_sync_dry_run_against_a_generated_microcosm_library_reports_sensibly()
     };
     let paths = TapectlPaths::new(home.path().to_path_buf());
 
-    let (report, errors) = sync_library(&conn, &paths, &lib, true).unwrap();
+    let (report, errors) = sync_collection(&conn, &paths, &lib, true).unwrap();
 
     assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     assert_eq!(
@@ -95,22 +95,22 @@ fn library_sync_dry_run_against_a_generated_microcosm_library_reports_sensibly()
 }
 
 #[test]
-fn library_sync_dry_run_parses_through_the_real_cli() {
-    // `LibraryCommands::Sync` declares its own `--dry-run`, distinct from
+fn collection_sync_dry_run_parses_through_the_real_cli() {
+    // `CollectionCommands::Sync` declares its own `--dry-run`, distinct from
     // Cli's top-level `global = true` `--dry-run` — both fields happen to
     // share the name `dry_run` but live in different structs. Confirm this
     // parses cleanly and the subcommand-local flag is what actually gets
     // set, rather than inferring it from `cmd.build()` not panicking during
     // man-page generation.
-    let cli = Cli::try_parse_from(["tapectl", "library", "sync", "--dry-run"])
-        .expect("`tapectl library sync --dry-run` must parse");
+    let cli = Cli::try_parse_from(["tapectl", "collection", "sync", "--dry-run"])
+        .expect("`tapectl collection sync --dry-run` must parse");
     match cli.command {
-        Commands::Library { command } => match command {
-            LibraryCommands::Sync { dry_run } => {
+        Commands::Collection { command } => match command {
+            CollectionCommands::Sync { dry_run } => {
                 assert!(dry_run, "the subcommand-local --dry-run must be set");
             }
-            other => panic!("expected LibraryCommands::Sync, got {other:?}"),
+            other => panic!("expected CollectionCommands::Sync, got {other:?}"),
         },
-        other => panic!("expected Commands::Library, got {other:?}"),
+        other => panic!("expected Commands::Collection, got {other:?}"),
     }
 }

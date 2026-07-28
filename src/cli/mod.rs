@@ -2,8 +2,8 @@ pub mod archive_set;
 pub mod audit;
 pub mod cartridge;
 pub mod catalog;
+pub mod collection;
 pub mod key;
-pub mod library;
 pub mod location;
 pub mod operations;
 pub mod report;
@@ -72,10 +72,10 @@ pub enum Commands {
         command: unit::UnitCommands,
     },
 
-    /// Manage media libraries (folder=unit factory + batch tape driver)
-    Library {
+    /// Manage media collections (folder=unit factory + batch tape driver)
+    Collection {
         #[command(subcommand)]
-        command: library::LibraryCommands,
+        command: collection::CollectionCommands,
     },
 
     /// Manage snapshots

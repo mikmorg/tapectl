@@ -1,6 +1,6 @@
 /// Microcosm fixture generator for format-v2 testing.
 ///
-/// Scales a 1/1024 deterministic synthetic media library to exercise real combinatorics
+/// Scales a 1/1024 deterministic synthetic media collection to exercise real combinatorics
 /// without full-scale hardware (per docs/design/v2-open-questions.md §8).
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -22,7 +22,7 @@ pub const MICRO_SLICE: &str = "10M";
 #[allow(dead_code)]
 pub const MICRO_ENOSPC: &str = "8M";
 
-/// Specification for deterministic library generation.
+/// Specification for deterministic collection generation.
 #[derive(Debug, Clone)]
 pub struct MicroSpec {
     /// Number of units (folders) to generate.
@@ -45,7 +45,7 @@ pub struct UnitFixture {
     pub files: Vec<(String, u64)>,
 }
 
-/// Generate a deterministic microcosm library under `root`.
+/// Generate a deterministic microcosm collection under `root`.
 ///
 /// # Determinism
 /// Same `root` and `spec` (n_units, seed) produce byte-identical trees;
@@ -66,7 +66,7 @@ pub struct UnitFixture {
 ///
 /// # Panics
 /// On I/O errors (permission, disk full, etc.).
-pub fn generate_library(root: &Path, spec: &MicroSpec) -> Vec<UnitFixture> {
+pub fn generate_collection(root: &Path, spec: &MicroSpec) -> Vec<UnitFixture> {
     fs::create_dir_all(root).expect("failed to create root directory");
 
     let mut fixtures = Vec::new();

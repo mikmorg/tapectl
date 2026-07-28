@@ -60,8 +60,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Unit { ref command } => {
             cli::unit::run(&conn, &paths, &cfg, command, cli.json)?;
         }
-        Commands::Library { ref command } => {
-            cli::library::run(&conn, &paths, &cfg, command, cli.json)?;
+        Commands::Collection { ref command } => {
+            cli::collection::run(&conn, &paths, &cfg, command, cli.json)?;
         }
         Commands::Snapshot { ref command } => {
             cli::snapshot::run(&conn, &paths, &cfg, command, cli.json)?;
