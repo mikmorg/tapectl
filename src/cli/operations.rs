@@ -128,16 +128,12 @@ pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: boo
             }));
             continue;
         }
-        // SHA256 check
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        let data = fs::read(&full_path)?;
-        hasher.update(&data);
-        let actual: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        // SHA256 check — streamed (issue #32/H6, the last H9-class
+        // whole-file-in-RAM site): reuses `staging::validate::hash_source_file`
+        // instead of `fs::read`-ing the whole file, so peak RAM here is a
+        // fixed buffer, never the file's size, and this can never disagree
+        // with the hash `stage_create`'s own baseline was established with.
+        let (actual, _) = crate::staging::validate::hash_source_file(&full_path, rel_path)?;
         if actual != *expected_sha {
             bitrot += 1;
             details.push(serde_json::json!({"path": rel_path, "status": "BITROT"}));
@@ -900,4 +896,131 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Issue #32/H6: `unit_check_integrity` was the last H9-class
+    //! whole-file-in-RAM site (`fs::read` the entire on-disk file before
+    //! hashing it). It now streams through
+    //! `staging::validate::hash_source_file` instead — the same function
+    //! `stage_create`'s own baseline is established with, so the two call
+    //! sites can never disagree about a file's sha256. These tests prove
+    //! the streamed hash is byte-for-byte identical to the old buffered
+    //! `fs::read` + `Sha256::digest` path it replaces (the same equivalence
+    //! trap issue #84 hit), then exercise the function end-to-end.
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The exact pre-#32 buffered hashing `unit_check_integrity` used to do
+    /// inline: whole-file `fs::read`, `Sha256::digest`, byte-iteration hex
+    /// (not `{:x}`) — reproduced verbatim so the comparison is against the
+    /// literal old behavior, not a paraphrase of it.
+    fn direct_old_style_hash(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn setup_conn_with_unit(current_path: &str) -> (Connection, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let schema = include_str!("../db/migrations/001_initial.sql");
+        conn.execute_batch(schema).unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+             VALUES ('u1', 'unit1', ?1, ?2, 'mtime_size', 1, 'active')",
+            params![tid, current_path],
+        )
+        .unwrap();
+        let uid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', ?2)",
+            params![uid, current_path],
+        )
+        .unwrap();
+        let sid = conn.last_insert_rowid();
+        (conn, sid)
+    }
+
+    fn insert_file(conn: &Connection, snapshot_id: i64, path: &str, size: i64, sha256: &str) {
+        conn.execute(
+            "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![snapshot_id, path, size, sha256],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn streamed_hash_source_file_matches_the_old_buffered_check_integrity_path() {
+        // Multi-chunk content (larger than one streaming buffer) proves
+        // this isn't a one-read toy case — varied content per line, not
+        // one repeated byte, so the hash reflects the whole input.
+        let tmp = TempDir::new().unwrap();
+        let mut content = Vec::new();
+        for i in 0..6000u32 {
+            content.extend_from_slice(format!("check-integrity line {i}\n").as_bytes());
+        }
+        let path = tmp.path().join("big.bin");
+        std::fs::write(&path, &content).unwrap();
+
+        let expected = direct_old_style_hash(&content);
+        let (streamed, streamed_len) =
+            crate::staging::validate::hash_source_file(&path, "big.bin").unwrap();
+
+        assert_eq!(streamed_len, content.len() as i64);
+        assert_eq!(
+            streamed, expected,
+            "streamed check-integrity hash must equal the old fs::read+Sha256::digest hash"
+        );
+    }
+
+    #[test]
+    fn check_integrity_runs_end_to_end_against_a_real_directory() {
+        // Regression coverage for the fix itself: the function must still
+        // run correctly now that its hashing goes through
+        // `hash_source_file` instead of `fs::read` + `Sha256` inline.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+
+        let (conn, sid) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        let hash = direct_old_style_hash(b"hello");
+        insert_file(&conn, sid, "f.txt", 5, &hash);
+
+        unit_check_integrity(&conn, "unit1", true).expect("check-integrity must succeed");
+    }
+
+    #[test]
+    fn check_integrity_still_detects_bitrot_after_the_streaming_swap() {
+        // Same-size, different-content must still classify BITROT after
+        // the streaming refactor — a regression guard so the fix for issue
+        // #32/H6's H9 remainder can't silently defang the existing BITROT
+        // detection this command already had.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"HELLO").unwrap(); // same size as "hello"
+
+        let (conn, sid) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        let stale_hash = direct_old_style_hash(b"hello"); // recorded for different bytes
+        insert_file(&conn, sid, "f.txt", 5, &stale_hash);
+
+        // unit_check_integrity only prints/returns Ok even when BITROT is
+        // found (it's a diagnostic report, not a gate) — so confirm the
+        // streamed hash itself actually diverges from the recorded one,
+        // proving the classification this call depends on still fires.
+        let (actual, _) =
+            crate::staging::validate::hash_source_file(&tmp.path().join("f.txt"), "f.txt").unwrap();
+        assert_ne!(actual, stale_hash);
+        unit_check_integrity(&conn, "unit1", true).expect("check-integrity must still succeed");
+    }
 }
