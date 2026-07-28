@@ -294,6 +294,107 @@ pub enum ConfirmOutcome {
     Quarantined(QuarantinedSession),
 }
 
+// ── shared contact check (File 0 + seal marker) — issue #27 ──
+
+/// What [`check_tape_contact`] found. Carries no side effects (no
+/// `Connection`, no DB writes) — every caller decides for itself what an
+/// outcome means: `InterruptedSession::resume_checking` maps it onto its
+/// existing quarantine bookkeeping (below); the fresh-write path
+/// (`write::check_fresh_write_contact`) maps it onto a plain refusal, since
+/// a wrong cartridge loaded for a fresh write means the operator grabbed the
+/// wrong tape — it says nothing about the not-yet-written logical volume
+/// itself having diverged from anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContactOutcome {
+    /// File 0 unreadable: nothing recorded there. For resume this is a
+    /// session crashed before File 0 ever landed; for a fresh write it is
+    /// the ordinary shape of a blank cartridge. Either way: safe to
+    /// (re)write from BOT.
+    Blank,
+    /// File 0 parsed and its identity matches `expected_label`/`expected_uuid`,
+    /// and (when a seal position was given) nothing parseable was found
+    /// there either — safe to continue.
+    Matches,
+    /// File 0 parsed but disagrees with the expected identity, or was
+    /// readable yet failed to parse at all (ambiguous is treated as a
+    /// mismatch — never overwrite on ambiguity).
+    IdentityMismatch {
+        found: Option<format::IdThunkIdentity>,
+    },
+    /// The seal-marker position parsed as a seal marker: this tape already
+    /// holds a SEALED volume (ADR-0003 — sealed volumes are immutable,
+    /// there is no append).
+    AlreadySealed { seal_position: u32 },
+}
+
+/// The one check both [`InterruptedSession::resume_checking`] and the
+/// fresh-write path (`write::volume_init`/`write::volume_write`, issue #27)
+/// run before ever executing an entry — `docs/design/layout-session.md`'s
+/// Resume rule: "rewind, read file 0, require ID-thunk identity match (label
+/// and uuid) — mismatch = divergence = quarantine, not overwrite," plus the
+/// seal-marker absence check that follows it ("The absent seal marker
+/// confirms the tape is legitimately unsealed"). Factored out so the two
+/// call sites cannot drift apart — this is the algorithm, not a description
+/// of it.
+///
+/// `seal_position` is the tape position to probe for a seal marker, if the
+/// caller has one to check: `resume_checking` and `volume_write` always
+/// pass `Some` (they hold a real [`BuiltLayout`] with a known seal-marker
+/// entry); `volume_init` has no Layout yet (no staged units — only a label
+/// and a freshly generated candidate uuid) and passes `None`. This loses
+/// nothing in practice: the only way this function would ever reach a
+/// *matching*-identity seal check is if the tape's File 0 already carried
+/// the caller's own `expected_uuid` — impossible for `volume_init`, whose
+/// uuid is always freshly generated. Any tape `volume_init` is about to
+/// stamp that already has a parseable File 0 therefore already refuses via
+/// `IdentityMismatch`, sealed or not.
+///
+/// The two probes are independent: the seal-marker check runs whether or
+/// not File 0 was readable (a File-0-unreadable-but-sealed-tail tape is
+/// exactly the front/tail damage asymmetry `volume-format-v2.md` §4 designs
+/// for), but not if File 0 was readable and already mismatched (no need —
+/// that already refuses).
+pub fn check_tape_contact(
+    store: &mut dyn Store,
+    expected_label: &str,
+    expected_uuid: &str,
+    seal_position: Option<u32>,
+) -> ContactOutcome {
+    let mut id_thunk_bytes = Vec::new();
+    let file_zero_present = store.read_file(0, &mut id_thunk_bytes).is_ok();
+    if file_zero_present {
+        let text = String::from_utf8_lossy(&id_thunk_bytes);
+        let identity = format::parse_id_thunk_identity(&text);
+        let matches = matches!(
+            &identity,
+            Ok(id) if id.label == expected_label && id.uuid == expected_uuid
+        );
+        if !matches {
+            return ContactOutcome::IdentityMismatch {
+                found: identity.ok(),
+            };
+        }
+    }
+
+    if let Some(seal_pos) = seal_position {
+        let mut seal_bytes = Vec::new();
+        if store.read_file(seal_pos, &mut seal_bytes).is_ok() {
+            let text = String::from_utf8_lossy(&seal_bytes);
+            if format::parse_seal_marker(&text).is_ok() {
+                return ContactOutcome::AlreadySealed {
+                    seal_position: seal_pos,
+                };
+            }
+        }
+    }
+
+    if file_zero_present {
+        ContactOutcome::Matches
+    } else {
+        ContactOutcome::Blank
+    }
+}
+
 impl PlannedSession {
     /// `PlannedSession -> ExecuteOutcome`, checking for interruption via the
     /// real process-global signal flag. See [`Self::execute_checking`] for
@@ -392,23 +493,34 @@ impl InterruptedSession {
             }));
         }
 
-        // 2. File-0 identity check. A read failure (nothing recorded at
-        // position 0 at all) means legitimately nothing was written yet —
-        // NOT a mismatch, since a session crashed before File 0 landed is
-        // exactly the "zero slices written" cursor case below, which
-        // restarts from BOT anyway. Only a File 0 that IS readable but
-        // disagrees (or fails to parse — ambiguous, so treated as a
-        // mismatch: never overwrite on ambiguity) is a divergence.
-        let mut id_thunk_bytes = Vec::new();
-        if store.read_file(0, &mut id_thunk_bytes).is_ok() {
-            let text = String::from_utf8_lossy(&id_thunk_bytes);
-            let identity = format::parse_id_thunk_identity(&text);
-            let matches = matches!(
-                &identity,
-                Ok(id) if id.label == self.built.layout.label
-                    && id.uuid == self.built.layout.volume_uuid
-            );
-            if !matches {
+        // 2+2b. File-0 identity, then (independently) the seal-marker
+        // absence check — `docs/design/layout-session.md`'s Resume rule: "The
+        // absent seal marker confirms the tape is legitimately unsealed
+        // (safe to resume, not an append to a sealed volume)" — so a seal
+        // marker that IS present means this tape is finished and resuming
+        // would append to a sealed volume, which ADR-0003 forbids outright.
+        // This is not hypothetical: `recover_orphaned_sessions` sweeps a
+        // crashed `in_progress` session to `interrupted` (resumable), and a
+        // crash during confirm — i.e. AFTER seal() wrote the marker — lands
+        // exactly here. The File-0 identity check alone cannot catch it: the
+        // identity genuinely matches, because it genuinely is the same tape.
+        // Both checks are [`check_tape_contact`] (#27) — shared verbatim with
+        // the fresh-write path so the two cannot drift apart.
+        let seal_position = self
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .map(|e| e.position as u32);
+        match check_tape_contact(
+            store,
+            &self.built.layout.label,
+            &self.built.layout.volume_uuid,
+            seal_position,
+        ) {
+            ContactOutcome::Blank | ContactOutcome::Matches => {}
+            ContactOutcome::IdentityMismatch { found } => {
                 conn.execute(
                     "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
                     params![self.volume_id],
@@ -420,50 +532,21 @@ impl InterruptedSession {
                     reason: QuarantineReason::IdentityMismatch {
                         expected_label: self.built.layout.label.clone(),
                         expected_uuid: self.built.layout.volume_uuid.clone(),
-                        found: identity.ok(),
+                        found,
                     },
                 }));
             }
-        }
-
-        // 2b. Seal-marker absence check. layout-session.md's Resume rule ends
-        // "The absent seal marker confirms the tape is legitimately unsealed
-        // (safe to resume, not an append to a sealed volume)" — so a seal
-        // marker that IS present means this tape is finished and resuming
-        // would append to a sealed volume, which ADR-0003 forbids outright.
-        // This is not hypothetical: `recover_orphaned_sessions` sweeps a
-        // crashed `in_progress` session to `interrupted` (resumable), and a
-        // crash during confirm — i.e. AFTER seal() wrote the marker — lands
-        // exactly here. The File-0 identity check above cannot catch it: the
-        // identity genuinely matches, because it genuinely is the same tape.
-        // Read the last position and refuse if it parses as a seal marker; an
-        // unsealed tape has nothing readable there (past EOD), so a read
-        // failure is the expected, safe case.
-        if let Some(seal_entry) = self
-            .built
-            .layout
-            .entries
-            .iter()
-            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
-        {
-            let seal_pos = seal_entry.position as u32;
-            let mut seal_bytes = Vec::new();
-            if store.read_file(seal_pos, &mut seal_bytes).is_ok() {
-                let text = String::from_utf8_lossy(&seal_bytes);
-                if format::parse_seal_marker(&text).is_ok() {
-                    conn.execute(
-                        "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
-                        params![self.volume_id],
-                    )?;
-                    mark_writes(conn, &self.write_ids, "aborted")?;
-                    return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
-                        volume_id: self.volume_id,
-                        label: self.built.layout.label.clone(),
-                        reason: QuarantineReason::AlreadySealed {
-                            seal_position: seal_pos,
-                        },
-                    }));
-                }
+            ContactOutcome::AlreadySealed { seal_position } => {
+                conn.execute(
+                    "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                    params![self.volume_id],
+                )?;
+                mark_writes(conn, &self.write_ids, "aborted")?;
+                return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
+                    volume_id: self.volume_id,
+                    label: self.built.layout.label.clone(),
+                    reason: QuarantineReason::AlreadySealed { seal_position },
+                }));
             }
         }
 
@@ -1823,5 +1906,168 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vs_outcome, "failed");
+    }
+
+    // --- check_tape_contact: the shared File-0 + seal-marker check (#27) ---
+    //
+    // Pure: no `Connection`, no DB access — MemStore only. These pin the
+    // exact algorithm `resume_checking` (above) and the fresh-write path
+    // (`write::check_fresh_write_contact`) both run, so the two callers
+    // cannot silently diverge. `resume_quarantines_on_id_thunk_identity_mismatch`
+    // and `resume_refuses_a_tape_that_already_carries_a_seal_marker` above
+    // already exercise this same code through `resume_checking`; these tests
+    // exercise it directly, including shapes (`seal_position = None`) that
+    // only the fresh-write caller ever produces.
+
+    const CONTACT_LABEL: &str = "SESSTEST";
+    const CONTACT_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn contact_id_thunk_bytes(label: &str, uuid: &str, total_files: i32) -> Vec<u8> {
+        let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label,
+            uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-28T00:00:00Z",
+        });
+        let mut padded = thunk.into_bytes();
+        padded.resize(BS as usize, 0);
+        padded
+    }
+
+    /// Writes `bytes` into `store.files[position]`, growing the (contiguous)
+    /// vec with empty placeholder files if needed — mirrors how the session
+    /// bonus tests above stage a MemStore by hand.
+    fn put_file(store: &mut MemStore, position: usize, bytes: Vec<u8>) {
+        if store.files.len() <= position {
+            store.files.resize(position + 1, Vec::new());
+            store.syncs.resize(position + 1, false);
+        }
+        store.files[position] = bytes;
+    }
+
+    #[test]
+    fn check_tape_contact_blank_tape_with_a_known_seal_position_proceeds() {
+        // volume_write's shape on a genuinely blank cartridge: a real Layout
+        // (so `seal_position` is `Some`), but nothing at all on tape yet.
+        let mut store = MemStore::new(BS as usize);
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(5));
+        assert_eq!(outcome, ContactOutcome::Blank);
+    }
+
+    #[test]
+    fn check_tape_contact_blank_tape_with_no_seal_position_proceeds() {
+        // volume_init's shape: no Layout yet at all, so nothing to check
+        // beyond File 0 (see `check_tape_contact`'s doc comment on why this
+        // costs nothing in practice).
+        let mut store = MemStore::new(BS as usize);
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        assert_eq!(outcome, ContactOutcome::Blank);
+    }
+
+    #[test]
+    fn check_tape_contact_matches_when_identity_agrees_and_seal_position_is_unwritten() {
+        // THE critical fresh-write happy path (not just "blank tape"):
+        // `volume_init` already stamped this exact tape's File 0 with this
+        // exact label+uuid; `volume_write` runs next, on the SAME physical
+        // tape, with a real Layout (`seal_position = Some`) but nothing
+        // written at that position yet. This must proceed — refusing here
+        // would break ordinary, correct usage, not just the wrong-tape case.
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 8),
+        );
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(7));
+        assert_eq!(outcome, ContactOutcome::Matches);
+    }
+
+    #[test]
+    fn check_tape_contact_matches_when_identity_agrees_and_no_seal_position_given() {
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 8),
+        );
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        assert_eq!(outcome, ContactOutcome::Matches);
+    }
+
+    #[test]
+    fn check_tape_contact_identity_mismatch_reports_found_identity() {
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 8),
+        );
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        match outcome {
+            ContactOutcome::IdentityMismatch { found } => {
+                let found = found.expect("File 0 parsed, just disagreed");
+                assert_eq!(found.label, "WRONGVOL");
+                assert_eq!(found.uuid, "00000000-0000-0000-0000-000000000000");
+            }
+            other => panic!("expected IdentityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_tape_contact_identity_mismatch_when_file_zero_is_unparseable_garbage() {
+        // Readable but not valid TOML at all: ambiguous, so treated as a
+        // mismatch (never overwrite on ambiguity) — `found` is `None`, not a
+        // crash.
+        let mut store = MemStore::new(BS as usize);
+        put_file(&mut store, 0, b"not a tapectl id thunk at all".to_vec());
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        match outcome {
+            ContactOutcome::IdentityMismatch { found } => assert!(found.is_none()),
+            other => panic!("expected IdentityMismatch{{found: None}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_tape_contact_already_sealed_when_seal_position_parses() {
+        // Identity matches (it genuinely is "this" volume) but the tape is
+        // already sealed — mirrors `resume_refuses_a_tape_that_already_carries_a_seal_marker`,
+        // proving the same outcome is reachable directly, not only through
+        // `resume_checking`.
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
+        );
+        let seal_bytes =
+            layout::generate_seal_marker(CONTACT_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        put_file(&mut store, 5, seal_padded);
+
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(5));
+        match outcome {
+            ContactOutcome::AlreadySealed { seal_position } => assert_eq!(seal_position, 5),
+            other => panic!("expected AlreadySealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_tape_contact_blank_when_seal_position_given_but_nothing_recorded_there() {
+        // An unsealed tape has nothing readable at the (hypothetical) seal
+        // position — a read failure there is the expected, safe case, not
+        // an error (mirrors `resume_checking`'s own comment on this exact
+        // point).
+        let mut store = MemStore::new(BS as usize);
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(5));
+        assert_eq!(outcome, ContactOutcome::Blank);
     }
 }
