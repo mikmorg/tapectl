@@ -474,6 +474,23 @@ impl TapeStore {
         }
         Ok(Self { dev, usable_bytes })
     }
+
+    /// Open the drive read-only, rewound to BOT — for restore, which only
+    /// ever calls `read_file` (issue #85 migrated the restore read seam onto
+    /// this trait: `TapeStore::read_file` already does exactly the
+    /// rewind + forward-space-file + streaming-read sequence restore used
+    /// to inline by hand). Unlike [`Self::open`], this does not touch
+    /// hardware compression (a write-time-only concern) and reports zero
+    /// usable capacity, since nothing on the restore path ever calls
+    /// `capacity()`.
+    pub fn open_read(device: &str, block_size: usize) -> Result<Self> {
+        let dev = TapeDevice::open_read(device, block_size)?;
+        dev.rewind()?;
+        Ok(Self {
+            dev,
+            usable_bytes: 0,
+        })
+    }
 }
 
 impl Store for TapeStore {
