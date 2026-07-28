@@ -370,6 +370,29 @@ pub fn check_tape_contact(
             Ok(id) if id.label == expected_label && id.uuid == expected_uuid
         );
         if !matches {
+            // Before concluding a plain identity mismatch, check whether
+            // THIS tape — whatever foreign or stale volume it actually
+            // holds — is itself already sealed, at ITS OWN self-reported
+            // seal position (`format::parse_id_thunk_layout_pointers`'
+            // `[layout].seal_marker`, not the caller's `seal_position`
+            // argument below, which is a position in the CALLER's own
+            // layout and has no relationship to a different tape's real
+            // seal marker). This closes issue #27's headline scenario:
+            // without it, a foreign-but-sealed cartridge would present as
+            // a plain `IdentityMismatch`, which the fresh-write path's
+            // `--force` override is allowed to defeat — silently
+            // permitting exactly the sealed-volume overwrite ADR-0003
+            // forbids. `resume_checking` never uses `--force`, so this is
+            // pure additional safety there, not a behavior change.
+            if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
+                if pointers.seal_marker >= 0
+                    && seal_marker_parses_at(store, pointers.seal_marker as u32)
+                {
+                    return ContactOutcome::AlreadySealed {
+                        seal_position: pointers.seal_marker as u32,
+                    };
+                }
+            }
             return ContactOutcome::IdentityMismatch {
                 found: identity.ok(),
             };
@@ -377,14 +400,10 @@ pub fn check_tape_contact(
     }
 
     if let Some(seal_pos) = seal_position {
-        let mut seal_bytes = Vec::new();
-        if store.read_file(seal_pos, &mut seal_bytes).is_ok() {
-            let text = String::from_utf8_lossy(&seal_bytes);
-            if format::parse_seal_marker(&text).is_ok() {
-                return ContactOutcome::AlreadySealed {
-                    seal_position: seal_pos,
-                };
-            }
+        if seal_marker_parses_at(store, seal_pos) {
+            return ContactOutcome::AlreadySealed {
+                seal_position: seal_pos,
+            };
         }
     }
 
@@ -392,6 +411,22 @@ pub fn check_tape_contact(
         ContactOutcome::Matches
     } else {
         ContactOutcome::Blank
+    }
+}
+
+/// Read `position` and report whether it parses as a seal marker — a read
+/// failure (nothing recorded there) is the expected, safe "not sealed"
+/// case, never an error. Shared by [`check_tape_contact`]'s two seal probes
+/// (the caller-supplied position, and a foreign tape's own self-reported
+/// one) so there is exactly one "does this position hold a seal marker"
+/// check, not two copies that could drift.
+fn seal_marker_parses_at(store: &mut dyn Store, position: u32) -> bool {
+    let mut bytes = Vec::new();
+    if store.read_file(position, &mut bytes).is_ok() {
+        let text = String::from_utf8_lossy(&bytes);
+        format::parse_seal_marker(&text).is_ok()
+    } else {
+        false
     }
 }
 
@@ -2057,6 +2092,45 @@ mod tests {
         match outcome {
             ContactOutcome::AlreadySealed { seal_position } => assert_eq!(seal_position, 5),
             other => panic!("expected AlreadySealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_tape_contact_already_sealed_wins_over_identity_mismatch_on_a_foreign_tape() {
+        // THE dangerous scenario the issue exists for: a wrong cartridge
+        // loaded, holding a DIFFERENT, already-sealed volume. The caller's
+        // `seal_position` argument is a position in the CALLER's own
+        // not-yet-written layout (or, for `volume_init`, `None` — no layout
+        // at all yet) — it has no relationship to where a FOREIGN tape's
+        // real seal marker actually sits. If `check_tape_contact` only ever
+        // consulted the caller's own `seal_position`, a foreign sealed tape
+        // would present as a plain `IdentityMismatch` — which `--force`
+        // (write.rs's `decide_fresh_write_contact`) is allowed to override —
+        // silently permitting exactly the destructive overwrite ADR-0003
+        // forbids. The fix: when identity mismatches, ALSO probe the
+        // foreign tape's OWN self-reported `[layout].seal_marker` position
+        // (`format::parse_id_thunk_layout_pointers`) before concluding
+        // IdentityMismatch. Deliberately passes a caller `seal_position`
+        // (7) that does NOT match the foreign tape's real seal position (5)
+        // — proving the self-report, not the caller's guess, is what finds
+        // it.
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
+        );
+        let seal_bytes = layout::generate_seal_marker("WRONGVOL", 6, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        put_file(&mut store, 5, seal_padded);
+
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(7));
+        match outcome {
+            ContactOutcome::AlreadySealed { seal_position } => assert_eq!(seal_position, 5),
+            other => panic!(
+                "expected AlreadySealed (foreign tape's own self-reported position), got {other:?}"
+            ),
         }
     }
 

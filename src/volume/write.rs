@@ -1803,6 +1803,39 @@ mod tests {
     }
 
     #[test]
+    fn check_fresh_write_contact_foreign_sealed_tape_refuses_even_with_force() {
+        // The headline scenario from issue #27's own description: "loading
+        // the WRONG physical cartridge — including one holding a
+        // different, already-sealed volume." Unlike the test above (same
+        // label/uuid, sealed), File 0 here identifies a totally DIFFERENT,
+        // foreign volume — the caller's own `seal_position` (7) is a
+        // position in ITS layout, unrelated to where this foreign tape's
+        // real seal marker (5) sits. --force can defeat a plain identity
+        // mismatch, so if the foreign tape's own sealed-ness were missed,
+        // this would silently overwrite a sealed volume. Must refuse
+        // regardless.
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(
+            &mut store,
+            0,
+            fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
+        );
+        let seal_bytes = layout::generate_seal_marker("WRONGVOL", 6, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(FW_BS as usize, 0);
+        fw_put_file(&mut store, 5, seal_padded);
+
+        let err =
+            check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, Some(7), true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ADR-0003"),
+            "expected ADR citation (this must be an AlreadySealed refusal, not a bypassed \
+             IdentityMismatch) in: {msg}"
+        );
+    }
+
+    #[test]
     fn check_fresh_write_contact_default_is_no_override_not_reachable_by_accident() {
         // The zero-argument, no-flag CLI invocation must refuse — the
         // override is never the default.

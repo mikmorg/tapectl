@@ -147,7 +147,10 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
 /// the ID thunk (`layout::generate_id_thunk_v2`'s `magic`, `layout_version`,
 /// `tapectl_version`, capacities, `created_at`, and the whole `[layout]`/
 /// `[media]` tables) is either provisional or not part of this specific
-/// check, so this struct deliberately carries only what resume needs.
+/// check, so this struct deliberately carries only what resume needs. The
+/// `[layout]` table's own pointers have a sibling parser,
+/// [`parse_id_thunk_layout_pointers`], for the one other consumer that
+/// needs them (a foreign tape's self-reported seal position, #27).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdThunkIdentity {
     pub label: String,
@@ -183,6 +186,55 @@ pub fn parse_id_thunk_identity(raw: &str) -> Result<IdThunkIdentity> {
     Ok(IdThunkIdentity {
         label: doc.volume.label,
         uuid: doc.volume.uuid,
+    })
+}
+
+/// The ID thunk (File 0)'s `[layout]` pointers — `front_index` (always 3),
+/// `seal_marker` (the last file — `layout::generate_id_thunk_v2` computes
+/// this as `total_files - 1`), and `total_files`
+/// (`docs/design/volume-format-v2.md` §1). A tape's own claim about its own
+/// shape.
+///
+/// Used by the fresh-write contact check (`session::check_tape_contact`,
+/// issue #27) to find a FOREIGN tape's real seal-marker position when its
+/// File-0 identity does not match what the caller expected: the caller's own
+/// `seal_position` argument is a position in the caller's own (not-yet-
+/// written, or for `volume_init` nonexistent) layout, which has no
+/// relationship to where a *different* tape's actual seal marker sits.
+/// Without consulting the tape's own self-report, a foreign-but-sealed
+/// cartridge would present as a plain identity mismatch — which the
+/// `--force` override can defeat — silently permitting exactly the
+/// overwrite-of-a-sealed-volume ADR-0003 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdThunkLayoutPointers {
+    pub front_index: i32,
+    pub seal_marker: i32,
+    pub total_files: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct LayoutPointersToml {
+    front_index: i64,
+    seal_marker: i64,
+    total_files: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdThunkLayoutDoc {
+    layout: LayoutPointersToml,
+}
+
+/// Parse the ID thunk (File 0)'s `[layout]` pointers. Same fail-safe
+/// convention as every other parser here: absent/malformed input is a
+/// normal `Err`, never a panic.
+pub fn parse_id_thunk_layout_pointers(raw: &str) -> Result<IdThunkLayoutPointers> {
+    let body = toml_body(raw, "[layout]", "id thunk layout")?;
+    let doc: IdThunkLayoutDoc = toml::from_str(body)
+        .map_err(|e| TapectlError::Other(format!("id thunk layout: TOML parse failed: {e}")))?;
+    Ok(IdThunkLayoutPointers {
+        front_index: doc.layout.front_index as i32,
+        seal_marker: doc.layout.seal_marker as i32,
+        total_files: doc.layout.total_files as i32,
     })
 }
 
@@ -506,6 +558,44 @@ mod tests {
 
         let parsed = parse_id_thunk_identity(&padded_str).expect("parses despite NUL padding");
         assert_eq!(parsed.label, "RT03");
+    }
+
+    // --- id thunk layout pointers (the foreign-tape seal-position check, #27) --
+
+    #[test]
+    fn id_thunk_layout_pointers_round_trip_through_the_parser() {
+        let params = sample_id_thunk_params("RT04", "11111111-2222-3333-4444-555555555555");
+        let generated = generate_id_thunk_v2(&params);
+
+        let parsed = parse_id_thunk_layout_pointers(&generated).expect("parses");
+        assert_eq!(parsed.front_index, 3);
+        assert_eq!(parsed.total_files, 12);
+        assert_eq!(parsed.seal_marker, 11, "seal_marker = total_files - 1");
+    }
+
+    #[test]
+    fn id_thunk_layout_pointers_parser_ignores_the_volume_and_media_tables() {
+        let params = sample_id_thunk_params("RT05", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let generated = generate_id_thunk_v2(&params);
+        assert!(parse_id_thunk_layout_pointers(&generated).is_ok());
+    }
+
+    #[test]
+    fn id_thunk_layout_pointers_parser_is_tolerant_of_trailing_block_padding_nuls() {
+        let params = sample_id_thunk_params("RT06", "cccccccc-dddd-eeee-ffff-000000000000");
+        let generated = generate_id_thunk_v2(&params);
+        let mut padded = generated.into_bytes();
+        padded.resize(padded.len() + 4096, 0);
+        let padded_str = String::from_utf8(padded).unwrap();
+
+        let parsed =
+            parse_id_thunk_layout_pointers(&padded_str).expect("parses despite NUL padding");
+        assert_eq!(parsed.total_files, 12);
+    }
+
+    #[test]
+    fn id_thunk_layout_pointers_missing_marker_is_an_err_not_a_panic() {
+        assert!(parse_id_thunk_layout_pointers("no toml here at all").is_err());
     }
 
     #[test]
