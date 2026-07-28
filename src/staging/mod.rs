@@ -314,7 +314,13 @@ pub fn stage_create(
         )?;
     }
 
-    // Backfill sha256 into files and manifest_entries (first stage only)
+    // Backfill sha256 into files and manifest_entries — establishes the
+    // baseline ONLY where one doesn't already exist (issue #32/H6).
+    // `validate_source` now refuses to stage (BITROT) before we ever get
+    // here if a hash disagrees with an existing baseline, but the thing
+    // that actually makes "(first stage only)" true is
+    // `backfill_checksums`'s own `sha256 IS NULL` guard on both UPDATEs —
+    // not this `is_empty()` check, which only skips a no-op call.
     if !checksums.is_empty() {
         backfill_checksums(conn, snapshot_id, &checksums)?;
     }
@@ -557,17 +563,31 @@ fn stream_copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64>
     Ok(total)
 }
 
+/// Establish the sha256 baseline for every `(path, hash)` pair — but ONLY
+/// where `files`/`manifest_entries` don't already have one (issue #32/H6).
+///
+/// The `sha256 IS NULL` guard on both UPDATEs is the actual enforcement:
+/// it makes this function safe to call on every `stage_create` (including
+/// a re-stage of an already-baselined snapshot) regardless of what
+/// `checksums` contains, rather than relying on the caller to have
+/// filtered it first. `validate_source` already refuses to stage (BITROT)
+/// before this point if a hash disagrees with an existing baseline, so in
+/// practice every row here either has no baseline yet (this call
+/// establishes it) or already matches (a no-op rewrite of the identical
+/// value) — but the guard holds even if that invariant is ever violated by
+/// a future caller.
 fn backfill_checksums(
     conn: &Connection,
     snapshot_id: i64,
     checksums: &[(String, String)],
 ) -> Result<()> {
-    let mut file_update =
-        conn.prepare("UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = ?3")?;
+    let mut file_update = conn.prepare(
+        "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = ?3 AND sha256 IS NULL",
+    )?;
     let mut manifest_update = conn.prepare(
         "UPDATE manifest_entries SET sha256 = ?1
          WHERE manifest_id = (SELECT id FROM manifests WHERE snapshot_id = ?2 LIMIT 1)
-         AND path = ?3",
+         AND path = ?3 AND sha256 IS NULL",
     )?;
 
     for (path, hash) in checksums {

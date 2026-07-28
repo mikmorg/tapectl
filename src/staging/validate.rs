@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 
@@ -8,7 +9,35 @@ use crate::error::{Result, TapectlError};
 use crate::util::HashingReader;
 
 /// Validate source files by computing SHA256 for all files in the snapshot.
-/// Returns Vec<(relative_path, sha256_hex)>.
+///
+/// This is the archival **commitment point** (issue #32/H6; design doc
+/// §2.13: "staging is the archival commitment point — full sha256 every
+/// time"). The first `stage_create` for a snapshot has no recorded
+/// `files.sha256` baseline yet; the hash computed here is what the caller's
+/// `backfill_checksums` uses to establish it. Every *later* `stage_create`
+/// call for the same `snapshot_id` (a re-stage) already has a baseline, and
+/// this function now compares against it instead of blindly recomputing and
+/// letting the backfill silently clobber it:
+///
+///   - no baseline yet                  -> establish it (normal, not an error)
+///   - baseline matches                 -> fine
+///   - baseline differs, SAME size      -> BITROT suspected: refuse to stage
+///   - baseline differs, size DIFFERS   -> DIRTY: a real edit (issue #36's
+///     scope, not bitrot — see `check_source_size`)
+///
+/// Also diffs the on-disk file set against the manifest for NEW files
+/// (the issue's own remediation text: "diff walked set vs manifest for
+/// NEW/MISSING") — a file dar would silently archive that the catalog has
+/// never seen would break the "two stage_sets of one snapshot are logically
+/// identical" invariant the finding named. MISSING (a manifest file absent
+/// from disk) already errored before this fix, via `check_source_size`'s
+/// `metadata()` call below — preserved verbatim.
+///
+/// Returns `Vec<(relative_path, sha256_hex)>` for every file — the return
+/// contract is unchanged (callers depend on it): `stage_create` passes this
+/// straight to `backfill_checksums`, whose own `sha256 IS NULL` guard —
+/// not any filtering here — is what actually prevents overwriting an
+/// existing baseline.
 pub fn validate_source(
     conn: &Connection,
     snapshot_id: i64,
@@ -16,18 +45,48 @@ pub fn validate_source(
 ) -> Result<Vec<(String, String)>> {
     let base = Path::new(source_path);
 
-    // Get all non-directory files from the manifest
+    // Get all non-directory files from the manifest, including any
+    // already-established sha256 baseline.
     let mut stmt = conn.prepare(
-        "SELECT path, size_bytes FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
+        "SELECT path, size_bytes, sha256 FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
     )?;
-    let files: Vec<(String, i64)> = stmt
+    let files: Vec<(String, i64, Option<String>)> = stmt
         .query_map(params![snapshot_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // NEW detection (issue #32/H6): diff the walked on-disk set against the
+    // manifest's path set, before touching any file's bytes. Reuses
+    // `staging::walk_directory`'s exact rel_path derivation (strip_prefix +
+    // to_string_lossy, follow_links(false), is_dir filter) via `super`
+    // rather than a second walk implementation that could silently
+    // disagree with what `snapshot_create` itself considered "the files" —
+    // this is an extra O(file count) directory walk every stage, accepted
+    // for the walk-parity guarantee.
+    let (_, _, disk_entries) = super::walk_directory(source_path)?;
+    let manifest_paths: HashSet<&str> = files.iter().map(|(p, _, _)| p.as_str()).collect();
+    let mut new_files: Vec<&str> = disk_entries
+        .iter()
+        .filter(|e| !e.is_dir && !manifest_paths.contains(e.path.as_str()))
+        .map(|e| e.path.as_str())
+        .collect();
+    new_files.sort_unstable();
+    if !new_files.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "NEW: file(s) on disk not present in the snapshot manifest: {} — \
+             dar would archive content the catalog has never seen; take a new \
+             snapshot before staging (see #32)",
+            new_files.join(", ")
+        )));
+    }
+
     let total_files = files.len();
-    let total_bytes: i64 = files.iter().map(|(_, s)| s).sum();
+    let total_bytes: i64 = files.iter().map(|(_, s, _)| s).sum();
     info!(
         files = total_files,
         total_mb = total_bytes / (1024 * 1024),
@@ -37,7 +96,7 @@ pub fn validate_source(
     let mut checksums = Vec::new();
     let mut validated = 0;
 
-    for (rel_path, expected_size) in &files {
+    for (rel_path, expected_size, baseline_sha) in &files {
         let full_path = base.join(rel_path);
         let expected_size = *expected_size;
 
@@ -45,7 +104,8 @@ pub fn validate_source(
         // metadata() stat is instant and fails fast on a missing or
         // changed file before any I/O is spent hashing it — replaces the
         // `exists()` + whole-file `std::fs::read` this check used to ride
-        // along with.
+        // along with. Also doubles as the MISSING and DIRTY-by-size
+        // classifications (issue #32) — see its doc comment.
         check_source_size(&full_path, rel_path, expected_size)?;
 
         // Hash by streaming (H9 remainder, issue #84): reuses
@@ -73,6 +133,38 @@ pub fn validate_source(
             )));
         }
 
+        // Commitment-point comparison (issue #32/H6): `baseline_sha` is
+        // `files.sha256` as recorded by the last successful backfill (NULL
+        // if this snapshot has never been staged before). By this point
+        // `check_source_size` and the streamed byte count have both
+        // already proven the current on-disk size equals the manifest's
+        // recorded size, so a hash mismatch here is content drift at a
+        // CONSTANT size — bitrot, not an edit.
+        match baseline_sha.as_deref() {
+            None => {
+                // Commitment point: nothing to compare against yet. Normal,
+                // not an error — the caller's guarded backfill establishes
+                // the baseline from the hash pushed below.
+            }
+            Some(baseline) if baseline == hex.as_str() => {
+                // Matches — fine.
+            }
+            Some(baseline) => {
+                // BITROT suspected. Per the steer for #32: refuse to stage
+                // rather than archive content already suspected corrupt
+                // over a baseline that proves it — and never let this
+                // hash reach `backfill_checksums` (moot here since
+                // returning Err discards `checksums` entirely, but the
+                // SQL guard in `backfill_checksums` protects this
+                // independent of that).
+                return Err(TapectlError::Other(format!(
+                    "BITROT suspected: {rel_path} — sha256 differs at an unchanged \
+                     size ({expected_size} bytes): baseline={baseline}, current={hex}. \
+                     Refusing to stage (see #32); investigate before re-staging."
+                )));
+            }
+        }
+
         checksums.push((rel_path.clone(), hex));
 
         validated += 1;
@@ -92,6 +184,16 @@ pub fn validate_source(
 /// (the size recorded in the manifest at snapshot time) — a plain
 /// `metadata()` call, no read (H9 remainder, issue #84): fails fast on a
 /// missing or already-changed file before any I/O is spent hashing it.
+///
+/// Doubles as two of the issue #32/H6 classifications, both unconditional
+/// on whether a sha256 baseline exists (they only need a size comparison):
+///   - NotFound             -> MISSING (unchanged wording/behavior — this
+///     already errored before #32; not touched here).
+///   - size mismatch        -> DIRTY: a real edit changed both size and
+///     content. Deliberately kept out of `validate_source`'s BITROT
+///     wording (and vice versa) so the two outcomes can never be
+///     conflated — full dirty-detection machinery (`unit status --dirty`,
+///     `mark-tape-only`'s guard) is issue #36's scope, not this one's.
 fn check_source_size(full_path: &Path, rel_path: &str, expected_size: i64) -> Result<()> {
     let metadata = std::fs::metadata(full_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -103,7 +205,9 @@ fn check_source_size(full_path: &Path, rel_path: &str, expected_size: i64) -> Re
 
     if metadata.len() as i64 != expected_size {
         return Err(TapectlError::Other(format!(
-            "source file size changed: {rel_path} (expected {expected_size}, got {})",
+            "DIRTY: source file size changed: {rel_path} (expected {expected_size} bytes, \
+             found {} bytes) — a real edit (size and content both differ); tracked \
+             separately under issue #36",
             metadata.len()
         )));
     }
@@ -124,7 +228,12 @@ const VALIDATE_STREAM_BUFFER: usize = 128 * 1024;
 /// its size. The byte count is returned alongside the hash (not just the
 /// hash) so the caller can detect a file that changed size during this very
 /// read — see the TOCTOU guard in `validate_source`.
-fn hash_source_file(full_path: &Path, rel_path: &str) -> Result<(String, i64)> {
+///
+/// `pub(crate)` (issue #32/H6): `cli::operations::unit_check_integrity` was
+/// the last whole-file `fs::read` site (H9-class); it now streams through
+/// this exact function instead of growing a second implementation, so the
+/// two call sites can never disagree about what a file's sha256 is.
+pub(crate) fn hash_source_file(full_path: &Path, rel_path: &str) -> Result<(String, i64)> {
     let file = std::fs::File::open(full_path)
         .map_err(|e| TapectlError::Other(format!("cannot open source file: {rel_path} ({e})")))?;
     let mut reader = HashingReader::new(file);
@@ -147,7 +256,13 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    fn setup_conn_with_snapshot(files: &[(&str, i64)]) -> (Connection, i64) {
+    /// `files` is `(path, size_bytes, sha256_baseline)` — the third element
+    /// seeds `files.sha256`/`manifest_entries.sha256` as they'd stand after
+    /// a *previous* successful stage (issue #32/H6): `None` simulates a
+    /// snapshot that has never been staged (no baseline yet — the
+    /// commitment point hasn't happened); `Some(hex)` simulates a re-stage
+    /// with an already-established baseline to compare against.
+    fn setup_conn_with_snapshot(files: &[(&str, i64, Option<&str>)]) -> (Connection, i64) {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         let schema = include_str!("../db/migrations/001_initial.sql");
@@ -174,11 +289,25 @@ mod tests {
         .unwrap();
         let sid = conn.last_insert_rowid();
 
-        for (path, size) in files {
+        conn.execute("INSERT INTO manifests (snapshot_id) VALUES (?1)", [sid])
+            .unwrap();
+        let mid = conn.last_insert_rowid();
+
+        for (path, size, sha) in files {
             conn.execute(
-                "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-                 VALUES (?1, ?2, ?3, 0)",
-                params![sid, path, size],
+                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![sid, path, size, sha],
+            )
+            .unwrap();
+            // Mirrors the production backfill target: `manifest_entries`
+            // carries the same baseline and the same never-overwrite
+            // guarantee `backfill_checksums` must provide.
+            conn.execute(
+                "INSERT INTO manifest_entries
+                     (manifest_id, path, size_bytes, mtime, sha256, is_directory)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 0)",
+                params![mid, path, size, sha],
             )
             .unwrap();
         }
@@ -191,7 +320,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
         std::fs::write(tmp.path().join("b.bin"), b"world!!").unwrap();
 
-        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5), ("b.bin", 7)]);
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None), ("b.bin", 7, None)]);
         let result = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(result.len(), 2);
         // Sha256 of "hello" is 2cf24d...
@@ -207,10 +336,13 @@ mod tests {
 
     #[test]
     fn validate_source_missing_file_errors() {
+        // MISSING classification (issue #32): a manifest file absent from
+        // disk. This already errored before #32 — preserved verbatim.
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("present.txt"), b"ok").unwrap();
 
-        let (conn, sid) = setup_conn_with_snapshot(&[("present.txt", 2), ("missing.txt", 10)]);
+        let (conn, sid) =
+            setup_conn_with_snapshot(&[("present.txt", 2, None), ("missing.txt", 10, None)]);
         let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
             .err()
             .unwrap();
@@ -226,7 +358,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("growing.txt"), b"actually longer").unwrap();
 
-        let (conn, sid) = setup_conn_with_snapshot(&[("growing.txt", 3)]);
+        let (conn, sid) = setup_conn_with_snapshot(&[("growing.txt", 3, None)]);
         let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
             .err()
             .unwrap();
@@ -239,6 +371,238 @@ mod tests {
             msg.contains("growing.txt"),
             "error must name the file, got: {msg}"
         );
+    }
+
+    // --- Bitrot commitment point (issue #32/H6) ---------------------------
+    //
+    // `validate_source` used to compute a fresh sha256 for every file and
+    // compare it against *nothing* — the query never even selected
+    // `sha256`. These tests drive the full classification the fix adds:
+    // baseline-absent (commitment point), baseline-matches, baseline-differs
+    // at the SAME size (bitrot — refuse to stage), baseline-differs at a
+    // DIFFERENT size (dirty — #36's scope, not bitrot), and on-disk files
+    // the manifest never saw (NEW — refuse to stage, per the issue's own
+    // remediation text: "diff walked set vs manifest for NEW/MISSING").
+
+    #[test]
+    fn first_stage_establishes_a_baseline_where_none_existed() {
+        // The commitment point itself: no `files.sha256` recorded yet ⇒
+        // this is normal, not an error, and the hash computed here is what
+        // `backfill_checksums` will use to establish the baseline.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(checksums.len(), 1);
+        let (path, hex) = &checksums[0];
+        assert_eq!(path, "a.txt");
+        assert_eq!(
+            hex,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+
+        // Simulate stage_create's backfill step and confirm it actually
+        // lands — there is nothing to protect yet, so this must write.
+        crate::staging::backfill_checksums(&conn, sid, &checksums).unwrap();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn restage_with_unchanged_content_passes_and_baseline_is_untouched() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        let baseline = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline))]);
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(checksums[0].1, baseline);
+
+        crate::staging::backfill_checksums(&conn, sid, &checksums).unwrap();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(baseline));
+    }
+
+    #[test]
+    fn same_size_different_content_is_bitrot_suspected_and_baseline_not_overwritten() {
+        // The whole reason issue #32/H6 exists: content changed at a
+        // constant size. Must refuse to stage, must name the file and BOTH
+        // hashes and the shared size, and must never let the corrupt
+        // content's hash reach the baseline.
+        let tmp = TempDir::new().unwrap();
+        let actual_content = b"HELLO"; // same size as "hello", different bytes
+        std::fs::write(tmp.path().join("a.txt"), actual_content).unwrap();
+        let stale_baseline = direct_hash(b"hello");
+        let current_hex = direct_hash(actual_content);
+        assert_ne!(
+            stale_baseline, current_hex,
+            "test setup must actually differ"
+        );
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(stale_baseline.as_str()))]);
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+            .err()
+            .unwrap();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("BITROT"), "must name it BITROT, got: {msg}");
+        assert!(msg.contains("a.txt"), "must name the file, got: {msg}");
+        assert!(
+            msg.contains(stale_baseline.as_str()),
+            "must show the baseline hash, got: {msg}"
+        );
+        assert!(
+            msg.contains(current_hex.as_str()),
+            "must show the current hash, got: {msg}"
+        );
+        assert!(
+            msg.contains("5 bytes"),
+            "must show the shared size, got: {msg}"
+        );
+
+        // The baseline must survive completely untouched — validate_source
+        // itself never writes, but assert directly against the DB so this
+        // test also guards against a future refactor that calls backfill
+        // unconditionally before checking the result.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(stale_baseline.as_str()));
+    }
+
+    #[test]
+    fn different_size_different_content_is_classified_dirty_not_bitrot() {
+        // A real edit (both size and content differ) is DIRTY (#36's
+        // scope), never BITROT — the two outcomes must stay distinctly
+        // named so they can never be conflated.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a much longer edited body").unwrap();
+        let baseline = direct_hash(b"hello");
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline.as_str()))]);
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+            .err()
+            .unwrap();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("DIRTY"), "must name it DIRTY, got: {msg}");
+        assert!(
+            !msg.contains("BITROT"),
+            "dirty and bitrot must be mutually exclusive outcomes, got: {msg}"
+        );
+        assert!(msg.contains("a.txt"), "must name the file, got: {msg}");
+    }
+
+    #[test]
+    fn new_file_on_disk_not_in_manifest_is_classified_new_and_refused() {
+        // NEW (issue #32's own remediation text: "diff walked set vs
+        // manifest for NEW/MISSING"): dar would silently archive
+        // `extra.txt` even though the catalog has never seen it, breaking
+        // the "two stage_sets of one snapshot are logically identical"
+        // invariant the finding names — refuse to stage rather than let
+        // that happen quietly.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), b"hello").unwrap();
+        std::fs::write(tmp.path().join("extra.txt"), b"surprise").unwrap();
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("keep.txt", 5, None)]);
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+            .err()
+            .unwrap();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("NEW"), "must name it NEW, got: {msg}");
+        assert!(
+            msg.contains("extra.txt"),
+            "must name the untracked file, got: {msg}"
+        );
+        assert!(
+            !msg.contains("keep.txt"),
+            "must not implicate the tracked file, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn backfill_checksums_sql_guard_refuses_to_overwrite_an_existing_baseline() {
+        // Defense in depth: even called directly with a hash that
+        // disagrees with an existing baseline — bypassing
+        // `validate_source`'s own refusal entirely — the UPDATE's own
+        // `sha256 IS NULL` guard must still refuse the write. This is what
+        // makes the "(first stage only)" comment literally true rather
+        // than a promise nothing enforces.
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some("original00baseline"))]);
+
+        crate::staging::backfill_checksums(
+            &conn,
+            sid,
+            &[("a.txt".to_string(), "attemptedoverwrite".to_string())],
+        )
+        .unwrap();
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("original00baseline"),
+            "backfill must never overwrite an existing files.sha256 baseline"
+        );
+
+        let stored_manifest: Option<String> = conn
+            .query_row(
+                "SELECT me.sha256 FROM manifest_entries me
+                 JOIN manifests m ON m.id = me.manifest_id
+                 WHERE m.snapshot_id = ?1 AND me.path = 'a.txt'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_manifest.as_deref(),
+            Some("original00baseline"),
+            "backfill must never overwrite an existing manifest_entries.sha256 baseline"
+        );
+    }
+
+    #[test]
+    fn backfill_checksums_establishes_a_baseline_when_absent() {
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
+        crate::staging::backfill_checksums(
+            &conn,
+            sid,
+            &[("a.txt".to_string(), "freshbaseline".to_string())],
+        )
+        .unwrap();
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("freshbaseline"));
     }
 
     #[test]
