@@ -15,7 +15,9 @@
 //! preserves the name-ordered "tape spine").
 
 pub mod fingerprint;
+pub mod plan;
 pub mod selector;
+pub mod status;
 pub mod sync;
 
 use crate::config::LibraryConfig;
