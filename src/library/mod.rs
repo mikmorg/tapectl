@@ -14,6 +14,7 @@
 //! stands), and best-fit-decreasing packing (§7 — alphabetical first-fit
 //! preserves the name-ordered "tape spine").
 
+pub mod batch;
 pub mod fingerprint;
 pub mod plan;
 pub mod selector;
