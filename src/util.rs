@@ -106,6 +106,64 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+/// A `Write` adapter that forwards at most the first `limit` bytes it
+/// receives to `inner`, silently discarding everything after — trims a
+/// stream's trailing bytes (e.g. a tape file's block padding) to a known
+/// true length as the bytes arrive, without needing to know in advance
+/// which single `write()` call the true/padding boundary falls inside (a
+/// real tape read arrives in many `block_size`-sized pushes via
+/// `Store::read_file`, not one whole-buffer write).
+///
+/// Originally added in `volume/restore.rs` for the ciphertext trim (issue
+/// #85: mirrors the `&enc_data[..encrypted_bytes]` trim `restore_unit` used
+/// to do after the fact, once the whole padded slice sat in a `Vec`);
+/// lifted here so `store.rs`'s `chain_walk` content-file hashing and
+/// `volume/write.rs`'s `read_slices`/`compact_read` slice staging (issue
+/// #86) can share this identical, already-proven boundary logic instead of
+/// each growing a second implementation.
+pub struct TruncatingWriter<W> {
+    inner: W,
+    remaining: u64,
+}
+
+impl<W: Write> TruncatingWriter<W> {
+    /// Wrap `inner`, forwarding at most `limit` bytes to it and discarding
+    /// the rest of whatever is written through this adapter.
+    pub fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+
+    /// Reclaim the wrapped writer once streaming is done.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for TruncatingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let take = (buf.len() as u64).min(self.remaining) as usize;
+        if take > 0 {
+            self.inner.write_all(&buf[..take])?;
+            self.remaining -= take as u64;
+        }
+        // Always claim the WHOLE input as "written", even the silently
+        // discarded tail — never `Ok(take)`. `Write::write_all`'s default
+        // implementation treats a `write()` that returns `Ok(0)` for a
+        // non-empty buffer as `ErrorKind::WriteZero`, which is exactly what
+        // an "honest" `Ok(take)` triggers on every push once `remaining`
+        // hits zero (proven by the tests below failing against that
+        // version) — issue #85.
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +272,56 @@ mod tests {
         writer.write_all(data).unwrap();
         let inner = writer.inner;
         assert_eq!(inner, data);
+    }
+
+    // --- TruncatingWriter (moved from volume/restore.rs, issue #86 —
+    // shared with store.rs's chain_walk and volume/write.rs's
+    // read_slices/compact_read) --------------------------------------------
+
+    #[test]
+    fn truncating_writer_passes_bytes_through_up_to_the_limit() {
+        let mut w = TruncatingWriter::new(Vec::new(), 5);
+        w.write_all(b"hello world").unwrap();
+        assert_eq!(w.into_inner(), b"hello");
+    }
+
+    #[test]
+    fn truncating_writer_forwards_everything_when_limit_exceeds_total_bytes() {
+        // Mirrors the original buffered code's fallback branch (declared
+        // size >= what's actually there means no trimming happens at all).
+        let mut w = TruncatingWriter::new(Vec::new(), 100);
+        w.write_all(b"short").unwrap();
+        assert_eq!(w.into_inner(), b"short");
+    }
+
+    #[test]
+    fn truncating_writer_handles_the_boundary_falling_mid_write_across_several_pushes() {
+        // Simulates a real tape read arriving in several `block_size`-sized
+        // `write_all` pushes (`Store::read_file`/`read_file_streaming`),
+        // rather than one whole-buffer write — the limit boundary lands in
+        // the MIDDLE of the third push here, not on a push boundary.
+        let mut w = TruncatingWriter::new(Vec::new(), 10);
+        w.write_all(b"AAAA").unwrap(); // remaining 10 -> 6, all 4 land
+        w.write_all(b"BBBB").unwrap(); // remaining 6 -> 2, all 4 land
+        w.write_all(b"CCCC").unwrap(); // remaining 2 -> 0, only "CC" lands
+        w.write_all(b"DDDD").unwrap(); // remaining stays 0, nothing lands
+        assert_eq!(w.into_inner(), b"AAAABBBBCC");
+    }
+
+    #[test]
+    fn truncating_writer_write_all_never_errors_once_the_limit_is_reached() {
+        // The load-bearing behavior (issue #85): `write()` must report the
+        // caller's full input length as "written" even when it silently
+        // drops bytes past the limit, because `Write::write_all`'s default
+        // implementation treats a `write()` that returns `Ok(0)` for a
+        // non-empty buffer as `ErrorKind::WriteZero` — exactly what a naive
+        // "honest" implementation (report only bytes actually forwarded)
+        // triggers on every push once `remaining` hits zero.
+        let mut w = TruncatingWriter::new(Vec::new(), 0);
+        for _ in 0..5 {
+            w.write_all(&[1, 2, 3, 4])
+                .expect("write_all must not error once the limit is exhausted");
+        }
+        assert_eq!(w.into_inner(), Vec::<u8>::new());
     }
 }

@@ -13,12 +13,13 @@
 //! the real algorithm — not a description of it — that the unit tests below
 //! (and later, the T7 synthetic-heir harness) exercise with no tape anywhere.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, TapectlError};
 use crate::tape::ioctl::TapeDevice;
+use crate::util::{HashingWriter, TruncatingWriter};
 use crate::volume::format;
 use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
 
@@ -141,10 +142,8 @@ pub trait Store {
     /// deposit receipt, `layout-session.md`'s Store seam) — TapeStore and
     /// MemStore both take the default.
     fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence> {
-        chain_walk(layout, tier, |position| {
-            let mut buf = Vec::new();
-            self.read_file(position, &mut buf)?;
-            Ok(buf)
+        chain_walk(layout, tier, |position, sink| {
+            self.read_file(position, sink)
         })
     }
 
@@ -197,14 +196,28 @@ pub trait Store {
 /// The §5 chain walk, shared by every `Store` impl's `confirm` so the exact
 /// algorithm — not a re-description of it — is what both `TapeStore` (via
 /// hardware/mhvtl) and `MemStore` (via the unit tests below and the future
-/// T7 synthetic-heir harness) run. `read` fetches one tape file's on-tape
-/// (still block-padded) bytes by position; any `Err` it returns is folded
-/// into the walk's fail-safe verdict rather than propagated — reading past
-/// what a store actually holds is exactly the "absent" case for the seal
-/// marker, and an ordinary read failure for anything else.
+/// T7 synthetic-heir harness) run. `read` streams one tape file's on-tape
+/// (still block-padded) bytes by position into the given sink, mirroring
+/// `Store::read_file`'s own signature exactly (confirm's default impl is a
+/// direct pass-through to it) — any `Err` it returns is folded into the
+/// walk's fail-safe verdict rather than propagated — reading past what a
+/// store actually holds is exactly the "absent" case for the seal marker,
+/// and an ordinary read failure for anything else.
+///
+/// Buffering is decided HERE, per file, not by the caller (issue #86): the
+/// seal marker and the front index (File 3) are parsed as TOML, so their
+/// true bytes are genuinely needed — both are small and bounded (a front
+/// index is ≈54 KB for a full tape), so buffering them into a `Vec` is
+/// correct and cheap. Every other (content) file is only ever hashed, never
+/// otherwise inspected — these are the potentially multi-GB slices/
+/// envelopes, so they stream through a hash-only sink
+/// (`TruncatingWriter<HashingWriter<io::Sink>>`, discarding into
+/// `io::sink()`) that never materializes the file, trimming block padding
+/// to the front index's claimed `size_bytes` as the bytes arrive exactly
+/// like `restore.rs::restore_one_slice_inner`'s ciphertext pass does.
 fn chain_walk<F>(layout: &Layout, tier: Tier, mut read: F) -> Result<Evidence>
 where
-    F: FnMut(u32) -> Result<Vec<u8>>,
+    F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
     let seal_entry = layout
         .entries
@@ -229,24 +242,24 @@ where
     let mut files_checked: u32 = 0;
 
     let evidence = 'walk: {
-        // Step 1 (§5.1): read + parse the seal marker (the last file).
+        // Step 1 (§5.1): read + parse the seal marker (the last file). It is
+        // parsed as TOML, so its true bytes are genuinely needed — small and
+        // bounded, so buffering into a `Vec` here is correct (issue #86).
         // Absent or unparseable is the normal unsealed signal, never an Err.
-        let seal_bytes = match read(seal_pos) {
-            Ok(b) => b,
-            Err(e) => {
-                mismatches.push(Mismatch {
-                    position: seal_pos,
-                    kind: MismatchKind::SealUnreadable,
-                    expected: "seal marker present and readable".to_string(),
-                    actual: format!("read failed: {e}"),
-                });
-                break 'walk Evidence {
-                    tier,
-                    files_checked,
-                    mismatches,
-                };
-            }
-        };
+        let mut seal_bytes = Vec::new();
+        if let Err(e) = read(seal_pos, &mut seal_bytes) {
+            mismatches.push(Mismatch {
+                position: seal_pos,
+                kind: MismatchKind::SealUnreadable,
+                expected: "seal marker present and readable".to_string(),
+                actual: format!("read failed: {e}"),
+            });
+            break 'walk Evidence {
+                tier,
+                files_checked,
+                mismatches,
+            };
+        }
         files_checked += 1;
         let seal_str = String::from_utf8_lossy(&seal_bytes);
         let seal = match format::parse_seal_marker(&seal_str) {
@@ -266,23 +279,24 @@ where
             }
         };
 
-        // Step 2 (§5.2): hash File 3's TRUE bytes; compare to the seal's binding.
-        let fi_bytes = match read(fi_pos) {
-            Ok(b) => b,
-            Err(e) => {
-                mismatches.push(Mismatch {
-                    position: fi_pos,
-                    kind: MismatchKind::FrontIndexUnreadable,
-                    expected: "front index present and readable".to_string(),
-                    actual: format!("read failed: {e}"),
-                });
-                break 'walk Evidence {
-                    tier,
-                    files_checked,
-                    mismatches,
-                };
-            }
-        };
+        // Step 2 (§5.2): hash File 3's TRUE bytes; compare to the seal's
+        // binding. File 3 is also parsed as TOML in step 3 below, so its
+        // true bytes are genuinely needed too — same bounded-size reasoning
+        // as the seal marker (issue #86).
+        let mut fi_bytes = Vec::new();
+        if let Err(e) = read(fi_pos, &mut fi_bytes) {
+            mismatches.push(Mismatch {
+                position: fi_pos,
+                kind: MismatchKind::FrontIndexUnreadable,
+                expected: "front index present and readable".to_string(),
+                actual: format!("read failed: {e}"),
+            });
+            break 'walk Evidence {
+                tier,
+                files_checked,
+                mismatches,
+            };
+        }
         files_checked += 1;
         if fi_true_len > fi_bytes.len() {
             mismatches.push(Mismatch {
@@ -403,8 +417,20 @@ where
                 continue;
             };
 
-            let bytes = match read(position) {
-                Ok(b) => b,
+            // Content files are only ever hashed, never otherwise
+            // inspected — so unlike the seal marker/front index above, this
+            // never buffers the file. `TruncatingWriter` trims to `want_size`
+            // (the front index's claimed true length) as bytes arrive,
+            // wrapping a `HashingWriter` that discards into `io::sink()` —
+            // the same composition `restore.rs::restore_one_slice_inner`
+            // uses for its ciphertext pass, just with a sink that has no use
+            // for the bytes themselves (issue #86).
+            let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
+            let read_result = read(position, &mut sink);
+            let hashing = sink.into_inner();
+
+            let n_read = match read_result {
+                Ok(n) => n,
                 Err(e) => {
                     mismatches.push(Mismatch {
                         position,
@@ -417,16 +443,16 @@ where
             };
             files_checked += 1;
 
-            if want_size as usize > bytes.len() {
+            if want_size > n_read {
                 mismatches.push(Mismatch {
                     position,
                     kind: MismatchKind::ContentHashMismatch,
                     expected: format!("{want_size} on-tape bytes"),
-                    actual: format!("only {} bytes read back", bytes.len()),
+                    actual: format!("only {n_read} bytes read back"),
                 });
                 continue;
             }
-            let actual_hash = sha256_hex(&bytes[..want_size as usize]);
+            let actual_hash = hashing.finalize_hex();
             if &actual_hash != want_hash {
                 mismatches.push(Mismatch {
                     position,
@@ -947,6 +973,137 @@ mod tests {
         };
 
         (layout, store)
+    }
+
+    /// A `Store` whose `read_file` streams a file in small fixed-size
+    /// chunks — via several separate `sink.write_all()` calls — rather than
+    /// `MemStore::read_file`'s single whole-buffer `write_all`. Proves
+    /// `chain_walk`'s content-file hashing sink correctly accumulates hash
+    /// state and respects the true/padding truncation boundary across many
+    /// pushes, the way a real tape read (`TapeDevice::read_file_streaming`,
+    /// block-sized pushes) actually arrives — `MemStore`'s one-shot
+    /// `write_all` cannot exercise this (issue #86). Only `read_file` is
+    /// exercised by these tests (via `confirm`'s default trait method); the
+    /// other three `Store` methods are unused here.
+    struct ChunkedStore {
+        files: Vec<Vec<u8>>,
+        chunk_size: usize,
+    }
+
+    impl Store for ChunkedStore {
+        fn capacity(&mut self) -> Result<CapacityReport> {
+            unimplemented!("ChunkedStore only exercises read_file via confirm")
+        }
+
+        fn execute(&mut self, _src: &mut dyn Read, _len: u64, _sync: bool) -> Result<u64> {
+            unimplemented!("ChunkedStore only exercises read_file via confirm")
+        }
+
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            let bytes = self.files.get(position as usize).ok_or_else(|| {
+                TapectlError::Other(format!("no file recorded at position {position}"))
+            })?;
+            let mut total = 0u64;
+            for chunk in bytes.chunks(self.chunk_size.max(1)) {
+                sink.write_all(chunk)
+                    .map_err(|e| TapectlError::Other(format!("sink write: {e}")))?;
+                total += chunk.len() as u64;
+            }
+            Ok(total)
+        }
+
+        fn reposition_for_resume(&mut self, _file_index: u32) -> Result<()> {
+            unimplemented!("ChunkedStore only exercises read_file via confirm")
+        }
+    }
+
+    #[test]
+    fn confirm_hashes_a_multi_chunk_content_file_correctly_via_genuine_streaming() {
+        // Reuses build_confirm_fixture's well-formed 6-file layout and
+        // on-tape bytes (already proven correct via the MemStore-backed
+        // tests below), but re-hosts them in ChunkedStore, whose read_file
+        // streams every file in small fixed chunks via several separate
+        // write() calls — unlike MemStore's single write_all. This is the
+        // genuine proof that chain_walk's content-file hashing sink
+        // correctly accumulates state across many pushes and still trims
+        // the true/padding boundary correctly when that boundary does NOT
+        // land on a push boundary (300_000 is not a multiple of 4096) —
+        // MemStore's one-shot write cannot exercise either property.
+        let (layout, mem_store) = build_confirm_fixture(None);
+        let mut store = ChunkedStore {
+            files: mem_store.files,
+            chunk_size: 4096, // several times smaller than the 300_000-byte slice
+        };
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(
+            evidence.mismatches,
+            Vec::new(),
+            "genuine multi-push content hashing must still pass: {:?}",
+            evidence.mismatches
+        );
+        assert_eq!(evidence.files_checked, 6);
+    }
+
+    #[test]
+    fn confirm_detects_corruption_in_a_multi_chunk_content_file_via_genuine_streaming() {
+        // Same fixture/store as above, but corrupts the same byte
+        // `confirm_detects_content_hash_mismatch_only_at_integrity_tier`
+        // does — proving detection still works, at the right position,
+        // when the file is delivered via genuine multi-push streaming
+        // rather than MemStore's single write.
+        let (layout, mem_store) = build_confirm_fixture(None);
+        let mut files = mem_store.files;
+        files[4][100] ^= 0xFF;
+        let mut store = ChunkedStore {
+            files,
+            chunk_size: 4096,
+        };
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(evidence.mismatches.len(), 1, "{:?}", evidence.mismatches);
+        assert_eq!(evidence.mismatches[0].position, 4);
+        assert_eq!(
+            evidence.mismatches[0].kind,
+            MismatchKind::ContentHashMismatch
+        );
+    }
+
+    #[test]
+    fn confirm_ignores_corruption_confined_to_the_padding_tail() {
+        // The streaming content-file hash (issue #86) must hash only the
+        // TRUE (unpadded) bytes the front index claims, exactly like the
+        // old buffered `&bytes[..want_size]` slice it replaces — corruption
+        // that lands only in the trailing block-padding region must never
+        // surface as a ContentHashMismatch.
+        // `confirm_detects_content_hash_mismatch_only_at_integrity_tier`
+        // below only ever corrupts within the true region; this is the
+        // complementary boundary case, proving the truncate-before-hash
+        // contract holds under streaming, not just under whole-buffer
+        // slicing.
+        let (layout, mut store) = build_confirm_fixture(None);
+        let true_len = layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .unwrap()
+            .size_bytes
+            .unwrap() as usize;
+        assert!(
+            store.files[4].len() > true_len,
+            "fixture must actually be padded for this test to mean anything"
+        );
+        // Flip a byte well within the padding tail (past the true length).
+        let pad_index = true_len + 1000;
+        store.files[4][pad_index] ^= 0xFF;
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(
+            evidence.mismatches,
+            Vec::new(),
+            "corruption confined to block padding must not be flagged: {:?}",
+            evidence.mismatches
+        );
     }
 
     #[test]
