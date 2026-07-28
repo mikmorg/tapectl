@@ -1,9 +1,8 @@
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{collections::HashSet, fs};
 
 use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -14,6 +13,7 @@ use crate::staging;
 use crate::tape::health;
 use crate::tape::ioctl::TapeDevice;
 use crate::tape::mam::MamInfo;
+use crate::util::{HashingWriter, TruncatingWriter};
 
 use crate::store::{Store, TapeStore, Tier};
 
@@ -843,6 +843,71 @@ pub fn volume_identify(device: &str, block_size: usize) -> Result<String> {
     Ok(text.trim_end_matches('\0').to_string())
 }
 
+/// Outcome of [`stream_verify_slice_to_staging`]. `write_positions.
+/// sha256_on_volume` and `stage_slices.sha256_encrypted` have historically
+/// been populated slightly differently across code paths, so a match
+/// against EITHER is accepted — the same either-match `read_slices`/
+/// `compact_read` always did, before or after streaming (issue #86).
+enum SliceStreamOutcome {
+    /// The streamed (true, unpadded) bytes matched one of the candidate
+    /// hashes; `dest_path` now holds exactly those bytes.
+    Verified,
+    /// The streamed bytes matched none of the candidates; `dest_path` has
+    /// already been removed.
+    ChecksumMismatch { actual: String },
+}
+
+/// Stream the tape file at `position` into `dest_path`, trimming block
+/// padding to `true_len` bytes as they arrive — never materializing a whole
+/// encrypted slice in RAM (the same OOM shape #85 fixed for restore; this
+/// is that fix for `read_slices`/`compact_read`, issue #86). Compares the
+/// resulting hash against `expected_hashes` (a match against ANY of them is
+/// accepted) and reports the verdict via [`SliceStreamOutcome`].
+///
+/// On anything other than a clean match — a checksum mismatch, or a tape
+/// read error propagated as `Err` — `dest_path` is removed before
+/// returning. Streaming writes bytes to `dest_path` as they arrive, so by
+/// the time a mismatch or error is discovered, a corrupt/partial (or,
+/// on a read error, merely empty) file may already sit there; the old
+/// buffered code could check the hash before ever calling `fs::write`, so
+/// this cleanup is what keeps the "no corrupt file left in staging"
+/// invariant that check-then-write used to give for free.
+///
+/// The verdict/cleanup logic is centralized HERE rather than inlined in
+/// each of `read_slices`/`compact_read`, specifically so it is
+/// unit-testable with `MemStore`: both callers' own signatures hard-depend
+/// on a real tape device path (`TapeStore::open_read`), so this function is
+/// the only layer a fixture can reach without mhvtl — mirrors
+/// `restore.rs::restore_one_slice_inner`'s pass 1 (`TruncatingWriter` over
+/// a `HashingWriter` over the destination file) for the same reason
+/// `restore_one_slice` is itself store-injectable.
+fn stream_verify_slice_to_staging(
+    store: &mut dyn Store,
+    position: u32,
+    true_len: u64,
+    expected_hashes: &[&str],
+    dest_path: &Path,
+) -> Result<SliceStreamOutcome> {
+    let file = fs::File::create(dest_path)?;
+    let mut bounded = TruncatingWriter::new(HashingWriter::new(file), true_len);
+    let read_result = store.read_file(position, &mut bounded);
+    let hashing = bounded.into_inner();
+    let actual = hashing.finalize_hex();
+    drop(hashing); // close dest_path's handle before any removal below
+
+    if let Err(e) = read_result {
+        let _ = fs::remove_file(dest_path);
+        return Err(e);
+    }
+
+    if expected_hashes.iter().any(|h| *h == actual) {
+        Ok(SliceStreamOutcome::Verified)
+    } else {
+        let _ = fs::remove_file(dest_path);
+        Ok(SliceStreamOutcome::ChecksumMismatch { actual })
+    }
+}
+
 /// Read encrypted slices for a unit from a volume into staging.
 /// After this, use `volume write` to write them to a destination tape
 /// with the full self-describing volume layout.
@@ -916,7 +981,7 @@ pub fn read_slices(
         std::path::Path::new(staging_dir).join(format!("clone-{from_label}-{unit_name}"));
     fs::create_dir_all(&clone_dir)?;
 
-    let mut tape = TapeDevice::open_read(device, block_size)?;
+    let mut store = TapeStore::open_read(device, block_size)?;
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
     let mut affected_stage_sets = HashSet::new();
@@ -931,32 +996,24 @@ pub fn read_slices(
         slice_db_id,
     ) in &source_slices
     {
-        let pos: i32 = pos_str.parse().unwrap_or(0);
-
-        tape.rewind()?;
-        if pos > 0 {
-            tape.forward_space_file(pos)?;
-        }
-
-        let data = tape.read_file()?;
-
-        // Trim padding to encrypted_bytes
-        let trimmed = if (*enc_bytes as usize) < data.len() {
-            &data[..*enc_bytes as usize]
-        } else {
-            &data
-        };
-
-        // Verify checksum
-        let actual_sha = sha256_hex(trimmed);
-        if actual_sha != *sha_on_vol && actual_sha != *sha_encrypted {
-            return Err(TapectlError::Other(format!(
-                "checksum mismatch reading slice at position {pos} from {from_label}"
-            )));
-        }
-
+        let pos: u32 = pos_str.parse().unwrap_or(0);
         let slice_path = clone_dir.join(format!("slice_{slice_db_id}.dat"));
-        fs::write(&slice_path, trimmed)?;
+
+        match stream_verify_slice_to_staging(
+            &mut store,
+            pos,
+            *enc_bytes as u64,
+            &[sha_on_vol.as_str(), sha_encrypted.as_str()],
+            &slice_path,
+        )? {
+            SliceStreamOutcome::Verified => {}
+            SliceStreamOutcome::ChecksumMismatch { actual } => {
+                return Err(TapectlError::Other(format!(
+                    "checksum mismatch reading slice at position {pos} from {from_label}: \
+                     got {actual}, expected {sha_on_vol} (or {sha_encrypted})"
+                )));
+            }
+        }
 
         // Update staging_path so volume_write can find this slice
         conn.execute(
@@ -1063,7 +1120,7 @@ pub fn compact_read(
     let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
     fs::create_dir_all(&compact_dir)?;
 
-    let mut tape = TapeDevice::open_read(device, block_size)?;
+    let mut store = TapeStore::open_read(device, block_size)?;
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
     let mut slices_skipped: i64 = 0;
@@ -1072,32 +1129,30 @@ pub fn compact_read(
     for (pos_str, sha_on_vol, _slice_id, enc_bytes, sha_encrypted, ss_id, slice_db_id) in
         &live_slices
     {
-        let pos: i32 = pos_str.parse().unwrap_or(0);
-        tape.rewind()?;
-        if pos > 0 {
-            tape.forward_space_file(pos)?;
-        }
-
-        let data = tape.read_file()?;
-        let trimmed = if (*enc_bytes as usize) < data.len() {
-            &data[..*enc_bytes as usize]
-        } else {
-            &data
-        };
-
-        let actual_sha = sha256_hex(trimmed);
-        if actual_sha != *sha_on_vol && actual_sha != *sha_encrypted {
-            warn!(
-                position = pos,
-                slice_id = slice_db_id,
-                "checksum mismatch — skipping slice"
-            );
-            slices_skipped += 1;
-            continue;
-        }
-
+        let pos: u32 = pos_str.parse().unwrap_or(0);
         let slice_path = compact_dir.join(format!("slice_{slice_db_id}.dat"));
-        fs::write(&slice_path, trimmed)?;
+
+        match stream_verify_slice_to_staging(
+            &mut store,
+            pos,
+            *enc_bytes as u64,
+            &[sha_on_vol.as_str(), sha_encrypted.as_str()],
+            &slice_path,
+        )? {
+            SliceStreamOutcome::Verified => {}
+            SliceStreamOutcome::ChecksumMismatch { actual } => {
+                warn!(
+                    position = pos,
+                    slice_id = slice_db_id,
+                    actual = %actual,
+                    expected_a = %sha_on_vol,
+                    expected_b = %sha_encrypted,
+                    "checksum mismatch — skipping slice"
+                );
+                slices_skipped += 1;
+                continue;
+            }
+        }
 
         // Update staging_path so compact-write can find slices
         conn.execute(
@@ -1326,15 +1381,155 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
     Ok(units)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
-    hash.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
+    use sha2::{Digest, Sha256};
+
+    fn direct_hash(data: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(data);
+        format!("{:x}", h.finalize())
+    }
+
+    // --- stream_verify_slice_to_staging (issue #86: read_slices/
+    // compact_read streaming) -----------------------------------------------
+    //
+    // `read_slices`/`compact_read` themselves have zero test coverage
+    // (before or after this change) because their public signatures
+    // hard-depend on a real tape device path (`TapeStore::open_read` opens
+    // an actual device node) — mhvtl is the only thing that can exercise
+    // them end-to-end. `stream_verify_slice_to_staging` is the per-slice
+    // logic extracted specifically so it takes `&mut dyn Store` instead,
+    // making it the one layer these tests CAN reach, mirroring
+    // `restore.rs::restore_one_slice`'s own store-injectable shape.
+    // (`MemStore` is imported once, further down, by the fresh-write-contact
+    // tests — a single `use` covers the whole flat `mod tests`.)
+
+    #[test]
+    fn stream_verify_slice_to_staging_round_trips_and_trims_padding() {
+        let mut store = MemStore::new(4096);
+        let true_bytes = b"encrypted slice content, repeated a bit so on-tape block \
+                           padding is real and not a no-op. "
+            .repeat(20);
+        let hash = direct_hash(&true_bytes);
+        store
+            .execute(
+                &mut Cursor::new(true_bytes.clone()),
+                true_bytes.len() as u64,
+                false,
+            )
+            .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("slice.dat");
+
+        let outcome = stream_verify_slice_to_staging(
+            &mut store,
+            0,
+            true_bytes.len() as u64,
+            &[hash.as_str()],
+            &dest,
+        )
+        .unwrap();
+        assert!(matches!(outcome, SliceStreamOutcome::Verified));
+
+        let on_disk = fs::read(&dest).unwrap();
+        assert_eq!(
+            on_disk, true_bytes,
+            "staged file must hold exactly the true (unpadded) bytes, not the padded tail"
+        );
+    }
+
+    #[test]
+    fn stream_verify_slice_to_staging_detects_mismatch_and_removes_the_partial_file() {
+        let mut store = MemStore::new(4096);
+        let true_bytes = b"some slice content that will not match the expected hash".to_vec();
+        store
+            .execute(
+                &mut Cursor::new(true_bytes.clone()),
+                true_bytes.len() as u64,
+                false,
+            )
+            .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("slice.dat");
+        let wrong_hash = "0".repeat(64);
+
+        let outcome = stream_verify_slice_to_staging(
+            &mut store,
+            0,
+            true_bytes.len() as u64,
+            &[wrong_hash.as_str()],
+            &dest,
+        )
+        .unwrap();
+        match outcome {
+            SliceStreamOutcome::ChecksumMismatch { actual } => {
+                assert_ne!(actual, wrong_hash);
+                assert_eq!(actual, direct_hash(&true_bytes));
+            }
+            SliceStreamOutcome::Verified => panic!("must not verify against a wrong hash"),
+        }
+        assert!(
+            !dest.exists(),
+            "a corrupt/mismatched slice must not be left behind in staging \
+             (streaming writes bytes before the hash is known, unlike the old \
+             buffered check-then-write code, so this cleanup is load-bearing)"
+        );
+    }
+
+    #[test]
+    fn stream_verify_slice_to_staging_accepts_a_match_against_either_expected_hash() {
+        // Mirrors read_slices'/compact_read's own `!= sha_on_vol &&
+        // != sha_encrypted` either-match: the true hash is the SECOND
+        // candidate here, proving a match anywhere in the list is accepted,
+        // not just at index 0.
+        let mut store = MemStore::new(4096);
+        let true_bytes = b"content whose hash matches the second candidate only".to_vec();
+        let hash = direct_hash(&true_bytes);
+        store
+            .execute(
+                &mut Cursor::new(true_bytes.clone()),
+                true_bytes.len() as u64,
+                false,
+            )
+            .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("slice.dat");
+        let wrong = "0".repeat(64);
+
+        let outcome = stream_verify_slice_to_staging(
+            &mut store,
+            0,
+            true_bytes.len() as u64,
+            &[wrong.as_str(), hash.as_str()],
+            &dest,
+        )
+        .unwrap();
+        assert!(matches!(outcome, SliceStreamOutcome::Verified));
+    }
+
+    #[test]
+    fn stream_verify_slice_to_staging_cleans_up_on_a_tape_read_error() {
+        // Nothing recorded at position 0 -> MemStore::read_file errors.
+        // The destination file is created (empty) before the read is
+        // attempted, so this proves the cleanup-on-error path removes it
+        // rather than leaving an empty file behind.
+        let mut store = MemStore::new(4096);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("slice.dat");
+
+        let err = stream_verify_slice_to_staging(&mut store, 0, 10, &["irrelevant"], &dest);
+        assert!(err.is_err());
+        assert!(
+            !dest.exists(),
+            "the empty file created before a failed read must not be left behind"
+        );
+    }
 
     #[test]
     fn volume_uuid_is_persisted_and_stable_not_derived_from_label() {
