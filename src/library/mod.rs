@@ -16,6 +16,7 @@
 
 pub mod fingerprint;
 pub mod selector;
+pub mod sync;
 
 use crate::config::LibraryConfig;
 use crate::db::models::Unit;
