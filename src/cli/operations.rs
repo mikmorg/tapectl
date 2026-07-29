@@ -587,6 +587,21 @@ pub fn unit_mark_tape_only(
     }
 
     // TIER 2 (ADR-0008): degraded but non-zero coverage — `--force` overrides.
+    //
+    // Issue #89 / ADR-0004 interaction, decided by the coordinator and
+    // recorded here so it is not re-litigated: `copy_count` above already
+    // excludes ineligible (quarantined/retired/erased/missing) volumes,
+    // so a unit whose every copy has become ineligible reads `copy_count
+    // == 0` right here — the SAME zero the Tier-3 guard above would use
+    // if it applied. It does not apply. Tier 3 is reserved for
+    // INCOHERENCE: a never-archived unit, where no tape ever held the
+    // data at all (caught above via `PendingReason::New`, independent of
+    // this count). A unit whose only copy sits on a quarantined volume is
+    // DEGRADED, not incoherent — the cartridge still physically exists,
+    // and quarantine means "claims unreliable until reconciled at
+    // contact," not "gone." So this stays Tier 2 and remains
+    // `--force`-overridable, same as any other below-threshold copy
+    // count. Do not move this case into the Tier-3 guard above.
     if !force {
         if copy_count < min_copies as i64 {
             return Err(TapectlError::Other(format!(
@@ -1941,6 +1956,44 @@ mod tests {
             unit_mark_tape_only(&conn, &config, "mto-both-sealed", false, false).expect(
                 "two sealed volumes must satisfy min_copies=2 -- the guard must not false-positive",
             );
+        }
+
+        #[test]
+        fn mark_tape_only_with_zero_eligible_copies_is_tier2_not_tier3() {
+            // ADR-0008 interaction (issue #89), the coordinator's decision
+            // recorded in the code comment above the Tier-2 check in
+            // `unit_mark_tape_only`: a unit whose every copy has become
+            // ineligible reads `copy_count == 0`, the same number Tier 3
+            // would use -- but this unit WAS archived (it has a snapshot
+            // and completed writes), so `PendingReason::New` never fires
+            // and the Tier-3 guard never applies. It must refuse with the
+            // ordinary Tier-2 message and must be overridable by --force,
+            // never the "never been archived... cannot be overridden"
+            // Tier-3 message that `mark_tape_only_refuses_a_never_archived_
+            // unit_even_with_force` (above) proves is absolute.
+            let name = "mto-zero-eligible";
+            let (conn, _unit_id) = setup_unit_with_two_volumes(name, "quarantined");
+            conn.execute(
+                &format!("UPDATE volumes SET status = 'quarantined' WHERE label = '{name}-SEALED'"),
+                [],
+            )
+            .unwrap();
+
+            let config = config_isolating_copy_count();
+            let err = unit_mark_tape_only(&conn, &config, name, false, false)
+                .expect_err("zero eligible copies must still refuse without --force");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("insufficient copies: 0 < 2"),
+                "must be the ordinary Tier-2 message: {msg}"
+            );
+            assert!(
+                !msg.contains("never been archived") && !msg.contains("cannot be overridden"),
+                "must NOT be classified as the Tier-3 never-archived case: {msg}"
+            );
+
+            unit_mark_tape_only(&conn, &config, name, true, false)
+                .expect("Tier 2 must be --force-overridable, unlike Tier 3");
         }
 
         /// tenant + unit + TWO snapshots: v1 ('superseded', the one to be
