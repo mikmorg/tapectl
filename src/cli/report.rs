@@ -2,6 +2,7 @@ use clap::Subcommand;
 use rusqlite::{params, Connection};
 
 use crate::config::Config;
+use crate::db::queries;
 use crate::error::Result;
 
 #[derive(Subcommand, Debug)]
@@ -300,37 +301,87 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
     Ok(())
 }
 
-fn report_dirty(conn: &Connection, _unit_filter: Option<&str>, json_output: bool) -> Result<()> {
-    // Dirty = units whose last_scanned < most recent file modification on disk
-    // Since we can't scan disk in a report, show units with no current snapshot
-    // or whose latest snapshot is older than a configurable threshold
-    let mut stmt = conn.prepare(
-        "SELECT u.name, u.current_path, MAX(s.created_at) as last_snap
-         FROM units u
-         LEFT JOIN snapshots s ON s.unit_id = u.id
-         WHERE u.status = 'active'
-         GROUP BY u.id
-         ORDER BY last_snap ASC NULLS FIRST",
-    )?;
-    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+/// One unit's dirty-scan row, split out from `report_dirty`'s printing so
+/// the computed result is directly assertable in tests without capturing
+/// stdout.
+struct DirtyRow {
+    name: String,
+    state: &'static str, // "clean" | "new" | "dirty"
+    added: Vec<String>,
+    removed: Vec<String>,
+    modified: Vec<String>,
+}
+
+/// The scan behind `report dirty`: reuses `fingerprint::classify` — the
+/// same scan `unit status --dirty` and `mark-tape-only`'s guard use — over
+/// every `active` unit (mirroring `pending_units_for_collection`'s own
+/// scope: `missing`/`tape_only`/`retired` units have no live directory this
+/// scan should second-guess), optionally narrowed to one unit by name.
+fn dirty_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<DirtyRow>> {
+    use crate::collection::fingerprint::{self, PendingReason};
+
+    // In-memory name filter (same pattern `unit list --tag` already uses)
+    // rather than a second SQL path — `queries::list_units` is the one
+    // place "active units" is derived from.
+    let mut units = queries::list_units(conn, None, Some("active"))?;
+    if let Some(name) = unit_filter {
+        units.retain(|u| u.name == name);
+    }
+
+    let mut rows = Vec::with_capacity(units.len());
+    for unit in &units {
+        let (state, changes) = match fingerprint::classify(conn, unit)? {
+            None => ("clean", fingerprint::FingerprintDiff::default()),
+            Some(p) if p.reason == PendingReason::New => {
+                ("new", fingerprint::FingerprintDiff::default())
+            }
+            Some(p) => ("dirty", p.changes),
+        };
+        rows.push(DirtyRow {
+            name: unit.name.clone(),
+            state,
+            added: changes.added,
+            removed: changes.removed,
+            modified: changes.modified,
+        });
+    }
+    Ok(rows)
+}
+
+fn report_dirty(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+    let rows = dirty_rows(conn, unit_filter)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, path, snap)| {
-                serde_json::json!({"unit": name, "path": path, "last_snapshot": snap})
+            .map(|r| {
+                serde_json::json!({
+                    "unit": r.name, "state": r.state,
+                    "added": r.added, "removed": r.removed, "modified": r.modified,
+                })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else if rows.is_empty() {
+        println!("no active units");
     } else {
-        println!("unit snapshot age (oldest first):");
-        for (name, _path, snap) in &rows {
-            println!(
-                "  {name}: last snapshot {}",
-                snap.as_deref().unwrap_or("never")
-            );
+        let dirty_count = rows.iter().filter(|r| r.state == "dirty").count();
+        println!(
+            "dirty scan: {dirty_count} of {} active unit(s) dirty",
+            rows.len()
+        );
+        for r in &rows {
+            match r.state {
+                "clean" => println!("  {}: clean", r.name),
+                "new" => println!("  {}: new — never archived", r.name),
+                _ => println!(
+                    "  {}: dirty ({} added, {} removed, {} modified)",
+                    r.name,
+                    r.added.len(),
+                    r.removed.len(),
+                    r.modified.len(),
+                ),
+            }
         }
     }
     Ok(())
@@ -758,4 +809,100 @@ fn report_compaction_candidates(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! `report dirty` (issue #36/H10): the old stub reported snapshot AGE,
+    //! not dirtiness, and its `unit` filter was ignored (parameter named
+    //! `_unit_filter`). These tests exercise the real classify()-backed
+    //! scan and confirm the filter now actually narrows the result.
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Two active units under one temp root: one left clean after its
+    /// snapshot, one mutated (a new file) after its snapshot — full
+    /// migrations + a real `snapshot_create`, so this exercises the exact
+    /// `fingerprint::classify` path `dirty_rows` calls, not a hand-rolled
+    /// substitute.
+    fn setup_two_units(root: &TempDir) -> Connection {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+
+        let clean_dir = root.path().join("clean_unit");
+        let dirty_dir = root.path().join("dirty_unit");
+        std::fs::create_dir_all(&clean_dir).unwrap();
+        std::fs::create_dir_all(&dirty_dir).unwrap();
+        std::fs::write(clean_dir.join("f.txt"), b"hello").unwrap();
+        std::fs::write(dirty_dir.join("f.txt"), b"hello").unwrap();
+
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+             VALUES ('u-clean', 'clean_unit', ?1, ?2, 'mtime_size', 1, 'active')",
+            params![tid, clean_dir.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+             VALUES ('u-dirty', 'dirty_unit', ?1, ?2, 'mtime_size', 1, 'active')",
+            params![tid, dirty_dir.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        crate::staging::snapshot_create(&conn, "clean_unit").unwrap();
+        crate::staging::snapshot_create(&conn, "dirty_unit").unwrap();
+
+        // Mutate dirty_unit's directory after its snapshot was taken.
+        std::fs::write(dirty_dir.join("g.txt"), b"new file").unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn dirty_rows_reports_clean_and_dirty_units_separately() {
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+
+        let rows = dirty_rows(&conn, None).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let clean = rows.iter().find(|r| r.name == "clean_unit").unwrap();
+        assert_eq!(clean.state, "clean");
+        assert!(clean.added.is_empty() && clean.removed.is_empty() && clean.modified.is_empty());
+
+        let dirty = rows.iter().find(|r| r.name == "dirty_unit").unwrap();
+        assert_eq!(dirty.state, "dirty");
+        assert_eq!(dirty.added, vec!["g.txt".to_string()]);
+    }
+
+    #[test]
+    fn dirty_rows_honors_the_unit_filter() {
+        // The bug this fixes: the old parameter was named `_unit_filter`
+        // and never consulted, so `--unit` silently did nothing.
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+
+        let rows = dirty_rows(&conn, Some("dirty_unit")).unwrap();
+        assert_eq!(rows.len(), 1, "--unit must narrow to exactly one unit");
+        assert_eq!(rows[0].name, "dirty_unit");
+        assert_eq!(rows[0].state, "dirty");
+
+        let rows = dirty_rows(&conn, Some("clean_unit")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "clean_unit");
+        assert_eq!(rows[0].state, "clean");
+    }
+
+    #[test]
+    fn report_dirty_runs_end_to_end_in_both_output_modes() {
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+        report_dirty(&conn, None, false).expect("plain output must succeed");
+        report_dirty(&conn, Some("clean_unit"), true).expect("json output must succeed");
+    }
 }
