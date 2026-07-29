@@ -2068,6 +2068,35 @@ mod tests {
             snapshot_mark_reclaimable(&conn, &config, "rec-both-sealed", 1, false, false)
                 .expect("two sealed volumes on the superseding snapshot must satisfy min_copies=2");
         }
+
+        /// The property this whole change exists to establish: the gate
+        /// (`unit_mark_tape_only`), `report copies`
+        /// (`cli::report::copies_rows`), and `audit`
+        /// (`cli::audit::copy_count_for_unit`) must never disagree about
+        /// how many copies a unit has. Same fixture, three surfaces, one
+        /// number.
+        #[test]
+        fn gate_report_and_audit_agree_on_the_copy_count() {
+            let (conn, unit_id) = setup_unit_with_two_volumes("parity-unit", "quarantined");
+
+            let config = config_isolating_copy_count();
+            let err = unit_mark_tape_only(&conn, &config, "parity-unit", false, false)
+                .expect_err("gate must refuse with only 1 eligible copy");
+            assert!(
+                err.to_string().contains("insufficient copies: 1 < 2"),
+                "{err}"
+            );
+
+            let rows = crate::cli::report::copies_rows(&conn, Some("parity-unit")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].1, 1,
+                "report copies must agree with the gate: 1, not 2"
+            );
+
+            let audit_copies = crate::cli::audit::copy_count_for_unit(&conn, unit_id).unwrap();
+            assert_eq!(audit_copies, 1, "audit must agree with the gate: 1, not 2");
+        }
     }
 
     /// Issue #38/H12: `cartridge_mark_erased`'s ADR-0008 Tier-2 lifecycle
