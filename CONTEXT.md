@@ -44,6 +44,17 @@ assertions, detected at contact.
 The volume state entered on divergence: no operation may rely on the volume's
 claims until an operator reconciles them at contact.
 
+**Dirty**:
+A unit whose source directory no longer matches the snapshot describing it:
+the claim is stale and the disk has moved on. Divergence's sibling at the
+other boundary, and deliberately not the same word — the disk is
+authoritative always, not only at contact, so the response is a fresh
+snapshot rather than quarantine. A dirty unit is routine, not an incident.
+It is why marking a unit tape-only is refused: the tape no longer holds what
+the disk now says.
+_Avoid_: divergence (reserved for tape↔catalog at contact), stale,
+out-of-date
+
 ### Writing
 
 **Layout**:
@@ -128,6 +139,21 @@ mhvtl, an autoloader or a human hand otherwise. Always written in full; a bare
 "library" is ambiguous in this codebase and should not be used for either
 sense.
 _Avoid_: library (unqualified), robot, jukebox
+
+**Pending**:
+A unit with archival work outstanding, in either of its two forms — **Never
+Archived** or [[dirty]]. The unit of selection for batching: planning fills a
+batch from pending units, so any count naming only one form understates the
+work actually queued.
+_Avoid_: pending as a synonym for never-archived alone (it is the parent of
+both forms, never one of them), queued, backlog
+
+**Never Archived**:
+The form of Pending with no snapshot at all: nothing about this unit has ever
+been recorded, so no tape holds it and no claim exists to be stale. Marking
+such a unit tape-only is incoherent — there is no copy to fall back on.
+_Avoid_: new (collides with a newly *discovered* unit, which may have been
+archived already under a previous path and is resolved by dotfile uuid)
 
 ### Storage
 
