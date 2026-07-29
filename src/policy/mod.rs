@@ -3,6 +3,8 @@ use rusqlite::{params, Connection};
 use crate::config::Config;
 use crate::db::models::Unit;
 
+pub mod coverage;
+
 /// Resolved policy for a unit after 3-level resolution:
 /// unit dotfile [policy] > archive_set > system [defaults].
 #[derive(Debug, Clone)]
