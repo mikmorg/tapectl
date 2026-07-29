@@ -8,9 +8,23 @@
 //! stays consistent with what a real `snapshot create` would see. Media
 //! immutability (§11: "pending ≈ new folders in practice") means the common
 //! case is "no snapshot at all," which classifies without needing the
-//! comparison; don't gold-plate this into content hashing at sync-scan time
-//! — mtime_size is the documented default and is what's implemented here.
+//! comparison; `mtime_size` is the documented default and stays exactly
+//! that fast, no-hashing comparison unconditionally.
+//!
+//! Issue #36/H10 wires up the other two `checksum_mode` values on top of
+//! that same comparison, never replacing it: `sha256` additionally compares
+//! content hash for regular files (`hash_diff`) once the mtime_size
+//! fingerprint already matches — the one edit mtime_size can never catch
+//! (same path, size, mtime, different bytes). `sha256_on_archive` means
+//! "hash at archive time," so dirty detection for it is deliberately
+//! identical to `mtime_size` (coordinator decision, issue #36). This makes
+//! `classify` the single scanner every caller (`unit status --dirty`,
+//! `mark-tape-only`'s guard, `report dirty`, and the pre-existing
+//! `collection sync/status/plan`) shares — a second, independently-written
+//! dirty check is exactly the class of bug issue #33 spent a cycle fixing
+//! (a walk and a validator disagreeing about the same fact).
 
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -31,6 +45,68 @@ pub enum PendingReason {
     Dirty,
 }
 
+/// Specific on-disk changes behind a `Dirty` verdict (issue #36/H10): an
+/// operator deciding whether it's safe to `mark-tape-only` — or just
+/// running `unit status --dirty` — needs to know WHICH files changed, not
+/// only that something did. Always empty for `PendingReason::New` (there is
+/// no recorded baseline yet to diff against).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FingerprintDiff {
+    /// Paths present on disk but not in the recorded fingerprint.
+    pub added: Vec<String>,
+    /// Paths in the recorded fingerprint but no longer on disk.
+    pub removed: Vec<String>,
+    /// Paths present in both but changed (mtime_size mismatch, or —
+    /// `sha256` mode only — a content hash mismatch at an unchanged
+    /// mtime_size).
+    pub modified: Vec<String>,
+}
+
+impl FingerprintDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.modified.is_empty()
+    }
+
+    /// Compact one-line summary for CLI error messages (`mark-tape-only`'s
+    /// guard) and plain-text reports — capped so a unit with thousands of
+    /// changed files can't flood a single line. Full, uncapped lists remain
+    /// on the struct itself for callers that want every path (`unit status
+    /// --dirty`'s plain output, and every JSON caller).
+    pub fn describe(&self) -> String {
+        const MAX_NAMES: usize = 8;
+
+        let mut counts = Vec::new();
+        if !self.added.is_empty() {
+            counts.push(format!("{} added", self.added.len()));
+        }
+        if !self.removed.is_empty() {
+            counts.push(format!("{} removed", self.removed.len()));
+        }
+        if !self.modified.is_empty() {
+            counts.push(format!("{} modified", self.modified.len()));
+        }
+        if counts.is_empty() {
+            return "no changes".to_string();
+        }
+
+        let mut names: Vec<&str> = self
+            .added
+            .iter()
+            .chain(self.removed.iter())
+            .chain(self.modified.iter())
+            .map(|s| s.as_str())
+            .collect();
+        let total = names.len();
+        names.truncate(MAX_NAMES);
+        let more = if total > MAX_NAMES {
+            format!(", … and {} more", total - MAX_NAMES)
+        } else {
+            String::new()
+        };
+        format!("{} ({}{more})", counts.join(", "), names.join(", "))
+    }
+}
+
 /// A unit needing archival work, with an on-disk size estimate (fresh walk,
 /// plaintext bytes — the same figure `snapshot_create` would record). This
 /// is a planning estimate, not a commitment: the real capacity gate is
@@ -40,6 +116,8 @@ pub struct PendingUnit {
     pub unit: Unit,
     pub reason: PendingReason,
     pub estimated_bytes: u64,
+    /// Specific added/removed/modified paths — see `FingerprintDiff`.
+    pub changes: FingerprintDiff,
 }
 
 /// One file as the fingerprint sees it — same shape as the `files` table
@@ -125,10 +203,153 @@ fn recorded_fingerprint(conn: &Connection, unit_id: i64) -> Result<Option<Vec<Fi
     Ok(Some(rows))
 }
 
+/// Merge-diff two path-sorted fingerprints into added/removed/modified path
+/// lists. `walk_fingerprint` and `recorded_fingerprint` both already return
+/// `Vec<FileStamp>` sorted by path (their derived `Ord` compares `path`
+/// first), so this is one linear pass over data already in memory — not a
+/// second filesystem or database scan.
+fn diff_stamps(recorded: &[FileStamp], fresh: &[FileStamp]) -> FingerprintDiff {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < recorded.len() && j < fresh.len() {
+        match recorded[i].path.cmp(&fresh[j].path) {
+            std::cmp::Ordering::Equal => {
+                if recorded[i].size_bytes != fresh[j].size_bytes
+                    || recorded[i].modified_at != fresh[j].modified_at
+                {
+                    modified.push(fresh[j].path.clone());
+                }
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                removed.push(recorded[i].path.clone());
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                added.push(fresh[j].path.clone());
+                j += 1;
+            }
+        }
+    }
+    removed.extend(recorded[i..].iter().map(|f| f.path.clone()));
+    added.extend(fresh[j..].iter().map(|f| f.path.clone()));
+    FingerprintDiff {
+        added,
+        removed,
+        modified,
+    }
+}
+
+/// `(file_type, sha256)`, keyed by path.
+type HashBaseline = HashMap<String, (Option<String>, Option<String>)>;
+
+/// Recorded `(file_type, sha256)` per path in the latest snapshot — the
+/// extra baseline `hash_diff` needs beyond what `FileStamp` carries. Its own
+/// "latest snapshot" lookup rather than a shared helper with
+/// `recorded_fingerprint`, so the `mtime_size` comparison above is
+/// provably untouched by this addition (issue #36): `recorded_fingerprint`
+/// is not modified by one byte.  `None` if the unit has no snapshot yet —
+/// `classify` never actually calls this in that case, since `New` is
+/// decided first, but it mirrors `recorded_fingerprint`'s own contract.
+fn recorded_hash_baseline(conn: &Connection, unit_id: i64) -> Result<HashBaseline> {
+    let latest_snapshot_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM snapshots WHERE unit_id = ?1 ORDER BY version DESC LIMIT 1",
+            params![unit_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(snapshot_id) = latest_snapshot_id else {
+        return Ok(HashMap::new());
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT path, file_type, sha256 FROM files
+         WHERE snapshot_id = ?1 AND is_directory = 0",
+    )?;
+    let map = stmt
+        .query_map(params![snapshot_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ),
+            ))
+        })?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    Ok(map)
+}
+
+/// `sha256` checksum_mode only, and only reached once the mtime_size
+/// comparison already found the recorded and fresh fingerprints identical
+/// (same paths, sizes, mtimes) — the one case `mtime_size` can never catch:
+/// content changed while size and mtime did not. Compares each regular
+/// file's fresh content hash against the recorded `files.sha256` baseline,
+/// via the exact same `hash_source_file` that established that baseline in
+/// the first place (`staging::validate::validate_source` ->
+/// `backfill_checksums`), so the two can never disagree about the
+/// algorithm.
+///
+/// Symlinks and special files (issue #33/H7: `file_type` != `"regular"`)
+/// have no content of their own to hash — their recorded `size_bytes` is
+/// lstat's target-string length, not payload — so they are excluded from
+/// hash comparison entirely and judged by mtime_size alone, which this
+/// function is only reached after already confirming unchanged. A `NULL`
+/// baseline (the file was recorded by `snapshot_create` but never staged,
+/// so no hash was ever computed) has nothing to compare against either;
+/// both cases fall back to the mtime_size verdict — "no change" — rather
+/// than reporting a spurious dirty flag.
+fn hash_diff(
+    conn: &Connection,
+    unit_id: i64,
+    unit_path: &Path,
+    fresh: &[FileStamp],
+) -> Result<FingerprintDiff> {
+    let baseline = recorded_hash_baseline(conn, unit_id)?;
+    let mut modified = Vec::new();
+    for stamp in fresh {
+        let Some((file_type, sha256)) = baseline.get(&stamp.path) else {
+            continue; // Not reached in practice: mtime_size already agreed
+                      // on the path set by the time this function is called.
+        };
+        if file_type.as_deref() != Some("regular") {
+            continue; // symlink/special/dir — no content to hash.
+        }
+        let Some(expected) = sha256 else {
+            continue; // never staged — no baseline to compare against.
+        };
+        let full_path = unit_path.join(&stamp.path);
+        let (actual, _) = crate::staging::validate::hash_source_file(&full_path, &stamp.path)?;
+        if &actual != expected {
+            modified.push(stamp.path.clone());
+        }
+    }
+    Ok(FingerprintDiff {
+        added: Vec::new(),
+        removed: Vec::new(),
+        modified,
+    })
+}
+
 /// Classify one unit: `None` if it has a snapshot whose recorded
 /// fingerprint matches the current directory (not pending); `Some`
-/// otherwise, naming why and estimating its current size from the same
-/// walk (one filesystem pass either way).
+/// otherwise, naming why, estimating its current size from the same walk
+/// (one filesystem pass either way), and — when dirty — the specific
+/// added/removed/modified paths (issue #36/H10).
+///
+/// `unit.checksum_mode` decides how thorough the comparison is:
+///   - `mtime_size` (the default) and `sha256_on_archive` (coordinator
+///     decision, issue #36: "hash at archive time" says nothing about how
+///     to detect dirty, so it stays the fast path) — path+size+mtime only,
+///     byte-for-byte the same comparison this function has always made.
+///     No file is ever opened.
+///   - `sha256` — additionally hashes regular files once their mtime_size
+///     fingerprint already matches (`hash_diff`), to catch the one edit
+///     mtime_size can never see.
 pub fn classify(conn: &Connection, unit: &Unit) -> Result<Option<PendingUnit>> {
     let Some(path) = unit.current_path.as_deref() else {
         return Ok(None);
@@ -141,16 +362,45 @@ pub fn classify(conn: &Connection, unit: &Unit) -> Result<Option<PendingUnit>> {
     let fresh = walk_fingerprint(Path::new(path));
     let estimated_bytes: u64 = fresh.iter().map(|f| f.size_bytes.max(0) as u64).sum();
 
-    let reason = match recorded_fingerprint(conn, unit.id)? {
-        None => PendingReason::New,
-        Some(recorded) if recorded == fresh => return Ok(None),
-        Some(_) => PendingReason::Dirty,
+    let Some(recorded) = recorded_fingerprint(conn, unit.id)? else {
+        return Ok(Some(PendingUnit {
+            unit: unit.clone(),
+            reason: PendingReason::New,
+            estimated_bytes,
+            changes: FingerprintDiff::default(),
+        }));
     };
 
+    if recorded != fresh {
+        // mtime_size already disagrees — dirty regardless of
+        // checksum_mode, exactly as before this field existed; naming the
+        // specific changes is the only thing new here.
+        return Ok(Some(PendingUnit {
+            unit: unit.clone(),
+            reason: PendingReason::Dirty,
+            estimated_bytes,
+            changes: diff_stamps(&recorded, &fresh),
+        }));
+    }
+
+    // mtime_size fingerprints match exactly. `mtime_size` and
+    // `sha256_on_archive` stop here — the same early return this function
+    // has always made for a matching fingerprint (previously spelled as a
+    // match-guard `Some(recorded) if recorded == fresh => return Ok(None)`;
+    // case-equivalent, no file is opened).
+    if unit.checksum_mode != "sha256" {
+        return Ok(None);
+    }
+
+    let changes = hash_diff(conn, unit.id, Path::new(path), &fresh)?;
+    if changes.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(PendingUnit {
         unit: unit.clone(),
-        reason,
+        reason: PendingReason::Dirty,
         estimated_bytes,
+        changes,
     }))
 }
 
@@ -275,6 +525,258 @@ mod tests {
         let p = classify(&conn, &unit).unwrap().expect("must be dirty");
         assert_eq!(p.reason, PendingReason::Dirty);
         assert_eq!(p.estimated_bytes, 5 + 7);
+        // issue #36: the specific change must be named, not just "dirty".
+        assert_eq!(p.changes.added, vec!["g.txt".to_string()]);
+        assert!(p.changes.removed.is_empty());
+        assert!(p.changes.modified.is_empty());
+    }
+
+    #[test]
+    fn a_removed_file_is_named_in_the_dirty_changes() {
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let unit_id = seed_unit(&conn, tmp.path());
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+
+        std::fs::remove_file(&file_path).unwrap();
+
+        let p = classify(&conn, &unit).unwrap().expect("must be dirty");
+        assert_eq!(p.reason, PendingReason::Dirty);
+        assert_eq!(p.changes.removed, vec!["f.txt".to_string()]);
+        assert!(p.changes.added.is_empty());
+        assert!(p.changes.modified.is_empty());
+    }
+
+    #[test]
+    fn a_modified_file_is_named_in_the_dirty_changes() {
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let unit_id = seed_unit(&conn, tmp.path());
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+
+        // A different size is enough for mtime_size to see this without
+        // needing to fuss with mtime precision.
+        std::fs::write(&file_path, b"hello, world! this content is now longer").unwrap();
+
+        let p = classify(&conn, &unit).unwrap().expect("must be dirty");
+        assert_eq!(p.reason, PendingReason::Dirty);
+        assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
+        assert!(p.changes.added.is_empty());
+        assert!(p.changes.removed.is_empty());
+    }
+
+    /// Sets a file's mtime back to `mtime` after its content has already
+    /// been rewritten — used by the `sha256` checksum_mode tests to
+    /// construct the one case `mtime_size` cannot see: identical size,
+    /// identical mtime, different bytes. `std::fs::File::set_modified` is
+    /// stable stdlib (1.75+); no new crate needed for this.
+    fn restore_mtime(path: &Path, mtime: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn mtime_size_mode_does_not_catch_a_same_size_same_mtime_content_change() {
+        // Contrast for the sha256-mode test below: the default
+        // checksum_mode is deliberately blind to this exact edit (issue
+        // #36) — that blindness is mtime_size's whole reason for being
+        // fast, not a bug the sha256 test is fixing.
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"original content!").unwrap();
+        let unit_id = seed_unit(&conn, tmp.path()); // checksum_mode stays default 'mtime_size'
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unit.checksum_mode, "mtime_size");
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+
+        let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+        std::fs::write(&file_path, b"REPLACED content!").unwrap(); // same length (17 bytes)
+        restore_mtime(&file_path, mtime_before);
+
+        assert!(
+            classify(&conn, &unit).unwrap().is_none(),
+            "mtime_size must stay blind to a same-size-same-mtime content \
+             change — that tradeoff is documented, not a bug"
+        );
+    }
+
+    #[test]
+    fn sha256_mode_catches_a_same_size_same_mtime_content_change() {
+        // The one edit mtime_size cannot catch (issue #36): same path, same
+        // size, same mtime, different bytes. Only checksum_mode = 'sha256'
+        // compares content — see the mtime_size contrast test above.
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"original content!").unwrap();
+
+        let unit_id = seed_unit(&conn, tmp.path());
+        conn.execute(
+            "UPDATE units SET checksum_mode = 'sha256' WHERE id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unit.checksum_mode, "sha256");
+
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+
+        // Establish the sha256 baseline for the original content — what a
+        // real `stage_create` would have backfilled via the exact same
+        // `hash_source_file` this scan reuses.
+        let (original_hash, _) =
+            crate::staging::validate::hash_source_file(&file_path, "f.txt").unwrap();
+        conn.execute(
+            "UPDATE files SET sha256 = ?1 WHERE path = 'f.txt'",
+            params![original_hash],
+        )
+        .unwrap();
+
+        // Replace the content with different bytes of the SAME length,
+        // then restore the original mtime — mtime_size alone sees no
+        // change at all.
+        let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+        std::fs::write(&file_path, b"REPLACED content!").unwrap();
+        restore_mtime(&file_path, mtime_before);
+
+        let p = classify(&conn, &unit)
+            .unwrap()
+            .expect("sha256 mode must catch a content change mtime_size cannot see");
+        assert_eq!(p.reason, PendingReason::Dirty);
+        assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
+        assert!(p.changes.added.is_empty());
+        assert!(p.changes.removed.is_empty());
+    }
+
+    #[test]
+    fn sha256_mode_falls_back_to_mtime_size_when_no_baseline_hash_was_ever_recorded() {
+        // A unit that has only ever been `snapshot create`d, never staged,
+        // has no `files.sha256` baseline at all (issue #36's documented
+        // fallback): sha256 mode must not spuriously flag it dirty just
+        // because there is nothing to hash-compare against — mtime_size's
+        // "unchanged" verdict is authoritative for such a file.
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+
+        let unit_id = seed_unit(&conn, tmp.path());
+        conn.execute(
+            "UPDATE units SET checksum_mode = 'sha256' WHERE id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        // Never staged — files.sha256 stays NULL for f.txt.
+
+        assert!(
+            classify(&conn, &unit).unwrap().is_none(),
+            "sha256 mode must fall back to the mtime_size verdict when no \
+             baseline hash exists, not report a spurious change"
+        );
+    }
+
+    #[test]
+    fn sha256_mode_excludes_a_symlink_from_hash_comparison() {
+        // Traps (issue #36): a symlink's recorded size_bytes is lstat's
+        // target-string length, not content (issue #33/H7) — it has no
+        // content sha256 to compare. If hash comparison were applied to
+        // it anyway, every symlink-containing unit would report dirty
+        // forever. Must be judged by mtime/size alone, exactly like the
+        // NULL-baseline fallback above.
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target.txt"), b"hi").unwrap();
+        std::os::unix::fs::symlink("target.txt", tmp.path().join("link")).unwrap();
+
+        let unit_id = seed_unit(&conn, tmp.path());
+        conn.execute(
+            "UPDATE units SET checksum_mode = 'sha256' WHERE id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+
+        // snapshot_create's real walk records the symlink's file_type
+        // ('symlink') and leaves its sha256 NULL — nothing to backfill.
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+
+        // Run the scan twice: the trap is specifically about a symlink
+        // being flagged dirty *forever*, not just once.
+        assert!(
+            classify(&conn, &unit).unwrap().is_none(),
+            "sha256 mode must not flag a symlink dirty for lacking a content hash"
+        );
+        assert!(
+            classify(&conn, &unit).unwrap().is_none(),
+            "must stay clean on a second scan too — not perpetually dirty"
+        );
     }
 
     #[test]
