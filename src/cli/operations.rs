@@ -524,6 +524,40 @@ pub fn unit_mark_tape_only(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
+    // Reuses `fingerprint::classify` — the same scan backing `unit status
+    // --dirty` and `report dirty` — so these can never disagree about
+    // whether a unit is dirty.
+    let pending = crate::collection::fingerprint::classify(conn, &unit)?;
+
+    // TIER 3 (ADR-0008): zero coverage is ABSOLUTE. Checked BEFORE `force`
+    // is consulted, and deliberately outside the `if !force` block below.
+    //
+    // A never-archived unit has no snapshot, so no tape holds it and there
+    // is no claim to be stale. Marking it tape-only is not a riskier
+    // version of a thin safety margin — it is incoherent, and it greenlights
+    // deleting the only copy of data that exists nowhere else. ADR-0008
+    // draws exactly this line: `--force` means "I accept a degraded but
+    // non-zero margin", never "I accept total loss". The escape hatch is
+    // `snapshot create`, which resolves the incoherence rather than waiving
+    // it.
+    //
+    // The copy-count check below cannot stand in for this. It catches a
+    // never-archived unit only INCIDENTALLY (zero completed writes fails
+    // `copy_count < min_copies`), and `min_copies_for_tape_only` is
+    // operator-configurable — at 0 that comparison passes vacuously.
+    if matches!(
+        pending.as_ref().map(|p| &p.reason),
+        Some(crate::collection::fingerprint::PendingReason::New)
+    ) {
+        return Err(TapectlError::Other(
+            "unit has never been archived: no snapshot exists, so there is no tape copy — \
+             marking it tape-only would greenlight deleting the only copy. This cannot be \
+             overridden (ADR-0008 Tier 3); run `tapectl snapshot create` first."
+                .to_string(),
+        ));
+    }
+
+    // TIER 2 (ADR-0008): degraded but non-zero coverage — `--force` overrides.
     if !force {
         if copy_count < min_copies as i64 {
             return Err(TapectlError::Other(format!(
@@ -536,42 +570,20 @@ pub fn unit_mark_tape_only(
             )));
         }
 
-        // Dirty guard (issue #36/H10, the safety-critical gap this fixes):
-        // tape_only is the operator's signal that local data may now be
-        // deleted. If the on-disk fingerprint no longer matches the last
-        // snapshot, the tape copy is stale — deleting local data would
-        // silently destroy the un-archived changes. Reuses
-        // `fingerprint::classify`, the same scan `unit status --dirty` and
-        // `report dirty` use, so this can never disagree with them about
-        // whether the unit is dirty.
-        //
-        // `New` is guarded explicitly rather than left to the copy-count
-        // check above. That check only covers it incidentally: it catches a
-        // never-archived unit because such a unit has zero completed
-        // writes, which fails `copy_count < min_copies`. But
-        // `min_copies_for_tape_only` is operator-configurable, and at 0 the
-        // comparison passes vacuously — so a unit that was NEVER archived
-        // could be marked tape_only, telling the operator it is safe to
-        // delete local data that exists nowhere else. Marking a unit with
-        // no snapshot at all as tape_only is incoherent under any
-        // configuration, so it is refused on its own terms here.
-        if let Some(pending) = crate::collection::fingerprint::classify(conn, &unit)? {
-            match pending.reason {
-                crate::collection::fingerprint::PendingReason::Dirty => {
-                    return Err(TapectlError::Other(format!(
-                        "unit is dirty: on-disk contents changed since the last snapshot — {} \
-                         (use --force to override)",
-                        pending.changes.describe()
-                    )));
-                }
-                crate::collection::fingerprint::PendingReason::New => {
-                    return Err(TapectlError::Other(
-                        "unit has never been archived: no snapshot exists, so there is no tape \
-                         copy — marking it tape-only would greenlight deleting the only copy \
-                         (use --force to override)"
-                            .to_string(),
-                    ));
-                }
+        // Dirty is Tier 2, not Tier 3: the tape copy is stale relative to
+        // disk, but it exists. An operator may legitimately know the delta
+        // is junk. `tape_only` is the signal that local data may be deleted,
+        // so a stale copy still warrants refusing by default.
+        if let Some(p) = &pending {
+            if matches!(
+                p.reason,
+                crate::collection::fingerprint::PendingReason::Dirty
+            ) {
+                return Err(TapectlError::Other(format!(
+                    "unit is dirty: on-disk contents changed since the last snapshot — {} \
+                     (use --force to override)",
+                    p.changes.describe()
+                )));
             }
         }
     }
@@ -1499,9 +1511,50 @@ mod tests {
             msg.contains("never been archived"),
             "error must say the unit was never archived: {msg}"
         );
+        assert_eq!(
+            unit_status(&conn),
+            "active",
+            "a refused mark-tape-only must not have changed unit status"
+        );
+    }
+
+    #[test]
+    fn mark_tape_only_refuses_a_never_archived_unit_even_with_force() {
+        // ADR-0008 Tier 3: zero coverage is ABSOLUTE — no flag defeats it.
+        //
+        // This guard originally shipped (issue #36) INSIDE the `if !force`
+        // block, with an error message advertising "(use --force to
+        // override)". ADR-0008 was ratified afterwards and reclassified
+        // zero coverage as absolute, which made that placement a live
+        // violation: `--force` really did greenlight marking a unit
+        // tape-only when no tape held it. This test pins the corrected
+        // behavior so the guard can never drift back inside `if !force`.
+        //
+        // Compare `AlreadySealed` (src/volume/session.rs), the other Tier-3
+        // case: `check_tape_contact` takes no `force` parameter at all, so
+        // it is structurally impossible to defeat. That is the stronger
+        // pattern; this check achieves the same outcome by running before
+        // `force` is ever consulted.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"never archived").unwrap();
+        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
+        // Deliberately NO snapshot_create.
+
+        let config = config_with_zero_tape_only_thresholds();
+        let err = unit_mark_tape_only(&conn, &config, "unit1", true, false)
+            .expect_err("--force must NOT defeat the Tier-3 never-archived guard");
+        let msg = err.to_string();
         assert!(
-            msg.contains("--force"),
-            "error must mention the override: {msg}"
+            msg.contains("never been archived"),
+            "error must say the unit was never archived: {msg}"
+        );
+        assert!(
+            msg.contains("cannot be overridden"),
+            "error must state the guard is absolute, not overridable: {msg}"
+        );
+        assert!(
+            msg.contains("snapshot create"),
+            "error must name the real escape hatch instead of --force: {msg}"
         );
         assert_eq!(
             unit_status(&conn),

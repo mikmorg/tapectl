@@ -19,22 +19,42 @@ the normative design set named in the Policy block below.
 - **Mode: phase-2 hardening (from 2026-07-28).** R&D has exited: the v2 regear
   is merged to master and the design docs are settled reference, not fluid.
   Issue work is live again — re-spec, close, and file as needed.
-- **Queue (updated 2026-07-29):** open `phase:2`, **highs first** — remaining:
-  **#34** (slice numbering), **#33** (symlinks), **#36** (dirty detection),
-  **#38** (destructive consent). Then the 26 mediums. **#69 (Heir Kit) is
-  deferred by CTO decision** — it has a physical step (printing, tamper-evident
-  envelopes) no agent can perform; skip it. **Take #34 and #33 first**: they are
-  the two `EXPECTED_FAIL` entries, so clearing them empties the gate manifest,
-  which is the stated phase-2 exit criterion. Skip `epic`-labeled issues,
-  `wontfix`, `needs-human`.
-  *Landed and closed:* #27 (contact discipline), #35/#84/#85/#86 (the whole H9
-  streaming class — staging encrypt, source validate, restore, confirm +
-  compaction), #32 (bitrot commitment point). #25's CLI-resume wiring remains
-  open and unqueued — resume mechanics are built and tested but unreachable
-  from any CLI path.
-- **Issues predate the v2 regear** — every one was written against the old
-  write path. Read them against the normative set below, never literally; a
-  re-triage pass has re-spec'd them, but if an issue still contradicts the
+- **Queue (re-triaged 2026-07-29 — order is evidence-based, follow it):**
+  **CTO ruled ALL phase-2 issues gate exit**, so severity drives *ordering*,
+  not scope. Highs first, in this order:
+  1. **#45** — `volume verify`/`db fsck` exit 0 on real corruption, and NO
+     `tracing_subscriber` is installed anywhere, so the `tracing::warn!`
+     fixes shipped for #32 and #36 reach nobody. Cheap, isolated, and it
+     un-mutes two already-landed fixes. Also closes #3's ignored `--verbose`.
+  2. **#89** — copy-count gates ignore `volumes.status`; a quarantined or
+     retired copy still satisfies `min_copies`. **ADR-0008's consent tiers
+     are computed from this count**, so #38's guarantees are only as sound
+     as this. Land it close behind #38.
+  3. **#48 + #47 together** — `units.archive_set_id` has no writer (resolver
+     layer 2 inert) *and* `stage_create` never calls the resolver. Fixing
+     either alone leaves archive-set policy inert.
+  4. **#49** — most delicate in the backlog. MUST move
+     `collection/fingerprint.rs::walk_fingerprint` in lockstep; making
+     `files` exclude-aware alone regresses #36's dirty scan into permanent
+     false positives. Prefer ONE shared parameterized walk, not two.
+     Landing it lets #32's NEW check be tightened back to a hard error.
+  Then mediums, then lows. **#69 (Heir Kit) deferred by CTO** — it has a
+  physical step (printing, tamper-evident envelopes) no agent can perform.
+  Skip `epic`, `wontfix`, `needs-human`.
+  **Cross-issue sequencing (recorded on the issues too):** #45 before #44
+  (else the smoke test pins the broken exit codes); #50/#51 must also patch
+  the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or the
+  heir path keeps the fixed-away behavior; #50's remedies are impossible as
+  written (`dar --acl` does not exist, `--hash sha256` is invalid) — remove,
+  don't implement.
+  *Landed and closed:* #27, #35/#84/#85/#86 (H9 streaming class), #32,
+  #34 (slice numbering), #33 (symlinks), #36 (dirty detection). #25's
+  CLI-resume wiring remains open and unqueued.
+- **Issues were re-triaged 2026-07-29 against shipped code** — verdicts and
+  rescopes are in each issue's comments and supersede the original text.
+  Four were partly/wholly stale, four over-severed, three escalated, one
+  (#64) a RESPEC whose prescribed fix would make the docs *less* accurate.
+  Read the comments before implementing. Where an issue still contradicts the
   shipped design, the design wins and the issue is wrong.
 - **Normative set (authority order):** `docs/design/volume-format-v2.md`
   (on-tape bytes) → `docs/design/layout-session.md` (session state machine) →
