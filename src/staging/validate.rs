@@ -45,17 +45,24 @@ pub fn validate_source(
 ) -> Result<Vec<(String, String)>> {
     let base = Path::new(source_path);
 
-    // Get all non-directory files from the manifest, including any
-    // already-established sha256 baseline.
+    // Get all non-directory entries from the manifest, including any
+    // already-established sha256 baseline and each entry's recorded
+    // file_type (issue #33/H7: 'regular' / 'symlink' / 'special' — 'dir' is
+    // already excluded by the is_directory filter). Fetched unfiltered by
+    // type here — NEW detection below needs every non-directory path the
+    // manifest knows about, symlink/special included, or a previously
+    // staged symlink would falsely reappear as NEW on every re-stage.
     let mut stmt = conn.prepare(
-        "SELECT path, size_bytes, sha256 FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
+        "SELECT path, size_bytes, sha256, file_type FROM files
+         WHERE snapshot_id = ?1 AND is_directory = 0",
     )?;
-    let files: Vec<(String, i64, Option<String>)> = stmt
+    let all_entries: Vec<(String, i64, Option<String>, Option<String>)> = stmt
         .query_map(params![snapshot_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -69,7 +76,7 @@ pub fn validate_source(
     // this is an extra O(file count) directory walk every stage, accepted
     // for the walk-parity guarantee.
     let (_, _, disk_entries) = super::walk_directory(source_path)?;
-    let manifest_paths: HashSet<&str> = files.iter().map(|(p, _, _)| p.as_str()).collect();
+    let manifest_paths: HashSet<&str> = all_entries.iter().map(|(p, ..)| p.as_str()).collect();
     let mut new_files: Vec<&str> = disk_entries
         .iter()
         .filter(|e| !e.is_dir && !manifest_paths.contains(e.path.as_str()))
@@ -103,6 +110,22 @@ pub fn validate_source(
              once #49 makes exclusion-aware detection possible)"
         );
     }
+
+    // Content validation (size check + sha256) applies to regular files
+    // only (issue #33/H7). Symlinks have no content of their own to
+    // checksum — their recorded `size_bytes` is lstat's target-string
+    // length, not payload, and comparing it against the *followed* size
+    // (as `check_source_size` does) produced a false DIRTY whenever the two
+    // happened to differ. Special files (FIFO/socket/device) are worse:
+    // `hash_source_file` opening a FIFO with no writer blocks forever. Both
+    // are recorded in the manifest (so restore and `catalog ls` still see
+    // them) but are excluded here, before any file in this set is ever
+    // stat'd or opened.
+    let files: Vec<(String, i64, Option<String>)> = all_entries
+        .into_iter()
+        .filter(|(_, _, _, file_type)| file_type.as_deref() == Some("regular"))
+        .map(|(path, size, sha, _)| (path, size, sha))
+        .collect();
 
     let total_files = files.len();
     let total_bytes: i64 = files.iter().map(|(_, s, _)| s).sum();
@@ -252,7 +275,23 @@ const VALIDATE_STREAM_BUFFER: usize = 128 * 1024;
 /// the last whole-file `fs::read` site (H9-class); it now streams through
 /// this exact function instead of growing a second implementation, so the
 /// two call sites can never disagree about what a file's sha256 is.
+///
+/// Defense in depth (issue #33/H7): `validate_source`'s own `file_type`
+/// filter is the primary guard, but this function refuses to `File::open`
+/// anything that isn't confirmed a regular file, independent of any
+/// caller's filtering. `symlink_metadata` (never follows) runs first and
+/// unconditionally — a FIFO with no writer blocks `File::open` forever
+/// with no timeout, so that call must never be reached for anything else.
 pub(crate) fn hash_source_file(full_path: &Path, rel_path: &str) -> Result<(String, i64)> {
+    let meta = std::fs::symlink_metadata(full_path)
+        .map_err(|e| TapectlError::Other(format!("cannot stat source file: {rel_path} ({e})")))?;
+    if !meta.is_file() {
+        return Err(TapectlError::Other(format!(
+            "refusing to read non-regular file: {rel_path} — symlinks/FIFOs/sockets/devices \
+             are never content-validated (issue #33)"
+        )));
+    }
+
     let file = std::fs::File::open(full_path)
         .map_err(|e| TapectlError::Other(format!("cannot open source file: {rel_path} ({e})")))?;
     let mut reader = HashingReader::new(file);
@@ -286,6 +325,12 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         let schema = include_str!("../db/migrations/001_initial.sql");
         conn.execute_batch(schema).unwrap();
+        // 005 adds file_type/link_target (issue #33/H7) — applied directly
+        // on top of 001 alone (it only touches files/manifest_entries,
+        // both already defined there), matching this helper's existing
+        // lightweight-schema convention rather than pulling in 002-004.
+        conn.execute_batch(include_str!("../db/migrations/005_file_types.sql"))
+            .unwrap();
 
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
@@ -313,9 +358,14 @@ mod tests {
         let mid = conn.last_insert_rowid();
 
         for (path, size, sha) in files {
+            // file_type = 'regular' unconditionally: every existing caller of
+            // this helper plants a genuine regular-file scenario. Symlink/
+            // special rows for the issue #33/H7 tests go through
+            // `insert_nonregular_file` instead, which takes file_type
+            // explicitly.
             conn.execute(
-                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
+                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory, file_type)
+                 VALUES (?1, ?2, ?3, ?4, 0, 'regular')",
                 params![sid, path, size, sha],
             )
             .unwrap();
@@ -324,8 +374,8 @@ mod tests {
             // guarantee `backfill_checksums` must provide.
             conn.execute(
                 "INSERT INTO manifest_entries
-                     (manifest_id, path, size_bytes, mtime, sha256, is_directory)
-                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 0)",
+                     (manifest_id, path, size_bytes, mtime, sha256, is_directory, file_type)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 0, 'regular')",
                 params![mid, path, size, sha],
             )
             .unwrap();
@@ -632,6 +682,8 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         let schema = include_str!("../db/migrations/001_initial.sql");
         conn.execute_batch(schema).unwrap();
+        conn.execute_batch(include_str!("../db/migrations/005_file_types.sql"))
+            .unwrap();
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
             [],
@@ -653,14 +705,14 @@ mod tests {
         .unwrap();
         let sid = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-             VALUES (?1, 'subdir', 0, 1)",
+            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type)
+             VALUES (?1, 'subdir', 0, 1, 'dir')",
             [sid],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-             VALUES (?1, 'subdir/f.txt', 1, 0)",
+            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type)
+             VALUES (?1, 'subdir/f.txt', 1, 0, 'regular')",
             [sid],
         )
         .unwrap();
@@ -819,5 +871,174 @@ mod tests {
             "the guard's premise: streamed count must diverge from the pre-checked size"
         );
         assert_eq!(streamed, 2048);
+    }
+
+    // --- Symlinks and special files (issue #33/H7) -------------------------
+    //
+    // `walk_directory` and `validate_source` used to disagree about
+    // link-following: the walk recorded a symlink's target-string length as
+    // its "size" (never following), while `check_source_size` used
+    // `std::fs::metadata` (which DOES follow) to compare against the
+    // target's real content size. Any symlink whose name-target length
+    // differed from the target's content size produced a false DIRTY (the
+    // gate's exact fixture: a 10-character target name pointing at 7 bytes
+    // of content). A broken symlink was reported as a missing source file.
+    // Opening a FIFO with no writer via `File::open` blocked forever with
+    // no timeout. The fix: content validation (size check + sha256) applies
+    // to regular files only — symlinks/specials are recorded (file_type +
+    // link_target) but excluded from the validation set entirely.
+
+    /// Plants one additional non-regular `files`/`manifest_entries` row
+    /// alongside whatever `setup_conn_with_snapshot` already inserted — that
+    /// helper hardcodes `file_type = 'regular'` (every existing caller is a
+    /// genuine regular-file scenario), so symlink/special rows need their
+    /// own insert with an explicit `file_type`/`link_target`.
+    fn insert_nonregular_file(
+        conn: &Connection,
+        snapshot_id: i64,
+        path: &str,
+        size: i64,
+        file_type: &str,
+        link_target: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type, link_target)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![snapshot_id, path, size, file_type, link_target],
+        )
+        .unwrap();
+        let manifest_id: i64 = conn
+            .query_row(
+                "SELECT id FROM manifests WHERE snapshot_id = ?1",
+                params![snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_entries
+                 (manifest_id, path, size_bytes, mtime, is_directory, file_type, link_target)
+             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 0, ?4, ?5)",
+            params![manifest_id, path, size, file_type, link_target],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn good_symlink_with_mismatched_target_length_does_not_false_positive_dirty() {
+        // Reproduces the mhvtl gate's exact fixture shape: target.txt holds
+        // 7 bytes of content, link-ok's target-string "target.txt" is 10
+        // characters. Pre-fix, `check_source_size` compared 10
+        // (walk_directory's recorded "size" for the symlink) against
+        // fs::metadata's followed 7 and raised "DIRTY: source file size
+        // changed" — a false positive with nothing actually dirty.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("target.txt"), b"target\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", tmp.path().join("link-ok")).unwrap();
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("target.txt", 7, None)]);
+        // Matches what walk_directory records for this symlink: size_bytes
+        // = meta.len() = len("target.txt") = 10 (lstat's own size for the
+        // symlink object — unchanged by this fix; only content
+        // *validation* is skipped, not the recorded size, see the commit
+        // message for why).
+        insert_nonregular_file(&conn, sid, "link-ok", 10, "symlink", Some("target.txt"));
+
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "a mismatched-length symlink must not produce a false DIRTY: {result:?}"
+        );
+        let checksums = result.unwrap();
+        assert!(
+            checksums.iter().any(|(p, _)| p == "target.txt"),
+            "the real regular file must still be validated: {checksums:?}"
+        );
+        assert!(
+            !checksums.iter().any(|(p, _)| p == "link-ok"),
+            "the symlink must be excluded from the validation set: {checksums:?}"
+        );
+    }
+
+    #[test]
+    fn broken_symlink_does_not_error_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("target.txt"), b"target\n").unwrap();
+        std::os::unix::fs::symlink("does-not-exist.txt", tmp.path().join("dangling")).unwrap();
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("target.txt", 7, None)]);
+        insert_nonregular_file(
+            &conn,
+            sid,
+            "dangling",
+            15,
+            "symlink",
+            Some("does-not-exist.txt"),
+        );
+
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "a broken symlink must not error at all — excluded from validation: {result:?}"
+        );
+        let checksums = result.unwrap();
+        assert!(
+            !checksums.iter().any(|(p, _)| p == "dangling"),
+            "the broken symlink must be excluded from the validation set: {checksums:?}"
+        );
+    }
+
+    #[test]
+    fn special_file_excluded_from_validation_set_without_needing_a_live_fifo_on_disk() {
+        // Deliberately does NOT create a real FIFO on disk at this path: if
+        // the exclusion filter (the `file_type = 'regular'` restriction on
+        // validate_source's SELECT) ever regresses on its own,
+        // hash_source_file's independent defense-in-depth guard would still
+        // convert a reintroduced special-file lookup into a clean `Err`
+        // (nothing exists at this path) — but this test's job is to prove
+        // the exclusion itself, not to depend on that second layer, so it
+        // never puts a live, writer-less FIFO anywhere a regression could
+        // reach `File::open` on it and hang the suite (see the commit
+        // message and `hash_source_file_refuses_a_fifo_instead_of_blocking`
+        // for the one place a real FIFO is used, which is safe only because
+        // it is itself a direct, deterministic call to the guarded
+        // function).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
+        insert_nonregular_file(&conn, sid, "a.fifo", 0, "special", None);
+
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            checksums.len(),
+            1,
+            "the special file must be excluded from the validation set: {checksums:?}"
+        );
+        assert_eq!(checksums[0].0, "a.txt");
+    }
+
+    #[test]
+    fn hash_source_file_refuses_a_fifo_instead_of_blocking() {
+        // Direct, deterministic call — not a thread race against a hang.
+        // Given the fix, hash_source_file's symlink_metadata check runs
+        // BEFORE any File::open, so this returns Err immediately by
+        // construction; it never reaches the open() call that would
+        // otherwise block forever waiting for a writer that will never
+        // come. (Do not run this test against the pre-fix code — with no
+        // writer ever connecting, it hangs rather than failing; see the
+        // commit message.)
+        let tmp = TempDir::new().unwrap();
+        let fifo_path = tmp.path().join("myfifo");
+        nix::unistd::mkfifo(
+            &fifo_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+
+        let result = hash_source_file(&fifo_path, "myfifo");
+        assert!(
+            result.is_err(),
+            "hash_source_file must refuse a FIFO, not block trying to read it: {result:?}"
+        );
     }
 }
