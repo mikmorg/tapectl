@@ -89,25 +89,39 @@ pub fn validate_source(
         // Two reasons. (1) The design doc (§2.13) files NEW as a
         // `check-integrity` REPORT status, not a stage-time gate; hard-failing
         // here would be tapectl inventing a stricter contract than its own spec.
-        // (2) More decisively, this check has a KNOWN false-positive source:
-        // `walk_directory` applies no exclusion filtering at all, while
-        // `stage_create` passes `global_excludes` to dar. So an incidentally
-        // excluded file appearing between `snapshot create` and `stage create`
-        // — an editor swap file, .DS_Store, a cache entry — would block staging
-        // outright for content dar was never going to archive.
+        // (2) This check HAD a known false-positive source: `walk_directory`
+        // applied no exclusion filtering at all, while `stage_create` passed
+        // `global_excludes` to dar. So an incidentally excluded file appearing
+        // between `snapshot create` and `stage create` — an editor swap file,
+        // .DS_Store, a cache entry — would block staging outright for content
+        // dar was never going to archive.
+        //
+        // Issue #49 landed: `walk_directory` now applies the unit's own
+        // dotfile `[excludes] patterns` (via the shared `staging::exclude`
+        // matcher, also used by `collection::fingerprint::walk_fingerprint`
+        // and merged into `stage_create`'s dar `-X` arguments alongside
+        // `global_excludes`). That closes the false-positive source for any
+        // pattern listed in the unit's own dotfile. It does NOT yet close it
+        // for a file excluded ONLY via `config.defaults.global_excludes` with
+        // no per-unit dotfile override — `walk_directory`'s sole caller
+        // (`snapshot_create`) has no `Config` in scope, and threading one to
+        // it ripples into caller graphs outside #49's fence (see
+        // `exclude::dotfile_patterns`'s doc comment and the PR report). So a
+        // *global*-only exclude can still surface a false NEW warning today —
+        // a real, acknowledged, narrower residual, tracked separately from
+        // this fix.
         //
         // A gate whose false positives halt legitimate work is worse than no
         // gate: operators learn to bypass it. The real cost of NEW is a catalog
         // that under-reports a file dar did archive — a wart, not data loss.
-        //
-        // Upgrade this to a hard error once #49 wires excludes through
-        // `walk_directory`, at which point the false-positive source is gone.
+        // Upgrading this to a hard error is a separate, deliberately unbundled
+        // behavior change (its own risk profile) from #49's exclusion wiring —
+        // do not couple the two in one commit.
         tracing::warn!(
             files = %new_files.join(", "),
             "NEW: file(s) on disk are absent from the snapshot manifest; dar will \
              archive content the catalog has not recorded. Re-run `snapshot create` \
-             before staging if these should be catalogued (design §2.13; hard-fails \
-             once #49 makes exclusion-aware detection possible)"
+             before staging if these should be catalogued (design §2.13)"
         );
     }
 

@@ -131,12 +131,40 @@ struct FileStamp {
 }
 
 /// Fresh walk of `unit_path`, sorted by path. Mirrors
-/// `staging::walk_directory`'s file enumeration (unfiltered — excludes are
-/// a dar-time / archive-content concern applied later at `stage create`,
-/// and the `files` table this compares against is unfiltered too) and its
-/// exact mtime-to-RFC3339 conversion, so a byte-identical directory always
-/// produces a byte-identical fingerprint against a byte-identical snapshot.
+/// `staging::walk_directory`'s file enumeration and its exact
+/// mtime-to-RFC3339 conversion, so a byte-identical directory always
+/// produces a byte-identical fingerprint against a byte-identical
+/// snapshot.
+///
+/// **Issue #49 update:** this walk used to be deliberately unfiltered, on
+/// the reasoning that "excludes are a dar-time / archive-content concern
+/// applied later at stage create, and the `files` table this compares
+/// against is unfiltered too." That second half stopped being true once
+/// #49 wired `staging::walk_directory` (which populates `files`) through
+/// the shared `staging::exclude` matcher — an unfiltered `walk_fingerprint`
+/// compared against a now-FILTERED `files` table would report every
+/// excluded file as a permanent phantom `added` entry (exactly the trap
+/// #49's own design review flagged: worse than the bug being fixed). So
+/// this walk now applies the identical matcher, via the identical
+/// per-unit dotfile lookup (`exclude::dotfile_patterns(unit_path)`) —
+/// same predicate, same source, so the two walks cannot independently
+/// disagree about the same fact (issues #33/#36/#48's shared failure
+/// shape).
+///
+/// Residual scope gap (see `exclude::dotfile_patterns`'s doc comment and
+/// the PR report): this is the per-unit (dotfile) half of "effective
+/// excludes = globals + dotfile" only. `classify`, this function's sole
+/// caller, has no `Config` in scope, and threading one to it ripples into
+/// caller graphs outside issue #49's fence (`src/cli/unit.rs`,
+/// `src/cli/report.rs`, `src/cli/operations.rs`,
+/// `src/collection/{status,plan,sync}.rs`). `staging::walk_directory` has
+/// the exact same gap for the exact same reason (`snapshot_create` also
+/// has no `Config`), so the two walks stay in lockstep with each other —
+/// they are just both, for now, short of dar's fuller (global + dotfile)
+/// exclude set.
 fn walk_fingerprint(unit_path: &Path) -> Vec<FileStamp> {
+    let exclude_compiled =
+        crate::staging::exclude::compile(&crate::staging::exclude::dotfile_patterns(unit_path));
     let mut out = Vec::new();
     for entry in WalkDir::new(unit_path)
         .follow_links(false)
@@ -151,6 +179,13 @@ fn walk_fingerprint(unit_path: &Path) -> Vec<FileStamp> {
             continue;
         };
         if meta.is_dir() {
+            continue;
+        }
+        // Issue #49: identical predicate to walk_directory's — see the
+        // module-level doc comment above and `exclude::is_excluded`'s own
+        // doc comment for why directories (already filtered out above)
+        // are never tested here either.
+        if crate::staging::exclude::is_excluded(path, &exclude_compiled) {
             continue;
         }
         let rel = path
@@ -888,5 +923,189 @@ mod tests {
             .unwrap();
 
         assert!(classify(&conn, &unit).unwrap().is_none());
+    }
+
+    // ── issue #49: shared exclude matcher, walk_directory/walk_fingerprint lockstep ──
+
+    /// THE anti-regression guard (write this first; it must fail against
+    /// the pre-#49 code): for the same directory and the same exclude
+    /// configuration, `staging::walk_directory` and this module's
+    /// `walk_fingerprint` must enumerate the identical relative-path set.
+    /// Pre-#49, both walks are unfiltered, so the pure equality half of
+    /// this assertion would trivially pass even on broken code (two
+    /// scanners agreeing on the same wrong answer isn't proof of
+    /// correctness) — the exclusion-content assertions below are what
+    /// actually fail pre-fix, and are the real proof this landed.
+    #[test]
+    fn walk_directory_and_walk_fingerprint_enumerate_identical_paths_for_excluded_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &tmp.path().join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: "u-1".into(),
+                name: "fixture".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "t".into(),
+                archive_set: None,
+                checksum_mode: "mtime_size".into(),
+                compression: "none".into(),
+                exclude_patterns: vec!["*.tmp".into(), "Thumbs.db".into()],
+            },
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), b"keep me").unwrap();
+        std::fs::write(tmp.path().join("junk.tmp"), b"junk").unwrap();
+        std::fs::write(tmp.path().join("Thumbs.db"), b"thumbnail cache").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/nested.tmp"), b"nested junk").unwrap();
+        std::fs::write(tmp.path().join("sub/nested_keep.txt"), b"nested keep").unwrap();
+
+        let mut from_directory =
+            crate::staging::walk_directory_relative_paths_for_test(tmp.path().to_str().unwrap())
+                .unwrap();
+        from_directory.sort();
+
+        let from_fingerprint: Vec<String> = walk_fingerprint(tmp.path())
+            .into_iter()
+            .map(|f| f.path)
+            .collect(); // walk_fingerprint's own output is already sorted
+
+        assert_eq!(
+            from_directory, from_fingerprint,
+            "walk_directory and walk_fingerprint must enumerate the identical \
+             relative-path set for the same exclude configuration (issue #49) — \
+             got walk_directory={from_directory:?}"
+        );
+
+        // Proves the fix itself, not just mutual agreement: the excluded
+        // files must actually be gone from both sides, and the kept ones
+        // must still be present on both sides.
+        for excluded in ["junk.tmp", "Thumbs.db", "sub/nested.tmp"] {
+            assert!(
+                !from_directory.contains(&excluded.to_string()),
+                "{excluded} must be excluded from walk_directory, got {from_directory:?}"
+            );
+            assert!(
+                !from_fingerprint.contains(&excluded.to_string()),
+                "{excluded} must be excluded from walk_fingerprint, got {from_fingerprint:?}"
+            );
+        }
+        for kept in ["keep.txt", "sub/nested_keep.txt"] {
+            assert!(
+                from_directory.contains(&kept.to_string()),
+                "{kept} must still be recorded by walk_directory, got {from_directory:?}"
+            );
+            assert!(
+                from_fingerprint.contains(&kept.to_string()),
+                "{kept} must still be recorded by walk_fingerprint, got {from_fingerprint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_fingerprint_with_no_dotfile_excludes_behaves_exactly_as_before() {
+        // The common case (issue #49 trap: "do NOT break units with no
+        // excludes configured") — no dotfile at all, so nothing is
+        // excluded and every non-directory file is enumerated, unchanged.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(
+            tmp.path().join("Thumbs.db"),
+            b"not excluded without a dotfile",
+        )
+        .unwrap();
+
+        let fresh = walk_fingerprint(tmp.path());
+        let paths: Vec<&str> = fresh.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"));
+        assert!(
+            paths.contains(&"Thumbs.db"),
+            "with no dotfile exclude_patterns, nothing is filtered — matches \
+             pre-#49 behavior exactly (the global-exclude half is a separate, \
+             reported scope gap, not implemented by this walk)"
+        );
+    }
+
+    /// Direct proof of the property `unit status --dirty` and `collection
+    /// status` rely on (both call `classify` unmodified): a unit whose
+    /// only "changed" file is dotfile-excluded junk must classify as
+    /// clean, and stay clean across a SECOND scan too — the #36 trap this
+    /// guards against is specifically about *perpetual* dirtiness from an
+    /// asymmetric walk, not a one-off false positive.
+    #[test]
+    fn a_unit_with_dotfile_excluded_junk_stays_clean_across_two_scans() {
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &tmp.path().join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: "u-2".into(),
+                name: "fixture2".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "t".into(),
+                archive_set: None,
+                checksum_mode: "mtime_size".into(),
+                compression: "none".into(),
+                exclude_patterns: vec!["*.tmp".into()],
+            },
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        std::fs::write(tmp.path().join("junk.tmp"), b"AAAA").unwrap();
+
+        let unit_id = seed_unit(&conn, tmp.path());
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+
+        assert!(
+            classify(&conn, &unit).unwrap().is_none(),
+            "excluded junk must not make a freshly-snapshotted unit dirty"
+        );
+
+        // The junk file changes (still excluded, still not tracked) — a
+        // SIZE-changing edit, deliberately not just a same-size content
+        // swap: `walk_fingerprint`'s `modified_at` is `meta.mtime()`
+        // truncated to whole SECONDS (chrono::DateTime::from_timestamp(_,
+        // 0)), so a same-size rewrite that lands within the same
+        // wall-clock second as `snapshot_create` produces an IDENTICAL
+        // mtime_size fingerprint regardless of whether exclusion filtering
+        // runs at all — that would make this assertion pass for the wrong
+        // reason (a genuine risk caught by mutation-testing this test: it
+        // originally used a same-size edit and kept passing even with the
+        // matcher neutralized to always return `false`). A size change is
+        // unambiguously visible to mtime_size with no timing dependency,
+        // so this assertion only passes when exclusion is what's actually
+        // keeping the unit clean. Must stay clean, not just be clean once.
+        std::fs::write(
+            tmp.path().join("junk.tmp"),
+            b"much bigger junk content now, definitely a different size",
+        )
+        .unwrap();
+        assert!(
+            classify(&conn, &unit).unwrap().is_none(),
+            "must stay clean on a second scan too — not perpetually dirty \
+             (issue #36's own trap)"
+        );
+
+        // Sanity check the other direction: a REAL (non-excluded) change
+        // must still be caught — proves this test isn't vacuously passing
+        // because classify() is broken in some other way.
+        std::fs::write(tmp.path().join("f.txt"), b"hello, world! now longer").unwrap();
+        let p = classify(&conn, &unit)
+            .unwrap()
+            .expect("a real, non-excluded change must still be detected");
+        assert_eq!(p.reason, PendingReason::Dirty);
+        assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
     }
 }

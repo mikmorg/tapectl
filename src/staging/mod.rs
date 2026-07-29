@@ -184,13 +184,24 @@ pub fn stage_create(
         snapshot.version,
     ));
 
+    // Issue #49 items 2/5: dar's -X masks must see BOTH layers of
+    // "effective excludes" — config.defaults.global_excludes (today's only
+    // source) AND the unit's own dotfile `[excludes] patterns` (until this
+    // fix, read/written but never consumed here). stage_create already has
+    // both `config` and the snapshot's own `source_path` in scope, so this
+    // merge is fully local — no threading through other callers needed
+    // (contrast walk_directory/walk_fingerprint's dotfile-only interim
+    // state; see exclude::dotfile_patterns's doc comment for why).
+    let mut dar_exclude_patterns = config.defaults.global_excludes.clone();
+    dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&snapshot.source_path)));
+
     let dar_result = dar::create::create_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
         source_path: Path::new(&snapshot.source_path),
         archive_base: &archive_base,
         slice_size: &slice_size,
         compression: &compression,
-        exclude_patterns: &config.defaults.global_excludes,
+        exclude_patterns: &dar_exclude_patterns,
         exclude_paths: &[],
         preserve_xattrs: resolved.preserve_xattrs,
         preserve_acls: resolved.preserve_acls,
@@ -776,6 +787,13 @@ fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
     use walkdir::WalkDir;
 
     let base = Path::new(path);
+    // Issue #49 item 3: the unit's own dotfile exclude patterns, compiled
+    // once per walk (not per entry). Directories are never tested against
+    // these (see `exclude::is_excluded`'s doc comment — this mirrors dar's
+    // own `-X`, which cannot exclude directories either), so this is the
+    // per-unit half only — see `exclude::dotfile_patterns`'s doc comment
+    // for the global-exclude half's current scope gap.
+    let exclude_compiled = exclude::compile(&exclude::dotfile_patterns(base));
     let mut entries = Vec::new();
     let mut total_size: i64 = 0;
     let mut file_count: i64 = 0;
@@ -797,6 +815,18 @@ fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
             .metadata()
             .map_err(|e| TapectlError::Other(e.to_string()))?;
         let is_dir = meta.is_dir();
+
+        // Issue #49: a non-directory entry matching an exclude pattern is
+        // dropped before any further work (symlink-target read, manifest
+        // row) — dar will never archive it (once stage_create's -X masks
+        // include this same pattern, see the dar_exclude_patterns merge
+        // above in stage_create), so the manifest/files table must not
+        // record it either. Checked before the file_type classification
+        // below so an excluded entry costs nothing beyond the basename
+        // match.
+        if !is_dir && exclude::is_excluded(entry.path(), &exclude_compiled) {
+            continue;
+        }
         // lstat's own size for the entry — for a symlink this is the length
         // of the *target path string*, not any real content size. Kept
         // as-is (not zeroed for a symlink/special below): it's what
@@ -875,6 +905,24 @@ fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
     }
 
     Ok((total_size, file_count, entries))
+}
+
+/// Test-only cross-module seam (issue #49): the relative, non-directory
+/// paths `walk_directory` enumerates for `path`, without exposing
+/// `ManifestEntry`'s internal shape outside this module. Used by
+/// `collection::fingerprint`'s anti-regression test proving `walk_directory`
+/// and `walk_fingerprint` enumerate an identical relative-path set for the
+/// same exclude configuration — the property that keeps the two
+/// independent `WalkDir`-based walks from silently drifting apart again
+/// (issues #33/#36/#48 each hit exactly this failure shape once already).
+#[cfg(test)]
+pub(crate) fn walk_directory_relative_paths_for_test(path: &str) -> Result<Vec<String>> {
+    let (_, _, entries) = walk_directory(path)?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.path)
+        .collect())
 }
 
 struct ManifestEntry {
@@ -1371,5 +1419,256 @@ mod tests {
              not config.defaults.slice_size (100M) — proves stage_create resolves \
              policy instead of reading config.defaults directly"
         );
+    }
+
+    // ── issue #49: exclusions end-to-end (dotfile+global -> dar, walk, validation) ──
+
+    /// Shared setup for the issue #49 tests below: a real tenant + unit
+    /// (via `unit::init_unit`, so a real dotfile + real tenant keys exist —
+    /// `stage_create` refuses to encrypt without active tenant keys), with
+    /// the unit's dotfile `[excludes] patterns` overwritten to
+    /// `exclude_patterns` (empty = the "no excludes configured" case,
+    /// `init_unit` itself always writes an empty list). Returns
+    /// `(conn, paths, config, src_dir)`; the caller writes fixture files
+    /// into `src_dir` and drives `snapshot_create`/`stage_create` itself,
+    /// since each test needs different file content/timing.
+    fn setup_unit_with_excludes(
+        tmp: &TempDir,
+        exclude_patterns: Vec<String>,
+    ) -> (Connection, TapectlPaths, Config, PathBuf) {
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let mut config = Config::default();
+        config.dar.binary = "/usr/bin/dar".to_string();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        if !exclude_patterns.is_empty() {
+            let dotfile_path = src.join(".tapectl-unit.toml");
+            let mut df = crate::unit::dotfile::read_dotfile(&dotfile_path).unwrap();
+            df.exclude_patterns = exclude_patterns;
+            crate::unit::dotfile::write_dotfile(&dotfile_path, &df).unwrap();
+        }
+
+        (conn, paths, config, src)
+    }
+
+    /// THE core claim of issue #49 (its own re-triage escalation): a unit
+    /// must not be permanently blocked from staging by content drift in a
+    /// file dar was never going to archive. Write this FIRST — it must
+    /// fail against the pre-#49 code (see the PR report for the captured
+    /// pre-fix failure): `walk_directory` used to record every file
+    /// unfiltered, so `backfill_checksums` established a sha256 baseline
+    /// for the excluded junk file too, and this re-stage's same-size
+    /// content drift then tripped `validate_source`'s BITROT refusal for
+    /// content dar was never going to touch.
+    #[test]
+    fn excluded_junk_file_content_drift_at_stable_size_does_not_false_positive_bitrot() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec!["*.tmp".to_string()]);
+
+        fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
+        fs::write(src.join("junk.tmp"), b"AAAA").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
+
+        // The excluded junk file's content drifts at an UNCHANGED size —
+        // exactly the false-BITROT scenario the issue describes
+        // (Thumbs.db/*.tmp regenerating at a stable size).
+        fs::write(src.join("junk.tmp"), b"BBBB").unwrap();
+
+        // Re-staging the SAME snapshot (a real "stage create" retry) must
+        // succeed cleanly — never raise BITROT over content dar was never
+        // going to archive.
+        let result = stage_create(&conn, &paths, &config, snap_id);
+        assert!(
+            result.is_ok(),
+            "re-staging must succeed — an excluded file's content drift must \
+             never raise BITROT: {result:?}"
+        );
+    }
+
+    #[test]
+    fn excluded_files_do_not_appear_in_manifest_or_files_table() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, _config, src) =
+            setup_unit_with_excludes(&tmp, vec!["*.tmp".to_string()]);
+
+        fs::write(src.join("keep.txt"), b"kept content").unwrap();
+        fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+
+        let files_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'junk.tmp'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(files_count, 0, "excluded file must not appear in `files`");
+
+        let manifest_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manifest_entries me
+                 JOIN manifests m ON m.id = me.manifest_id
+                 WHERE m.snapshot_id = ?1 AND me.path = 'junk.tmp'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            manifest_count, 0,
+            "excluded file must not appear in `manifest_entries`"
+        );
+
+        let kept_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_count, 1, "non-excluded file must still be recorded");
+    }
+
+    #[test]
+    fn excluded_files_never_receive_a_sha256_baseline() {
+        // "Once (3) lands, backfill_checksums naturally stops seeing them
+        // — verify that is true rather than assuming" (issue #49). Drives
+        // the REAL stage_create pipeline (not just snapshot_create) so
+        // backfill_checksums actually runs.
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec!["*.tmp".to_string()]);
+
+        fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
+        fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        stage_create(&conn, &paths, &config, snap_id).unwrap();
+
+        let junk_row_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'junk.tmp'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            junk_row_exists, 0,
+            "excluded file must have no `files` row at all, so there is \
+             nothing for backfill_checksums to baseline"
+        );
+
+        let kept_sha: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            kept_sha.is_some(),
+            "the non-excluded file must still get its baseline established"
+        );
+    }
+
+    #[test]
+    fn dotfile_exclude_patterns_reach_dars_constructed_arguments() {
+        // "Dotfile patterns reach dar (assert on the constructed dar
+        // arguments)" — stage_sets.dar_command records the exact
+        // Command::Debug-formatted string create_archive ran.
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) =
+            setup_unit_with_excludes(&tmp, vec!["*.unusual-dotfile-pattern".to_string()]);
+
+        fs::write(src.join("keep.txt"), b"kept content").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
+
+        let dar_command: String = conn
+            .query_row(
+                "SELECT dar_command FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            dar_command.contains("*.unusual-dotfile-pattern"),
+            "the dotfile's own exclude pattern must reach dar's constructed \
+             -X arguments, got: {dar_command}"
+        );
+        // The pre-existing global excludes must still be present too (this
+        // fix merges, not replaces).
+        assert!(
+            dar_command.contains("Thumbs.db"),
+            "config.defaults.global_excludes must still reach dar, got: {dar_command}"
+        );
+    }
+
+    #[test]
+    fn a_unit_with_no_excludes_configured_behaves_exactly_as_before() {
+        // Issue #49 trap: "do NOT break units with no excludes configured
+        // — the empty-pattern case must behave exactly as today, and is
+        // the common case." No dotfile override at all (init_unit's own
+        // default), so only whatever `config.defaults.global_excludes`
+        // would already exclude via dar is affected — the walk itself
+        // must record everything, unchanged from pre-#49.
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+
+        fs::write(src.join("keep.txt"), b"kept content").unwrap();
+        // Deliberately named like a *global*-default exclude pattern, to
+        // document (not silently hide) this fix's scope boundary: with NO
+        // per-unit dotfile override, the walk still records this file
+        // (unchanged from before #49) even though dar itself already
+        // excludes it via config.defaults.global_excludes — see
+        // exclude::dotfile_patterns's doc comment for the residual gap.
+        fs::write(src.join("Thumbs.db"), b"not a real thumbnail cache").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // 2 files recorded (keep.txt, Thumbs.db) + the dotfile itself
+        // (.tapectl-unit.toml, swept up like any other regular file —
+        // pre-existing, unrelated behavior this fix does not change).
+        assert_eq!(
+            file_count, 3,
+            "with no dotfile exclude_patterns, nothing is filtered from the \
+             walk — matches pre-#49 behavior exactly"
+        );
+
+        stage_create(&conn, &paths, &config, snap_id)
+            .expect("staging a unit with no per-unit excludes must succeed exactly as before");
     }
 }
