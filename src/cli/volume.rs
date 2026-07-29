@@ -136,6 +136,12 @@ pub enum VolumeCommands {
     },
 }
 
+/// Run a volume subcommand. Returns the process exit code (issue #45/H10),
+/// mirroring the `audit` convention (`src/cli/audit.rs`): 0=clean,
+/// 1=warning, 2=violation. Every arm but `Verify` has no exit-code
+/// semantics of its own and returns `EXIT_SUCCESS`; the caller (`main.rs`)
+/// decides whether to actually call `std::process::exit`, exactly as it
+/// does for `audit`.
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -144,7 +150,8 @@ pub fn run(
     json_output: bool,
     yes: bool,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<i32> {
+    let mut exit_code = crate::error::EXIT_SUCCESS;
     match command {
         VolumeCommands::Init {
             label,
@@ -218,6 +225,10 @@ pub fn run(
                     report.checked, report.passed, report.failed,
                 );
             }
+            // issue #45/H10: a failing verify must not exit 0 — a
+            // cron-scheduled integrity check that finds corruption but
+            // reports success defeats the entire point of verifying.
+            exit_code = verify_exit_code(&report);
         }
 
         VolumeCommands::Identify { device } => {
@@ -411,5 +422,61 @@ pub fn run(
             }
         }
     }
-    Ok(())
+    Ok(exit_code)
+}
+
+/// Decide the process exit code for `volume verify` from its report
+/// (issue #45/H10). No warning tier of its own: a chain walk either
+/// confirms every checked slice or it finds real corruption, so the
+/// result is binary — clean or violation — unlike `fsck`, which can also
+/// report a repaired-but-notable finding.
+fn verify_exit_code(report: &write::VerifyReport) -> i32 {
+    if report.failed > 0 {
+        crate::error::EXIT_ERROR
+    } else {
+        crate::error::EXIT_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_exit_code_clean_report_is_success() {
+        let report = write::VerifyReport {
+            checked: 10,
+            passed: 10,
+            failed: 0,
+        };
+        assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn verify_exit_code_any_failure_is_violation() {
+        let report = write::VerifyReport {
+            checked: 10,
+            passed: 9,
+            failed: 1,
+        };
+        assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
+    }
+
+    #[test]
+    fn verify_exit_code_all_failed_is_violation() {
+        let report = write::VerifyReport {
+            checked: 3,
+            passed: 0,
+            failed: 3,
+        };
+        assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
+    }
+
+    #[test]
+    fn verify_exit_code_empty_report_is_success() {
+        // A volume with zero checkable slices (degenerate but not a
+        // failure) must not be reported as a violation.
+        let report = write::VerifyReport::default();
+        assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
+    }
 }

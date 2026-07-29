@@ -16,6 +16,43 @@ fn main() {
     }
 }
 
+/// Flush stdout, then exit with `code` if it is non-zero (issue #45/H10).
+/// A code of 0 is a no-op — the healthy/clean path returns normally rather
+/// than calling `process::exit(0)`. The explicit flush guards against
+/// `println!`'s buffered output being dropped when stdout is a pipe (exactly
+/// how `scripts/mhvtl-verify-gate.sh` invokes this binary, under
+/// `pipefail`, so a truncated line is a real failure mode).
+fn exit_if_nonzero(code: i32) {
+    if code > 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+}
+
+/// Decide the process exit code for `db fsck` from its report (issue
+/// #45/H10). Mirrors the `audit` convention: 0=clean, 1=warning,
+/// 2=violation.
+///
+/// - The integrity check itself failing is a violation, full stop — no
+///   amount of orphan-row repair changes that.
+/// - Any other issue (e.g. orphaned rows) is a warning regardless of
+///   whether `--repair` fixed it: an unrepaired finding (fsck run without
+///   `--repair`) is still a finding nobody should see reported as a clean
+///   0 — that is exactly the "reports success while finding problems" bug
+///   this ticket exists to kill. It just isn't tape/DB corruption, so it's
+///   1, not 2.
+/// - No issues at all is genuinely clean.
+fn fsck_exit_code(report: &cli::operations::FsckReport) -> i32 {
+    if !report.integrity_ok {
+        error::EXIT_ERROR
+    } else if !report.issues.is_empty() {
+        error::EXIT_WARNING
+    } else {
+        error::EXIT_SUCCESS
+    }
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
     // Resolve paths
     let paths = if let Some(ref config_path) = cli.config {
@@ -73,7 +110,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::staging::run(&conn, command, cli.json)?;
         }
         Commands::Volume { ref command } => {
-            cli::volume::run(&conn, &paths, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
+            // issue #45/H10: `volume::run` now returns a process exit code
+            // (0=clean, 1=warning, 2=violation) for `Verify`; every other
+            // subcommand returns EXIT_SUCCESS. Mirrors the Audit arm below.
+            let exit_code =
+                cli::volume::run(&conn, &paths, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
+            exit_if_nonzero(exit_code);
         }
         Commands::Restore { ref command } => {
             cli::restore::run(&conn, &paths, &cfg, command, cli.json)?;
@@ -210,6 +252,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         println!("  {issue}");
                     }
                 }
+                // issue #45/H10: fsck must not exit 0 when it found real
+                // problems — see `fsck_exit_code` for the exact rule.
+                exit_if_nonzero(fsck_exit_code(&report));
             }
             cli::DbCommands::Export => {
                 // Export key table counts as JSON
@@ -367,4 +412,64 @@ fn check_dar(dar_path: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cli::operations::FsckReport;
+
+    #[test]
+    fn fsck_exit_code_clean_is_success() {
+        let report = FsckReport {
+            integrity_ok: true,
+            issues: vec![],
+            repaired: 0,
+        };
+        assert_eq!(fsck_exit_code(&report), error::EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn fsck_exit_code_broken_integrity_is_violation() {
+        let report = FsckReport {
+            integrity_ok: false,
+            issues: vec!["integrity_check: corrupted".to_string()],
+            repaired: 0,
+        };
+        assert_eq!(fsck_exit_code(&report), error::EXIT_ERROR);
+    }
+
+    #[test]
+    fn fsck_exit_code_broken_integrity_is_violation_even_if_other_things_repaired() {
+        // Integrity failure outranks repair count — repairing orphan rows
+        // does not paper over a corrupted database.
+        let report = FsckReport {
+            integrity_ok: false,
+            issues: vec!["integrity_check: corrupted".to_string(), "1 orphan".into()],
+            repaired: 1,
+        };
+        assert_eq!(fsck_exit_code(&report), error::EXIT_ERROR);
+    }
+
+    #[test]
+    fn fsck_exit_code_issues_found_and_repaired_is_warning() {
+        let report = FsckReport {
+            integrity_ok: true,
+            issues: vec!["3 orphaned write records".to_string()],
+            repaired: 1,
+        };
+        assert_eq!(fsck_exit_code(&report), error::EXIT_WARNING);
+    }
+
+    #[test]
+    fn fsck_exit_code_issues_found_but_not_repaired_is_still_warning() {
+        // Ran without --repair: nothing got fixed (repaired == 0), but the
+        // finding is real and must not be swallowed as a clean 0.
+        let report = FsckReport {
+            integrity_ok: true,
+            issues: vec!["3 orphaned write records".to_string()],
+            repaired: 0,
+        };
+        assert_eq!(fsck_exit_code(&report), error::EXIT_WARNING);
+    }
 }

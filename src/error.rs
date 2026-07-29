@@ -3,9 +3,12 @@ use std::process;
 use thiserror::Error;
 
 /// Exit codes per design: 0=success, 1=warnings, 2=errors/violations.
-#[allow(dead_code)]
+///
+/// Mirrors the convention `audit` already established (`src/cli/audit.rs`):
+/// 0=clean, 1=warning, 2=violation. `volume verify` (src/cli/volume.rs) and
+/// `db fsck` (src/main.rs) both compute their exit code against these same
+/// constants — see `verify_exit_code`/`fsck_exit_code` (issue #45/H10).
 pub const EXIT_SUCCESS: i32 = 0;
-#[allow(dead_code)]
 pub const EXIT_WARNING: i32 = 1;
 pub const EXIT_ERROR: i32 = 2;
 
