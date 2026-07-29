@@ -2079,3 +2079,128 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         "a keyless-tenant refusal must not create write records"
     );
 }
+
+// ── Tracing subscriber tests (issue #45/H10) ──
+//
+// Every other test in this file calls library functions directly
+// (`tapectl::cli::...::run`, `tapectl::db::open`, ...) and never goes
+// through `fn main()` in src/main.rs — so none of them exercise the
+// global tracing subscriber `main()` installs. Proving "warnings land on
+// stderr, not stdout" requires observing a real OS-level stream split,
+// which only exists once a real process has been spawned. This is
+// therefore the one test in the suite that spawns the compiled `tapectl`
+// binary itself, via Cargo's CARGO_BIN_EXE_<name> mechanism.
+
+/// Proves the subscriber installed in `main()` (src/main.rs `init_tracing`)
+/// writes to stderr and not stdout.
+///
+/// Trigger: `unit discover` against a `discovery.watch_roots` entry that
+/// does not exist on disk hits the pre-existing warn! in
+/// `src/unit/discovery.rs` ("watch root does not exist, skipping") with no
+/// dar/tape/staging setup required. Run with `--json`: the JSON branch of
+/// `unit discover` (src/cli/unit.rs) deliberately omits `skipped_roots`, so
+/// stdout is clean of the warning text *by construction* — this test would
+/// catch a subscriber regression (e.g. dropping `.with_writer(stderr)`, or
+/// its removal) that leaks the line onto stdout, corrupting every --json
+/// consumer (the real-world case: `scripts/mhvtl-verify-gate.sh` pipes
+/// `volume verify --json` through `tee` then parses the file).
+///
+/// What this does NOT prove: it does not exercise `volume verify`/`db
+/// fsck` themselves (neither currently logs via `tracing`), and it runs at
+/// default verbosity only (no `--verbose` case). It proves the specific,
+/// load-bearing property this ticket is about: the installed subscriber's
+/// writer is stderr, not stdout, for at least one real warn! call site,
+/// observed as a real process's real stdout/stderr file descriptors.
+#[test]
+fn test_tracing_warning_goes_to_stderr_not_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let db_path = home.join("tapectl.db");
+    let config_path = home.join("config.toml");
+    std::fs::create_dir_all(home.join("keys")).unwrap();
+
+    let bogus_root = home.join("does-not-exist-watch-root");
+    let bogus_root_str = bogus_root.to_string_lossy();
+    assert!(
+        !bogus_root.exists(),
+        "test fixture bug: bogus watch root must not exist"
+    );
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[dar]
+binary = "/usr/bin/dar"
+
+[staging]
+directory = "/tmp/tapectl-test-staging"
+
+[defaults]
+slice_size = "100M"
+compression = "none"
+hash = "sha256"
+checksum_mode = "mtime_size"
+encrypt = true
+preserve_xattrs = true
+preserve_acls = true
+preserve_fsa = true
+min_copies_for_tape_only = 2
+min_locations_for_tape_only = 2
+
+[discovery]
+watch_roots = ["{bogus_root_str}"]
+"#
+        ),
+    )
+    .unwrap();
+
+    // Create the schema the same way `tapectl init` would (real migration
+    // path via tapectl::db::open, same as `setup()` above), then drop the
+    // connection before the subprocess opens the same file — no WAL lock
+    // contention between the two processes.
+    {
+        let _conn = tapectl_test_db(&db_path);
+    }
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "unit",
+            "discover",
+        ])
+        .output()
+        .expect("failed to run the tapectl binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "unit discover should exit 0 on a merely-missing watch root \
+         (advisory, not fatal); stdout: {stdout:?}, stderr: {stderr:?}"
+    );
+
+    // stdout: valid, uncorrupted JSON. This is the exact property a
+    // --json consumer depends on.
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"));
+    assert!(
+        parsed.get("created").is_some(),
+        "unexpected JSON shape on stdout: {parsed}"
+    );
+    assert!(
+        !stdout.contains("watch root"),
+        "warning text leaked onto stdout, corrupting --json output: {stdout:?}"
+    );
+
+    // stderr: the tracing::warn! from src/unit/discovery.rs, emitted at
+    // default (non-verbose) verbosity — proves both that WARN-level
+    // surfaces without --verbose, and that it landed on stderr.
+    assert!(
+        stderr.contains("watch root does not exist"),
+        "expected the discovery warning on stderr, got: {stderr:?}"
+    );
+}

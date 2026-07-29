@@ -9,11 +9,43 @@ use config::{Config, TapectlPaths};
 fn main() {
     let cli = Cli::parse();
 
+    init_tracing(cli.verbose);
     signal::install_handler();
 
     if let Err(err) = run(cli) {
         error::exit_with_error(&err);
     }
+}
+
+/// Install the global tracing subscriber (issue #45/H10 — closes the "no
+/// sink" gap: `grep -rn tracing_subscriber` returned zero hits before this,
+/// so every `tracing::warn!`/`info!` call in the codebase, including #32's
+/// and #36's, went nowhere).
+///
+/// Writes to **stderr**, never stdout: every command's `--json` mode prints
+/// machine-readable output to stdout, and `scripts/mhvtl-verify-gate.sh`
+/// pipes `volume verify --json` straight into `tee` + a JSON parser under
+/// `pipefail` — a log line on stdout would corrupt that stream for every
+/// consumer.
+///
+/// Default level is WARN, so the existing warn!-only fixes surface without
+/// burying a command's own output; `--verbose` raises it to DEBUG (closes
+/// #3's "`--verbose` parsed but ignored").
+///
+/// Non-fatal by design: `try_init` (not `init`) so a failed or repeated
+/// install — e.g. this binary embedded in a future test harness that
+/// already set a subscriber — is silently ignored rather than panicking a
+/// command that would otherwise work fine.
+fn init_tracing(verbose: bool) {
+    let level = if verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 /// Flush stdout, then exit with `code` if it is non-zero (issue #45/H10).
