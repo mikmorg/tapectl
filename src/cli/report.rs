@@ -160,11 +160,21 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
     let min_copies = config.defaults.min_copies_for_tape_only as i64;
     let mut risks: Vec<serde_json::Value> = Vec::new();
 
-    // Units with fewer copies than min_copies
-    let mut stmt = conn.prepare(
+    // Units with fewer copies than min_copies. ADR-0004 (issue #89): a
+    // non-sealed volume's write must not count, but this query LEFT JOINs
+    // volumes to preserve units with zero writes (so they still surface
+    // with copies=0 rather than vanishing from the result) — putting the
+    // predicate in the JOIN's ON clause wouldn't work, since
+    // `COUNT(DISTINCT w.volume_id)` reads from the `writes` row, which
+    // stays non-NULL even when the volumes join fails to match. Wrapping
+    // it in a CASE instead correctly nulls out (and so excludes from
+    // COUNT DISTINCT) exactly the non-sealed writes, while leaving a
+    // unit with no writes at all still NULL -> copies=0, same as before.
+    let sealed = crate::policy::coverage::eligible("v");
+    let sql = format!(
         "SELECT u.name, u.status,
-                COUNT(DISTINCT w.volume_id) as copies,
-                COUNT(DISTINCT v.location_id) as locations
+                COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END) as copies,
+                COUNT(DISTINCT CASE WHEN {sealed} THEN v.location_id END) as locations
          FROM units u
          LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
          LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
@@ -172,8 +182,9 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
          LEFT JOIN volumes v ON v.id = w.volume_id
          WHERE u.status = 'active'
          GROUP BY u.id
-         HAVING copies < ?1 OR copies = 0",
-    )?;
+         HAVING copies < ?1 OR copies = 0"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let at_risk: Vec<(String, String, i64, i64)> = stmt
         .query_map(params![min_copies], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -208,18 +219,35 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
     Ok(())
 }
 
-fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
-    let mut sql = String::from(
+/// Per-unit `(name, copies, locations, volume_labels)` rows behind `report
+/// copies`, split out from the printing so the computed counts are
+/// directly assertable in tests without capturing stdout (same pattern as
+/// `dirty_rows` above `report_dirty`).
+///
+/// `pub(crate)` so `cli::operations`'s tests can call this directly
+/// against the same fixture a gate is tested with, proving `report
+/// copies` and the gates agree on the count — see
+/// `cli::audit::copy_count_for_unit`'s doc comment for why that
+/// cross-file equality is worth proving explicitly.
+///
+/// Routes copies/locations/volume-labels all through the shared ADR-0004
+/// predicate: see the comment in `report_fire_risk` above for why it must
+/// be a `CASE` inside the aggregate rather than a join condition.
+pub(crate) type CopyRow = (String, i64, i64, Option<String>);
+
+pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<CopyRow>> {
+    let sealed = crate::policy::coverage::eligible("v");
+    let mut sql = format!(
         "SELECT u.name,
-                COUNT(DISTINCT w.volume_id) as copies,
-                COUNT(DISTINCT v.location_id) as locations,
-                GROUP_CONCAT(DISTINCT v.label) as volumes
+                COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END) as copies,
+                COUNT(DISTINCT CASE WHEN {sealed} THEN v.location_id END) as locations,
+                GROUP_CONCAT(DISTINCT CASE WHEN {sealed} THEN v.label END) as volumes
          FROM units u
          LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
          LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
          LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
          LEFT JOIN volumes v ON v.id = w.volume_id
-         WHERE u.status IN ('active', 'tape_only')",
+         WHERE u.status IN ('active', 'tape_only')"
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(name) = unit_filter {
@@ -231,11 +259,16 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(String, i64, i64, Option<String>)> = stmt
+    let rows: Vec<CopyRow> = stmt
         .query_map(params_ref.as_slice(), |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+    let rows = copies_rows(conn, unit_filter)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
@@ -257,16 +290,21 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
 }
 
 fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
-    let mut sql = String::from(
+    // Same ADR-0004 CASE-in-aggregate treatment as `report_fire_risk` and
+    // `copies_rows` above (issue #89): the volumes LEFT JOIN must stay a
+    // LEFT JOIN (to keep tape-only units with zero eligible copies in the
+    // result), so the predicate goes inside the aggregate, not the join.
+    let sealed = crate::policy::coverage::eligible("v");
+    let mut sql = format!(
         "SELECT u.name,
-                COUNT(DISTINCT w.volume_id) as copies,
-                COUNT(DISTINCT v.location_id) as locations
+                COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END) as copies,
+                COUNT(DISTINCT CASE WHEN {sealed} THEN v.location_id END) as locations
          FROM units u
          LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
          LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
          LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
          LEFT JOIN volumes v ON v.id = w.volume_id
-         WHERE u.status = 'tape_only'",
+         WHERE u.status = 'tape_only'"
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(name) = unit_filter {
@@ -904,5 +942,165 @@ mod tests {
         let conn = setup_two_units(&root);
         report_dirty(&conn, None, false).expect("plain output must succeed");
         report_dirty(&conn, Some("clean_unit"), true).expect("json output must succeed");
+    }
+
+    /// Issue #89 / ADR-0004: `copies_rows` must re-qualify eligibility at
+    /// USE time via the shared `policy::coverage::eligible` predicate, the
+    /// same rule the gates (`unit mark-tape-only`, `snapshot
+    /// mark-reclaimable`) apply — see that function's doc comment and
+    /// `report_fire_risk`'s inline comment for why the predicate has to
+    /// live inside a `CASE` here rather than a join condition (this query
+    /// LEFT JOINs volumes and must keep a zero-copy unit visible).
+    mod adr0004_copy_eligibility {
+        use super::*;
+
+        /// tenant + unit (no `current_path` — this scan never touches
+        /// disk) + one 'current' snapshot + one 'staged' stage_set
+        /// completed-written to two volumes: `{name}-SEALED` (always
+        /// `sealed`) and `{name}-OTHER` (status = `second_volume_status`).
+        /// Mirrors
+        /// `operations::tests::adr0004_copy_eligibility::setup_unit_with_two_volumes`
+        /// and `audit::tests::setup_unit_with_two_volumes` — duplicated
+        /// rather than shared, consistent with this crate's existing
+        /// per-file test-fixture convention.
+        fn setup_unit_with_two_volumes(name: &str, second_volume_status: &str) -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                params![format!("uuid-{name}"), name, tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol1_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol1_id],
+            )
+            .unwrap();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol2_id],
+            )
+            .unwrap();
+
+            conn
+        }
+
+        fn assert_copies_rows_excludes_status(status: &str) {
+            let name = format!("rep-{status}");
+            let conn = setup_unit_with_two_volumes(&name, status);
+            let rows = copies_rows(&conn, Some(&name)).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, 1, "a {status} second volume must not count");
+        }
+
+        #[test]
+        fn copies_rows_excludes_a_quarantined_volume() {
+            assert_copies_rows_excludes_status("quarantined");
+        }
+
+        #[test]
+        fn copies_rows_excludes_a_retired_volume() {
+            assert_copies_rows_excludes_status("retired");
+        }
+
+        #[test]
+        fn copies_rows_excludes_an_erased_volume() {
+            assert_copies_rows_excludes_status("erased");
+        }
+
+        #[test]
+        fn copies_rows_excludes_a_missing_volume() {
+            assert_copies_rows_excludes_status("missing");
+        }
+
+        #[test]
+        fn copies_rows_counts_two_sealed_volumes_as_two() {
+            let conn = setup_unit_with_two_volumes("rep-both-sealed", "sealed");
+            let rows = copies_rows(&conn, Some("rep-both-sealed")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].1, 2,
+                "two sealed volumes must both count -- the guard must not false-positive"
+            );
+        }
+
+        #[test]
+        fn copies_rows_volume_label_list_excludes_a_non_sealed_volume() {
+            // The GROUP_CONCAT column must agree with the copies count it
+            // sits next to -- a report line claiming "1 copy" must not
+            // then list two volume labels as if both still counted.
+            let conn = setup_unit_with_two_volumes("rep-label-list", "quarantined");
+            let rows = copies_rows(&conn, Some("rep-label-list")).unwrap();
+            assert_eq!(rows.len(), 1);
+            let volumes = rows[0].3.as_deref().unwrap_or("");
+            assert!(
+                volumes.contains("rep-label-list-SEALED"),
+                "the sealed volume must still be listed: {volumes}"
+            );
+            assert!(
+                !volumes.contains("rep-label-list-OTHER"),
+                "the quarantined volume must not be listed: {volumes}"
+            );
+        }
+
+        #[test]
+        fn report_copies_and_report_fire_risk_run_end_to_end_without_panicking() {
+            // report_fire_risk shares the same CASE-in-aggregate fix but
+            // has no extracted rows function to unit-test directly (it
+            // filters units below min_copies rather than listing them
+            // all) -- this at least exercises it end-to-end over a
+            // fixture with a disqualified copy, so a regression that
+            // makes the query itself invalid (bad SQL, wrong arity) is
+            // still caught.
+            let conn = setup_unit_with_two_volumes("rep-e2e", "quarantined");
+            let config = Config::default();
+            report_copies(&conn, Some("rep-e2e"), false).expect("plain output must succeed");
+            report_copies(&conn, Some("rep-e2e"), true).expect("json output must succeed");
+            report_fire_risk(&conn, &config, false).expect("fire-risk plain output must succeed");
+            report_tape_only(&conn, Some("rep-e2e"), false)
+                .expect("tape-only plain output must succeed");
+        }
     }
 }

@@ -27,16 +27,11 @@ pub fn run(
     for unit in &units {
         let resolved = policy::resolve(conn, config, unit);
 
-        // Check copy count
-        let copy_count: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT w.volume_id)
-             FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'",
-            params![unit.id],
-            |row| row.get(0),
-        )?;
+        // Check copy count. Routes through the same ADR-0004 eligibility
+        // predicate (issue #89) the gates use, so `audit` and `unit
+        // mark-tape-only`/`snapshot mark-reclaimable` can never disagree
+        // about how many copies a unit has.
+        let copy_count = copy_count_for_unit(conn, unit.id)?;
 
         if copy_count < resolved.min_copies as i64 {
             violations.push(AuditFinding {
@@ -51,17 +46,7 @@ pub fn run(
         }
 
         // Check location presence
-        let location_count: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT v.location_id)
-             FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             JOIN volumes v ON v.id = w.volume_id
-             WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
-               AND v.location_id IS NOT NULL",
-            params![unit.id],
-            |row| row.get(0),
-        )?;
+        let location_count = location_count_for_unit(conn, unit.id)?;
 
         if !resolved.required_locations.is_empty() {
             let needed = resolved.required_locations.len() as i64;
@@ -235,6 +220,48 @@ pub fn run(
     Ok(exit_code)
 }
 
+/// A unit's current copy count for `audit`'s `copy_count` check.
+///
+/// `pub(crate)` (not private) so `cli::operations`' tests can call this
+/// directly against the same fixture a gate (`unit mark-tape-only`,
+/// `snapshot mark-reclaimable`) is tested with, proving `audit` and the
+/// gates agree on the number rather than merely asserting each in
+/// isolation — that equality is the property issue #89 exists to
+/// establish.
+///
+/// Routes through the shared ADR-0004 predicate
+/// (`policy::coverage::eligible`): a write's own `status = 'completed'`
+/// only proves its volume was sealed at write time, not that it still is.
+pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(DISTINCT w.volume_id)
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed' AND {}",
+        crate::policy::coverage::eligible("v")
+    );
+    Ok(conn.query_row(&sql, params![unit_id], |row| row.get(0))?)
+}
+
+/// A unit's current distinct-location count for `audit`'s
+/// `location_presence` check. Same ADR-0004 routing as
+/// [`copy_count_for_unit`] and for the same reason.
+pub(crate) fn location_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(DISTINCT v.location_id)
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+           AND v.location_id IS NOT NULL AND {}",
+        crate::policy::coverage::eligible("v")
+    );
+    Ok(conn.query_row(&sql, params![unit_id], |row| row.get(0))?)
+}
+
 struct AuditFinding {
     unit: String,
     check: String,
@@ -250,4 +277,167 @@ fn finding_json(f: &AuditFinding, severity: &str) -> serde_json::Value {
         "message": f.message,
         "action": f.action,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Issue #89 / ADR-0004: `copy_count_for_unit`/`location_count_for_unit`
+    //! must re-qualify eligibility at USE time via the shared
+    //! `policy::coverage::eligible` predicate, not trust `writes.status =
+    //! 'completed'` alone -- see the doc comments on those two functions
+    //! above for why. `audit` had no test module at all before this
+    //! change; these tests cover both the extracted per-unit helpers and
+    //! one full `run()` pass proving the violation actually surfaces.
+    use super::*;
+
+    /// tenant + unit (no `current_path` — `audit::run` never touches disk
+    /// for this check) + one 'current' snapshot + one 'staged' stage_set
+    /// completed-written to two volumes: `{name}-SEALED` (always
+    /// `sealed`) and `{name}-OTHER` (status = `second_volume_status`).
+    /// Returns (conn, unit_id). Mirrors
+    /// `operations::tests::adr0004_copy_eligibility::setup_unit_with_two_volumes`
+    /// — duplicated rather than shared across files, consistent with this
+    /// crate's existing per-file test-fixture convention.
+    fn setup_unit_with_two_volumes(name: &str, second_volume_status: &str) -> (Connection, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+            params![format!("uuid-{name}"), name, tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+
+        conn.execute(
+            &format!(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('{name}-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+            ),
+            [],
+        )
+        .unwrap();
+        let vol1_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, vol1_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            &format!(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+            ),
+            [],
+        )
+        .unwrap();
+        let vol2_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, vol2_id],
+        )
+        .unwrap();
+
+        (conn, unit_id)
+    }
+
+    fn assert_copy_count_excludes_status(status: &str) {
+        let (conn, unit_id) = setup_unit_with_two_volumes(&format!("audit-{status}"), status);
+        let count = copy_count_for_unit(&conn, unit_id).unwrap();
+        assert_eq!(count, 1, "a {status} second volume must not count");
+    }
+
+    #[test]
+    fn copy_count_excludes_a_quarantined_volume() {
+        assert_copy_count_excludes_status("quarantined");
+    }
+
+    #[test]
+    fn copy_count_excludes_a_retired_volume() {
+        assert_copy_count_excludes_status("retired");
+    }
+
+    #[test]
+    fn copy_count_excludes_an_erased_volume() {
+        assert_copy_count_excludes_status("erased");
+    }
+
+    #[test]
+    fn copy_count_excludes_a_missing_volume() {
+        assert_copy_count_excludes_status("missing");
+    }
+
+    #[test]
+    fn copy_count_counts_two_sealed_volumes_as_two() {
+        let (conn, unit_id) = setup_unit_with_two_volumes("audit-both-sealed", "sealed");
+        let count = copy_count_for_unit(&conn, unit_id).unwrap();
+        assert_eq!(count, 2, "two sealed volumes must both count");
+    }
+
+    #[test]
+    fn location_count_ignores_a_quarantined_volume_even_with_a_location_set() {
+        let (conn, unit_id) = setup_unit_with_two_volumes("audit-loc-quar", "quarantined");
+        conn.execute(
+            "INSERT INTO locations (name) VALUES ('home'), ('offsite')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'home')
+             WHERE label = 'audit-loc-quar-SEALED'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'offsite')
+             WHERE label = 'audit-loc-quar-OTHER'",
+            [],
+        )
+        .unwrap();
+
+        let count = location_count_for_unit(&conn, unit_id).unwrap();
+        assert_eq!(
+            count, 1,
+            "a quarantined volume's location must not count, even though location_id is set"
+        );
+    }
+
+    /// End-to-end: a unit whose only eligible copy sits on a quarantined
+    /// volume must surface as a real `copy_count` VIOLATION through the
+    /// full `audit::run` pipeline, not just through the extracted helper
+    /// in isolation — this is the silent-failure scenario issue #89
+    /// describes (quarantine is entered automatically at contact, with no
+    /// operator decision, so `audit` is the one surface that can catch it
+    /// after the fact).
+    #[test]
+    fn run_reports_a_violation_when_the_only_other_copy_is_quarantined() {
+        let (conn, _unit_id) = setup_unit_with_two_volumes("audit-e2e", "quarantined");
+        let config = Config::default();
+        let exit_code = run(&conn, &config, Some("audit-e2e"), false, false).unwrap();
+        assert_eq!(
+            exit_code, 2,
+            "a unit with only 1 eligible copy (min_copies=2 default) must be a violation, not clean"
+        );
+    }
 }
