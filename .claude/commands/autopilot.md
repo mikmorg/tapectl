@@ -19,16 +19,19 @@ the normative design set named in the Policy block below.
 - **Mode: phase-2 hardening (from 2026-07-28).** R&D has exited: the v2 regear
   is merged to master and the design docs are settled reference, not fluid.
   Issue work is live again — re-spec, close, and file as needed.
-- **Queue:** **#27 first** (phase 1, re-spec'd 2026-07-28) — the fresh-write
-  path has no contact discipline, so loading the wrong or an already-sealed
-  cartridge and running `volume init` silently overwrites it. Silent data loss
-  outranks everything; #25's CLI-resume wiring shares the same orchestration
-  seam and follows it. Then open `phase:2`: **highs first** (#32, #33, #34,
-  #35, #36, #38, #69), then mediums. **Among phase-2, #35 leads** — staging still
-  buffers whole slices (`fs::read(slice_path)` + `encrypt_data`), so at the
-  ratified 10 G slice size it needs ~20 G RAM on a 7 G machine. Nothing else
-  goes in front of it. Exit: phase 2 empty AND the gate's EXPECTED_FAIL
-  manifest empty. Skip `epic`-labeled issues, `wontfix`, `needs-human`.
+- **Queue (updated 2026-07-29):** open `phase:2`, **highs first** — remaining:
+  **#34** (slice numbering), **#33** (symlinks), **#36** (dirty detection),
+  **#38** (destructive consent). Then the 26 mediums. **#69 (Heir Kit) is
+  deferred by CTO decision** — it has a physical step (printing, tamper-evident
+  envelopes) no agent can perform; skip it. **Take #34 and #33 first**: they are
+  the two `EXPECTED_FAIL` entries, so clearing them empties the gate manifest,
+  which is the stated phase-2 exit criterion. Skip `epic`-labeled issues,
+  `wontfix`, `needs-human`.
+  *Landed and closed:* #27 (contact discipline), #35/#84/#85/#86 (the whole H9
+  streaming class — staging encrypt, source validate, restore, confirm +
+  compaction), #32 (bitrot commitment point). #25's CLI-resume wiring remains
+  open and unqueued — resume mechanics are built and tested but unreachable
+  from any CLI path.
 - **Issues predate the v2 regear** — every one was written against the old
   write path. Read them against the normative set below, never literally; a
   re-triage pass has re-spec'd them, but if an issue still contradicts the
@@ -116,11 +119,11 @@ re-litigated), then implement.
 
 ## Stopping the loop
 
-Stop (end the /loop, not just the iteration) when: the playbook is complete
-through T10; or every remaining task is blocked on a CTO decision and the
+Stop (end the /loop, not just the iteration) when: the phase-2 queue is empty
+AND the gate's EXPECTED_FAIL manifest is empty; or every remaining task is blocked on a CTO decision and the
 batch has been surfaced; or two consecutive iterations ended in escalation
-with nothing landed. **Always stop before T11 (close-out)** — R&D exit,
-merging to master, and pushing are CTO calls.
+with nothing landed. **Stop before any first production write** — that, the LTO-6 hardware session,
+and #69's physical Heir Kit step are CTO calls, not autopilot's.
 
 Before stopping: post a summary (landed with SHAs, decisions pending with
 their options, residuals accepted and why), update the memory checkpoint, send
@@ -135,5 +138,7 @@ design notes to make an implementation fit — if the code cannot satisfy the
 spec, the spec wins and the mismatch is a CTO escalation (the one exception:
 the spec is *demonstrably* wrong, in which case fix the doc FIRST, in its own
 commit, with the evidence in the message). Never run the tapectl binary
-against the real `~/.tapectl` — temp homes only. Never push, never merge to
-master, never file issues while in R&D mode.
+against the real `~/.tapectl` — temp homes only. (R&D mode has exited: pushing
+master after a verified land, and filing issues for real findings, are now
+expected — see the Integration authority and Mode lines above. This sentence
+previously forbade both and contradicted them.)
