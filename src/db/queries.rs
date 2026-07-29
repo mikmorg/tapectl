@@ -285,21 +285,89 @@ pub fn recipient_list_with_escrow(conn: &Connection, mut base: Vec<String>) -> R
     Ok(base)
 }
 
+// ── Archive Sets (issue #48) ──
+
+/// Look up an archive set's id by name. `Ok(None)` means no such archive
+/// set exists — callers that must reject an unknown name outright (`unit
+/// init --archive-set`, `unit discover`) go through [`resolve_archive_set`]
+/// instead, which wraps this with validation and a helpful error.
+pub fn get_archive_set_id_by_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM archive_sets WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Every archive set name currently defined, alphabetically — used to hint
+/// an operator who mistyped `--archive-set` in [`resolve_archive_set`]'s
+/// error message.
+pub fn list_archive_set_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM archive_sets ORDER BY name")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row?);
+    }
+    Ok(names)
+}
+
+/// Resolve an optional `--archive-set` name to its id, validating existence.
+///
+/// `None` in always resolves to `Ok(None)` — a unit with no archive set is
+/// the common case and must keep working exactly as before (issue #48).
+/// `Some(name)` in must name a real row, or this errors naming the unknown
+/// set and (when any are defined) listing the known ones — a typo must
+/// never be silently accepted and left permanently inert, which is exactly
+/// the failure mode issue #48 diagnosed for `units.archive_set_id`.
+pub fn resolve_archive_set(conn: &Connection, name: Option<&str>) -> Result<Option<i64>> {
+    let name = match name {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    match get_archive_set_id_by_name(conn, name)? {
+        Some(id) => Ok(Some(id)),
+        None => {
+            let known = list_archive_set_names(conn)?;
+            let hint = if known.is_empty() {
+                " (no archive sets are defined yet — see `tapectl archive-set create`)".to_string()
+            } else {
+                format!(" (known archive sets: {})", known.join(", "))
+            };
+            Err(crate::error::TapectlError::Other(format!(
+                "unknown archive set \"{name}\"{hint}"
+            )))
+        }
+    }
+}
+
 // ── Units ──
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_unit(
     conn: &Connection,
     uuid: &str,
     name: &str,
     tenant_id: i64,
+    archive_set_id: Option<i64>,
     current_path: &str,
     checksum_mode: &str,
     encrypt: bool,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![uuid, name, tenant_id, current_path, checksum_mode, encrypt],
+        "INSERT INTO units (uuid, name, tenant_id, archive_set_id, current_path, checksum_mode, encrypt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            uuid,
+            name,
+            tenant_id,
+            archive_set_id,
+            current_path,
+            checksum_mode,
+            encrypt
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -627,6 +695,7 @@ mod tests {
             "u-uuid",
             "origname",
             tid,
+            None,
             "/old/path",
             "mtime_size",
             true,
@@ -666,7 +735,7 @@ mod tests {
     fn add_and_remove_tag_for_unit() {
         let conn = fresh_conn();
         let tid = insert_tenant(&conn, "op", None, true).unwrap();
-        let uid = insert_unit(&conn, "u1", "u1", tid, "/p", "mtime_size", true).unwrap();
+        let uid = insert_unit(&conn, "u1", "u1", tid, None, "/p", "mtime_size", true).unwrap();
 
         add_tag_to_unit(&conn, uid, "media").unwrap();
         add_tag_to_unit(&conn, uid, "media").unwrap(); // idempotent via INSERT OR IGNORE
@@ -683,8 +752,8 @@ mod tests {
     fn count_active_units_for_tenant_counts_only_active() {
         let conn = fresh_conn();
         let tid = insert_tenant(&conn, "op", None, true).unwrap();
-        insert_unit(&conn, "u1", "u1", tid, "/a", "mtime_size", true).unwrap();
-        insert_unit(&conn, "u2", "u2", tid, "/b", "mtime_size", true).unwrap();
+        insert_unit(&conn, "u1", "u1", tid, None, "/a", "mtime_size", true).unwrap();
+        insert_unit(&conn, "u2", "u2", tid, None, "/b", "mtime_size", true).unwrap();
         // Mark one retired
         conn.execute("UPDATE units SET status='retired' WHERE name='u2'", [])
             .unwrap();
@@ -695,7 +764,17 @@ mod tests {
     fn check_nesting_conflict_detects_parent_and_child() {
         let conn = fresh_conn();
         let tid = insert_tenant(&conn, "op", None, true).unwrap();
-        insert_unit(&conn, "u1", "u1", tid, "/data/photos", "mtime_size", true).unwrap();
+        insert_unit(
+            &conn,
+            "u1",
+            "u1",
+            tid,
+            None,
+            "/data/photos",
+            "mtime_size",
+            true,
+        )
+        .unwrap();
 
         // Child-of-existing
         assert!(check_nesting_conflict(&conn, "/data/photos/2024")

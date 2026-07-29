@@ -42,6 +42,13 @@ pub fn init_unit(
     // Resolve tenant
     let tenant = crate::tenant::require_tenant(conn, tenant_name)?;
 
+    // Resolve --archive-set to an id, validating it exists (issue #48): a
+    // typo'd or nonexistent name must never be silently accepted and then
+    // sit permanently inert as a NULL `archive_set_id` — the exact bug this
+    // issue diagnosed. `None` (no --archive-set given) always resolves
+    // cleanly to `None`, the common case.
+    let archive_set_id = queries::resolve_archive_set(conn, archive_set)?;
+
     // Auto-name from path or use override
     let unit_name = if let Some(name) = name_override {
         name.to_string()
@@ -62,6 +69,7 @@ pub fn init_unit(
         &uuid,
         &unit_name,
         tenant.id,
+        archive_set_id,
         &abs_str,
         "mtime_size",
         true,
@@ -208,5 +216,146 @@ mod tests {
     #[test]
     fn test_auto_name_other() {
         assert_eq!(auto_name_from_path("/home/user/data"), "home/user/data");
+    }
+
+    // ── archive_set_id wiring (issue #48) ──
+
+    fn harness() -> (Connection, tempfile::TempDir, TapectlPaths) {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        (conn, tmp, paths)
+    }
+
+    /// The end-to-end proof issue #48 asks for: a unit created with
+    /// `--archive-set X` must have `archive_set_id` actually persisted (not
+    /// just written to the dotfile, which is all that happened before this
+    /// fix), and `policy::resolve` must then return X's values instead of
+    /// silently falling back to the global defaults it would use forever
+    /// if `archive_set_id` stayed NULL.
+    ///
+    /// Deliberately asserts on `min_copies`/`required_locations`, not
+    /// `compression`/`checksum_mode`: `init_unit`'s dotfile always carries
+    /// concrete values for the latter two (see the design doc's own §2.2
+    /// example dotfile), and `policy::resolve`'s dotfile layer outranks
+    /// archive_set whenever the dotfile is present — so for a real,
+    /// dotfile-backed unit those two fields are structurally shadowed
+    /// regardless of this fix. That is a separate, pre-existing defect
+    /// (the dotfile *writer* baking in what looks like a per-unit
+    /// override that was never actually chosen), not something #48 claims
+    /// to fix — see the commit message / final report for the full
+    /// analysis. `min_copies` and `required_locations` are never written
+    /// into the dotfile, so they resolve through archive_set exactly as
+    /// designed and are the correct fields to prove this wiring on.
+    #[test]
+    fn init_unit_with_archive_set_persists_id_and_unlocks_policy_layer_2() {
+        let (conn, tmp, paths) = harness();
+        conn.execute(
+            "INSERT INTO archive_sets (name, min_copies, required_locations) \
+             VALUES ('cold', 5, '[\"vault\"]')",
+            [],
+        )
+        .unwrap();
+
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let unit_id = init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            Some("cold"),
+        )
+        .unwrap();
+
+        let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+        assert_eq!(unit.id, unit_id);
+        assert!(
+            unit.archive_set_id.is_some(),
+            "archive_set_id must be persisted to the DB, not left NULL"
+        );
+
+        let config = crate::config::Config::default();
+        let resolved = crate::policy::resolve(&conn, &config, &unit);
+        assert_eq!(
+            resolved.min_copies, 5,
+            "must resolve the archive_set's min_copies, not the global default (2)"
+        );
+        assert_eq!(
+            resolved.required_locations,
+            vec!["vault".to_string()],
+            "must resolve the archive_set's required_locations, not the global default (empty)"
+        );
+    }
+
+    /// Issue #48 item 2: a typo'd or nonexistent `--archive-set` name must
+    /// never be silently accepted and left permanently inert — it must
+    /// fail loudly, naming the unknown set, and the unit must not be
+    /// created at all (no partial/incorrect state).
+    #[test]
+    fn init_unit_rejects_unknown_archive_set() {
+        let (conn, tmp, paths) = harness();
+
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let err = init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            Some("nonexistent"),
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent"),
+            "error must name the unknown archive set, got: {msg}"
+        );
+        assert!(
+            queries::get_unit_by_name(&conn, "unit1").unwrap().is_none(),
+            "no unit row should be created when --archive-set is invalid"
+        );
+    }
+
+    /// The common case, and issue #48's own explicit "do NOT break this"
+    /// requirement: no `--archive-set` at all must keep resolving cleanly
+    /// to system defaults, completely unaffected by this fix.
+    #[test]
+    fn init_unit_without_archive_set_still_resolves_defaults() {
+        let (conn, tmp, paths) = harness();
+
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let unit_id = init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+        assert_eq!(unit.id, unit_id);
+        assert!(unit.archive_set_id.is_none());
+
+        let config = crate::config::Config::default();
+        let resolved = crate::policy::resolve(&conn, &config, &unit);
+        assert_eq!(resolved.min_copies, 2);
+        assert_eq!(resolved.compression, "none");
     }
 }

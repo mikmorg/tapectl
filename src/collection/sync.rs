@@ -273,11 +273,18 @@ fn resolve_existing(
 fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -> Result<()> {
     let tenant = queries::get_tenant_by_name(conn, &df.tenant)?
         .ok_or_else(|| TapectlError::TenantNotFound(df.tenant.clone()))?;
+    // NOTE (issue #48 scope boundary): `df.archive_set` is available here
+    // too, but wiring the Collection layer's own archive_set adoption is
+    // out of this fix's assigned scope (`src/collection/` is not among the
+    // owned files for #48/#47) — passing `None` preserves exactly the
+    // behavior this call site already had (archive_set_id always NULL)
+    // before `insert_unit` gained this parameter. Flagged, not fixed.
     let unit_id = queries::insert_unit(
         conn,
         &df.uuid,
         &df.name,
         tenant.id,
+        None,
         dir_path,
         &df.checksum_mode,
         true,
@@ -305,7 +312,20 @@ fn insert_path_keyed_unit(
         return Err(TapectlError::UnitAlreadyExists(name));
     }
     let uuid = uuid::Uuid::new_v4().to_string();
-    let unit_id = queries::insert_unit(conn, &uuid, &name, tenant.id, abs_str, "mtime_size", true)?;
+    // Same scope-boundary note as `adopt_dotfile` above: `lib.archive_set`
+    // is available here too (path-keyed units have no dotfile to read it
+    // from, but the CollectionConfig itself carries it), and leaving it
+    // unwired is flagged, not fixed, for the same out-of-scope reason.
+    let unit_id = queries::insert_unit(
+        conn,
+        &uuid,
+        &name,
+        tenant.id,
+        None,
+        abs_str,
+        "mtime_size",
+        true,
+    )?;
     events::log_created(conn, "unit", unit_id, &name, Some(tenant.id))?;
     Ok(())
 }
