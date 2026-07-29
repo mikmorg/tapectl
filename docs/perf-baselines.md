@@ -8,7 +8,7 @@ slowdown between runs means something changed.
 
 ```bash
 TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
-    --nocapture --test-threads=1
+    --ignored --nocapture --test-threads=1
 ```
 
 Scenarios run disk-side only (no tape hardware). The design document's

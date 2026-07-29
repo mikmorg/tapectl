@@ -178,7 +178,7 @@ TAPECTL_MHVTL=1 cargo test --test mhvtl_e2e -- --ignored --nocapture
 # Performance scenarios (many files, many units, large file).
 # Gated because a full run takes ~2 minutes.
 TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
-    --nocapture --test-threads=1
+    --ignored --nocapture --test-threads=1
 ```
 
 ## Documentation

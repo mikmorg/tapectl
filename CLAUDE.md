@@ -125,7 +125,8 @@ TAPECTL_MHVTL=1 cargo test --test mhvtl_e2e -- --ignored --nocapture
 
 # Performance scenarios (thousands of files, large archives); ~2 min. This is the one
 # case a release build is expected.
-TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- --nocapture --test-threads=1
+TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
+    --ignored --nocapture --test-threads=1
 ```
 
 ## Architecture

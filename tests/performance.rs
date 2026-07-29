@@ -109,6 +109,7 @@ fn report(scenario: &str, detail: &str, elapsed: Duration) {
 /// Many small files in one unit — stresses filesystem walk, per-file sha256,
 /// dar's file-count scaling, and the manifest-insert transaction path.
 #[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_many_files_single_unit() {
     if !perf_enabled() {
         eprintln!("skip: TAPECTL_PERF_TESTS not set");
@@ -165,6 +166,7 @@ fn perf_many_files_single_unit() {
 /// Many units in the database — stresses catalog/audit queries whose cost
 /// scales with the unit count. No staging, no tape. Pure DB access path.
 #[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_many_units_audit() {
     if !perf_enabled() {
         eprintln!("skip: TAPECTL_PERF_TESTS not set");
@@ -250,6 +252,7 @@ fn perf_many_units_audit() {
 /// One large file in a unit — stresses streaming sha256, dar single-slice
 /// path, and age encryption throughput.
 #[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_large_single_file() {
     if !perf_enabled() {
         eprintln!("skip: TAPECTL_PERF_TESTS not set");
