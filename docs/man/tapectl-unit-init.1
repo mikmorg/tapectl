@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-unit-init 1  "tapectl-unit-init " 
+.SH NAME
+tapectl\-unit\-init \- Initialize a directory as an archival unit
+.SH SYNOPSIS
+\fBtapectl unit init\fR [\fB\-\-json\fR] <\fB\-\-tenant\fR> [\fB\-\-dry\-run\fR] [\fB\-\-name\fR] [\fB\-t\fR|\fB\-\-tag\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-archive\-set\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
+.SH DESCRIPTION
+Initialize a directory as an archival unit
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-tenant\fR \fI<TENANT>\fR
+Tenant name
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-name\fR \fI<NAME>\fR
+Override auto\-generated name
+.TP
+\fB\-t\fR, \fB\-\-tag\fR \fI<TAG>\fR
+Tags to apply
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-archive\-set\fR \fI<ARCHIVE_SET>\fR
+Archive set name
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPATH\fR>
+Path to directory

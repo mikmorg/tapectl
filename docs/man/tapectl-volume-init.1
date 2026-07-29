@@ -1,0 +1,37 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-init 1  "tapectl-volume-init " 
+.SH NAME
+tapectl\-volume\-init \- Initialize a new volume (write ID thunk to tape)
+.SH SYNOPSIS
+\fBtapectl volume init\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+.SH DESCRIPTION
+Initialize a new volume (write ID thunk to tape)
+.SH OPTIONS
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
+Tape device path
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-force\fR
+Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape). Refused by default (issue #27) — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR\-0003): bulk\-erase the physical tape and run `cartridge mark\-erased` first for that case
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fILABEL\fR>
+Volume label (e.g., L6\-0001)

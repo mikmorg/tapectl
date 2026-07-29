@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-key-generate 1  "tapectl-key-generate " 
+.SH NAME
+tapectl\-key\-generate \- Generate a new keypair for a tenant, or the permanent escrow recipient with \-\-escrow (ADR\-0005)
+.SH SYNOPSIS
+\fBtapectl key generate\fR [\fB\-\-json\fR] [\fB\-\-tenant\fR] [\fB\-\-alias\fR] [\fB\-\-dry\-run\fR] [\fB\-\-key\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-description\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-escrow\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Generate a new keypair for a tenant, or the permanent escrow recipient with \-\-escrow (ADR\-0005)
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-tenant\fR \fI<TENANT>\fR
+Tenant name (required unless \-\-escrow)
+.TP
+\fB\-\-alias\fR \fI<ALIAS>\fR
+Key alias (e.g., "primary", "backup", "2026") (required unless \-\-escrow)
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-key\-type\fR \fI<KEY_TYPE>\fR [default: primary]
+Key type
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+Description
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-\-escrow\fR
+Generate the permanent escrow recipient identity instead of a per\-tenant key (ADR\-0005). Prints the secret exactly once, for paper transcription — tapectl never stores it. Refuses if an escrow identity is already registered; there is only ever one, for the life of the archive
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

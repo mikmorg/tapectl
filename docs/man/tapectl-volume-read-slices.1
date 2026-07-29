@@ -1,0 +1,37 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-read-slices 1  "tapectl-volume-read-slices " 
+.SH NAME
+tapectl\-volume\-read\-slices \- Read encrypted slices from a volume into staging (then use `volume write` to write them)
+.SH SYNOPSIS
+\fBtapectl volume read\-slices\fR <\fB\-\-from\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Read encrypted slices from a volume into staging (then use `volume write` to write them)
+.SH OPTIONS
+.TP
+\fB\-\-from\fR \fI<FROM>\fR
+Source volume label
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-unit\fR \fI<UNIT>\fR
+Unit name to read
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
+Tape device path
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

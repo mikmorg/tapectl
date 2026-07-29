@@ -1,0 +1,65 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-archive-set-create 1  "tapectl-archive-set-create " 
+.SH NAME
+tapectl\-archive\-set\-create \- Create a new archive set policy
+.SH SYNOPSIS
+\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+.SH DESCRIPTION
+Create a new archive set policy
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-min\-copies\fR \fI<MIN_COPIES>\fR
+Minimum copy count
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-required\-locations\fR \fI<REQUIRED_LOCATIONS>\fR
+Required locations (comma\-separated)
+.TP
+\fB\-\-encrypt\fR \fI<ENCRYPT>\fR
+Encryption enabled
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+true
+.IP \(bu 2
+false
+.RE
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-compression\fR \fI<COMPRESSION>\fR
+Compression mode
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-checksum\-mode\fR \fI<CHECKSUM_MODE>\fR
+Checksum mode
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-\-slice\-size\fR \fI<SLICE_SIZE>\fR
+Slice size (e.g., "2400G")
+.TP
+\fB\-\-verify\-interval\-days\fR \fI<VERIFY_INTERVAL_DAYS>\fR
+Verify interval in days
+.TP
+\fB\-d\fR, \fB\-\-description\fR \fI<DESCRIPTION>\fR
+Description
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fINAME\fR>
+Archive set name

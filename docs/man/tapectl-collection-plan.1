@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-collection-plan 1  "tapectl-collection-plan " 
+.SH NAME
+tapectl\-collection\-plan \- Show the batch plan (alphabetical first\-fit, §7) for every configured collection\*(Aqs pending units
+.SH SYNOPSIS
+\fBtapectl collection plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Show the batch plan (alphabetical first\-fit, §7) for every configured collection\*(Aqs pending units
+.SH OPTIONS
+.TP
+\fB\-\-copies\fR \fI<COPIES>\fR [default: 2]
+Copies to plan for — informational only (batches don\*(Aqt change; this scales the printed cartridge\-count estimate)
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

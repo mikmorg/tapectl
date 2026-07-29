@@ -1,0 +1,40 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-restore-unit 1  "tapectl-restore-unit " 
+.SH NAME
+tapectl\-restore\-unit \- Restore a unit from a volume
+.SH SYNOPSIS
+\fBtapectl restore unit\fR [\fB\-\-json\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Restore a unit from a volume
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-unit\fR \fI<UNIT>\fR
+Unit name
+.TP
+\fB\-\-from\fR \fI<FROM>\fR
+Volume label
+.TP
+\fB\-\-to\fR \fI<TO>\fR
+Destination directory
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
+Tape device
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-\-dry\-run\fR
+Show what would be restored without restoring
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help

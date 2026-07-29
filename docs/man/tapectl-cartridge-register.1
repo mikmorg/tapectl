@@ -1,0 +1,40 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-cartridge-register 1  "tapectl-cartridge-register " 
+.SH NAME
+tapectl\-cartridge\-register \- Register a physical cartridge
+.SH SYNOPSIS
+\fBtapectl cartridge register\fR <\fB\-\-barcode\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-media\-type\fR> [\fB\-\-capacity\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-notes\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Register a physical cartridge
+.SH OPTIONS
+.TP
+\fB\-\-barcode\fR \fI<BARCODE>\fR
+Barcode label
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-media\-type\fR \fI<MEDIA_TYPE>\fR
+Media type (e.g., LTO\-6, LTO\-7, LTO\-8)
+.TP
+\fB\-\-capacity\fR \fI<CAPACITY>\fR [default: 2500G]
+Nominal capacity (e.g., "2500G")
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-notes\fR \fI<NOTES>\fR
+Notes
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
