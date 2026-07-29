@@ -273,18 +273,21 @@ fn resolve_existing(
 fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -> Result<()> {
     let tenant = queries::get_tenant_by_name(conn, &df.tenant)?
         .ok_or_else(|| TapectlError::TenantNotFound(df.tenant.clone()))?;
-    // NOTE (issue #48 scope boundary): `df.archive_set` is available here
-    // too, but wiring the Collection layer's own archive_set adoption is
-    // out of this fix's assigned scope (`src/collection/` is not among the
-    // owned files for #48/#47) — passing `None` preserves exactly the
-    // behavior this call site already had (archive_set_id always NULL)
-    // before `insert_unit` gained this parameter. Flagged, not fixed.
+    // Resolve `df.archive_set` exactly as `unit::discovery::sync_discovered_unit`
+    // does (issue #48 item 3). Both functions adopt a pre-existing dotfile for a
+    // unit not yet in the DB, from the same field — so if only one of them read
+    // it, `unit discover` and `collection sync` would silently disagree about
+    // the same unit's policy depending on which command happened to register it.
+    // A dotfile naming a deleted or hand-edited archive set surfaces as `Err`
+    // here, which the caller treats as a per-unit failure, not a fatal scan.
+    let archive_set_id = queries::resolve_archive_set(conn, df.archive_set.as_deref())?;
+
     let unit_id = queries::insert_unit(
         conn,
         &df.uuid,
         &df.name,
         tenant.id,
-        None,
+        archive_set_id,
         dir_path,
         &df.checksum_mode,
         true,
@@ -312,16 +315,20 @@ fn insert_path_keyed_unit(
         return Err(TapectlError::UnitAlreadyExists(name));
     }
     let uuid = uuid::Uuid::new_v4().to_string();
-    // Same scope-boundary note as `adopt_dotfile` above: `lib.archive_set`
-    // is available here too (path-keyed units have no dotfile to read it
-    // from, but the CollectionConfig itself carries it), and leaving it
-    // unwired is flagged, not fixed, for the same out-of-scope reason.
+    // Path-keyed units have no dotfile to read an archive set from, but the
+    // `CollectionConfig` itself carries one — and `sync_one_directory`'s
+    // dotfile-backed path already passes `lib.archive_set` through to
+    // `init_unit`. Resolving it here too keeps both branches of the same
+    // `collection sync` agreeing about the collection's own configured
+    // policy, rather than silently depending on `dotfiles = true/false`.
+    let archive_set_id = queries::resolve_archive_set(conn, lib.archive_set.as_deref())?;
+
     let unit_id = queries::insert_unit(
         conn,
         &uuid,
         &name,
         tenant.id,
-        None,
+        archive_set_id,
         abs_str,
         "mtime_size",
         true,
@@ -583,5 +590,88 @@ mod tests {
         assert!(queries::get_unit_by_name(&conn, "testlib/alpha")
             .unwrap()
             .is_some());
+    }
+
+    /// Seed an archive set and return its id.
+    fn seed_archive_set(conn: &Connection, name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO archive_sets (name, min_copies) VALUES (?1, 3)",
+            params![name],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn path_keyed_units_inherit_the_collection_s_archive_set() {
+        // A path-keyed unit has no dotfile to read an archive set from, but
+        // the CollectionConfig carries one — and the dotfile-backed branch of
+        // the same `collection sync` already passes it through. If only one
+        // branch resolved it, a collection's configured policy would silently
+        // depend on `dotfiles = true/false`. Issue #48.
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let as_id = seed_archive_set(&conn, "bulk-media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+
+        let mut lib = test_lib(root.path(), "media");
+        lib.dotfiles = false;
+        lib.archive_set = Some("bulk-media".to_string());
+
+        let (_report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        assert!(errors.is_empty(), "sync errors: {errors:?}");
+
+        let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .expect("unit must be registered");
+        assert_eq!(
+            unit.archive_set_id,
+            Some(as_id),
+            "a path-keyed unit must inherit the collection's configured archive set, \
+             or resolver layer 2 stays inert for it"
+        );
+    }
+
+    #[test]
+    fn adopting_an_existing_dotfile_picks_up_its_archive_set() {
+        // `collection sync`'s adopt path and `unit discover`'s not-found
+        // branch read the SAME dotfile field in the SAME scenario. If only
+        // one resolved it, the two commands would silently disagree about a
+        // unit's policy depending on which happened to register it — the
+        // walk-vs-validator failure shape that #33 and #36 both fixed.
+        let conn = db::open_memory().unwrap();
+        let tenant_id = seed_tenant(&conn, "media");
+        let as_id = seed_archive_set(&conn, "bulk-media");
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let df = dotfile::UnitDotfile {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            name: "testlib/alpha".to_string(),
+            created: "2026-07-29T00:00:00Z".to_string(),
+            tags: Vec::new(),
+            tenant: "media".to_string(),
+            archive_set: Some("bulk-media".to_string()),
+            checksum_mode: "mtime_size".to_string(),
+            compression: "none".to_string(),
+            exclude_patterns: Vec::new(),
+        };
+
+        adopt_dotfile(&conn, &df, dir.to_str().unwrap()).unwrap();
+
+        let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .expect("unit must be registered");
+        assert_eq!(unit.tenant_id, tenant_id);
+        assert_eq!(
+            unit.archive_set_id,
+            Some(as_id),
+            "adopt_dotfile must resolve the dotfile's archive_set, exactly as \
+             unit::discovery::sync_discovered_unit does"
+        );
     }
 }
