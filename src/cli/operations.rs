@@ -305,17 +305,35 @@ pub fn unit_mark_tape_only(
         // silently destroy the un-archived changes. Reuses
         // `fingerprint::classify`, the same scan `unit status --dirty` and
         // `report dirty` use, so this can never disagree with them about
-        // whether the unit is dirty. A unit with no snapshot at all
-        // (`PendingReason::New`) is already caught by the copy-count check
-        // above (zero completed writes), so only `Dirty` needs handling
-        // here.
+        // whether the unit is dirty.
+        //
+        // `New` is guarded explicitly rather than left to the copy-count
+        // check above. That check only covers it incidentally: it catches a
+        // never-archived unit because such a unit has zero completed
+        // writes, which fails `copy_count < min_copies`. But
+        // `min_copies_for_tape_only` is operator-configurable, and at 0 the
+        // comparison passes vacuously — so a unit that was NEVER archived
+        // could be marked tape_only, telling the operator it is safe to
+        // delete local data that exists nowhere else. Marking a unit with
+        // no snapshot at all as tape_only is incoherent under any
+        // configuration, so it is refused on its own terms here.
         if let Some(pending) = crate::collection::fingerprint::classify(conn, &unit)? {
-            if pending.reason == crate::collection::fingerprint::PendingReason::Dirty {
-                return Err(TapectlError::Other(format!(
-                    "unit is dirty: on-disk contents changed since the last snapshot — {} \
-                     (use --force to override)",
-                    pending.changes.describe()
-                )));
+            match pending.reason {
+                crate::collection::fingerprint::PendingReason::Dirty => {
+                    return Err(TapectlError::Other(format!(
+                        "unit is dirty: on-disk contents changed since the last snapshot — {} \
+                         (use --force to override)",
+                        pending.changes.describe()
+                    )));
+                }
+                crate::collection::fingerprint::PendingReason::New => {
+                    return Err(TapectlError::Other(
+                        "unit has never been archived: no snapshot exists, so there is no tape \
+                         copy — marking it tape-only would greenlight deleting the only copy \
+                         (use --force to override)"
+                            .to_string(),
+                    ));
+                }
             }
         }
     }
@@ -1143,5 +1161,40 @@ mod tests {
         unit_mark_tape_only(&conn, &config, "unit1", false, false)
             .expect("a clean unit must not be blocked by the new dirty guard");
         assert_eq!(unit_status(&conn), "tape_only");
+    }
+
+    #[test]
+    fn mark_tape_only_refuses_a_never_archived_unit_even_with_zero_min_copies() {
+        // The copy-count check catches a never-archived unit only
+        // INCIDENTALLY: zero completed writes fails `copy_count <
+        // min_copies` at the default of 2. But min_copies_for_tape_only is
+        // operator-configurable, and at 0 that comparison passes vacuously
+        // (0 < 0 is false) — which is exactly what
+        // `config_with_zero_tape_only_thresholds` sets up. Without an
+        // explicit `New` guard, a unit that was never archived would be
+        // marked tape_only, telling the operator it is safe to delete the
+        // ONLY copy of that data.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"never archived").unwrap();
+        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
+        // Deliberately NO snapshot_create — the unit has never been archived.
+
+        let config = config_with_zero_tape_only_thresholds();
+        let err = unit_mark_tape_only(&conn, &config, "unit1", false, false)
+            .expect_err("a never-archived unit must refuse mark-tape-only");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("never been archived"),
+            "error must say the unit was never archived: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "error must mention the override: {msg}"
+        );
+        assert_eq!(
+            unit_status(&conn),
+            "active",
+            "a refused mark-tape-only must not have changed unit status"
+        );
     }
 }

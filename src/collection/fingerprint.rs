@@ -323,7 +323,28 @@ fn hash_diff(
             continue; // never staged — no baseline to compare against.
         };
         let full_path = unit_path.join(&stamp.path);
-        let (actual, _) = crate::staging::validate::hash_source_file(&full_path, &stamp.path)?;
+        // A single unreadable file must NOT abort the scan. `report dirty`
+        // sweeps every unit, so propagating this error would turn one bad
+        // file into "the whole report failed" — a diagnostic command that
+        // refuses to diagnose. The realistic trigger is concrete: migration
+        // 005 backfills every pre-existing row as 'regular' because the
+        // symlink/special distinction was never recorded before #33, so a
+        // legacy row that is really a symlink reaches this line and
+        // `hash_source_file`'s own non-regular guard (#33) rejects it.
+        // Treat an unreadable file as "cannot prove clean" — report it as
+        // modified so it surfaces to the operator, and keep scanning.
+        let actual = match crate::staging::validate::hash_source_file(&full_path, &stamp.path) {
+            Ok((hex, _)) => hex,
+            Err(e) => {
+                tracing::warn!(
+                    path = %stamp.path,
+                    error = %e,
+                    "cannot hash file during dirty scan — reporting as changed"
+                );
+                modified.push(stamp.path.clone());
+                continue;
+            }
+        };
         if &actual != expected {
             modified.push(stamp.path.clone());
         }
@@ -777,6 +798,71 @@ mod tests {
             classify(&conn, &unit).unwrap().is_none(),
             "must stay clean on a second scan too — not perpetually dirty"
         );
+    }
+
+    #[test]
+    fn sha256_mode_reports_an_unreadable_file_instead_of_aborting_the_scan() {
+        // `report dirty` sweeps every unit, so a single unreadable file
+        // must not propagate an error and kill the whole report — a
+        // diagnostic command that refuses to diagnose. It is reported as
+        // changed ("cannot prove clean") and the scan continues.
+        use std::os::unix::fs::PermissionsExt;
+
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let unreadable = tmp.path().join("locked.txt");
+        std::fs::write(&unreadable, b"secret").unwrap();
+
+        let unit_id = seed_unit(&conn, tmp.path());
+        conn.execute(
+            "UPDATE units SET checksum_mode = 'sha256' WHERE id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+
+        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        // snapshot_create leaves sha256 NULL (only staging populates it),
+        // and a NULL baseline is skipped — so give it one, which is what a
+        // previously-staged unit would have.
+        conn.execute(
+            "UPDATE files SET sha256 = 'aa00bb11cc22dd33ee44ff55aa66bb77cc88dd99ee00ff11aa22bb33cc44dd55'
+             WHERE path = 'locked.txt'",
+            [],
+        )
+        .unwrap();
+
+        // Size and mtime are untouched, so the mtime_size fingerprint still
+        // matches and the scan reaches the hash comparison.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&unreadable).is_ok() {
+            // Running as root, where mode 0o000 is not enforced — the
+            // precondition cannot be established, so this proves nothing.
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let pending = classify(&conn, &unit)
+            .expect("an unreadable file must not abort the scan")
+            .expect("the unit must be reported dirty, not silently clean");
+        assert_eq!(pending.reason, PendingReason::Dirty);
+        assert!(
+            pending.changes.modified.contains(&"locked.txt".to_string()),
+            "the unreadable file must be surfaced as changed, got {:?}",
+            pending.changes
+        );
+
+        // Restore so TempDir cleanup can remove it.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
