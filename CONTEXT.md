@@ -92,6 +92,17 @@ unit of coverage in derivations. Seal status decides eligibility; evidence age
 qualifies presentation (warnings at destructive moments) but never eligibility.
 _Avoid_: backup, replica
 
+**Current**:
+A snapshot that has been sealed onto a volume and still counts. **More than one
+snapshot of a unit may be current at once** — archiving a new version does not
+demote the old one, and there is no automatic supersession. Age alone therefore
+decides nothing: only the highest-versioned current snapshot of a unit counts as
+live in a derivation, and the earlier ones remain current until an operator
+makes them **Reclaimable**, which is the sole demotion. A derivation that counts
+every current snapshot of a unit as live is wrong.
+_Avoid_: superseded (nothing writes that status; it is vestigial and must not be
+read as a lifecycle stage), latest (says nothing about whether it is sealed)
+
 ### Restoring
 
 **Heir Path**:
