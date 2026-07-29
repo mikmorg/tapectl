@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cartridge;
 pub mod catalog;
 pub mod collection;
+pub mod consent;
 pub mod key;
 pub mod location;
 pub mod operations;
