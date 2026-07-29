@@ -120,10 +120,13 @@ check() { # check <name> <fn>
 }
 EXPECTED_FAIL=(
     stage_symlink_unit        # H7  (#33): symlinks break staging
-    restore_multislice_unit   # H8  (#34): >=10 slices mis-numbered on restore
     # H1 fixed in #24: the mini-index is generated from the complete Layout, so
     # it now lists the envelopes and the no-tapectl heir path works end-to-end
     # (find-envelope + full restore, byte-identical).
+    # H8 fixed in #34: list_slices parses dar's numeric slice index instead of
+    # sorting filenames lexicographically, so slice_number no longer permutes at
+    # >=10 slices. Verified on tape 2026-07-29: unitB staged a clean 1..=12 run
+    # and restore_multislice_unit's `diff -r` came back byte-identical.
 )
 
 # ---------- fixtures ----------
