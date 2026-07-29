@@ -55,13 +55,15 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str) -> Result<i64> {
 
     // Insert manifest entries and files
     let mut file_insert = conn.prepare(
-        "INSERT INTO files (snapshot_id, path, size_bytes, modified_at, is_directory)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO files (snapshot_id, path, size_bytes, modified_at, is_directory,
+                            file_type, link_target)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     let mut manifest_insert = conn.prepare(
         "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime, is_directory,
-                                       mode, uid, gid, username, groupname, has_xattrs, has_acls)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                       mode, uid, gid, username, groupname, has_xattrs, has_acls,
+                                       file_type, link_target)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
 
     for entry in &manifest_entries {
@@ -71,6 +73,8 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str) -> Result<i64> {
             entry.size,
             entry.mtime,
             entry.is_dir,
+            entry.file_type,
+            entry.link_target,
         ])?;
         manifest_insert.execute(params![
             manifest_id,
@@ -85,6 +89,8 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str) -> Result<i64> {
             entry.groupname,
             0i32, // has_xattrs — populated on stage
             0i32, // has_acls
+            entry.file_type,
+            entry.link_target,
         ])?;
     }
 
@@ -687,14 +693,66 @@ fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
             .metadata()
             .map_err(|e| TapectlError::Other(e.to_string()))?;
         let is_dir = meta.is_dir();
+        // lstat's own size for the entry — for a symlink this is the length
+        // of the *target path string*, not any real content size. Kept
+        // as-is (not zeroed for a symlink/special below): it's what
+        // `collection::fingerprint`'s independent walk also computes from
+        // the same never-follow metadata, and zeroing it here would make
+        // that fingerprint comparison disagree with what's recorded,
+        // falsely flagging every symlink-containing unit as perpetually
+        // dirty. Only `total_size` below excludes it (see that comment).
         let size = if is_dir { 0 } else { meta.len() as i64 };
         let mtime = chrono::DateTime::from_timestamp(meta.mtime(), 0)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default();
 
+        // Classify by filesystem type (issue #33/H7) via entry.file_type(),
+        // which — under WalkDir::follow_links(false), already set above —
+        // reflects symlink_metadata (never follows), matching the size/mtime
+        // computation above. This is the fact the validator
+        // (staging/validate.rs) filters its content-validation set on: only
+        // 'regular' files get a size check + sha256; symlinks and special
+        // files (FIFO, socket, block/char device) are recorded here but
+        // never opened or hashed.
+        let ft = entry.file_type();
+        let (file_type, link_target): (&'static str, Option<String>) = if is_dir {
+            ("dir", None)
+        } else if ft.is_symlink() {
+            // Never followed: the target may not exist (a broken symlink
+            // is still recorded, not an error) and reading the link
+            // itself — unlike opening a FIFO — never risks blocking.
+            let target = fs::read_link(entry.path()).map_err(|e| {
+                TapectlError::Other(format!("cannot read symlink target: {rel_path} ({e})"))
+            })?;
+            ("symlink", Some(target.to_string_lossy().to_string()))
+        } else if ft.is_file() {
+            ("regular", None)
+        } else {
+            // FIFO, socket, block/char device: recorded (so restore and
+            // `catalog ls` still see them) but never content-validated —
+            // opening a FIFO with no writer via File::open blocks forever
+            // with no timeout, and none of these has "content" to
+            // checksum in the first place.
+            tracing::warn!(
+                path = %rel_path,
+                "special file (FIFO/socket/device) recorded but not content-validated"
+            );
+            ("special", None)
+        };
+
         if !is_dir {
-            total_size += size;
+            // Every non-directory entry counts toward file_count, same as
+            // before this fix (dar will archive and catalog a symlink or
+            // special file as a real entry even though it carries no
+            // content payload).
             file_count += 1;
+            // Only real content bytes count as archival payload — a
+            // symlink's "size" (from lstat, above) is the length of its
+            // target *string*, not payload, and a special file has no
+            // payload at all (issue #33/H7).
+            if file_type == "regular" {
+                total_size += size;
+            }
         }
 
         entries.push(ManifestEntry {
@@ -702,6 +760,8 @@ fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
             size,
             mtime,
             is_dir,
+            file_type,
+            link_target,
             mode: Some(meta.mode() as i64),
             uid: Some(meta.uid() as i64),
             gid: Some(meta.gid() as i64),
@@ -718,6 +778,8 @@ struct ManifestEntry {
     size: i64,
     mtime: String,
     is_dir: bool,
+    file_type: &'static str,
+    link_target: Option<String>,
     mode: Option<i64>,
     uid: Option<i64>,
     gid: Option<i64>,
@@ -1013,5 +1075,107 @@ mod tests {
             !output_path.exists(),
             "no output file should be created before recipients are validated"
         );
+    }
+
+    // --- walk_directory: symlinks and special files (issue #33/H7) --------
+    //
+    // `walk_directory` used to record every non-directory entry as an
+    // undifferentiated "file": for a symlink, `entry.metadata()` (never
+    // follows — `WalkDir::follow_links(false)`) reports `size = len(target
+    // string)`, not any real content size, and `is_dir = false`. The
+    // validator (`staging::validate::check_source_size`) then compared that
+    // recorded size against `std::fs::metadata`'s *followed* size — a
+    // symlink whose target-string length differs from its target's content
+    // size produced a false DIRTY (the mhvtl gate's exact fixture:
+    // `target.txt` is 7 bytes, `link-ok`'s target string "target.txt" is 10
+    // characters). The fix classifies each entry by filesystem type so the
+    // validator can filter on that recorded fact instead of re-deriving
+    // (and potentially re-disagreeing on) type information of its own.
+
+    #[test]
+    fn walk_directory_records_symlink_file_type_target_and_excludes_it_from_total_size() {
+        // Reproduces the mhvtl gate's exact fixture shape: target.txt holds
+        // 7 bytes of real content; link-ok's target-string "target.txt" is
+        // 10 characters — deliberately different, so a bug that conflates
+        // "symlink size" with "content size" shows up immediately in
+        // total_size.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("target.txt"), b"target\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", tmp.path().join("link-ok")).unwrap();
+
+        let (total_size, file_count, entries) =
+            walk_directory(tmp.path().to_str().unwrap()).unwrap();
+
+        let link_entry = entries
+            .iter()
+            .find(|e| e.path == "link-ok")
+            .expect("link-ok must be recorded in the manifest, not dropped");
+        assert_eq!(link_entry.file_type, "symlink");
+        assert_eq!(link_entry.link_target.as_deref(), Some("target.txt"));
+
+        // Only target.txt's 7 real content bytes count as archival payload —
+        // link-ok's target-string length (10) must never be added, whatever
+        // its own recorded `size` field holds (that field stays lstat's raw
+        // size — see the commit message for why it isn't zeroed).
+        assert_eq!(
+            total_size, 7,
+            "a symlink's target-string length must not count as payload"
+        );
+
+        // Both non-directory entries count toward file_count — dar will
+        // archive and catalog the symlink as a real entry even though it
+        // carries no content payload (see commit message for the
+        // file_count-vs-total_size rationale: this preserves today's
+        // `if !is_dir { file_count += 1 }` behavior verbatim; only
+        // total_size's accounting changes).
+        assert_eq!(file_count, 2);
+    }
+
+    #[test]
+    fn walk_directory_records_broken_symlink_without_error() {
+        // A broken symlink (target does not exist) must still be walked
+        // and recorded, never treated as an error — `fs::read_link` reads
+        // the symlink's own stored target string and never requires the
+        // target to exist.
+        let tmp = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("does-not-exist.txt", tmp.path().join("dangling")).unwrap();
+
+        let (_, _, entries) = walk_directory(tmp.path().to_str().unwrap()).unwrap();
+
+        let entry = entries
+            .iter()
+            .find(|e| e.path == "dangling")
+            .expect("a broken symlink must still be walked and recorded, not error out");
+        assert_eq!(entry.file_type, "symlink");
+        assert_eq!(entry.link_target.as_deref(), Some("does-not-exist.txt"));
+    }
+
+    #[test]
+    fn walk_directory_classifies_a_fifo_as_special_and_excludes_it_from_total_size() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("regular.txt"), b"real content").unwrap();
+        let fifo_path = tmp.path().join("a.fifo");
+        nix::unistd::mkfifo(
+            &fifo_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+
+        let (total_size, file_count, entries) =
+            walk_directory(tmp.path().to_str().unwrap()).unwrap();
+
+        let fifo_entry = entries
+            .iter()
+            .find(|e| e.path == "a.fifo")
+            .expect("the FIFO must still be recorded in the manifest, not dropped");
+        assert_eq!(fifo_entry.file_type, "special");
+        assert_eq!(fifo_entry.link_target, None);
+
+        assert_eq!(
+            total_size,
+            "real content".len() as i64,
+            "the FIFO must not contribute to total_size"
+        );
+        assert_eq!(file_count, 2, "the FIFO still counts toward file_count");
     }
 }

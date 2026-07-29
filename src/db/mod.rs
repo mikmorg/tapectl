@@ -51,6 +51,12 @@ fn migrations() -> Migrations<'static> {
         // thunk pairs it with label, and §2.1 seeds the envelope permutation from
         // it). See the migration for why deriving it from the label was rejected.
         M::up(include_str!("migrations/004_volume_uuid.sql")),
+        // 005 adds files.file_type/link_target and manifest_entries.file_type/
+        // link_target (issue #33/H7): the walk and the validator must agree on
+        // link-following semantics, so the walk's classification is recorded and
+        // the validator filters its content-validation set on it directly. See
+        // the migration for the full defect history.
+        M::up(include_str!("migrations/005_file_types.sql")),
     ])
 }
 
