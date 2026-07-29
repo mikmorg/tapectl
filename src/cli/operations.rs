@@ -361,6 +361,143 @@ fn print_retire_impact(
     }
 }
 
+/// Mark a cartridge as erased (available for reuse), moving any
+/// currently-mounted volume to `erased`.
+///
+/// Enforces the physical-reuse lifecycle (ADR-0008 Tier 2): the cartridge
+/// should be in `pending_erase` — the state `volume compact-finish` (and
+/// the write path generally) leaves it in once its data has actually been
+/// superseded and the physical tape is meant to be bulk-erased next.
+/// Marking a cartridge erased from any OTHER status skips that checkpoint
+/// and needs consent (`--force`, the global `--yes`, or an interactive
+/// confirmation; a non-interactive session with neither refuses rather
+/// than assuming consent — see `cli::consent`). `--dry-run` reports what
+/// would happen and changes nothing.
+///
+/// Note: `cartridges.status` has no `'erased'` value in its CHECK
+/// constraint (`available|in_use|pending_erase|retired_permanent|offsite`)
+/// — only `volumes.status` does. So this command's own namesake mutation
+/// is the cartridge moving to `'available'` (freed for reuse); it is the
+/// volume(s) that were mounted on it that move to `'erased'`.
+pub fn cartridge_mark_erased(
+    conn: &Connection,
+    barcode: &str,
+    force: bool,
+    assume_yes: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    let (id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    // Currently-mounted volume(s), if any -- these physically lose their
+    // data the instant the cartridge is bulk-erased, so they move to
+    // 'erased' regardless of which path (pending_erase, or an override)
+    // got us here.
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.label FROM cartridge_volumes cv
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL",
+    )?;
+    let mounted_volumes: Vec<(i64, String)> = stmt
+        .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let volume_labels: Vec<String> = mounted_volumes.iter().map(|(_, l)| l.clone()).collect();
+
+    if dry_run {
+        if json_output {
+            let mut obj = serde_json::json!({
+                "barcode": barcode,
+                "status": status,
+                "volumes_to_erase": volume_labels,
+            });
+            obj["dry_run"] = serde_json::json!(true);
+            println!("{obj}");
+        } else {
+            println!("would mark cartridge \"{barcode}\" erased (currently: {status})");
+            for label in &volume_labels {
+                println!("  would move volume \"{label}\" to \"erased\"");
+            }
+            println!("DRY RUN — no changes made.");
+        }
+        return Ok(());
+    }
+
+    // ADR-0008 Tier 2: the normal path (cartridge already pending_erase)
+    // needs no consent at all -- it's the expected end of the retire ->
+    // bulk-erase -> mark-erased lifecycle. Any OTHER status is a
+    // precondition violation and needs an explicit override.
+    if status != "pending_erase" {
+        let action = format!("mark cartridge \"{barcode}\" erased");
+        let facts = vec![format!(
+            "cartridge \"{barcode}\" is in status \"{status}\", not \"pending_erase\" -- \
+             marking it erased skips the normal bulk-erase lifecycle checkpoint"
+        )];
+        if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
+            let reason = e.to_string();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "barcode": barcode, "status": status,
+                        "consent": "refused", "reason": reason,
+                    })
+                );
+            }
+            return Err(e);
+        }
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE cartridges SET status = 'available' WHERE id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
+         WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
+        params![id],
+    )?;
+    for (vol_id, _) in &mounted_volumes {
+        tx.execute(
+            "UPDATE volumes SET status = 'erased' WHERE id = ?1",
+            params![vol_id],
+        )?;
+    }
+    events::log_field_change(
+        &tx,
+        "cartridge",
+        id,
+        barcode,
+        "erased",
+        "status",
+        Some(&status),
+        "available",
+        None,
+    )?;
+    tx.commit()?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "barcode": barcode, "status": "available", "volumes_erased": volume_labels,
+            })
+        );
+    } else {
+        println!("cartridge \"{barcode}\" marked as erased (available for reuse)");
+        for label in &volume_labels {
+            println!("  volume \"{label}\" marked erased");
+        }
+    }
+    Ok(())
+}
+
 /// Mark a unit as tape-only with enforcement.
 pub fn unit_mark_tape_only(
     conn: &Connection,

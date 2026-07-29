@@ -38,6 +38,10 @@ pub enum CartridgeCommands {
     MarkErased {
         /// Barcode
         barcode: String,
+        /// Override the pending_erase lifecycle precondition (ADR-0008
+        /// Tier 2 — see cli::consent)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -55,7 +59,13 @@ struct CartridgeRow {
     volume: String,
 }
 
-pub fn run(conn: &Connection, command: &CartridgeCommands, json_output: bool) -> Result<()> {
+pub fn run(
+    conn: &Connection,
+    command: &CartridgeCommands,
+    json_output: bool,
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
     match command {
         CartridgeCommands::Register {
             barcode,
@@ -178,46 +188,15 @@ pub fn run(conn: &Connection, command: &CartridgeCommands, json_output: bool) ->
                 }
             }
         }
-        CartridgeCommands::MarkErased { barcode } => {
-            let id: i64 = conn
-                .query_row(
-                    "SELECT id FROM cartridges WHERE barcode = ?1",
-                    params![barcode],
-                    |row| row.get(0),
-                )
-                .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
-
-            conn.execute(
-                "UPDATE cartridges SET status = 'available' WHERE id = ?1",
-                params![id],
-            )?;
-
-            // Unmount any current volume
-            conn.execute(
-                "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
-                 WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
-                params![id],
-            )?;
-
-            events::log_field_change(
+        CartridgeCommands::MarkErased { barcode, force } => {
+            crate::cli::operations::cartridge_mark_erased(
                 conn,
-                "cartridge",
-                id,
                 barcode,
-                "erased",
-                "status",
-                None,
-                "available",
-                None,
+                *force,
+                yes,
+                dry_run,
+                json_output,
             )?;
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"barcode": barcode, "status": "available"})
-                );
-            } else {
-                println!("cartridge \"{barcode}\" marked as erased (available for reuse)");
-            }
         }
     }
     Ok(())

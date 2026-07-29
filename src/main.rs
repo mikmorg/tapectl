@@ -85,7 +85,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::location::run(&conn, command, cli.json)?;
         }
         Commands::Cartridge { ref command } => {
-            cli::cartridge::run(&conn, command, cli.json)?;
+            cli::cartridge::run(&conn, command, cli.json, cli.yes, cli.dry_run)?;
         }
         Commands::ArchiveSet { ref command } => {
             cli::archive_set::run(&conn, &cfg, command, cli.json)?;
