@@ -175,7 +175,22 @@ pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: boo
 }
 
 /// Retire a volume with impact analysis.
-pub fn volume_retire(conn: &Connection, label: &str, json_output: bool) -> Result<()> {
+///
+/// ADR-0008 Tier 2: if any unit would drop to ZERO remaining copies, the
+/// retirement needs consent before it proceeds (`--yes` overrides; a
+/// non-interactive session with no `--yes` refuses rather than assuming
+/// consent — see `cli::consent`). `--dry-run` reports the same impact
+/// analysis and changes nothing. A refusal is reported through the normal
+/// return channel (`Err`) *and*, when `--json` was requested, as a JSON
+/// object on stdout — a JSON consumer must be able to see why, not just
+/// observe a non-zero exit.
+pub fn volume_retire(
+    conn: &Connection,
+    label: &str,
+    assume_yes: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
     let (vol_id, status): (i64, String) = conn
         .query_row(
             "SELECT id, status FROM volumes WHERE label = ?1",
@@ -206,35 +221,65 @@ pub fn volume_retire(conn: &Connection, label: &str, json_output: bool) -> Resul
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    if json_output {
-        let json_impacts: Vec<serde_json::Value> = impacts
+    let at_risk: Vec<String> = impacts
+        .iter()
+        .filter(|(_, _, other_copies)| *other_copies == 0)
+        .map(|(name, _, _)| name.clone())
+        .collect();
+
+    // --dry-run: report the impact analysis and stop, before any consent
+    // prompt and before any mutation.
+    if dry_run {
+        if json_output {
+            let mut obj = serde_json::json!({
+                "volume": label,
+                "affected_units": retire_impacts_json(&impacts),
+                "at_risk_units": at_risk,
+            });
+            obj["dry_run"] = serde_json::json!(true);
+            println!("{obj}");
+        } else {
+            print_retire_impact(label, &status, &impacts, &at_risk);
+            println!("\n  DRY RUN — no changes made.");
+        }
+        return Ok(());
+    }
+
+    // ADR-0008 Tier 2: only the zero-copy case needs consent -- a
+    // retirement that leaves every affected unit with at least one other
+    // copy is a normal, non-risky operation and proceeds unconditionally,
+    // same as before this change.
+    if !at_risk.is_empty() {
+        let action = format!("retire volume \"{label}\"");
+        let facts: Vec<String> = at_risk
             .iter()
-            .map(|(name, status, copies)| {
-                serde_json::json!({"unit": name, "status": status, "remaining_copies": copies})
+            .map(|name| {
+                format!("unit \"{name}\" would have ZERO copies remaining after this retirement")
             })
             .collect();
+
+        if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
+            let reason = e.to_string();
+            if json_output {
+                println!(
+                    "{}",
+                    retire_refusal_json(label, &impacts, &at_risk, &reason)
+                );
+            } else {
+                print_retire_impact(label, &status, &impacts, &at_risk);
+                println!("\n  REFUSED: {reason}");
+            }
+            return Err(e);
+        }
+    }
+
+    if json_output {
         println!(
             "{}",
-            serde_json::json!({"volume": label, "affected_units": json_impacts})
+            serde_json::json!({"volume": label, "affected_units": retire_impacts_json(&impacts)})
         );
     } else {
-        println!("Retiring volume \"{label}\"");
-        println!("  Current status: {status}");
-        println!("  Affected units:");
-        let mut at_risk = 0;
-        for (name, unit_status, other_copies) in &impacts {
-            let warning = if *other_copies == 0 {
-                at_risk += 1;
-                " *** ZERO copies remaining! ***"
-            } else {
-                ""
-            };
-            println!("    {name} [{unit_status}]: {other_copies} other copy/copies{warning}");
-        }
-        if at_risk > 0 {
-            println!("\n  WARNING: {at_risk} unit(s) will have ZERO copies after retirement!");
-            println!("  Consider writing additional copies before retiring.");
-        }
+        print_retire_impact(label, &status, &impacts, &at_risk);
     }
 
     // Actually retire
@@ -258,6 +303,62 @@ pub fn volume_retire(conn: &Connection, label: &str, json_output: bool) -> Resul
         println!("  Volume \"{label}\" retired.");
     }
     Ok(())
+}
+
+fn retire_impacts_json(impacts: &[(String, String, i64)]) -> Vec<serde_json::Value> {
+    impacts
+        .iter()
+        .map(|(name, status, copies)| {
+            serde_json::json!({"unit": name, "status": status, "remaining_copies": copies})
+        })
+        .collect()
+}
+
+/// The JSON object `volume_retire` emits to stdout when the Tier-2 consent
+/// gate refuses. Split out from the call site so its shape — in
+/// particular, that `reason` carries the actual refusal text — is
+/// directly testable without capturing stdout (issue #38 / H12: "a JSON
+/// consumer must be able to see the refusal reason, not just a non-zero
+/// exit").
+fn retire_refusal_json(
+    label: &str,
+    impacts: &[(String, String, i64)],
+    at_risk: &[String],
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "volume": label,
+        "affected_units": retire_impacts_json(impacts),
+        "at_risk_units": at_risk,
+        "consent": "refused",
+        "reason": reason,
+    })
+}
+
+fn print_retire_impact(
+    label: &str,
+    status: &str,
+    impacts: &[(String, String, i64)],
+    at_risk: &[String],
+) {
+    println!("Retiring volume \"{label}\"");
+    println!("  Current status: {status}");
+    println!("  Affected units:");
+    for (name, unit_status, other_copies) in impacts {
+        let warning = if *other_copies == 0 {
+            " *** ZERO copies remaining! ***"
+        } else {
+            ""
+        };
+        println!("    {name} [{unit_status}]: {other_copies} other copy/copies{warning}");
+    }
+    if !at_risk.is_empty() {
+        println!(
+            "\n  WARNING: {} unit(s) will have ZERO copies after retirement!",
+            at_risk.len()
+        );
+        println!("  Consider writing additional copies before retiring.");
+    }
 }
 
 /// Mark a unit as tape-only with enforcement.

@@ -73,7 +73,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::staging::run(&conn, command, cli.json)?;
         }
         Commands::Volume { ref command } => {
-            cli::volume::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::volume::run(&conn, &paths, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
         }
         Commands::Restore { ref command } => {
             cli::restore::run(&conn, &paths, &cfg, command, cli.json)?;

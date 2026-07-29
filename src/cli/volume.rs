@@ -142,6 +142,8 @@ pub fn run(
     config: &Config,
     command: &VolumeCommands,
     json_output: bool,
+    yes: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         VolumeCommands::Init {
@@ -233,7 +235,7 @@ pub fn run(
         }
 
         VolumeCommands::Retire { label } => {
-            crate::cli::operations::volume_retire(conn, label, json_output)?;
+            crate::cli::operations::volume_retire(conn, label, yes, dry_run, json_output)?;
         }
 
         VolumeCommands::ReadSlices { from, unit, device } => {
