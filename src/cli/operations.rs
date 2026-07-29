@@ -199,27 +199,7 @@ pub fn volume_retire(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    // Impact analysis: find all units with data on this volume
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT u.name, u.status,
-                (SELECT COUNT(DISTINCT w2.volume_id)
-                 FROM writes w2
-                 JOIN stage_sets ss2 ON ss2.id = w2.stage_set_id
-                 JOIN snapshots s2 ON s2.id = ss2.snapshot_id
-                 WHERE s2.unit_id = u.id AND w2.status = 'completed' AND w2.volume_id != ?1) as other_copies
-         FROM units u
-         JOIN snapshots s ON s.unit_id = u.id
-         JOIN stage_sets ss ON ss.snapshot_id = s.id
-         JOIN writes w ON w.stage_set_id = ss.id
-         WHERE w.volume_id = ?1 AND w.status = 'completed'
-         ORDER BY u.name",
-    )?;
-
-    let impacts: Vec<(String, String, i64)> = stmt
-        .query_map(params![vol_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let impacts = retire_impacts(conn, vol_id)?;
 
     let at_risk: Vec<String> = impacts
         .iter()
@@ -303,6 +283,50 @@ pub fn volume_retire(
         println!("  Volume \"{label}\" retired.");
     }
     Ok(())
+}
+
+/// `(unit_name, unit_status, other_copies)` for every unit with a
+/// completed write on `vol_id` — the impact analysis behind
+/// `volume_retire`. Split out from the call site (same reasoning as
+/// `report::copies_rows`/`audit::copy_count_for_unit`) so the
+/// `other_copies` derivation is directly testable without going anywhere
+/// near `volume_retire`'s consent gate — which reads real stdin when
+/// `assume_yes` is false and a unit is genuinely at risk, exactly the
+/// hazard `volume_retire_consent`'s tests are written to avoid.
+///
+/// `other_copies` is the ADR-0004 coverage derivation: does this unit
+/// have a claim on some OTHER volume that is currently eligible (sealed,
+/// unquarantined, unretired)? Routes through the shared predicate
+/// (`policy::coverage::eligible`) — a write's own `completed` status only
+/// proves its volume was sealed at write time, not that it still is
+/// (issue #89). The volume being retired (`vol_id`) is excluded from its
+/// own "other copies" by identity, not by status, since we are retiring
+/// it regardless of what its current status happens to be.
+fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<(String, String, i64)>> {
+    let sql = format!(
+        "SELECT DISTINCT u.name, u.status,
+                (SELECT COUNT(DISTINCT w2.volume_id)
+                 FROM writes w2
+                 JOIN stage_sets ss2 ON ss2.id = w2.stage_set_id
+                 JOIN snapshots s2 ON s2.id = ss2.snapshot_id
+                 JOIN volumes v2 ON v2.id = w2.volume_id
+                 WHERE s2.unit_id = u.id AND w2.status = 'completed' AND w2.volume_id != ?1
+                   AND {}) as other_copies
+         FROM units u
+         JOIN snapshots s ON s.unit_id = u.id
+         JOIN stage_sets ss ON ss.snapshot_id = s.id
+         JOIN writes w ON w.stage_set_id = ss.id
+         WHERE w.volume_id = ?1 AND w.status = 'completed'
+         ORDER BY u.name",
+        crate::policy::coverage::eligible("v2")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let impacts: Vec<(String, String, i64)> = stmt
+        .query_map(params![vol_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(impacts)
 }
 
 fn retire_impacts_json(impacts: &[(String, String, i64)]) -> Vec<serde_json::Value> {
@@ -512,17 +536,22 @@ pub fn unit_mark_tape_only(
     let min_copies = config.defaults.min_copies_for_tape_only;
     let min_locations = config.defaults.min_locations_for_tape_only;
 
-    // Count copies and locations
-    let (copy_count, location_count): (i64, i64) = conn.query_row(
+    // Count copies and locations. ADR-0004: a write's own `status =
+    // 'completed'` only proves the volume was sealed AT WRITE TIME —
+    // `volumes.status` keeps moving afterwards (retired/quarantined/
+    // erased/missing), so eligibility must be re-checked at USE time via
+    // the shared predicate (issue #89).
+    let sql = format!(
         "SELECT COUNT(DISTINCT w.id), COUNT(DISTINCT v.location_id)
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
          JOIN volumes v ON v.id = w.volume_id
-         WHERE s.unit_id = ?1 AND s.status = 'current'",
-        params![unit.id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+         WHERE s.unit_id = ?1 AND s.status = 'current' AND {}",
+        crate::policy::coverage::eligible("v")
+    );
+    let (copy_count, location_count): (i64, i64) =
+        conn.query_row(&sql, params![unit.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
     // Reuses `fingerprint::classify` — the same scan backing `unit status
     // --dirty` and `report dirty` — so these can never disagree about
@@ -931,14 +960,21 @@ pub fn snapshot_mark_reclaimable(
             required_locations *= multiplier;
         }
 
-        let copy_count: i64 = conn.query_row(
+        // ADR-0004 (issue #89): this query previously had no JOIN to
+        // volumes at all, so it counted every completed write regardless
+        // of whether the volume holding it had since been quarantined,
+        // retired, erased, or reported missing. The shared eligibility
+        // predicate re-qualifies at use time instead of trusting
+        // write-time status forever.
+        let sql = format!(
             "SELECT COUNT(DISTINCT w.volume_id)
              FROM writes w
              JOIN stage_sets ss ON ss.id = w.stage_set_id
-             WHERE ss.snapshot_id = ?1 AND w.status = 'completed'",
-            params![superseding.0],
-            |row| row.get(0),
-        )?;
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND {}",
+            crate::policy::coverage::eligible("v")
+        );
+        let copy_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
 
         if copy_count < required_copies {
             return Err(TapectlError::Other(format!(
@@ -948,15 +984,16 @@ pub fn snapshot_mark_reclaimable(
             )));
         }
 
-        let location_count: i64 = conn.query_row(
+        let sql = format!(
             "SELECT COUNT(DISTINCT v.location_id)
              FROM writes w
              JOIN stage_sets ss ON ss.id = w.stage_set_id
              JOIN volumes v ON v.id = w.volume_id
-             WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND v.location_id IS NOT NULL",
-            params![superseding.0],
-            |row| row.get(0),
-        )?;
+             WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND v.location_id IS NOT NULL
+               AND {}",
+            crate::policy::coverage::eligible("v")
+        );
+        let location_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
 
         if required_locations > 0 && location_count < required_locations {
             return Err(TapectlError::Other(format!(
@@ -1627,9 +1664,14 @@ mod tests {
             .unwrap();
 
             if with_other_copy {
+                // 'sealed', not 'active' -- post-#89 the "other copy" only
+                // counts toward coverage if it is currently sealed, so an
+                // 'active' (never-sealed) stand-in would no longer satisfy
+                // `proceeds_without_any_consent_gate_when_no_unit_is_at_risk`
+                // below for the reason the test intends.
                 conn.execute(
                     "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                     VALUES ('OTHER-VOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                     VALUES ('OTHER-VOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
                     [],
                 )
                 .unwrap();
@@ -1696,6 +1738,36 @@ mod tests {
         }
 
         #[test]
+        fn other_copies_excludes_a_quarantined_second_volume() {
+            // Issue #89 / Change 2: `retire_impacts`'s `other_copies` must
+            // not count a second volume that no longer passes ADR-0004's
+            // eligibility rule. Exercises `retire_impacts` directly rather
+            // than `volume_retire` itself -- calling the full function
+            // with `assume_yes: false` in a genuinely at-risk scenario is
+            // exactly the stdin hazard this module's doc comment (top of
+            // `volume_retire_consent`) warns every other test away from.
+            let (conn, vol_id) = setup_volume_with_one_unit("L6-QUAR", true);
+            // The fixture's OTHER-VOL is 'sealed' by default (so the
+            // pre-existing tests above still see a real second copy);
+            // flip it to 'quarantined' here, after setup, to isolate
+            // exactly this test's point without changing that default.
+            conn.execute(
+                "UPDATE volumes SET status = 'quarantined' WHERE label = 'OTHER-VOL'",
+                [],
+            )
+            .unwrap();
+
+            let impacts = retire_impacts(&conn, vol_id).unwrap();
+            assert_eq!(impacts.len(), 1);
+            let (name, _status, other_copies) = &impacts[0];
+            assert_eq!(name, "unitA");
+            assert_eq!(
+                *other_copies, 0,
+                "a quarantined second volume must not count as another copy"
+            );
+        }
+
+        #[test]
         fn refusal_json_carries_the_volume_and_the_reason() {
             // Change 3's explicit requirement: a JSON consumer must be
             // able to see WHY retirement was refused, not just observe a
@@ -1715,6 +1787,286 @@ mod tests {
             assert_eq!(json["at_risk_units"][0], "unitA");
             assert_eq!(json["affected_units"][0]["unit"], "unitA");
             assert_eq!(json["affected_units"][0]["remaining_copies"], 0);
+        }
+    }
+
+    /// Issue #89 / ADR-0004: copy-count derivations must re-qualify
+    /// eligibility at USE time (is the volume currently sealed?), not
+    /// trust `writes.status = 'completed'` forever — that only proves the
+    /// volume was sealed AT WRITE TIME (`src/volume/session.rs` sets both
+    /// in the same transaction, at confirm). `volumes.status` keeps
+    /// moving afterwards; the `writes` row does not.
+    ///
+    /// Each test here builds a unit with one completed write to a
+    /// permanently-`sealed` volume and a second completed write to a
+    /// volume whose status is the dimension under test, then proves:
+    ///   - the gate (`unit_mark_tape_only` / `snapshot_mark_reclaimable`)
+    ///     sees 1 copy, not 2, and refuses at `min_copies = 2`;
+    ///   - two SEALED volumes still count as 2 (the guard must not
+    ///     false-positive on the happy path);
+    ///   - `report copies` and `audit` see the SAME count the gate does —
+    ///     the equality this whole change exists to establish.
+    mod adr0004_copy_eligibility {
+        use super::*;
+
+        /// tenant + unit (deliberately no `current_path`: `fingerprint::
+        /// classify` returns `Ok(None)` for a unit with no path, so
+        /// `unit_mark_tape_only`'s New/Dirty guards never fire here — only
+        /// the copy/location-count gate under test can refuse) + one
+        /// 'current' snapshot + one 'staged' stage_set completed-written
+        /// to two volumes: `{name}-SEALED` (always `sealed`) and
+        /// `{name}-OTHER` (status = `second_volume_status`, the dimension
+        /// under test). Returns (conn, unit_id).
+        fn setup_unit_with_two_volumes(
+            name: &str,
+            second_volume_status: &str,
+        ) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                params![format!("uuid-{name}"), name, tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol1_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol1_id],
+            )
+            .unwrap();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol2_id],
+            )
+            .unwrap();
+
+            (conn, unit_id)
+        }
+
+        /// `min_copies_for_tape_only` at its default (2);
+        /// `min_locations_for_tape_only` zeroed to isolate the copy-count
+        /// gate from the location-count gate — neither volume above sets
+        /// `location_id`, so without this override `location_count` would
+        /// also read 0 and every refusal below would be "insufficient
+        /// locations" instead of "insufficient copies", masking which
+        /// check actually fired (same isolation technique as the
+        /// pre-existing `config_with_zero_tape_only_thresholds`, which
+        /// zeroes both because it is isolating a THIRD guard, the dirty
+        /// check).
+        fn config_isolating_copy_count() -> Config {
+            let mut config = Config::default();
+            config.defaults.min_locations_for_tape_only = 0;
+            config
+        }
+
+        fn mark_tape_only_refuses_for_status(status: &str) {
+            let name = format!("mto-{status}");
+            let (conn, _unit_id) = setup_unit_with_two_volumes(&name, status);
+            let config = config_isolating_copy_count();
+            let err = unit_mark_tape_only(&conn, &config, &name, false, false).expect_err(
+                &format!("a {status} second volume must not count toward min_copies"),
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("insufficient copies: 1 < 2"),
+                "status {status}: {msg}"
+            );
+        }
+
+        #[test]
+        fn mark_tape_only_refuses_when_second_volume_is_quarantined() {
+            mark_tape_only_refuses_for_status("quarantined");
+        }
+
+        #[test]
+        fn mark_tape_only_refuses_when_second_volume_is_retired() {
+            mark_tape_only_refuses_for_status("retired");
+        }
+
+        #[test]
+        fn mark_tape_only_refuses_when_second_volume_is_erased() {
+            mark_tape_only_refuses_for_status("erased");
+        }
+
+        #[test]
+        fn mark_tape_only_refuses_when_second_volume_is_missing() {
+            mark_tape_only_refuses_for_status("missing");
+        }
+
+        #[test]
+        fn mark_tape_only_counts_two_sealed_volumes_as_two() {
+            let (conn, _unit_id) = setup_unit_with_two_volumes("mto-both-sealed", "sealed");
+            let config = config_isolating_copy_count();
+            unit_mark_tape_only(&conn, &config, "mto-both-sealed", false, false).expect(
+                "two sealed volumes must satisfy min_copies=2 -- the guard must not false-positive",
+            );
+        }
+
+        /// tenant + unit + TWO snapshots: v1 ('superseded', the one to be
+        /// marked reclaimable) and v2 ('current', the superseding
+        /// snapshot whose coverage `snapshot_mark_reclaimable` actually
+        /// measures) + v2's 'staged' stage_set completed-written to two
+        /// volumes, same SEALED / `second_volume_status` shape as
+        /// `setup_unit_with_two_volumes`. Returns (conn, unit_id).
+        fn setup_reclaimable_fixture(name: &str, second_volume_status: &str) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                params![format!("uuid-{name}"), name, tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'superseded', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 2, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap2_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol1_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap2_id, vol1_id],
+            )
+            .unwrap();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap2_id, vol2_id],
+            )
+            .unwrap();
+
+            (conn, unit_id)
+        }
+
+        fn mark_reclaimable_refuses_for_status(status: &str) {
+            let name = format!("rec-{status}");
+            // `Config::default()`'s `resolved.required_locations` stays
+            // empty (no archive_set bound to this unit), so the location
+            // precondition is skipped entirely and only the copy-count
+            // precondition under test can refuse.
+            let config = Config::default();
+            let (conn, _unit_id) = setup_reclaimable_fixture(&name, status);
+            let err = snapshot_mark_reclaimable(&conn, &config, &name, 1, false, false).expect_err(
+                &format!(
+                    "a {status} second volume must not count toward the superseding snapshot's coverage"
+                ),
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("has 1 copies, needs 2"),
+                "status {status}: {msg}"
+            );
+        }
+
+        #[test]
+        fn mark_reclaimable_refuses_when_second_volume_is_quarantined() {
+            mark_reclaimable_refuses_for_status("quarantined");
+        }
+
+        #[test]
+        fn mark_reclaimable_refuses_when_second_volume_is_retired() {
+            mark_reclaimable_refuses_for_status("retired");
+        }
+
+        #[test]
+        fn mark_reclaimable_refuses_when_second_volume_is_erased() {
+            mark_reclaimable_refuses_for_status("erased");
+        }
+
+        #[test]
+        fn mark_reclaimable_refuses_when_second_volume_is_missing() {
+            mark_reclaimable_refuses_for_status("missing");
+        }
+
+        #[test]
+        fn mark_reclaimable_counts_two_sealed_volumes_as_two() {
+            let (conn, _unit_id) = setup_reclaimable_fixture("rec-both-sealed", "sealed");
+            let config = Config::default();
+            snapshot_mark_reclaimable(&conn, &config, "rec-both-sealed", 1, false, false)
+                .expect("two sealed volumes on the superseding snapshot must satisfy min_copies=2");
         }
     }
 
