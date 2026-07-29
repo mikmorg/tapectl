@@ -126,15 +126,44 @@ pub fn stage_create(
     let source_size = snapshot.total_size.unwrap_or(0);
     check_staging_space(staging_dir, source_size)?;
 
-    // Resolve slice size
-    let slice_size = config.defaults.slice_size.clone();
-    let compression = config.defaults.compression.clone();
+    // Resolve policy (dotfile > archive_set > defaults) — issue #47/#48:
+    // stage_create used to read config.defaults.* unconditionally, so an
+    // archive_set or dotfile override of slice_size/compression/preserve_*
+    // was silently discarded even where #48 gives archive_set_id a writer.
+    let resolved = crate::policy::resolve(conn, config, &unit);
+
+    // `ResolvedPolicy.slice_size` is bytes-only at every layer (even
+    // `policy::resolve`'s own default layer runs `config.defaults.slice_size`
+    // through `parse_size_to_bytes`), but dar's `-s` argument must keep
+    // receiving a *string dar parses itself* — see `resolve_slice_size_string`
+    // for why this can't simply be `resolved.slice_size.to_string()`
+    // unconditionally (issue #59's known parser defects must never reach
+    // real on-tape slicing — only the bookkeeping column below, which is
+    // `resolved.slice_size` directly now, with no second parse needed).
+    let slice_size = resolve_slice_size_string(conn, config, &unit, resolved.slice_size);
+    let compression = resolved.compression.clone();
+
+    // ADR-0005's escrow recipient participates in every write, and
+    // pre-write validation refuses without one — encryption cannot be made
+    // optional without contradicting that, and doing so would also breach
+    // the sacred no-plaintext-tenant-identity-on-tape invariant. Coordinator
+    // decision (issues #47/#48, 2026-07-29): never refuse the stage and
+    // never silently ignore a `policy.encrypt = false`, but never honor it
+    // either — warn loudly (now that #45 wires `tracing` to stderr, this
+    // reaches the operator) and encrypt regardless.
+    if !resolved.encrypt {
+        tracing::warn!(
+            unit = %unit.name,
+            "policy resolved encrypt=false, but encryption cannot be disabled \
+             (ADR-0005 escrow requirement) — encrypting anyway"
+        );
+    }
 
     // Create stage_set record
     conn.execute(
         "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
          VALUES (?1, ?2, ?3, 1)",
-        params![snapshot_id, parse_size_to_bytes(&slice_size), compression],
+        params![snapshot_id, resolved.slice_size, compression],
     )?;
     let stage_set_id = conn.last_insert_rowid();
 
@@ -162,9 +191,9 @@ pub fn stage_create(
         compression: &compression,
         exclude_patterns: &config.defaults.global_excludes,
         exclude_paths: &[],
-        preserve_xattrs: config.defaults.preserve_xattrs,
-        preserve_acls: config.defaults.preserve_acls,
-        preserve_fsa: config.defaults.preserve_fsa,
+        preserve_xattrs: resolved.preserve_xattrs,
+        preserve_acls: resolved.preserve_acls,
+        preserve_fsa: resolved.preserve_fsa,
     })?;
 
     info!(slices = dar_result.num_slices, "dar archive created");
@@ -350,6 +379,80 @@ pub fn stage_create(
     )?;
 
     Ok(stage_set_id)
+}
+
+/// The literal STRING to hand `dar -s` for this unit's stage, resolved
+/// through the SAME dotfile > archive_set > default priority as
+/// `policy::resolve` — but never by reformatting an already-parsed byte
+/// count back into a suffixed string. `resolved_bytes` must be
+/// `policy::resolve(..).slice_size` for the same `unit`, so the
+/// archive_set fallback below is always consistent with whatever the
+/// resolver already decided.
+///
+/// Why this isn't simply `resolved_bytes.to_string()` unconditionally:
+/// `parse_size_to_bytes` (issue #59) silently maps any suffix outside
+/// K/KB/M/MB/G/GB/T/TB to a multiplier of 1 — a real defect that today is
+/// confined to the `stage_sets.slice_size` *bookkeeping* column, which
+/// nothing downstream trusts for the real cut (dar re-parses its own `-s`
+/// argument independently). Routing dar's actual argument through that
+/// same parser — even indirectly, via a byte count computed from it —
+/// would let that defect reach real on-tape slice boundaries for every
+/// unit, including the overwhelmingly common case with no override at
+/// all. So: whichever layer has a native operator-facing string (the
+/// dotfile's raw TOML value, or the system default's config string) hands
+/// that string to dar untouched, exactly as before issue #47. Only the
+/// archive_set layer has no string to fall back on — `archive_sets.slice_size`
+/// has been byte-typed in the schema since M6, so `resolved_bytes` is its
+/// only representation — but handing dar that exact byte count with no
+/// suffix is lossless and valid syntax: dar's own manual states a bare
+/// `-s` number means exactly that many bytes ("'20M' means 20 megabytes,
+/// by default, it is the same as giving 20971520 as argument").
+fn resolve_slice_size_string(
+    conn: &Connection,
+    config: &Config,
+    unit: &models::Unit,
+    resolved_bytes: i64,
+) -> String {
+    // Layer 1 (highest priority): the unit dotfile's own [policy]
+    // slice_size, read the same raw-TOML-table way `policy::resolve` does.
+    // This key isn't part of the structured `UnitDotfile`/`PolicySection`
+    // model (only checksum_mode/compression are), so it has to be read the
+    // same ad-hoc way `policy::resolve` reads it, not via `dotfile::read_dotfile`.
+    if let Some(ref path) = unit.current_path {
+        let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
+        if let Ok(contents) = fs::read_to_string(&dotfile_path) {
+            if let Ok(toml) = contents.parse::<toml::Table>() {
+                if let Some(v) = toml
+                    .get("policy")
+                    .and_then(|p| p.as_table())
+                    .and_then(|p| p.get("slice_size"))
+                    .and_then(|v| v.as_str())
+                {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+
+    // Layer 2: archive_set. Byte-only column — the resolved byte count
+    // (already computed by `policy::resolve`) is the only faithful string.
+    if let Some(as_id) = unit.archive_set_id {
+        let has_override: bool = conn
+            .query_row(
+                "SELECT slice_size IS NOT NULL FROM archive_sets WHERE id = ?1",
+                params![as_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if has_override {
+            return resolved_bytes.to_string();
+        }
+    }
+
+    // Layer 3: system default — unchanged from before issue #47: dar
+    // receives the config string verbatim, never round-tripped through
+    // `parse_size_to_bytes`.
+    config.defaults.slice_size.clone()
 }
 
 fn get_snapshot(conn: &Connection, id: i64) -> Result<models::Snapshot> {
@@ -1177,5 +1280,95 @@ mod tests {
             "the FIFO must not contribute to total_size"
         );
         assert_eq!(file_count, 2, "the FIFO still counts toward file_count");
+    }
+
+    // ── issue #47: stage_create must resolve policy, not read config.defaults directly ──
+
+    /// The core claim of issue #47: `stage_create` must resolve
+    /// `slice_size` through `policy::resolve` (dotfile > archive_set >
+    /// default), not read `config.defaults.slice_size` unconditionally.
+    /// Exercises the REAL pipeline end to end (real `dar`, real tenant
+    /// keys via `tenant::add_tenant`) so the assertion is against what
+    /// actually lands in `stage_sets`, not a mocked shortcut.
+    ///
+    /// Deliberately asserts on `slice_size` only, not `compression`:
+    /// `unit::init_unit` always writes a dotfile whose `[policy]` section
+    /// carries a concrete `compression` value (see the design doc's own
+    /// §2.2 example), and `policy::resolve`'s dotfile layer outranks
+    /// archive_set whenever a dotfile is present — so for a real,
+    /// dotfile-backed unit, `compression` resolves to the dotfile's value
+    /// regardless of any archive_set override. That is a separate,
+    /// pre-existing defect in how `init_unit` writes dotfiles (out of this
+    /// fix's scope — see the final report), not a gap in this wiring.
+    /// `slice_size` is never written into the dotfile's `[policy]` section
+    /// by `write_dotfile` (only `checksum_mode`/`compression` are part of
+    /// the structured model), so it is unaffected and is the correct
+    /// field to prove `stage_create`'s resolver wiring on.
+    #[test]
+    fn stage_create_uses_archive_set_resolved_slice_size_not_global_default() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let mut config = Config::default();
+        config.dar.binary = "/usr/bin/dar".to_string();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+        config.defaults.slice_size = "100M".to_string();
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+
+        // Archive set overriding slice_size away from config.defaults'
+        // "100M" above.
+        conn.execute(
+            "INSERT INTO archive_sets (name, slice_size) VALUES ('cold', ?1)",
+            params![50i64 * 1024 * 1024],
+        )
+        .unwrap();
+
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("f.txt"),
+            b"hello world, this is stage_create resolver test content",
+        )
+        .unwrap();
+
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            Some("cold"),
+        )
+        .unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
+
+        let slice_size: i64 = conn
+            .query_row(
+                "SELECT slice_size FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            slice_size,
+            50 * 1024 * 1024,
+            "stage_sets.slice_size must reflect the archive_set's override (50M), \
+             not config.defaults.slice_size (100M) — proves stage_create resolves \
+             policy instead of reading config.defaults directly"
+        );
     }
 }
