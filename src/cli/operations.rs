@@ -297,6 +297,27 @@ pub fn unit_mark_tape_only(
                 "insufficient locations: {location_count} < {min_locations} required (use --force to override)"
             )));
         }
+
+        // Dirty guard (issue #36/H10, the safety-critical gap this fixes):
+        // tape_only is the operator's signal that local data may now be
+        // deleted. If the on-disk fingerprint no longer matches the last
+        // snapshot, the tape copy is stale — deleting local data would
+        // silently destroy the un-archived changes. Reuses
+        // `fingerprint::classify`, the same scan `unit status --dirty` and
+        // `report dirty` use, so this can never disagree with them about
+        // whether the unit is dirty. A unit with no snapshot at all
+        // (`PendingReason::New`) is already caught by the copy-count check
+        // above (zero completed writes), so only `Dirty` needs handling
+        // here.
+        if let Some(pending) = crate::collection::fingerprint::classify(conn, &unit)? {
+            if pending.reason == crate::collection::fingerprint::PendingReason::Dirty {
+                return Err(TapectlError::Other(format!(
+                    "unit is dirty: on-disk contents changed since the last snapshot — {} \
+                     (use --force to override)",
+                    pending.changes.describe()
+                )));
+            }
+        }
     }
 
     conn.execute(
@@ -1022,5 +1043,105 @@ mod tests {
             crate::staging::validate::hash_source_file(&tmp.path().join("f.txt"), "f.txt").unwrap();
         assert_ne!(actual, stale_hash);
         unit_check_integrity(&conn, "unit1", true).expect("check-integrity must still succeed");
+    }
+
+    /// Issue #36/H10: `unit_mark_tape_only`'s dirty guard. Full migrations
+    /// (not just 001, unlike `setup_conn_with_unit` above) because these
+    /// tests exercise the real `fingerprint::classify` via a real
+    /// `snapshot_create`, not a hand-inserted `files` row.
+    fn setup_unit_for_tape_only(current_path: &str) -> Connection {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+             VALUES ('u1', 'unit1', ?1, ?2, 'mtime_size', 1, 'active')",
+            params![tid, current_path],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Tape-only copy/location thresholds relaxed to 0: 0 completed writes
+    /// < 0 required is false, so the pre-existing copy/location checks
+    /// trivially pass and the ONLY thing that can refuse in these tests is
+    /// the new dirty guard — isolating exactly what's under test without
+    /// also having to fabricate volumes/writes/locations fixtures.
+    fn config_with_zero_tape_only_thresholds() -> Config {
+        let mut config = Config::default();
+        config.defaults.min_copies_for_tape_only = 0;
+        config.defaults.min_locations_for_tape_only = 0;
+        config
+    }
+
+    fn unit_status(conn: &Connection) -> String {
+        conn.query_row("SELECT status FROM units WHERE name = 'unit1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn mark_tape_only_refuses_a_dirty_unit_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
+        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+
+        let config = config_with_zero_tape_only_thresholds();
+        let err = unit_mark_tape_only(&conn, &config, "unit1", false, false)
+            .expect_err("a dirty unit must refuse mark-tape-only without --force");
+        let msg = err.to_string();
+        assert!(msg.contains("dirty"), "error must mention dirty: {msg}");
+        assert!(
+            msg.contains("f.txt"),
+            "error must name the specific changed file: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "error must mention the override: {msg}"
+        );
+        assert_eq!(
+            unit_status(&conn),
+            "active",
+            "a refused mark-tape-only must not have changed unit status"
+        );
+    }
+
+    #[test]
+    fn mark_tape_only_succeeds_on_a_dirty_unit_with_force() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
+        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+
+        let config = config_with_zero_tape_only_thresholds();
+        unit_mark_tape_only(&conn, &config, "unit1", true, false)
+            .expect("--force must override the dirty guard, same as the copy/location checks");
+        assert_eq!(unit_status(&conn), "tape_only");
+    }
+
+    #[test]
+    fn mark_tape_only_does_not_block_a_clean_unit() {
+        // Regression guard for the guard itself: proves it doesn't
+        // false-positive on a unit nothing has changed for.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
+        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        // No mutation after the snapshot — stays clean.
+
+        let config = config_with_zero_tape_only_thresholds();
+        unit_mark_tape_only(&conn, &config, "unit1", false, false)
+            .expect("a clean unit must not be blocked by the new dirty guard");
+        assert_eq!(unit_status(&conn), "tape_only");
     }
 }
