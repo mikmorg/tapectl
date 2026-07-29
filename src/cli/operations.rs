@@ -1509,4 +1509,368 @@ mod tests {
             "a refused mark-tape-only must not have changed unit status"
         );
     }
+
+    /// Issue #38/H12: `volume_retire`'s ADR-0008 Tier-2 consent gate.
+    ///
+    /// None of these tests call `volume_retire` with `assume_yes: false`
+    /// in a scenario that would actually reach `cli::consent::confirm` --
+    /// doing so would read the REAL `std::io::stdin().is_terminal()`, and
+    /// on a dev box running `cargo test` attached to an actual terminal
+    /// that could attempt a real prompt and hang the suite (the exact
+    /// issue #33 class of bug consent.rs's own tests exist to rule out).
+    /// So every test here is constructed so the gate either isn't reached
+    /// at all (no at-risk units) or is bypassed via `assume_yes`/`--force`
+    /// (which short-circuit before any stdin interaction). The "refuses
+    /// without consent" behavior itself is proven exhaustively, with
+    /// dependency-injected stdin, in `cli::consent`'s own test module.
+    mod volume_retire_consent {
+        use super::*;
+
+        /// tenant + unit + snapshot + stage_set + a volume `label` with a
+        /// completed write of that stage_set to it. When `with_other_copy`,
+        /// the same stage_set is also completed-written to a second volume,
+        /// so the unit keeps one copy after `label` is retired (not at
+        /// risk). Returns (conn, retiring_volume_id).
+        fn setup_volume_with_one_unit(label: &str, with_other_copy: bool) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u1', 'unitA', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                params![label],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol_id],
+            )
+            .unwrap();
+
+            if with_other_copy {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('OTHER-VOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                    [],
+                )
+                .unwrap();
+                let other_vol_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![stage_set_id, snap_id, other_vol_id],
+                )
+                .unwrap();
+            }
+
+            (conn, vol_id)
+        }
+
+        fn volume_status(conn: &Connection, vol_id: i64) -> String {
+            conn.query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![vol_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn dry_run_mutates_nothing_even_when_a_unit_is_at_risk() {
+            let (conn, vol_id) = setup_volume_with_one_unit("L6-DRYRUN", false);
+            volume_retire(&conn, "L6-DRYRUN", false, true, false).expect("dry-run must succeed");
+
+            assert_eq!(
+                volume_status(&conn, vol_id),
+                "active",
+                "dry-run must not change the volume's status"
+            );
+            let event_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE entity_type = 'volume'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(event_count, 0, "dry-run must not write an audit event");
+        }
+
+        #[test]
+        fn assume_yes_proceeds_even_when_a_unit_is_at_risk() {
+            // Safe: assume_yes=true short-circuits confirm() before any
+            // stdin interaction, regardless of the test process's TTY-ness.
+            let (conn, vol_id) = setup_volume_with_one_unit("L6-FORCED", false);
+            volume_retire(&conn, "L6-FORCED", true, false, false)
+                .expect("--yes must override the zero-copy consent gate");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        #[test]
+        fn proceeds_without_any_consent_gate_when_no_unit_is_at_risk() {
+            // Safe with assume_yes=false: with_other_copy=true means no
+            // unit drops to zero copies, so `confirm()` (and therefore any
+            // stdin interaction) is never reached at all.
+            let (conn, vol_id) = setup_volume_with_one_unit("L6-SAFE", true);
+            volume_retire(&conn, "L6-SAFE", false, false, false)
+                .expect("no at-risk units must retire without any consent gate");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        #[test]
+        fn refusal_json_carries_the_volume_and_the_reason() {
+            // Change 3's explicit requirement: a JSON consumer must be
+            // able to see WHY retirement was refused, not just observe a
+            // non-zero exit. Tests the exact function the refusal branch
+            // calls, so production and test share one code path -- no
+            // stdout capture needed to prove the object's shape.
+            let impacts = vec![("unitA".to_string(), "active".to_string(), 0i64)];
+            let at_risk = vec!["unitA".to_string()];
+            let reason = "retire volume \"L6-0001\" refused: non-interactive session with no \
+                           confirmation given — refusing rather than assuming consent \
+                           (re-run with --yes to proceed)";
+            let json = retire_refusal_json("L6-0001", &impacts, &at_risk, reason);
+
+            assert_eq!(json["volume"], "L6-0001");
+            assert_eq!(json["consent"], "refused");
+            assert_eq!(json["reason"], reason);
+            assert_eq!(json["at_risk_units"][0], "unitA");
+            assert_eq!(json["affected_units"][0]["unit"], "unitA");
+            assert_eq!(json["affected_units"][0]["remaining_copies"], 0);
+        }
+    }
+
+    /// Issue #38/H12: `cartridge_mark_erased`'s ADR-0008 Tier-2 lifecycle
+    /// gate, plus the volume -> 'erased' transition (Change 5). Same
+    /// no-real-stdin discipline as `volume_retire_consent` above: every
+    /// test either avoids the gate (already `pending_erase`) or bypasses
+    /// it via `force`/`assume_yes` (both short-circuit before stdin).
+    mod cartridge_mark_erased_consent {
+        use super::*;
+
+        /// A cartridge in `status`, optionally with a volume currently
+        /// mounted on it (`cartridge_volumes.unmounted_at IS NULL`).
+        /// Returns (conn, cartridge_id, mounted_volume_id).
+        fn setup_cartridge(status: &str, mount_volume: bool) -> (Connection, i64, Option<i64>) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('BC001', 'LTO-6', 2500000000000, ?1)",
+                params![status],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+
+            let vol_id = if mount_volume {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('L6-MOUNTED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'full')",
+                    [],
+                )
+                .unwrap();
+                let vid = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                    params![cart_id, vid],
+                )
+                .unwrap();
+                Some(vid)
+            } else {
+                None
+            };
+
+            (conn, cart_id, vol_id)
+        }
+
+        fn cartridge_status(conn: &Connection, id: i64) -> String {
+            conn.query_row(
+                "SELECT status FROM cartridges WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn volume_status(conn: &Connection, id: i64) -> String {
+            conn.query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn pending_erase_proceeds_without_consent_and_moves_the_volume_to_erased() {
+            // Safe with force=false, assume_yes=false: the cartridge is
+            // already pending_erase (the expected end of the retire ->
+            // bulk-erase -> mark-erased lifecycle), so the gate is never
+            // reached.
+            let (conn, cart_id, vol_id) = setup_cartridge("pending_erase", true);
+            cartridge_mark_erased(&conn, "BC001", false, false, false, false)
+                .expect("pending_erase must mark-erased without any consent gate");
+
+            assert_eq!(cartridge_status(&conn, cart_id), "available");
+            assert_eq!(
+                volume_status(&conn, vol_id.unwrap()),
+                "erased",
+                "the volume that was mounted on this cartridge must move to erased"
+            );
+        }
+
+        #[test]
+        fn force_overrides_a_cartridge_not_in_pending_erase() {
+            let (conn, cart_id, _vol_id) = setup_cartridge("in_use", false);
+            cartridge_mark_erased(&conn, "BC001", true, false, false, false)
+                .expect("--force must override the pending_erase precondition");
+            assert_eq!(cartridge_status(&conn, cart_id), "available");
+        }
+
+        #[test]
+        fn global_yes_also_overrides_a_cartridge_not_in_pending_erase() {
+            // Proves the OR: the global --yes suffices on its own, not
+            // only the command-local --force.
+            let (conn, cart_id, _vol_id) = setup_cartridge("in_use", false);
+            cartridge_mark_erased(&conn, "BC001", false, true, false, false)
+                .expect("the global --yes must also override, not just --force");
+            assert_eq!(cartridge_status(&conn, cart_id), "available");
+        }
+
+        #[test]
+        fn dry_run_mutates_nothing() {
+            let (conn, cart_id, vol_id) = setup_cartridge("in_use", true);
+            cartridge_mark_erased(&conn, "BC001", false, false, true, false)
+                .expect("dry-run must succeed");
+            assert_eq!(
+                cartridge_status(&conn, cart_id),
+                "in_use",
+                "dry-run must not change the cartridge's status"
+            );
+            assert_eq!(
+                volume_status(&conn, vol_id.unwrap()),
+                "full",
+                "dry-run must not change the mounted volume's status"
+            );
+        }
+    }
+
+    /// Issue #38/H12: `db_import`'s always-on ADR-0008 Tier-2 consent
+    /// gate. Only the `assume_yes: true` path is exercised at this level
+    /// (safe -- short-circuits before stdin); the refusal path itself is
+    /// proven, with dependency-injected stdin, in `cli::consent`'s tests.
+    mod db_import_consent {
+        use super::*;
+
+        /// A fresh tapectl home (real files, not `:memory:` -- `db_import`
+        /// opens the destination and source by path) with one tenant row
+        /// named `marker_name`, so a test can tell before/after content
+        /// apart with a single SELECT.
+        fn temp_home_with_marker_tenant(
+            marker_name: &str,
+        ) -> (tempfile::TempDir, crate::config::TapectlPaths) {
+            let tmp = TempDir::new().unwrap();
+            let paths = crate::config::TapectlPaths::new(tmp.path().to_path_buf());
+            paths.ensure_dirs().unwrap();
+            let conn = crate::db::open(&paths.db_file).unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES (?1, 0, 'active')",
+                params![marker_name],
+            )
+            .unwrap();
+            drop(conn);
+            (tmp, paths)
+        }
+
+        fn marker_tenant_name(paths: &crate::config::TapectlPaths) -> String {
+            let conn = crate::db::open(&paths.db_file).unwrap();
+            conn.query_row("SELECT name FROM tenants LIMIT 1", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        #[test]
+        fn dry_run_does_not_touch_the_destination_database() {
+            let (_dest_tmp, dest_paths) = temp_home_with_marker_tenant("dest-original");
+            let (_src_tmp, src_paths) = temp_home_with_marker_tenant("source-marker");
+
+            db_import(
+                &dest_paths,
+                src_paths.db_file.to_str().unwrap(),
+                false,
+                true,
+                false,
+            )
+            .expect("dry-run must succeed");
+
+            assert_eq!(
+                marker_tenant_name(&dest_paths),
+                "dest-original",
+                "dry-run must not touch the destination database"
+            );
+        }
+
+        #[test]
+        fn assume_yes_overwrites_the_destination_with_the_source() {
+            let (_dest_tmp, dest_paths) = temp_home_with_marker_tenant("dest-original");
+            let (_src_tmp, src_paths) = temp_home_with_marker_tenant("source-marker");
+
+            db_import(
+                &dest_paths,
+                src_paths.db_file.to_str().unwrap(),
+                true,
+                false,
+                false,
+            )
+            .expect("assume_yes must let the import proceed");
+
+            assert_eq!(
+                marker_tenant_name(&dest_paths),
+                "source-marker",
+                "the destination must now hold the source's content"
+            );
+        }
+
+        #[test]
+        fn missing_source_errors_before_touching_anything() {
+            let (_dest_tmp, dest_paths) = temp_home_with_marker_tenant("dest-original");
+            let err = db_import(
+                &dest_paths,
+                "/nonexistent/path/to/nowhere.db",
+                true,
+                false,
+                false,
+            )
+            .expect_err("a missing import source must error");
+            assert!(err.to_string().contains("not found"), "{err}");
+            assert_eq!(
+                marker_tenant_name(&dest_paths),
+                "dest-original",
+                "a rejected import must not touch the destination"
+            );
+        }
+    }
 }
