@@ -2022,8 +2022,20 @@ Tasks:
 - [x] Comprehensive unit tests for every module
 - [x] Integration tests against mhvtl (automated test suite)
 - [x] End-to-end tests: init → multi-tenant write → multi-tape restore
-- [x] Failure mode tests: interrupted writes, corrupted staging, missing keys,
-  crashed DB recovery, raw-volume restore, ENOSPC recovery
+- [x] Failure mode tests: interrupted writes (`session.rs`
+  `sigint_between_entries_interrupts_and_resume_completes_the_session`,
+  `resume_after_interrupt_before_any_entry_restarts_from_bot`), ENOSPC
+  recovery (`session.rs`
+  `enospc_mid_execute_aborts_unsealed_same_as_hash_mismatch`, fault-injected
+  via `MemStore::with_enospc_after`), corrupted staging (at the pipeline
+  layer, not just crypto: `staging/validate.rs`, `volume/build.rs`,
+  `volume/restore.rs`, `volume/session.rs`), missing keys, crashed DB
+  recovery (`tests/failure_modes.rs`)
+- [ ] Raw-volume-restore failure test — no `tapectl restore --raw-volume`
+  command exists. Per #63 the *capability* is deliberately served by the
+  heir path (RESTORE.sh reads the front index and cross-checks each slice
+  against both the manifest and the index before decrypting), so this is a
+  missing command, not a missing recovery route.
 - [x] Performance tests: large units, many units (500+), many files (5K+) — dev-VM
   scale; production 2+ TB / 100K+ targets gated on real hardware (see
   `docs/perf-baselines.md`)
