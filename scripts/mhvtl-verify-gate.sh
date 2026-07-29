@@ -118,16 +118,23 @@ check() { # check <name> <fn>
     if "$@" >"$RUN/log-$name.txt" 2>&1; then RESULT[$name]=PASS; else RESULT[$name]=FAIL; fi
     echo "  [$name] ${RESULT[$name]}"
 }
-EXPECTED_FAIL=(
-    stage_symlink_unit        # H7  (#33): symlinks break staging
-    # H1 fixed in #24: the mini-index is generated from the complete Layout, so
-    # it now lists the envelopes and the no-tapectl heir path works end-to-end
-    # (find-envelope + full restore, byte-identical).
-    # H8 fixed in #34: list_slices parses dar's numeric slice index instead of
-    # sorting filenames lexicographically, so slice_number no longer permutes at
-    # >=10 slices. Verified on tape 2026-07-29: unitB staged a clean 1..=12 run
-    # and restore_multislice_unit's `diff -r` came back byte-identical.
-)
+# EMPTY as of 2026-07-29 — every check below must now PASS. Do not add an
+# entry here to make a red gate green; a new failure is a regression to fix,
+# and the array may only grow via a deliberate, ticketed decision.
+#
+# History of what used to be pinned here:
+#   H1 fixed in #24: the mini-index is generated from the complete Layout, so
+#     it now lists the envelopes and the no-tapectl heir path works end-to-end
+#     (find-envelope + full restore, byte-identical).
+#   H8 fixed in #34: list_slices parses dar's numeric slice index instead of
+#     sorting filenames lexicographically, so slice_number no longer permutes
+#     at >=10 slices. Verified on tape: unitB staged a clean 1..=12 run and
+#     restore_multislice_unit's `diff -r` came back byte-identical.
+#   H7 fixed in #33: the directory walk records each entry's file type, and
+#     content validation (size + sha256) applies to regular files only, so a
+#     symlink no longer false-DIRTYs (lstat target-string length vs the
+#     followed target's size) and a FIFO can no longer block staging forever.
+EXPECTED_FAIL=()
 
 # ---------- fixtures ----------
 CANARY="CANARY_tapectl_gate_$(date +%s)"
@@ -246,6 +253,21 @@ step_restore_B() {
     TCTL restore unit --unit unitB --from "$LABEL" --to "$RUN/restored-B" --device "$TAPE_DEV" \
     && diff -r "$SRC/unitB" "$RUN/restored-B"
 }
+# unitC carries a good symlink and a deliberately broken one. Before #33 it
+# could not stage at all, so nothing ever checked that a symlink SURVIVES a
+# round trip -- only that staging didn't error.
+#
+# `--no-dereference` is load-bearing, not a style choice: plain `diff -r`
+# FOLLOWS symlinks, so if a symlink were restored as a flattened regular copy
+# of its target, plain `diff -r` exits 0 and the check silently cannot fail.
+# Demonstrated on diffutils 3.10 before this leg was written. With
+# --no-dereference, both flattening and a wrong target exit 1. It also lets
+# the broken symlink compare as a symlink instead of erroring on its missing
+# target.
+step_restore_C() {
+    TCTL restore unit --unit unitC --from "$LABEL" --to "$RUN/restored-C" --device "$TAPE_DEV" \
+    && diff -r --no-dereference "$SRC/unitC" "$RUN/restored-C"
+}
 
 echo "gate: leg 1 — tapectl round trip"
 check init            step_init
@@ -261,6 +283,7 @@ check volume_verify   step_vol_verify
 check evidence_row    step_evidence
 check restore_diff    step_restore_A
 check restore_multislice_unit step_restore_B
+check restore_symlink_unit    step_restore_C
 
 # ---------- leg 3a: negative crypto + leak scan (before heir leg rewinds) ----------
 step_crosskey() {
@@ -311,14 +334,30 @@ step_heir_restore() {
     # RESTORE.sh extracts the unit's contents directly into --to (dar restores
     # the unit's own tree), so compare that tree to the source directly — same
     # shape as the tapectl restore_diff leg.
-    (cd "$HEIR" && ./RESTORE.sh --restore --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered") \
+    #
+    # `--unit unitA` is REQUIRED, and its absence used to pass only by
+    # accident: alice owns both unitA and unitC, but before #33 unitC could
+    # never stage, so alice's envelope happened to hold exactly one unit and
+    # RESTORE.sh had nothing to disambiguate. With #33 fixed, unitC reaches
+    # the tape and RESTORE.sh correctly refuses to guess ("FATAL: multiple
+    # units found"). Naming the unit restores the intended assertion — this
+    # leg diffs against $SRC/unitA, so it must ask for unitA.
+    (cd "$HEIR" && ./RESTORE.sh --restore --unit unitA --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered") \
     && diff -r "$SRC/unitA" "$HEIR/recovered"
+}
+# The heir path is the reason this project exists, so symlink survival is
+# checked there too, not only through tapectl. See step_restore_C for why
+# --no-dereference is mandatory here.
+step_heir_restore_symlinks() {
+    (cd "$HEIR" && ./RESTORE.sh --restore --unit unitC --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-C") \
+    && diff -r --no-dereference "$SRC/unitC" "$HEIR/recovered-C"
 }
 echo "gate: leg 2 — heir leg (RESTORE.sh, no tapectl)"
 check heir_extract_script step_heir_extract
 check heir_info           step_heir_info
 check heir_find_envelope  step_heir_find
 check heir_restore        step_heir_restore
+check heir_restore_symlink_unit step_heir_restore_symlinks
 
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
