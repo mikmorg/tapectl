@@ -966,6 +966,80 @@ pub fn db_backup(paths: &TapectlPaths, dest: &str) -> Result<()> {
     Ok(())
 }
 
+/// DB import: restore a backup file over the live database.
+///
+/// Always destructive — the live database's entire contents are replaced
+/// with `import_path`'s. Always gated on consent (ADR-0008 Tier 2: `--yes`
+/// overrides; a non-interactive session with no `--yes` refuses rather
+/// than assuming consent — see `cli::consent`). `--dry-run` reports what
+/// would happen and changes nothing.
+pub fn db_import(
+    paths: &TapectlPaths,
+    import_path: &str,
+    assume_yes: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    if !Path::new(import_path).exists() {
+        return Err(TapectlError::Other(format!(
+            "import source not found: {import_path}"
+        )));
+    }
+
+    let dest_display = paths.db_file.display().to_string();
+
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": import_path, "destination": dest_display, "dry_run": true,
+                })
+            );
+        } else {
+            println!(
+                "would import {import_path} over the live database at {dest_display} — no changes made"
+            );
+        }
+        return Ok(());
+    }
+
+    let action = format!("import \"{import_path}\" over the live database");
+    let facts = vec![format!(
+        "this OVERWRITES the entire live database at {dest_display} with the contents of {import_path}"
+    )];
+
+    if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
+        let reason = e.to_string();
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": import_path, "consent": "refused", "reason": reason,
+                })
+            );
+        }
+        return Err(e);
+    }
+
+    let src_conn = rusqlite::Connection::open(import_path)?;
+    let mut dst_conn = rusqlite::Connection::open(&paths.db_file)?;
+    let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
+    backup
+        .run_to_completion(100, std::time::Duration::from_millis(10), None)
+        .map_err(TapectlError::Database)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"source": import_path, "status": "imported"})
+        );
+    } else {
+        println!("database imported from {import_path}");
+    }
+    Ok(())
+}
+
 /// DB fsck: integrity check with optional repair.
 pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
     let mut report = FsckReport::default();

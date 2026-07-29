@@ -233,14 +233,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&counts).unwrap());
             }
             cli::DbCommands::Import { path: import_path } => {
-                // Import = restore from backup
-                let src = rusqlite::Connection::open(import_path)?;
-                let mut dst = rusqlite::Connection::open(&paths.db_file)?;
-                let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
-                backup
-                    .run_to_completion(100, std::time::Duration::from_millis(10), None)
-                    .map_err(|e| anyhow::anyhow!("import failed: {e}"))?;
-                println!("database imported from {import_path}");
+                cli::operations::db_import(&paths, import_path, cli.yes, cli.dry_run, cli.json)?;
             }
             cli::DbCommands::Stats => {
                 let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
