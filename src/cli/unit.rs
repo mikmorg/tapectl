@@ -55,6 +55,11 @@ pub enum UnitCommands {
     Status {
         /// Unit name or path
         name: String,
+        /// Show dirty/clean/new status via an on-disk fingerprint scan
+        /// (checksum_mode-aware — see `unit init`'s checksum_mode) instead
+        /// of the usual detail view
+        #[arg(long)]
+        dirty: bool,
     },
 
     /// Add/remove tags
@@ -223,7 +228,11 @@ pub fn run(
             }
         }
 
-        UnitCommands::Status { name } => {
+        UnitCommands::Status { name, dirty } if *dirty => {
+            show_dirty_status(conn, name, json_output)?;
+        }
+
+        UnitCommands::Status { name, .. } => {
             let unit = resolve_unit(conn, name)?;
             let tags = queries::get_tags_for_unit(conn, unit.id)?;
             let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?;
@@ -345,4 +354,165 @@ fn resolve_unit_name(conn: &Connection, unit_id: i64) -> Result<String> {
         |row| row.get(0),
     )?;
     Ok(unit)
+}
+
+/// One unit's dirty-scan verdict — split out from `show_dirty_status`'s
+/// printing so the result is directly assertable in tests without
+/// capturing stdout.
+struct DirtyStatus {
+    state: &'static str, // "clean" | "new" | "dirty"
+    changes: crate::collection::fingerprint::FingerprintDiff,
+}
+
+/// `unit status --dirty`'s scan: reuses `fingerprint::classify` — the same
+/// scan the Collection layer (`collection sync|status|plan`) and `report
+/// dirty` use — so this can never disagree with them about whether a
+/// unit's disk matches its last snapshot (issue #36/H10).
+fn dirty_status(conn: &Connection, unit: &crate::db::models::Unit) -> Result<DirtyStatus> {
+    use crate::collection::fingerprint::{self, PendingReason};
+
+    Ok(match fingerprint::classify(conn, unit)? {
+        None => DirtyStatus {
+            state: "clean",
+            changes: fingerprint::FingerprintDiff::default(),
+        },
+        Some(p) if p.reason == PendingReason::New => DirtyStatus {
+            state: "new",
+            changes: fingerprint::FingerprintDiff::default(),
+        },
+        Some(p) => DirtyStatus {
+            state: "dirty",
+            changes: p.changes,
+        },
+    })
+}
+
+fn show_dirty_status(conn: &Connection, name: &str, json_output: bool) -> Result<()> {
+    let unit = resolve_unit(conn, name)?;
+    let status = dirty_status(conn, &unit)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "unit": unit.name,
+                "state": status.state,
+                "added": status.changes.added,
+                "removed": status.changes.removed,
+                "modified": status.changes.modified,
+            })
+        );
+    } else {
+        match status.state {
+            "clean" => println!("unit \"{}\": clean", unit.name),
+            "new" => println!("unit \"{}\": new — never archived", unit.name),
+            _ => {
+                println!(
+                    "unit \"{}\": dirty ({} added, {} removed, {} modified)",
+                    unit.name,
+                    status.changes.added.len(),
+                    status.changes.removed.len(),
+                    status.changes.modified.len(),
+                );
+                // The audit's own wording ("shows specific changes") is why
+                // this exists at all — a bare "dirty" doesn't tell an
+                // operator whether it's safe to delete local data.
+                for p in &status.changes.added {
+                    println!("  + {p}");
+                }
+                for p in &status.changes.removed {
+                    println!("  - {p}");
+                }
+                for p in &status.changes.modified {
+                    println!("  ~ {p}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    fn setup_unit(current_path: &str, checksum_mode: &str) -> (Connection, i64) {
+        // Full migration set (not just 001) — snapshot_create's real walk
+        // writes files.file_type/link_target, added by migration 005.
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+             VALUES ('u1', 'unit1', ?1, ?2, ?3, 1, 'active')",
+            params![tid, current_path, checksum_mode],
+        )
+        .unwrap();
+        let uid = conn.last_insert_rowid();
+        (conn, uid)
+    }
+
+    #[test]
+    fn a_clean_unit_reports_clean() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
+        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+
+        let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+        let status = dirty_status(&conn, &unit).unwrap();
+        assert_eq!(status.state, "clean");
+        assert!(status.changes.is_empty());
+    }
+
+    #[test]
+    fn a_never_archived_unit_reports_new() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
+        // No snapshot_create call — never archived.
+
+        let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+        let status = dirty_status(&conn, &unit).unwrap();
+        assert_eq!(status.state, "new");
+    }
+
+    #[test]
+    fn a_modified_unit_reports_dirty_and_names_the_changed_file() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
+        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+
+        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+
+        let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+        let status = dirty_status(&conn, &unit).unwrap();
+        assert_eq!(status.state, "dirty");
+        assert_eq!(status.changes.modified, vec!["f.txt".to_string()]);
+    }
+
+    #[test]
+    fn show_dirty_status_runs_end_to_end_for_a_dirty_unit() {
+        // Wiring smoke test: the CLI-facing function must run to completion
+        // (JSON and plain) against a real dirty unit, not just the
+        // underlying dirty_status() helper the tests above exercise
+        // directly.
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
+        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+
+        show_dirty_status(&conn, "unit1", false).expect("plain output must succeed");
+        show_dirty_status(&conn, "unit1", true).expect("json output must succeed");
+    }
 }
