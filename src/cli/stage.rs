@@ -145,7 +145,7 @@ pub fn run(
                      FROM stage_sets ss
                      JOIN snapshots s ON s.id = ss.snapshot_id
                      WHERE s.unit_id = ?1 AND s.version = ?2
-                     ORDER BY ss.created_at DESC LIMIT 1",
+                     ORDER BY ss.created_at DESC, ss.id DESC LIMIT 1",
                     params![unit.id, version],
                     |row| {
                         Ok((
@@ -163,6 +163,18 @@ pub fn run(
                 .map_err(|_| {
                     TapectlError::Other(format!("no stage set for \"{name}\" v{version}"))
                 })?;
+
+            // Once issue #53 lets a snapshot carry several stage sets (a
+            // re-stage after `staging clean`), the query above still shows
+            // only the newest — this count lets both output modes say so
+            // without hiding the others' existence.
+            let stage_set_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 WHERE s.unit_id = ?1 AND s.version = ?2",
+                params![unit.id, version],
+                |row| row.get(0),
+            )?;
 
             // Get slices
             let mut stmt = conn.prepare(
@@ -192,10 +204,16 @@ pub fn run(
                         "status": status, "dar_version": dar_ver,
                         "num_slices": num_slices, "total_dar_size": dar_size,
                         "total_encrypted_size": enc_size, "slices": slice_json,
+                        "stage_set_count": stage_set_count,
                     })
                 );
             } else {
                 println!("Stage set for {name} v{version} (id={ss_id})");
+                if stage_set_count > 1 {
+                    println!(
+                        "  ({stage_set_count} stage sets exist for this version; showing the newest)"
+                    );
+                }
                 println!("  Status:    {status}");
                 if let Some(dv) = &dar_ver {
                     println!("  dar:       {dv}");
@@ -519,5 +537,122 @@ mod tests {
             count, 2,
             "re-staging must add a second stage set, not replace the first"
         );
+    }
+
+    /// Issue #53 change 4: once a snapshot can have several stage sets,
+    /// `stage info` must not silently hide the siblings. It still shows
+    /// only the newest (via `ORDER BY created_at DESC, id DESC`, so two
+    /// stage sets created in the same wall-clock second still resolve
+    /// deterministically to the just-created one), but must be able to
+    /// report how many exist. `run()` only prints to stdout, so this
+    /// exercises the same count query `Info`'s handler runs, against the
+    /// same fixture, rather than scraping process stdout (which would
+    /// race other tests' output under parallel `cargo test`).
+    #[test]
+    fn info_query_counts_sibling_stage_sets_after_a_restage() {
+        let (conn, paths, config, _tmp) = setup();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        // Only one stage set yet — count must be 1, and both output modes
+        // of `Info` must succeed without printing a sibling note.
+        let unit = crate::db::queries::get_unit_by_name(&conn, "unit1")
+            .unwrap()
+            .unwrap();
+        let count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 WHERE s.unit_id = ?1 AND s.version = ?2",
+                params![unit.id, 1i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_before, 1);
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Info {
+                name: "unit1".to_string(),
+                version: 1,
+            },
+            false,
+        )
+        .unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Info {
+                name: "unit1".to_string(),
+                version: 1,
+            },
+            true,
+        )
+        .unwrap();
+
+        crate::staging::clean::clean_staging(&conn, true).unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: Some(1),
+            },
+            false,
+        )
+        .unwrap();
+
+        let count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 WHERE s.unit_id = ?1 AND s.version = ?2",
+                params![unit.id, 1i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after, 2,
+            "the exact query `stage info` uses to build stage_set_count must \
+             see both stage sets once a re-stage has happened"
+        );
+
+        // `Info` must still resolve to a single row (the newest) and not
+        // error, in both output modes, now that two exist for this version.
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Info {
+                name: "unit1".to_string(),
+                version: 1,
+            },
+            false,
+        )
+        .unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Info {
+                name: "unit1".to_string(),
+                version: 1,
+            },
+            true,
+        )
+        .unwrap();
     }
 }
