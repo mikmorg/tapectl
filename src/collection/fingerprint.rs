@@ -965,8 +965,8 @@ mod tests {
                 tags: vec![],
                 tenant: "t".into(),
                 archive_set: None,
-                checksum_mode: "mtime_size".into(),
-                compression: "none".into(),
+                checksum_mode: Some("mtime_size".into()),
+                compression: Some("none".into()),
                 exclude_patterns: vec!["*.tmp".into(), "Thumbs.db".into()],
             },
         )
@@ -1094,8 +1094,8 @@ mod tests {
                 tags: vec![],
                 tenant: "t".into(),
                 archive_set: None,
-                checksum_mode: "mtime_size".into(),
-                compression: "none".into(),
+                checksum_mode: Some("mtime_size".into()),
+                compression: Some("none".into()),
                 exclude_patterns: vec!["*.tmp".into()],
             },
         )

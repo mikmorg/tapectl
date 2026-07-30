@@ -296,7 +296,9 @@ fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -
         tenant.id,
         archive_set_id,
         dir_path,
-        &df.checksum_mode,
+        df.checksum_mode
+            .as_deref()
+            .unwrap_or(crate::unit::dotfile::DEFAULT_CHECKSUM_MODE),
         true,
     )?;
     events::log_created(conn, "unit", unit_id, &df.name, Some(tenant.id))?;
@@ -539,8 +541,8 @@ mod tests {
                 tags: vec![],
                 tenant: "media".to_string(),
                 archive_set: None,
-                checksum_mode: "mtime_size".to_string(),
-                compression: "none".to_string(),
+                checksum_mode: Some("mtime_size".to_string()),
+                compression: Some("none".to_string()),
                 exclude_patterns: vec![],
             },
         )
@@ -669,8 +671,8 @@ mod tests {
             tags: Vec::new(),
             tenant: "media".to_string(),
             archive_set: Some("bulk-media".to_string()),
-            checksum_mode: "mtime_size".to_string(),
-            compression: "none".to_string(),
+            checksum_mode: Some("mtime_size".to_string()),
+            compression: Some("none".to_string()),
             exclude_patterns: Vec::new(),
         };
 

@@ -140,7 +140,9 @@ fn sync_discovered_unit(
         tenant.id,
         archive_set_id,
         dir_path,
-        &df.checksum_mode,
+        df.checksum_mode
+            .as_deref()
+            .unwrap_or(dotfile::DEFAULT_CHECKSUM_MODE),
         true,
     )?;
     events::log_created(conn, "unit", unit_id, &df.name, Some(tenant.id))?;
@@ -173,8 +175,8 @@ mod tests {
             tags: vec![],
             tenant: "alice".to_string(),
             archive_set: archive_set.map(|s| s.to_string()),
-            checksum_mode: "mtime_size".to_string(),
-            compression: "none".to_string(),
+            checksum_mode: Some("mtime_size".to_string()),
+            compression: Some("none".to_string()),
             exclude_patterns: vec![],
         };
         dotfile::write_dotfile(&dir.join(".tapectl-unit.toml"), &df).unwrap();
