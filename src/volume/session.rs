@@ -479,6 +479,130 @@ impl PlannedSession {
 }
 
 impl InterruptedSession {
+    /// Reconstruct an interrupted session for `volume_id` from durable state
+    /// alone — the `writes`/`write_positions` rows and the frozen session
+    /// staging directory they point at — so `tapectl volume resume` can pick
+    /// up a session whose process is gone (issue #25, playbook T8 remainder).
+    /// Returns `Ok(None)` when there is nothing to resume.
+    ///
+    /// **The Layout is REHYDRATED, never regenerated.** `build()` is not
+    /// reproducible across a process restart, for two independent reasons:
+    /// `BuildInputs::created_at` is `chrono::Utc::now()` at `volume_write`
+    /// call time and is persisted nowhere, and `BuildInputs::mam_loads` is
+    /// `tape::mam::read_mam`'s `load_count`, which increments on every
+    /// cartridge load. Either one drifting changes the ID-thunk bytes, hence
+    /// File 0's sha256, hence the front index that records it. Since
+    /// [`SealedPending::confirm`] diffs the front index read back off the
+    /// medium against the Layout it holds, a regenerated Layout would
+    /// quarantine a perfectly good tape — silent process corruption, not a
+    /// loud failure. `docs/design/layout-session.md`'s Resume rule says the
+    /// frozen generated zones "re-hash byte-identical" (re-hash the frozen
+    /// files, not re-generate them), and `ContentSource`'s doc comment
+    /// records the same conclusion. So this reads `layout.json`
+    /// (`build::LAYOUT_SIDECAR`) and points at the ORIGINAL `session_dir`.
+    ///
+    /// **Only `interrupted` rows are accepted, never `in_progress`.**
+    /// `db::open` calls `recover_orphaned_sessions` unconditionally, which
+    /// sweeps every `in_progress` row to `interrupted` before any command
+    /// holds a `Connection`. A row still `in_progress` by the time this runs
+    /// therefore means a LIVE writer in another process — resuming it would
+    /// put two processes on one tape. It is skipped rather than adopted.
+    ///
+    /// This method only READS. `ValidatedLayout::plan` remains the sole
+    /// writer of `writes` rows (`UNIQUE(stage_set_id, volume_id)` would
+    /// reject an insert here anyway, and `layout-session.md` is explicit that
+    /// resume reuses the existing rows).
+    pub fn rehydrate(conn: &Connection, volume_id: i64) -> Result<Option<InterruptedSession>> {
+        // `plan` inserts one row per unit in order, so ordering by id
+        // reproduces its `write_ids` sequence exactly.
+        let rows: Vec<(i64, i64, Option<String>)> = conn
+            .prepare(
+                "SELECT id, snapshot_id, session_dir FROM writes
+                 WHERE volume_id = ?1 AND status = 'interrupted'
+                 ORDER BY id",
+            )?
+            .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let write_ids: Vec<(i64, i64)> = rows.iter().map(|(id, snap, _)| (*id, *snap)).collect();
+
+        // Every row of one session shares one session directory (plan writes
+        // the same value to all of them). Disagreement means these rows are
+        // not one session, which is not something to guess through.
+        let mut dirs: Vec<&str> = rows
+            .iter()
+            .map(|(id, _, dir)| {
+                dir.as_deref().ok_or_else(|| {
+                    TapectlError::Other(format!(
+                        "volume {volume_id}: interrupted write {id} has no recorded session \
+                         directory (it predates migration 006). The frozen staging files are \
+                         the rewrite source; without them this session cannot be resumed, only \
+                         aborted — mark its `writes` rows aborted and start a fresh write to a \
+                         blank cartridge."
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        dirs.sort_unstable();
+        dirs.dedup();
+        if dirs.len() > 1 {
+            return Err(TapectlError::Other(format!(
+                "volume {volume_id}: its interrupted `writes` rows name {} different session \
+                 directories ({dirs:?}) — these are not one write session, and resuming would \
+                 mix frozen files from different builds. Resolve by hand before retrying.",
+                dirs.len()
+            )));
+        }
+        let session_dir = Path::new(dirs[0]).to_path_buf();
+
+        let sidecar = session_dir.join(super::build::LAYOUT_SIDECAR);
+        let json = std::fs::read(&sidecar).map_err(|e| {
+            TapectlError::Other(format!(
+                "volume {volume_id}: cannot read the frozen layout at {}: {e}. The frozen \
+                 staging files are the rewrite source; without them this session cannot be \
+                 resumed, only aborted (the Layout cannot be rebuilt — its ID thunk embeds a \
+                 `created_at` and a MAM load count that no longer exist).",
+                sidecar.display()
+            ))
+        })?;
+        let layout: super::layout_model::Layout = serde_json::from_slice(&json).map_err(|e| {
+            TapectlError::Other(format!(
+                "volume {volume_id}: the frozen layout at {} is unparseable: {e}",
+                sidecar.display()
+            ))
+        })?;
+
+        // `slice_write_id`, exactly as `plan` built it: it inserted one
+        // `write_positions` row per slice entry, keyed by the owning unit's
+        // write_id, so reading those rows back reproduces the map without
+        // needing the `BuildUnit`s (which no longer exist).
+        let mut slice_write_id = HashMap::new();
+        for (write_id, _) in &write_ids {
+            let mut stmt =
+                conn.prepare("SELECT stage_slice_id FROM write_positions WHERE write_id = ?1")?;
+            let ids: Vec<i64> = stmt
+                .query_map(params![write_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for slice_id in ids {
+                slice_write_id.insert(slice_id, *write_id);
+            }
+        }
+
+        Ok(Some(InterruptedSession {
+            built: BuiltLayout {
+                layout,
+                session_dir,
+            },
+            volume_id,
+            write_ids,
+            slice_write_id,
+        }))
+    }
+
     /// `InterruptedSession -> ResumeOutcome`, checking for interruption via
     /// the real process-global signal flag. See [`Self::resume_checking`]
     /// for the injectable form tests use.
@@ -504,15 +628,15 @@ impl InterruptedSession {
     /// `front_zone_len + written_slices` (both terms exact) and continue.
     /// The absent seal marker confirms the tape is legitimately unsealed.
     ///
-    /// Caller note: this resumes the SAME in-memory session value (e.g.
-    /// after a caught SIGINT within one process, or in a test). Reconstructing
-    /// an `InterruptedSession` after an actual process restart means
-    /// re-reading the ORIGINAL session_dir's frozen files — never calling
-    /// `build()` again, which is not reproducible (`ContentSource::Materialized`'s
-    /// doc comment) — and is the CLI orchestrator's job (T8), not this
-    /// module's; this method only requires that its caller supply a valid
-    /// `BuiltLayout` (carried on `self` from whenever this `InterruptedSession`
-    /// was constructed), however they sourced it.
+    /// Caller note: this requires only that `self` carry a valid
+    /// `BuiltLayout`, however it was sourced — either the same in-memory
+    /// session value `execute` returned (a caught SIGINT within one process,
+    /// or a test), or one rebuilt from durable state by
+    /// [`Self::rehydrate`] after an actual process restart. Rehydration
+    /// re-reads the ORIGINAL `session_dir`'s frozen files and never calls
+    /// `build()` again, which is not reproducible
+    /// (`ContentSource::Materialized`'s doc comment); `write::volume_resume`
+    /// is the CLI orchestrator around it.
     pub fn resume_checking(
         self,
         conn: &Connection,
