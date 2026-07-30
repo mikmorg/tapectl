@@ -12,6 +12,74 @@ pub fn run(
     action_plan: bool,
     json_output: bool,
 ) -> Result<i32> {
+    let (violations, warnings) = collect_findings(conn, config, unit_filter)?;
+
+    // Output
+    let exit_code = if !violations.is_empty() {
+        2
+    } else if !warnings.is_empty() {
+        1
+    } else {
+        0
+    };
+
+    if json_output {
+        let findings: Vec<serde_json::Value> = violations
+            .iter()
+            .map(|f| finding_json(f, "violation"))
+            .chain(warnings.iter().map(|f| finding_json(f, "warning")))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "exit_code": exit_code,
+                "violations": violations.len(),
+                "warnings": warnings.len(),
+                "findings": findings,
+            })
+        );
+    } else if violations.is_empty() && warnings.is_empty() {
+        println!("audit: clean");
+    } else {
+        if !violations.is_empty() {
+            println!("VIOLATIONS ({}):", violations.len());
+            for f in &violations {
+                println!("  [{}] {}: {}", f.check, f.unit, f.message);
+                if action_plan {
+                    println!("    fix: {}", f.action);
+                }
+            }
+        }
+        if !warnings.is_empty() {
+            println!("WARNINGS ({}):", warnings.len());
+            for f in &warnings {
+                println!("  [{}] {}: {}", f.check, f.unit, f.message);
+                if action_plan {
+                    println!("    fix: {}", f.action);
+                }
+            }
+        }
+    }
+    println!(
+        "audit: {} violations, {} warnings (exit {})",
+        violations.len(),
+        warnings.len(),
+        exit_code,
+    );
+
+    Ok(exit_code)
+}
+
+/// Collect every audit finding for `unit_filter` (or all active units),
+/// split into (violations, warnings). Extracted from [`run`] so tests can
+/// assert on the actual finding set — `check` names, counts, which unit —
+/// rather than only the collapsed exit code, which two different finding
+/// combinations can produce identically.
+fn collect_findings(
+    conn: &Connection,
+    config: &Config,
+    unit_filter: Option<&str>,
+) -> Result<(Vec<AuditFinding>, Vec<AuditFinding>)> {
     let mut warnings: Vec<AuditFinding> = Vec::new();
     let mut violations: Vec<AuditFinding> = Vec::new();
 
@@ -23,6 +91,14 @@ pub fn run(
     } else {
         crate::db::queries::list_units(conn, None, Some("active"))?
     };
+
+    // Dirty scan (design §2.20): computed once for all units (or the one
+    // filtered unit) and indexed per-unit below, reusing the exact same
+    // `fingerprint::classify`-backed scan `report dirty` uses rather than a
+    // second implementation (issue #56 / the #33/#36/#48/#49/#89/#96
+    // discipline: one predicate, one place).
+    let dirty_rows =
+        crate::cli::report::dirty_rows(conn, unit_filter, &config.defaults.global_excludes)?;
 
     for unit in &units {
         let resolved = policy::resolve(conn, config, unit);
@@ -123,6 +199,81 @@ pub fn run(
                 ),
             });
         }
+
+        // Check dirty status (design §2.20). MUST NOT fire for
+        // `PendingReason::New` — a never-archived unit is already reported
+        // by `no_archive` above, and firing both would double-report the
+        // same condition (`dirty_rows`'s "new" state, distinct from
+        // "dirty", exists for exactly this reason).
+        if let Some(row) = dirty_rows.iter().find(|r| r.name == unit.name) {
+            if row.state == "dirty" {
+                warnings.push(AuditFinding {
+                    unit: unit.name.clone(),
+                    check: "dirty".into(),
+                    message: format!(
+                        "source has drifted since last archive ({} added, {} removed, {} modified)",
+                        row.added.len(),
+                        row.removed.len(),
+                        row.modified.len(),
+                    ),
+                    action: format!(
+                        "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
+                        unit.name, unit.name
+                    ),
+                });
+            }
+        }
+
+        // Check encryption compliance (design §2.20). Fires when policy
+        // requires encryption but at least one `stage_sets` row written to
+        // an in-service volume for the unit's current snapshot is
+        // unencrypted. The join mirrors `copy_count_for_unit` exactly
+        // (writes -> stage_sets -> snapshots, `s.status = 'current'`,
+        // `w.status = 'completed'`), scoped the same way every other
+        // per-unit check in this file is.
+        //
+        // Known and accepted gap: a plaintext stage_set written under a
+        // now-superseded (non-`current`) snapshot is still plaintext on a
+        // tape but will not be reported here, because this check scopes to
+        // the current snapshot like its neighbours. Widening that is
+        // deliberately out of scope for this task.
+        //
+        // Uses `policy::coverage::in_service`, not `eligible`: this is an
+        // inventory question ("is unencrypted data sitting on media we
+        // still account for?"), not a durability/copy-count claim, so the
+        // wider in-service set (active/full/sealed) is correct here — see
+        // `in_service`'s doc comment. Routing through the shared predicate
+        // rather than inlining a status list is the discipline issue #96
+        // established.
+        if resolved.encrypt {
+            let unencrypted_count: i64 = {
+                let sql = format!(
+                    "SELECT COUNT(*)
+                     FROM writes w
+                     JOIN stage_sets ss ON ss.id = w.stage_set_id
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     JOIN volumes v ON v.id = w.volume_id
+                     WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+                       AND ss.encrypted = 0 AND {}",
+                    policy::coverage::in_service("v")
+                );
+                conn.query_row(&sql, params![unit.id], |row| row.get(0))?
+            };
+
+            if unencrypted_count > 0 {
+                violations.push(AuditFinding {
+                    unit: unit.name.clone(),
+                    check: "encryption".into(),
+                    message: format!(
+                        "{unencrypted_count} unencrypted stage set(s) on tape, policy requires encryption"
+                    ),
+                    action: format!(
+                        "tapectl stage create {} && tapectl volume write <LABEL>",
+                        unit.name
+                    ),
+                });
+            }
+        }
     }
 
     // Check compaction candidates (volume-level, not per-unit)
@@ -133,62 +284,7 @@ pub fn run(
         )?);
     }
 
-    // Output
-    let exit_code = if !violations.is_empty() {
-        2
-    } else if !warnings.is_empty() {
-        1
-    } else {
-        0
-    };
-
-    if json_output {
-        let findings: Vec<serde_json::Value> = violations
-            .iter()
-            .map(|f| finding_json(f, "violation"))
-            .chain(warnings.iter().map(|f| finding_json(f, "warning")))
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({
-                "exit_code": exit_code,
-                "violations": violations.len(),
-                "warnings": warnings.len(),
-                "findings": findings,
-            })
-        );
-    } else {
-        if violations.is_empty() && warnings.is_empty() {
-            println!("audit: clean");
-        } else {
-            if !violations.is_empty() {
-                println!("VIOLATIONS ({}):", violations.len());
-                for f in &violations {
-                    println!("  [{}] {}: {}", f.check, f.unit, f.message);
-                    if action_plan {
-                        println!("    fix: {}", f.action);
-                    }
-                }
-            }
-            if !warnings.is_empty() {
-                println!("WARNINGS ({}):", warnings.len());
-                for f in &warnings {
-                    println!("  [{}] {}: {}", f.check, f.unit, f.message);
-                    if action_plan {
-                        println!("    fix: {}", f.action);
-                    }
-                }
-            }
-        }
-        println!(
-            "audit: {} violations, {} warnings (exit {})",
-            violations.len(),
-            warnings.len(),
-            exit_code,
-        );
-    }
-
-    Ok(exit_code)
+    Ok((violations, warnings))
 }
 
 /// A unit's current copy count for `audit`'s `copy_count` check.
@@ -627,6 +723,234 @@ mod tests {
                  so exit 1 means the finding really reached the warning list, and \
                  exit 0 means audit passed silently on two under-utilized sealed tapes"
             );
+        }
+    }
+
+    /// Issue #56 / design §2.20: the two previously-missing checks —
+    /// encryption compliance (violation) and dirty status (warning).
+    mod encryption_and_dirty_checks {
+        use super::*;
+        use tempfile::TempDir;
+
+        /// tenant + one active unit (no `current_path`, matching
+        /// `setup_unit_with_two_volumes`) + one `current` snapshot + one
+        /// `stage_sets` row with the given `encrypted` flag, written
+        /// (`writes.status = 'completed'`) to one volume of the given
+        /// status. Returns `(conn, unit_id)`.
+        fn setup_unit_with_stage_set(
+            name: &str,
+            encrypted: i64,
+            volume_status: &str,
+        ) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                params![format!("uuid-{name}"), name, tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
+                 VALUES (?1, 'staged', 524288, ?2)",
+                params![snap_id, encrypted],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES ('{name}-VOL', 'lto', 'lto0', 'LTO-6', 2500000000000, '{volume_status}')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol_id],
+            )
+            .unwrap();
+
+            (conn, unit_id)
+        }
+
+        /// A `Config` with `min_copies_for_tape_only` zeroed out, so the
+        /// `copy_count` check (min_copies default 2) never fires in these
+        /// fixtures, which intentionally have 0 or 1 eligible (`sealed`)
+        /// copies. Without this, `copy_count`'s violation/warning noise
+        /// would make an exit-code-only assertion pass for the wrong
+        /// reason — exactly the trap the doc comments below call out.
+        fn config_without_min_copies() -> Config {
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 0;
+            config
+        }
+
+        /// A `current`-snapshot stage_set with `encrypted = 0` on a
+        /// `sealed` (in-service) volume, with policy demanding encryption
+        /// (the `Config` default), must be a VIOLATION — plaintext really
+        /// is sitting on tape. Asserted on the specific `check` name, not
+        /// just the exit code: confirmed this fails without the change by
+        /// running it against the pre-change `run` (no `encryption` check
+        /// at all) — `violations` was empty and `exit_code` was 0, since
+        /// `config_without_min_copies` also neutralizes `copy_count`.
+        #[test]
+        fn encryption_check_fires_for_unencrypted_stage_set_on_in_service_volume() {
+            let (conn, _unit_id) = setup_unit_with_stage_set("audit-plain", 0, "sealed");
+            let config = config_without_min_copies();
+            let (violations, _warnings) =
+                collect_findings(&conn, &config, Some("audit-plain")).unwrap();
+            assert_eq!(violations.len(), 1);
+            assert_eq!(violations[0].check, "encryption");
+            assert_eq!(violations[0].unit, "audit-plain");
+        }
+
+        /// Same fixture, but `encrypted = 1`: must NOT fire.
+        #[test]
+        fn encryption_check_does_not_fire_when_encrypted() {
+            let (conn, unit_id) = setup_unit_with_stage_set("audit-enc", 1, "sealed");
+            let count: i64 = {
+                let sql = format!(
+                    "SELECT COUNT(*)
+                     FROM writes w
+                     JOIN stage_sets ss ON ss.id = w.stage_set_id
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     JOIN volumes v ON v.id = w.volume_id
+                     WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+                       AND ss.encrypted = 0 AND {}",
+                    policy::coverage::in_service("v")
+                );
+                conn.query_row(&sql, params![unit_id], |row| row.get(0))
+                    .unwrap()
+            };
+            assert_eq!(count, 0, "an encrypted stage set must not count");
+        }
+
+        /// Same unencrypted stage_set, but the volume is `retired` — not
+        /// `in_service` — so the check must NOT fire, proving the
+        /// coverage predicate is actually applied rather than the check
+        /// firing on any unencrypted stage_set regardless of where it
+        /// lives.
+        #[test]
+        fn encryption_check_ignores_a_not_in_service_volume() {
+            let (conn, _unit_id) = setup_unit_with_stage_set("audit-retired", 0, "retired");
+            let config = config_without_min_copies();
+            let (violations, _warnings) =
+                collect_findings(&conn, &config, Some("audit-retired")).unwrap();
+            assert!(
+                violations.iter().all(|f| f.check != "encryption"),
+                "an unencrypted stage set on a retired (not in-service) volume is not a live finding"
+            );
+        }
+
+        /// A unit whose on-disk directory drifted from its recorded
+        /// fingerprint since its last snapshot must produce a `dirty`
+        /// WARNING (exit 1), mirroring `report.rs`'s dirty tests
+        /// (`report::tests::setup_two_units`).
+        #[test]
+        fn dirty_check_fires_for_a_unit_that_drifted_since_its_snapshot() {
+            let root = TempDir::new().unwrap();
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+
+            let dir = root.path().join("dirty_unit");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES ('u-dirty', 'dirty_unit', ?1, ?2, 'mtime_size', 1, 'active')",
+                params![tid, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+
+            crate::staging::snapshot_create(&conn, "dirty_unit", &[]).unwrap();
+            // Mark the snapshot 'current' (snapshot_create alone leaves it
+            // 'created') so `no_archive` doesn't also fire here — this test
+            // isolates the `dirty` check specifically.
+            conn.execute(
+                "UPDATE snapshots SET status = 'current' WHERE unit_id = \
+                 (SELECT id FROM units WHERE name = 'dirty_unit')",
+                [],
+            )
+            .unwrap();
+            std::fs::write(dir.join("g.txt"), b"new file").unwrap();
+
+            let config = config_without_min_copies();
+            let (violations, warnings) =
+                collect_findings(&conn, &config, Some("dirty_unit")).unwrap();
+            assert!(violations.is_empty());
+            assert_eq!(warnings.len(), 1, "exactly one warning (dirty) is expected");
+            assert_eq!(warnings[0].check, "dirty");
+            assert_eq!(warnings[0].unit, "dirty_unit");
+        }
+
+        /// A never-archived (`PendingReason::New`) unit must NOT trigger
+        /// the dirty check — that would double-report the same condition
+        /// `no_archive` already reports. Confirmed this fails without the
+        /// `state == "dirty"` guard: `dirty_rows` classifies a brand new
+        /// unit as `state == "new"`, and a naive `!= "clean"` check (which
+        /// is what an implementation without the guard would plausibly
+        /// write) would fire here, producing a SECOND (dirty) warning
+        /// alongside `no_archive`, which the exact-count assertion below
+        /// would catch.
+        #[test]
+        fn dirty_check_does_not_fire_for_a_never_archived_unit() {
+            let root = TempDir::new().unwrap();
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+
+            let dir = root.path().join("new_unit");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES ('u-new', 'new_unit', ?1, ?2, 'mtime_size', 1, 'active')",
+                params![tid, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+
+            let config = config_without_min_copies();
+            let (violations, warnings) =
+                collect_findings(&conn, &config, Some("new_unit")).unwrap();
+            assert!(violations.is_empty());
+            assert_eq!(
+                warnings.len(),
+                1,
+                "exactly one warning (no_archive) is expected; a second (dirty) warning \
+                 here would mean the New-exclusion guard is missing or wrong — confirmed \
+                 by temporarily replacing the `row.state == \"dirty\"` guard with \
+                 `row.state != \"clean\"` while developing this test, which made this \
+                 assertion fail with warnings.len() == 2"
+            );
+            assert_eq!(warnings[0].check, "no_archive");
         }
     }
 }
