@@ -136,6 +136,25 @@ Rules that hold in every path:
   zone length is fixed by the Layout, the slice count by the cursor rows) and
   continue. The absent seal marker confirms the tape is legitimately unsealed
   (safe to resume, not an append to a sealed volume).
+- **Resume across a process restart** (#25): the rule above is scoped "same
+  session", meaning the `InterruptedSession` value `execute` returned. When the
+  process itself is gone, that value must be rebuilt — and it is **rehydrated,
+  never regenerated**. `build()` is not reproducible across a restart for two
+  independent reasons: `BuildInputs::created_at` is `Utc::now()` at call time
+  and is persisted nowhere, and `mam_loads` is the drive's load count, which
+  increments on every cartridge load. Either one drifting changes the ID-thunk
+  bytes, so a regenerated Layout would disagree with File 0 and **Confirm would
+  quarantine a perfectly good tape** — silent corruption, not a loud failure.
+  Hence "re-hash byte-identical" above means re-hash the *frozen files*, not
+  re-generate them. The durable path back to them: `plan` records the session
+  staging directory on every `writes` row it inserts (`writes.session_dir`,
+  migration 006 — `plan` is the sole writer), and `build()` freezes the Layout
+  itself to `session_dir/layout.json` (a staging-side sidecar; never a
+  `LayoutEntry`, never on tape). `InterruptedSession::rehydrate` reads both,
+  reconstructs the cursor map from `write_positions`, and adopts only
+  `interrupted` rows — never `in_progress`, since `db::open` sweeps those
+  before any command holds a `Connection`, so one still `in_progress` means a
+  live writer in another process. Revalidation is unchanged and still runs.
 - **Confirm** (#23): a single forward pass from BOP (the index is at the front,
   not the tail — no seek-back). Read the seal marker and verify it binds File 3;
   diff the front index against the Layout (navigable tier); hash each file
