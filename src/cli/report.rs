@@ -235,6 +235,20 @@ fn in_service_volume_count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
+/// Bytes held by the volumes [`in_service_volume_count`] counts.
+///
+/// Filtered by the SAME predicate on purpose (issue #96): an unfiltered sum
+/// here would report bytes carried by retired, erased, and missing media
+/// beside a count that excludes exactly those volumes, so the two numbers
+/// on one `report summary` line would describe different populations.
+fn in_service_bytes_written(conn: &Connection) -> Result<i64> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(bytes_written),0) FROM volumes WHERE {}",
+        crate::policy::coverage::in_service("volumes")
+    );
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
 fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
     let unit_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM units WHERE status = 'active'",
@@ -253,11 +267,7 @@ fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    let total_bytes: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(bytes_written),0) FROM volumes",
-        [],
-        |r| r.get(0),
-    )?;
+    let total_bytes: i64 = in_service_bytes_written(conn)?;
     let staged_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'",
         [],
@@ -1485,6 +1495,24 @@ mod tests {
             seed_written_volume(&conn, unit, "ERA01", "erased", 1000, 100, 0);
 
             assert_eq!(in_service_volume_count(&conn).unwrap(), 0);
+        }
+
+        /// `report summary` prints the count and the byte total on one line,
+        /// so they must describe the same population (issue #96). An
+        /// unfiltered sum would report the retired volume's bytes beside a
+        /// count of 1, which reads as "one volume holding 3000 bytes".
+        #[test]
+        fn summary_bytes_and_count_describe_the_same_volumes() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "SEAL05", "sealed", 1000, 100, 900);
+            seed_written_volume(&conn, unit, "RET03", "retired", 2000, 100, 0);
+
+            assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
+            assert_eq!(
+                in_service_bytes_written(&conn).unwrap(),
+                1000,
+                "the retired volume's bytes must not be summed into an in-service total"
+            );
         }
 
         #[test]
