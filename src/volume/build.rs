@@ -130,8 +130,9 @@ pub struct BuildInputs {
     pub operator_public_keys: Vec<String>,
     /// The permanent Escrow Recipient (ADR-0005), appended to every
     /// encryption's recipient list when present. Escrow wiring landed in T2;
-    /// `None` here now means only "the caller intentionally omits it" (e.g.
-    /// no orchestrator wires this up yet — T8's job). `BuiltLayout::validate`'s
+    /// `None` here now means only "the caller intentionally omits it" (test
+    /// fixtures do; `write::volume_write` supplies the registered escrow key).
+    /// `BuiltLayout::validate`'s
     /// `KeyAvailability.escrow_recipient_present` is a separate, independent
     /// check (matching the existing `Layout::validate` design — it does not
     /// re-derive from what `build()` actually used).
@@ -474,14 +475,14 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     entries.sort_by_key(|e| e.position);
 
     let layout = Layout {
-            label: inputs.label.clone(),
-            volume_uuid: inputs.volume_uuid.clone(),
-            media_type: inputs.media_type.clone(),
-            block_size: inputs.block_size,
-            budget: CapacityBudget {
-                available_bytes: inputs.usable_bytes,
-                reserve_bytes: inputs.enospc_buffer,
-            },
+        label: inputs.label.clone(),
+        volume_uuid: inputs.volume_uuid.clone(),
+        media_type: inputs.media_type.clone(),
+        block_size: inputs.block_size,
+        budget: CapacityBudget {
+            available_bytes: inputs.usable_bytes,
+            reserve_bytes: inputs.enospc_buffer,
+        },
         entries,
     };
 
@@ -504,9 +505,8 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     // frozen zones to "re-hash byte-identical"; this is what makes that
     // reachable from a cold start.
     let sidecar = session_dir.join(LAYOUT_SIDECAR);
-    let json = serde_json::to_vec_pretty(&layout).map_err(|e| {
-        TapectlError::Other(format!("build: serializing the layout sidecar: {e}"))
-    })?;
+    let json = serde_json::to_vec_pretty(&layout)
+        .map_err(|e| TapectlError::Other(format!("build: serializing the layout sidecar: {e}")))?;
     fs::write(&sidecar, &json)
         .map_err(|e| TapectlError::Other(format!("build: writing {}: {e}", sidecar.display())))?;
 

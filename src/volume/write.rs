@@ -24,7 +24,7 @@ use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, ZoneKind,
 };
 use super::session::{
-    check_tape_contact, ConfirmOutcome, ContactOutcome, ExecuteOutcome, QuarantineReason,
+    self, check_tape_contact, ConfirmOutcome, ContactOutcome, QuarantineReason, ResumeOutcome,
 };
 
 /// STOP-GAP pending an explicit operator/schema decision — see the T8 report.
@@ -224,12 +224,11 @@ pub fn volume_write(
     // Refuse fast, before any real work, if this volume already has an
     // unresolved write session. `ValidatedLayout::plan` would otherwise hit
     // `writes`' `UNIQUE(stage_set_id, volume_id)` with a raw constraint
-    // error on the retry. Cross-process resume — reconstructing a
-    // `BuiltLayout` from a prior session's frozen files without recalling
-    // `build()`, per `session::InterruptedSession::resume_checking`'s own
-    // doc comment ("the CLI orchestrator's job (T8)") — is not wired into
-    // this orchestrator (see the T8 report); this guard only turns what
-    // would otherwise be an opaque SQL error into a clear, honest refusal.
+    // error on the retry, and — worse — a fresh `build()` would produce a
+    // Layout that cannot match what a partially written tape already holds
+    // (its ID thunk embeds a `created_at` and a MAM load count that have
+    // since moved on). An interrupted session is resumed, never re-written:
+    // that is `volume_resume`'s job.
     let existing_sessions: i64 = conn.query_row(
         "SELECT COUNT(*) FROM writes WHERE volume_id = ?1 AND status IN ('planned','in_progress','interrupted')",
         params![volume_id],
@@ -238,9 +237,10 @@ pub fn volume_write(
     if existing_sessions > 0 {
         return Err(TapectlError::Other(format!(
             "volume \"{label}\" already has an unresolved write session \
-             (status planned/in_progress/interrupted) — automatic cross-process resume \
-             is not yet wired; inspect the `writes`/`write_positions` rows for volume_id \
-             {volume_id} before retrying"
+             (status planned/in_progress/interrupted). If it was interrupted, reload the \
+             same cartridge and run `tapectl volume resume {label}` — it continues that \
+             session from its frozen staging files rather than rebuilding it. Otherwise \
+             inspect the `writes`/`write_positions` rows for volume_id {volume_id}."
         )));
     }
 
@@ -264,53 +264,15 @@ pub fn volume_write(
     // this was that "nothing").
     let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer).max(0) as u64;
 
-    // Tenants + keys: one TenantInfo per distinct tenant_id in this batch,
-    // its own active (non-escrow) keys only — build() appends operator and
-    // escrow keys itself (`with_escrow`).
     let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
     distinct_tenant_ids.sort_unstable();
     distinct_tenant_ids.dedup();
-
-    let mut tenants = Vec::with_capacity(distinct_tenant_ids.len());
-    let mut tenants_with_active_key = HashSet::new();
-    for &tenant_id in &distinct_tenant_ids {
-        let tenant = queries::get_tenant_by_id(conn, tenant_id)?
-            .ok_or_else(|| TapectlError::Other(format!("tenant {tenant_id} not found")))?;
-        let keys = queries::get_active_keys_for_tenant(conn, tenant_id)?;
-        if keys.is_empty() {
-            return Err(TapectlError::Other(format!(
-                "tenant \"{}\" (id={tenant_id}) has no active key — cannot encrypt its envelope",
-                tenant.name
-            )));
-        }
-        tenants_with_active_key.insert(tenant_id);
-        tenants.push(TenantInfo {
-            tenant_id,
-            tenant_name: tenant.name,
-            public_keys: keys.into_iter().map(|k| k.public_key).collect(),
-        });
-    }
-
-    let operator = queries::get_operator_tenant(conn)?
-        .ok_or_else(|| TapectlError::Other("no operator tenant configured".into()))?;
-    let operator_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
-    if operator_keys.is_empty() {
-        return Err(TapectlError::Other("operator has no active key".into()));
-    }
-    let operator_public_keys: Vec<String> =
-        operator_keys.into_iter().map(|k| k.public_key).collect();
-
-    // ADR-0005: the permanent escrow recipient. `None` fails validation via
-    // `KeyAvailability.escrow_recipient_present = Some(false)` below, the
-    // same way `key rotate` refuses without one.
-    let escrow_public_key = queries::escrow_public_key(conn)?;
-
-    let keys = KeyAvailability {
-        tenant_ids: distinct_tenant_ids,
-        tenants_with_active_key,
-        operator_key_present: true,
-        escrow_recipient_present: Some(escrow_public_key.is_some()),
-    };
+    let SessionKeys {
+        keys,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+    } = assemble_session_keys(conn, &distinct_tenant_ids)?;
 
     // MAM (best-effort, informational; never gates the write — the pre-flight
     // capacity gate below reads the configured nominal capacity, which is
@@ -424,12 +386,214 @@ pub fn volume_write(
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
     let execute_outcome = planned.execute(conn, &mut store)?;
 
-    let result: Result<()> = match execute_outcome {
-        ExecuteOutcome::Ready(ready) => {
-            let sealed_pending = ready.seal(&mut store)?;
-            match sealed_pending.confirm(conn, &mut store, Tier::default())? {
+    let result = finish_session(
+        conn,
+        &mut store,
+        volume_id,
+        label,
+        &layout_snapshot,
+        block_size as u64,
+        execute_outcome.into(),
+    );
+
+    collect_health_best_effort(conn, config, device, volume_id);
+
+    result
+}
+
+/// Resume an interrupted write session for `label` — the cross-process half
+/// of `docs/design/layout-session.md`'s Resume rule (issue #25, playbook T8
+/// remainder). Mirrors [`volume_write`]'s shape, with three deliberate
+/// differences:
+///
+/// 1. It **rehydrates** the Layout via [`session::InterruptedSession::rehydrate`]
+///    rather than calling `build::build`. This is the load-bearing fact:
+///    `BuildInputs::created_at` is `chrono::Utc::now()` at `volume_write` call
+///    time and is persisted nowhere, and `BuildInputs::mam_loads` is
+///    `read_mam`'s `load_count`, which increments on every cartridge load. A
+///    rebuilt Layout would therefore carry different ID-thunk bytes than the
+///    tape already holds, and `SealedPending::confirm`'s front-index diff
+///    would quarantine a perfectly good volume.
+/// 2. It never calls [`check_fresh_write_contact`]. Resume has its own
+///    contact discipline INSIDE `resume_checking` (the File-0 identity check
+///    plus the seal-marker absence check, both via `check_tape_contact`), and
+///    the fresh-write refusal — which treats a matching-but-partially-written
+///    tape as a wrong-cartridge event — would reject every legitimate resume.
+/// 3. Its tenant list comes from the rehydrated Layout's tenant-envelope
+///    entries, not from a staged batch (there is none: `plan` already
+///    consumed it, and `find_staged_data` would return the wrong thing).
+///    `KeyAvailability::tenant_ids` is documented as exactly this — "every
+///    tenant that has an envelope on this volume".
+///
+/// It shares [`assemble_session_keys`] and [`finish_session`] with
+/// `volume_write` rather than copying them.
+pub fn volume_resume(
+    conn: &Connection,
+    _paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+) -> Result<()> {
+    let volume_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    let session = session::InterruptedSession::rehydrate(conn, volume_id)?.ok_or_else(|| {
+        TapectlError::Other(format!(
+            "volume \"{label}\" has no interrupted write session to resume — its `writes` rows \
+             are all resolved (completed/aborted) or none exist. Run `tapectl volume write` to \
+             start a new session."
+        ))
+    })?;
+
+    // Snapshot before `resume` consumes the session (same reason
+    // `volume_write` clones its Layout: the terminal `SealedSession` exposes
+    // only volume_id/label, and the bookkeeping below needs the entries).
+    let layout_snapshot = session.layout().clone();
+
+    let tenant_ids: Vec<i64> = {
+        let mut ids: Vec<i64> = layout_snapshot
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                ZoneKind::TenantEnvelope { tenant_id } => Some(tenant_id),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let SessionKeys { keys, .. } = assemble_session_keys(conn, &tenant_ids)?;
+
+    let backend = config
+        .backends
+        .lto
+        .first()
+        .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
+    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
+    let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+
+    info!(label, volume_id, "resuming interrupted volume write");
+    let outcome = session.resume(conn, &keys, &mut store)?;
+
+    let result = finish_session(
+        conn,
+        &mut store,
+        volume_id,
+        label,
+        &layout_snapshot,
+        block_size as u64,
+        outcome,
+    );
+
+    collect_health_best_effort(conn, config, device, volume_id);
+
+    result
+}
+
+/// Everything a write session needs from the tenant/key tables, assembled
+/// once. Shared by [`volume_write`] and [`volume_resume`] so the two can
+/// never drift on what "the keys for this volume" means — they differ only in
+/// where `tenant_ids` comes from (a staged batch vs. the rehydrated Layout's
+/// tenant-envelope entries), which is why that is a parameter.
+///
+/// One `TenantInfo` per tenant, carrying that tenant's own active
+/// (non-escrow) keys only: `build()` appends the operator and escrow
+/// recipients itself (`with_escrow`).
+struct SessionKeys {
+    keys: KeyAvailability,
+    tenants: Vec<TenantInfo>,
+    operator_public_keys: Vec<String>,
+    escrow_public_key: Option<String>,
+}
+
+fn assemble_session_keys(conn: &Connection, tenant_ids: &[i64]) -> Result<SessionKeys> {
+    let mut tenants = Vec::with_capacity(tenant_ids.len());
+    let mut tenants_with_active_key = HashSet::new();
+    for &tenant_id in tenant_ids {
+        let tenant = queries::get_tenant_by_id(conn, tenant_id)?
+            .ok_or_else(|| TapectlError::Other(format!("tenant {tenant_id} not found")))?;
+        let keys = queries::get_active_keys_for_tenant(conn, tenant_id)?;
+        if keys.is_empty() {
+            return Err(TapectlError::Other(format!(
+                "tenant \"{}\" (id={tenant_id}) has no active key — cannot encrypt its envelope",
+                tenant.name
+            )));
+        }
+        tenants_with_active_key.insert(tenant_id);
+        tenants.push(TenantInfo {
+            tenant_id,
+            tenant_name: tenant.name,
+            public_keys: keys.into_iter().map(|k| k.public_key).collect(),
+        });
+    }
+
+    let operator = queries::get_operator_tenant(conn)?
+        .ok_or_else(|| TapectlError::Other("no operator tenant configured".into()))?;
+    let operator_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
+    if operator_keys.is_empty() {
+        return Err(TapectlError::Other("operator has no active key".into()));
+    }
+    let operator_public_keys: Vec<String> =
+        operator_keys.into_iter().map(|k| k.public_key).collect();
+
+    // ADR-0005: the permanent escrow recipient. `None` fails validation via
+    // `KeyAvailability.escrow_recipient_present = Some(false)`, the same way
+    // `key rotate` refuses without one.
+    let escrow_public_key = queries::escrow_public_key(conn)?;
+
+    Ok(SessionKeys {
+        keys: KeyAvailability {
+            tenant_ids: tenant_ids.to_vec(),
+            tenants_with_active_key,
+            operator_key_present: true,
+            escrow_recipient_present: Some(escrow_public_key.is_some()),
+        },
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+    })
+}
+
+/// The post-execute tail, shared verbatim by [`volume_write`] and
+/// [`volume_resume`]: `seal` -> `confirm` -> bookkeeping/audit, plus the
+/// Interrupted/Aborted/Quarantined terminations. Factored rather than
+/// duplicated because this is where a copy-paste would silently drift — in
+/// particular the `Quarantined` arm, which only the resume path can reach
+/// from `resume` itself (the File-0 identity check / already-sealed refusal)
+/// and which a half-copied tail would drop.
+///
+/// It takes a [`ResumeOutcome`] because that enum is the superset:
+/// `volume_write` converts its `ExecuteOutcome` via the existing
+/// `From<ExecuteOutcome>` impl, leaving `Quarantined` unreachable-but-handled
+/// on the fresh path. This shares the Interrupted and Aborted arms too, not
+/// just seal/confirm.
+///
+/// Sacred invariant 1 (`v2-implementation-plan.md`): the seal marker is
+/// written only inside `ReadyToSeal::seal`. This function calls it; it never
+/// constructs a seal entry of its own.
+fn finish_session(
+    conn: &Connection,
+    store: &mut dyn Store,
+    volume_id: i64,
+    label: &str,
+    layout: &Layout,
+    block_size: u64,
+    outcome: ResumeOutcome,
+) -> Result<()> {
+    match outcome {
+        ResumeOutcome::Ready(ready) => {
+            let sealed_pending = ready.seal(store)?;
+            match sealed_pending.confirm(conn, store, Tier::default())? {
                 ConfirmOutcome::Sealed(sealed) => {
-                    record_write_bookkeeping(conn, volume_id, &layout_snapshot, block_size as u64)?;
+                    record_write_bookkeeping(conn, volume_id, layout, block_size)?;
                     events::log_event(
                         conn,
                         "volume",
@@ -445,27 +609,11 @@ pub fn volume_write(
                     info!(label = sealed.label, volume_id, "volume write sealed");
                     Ok(())
                 }
-                ConfirmOutcome::Quarantined(q) => {
-                    let reason = describe_quarantine(&q.reason);
-                    events::log_event(
-                        conn,
-                        "volume",
-                        volume_id,
-                        Some(label),
-                        "write_quarantined",
-                        None,
-                        None,
-                        Some(&reason),
-                        None,
-                        None,
-                    )?;
-                    Err(TapectlError::Other(format!(
-                        "volume \"{label}\" quarantined at confirm: {reason}"
-                    )))
-                }
+                ConfirmOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
             }
         }
-        ExecuteOutcome::Interrupted(_) => {
+        ResumeOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
+        ResumeOutcome::Interrupted(_) => {
             events::log_event(
                 conn,
                 "volume",
@@ -479,13 +627,13 @@ pub fn volume_write(
                 None,
             )?;
             Err(TapectlError::Other(format!(
-                "volume \"{label}\" write interrupted (SIGINT) — the tape is left unsealed and \
-                 resumable in principle (`writes`/`write_positions` were left in the \
-                 `interrupted` state), but automatic cross-process resume is not yet wired into \
-                 this CLI (see the T8 report)"
+                "volume \"{label}\" write interrupted (SIGINT) — the tape is left unsealed, and \
+                 the session's `writes`/`write_positions` rows are in the `interrupted` state. \
+                 Reload the same cartridge and run `tapectl volume resume {label}` to continue \
+                 from where it stopped."
             )))
         }
-        ExecuteOutcome::Aborted(a) => {
+        ResumeOutcome::Aborted(a) => {
             events::log_event(
                 conn,
                 "volume",
@@ -503,11 +651,40 @@ pub fn volume_write(
                 a.reason
             )))
         }
-    };
+    }
+}
 
-    // Best-effort sg_logs health collection. Never let a collection failure
-    // shadow the real outcome above (matching v1: always attempted, its own
-    // errors only logged).
+/// The one place a quarantine is recorded and reported — reached from
+/// `confirm`'s failure (either path) and from `resume`'s own divergence
+/// findings (the resume-only arm).
+fn log_quarantine(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    reason: &QuarantineReason,
+) -> Result<()> {
+    let reason = describe_quarantine(reason);
+    events::log_event(
+        conn,
+        "volume",
+        volume_id,
+        Some(label),
+        "write_quarantined",
+        None,
+        None,
+        Some(&reason),
+        None,
+        None,
+    )?;
+    Err(TapectlError::Other(format!(
+        "volume \"{label}\" quarantined: {reason}"
+    )))
+}
+
+/// Best-effort sg_logs health collection. Never lets a collection failure
+/// shadow the session's real outcome (matching v1: always attempted, its own
+/// errors only logged).
+fn collect_health_best_effort(conn: &Connection, config: &Config, device: &str, volume_id: i64) {
     if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
         match health::collect(&bk.device_sg) {
             Ok((counters, raw)) => {
@@ -518,8 +695,6 @@ pub fn volume_write(
             Err(e) => warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed"),
         }
     }
-
-    result
 }
 
 /// Populate `volumes`' write-summary columns (`bytes_written`,
@@ -555,12 +730,11 @@ fn record_write_bookkeeping(
     Ok(())
 }
 
-/// A one-line, human-readable summary of why a session quarantined —
+/// A one-line, human-readable summary of why a session quarantined.
 /// `volume_write`'s fresh (non-resumed) path only ever reaches
-/// `QuarantineReason::ConfirmFailed` here: `IdentityMismatch`/`AlreadySealed`
-/// are resume-only outcomes this orchestrator doesn't produce (it never
-/// calls `InterruptedSession::resume`), but are handled here anyway so this
-/// stays exhaustive if that changes. (Issue #27 added an EQUIVALENT
+/// `QuarantineReason::ConfirmFailed`; `IdentityMismatch`/`AlreadySealed` are
+/// resume-only findings, produced by `InterruptedSession::resume` and reached
+/// through `volume_resume`. (Issue #27 added an EQUIVALENT
 /// identity/seal check to the fresh path too, in `check_fresh_write_contact`
 /// below — but deliberately as a plain refusal, not a `QuarantineReason`: a
 /// wrong cartridge loaded before any write means the operator grabbed the

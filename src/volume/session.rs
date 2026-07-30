@@ -479,6 +479,16 @@ impl PlannedSession {
 }
 
 impl InterruptedSession {
+    /// The Layout this session will resume against. Exposed because the CLI
+    /// orchestrator (`write::volume_resume`) needs it BEFORE `resume`
+    /// consumes `self`: the tenant-envelope entries are where a restarted
+    /// process learns which tenants' keys to require (there is no staged
+    /// batch to derive them from), and the post-confirm bookkeeping needs the
+    /// slice entries.
+    pub fn layout(&self) -> &super::layout_model::Layout {
+        &self.built.layout
+    }
+
     /// Reconstruct an interrupted session for `volume_id` from durable state
     /// alone — the `writes`/`write_positions` rows and the frozen session
     /// staging directory they point at — so `tapectl volume resume` can pick
@@ -521,7 +531,9 @@ impl InterruptedSession {
                  WHERE volume_id = ?1 AND status = 'interrupted'
                  ORDER BY id",
             )?
-            .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map(params![volume_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
 
         if rows.is_empty() {

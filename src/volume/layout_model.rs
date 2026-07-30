@@ -195,10 +195,9 @@ pub struct KeyAvailability {
     /// when a registered escrow row exists, `Some(false)` when it does not
     /// (fails validation, `LayoutError::EscrowRecipientMissing`). `None`
     /// skips the check entirely — meant for a caller that has no escrow
-    /// concept in its context, not a routine choice; every real orchestrator
-    /// wiring this struct up (T8's job — none exists in this tree yet, since
-    /// the v1 write path this is meant to replace doesn't call `validate` at
-    /// all) should pass `Some(..)`, now that escrow wiring landed in T2
+    /// concept in its context, not a routine choice. The real orchestrators
+    /// (`write::volume_write` and `write::volume_resume`, both via
+    /// `write::assemble_session_keys`) pass `Some(..)`, as should any new one
     /// (ADR-0005).
     pub escrow_recipient_present: Option<bool>,
 }
