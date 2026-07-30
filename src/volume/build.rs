@@ -822,8 +822,10 @@ fn catalog_file_paths(catalog_path: &str) -> Vec<(String, PathBuf)> {
 /// Build an envelope tar directly into the age encryption stream, which
 /// writes directly to `session_dir/filename` — issue #87's single-pass
 /// streaming redesign of the old buffer-the-whole-tar-then-encrypt-the-
-/// whole-thing path (`staging::encrypt_data`, now `#[cfg(test)]`-only). The
-/// wrapping order, innermost-to-disk first, is:
+/// whole-thing path (`staging::encrypt_data`, which survives only as a
+/// test-facing reference implementation — see its doc comment for why it
+/// could not be `#[cfg(test)]`-gated). The wrapping order, innermost-to-disk
+/// first, is:
 ///
 /// `File` → [`crate::util::HashingWriter`] → age `StreamWriter` →
 /// `tar::Builder`
@@ -852,7 +854,31 @@ fn materialize_envelope_streaming(
     recipients: &[String],
 ) -> Result<(PathBuf, u64, String)> {
     let path = session_dir.join(filename);
-    let file = fs::File::create(&path)?;
+    let result = materialize_envelope_streaming_inner(
+        &path, manifest, recovery, catalogs, plan_toml, recipients,
+    );
+    if result.is_err() {
+        // Mirrors `staging::encrypt_file_streaming`'s cleanup: the buffered
+        // predecessor could never leave a partial envelope behind, because it
+        // only wrote once the whole ciphertext existed in RAM. Streaming can,
+        // so remove it rather than leaving a truncated `.age` in the session
+        // dir for a later resume to trip over. Not an integrity concern
+        // either way — an error propagates out of `build`, so no LayoutEntry
+        // ever references this path.
+        let _ = fs::remove_file(&path);
+    }
+    result.map(|(size, hash)| (path, size, hash))
+}
+
+fn materialize_envelope_streaming_inner(
+    path: &Path,
+    manifest: &str,
+    recovery: &str,
+    catalogs: &[(String, PathBuf)],
+    plan_toml: Option<&str>,
+    recipients: &[String],
+) -> Result<(u64, String)> {
+    let file = fs::File::create(path)?;
     let hashing_output = crate::util::HashingWriter::new(file);
 
     let encryptor = staging::build_encryptor(recipients)?;
@@ -883,8 +909,7 @@ fn materialize_envelope_streaming(
         .map_err(|e| TapectlError::Encryption(format!("finish failed: {e}")))?;
     let hash = hashing_output.finalize_hex();
     let size = hashing_output.bytes_written();
-
-    Ok((path, size, hash))
+    Ok((size, hash))
 }
 
 fn append_tar_member<W: std::io::Write>(
@@ -1715,5 +1740,52 @@ mod tests {
             recovered, &big_catalog_bytes,
             "large catalog file must round-trip byte-for-byte through the streaming envelope path"
         );
+
+        // ── the invariant #87 most endangered ──
+        //
+        // `OperatorEnvelopeBackup` must be the SAME ciphertext as
+        // `OperatorEnvelope`, not a second independent encryption. Under the
+        // old buffered path this was free (both entries materialized the one
+        // `op_encrypted` Vec). Streaming makes "just call the helper again"
+        // the obvious-looking implementation, and it is wrong: `age::Encryptor`
+        // draws a fresh ephemeral key per call and the tar layer stamps
+        // `set_mtime(now)`, so a second pass yields unrelated bytes that merely
+        // happen to decrypt to the same plaintext — a redundant copy that
+        // shares no ciphertext with the thing it is meant to back up. Nothing
+        // pinned this before; asserting on the raw bytes means a future
+        // regression fails here instead of on a tape years from now.
+        let op_path = match &built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::OperatorEnvelope))
+            .unwrap()
+            .source
+        {
+            ContentSource::Materialized(p) => p.clone(),
+            _ => panic!("expected Materialized"),
+        };
+        let backup_entry = built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::OperatorEnvelopeBackup))
+            .unwrap();
+        let ContentSource::Materialized(backup_path) = &backup_entry.source else {
+            panic!("expected Materialized");
+        };
+        let op_bytes = std::fs::read(&op_path).unwrap();
+        let backup_bytes = std::fs::read(backup_path).unwrap();
+        assert_eq!(
+            op_bytes, backup_bytes,
+            "operator envelope backup must be a byte-for-byte copy of the primary, \
+             not a second independent encryption (issue #87)"
+        );
+        assert_eq!(
+            backup_entry.sha256.as_deref(),
+            Some(sha_hex(&op_bytes).as_str()),
+            "backup entry must record the primary's ciphertext hash"
+        );
+        assert_eq!(backup_entry.size_bytes, Some(op_bytes.len() as u64));
     }
 }
