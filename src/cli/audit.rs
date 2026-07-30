@@ -23,13 +23,42 @@ pub fn run(
         0
     };
 
+    print!(
+        "{}",
+        render(&violations, &warnings, exit_code, action_plan, json_output)
+    );
+
+    Ok(exit_code)
+}
+
+/// Render `audit`'s complete stdout as a string, so the output contract is
+/// assertable without capturing stdout.
+///
+/// In `--json` mode the returned string is a *single* parseable JSON object
+/// and nothing else — §2.20 specifies JSON "for scripting", so any extra
+/// human-readable line makes the stream unparseable for every consumer that
+/// pipes it. That is not hypothetical: extracting `collect_findings` out of
+/// `run` (issue #56) hoisted the trailing summary line out of the non-JSON
+/// branch and silently broke exactly this. `json_output_is_a_single_parseable_object`
+/// pins it.
+fn render(
+    violations: &[AuditFinding],
+    warnings: &[AuditFinding],
+    exit_code: i32,
+    action_plan: bool,
+    json_output: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
     if json_output {
         let findings: Vec<serde_json::Value> = violations
             .iter()
             .map(|f| finding_json(f, "violation"))
             .chain(warnings.iter().map(|f| finding_json(f, "warning")))
             .collect();
-        println!(
+        let _ = writeln!(
+            out,
             "{}",
             serde_json::json!({
                 "exit_code": exit_code,
@@ -38,36 +67,39 @@ pub fn run(
                 "findings": findings,
             })
         );
-    } else if violations.is_empty() && warnings.is_empty() {
-        println!("audit: clean");
+        return out;
+    }
+
+    if violations.is_empty() && warnings.is_empty() {
+        let _ = writeln!(out, "audit: clean");
     } else {
         if !violations.is_empty() {
-            println!("VIOLATIONS ({}):", violations.len());
-            for f in &violations {
-                println!("  [{}] {}: {}", f.check, f.unit, f.message);
+            let _ = writeln!(out, "VIOLATIONS ({}):", violations.len());
+            for f in violations {
+                let _ = writeln!(out, "  [{}] {}: {}", f.check, f.unit, f.message);
                 if action_plan {
-                    println!("    fix: {}", f.action);
+                    let _ = writeln!(out, "    fix: {}", f.action);
                 }
             }
         }
         if !warnings.is_empty() {
-            println!("WARNINGS ({}):", warnings.len());
-            for f in &warnings {
-                println!("  [{}] {}: {}", f.check, f.unit, f.message);
+            let _ = writeln!(out, "WARNINGS ({}):", warnings.len());
+            for f in warnings {
+                let _ = writeln!(out, "  [{}] {}: {}", f.check, f.unit, f.message);
                 if action_plan {
-                    println!("    fix: {}", f.action);
+                    let _ = writeln!(out, "    fix: {}", f.action);
                 }
             }
         }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "audit: {} violations, {} warnings (exit {})",
         violations.len(),
         warnings.len(),
         exit_code,
     );
-
-    Ok(exit_code)
+    out
 }
 
 /// Collect every audit finding for `unit_filter` (or all active units),
@@ -952,5 +984,77 @@ mod tests {
             );
             assert_eq!(warnings[0].check, "no_archive");
         }
+    }
+
+    // ── output contract (issue #56) ──
+
+    fn sample_findings() -> (Vec<AuditFinding>, Vec<AuditFinding>) {
+        (
+            vec![AuditFinding {
+                unit: "photos".into(),
+                check: "encryption".into(),
+                message: "1 unencrypted stage set(s) on tape".into(),
+                action: "tapectl stage create photos".into(),
+            }],
+            vec![AuditFinding {
+                unit: "docs".into(),
+                check: "dirty".into(),
+                message: "source has drifted".into(),
+                action: "tapectl snapshot create docs".into(),
+            }],
+        )
+    }
+
+    /// §2.20 specifies `--format json` "for scripting", so in JSON mode the
+    /// ENTIRE stdout must parse as one object — a trailing human-readable
+    /// summary line makes it unparseable for anything that pipes it.
+    ///
+    /// This is a real regression, not a hypothetical: extracting
+    /// `collect_findings` out of `run` moved the summary `println!` out of
+    /// the non-JSON branch, so `audit --json` emitted valid JSON followed by
+    /// `audit: 1 violations, 1 warnings (exit 2)`. Every existing test
+    /// asserted on findings or exit codes, so nothing caught it.
+    #[test]
+    fn json_output_is_a_single_parseable_object() {
+        let (violations, warnings) = sample_findings();
+        let out = render(&violations, &warnings, 2, true, true);
+
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("the whole of --json stdout must parse as one JSON object");
+        assert_eq!(parsed["exit_code"], 2);
+        assert_eq!(parsed["violations"], 1);
+        assert_eq!(parsed["warnings"], 1);
+        assert_eq!(parsed["findings"].as_array().unwrap().len(), 2);
+
+        assert!(
+            !out.contains("audit: 1 violations"),
+            "the human-readable summary line must not appear in JSON mode, got: {out}"
+        );
+    }
+
+    /// The summary line is part of the human-readable contract and must
+    /// survive — the fix for the above must not delete it outright.
+    #[test]
+    fn human_output_keeps_the_summary_line_and_action_plan() {
+        let (violations, warnings) = sample_findings();
+        let out = render(&violations, &warnings, 2, true, false);
+        assert!(out.contains("VIOLATIONS (1):"), "got: {out}");
+        assert!(out.contains("[encryption] photos:"), "got: {out}");
+        assert!(out.contains("WARNINGS (1):"), "got: {out}");
+        assert!(
+            out.contains("fix: tapectl stage create photos"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("audit: 1 violations, 1 warnings (exit 2)"),
+            "got: {out}"
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
+    }
+
+    #[test]
+    fn human_output_says_clean_when_there_are_no_findings() {
+        let out = render(&[], &[], 0, false, false);
+        assert!(out.contains("audit: clean"), "got: {out}");
     }
 }
