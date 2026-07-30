@@ -28,8 +28,22 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52
-  closed 2026-07-30; #97/#98 filed as residuals.)
+  set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
+  #53 closed 2026-07-30; #97/#98 filed as residuals.) **Remaining mediums:
+  #44, #46, #93. Then lows: #43, #59, #61, #62, #63, #83, #91, #95, #97, #98,
+  #51, #50.** (#50/#51 keep their cross-issue note below.)
+  **Staging file naming is now `{uuid12}_v{version}_s{stage_set_id}.`** (#53)
+  and lives in ONE place: `archive_base_name` / `archive_base_prefix` in
+  `staging/mod.rs`. `stage_create` and `cleanup_failed_stage_set` both call
+  them — if you change one, the other follows automatically. #54's
+  end-to-end test is the lockstep guard (verified: reverting cleanup to the
+  old per-snapshot shape fails it). `catalog_base` stays PER-SNAPSHOT on
+  purpose — the `existing_catalogs == 0` guard extracts once and later stage
+  sets reuse it; "making the naming consistent" is the wrong move.
+  **Re-staging vs read-slices:** a re-stage yields DIFFERENT checksums (dar
+  timestamps + randomized age) and that is correct. §2.21 read-slices is the
+  identical-bytes path (tape→staging); re-stage is the fresh-bytes path
+  (source→staging). Never treat them as substitutes.
   **`snapshot_create` now takes `config: &Config`** (replaced its
   `global_excludes` param, #52) and enforces design lines 184/185/203:
   nesting is an ERROR, empty units warn (gated on `file_count`, never
