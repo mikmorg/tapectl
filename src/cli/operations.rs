@@ -873,30 +873,56 @@ pub fn snapshot_delete(
         )));
     }
 
+    // The `stage_slices.staging_path` rows about to be deleted are the ONLY
+    // handle anything has on the encrypted `.age` files in staging:
+    // `staging::clean_staging` finds files exclusively by joining
+    // `stage_slices`. So dropping these rows without first recording the
+    // paths orphans those files permanently — no cleanup path can ever see
+    // them again. Reachable today via `--force` (the only way to delete a
+    // snapshot that still has `staged` sets). Collected before the
+    // transaction; unlinked after it commits, for the reason below.
+    let staging_paths: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT sl.staging_path
+             FROM stage_slices sl
+             JOIN stage_sets ss ON ss.id = sl.stage_set_id
+             WHERE ss.snapshot_id = ?1 AND sl.staging_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![snap_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
     // Cascade delete: stage_slices -> stage_sets -> manifest_entries -> manifests -> files -> snapshot
-    conn.execute(
+    //
+    // One transaction, including the event (issue #55): as six bare
+    // `conn.execute` calls, a failure partway left a half-deleted snapshot —
+    // e.g. `stage_slices` gone but `stage_sets` still present, referencing
+    // slices that no longer exist. Mirrors `snapshot_purge` above, which
+    // already had this treatment.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM stage_slices WHERE stage_set_id IN
          (SELECT id FROM stage_sets WHERE snapshot_id = ?1)",
         params![snap_id],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM stage_sets WHERE snapshot_id = ?1",
         params![snap_id],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM manifest_entries WHERE manifest_id IN
          (SELECT id FROM manifests WHERE snapshot_id = ?1)",
         params![snap_id],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM manifests WHERE snapshot_id = ?1",
         params![snap_id],
     )?;
-    conn.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
-    conn.execute("DELETE FROM snapshots WHERE id = ?1", params![snap_id])?;
+    tx.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
+    tx.execute("DELETE FROM snapshots WHERE id = ?1", params![snap_id])?;
 
     events::log_event(
-        conn,
+        &tx,
         "snapshot",
         snap_id,
         Some(&format!("{unit_name}/v{version}")),
@@ -907,6 +933,33 @@ pub fn snapshot_delete(
         None,
         Some(unit.tenant_id),
     )?;
+
+    tx.commit()?;
+
+    // Unlink AFTER the commit, deliberately. If the transaction fails, the
+    // snapshot still exists and its slices must still be on disk for it to
+    // remain usable — deleting files first would strand a live snapshot
+    // pointing at nothing, and `volume write` would then fail on rows that
+    // look perfectly valid. Unlinking after means the worst case (a crash
+    // between commit and unlink) is an orphaned file, which is exactly
+    // today's behaviour and strictly better than a corrupt live snapshot.
+    // Best-effort: a file already gone, or one we cannot remove, must not
+    // turn a completed delete into an error.
+    let mut removed = 0usize;
+    for path in &staging_paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %path, error = %e, "could not remove staged slice"),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            count = removed,
+            snapshot = %format!("{unit_name}/v{version}"),
+            "removed staged slice files belonging to the deleted snapshot"
+        );
+    }
 
     if json_output {
         println!(
@@ -2465,6 +2518,155 @@ mod tests {
 
             assert!(dest.exists());
             assert!(!dest.with_extension("keys").exists());
+        }
+    }
+
+    // ── issue #55: snapshot delete — transactional cascade + no orphaned files ──
+
+    /// Fixture: unit + snapshot v1 with a `staged` stage_set whose slice
+    /// rows point at real files on disk, plus manifest/file rows, so a
+    /// delete has something to cascade through.
+    fn setup_deletable_snapshot(dir: &Path) -> (Connection, i64, Vec<std::path::PathBuf>) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(include_str!("../db/migrations/001_initial.sql"))
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let uid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'created', '/src')",
+            params![uid],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted, status)
+             VALUES (?1, 1024, 'none', 1, 'staged')",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+
+        let mut slice_files = Vec::new();
+        for n in 1..=2i64 {
+            let f = dir.join(format!("slice{n}.dar.age"));
+            fs::write(&f, b"ciphertext").unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           encrypted_bytes, sha256_plain, sha256_encrypted,
+                                           staging_path)
+                 VALUES (?1, ?2, 10, 10, 'aa', 'bb', ?3)",
+                params![ss_id, n, f.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            slice_files.push(f);
+        }
+
+        conn.execute(
+            "INSERT INTO manifests (snapshot_id) VALUES (?1)",
+            params![snap_id],
+        )
+        .unwrap();
+        insert_file(&conn, snap_id, "/src/a.txt", 3, "cc");
+
+        (conn, snap_id, slice_files)
+    }
+
+    /// The encrypted `.age` files must not be orphaned. `stage_slices` rows
+    /// are the ONLY handle `staging::clean_staging` has on them (it finds
+    /// files exclusively by joining that table), so deleting the rows
+    /// without unlinking the files strands them forever with no cleanup
+    /// path able to see them. Reachable via `--force`, the only way to
+    /// delete a snapshot that still has `staged` sets.
+    #[test]
+    fn delete_removes_the_staged_slice_files_it_drops_the_rows_for() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, _snap_id, slice_files) = setup_deletable_snapshot(tmp.path());
+
+        for f in &slice_files {
+            assert!(f.exists(), "fixture slice should exist before delete");
+        }
+
+        snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
+
+        for f in &slice_files {
+            assert!(
+                !f.exists(),
+                "staged slice file {} must be removed — its stage_slices row is gone, \
+                 so nothing could ever find it again (issue #55)",
+                f.display()
+            );
+        }
+    }
+
+    /// The cascade must be all-or-nothing. Driven by a trigger that rejects
+    /// the final `DELETE FROM snapshots`, i.e. a failure at the LAST of the
+    /// six statements — the case that, untransacted, left every dependent
+    /// row deleted while the snapshot itself survived, referencing nothing.
+    #[test]
+    fn a_failure_late_in_the_cascade_rolls_back_the_whole_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, slice_files) = setup_deletable_snapshot(tmp.path());
+
+        conn.execute_batch(
+            "CREATE TRIGGER reject_snapshot_delete
+             BEFORE DELETE ON snapshots
+             BEGIN SELECT RAISE(ABORT, 'reject for test'); END;",
+        )
+        .unwrap();
+
+        let err = snapshot_delete(&conn, "unit1", 1, true, false).unwrap_err();
+        assert!(
+            err.to_string().contains("reject for test"),
+            "expected the trigger's abort, got: {err}"
+        );
+
+        // Every dependent row must survive: without a transaction the five
+        // earlier DELETEs would have committed individually.
+        for (table, sql) in [
+            ("stage_slices", "SELECT COUNT(*) FROM stage_slices"),
+            ("stage_sets", "SELECT COUNT(*) FROM stage_sets"),
+            ("manifests", "SELECT COUNT(*) FROM manifests"),
+            ("files", "SELECT COUNT(*) FROM files"),
+        ] {
+            let n: i64 = conn.query_row(sql, [], |row| row.get(0)).unwrap();
+            assert!(
+                n > 0,
+                "{table} rows must be rolled back with the failed delete, found {n}"
+            );
+        }
+        let snaps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snaps, 1, "the snapshot itself must survive");
+
+        // And the files must still be on disk — a rolled-back delete that
+        // had already unlinked them would leave a live snapshot pointing at
+        // nothing, which is worse than not deleting at all.
+        for f in &slice_files {
+            assert!(
+                f.exists(),
+                "slice file {} must survive a rolled-back delete",
+                f.display()
+            );
         }
     }
 }
