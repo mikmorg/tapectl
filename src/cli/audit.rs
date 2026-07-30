@@ -228,7 +228,7 @@ fn compaction_findings(conn: &Connection, threshold: f64) -> Result<Vec<AuditFin
          JOIN stage_slices ss ON ss.stage_set_id = sts.id
          WHERE {}
          GROUP BY v.id",
-        "v.status IN ('active','full')"
+        crate::policy::coverage::eligible("v")
     );
     let mut stmt = conn.prepare(&sql)?;
     let candidates: Vec<(String, i64, i64)> = stmt

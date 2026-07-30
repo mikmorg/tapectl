@@ -228,7 +228,10 @@ fn supersedable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serd
 /// Count of volumes whose physical media is in service and accounted for
 /// (`report summary`). Group-B (issue #96): inventory, not copy-counting.
 fn in_service_volume_count(conn: &Connection) -> Result<i64> {
-    let sql = "SELECT COUNT(*) FROM volumes WHERE status IN ('active','full')".to_string();
+    let sql = format!(
+        "SELECT COUNT(*) FROM volumes WHERE {}",
+        crate::policy::coverage::in_service("volumes")
+    );
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
@@ -746,10 +749,12 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
 /// provisioned-but-not-yet-written media too, so the operator can see a tape
 /// that is ready to receive bytes.
 fn per_volume_capacity_rows(conn: &Connection) -> Result<Vec<(String, i64, i64, String)>> {
-    let sql = "SELECT label, capacity_bytes, bytes_written, status FROM volumes
-             WHERE status IN ('active','full','initialized')
-             ORDER BY label"
-        .to_string();
+    let sql = format!(
+        "SELECT label, capacity_bytes, bytes_written, status FROM volumes
+         WHERE {}
+         ORDER BY label",
+        crate::policy::coverage::in_service_or_provisioned("volumes")
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map([], |row| {
@@ -765,7 +770,7 @@ fn capacity_totals(conn: &Connection) -> Result<(i64, i64, i64)> {
     let sql = format!(
         "SELECT COALESCE(SUM(capacity_bytes),0), COALESCE(SUM(bytes_written),0), COUNT(*)
          FROM volumes WHERE {}",
-        "status IN ('active','full')"
+        crate::policy::coverage::in_service("volumes")
     );
     Ok(conn.query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
 }
@@ -938,7 +943,7 @@ fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<(String, i64, i64,
          WHERE {}
          GROUP BY v.id
          ORDER BY live_bytes * 1.0 / NULLIF(v.bytes_written, 0) ASC",
-        "v.status IN ('active','full')"
+        crate::policy::coverage::eligible("v")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -1358,7 +1363,6 @@ mod tests {
             unit_id: i64,
             label: &str,
             status: &str,
-            capacity: i64,
             bytes_written: i64,
             live: i64,
             reclaimable: i64,
@@ -1366,8 +1370,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                                       capacity_bytes, bytes_written, status)
-                 VALUES (?1, 'lto', 'lto0', 'LTO-6', ?2, ?3, ?4)",
-                params![label, capacity, bytes_written, status],
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000, ?2, ?3)",
+                params![label, bytes_written, status],
             )
             .unwrap();
             let vol_id = conn.last_insert_rowid();
@@ -1432,7 +1436,7 @@ mod tests {
         #[test]
         fn compaction_rows_see_a_sealed_volume() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "SEAL01", "sealed", 1000, 1000, 100, 900);
+            seed_written_volume(&conn, unit, "SEAL01", "sealed", 1000, 100, 900);
 
             let rows = compaction_candidate_rows(&conn).unwrap();
             assert_eq!(
@@ -1447,7 +1451,7 @@ mod tests {
         #[test]
         fn compaction_rows_exclude_a_retired_volume() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "RET01", "retired", 1000, 1000, 100, 900);
+            seed_written_volume(&conn, unit, "RET01", "retired", 1000, 100, 900);
 
             assert!(compaction_candidate_rows(&conn).unwrap().is_empty());
         }
@@ -1457,7 +1461,7 @@ mod tests {
         #[test]
         fn summary_counts_a_sealed_volume() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "SEAL02", "sealed", 1000, 1000, 100, 900);
+            seed_written_volume(&conn, unit, "SEAL02", "sealed", 1000, 100, 900);
 
             assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
         }
@@ -1469,7 +1473,7 @@ mod tests {
         #[test]
         fn summary_still_counts_a_legacy_full_volume() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "FULL01", "full", 1000, 1000, 100, 900);
+            seed_written_volume(&conn, unit, "FULL01", "full", 1000, 100, 900);
 
             assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
         }
@@ -1477,8 +1481,8 @@ mod tests {
         #[test]
         fn summary_excludes_retired_and_erased_volumes() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "RET02", "retired", 1000, 1000, 100, 0);
-            seed_written_volume(&conn, unit, "ERA01", "erased", 1000, 1000, 100, 0);
+            seed_written_volume(&conn, unit, "RET02", "retired", 1000, 100, 0);
+            seed_written_volume(&conn, unit, "ERA01", "erased", 1000, 100, 0);
 
             assert_eq!(in_service_volume_count(&conn).unwrap(), 0);
         }
@@ -1486,9 +1490,9 @@ mod tests {
         #[test]
         fn capacity_totals_include_sealed_and_legacy_full() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "SEAL03", "sealed", 1000, 400, 400, 0);
-            seed_written_volume(&conn, unit, "FULL02", "full", 1000, 600, 600, 0);
-            seed_written_volume(&conn, unit, "RET03", "retired", 9999, 9999, 100, 0);
+            seed_written_volume(&conn, unit, "SEAL03", "sealed", 400, 400, 0);
+            seed_written_volume(&conn, unit, "FULL02", "full", 600, 600, 0);
+            seed_written_volume(&conn, unit, "RET03", "retired", 9999, 100, 0);
 
             let (cap, written, count) = capacity_totals(&conn).unwrap();
             assert_eq!(count, 2, "sealed + full count; retired does not");
@@ -1501,10 +1505,10 @@ mod tests {
         #[test]
         fn per_volume_rows_list_sealed_full_and_initialized_but_not_retired() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "SEAL04", "sealed", 1000, 400, 400, 0);
-            seed_written_volume(&conn, unit, "FULL03", "full", 1000, 600, 600, 0);
-            seed_written_volume(&conn, unit, "INIT01", "initialized", 1000, 0, 0, 0);
-            seed_written_volume(&conn, unit, "RET04", "retired", 1000, 100, 100, 0);
+            seed_written_volume(&conn, unit, "SEAL04", "sealed", 400, 400, 0);
+            seed_written_volume(&conn, unit, "FULL03", "full", 600, 600, 0);
+            seed_written_volume(&conn, unit, "INIT01", "initialized", 0, 0, 0);
+            seed_written_volume(&conn, unit, "RET04", "retired", 100, 100, 0);
 
             let labels: Vec<String> = per_volume_capacity_rows(&conn)
                 .unwrap()
