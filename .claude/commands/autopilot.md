@@ -26,12 +26,14 @@ the normative design set named in the Policy block below.
   then lows. **#69 (Heir Kit) deferred by CTO** — it has a physical step
   (printing, tamper-evident envelopes) no agent can perform. Skip `epic`,
   `wontfix`, `needs-human`.
-  **Next up:** **#96 first** (new high — `confirm` writes `volumes.status =
-  'sealed'` but seven queries still filter `('active','full')`; the
-  `audit.rs:139` site passes *silently* on an empty set). Then mediums, no
-  hard order, pick by blast radius: #87, #56, #55, #54, #53, #52, #44, #46,
-  #93, #95, #51. Prefer ones outside the gate's path set when parallelising.
-  (#94, #90 closed 2026-07-30.)
+  **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
+  #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
+  set when parallelising. (#94, #90, #96 closed 2026-07-30.)
+  **Status-predicate discipline (from #96):** every `volumes.status` read
+  filter now routes through `policy::coverage` — `eligible` ("is a finished
+  copy", `sealed`), `in_service` ("holds bytes we account for", + `active`/
+  legacy `full`), `in_service_or_provisioned` (+ `initialized`). Never inline
+  a status list again; five inlined copies are how #96 happened.
   **Blocked on CTO:** **#92** — archive-set `compression`/`checksum_mode` are
   shadowed because `UnitDotfile`'s fields are non-`Option` with serde
   defaults, so a dotfile can never say "defer upward". The three options
