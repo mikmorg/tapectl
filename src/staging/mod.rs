@@ -16,7 +16,17 @@ use crate::error::{Result, TapectlError};
 use crate::util::{HashingReader, HashingWriter};
 
 /// Create a snapshot: fast directory walk, manifest, files table.
-pub fn snapshot_create(conn: &Connection, unit_name: &str) -> Result<i64> {
+///
+/// `global_excludes` is `config.defaults.global_excludes` (issue #49 item
+/// 5) — passed through to `walk_directory` so the recorded `files`/manifest
+/// rows never include a file dar itself was never going to archive (the
+/// unit's own dotfile excludes are read internally by `walk_directory`,
+/// keyed off `source_path`, unchanged from before this parameter existed).
+pub fn snapshot_create(
+    conn: &Connection,
+    unit_name: &str,
+    global_excludes: &[String],
+) -> Result<i64> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
@@ -37,7 +47,7 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str) -> Result<i64> {
     )?;
 
     // Walk directory and build manifest
-    let (total_size, file_count, manifest_entries) = walk_directory(source_path)?;
+    let (total_size, file_count, manifest_entries) = walk_directory(source_path, global_excludes)?;
 
     // Insert snapshot
     conn.execute(
@@ -170,7 +180,12 @@ pub fn stage_create(
 
     // Step 1: SHA256 source validation
     info!("validating source checksums");
-    let checksums = validate::validate_source(conn, snapshot_id, &snapshot.source_path)?;
+    let checksums = validate::validate_source(
+        conn,
+        snapshot_id,
+        &snapshot.source_path,
+        &config.defaults.global_excludes,
+    )?;
 
     conn.execute(
         "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
@@ -781,19 +796,27 @@ pub fn parse_size_to_bytes(s: &str) -> i64 {
     (num * multiplier) as i64
 }
 
-/// Walk a directory and collect manifest entries.
-fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
+/// Walk a directory and collect manifest entries. `global_excludes` is
+/// `config.defaults.global_excludes` (issue #49 item 5) — combined with the
+/// unit's own dotfile `[excludes] patterns` (read internally, keyed off
+/// `path`, exactly as before) via `exclude::effective_compiled`, the single
+/// place both halves are merged so this walk and
+/// `collection::fingerprint::walk_fingerprint` can never independently
+/// disagree about the effective set.
+fn walk_directory(
+    path: &str,
+    global_excludes: &[String],
+) -> Result<(i64, i64, Vec<ManifestEntry>)> {
     use std::os::unix::fs::MetadataExt;
     use walkdir::WalkDir;
 
     let base = Path::new(path);
-    // Issue #49 item 3: the unit's own dotfile exclude patterns, compiled
-    // once per walk (not per entry). Directories are never tested against
-    // these (see `exclude::is_excluded`'s doc comment — this mirrors dar's
-    // own `-X`, which cannot exclude directories either), so this is the
-    // per-unit half only — see `exclude::dotfile_patterns`'s doc comment
-    // for the global-exclude half's current scope gap.
-    let exclude_compiled = exclude::compile(&exclude::dotfile_patterns(base));
+    // Issue #49 items 3+5: global excludes + the unit's own dotfile exclude
+    // patterns, compiled once per walk (not per entry). Directories are
+    // never tested against these (see `exclude::is_excluded`'s doc comment
+    // — this mirrors dar's own `-X`, which cannot exclude directories
+    // either).
+    let exclude_compiled = exclude::effective_compiled(base, global_excludes);
     let mut entries = Vec::new();
     let mut total_size: i64 = 0;
     let mut file_count: i64 = 0;
@@ -916,8 +939,11 @@ fn walk_directory(path: &str) -> Result<(i64, i64, Vec<ManifestEntry>)> {
 /// independent `WalkDir`-based walks from silently drifting apart again
 /// (issues #33/#36/#48 each hit exactly this failure shape once already).
 #[cfg(test)]
-pub(crate) fn walk_directory_relative_paths_for_test(path: &str) -> Result<Vec<String>> {
-    let (_, _, entries) = walk_directory(path)?;
+pub(crate) fn walk_directory_relative_paths_for_test(
+    path: &str,
+    global_excludes: &[String],
+) -> Result<Vec<String>> {
+    let (_, _, entries) = walk_directory(path, global_excludes)?;
     Ok(entries
         .into_iter()
         .filter(|e| !e.is_dir)
@@ -1256,7 +1282,7 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", tmp.path().join("link-ok")).unwrap();
 
         let (total_size, file_count, entries) =
-            walk_directory(tmp.path().to_str().unwrap()).unwrap();
+            walk_directory(tmp.path().to_str().unwrap(), &[]).unwrap();
 
         let link_entry = entries
             .iter()
@@ -1292,7 +1318,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::os::unix::fs::symlink("does-not-exist.txt", tmp.path().join("dangling")).unwrap();
 
-        let (_, _, entries) = walk_directory(tmp.path().to_str().unwrap()).unwrap();
+        let (_, _, entries) = walk_directory(tmp.path().to_str().unwrap(), &[]).unwrap();
 
         let entry = entries
             .iter()
@@ -1314,7 +1340,7 @@ mod tests {
         .unwrap();
 
         let (total_size, file_count, entries) =
-            walk_directory(tmp.path().to_str().unwrap()).unwrap();
+            walk_directory(tmp.path().to_str().unwrap(), &[]).unwrap();
 
         let fifo_entry = entries
             .iter()
@@ -1401,7 +1427,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let slice_size: i64 = conn
@@ -1493,7 +1519,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
         fs::write(src.join("junk.tmp"), b"AAAA").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
         stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
 
         // The excluded junk file's content drifts at an UNCHANGED size —
@@ -1521,7 +1547,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
 
         let files_count: i64 = conn
             .query_row(
@@ -1568,7 +1594,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
         fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
         stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let junk_row_exists: i64 = conn
@@ -1608,7 +1634,7 @@ mod tests {
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let dar_command: String = conn
@@ -1635,23 +1661,23 @@ mod tests {
     fn a_unit_with_no_excludes_configured_behaves_exactly_as_before() {
         // Issue #49 trap: "do NOT break units with no excludes configured
         // — the empty-pattern case must behave exactly as today, and is
-        // the common case." No dotfile override at all (init_unit's own
-        // default), so only whatever `config.defaults.global_excludes`
-        // would already exclude via dar is affected — the walk itself
-        // must record everything, unchanged from pre-#49.
+        // the common case." No dotfile override (init_unit's own default)
+        // AND an empty `global_excludes` slice passed explicitly — the true
+        // "nothing configured anywhere" case, which must record everything.
+        // (The case where `global_excludes` is non-empty but no dotfile
+        // exists — the ticket's own headline scenario — is covered
+        // separately below, in the "second half" test block; this test's
+        // fixture is deliberately a neutral filename, not one that
+        // resembles a real default global-exclude pattern, so it stays a
+        // clean proof of the empty/empty case rather than depending on
+        // `Config::default()`'s specific pattern list.)
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
-        // Deliberately named like a *global*-default exclude pattern, to
-        // document (not silently hide) this fix's scope boundary: with NO
-        // per-unit dotfile override, the walk still records this file
-        // (unchanged from before #49) even though dar itself already
-        // excludes it via config.defaults.global_excludes — see
-        // exclude::dotfile_patterns's doc comment for the residual gap.
-        fs::write(src.join("Thumbs.db"), b"not a real thumbnail cache").unwrap();
+        fs::write(src.join("media_file.dat"), b"ordinary archival content").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
         let file_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1",
@@ -1659,16 +1685,140 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 2 files recorded (keep.txt, Thumbs.db) + the dotfile itself
+        // 2 files recorded (keep.txt, media_file.dat) + the dotfile itself
         // (.tapectl-unit.toml, swept up like any other regular file —
         // pre-existing, unrelated behavior this fix does not change).
         assert_eq!(
             file_count, 3,
-            "with no dotfile exclude_patterns, nothing is filtered from the \
-             walk — matches pre-#49 behavior exactly"
+            "with no dotfile exclude_patterns and no global_excludes, nothing \
+             is filtered from the walk — matches pre-#49 behavior exactly"
         );
 
         stage_create(&conn, &paths, &config, snap_id)
-            .expect("staging a unit with no per-unit excludes must succeed exactly as before");
+            .expect("staging a unit with no excludes at all must succeed exactly as before");
+    }
+
+    // ── issue #49 (second half): global excludes must reach both walks ──
+    //
+    // The ticket's own headline example: `config.defaults.global_excludes`
+    // (Thumbs.db/.DS_Store/*.nfo/*.tmp by default) reached dar only —
+    // neither walk saw it. For a unit with NO dotfile override (the common
+    // case), `walk_directory` recorded the globally-excluded file into
+    // `files`, `backfill_checksums` gave it a sha256 baseline, and a
+    // same-size content regeneration then tripped `validate_source`'s
+    // BITROT refusal for content dar was never going to archive — see the
+    // PR report for the captured pre-fix failure. These tests use
+    // `setup_unit_with_excludes(&tmp, vec![])` (no dotfile override) and
+    // pass the REAL `config.defaults.global_excludes` returned by that
+    // helper, so `Thumbs.db` here is the actual default pattern, not a
+    // stand-in.
+
+    /// Write this FIRST — it must fail against the pre-fix code (see the PR
+    /// report for the captured pre-fix failure output).
+    #[test]
+    fn global_default_excluded_file_content_drift_at_stable_size_does_not_false_positive_bitrot() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+
+        fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
+        fs::write(src.join("Thumbs.db"), b"AAAA").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &config.defaults.global_excludes).unwrap();
+        stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
+
+        // Thumbs.db regenerates at an UNCHANGED size — exactly the
+        // false-BITROT scenario the issue describes.
+        fs::write(src.join("Thumbs.db"), b"BBBB").unwrap();
+
+        let result = stage_create(&conn, &paths, &config, snap_id);
+        assert!(
+            result.is_ok(),
+            "re-staging must succeed — a globally-excluded file's content drift \
+             must never raise BITROT, even with no dotfile override: {result:?}"
+        );
+    }
+
+    #[test]
+    fn global_default_excluded_files_do_not_appear_in_manifest_or_files_table() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+
+        fs::write(src.join("keep.txt"), b"kept content").unwrap();
+        fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &config.defaults.global_excludes).unwrap();
+
+        let files_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'Thumbs.db'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            files_count, 0,
+            "a globally-excluded file must not appear in `files`, even with no \
+             dotfile override"
+        );
+
+        let manifest_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manifest_entries me
+                 JOIN manifests m ON m.id = me.manifest_id
+                 WHERE m.snapshot_id = ?1 AND me.path = 'Thumbs.db'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            manifest_count, 0,
+            "a globally-excluded file must not appear in `manifest_entries` either"
+        );
+
+        let kept_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_count, 1, "non-excluded file must still be recorded");
+    }
+
+    #[test]
+    fn global_default_excluded_files_never_receive_a_sha256_baseline() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+
+        fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
+        fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &config.defaults.global_excludes).unwrap();
+        stage_create(&conn, &paths, &config, snap_id).unwrap();
+
+        let junk_row_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'Thumbs.db'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            junk_row_exists, 0,
+            "a globally-excluded file must have no `files` row at all, so there \
+             is nothing for backfill_checksums to baseline"
+        );
+
+        let kept_sha: Option<String> = conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            kept_sha.is_some(),
+            "the non-excluded file must still get its baseline established"
+        );
     }
 }

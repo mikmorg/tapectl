@@ -42,11 +42,18 @@ pub struct SyncReport {
 /// Errors from individual directories (e.g. a dotfile naming an unknown
 /// tenant) are collected rather than aborting the whole sync, same spirit
 /// as `unit::discovery::discover`.
+///
+/// `global_excludes` is `config.defaults.global_excludes` (issue #49) —
+/// threaded through to step 3's `pending_units_for_collection` call so this
+/// sync's pending/dirty counts agree with `unit status --dirty`/`report
+/// dirty`/`collection status`. Passed as a slice rather than the whole
+/// `Config` since that is the only field this function's own scan needs.
 pub fn sync_collection(
     conn: &Connection,
     paths: &TapectlPaths,
     lib: &CollectionConfig,
     dry_run: bool,
+    global_excludes: &[String],
 ) -> Result<(SyncReport, Vec<String>)> {
     let mut report = SyncReport::default();
     let mut errors = Vec::new();
@@ -106,7 +113,7 @@ pub fn sync_collection(
     // dry-run mode this is the PRE-sync state, since nothing above was
     // actually written — newly-would-be-created units correctly don't
     // appear here yet, they're already counted via `report.created`).
-    for p in super::fingerprint::pending_units_for_collection(conn, lib)? {
+    for p in super::fingerprint::pending_units_for_collection(conn, lib, global_excludes)? {
         match p.reason {
             super::fingerprint::PendingReason::New => report.pending += 1,
             super::fingerprint::PendingReason::Dirty => report.dirty += 1,
@@ -377,7 +384,8 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
 
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(report.created, 1);
@@ -398,7 +406,8 @@ mod tests {
         std::fs::create_dir_all(root.path().join("beta")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, true).unwrap();
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, true, &[]).unwrap();
 
         assert!(errors.is_empty());
         assert_eq!(report.created, 2, "must detect both new directories");
@@ -423,14 +432,15 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         let unit_before = queries::get_unit_by_name(&conn, "testlib/alpha")
             .unwrap()
             .unwrap();
         assert_eq!(unit_before.status, "active");
 
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
-        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.missing, 1);
         assert_eq!(report.created, 0, "must not re-create the vanished unit");
@@ -452,7 +462,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
 
         let lib = test_lib(root.path(), "media");
-        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         let unit_before = queries::get_unit_by_name(&conn, "testlib/alpha")
             .unwrap()
             .unwrap();
@@ -461,7 +471,8 @@ mod tests {
         // directory, exactly like `unit::discovery`'s rename-proofing).
         std::fs::rename(root.path().join("alpha"), root.path().join("alpha-renamed")).unwrap();
 
-        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.moved, 1);
         assert_eq!(
@@ -493,12 +504,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
         let lib = test_lib(root.path(), "media");
-        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
 
         // Simulate an external drive going away: directory removed, then a
         // sync runs and marks it missing.
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
-        sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         assert_eq!(
             queries::get_unit_by_name(&conn, "testlib/alpha")
                 .unwrap()
@@ -535,7 +546,8 @@ mod tests {
         )
         .unwrap();
 
-        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.reactivated, 1);
         assert_eq!(
@@ -558,7 +570,7 @@ mod tests {
 
         let lib = test_lib(root.path(), "media");
         let (report, _errors) =
-            sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
 
         assert_eq!(report.created, 1, "only the non-excluded directory");
         assert!(queries::get_unit_by_name(&conn, "testlib/alpha")
@@ -580,7 +592,8 @@ mod tests {
         let mut lib = test_lib(root.path(), "media");
         lib.dotfiles = false;
 
-        let (report, errors) = sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         assert!(errors.is_empty());
         assert_eq!(report.created, 1);
         assert!(
@@ -621,7 +634,7 @@ mod tests {
         lib.archive_set = Some("bulk-media".to_string());
 
         let (_report, errors) =
-            sync_collection(&conn, &paths_in(home.path()), &lib, false).unwrap();
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
         assert!(errors.is_empty(), "sync errors: {errors:?}");
 
         let unit = queries::get_unit_by_name(&conn, "testlib/alpha")

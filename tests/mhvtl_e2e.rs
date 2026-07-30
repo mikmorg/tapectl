@@ -233,7 +233,7 @@ fn add_unit(
     )
     .unwrap();
     h.source_dirs.push(src);
-    let sid = staging::snapshot_create(&h.conn, unit_name).unwrap();
+    let sid = staging::snapshot_create(&h.conn, unit_name, &[]).unwrap();
     staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
 }
 
@@ -272,7 +272,7 @@ fn add_unit_with_sentinel_file(
     )
     .unwrap();
     h.source_dirs.push(src);
-    let sid = staging::snapshot_create(&h.conn, unit_name).unwrap();
+    let sid = staging::snapshot_create(&h.conn, unit_name, &[]).unwrap();
     staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
 }
 

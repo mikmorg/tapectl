@@ -111,7 +111,13 @@ fn cmd_sync(
 
     let mut rows = Vec::new();
     for lib in &config.collections {
-        let (report, errors) = collection::sync::sync_collection(conn, paths, lib, dry_run)?;
+        let (report, errors) = collection::sync::sync_collection(
+            conn,
+            paths,
+            lib,
+            dry_run,
+            &config.defaults.global_excludes,
+        )?;
         rows.push((lib.name.clone(), report, errors));
     }
 

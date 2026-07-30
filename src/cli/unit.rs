@@ -229,7 +229,7 @@ pub fn run(
         }
 
         UnitCommands::Status { name, dirty } if *dirty => {
-            show_dirty_status(conn, name, json_output)?;
+            show_dirty_status(conn, name, json_output, &config.defaults.global_excludes)?;
         }
 
         UnitCommands::Status { name, .. } => {
@@ -367,11 +367,17 @@ struct DirtyStatus {
 /// `unit status --dirty`'s scan: reuses `fingerprint::classify` — the same
 /// scan the Collection layer (`collection sync|status|plan`) and `report
 /// dirty` use — so this can never disagree with them about whether a
-/// unit's disk matches its last snapshot (issue #36/H10).
-fn dirty_status(conn: &Connection, unit: &crate::db::models::Unit) -> Result<DirtyStatus> {
+/// unit's disk matches its last snapshot (issue #36/H10). `global_excludes`
+/// is `config.defaults.global_excludes` (issue #49), kept in lockstep with
+/// those other callers.
+fn dirty_status(
+    conn: &Connection,
+    unit: &crate::db::models::Unit,
+    global_excludes: &[String],
+) -> Result<DirtyStatus> {
     use crate::collection::fingerprint::{self, PendingReason};
 
-    Ok(match fingerprint::classify(conn, unit)? {
+    Ok(match fingerprint::classify(conn, unit, global_excludes)? {
         None => DirtyStatus {
             state: "clean",
             changes: fingerprint::FingerprintDiff::default(),
@@ -387,9 +393,14 @@ fn dirty_status(conn: &Connection, unit: &crate::db::models::Unit) -> Result<Dir
     })
 }
 
-fn show_dirty_status(conn: &Connection, name: &str, json_output: bool) -> Result<()> {
+fn show_dirty_status(
+    conn: &Connection,
+    name: &str,
+    json_output: bool,
+    global_excludes: &[String],
+) -> Result<()> {
     let unit = resolve_unit(conn, name)?;
-    let status = dirty_status(conn, &unit)?;
+    let status = dirty_status(conn, &unit, global_excludes)?;
 
     if json_output {
         println!(
@@ -463,10 +474,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
-        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
 
         let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
-        let status = dirty_status(&conn, &unit).unwrap();
+        let status = dirty_status(&conn, &unit, &[]).unwrap();
         assert_eq!(status.state, "clean");
         assert!(status.changes.is_empty());
     }
@@ -479,7 +490,7 @@ mod tests {
         // No snapshot_create call — never archived.
 
         let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
-        let status = dirty_status(&conn, &unit).unwrap();
+        let status = dirty_status(&conn, &unit, &[]).unwrap();
         assert_eq!(status.state, "new");
     }
 
@@ -489,12 +500,12 @@ mod tests {
         let file_path = tmp.path().join("f.txt");
         std::fs::write(&file_path, b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
-        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
 
         std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
 
         let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
-        let status = dirty_status(&conn, &unit).unwrap();
+        let status = dirty_status(&conn, &unit, &[]).unwrap();
         assert_eq!(status.state, "dirty");
         assert_eq!(status.changes.modified, vec!["f.txt".to_string()]);
     }
@@ -509,10 +520,10 @@ mod tests {
         let file_path = tmp.path().join("f.txt");
         std::fs::write(&file_path, b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
-        crate::staging::snapshot_create(&conn, "unit1").unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
         std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
 
-        show_dirty_status(&conn, "unit1", false).expect("plain output must succeed");
-        show_dirty_status(&conn, "unit1", true).expect("json output must succeed");
+        show_dirty_status(&conn, "unit1", false, &[]).expect("plain output must succeed");
+        show_dirty_status(&conn, "unit1", true, &[]).expect("json output must succeed");
     }
 }

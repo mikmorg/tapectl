@@ -79,7 +79,12 @@ pub fn run(
         ReportCommands::FireRisk => report_fire_risk(conn, config, json_output),
         ReportCommands::Copies { unit } => report_copies(conn, unit.as_deref(), json_output),
         ReportCommands::TapeOnly { unit } => report_tape_only(conn, unit.as_deref(), json_output),
-        ReportCommands::Dirty { unit } => report_dirty(conn, unit.as_deref(), json_output),
+        ReportCommands::Dirty { unit } => report_dirty(
+            conn,
+            unit.as_deref(),
+            json_output,
+            &config.defaults.global_excludes,
+        ),
         ReportCommands::Pending => report_pending(conn, json_output),
         ReportCommands::VerifyStatus { volume } => {
             report_verify_status(conn, volume.as_deref(), json_output)
@@ -355,7 +360,13 @@ struct DirtyRow {
 /// every `active` unit (mirroring `pending_units_for_collection`'s own
 /// scope: `missing`/`tape_only`/`retired` units have no live directory this
 /// scan should second-guess), optionally narrowed to one unit by name.
-fn dirty_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<DirtyRow>> {
+/// `global_excludes` is `config.defaults.global_excludes` (issue #49),
+/// kept in lockstep with those other callers.
+fn dirty_rows(
+    conn: &Connection,
+    unit_filter: Option<&str>,
+    global_excludes: &[String],
+) -> Result<Vec<DirtyRow>> {
     use crate::collection::fingerprint::{self, PendingReason};
 
     // In-memory name filter (same pattern `unit list --tag` already uses)
@@ -368,7 +379,7 @@ fn dirty_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<DirtyR
 
     let mut rows = Vec::with_capacity(units.len());
     for unit in &units {
-        let (state, changes) = match fingerprint::classify(conn, unit)? {
+        let (state, changes) = match fingerprint::classify(conn, unit, global_excludes)? {
             None => ("clean", fingerprint::FingerprintDiff::default()),
             Some(p) if p.reason == PendingReason::New => {
                 ("new", fingerprint::FingerprintDiff::default())
@@ -386,8 +397,13 @@ fn dirty_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<DirtyR
     Ok(rows)
 }
 
-fn report_dirty(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
-    let rows = dirty_rows(conn, unit_filter)?;
+fn report_dirty(
+    conn: &Connection,
+    unit_filter: Option<&str>,
+    json_output: bool,
+    global_excludes: &[String],
+) -> Result<()> {
+    let rows = dirty_rows(conn, unit_filter, global_excludes)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
@@ -892,8 +908,8 @@ mod tests {
         )
         .unwrap();
 
-        crate::staging::snapshot_create(&conn, "clean_unit").unwrap();
-        crate::staging::snapshot_create(&conn, "dirty_unit").unwrap();
+        crate::staging::snapshot_create(&conn, "clean_unit", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "dirty_unit", &[]).unwrap();
 
         // Mutate dirty_unit's directory after its snapshot was taken.
         std::fs::write(dirty_dir.join("g.txt"), b"new file").unwrap();
@@ -906,7 +922,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let conn = setup_two_units(&root);
 
-        let rows = dirty_rows(&conn, None).unwrap();
+        let rows = dirty_rows(&conn, None, &[]).unwrap();
         assert_eq!(rows.len(), 2);
 
         let clean = rows.iter().find(|r| r.name == "clean_unit").unwrap();
@@ -925,12 +941,12 @@ mod tests {
         let root = TempDir::new().unwrap();
         let conn = setup_two_units(&root);
 
-        let rows = dirty_rows(&conn, Some("dirty_unit")).unwrap();
+        let rows = dirty_rows(&conn, Some("dirty_unit"), &[]).unwrap();
         assert_eq!(rows.len(), 1, "--unit must narrow to exactly one unit");
         assert_eq!(rows[0].name, "dirty_unit");
         assert_eq!(rows[0].state, "dirty");
 
-        let rows = dirty_rows(&conn, Some("clean_unit")).unwrap();
+        let rows = dirty_rows(&conn, Some("clean_unit"), &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "clean_unit");
         assert_eq!(rows[0].state, "clean");
@@ -940,8 +956,8 @@ mod tests {
     fn report_dirty_runs_end_to_end_in_both_output_modes() {
         let root = TempDir::new().unwrap();
         let conn = setup_two_units(&root);
-        report_dirty(&conn, None, false).expect("plain output must succeed");
-        report_dirty(&conn, Some("clean_unit"), true).expect("json output must succeed");
+        report_dirty(&conn, None, false, &[]).expect("plain output must succeed");
+        report_dirty(&conn, Some("clean_unit"), true, &[]).expect("json output must succeed");
     }
 
     /// Issue #89 / ADR-0004: `copies_rows` must re-qualify eligibility at

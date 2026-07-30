@@ -38,7 +38,11 @@ pub fn plan_for_collection(
     config: &Config,
     lib: &CollectionConfig,
 ) -> Result<Vec<Batch>> {
-    let pending = super::fingerprint::pending_units_for_collection(conn, lib)?;
+    let pending = super::fingerprint::pending_units_for_collection(
+        conn,
+        lib,
+        &config.defaults.global_excludes,
+    )?;
     let synthetic: Vec<selector::PendingUnit> = pending
         .iter()
         .map(|p| selector::PendingUnit {
@@ -120,7 +124,7 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
         let batches = plan_for_collection(&conn, &config, &lib).unwrap();
@@ -157,7 +161,7 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
         let err = plan_for_collection(&conn, &config, &lib).unwrap_err();

@@ -32,7 +32,11 @@ pub fn status_for_collection(
 ) -> Result<CollectionStatus> {
     let mut status = CollectionStatus::default();
 
-    for p in super::fingerprint::pending_units_for_collection(conn, lib)? {
+    for p in super::fingerprint::pending_units_for_collection(
+        conn,
+        lib,
+        &config.defaults.global_excludes,
+    )? {
         match p.reason {
             PendingReason::New => status.pending += 1,
             PendingReason::Dirty => status.dirty += 1,
@@ -93,7 +97,7 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = Config::default();
         let status = status_for_collection(&conn, &config, &lib).unwrap();
@@ -128,9 +132,9 @@ mod tests {
             dotfiles: true,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
-        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
-        super::super::sync::sync_collection(&conn, &paths, &lib, false).unwrap();
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = Config::default();
         let status = status_for_collection(&conn, &config, &lib).unwrap();

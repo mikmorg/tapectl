@@ -64,7 +64,7 @@ fn collection_sync_dry_run_against_a_generated_microcosm_collection_reports_sens
     };
     let paths = TapectlPaths::new(home.path().to_path_buf());
 
-    let (report, errors) = sync_collection(&conn, &paths, &lib, true).unwrap();
+    let (report, errors) = sync_collection(&conn, &paths, &lib, true, &[]).unwrap();
 
     assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     assert_eq!(

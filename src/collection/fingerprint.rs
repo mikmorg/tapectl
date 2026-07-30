@@ -136,35 +136,24 @@ struct FileStamp {
 /// produces a byte-identical fingerprint against a byte-identical
 /// snapshot.
 ///
-/// **Issue #49 update:** this walk used to be deliberately unfiltered, on
-/// the reasoning that "excludes are a dar-time / archive-content concern
+/// **Issue #49:** this walk used to be deliberately unfiltered, on the
+/// reasoning that "excludes are a dar-time / archive-content concern
 /// applied later at stage create, and the `files` table this compares
-/// against is unfiltered too." That second half stopped being true once
-/// #49 wired `staging::walk_directory` (which populates `files`) through
-/// the shared `staging::exclude` matcher — an unfiltered `walk_fingerprint`
-/// compared against a now-FILTERED `files` table would report every
-/// excluded file as a permanent phantom `added` entry (exactly the trap
-/// #49's own design review flagged: worse than the bug being fixed). So
-/// this walk now applies the identical matcher, via the identical
-/// per-unit dotfile lookup (`exclude::dotfile_patterns(unit_path)`) —
-/// same predicate, same source, so the two walks cannot independently
-/// disagree about the same fact (issues #33/#36/#48's shared failure
-/// shape).
-///
-/// Residual scope gap (see `exclude::dotfile_patterns`'s doc comment and
-/// the PR report): this is the per-unit (dotfile) half of "effective
-/// excludes = globals + dotfile" only. `classify`, this function's sole
-/// caller, has no `Config` in scope, and threading one to it ripples into
-/// caller graphs outside issue #49's fence (`src/cli/unit.rs`,
-/// `src/cli/report.rs`, `src/cli/operations.rs`,
-/// `src/collection/{status,plan,sync}.rs`). `staging::walk_directory` has
-/// the exact same gap for the exact same reason (`snapshot_create` also
-/// has no `Config`), so the two walks stay in lockstep with each other —
-/// they are just both, for now, short of dar's fuller (global + dotfile)
-/// exclude set.
-fn walk_fingerprint(unit_path: &Path) -> Vec<FileStamp> {
-    let exclude_compiled =
-        crate::staging::exclude::compile(&crate::staging::exclude::dotfile_patterns(unit_path));
+/// against is unfiltered too." That stopped being true once #49 wired
+/// `staging::walk_directory` (which populates `files`) through the shared
+/// `staging::exclude` matcher — an unfiltered `walk_fingerprint` compared
+/// against a now-FILTERED `files` table would report every excluded file
+/// as a permanent phantom `added` entry (exactly the trap #49's own design
+/// review flagged: worse than the bug being fixed). So this walk applies
+/// the identical matcher, via `exclude::effective_compiled` — the same
+/// combination of `global_excludes` (`config.defaults.global_excludes`,
+/// passed in by the caller) and this directory's own dotfile patterns
+/// (read internally, keyed off `unit_path`) that `staging::walk_directory`
+/// uses — same predicate, same source, same combination logic, so the two
+/// walks cannot independently disagree about the same fact (issues
+/// #33/#36/#48's shared failure shape).
+fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Vec<FileStamp> {
+    let exclude_compiled = crate::staging::exclude::effective_compiled(unit_path, global_excludes);
     let mut out = Vec::new();
     for entry in WalkDir::new(unit_path)
         .follow_links(false)
@@ -406,7 +395,16 @@ fn hash_diff(
 ///   - `sha256` — additionally hashes regular files once their mtime_size
 ///     fingerprint already matches (`hash_diff`), to catch the one edit
 ///     mtime_size can never see.
-pub fn classify(conn: &Connection, unit: &Unit) -> Result<Option<PendingUnit>> {
+///
+/// `global_excludes` is `config.defaults.global_excludes` (issue #49) —
+/// passed through to `walk_fingerprint` so this scan can never disagree
+/// with `staging::walk_directory`/`snapshot_create` about which files are
+/// part of the unit's tracked content.
+pub fn classify(
+    conn: &Connection,
+    unit: &Unit,
+    global_excludes: &[String],
+) -> Result<Option<PendingUnit>> {
     let Some(path) = unit.current_path.as_deref() else {
         return Ok(None);
     };
@@ -415,7 +413,7 @@ pub fn classify(conn: &Connection, unit: &Unit) -> Result<Option<PendingUnit>> {
         return Ok(None);
     }
 
-    let fresh = walk_fingerprint(Path::new(path));
+    let fresh = walk_fingerprint(Path::new(path), global_excludes);
     let estimated_bytes: u64 = fresh.iter().map(|f| f.size_bytes.max(0) as u64).sum();
 
     let Some(recorded) = recorded_fingerprint(conn, unit.id)? else {
@@ -464,15 +462,26 @@ pub fn classify(conn: &Connection, unit: &Unit) -> Result<Option<PendingUnit>> {
 /// classified. Only `'active'` units are considered — `missing` units have
 /// no directory to walk, and `tape_only`/`retired` are deliberate operator
 /// states this module never second-guesses.
+///
+/// `global_excludes` (issue #49) is threaded straight through to `classify`
+/// for every unit — required so `collection sync|status|plan` (this
+/// function's callers) agree with `unit status --dirty`/`report dirty`
+/// about which units are dirty. Without it, once `staging::walk_directory`
+/// starts filtering `config.defaults.global_excludes` out of the `files`
+/// table (this same issue), any caller here that kept comparing against an
+/// unfiltered fresh walk would report a permanent phantom `added` entry for
+/// every globally-excluded file — worse than the pre-fix gap, not a
+/// continuation of it.
 pub fn pending_units_for_collection(
     conn: &Connection,
     lib: &CollectionConfig,
+    global_excludes: &[String],
 ) -> Result<Vec<PendingUnit>> {
     let root = super::canonical_root(lib)?;
     let units = super::units_under_root(conn, &root)?;
     let mut out = Vec::new();
     for unit in units.into_iter().filter(|u| u.status == "active") {
-        if let Some(p) = classify(conn, &unit)? {
+        if let Some(p) = classify(conn, &unit, global_excludes)? {
             out.push(p);
         }
     }
@@ -526,7 +535,9 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let p = classify(&conn, &unit).unwrap().expect("must be pending");
+        let p = classify(&conn, &unit, &[])
+            .unwrap()
+            .expect("must be pending");
         assert_eq!(p.reason, PendingReason::New);
         assert_eq!(p.estimated_bytes, 5);
     }
@@ -549,10 +560,10 @@ mod tests {
             .unwrap();
 
         // Simulate a real snapshot_create by using it directly.
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "freshly snapshotted, unchanged unit must not be pending"
         );
     }
@@ -573,12 +584,12 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         // Mutate after the snapshot: add a new file.
         std::fs::write(tmp.path().join("g.txt"), b"world!!").unwrap();
 
-        let p = classify(&conn, &unit).unwrap().expect("must be dirty");
+        let p = classify(&conn, &unit, &[]).unwrap().expect("must be dirty");
         assert_eq!(p.reason, PendingReason::Dirty);
         assert_eq!(p.estimated_bytes, 5 + 7);
         // issue #36: the specific change must be named, not just "dirty".
@@ -604,11 +615,11 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         std::fs::remove_file(&file_path).unwrap();
 
-        let p = classify(&conn, &unit).unwrap().expect("must be dirty");
+        let p = classify(&conn, &unit, &[]).unwrap().expect("must be dirty");
         assert_eq!(p.reason, PendingReason::Dirty);
         assert_eq!(p.changes.removed, vec!["f.txt".to_string()]);
         assert!(p.changes.added.is_empty());
@@ -632,13 +643,13 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         // A different size is enough for mtime_size to see this without
         // needing to fuss with mtime precision.
         std::fs::write(&file_path, b"hello, world! this content is now longer").unwrap();
 
-        let p = classify(&conn, &unit).unwrap().expect("must be dirty");
+        let p = classify(&conn, &unit, &[]).unwrap().expect("must be dirty");
         assert_eq!(p.reason, PendingReason::Dirty);
         assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
         assert!(p.changes.added.is_empty());
@@ -681,14 +692,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unit.checksum_mode, "mtime_size");
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
         std::fs::write(&file_path, b"REPLACED content!").unwrap(); // same length (17 bytes)
         restore_mtime(&file_path, mtime_before);
 
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "mtime_size must stay blind to a same-size-same-mtime content \
              change — that tradeoff is documented, not a bug"
         );
@@ -722,7 +733,7 @@ mod tests {
             .unwrap();
         assert_eq!(unit.checksum_mode, "sha256");
 
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         // Establish the sha256 baseline for the original content — what a
         // real `stage_create` would have backfilled via the exact same
@@ -742,7 +753,7 @@ mod tests {
         std::fs::write(&file_path, b"REPLACED content!").unwrap();
         restore_mtime(&file_path, mtime_before);
 
-        let p = classify(&conn, &unit)
+        let p = classify(&conn, &unit, &[])
             .unwrap()
             .expect("sha256 mode must catch a content change mtime_size cannot see");
         assert_eq!(p.reason, PendingReason::Dirty);
@@ -779,11 +790,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
         // Never staged — files.sha256 stays NULL for f.txt.
 
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "sha256 mode must fall back to the mtime_size verdict when no \
              baseline hash exists, not report a spurious change"
         );
@@ -821,16 +832,16 @@ mod tests {
 
         // snapshot_create's real walk records the symlink's file_type
         // ('symlink') and leaves its sha256 NULL — nothing to backfill.
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         // Run the scan twice: the trap is specifically about a symlink
         // being flagged dirty *forever*, not just once.
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "sha256 mode must not flag a symlink dirty for lacking a content hash"
         );
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "must stay clean on a second scan too — not perpetually dirty"
         );
     }
@@ -865,7 +876,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
         // snapshot_create leaves sha256 NULL (only staging populates it),
         // and a NULL baseline is skipped — so give it one, which is what a
         // previously-staged unit would have.
@@ -886,7 +897,7 @@ mod tests {
             return;
         }
 
-        let pending = classify(&conn, &unit)
+        let pending = classify(&conn, &unit, &[])
             .expect("an unreadable file must not abort the scan")
             .expect("the unit must be reported dirty, not silently clean");
         assert_eq!(pending.reason, PendingReason::Dirty);
@@ -922,7 +933,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(classify(&conn, &unit).unwrap().is_none());
+        assert!(classify(&conn, &unit, &[]).unwrap().is_none());
     }
 
     // ── issue #49: shared exclude matcher, walk_directory/walk_fingerprint lockstep ──
@@ -936,6 +947,12 @@ mod tests {
     /// scanners agreeing on the same wrong answer isn't proof of
     /// correctness) — the exclusion-content assertions below are what
     /// actually fail pre-fix, and are the real proof this landed.
+    ///
+    /// Issue #49 (second half): extended with a **globally**-excluded
+    /// fixture (`data.cache`, matched only by `global_excludes`, disjoint
+    /// from the dotfile's own `*.tmp`/`Thumbs.db` patterns) so this guard
+    /// also covers the global half, not just the dotfile half the first
+    /// half of the ticket landed.
     #[test]
     fn walk_directory_and_walk_fingerprint_enumerate_identical_paths_for_excluded_fixture() {
         let tmp = tempfile::tempdir().unwrap();
@@ -954,19 +971,23 @@ mod tests {
             },
         )
         .unwrap();
+        let global_excludes = vec!["*.cache".to_string()];
         std::fs::write(tmp.path().join("keep.txt"), b"keep me").unwrap();
         std::fs::write(tmp.path().join("junk.tmp"), b"junk").unwrap();
         std::fs::write(tmp.path().join("Thumbs.db"), b"thumbnail cache").unwrap();
+        std::fs::write(tmp.path().join("data.cache"), b"globally-excluded junk").unwrap();
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         std::fs::write(tmp.path().join("sub/nested.tmp"), b"nested junk").unwrap();
         std::fs::write(tmp.path().join("sub/nested_keep.txt"), b"nested keep").unwrap();
 
-        let mut from_directory =
-            crate::staging::walk_directory_relative_paths_for_test(tmp.path().to_str().unwrap())
-                .unwrap();
+        let mut from_directory = crate::staging::walk_directory_relative_paths_for_test(
+            tmp.path().to_str().unwrap(),
+            &global_excludes,
+        )
+        .unwrap();
         from_directory.sort();
 
-        let from_fingerprint: Vec<String> = walk_fingerprint(tmp.path())
+        let from_fingerprint: Vec<String> = walk_fingerprint(tmp.path(), &global_excludes)
             .into_iter()
             .map(|f| f.path)
             .collect(); // walk_fingerprint's own output is already sorted
@@ -980,8 +1001,10 @@ mod tests {
 
         // Proves the fix itself, not just mutual agreement: the excluded
         // files must actually be gone from both sides, and the kept ones
-        // must still be present on both sides.
-        for excluded in ["junk.tmp", "Thumbs.db", "sub/nested.tmp"] {
+        // must still be present on both sides. `data.cache` is matched only
+        // by `global_excludes`, never by the dotfile — its absence is the
+        // proof this test guards the global half, not just the dotfile half.
+        for excluded in ["junk.tmp", "Thumbs.db", "sub/nested.tmp", "data.cache"] {
             assert!(
                 !from_directory.contains(&excluded.to_string()),
                 "{excluded} must be excluded from walk_directory, got {from_directory:?}"
@@ -1004,26 +1027,51 @@ mod tests {
     }
 
     #[test]
-    fn walk_fingerprint_with_no_dotfile_excludes_behaves_exactly_as_before() {
-        // The common case (issue #49 trap: "do NOT break units with no
-        // excludes configured") — no dotfile at all, so nothing is
-        // excluded and every non-directory file is enumerated, unchanged.
+    fn walk_fingerprint_with_no_excludes_at_all_behaves_exactly_as_before() {
+        // The true no-excludes case (issue #49 trap: "do NOT break units
+        // with no excludes configured") — no dotfile AND an empty
+        // `global_excludes` slice, so nothing is excluded and every
+        // non-directory file is enumerated, unchanged. (The case where
+        // `global_excludes` is non-empty but there is no dotfile is the
+        // ticket's own headline scenario — see
+        // `walk_fingerprint_applies_global_excludes_even_with_no_dotfile_at_all`
+        // below.)
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.txt"), b"a").unwrap();
         std::fs::write(
             tmp.path().join("Thumbs.db"),
-            b"not excluded without a dotfile",
+            b"not excluded with no dotfile and no global_excludes",
         )
         .unwrap();
 
-        let fresh = walk_fingerprint(tmp.path());
+        let fresh = walk_fingerprint(tmp.path(), &[]);
         let paths: Vec<&str> = fresh.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"a.txt"));
         assert!(
             paths.contains(&"Thumbs.db"),
-            "with no dotfile exclude_patterns, nothing is filtered — matches \
-             pre-#49 behavior exactly (the global-exclude half is a separate, \
-             reported scope gap, not implemented by this walk)"
+            "with no dotfile exclude_patterns and no global_excludes, nothing \
+             is filtered — matches pre-#49 behavior exactly"
+        );
+    }
+
+    /// Issue #49 (second half): the ticket's own headline gap, exercised
+    /// directly on `walk_fingerprint` — a real default global-exclude
+    /// pattern (`Thumbs.db`) must be filtered even with NO dotfile
+    /// override, once `global_excludes` is passed through.
+    #[test]
+    fn walk_fingerprint_applies_global_excludes_even_with_no_dotfile_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(tmp.path().join("Thumbs.db"), b"thumbnail cache junk").unwrap();
+
+        let global_excludes = vec!["Thumbs.db".to_string()];
+        let fresh = walk_fingerprint(tmp.path(), &global_excludes);
+        let paths: Vec<&str> = fresh.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"), "non-excluded file must remain");
+        assert!(
+            !paths.contains(&"Thumbs.db"),
+            "a globally-excluded file must be filtered even with no dotfile \
+             override at all — got {paths:?}"
         );
     }
 
@@ -1066,10 +1114,10 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
 
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "excluded junk must not make a freshly-snapshotted unit dirty"
         );
 
@@ -1093,7 +1141,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            classify(&conn, &unit).unwrap().is_none(),
+            classify(&conn, &unit, &[]).unwrap().is_none(),
             "must stay clean on a second scan too — not perpetually dirty \
              (issue #36's own trap)"
         );
@@ -1102,10 +1150,142 @@ mod tests {
         // must still be caught — proves this test isn't vacuously passing
         // because classify() is broken in some other way.
         std::fs::write(tmp.path().join("f.txt"), b"hello, world! now longer").unwrap();
-        let p = classify(&conn, &unit)
+        let p = classify(&conn, &unit, &[])
             .unwrap()
             .expect("a real, non-excluded change must still be detected");
         assert_eq!(p.reason, PendingReason::Dirty);
         assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
+    }
+
+    /// Issue #49 (second half): the same `#36` perpetual-dirtiness trap as
+    /// the dotfile test above, but for a unit with NO dotfile override at
+    /// all — only `config.defaults.global_excludes`-shaped junk
+    /// (`Thumbs.db`) — the ticket's own headline scenario, this time
+    /// exercised through `classify` (the scan `unit status --dirty`,
+    /// `report dirty`, and `collection status`/`sync`/`plan` all share)
+    /// rather than through the full `stage_create` pipeline.
+    #[test]
+    fn a_unit_with_globally_excluded_junk_and_no_dotfile_stays_clean_across_two_scans() {
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // No dotfile written at all for this unit — the common case.
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        std::fs::write(tmp.path().join("Thumbs.db"), b"AAAA").unwrap();
+
+        let unit_id = seed_unit(&conn, tmp.path());
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        let global_excludes = vec!["Thumbs.db".to_string()];
+        crate::staging::snapshot_create(&conn, &unit.name, &global_excludes).unwrap();
+
+        assert!(
+            classify(&conn, &unit, &global_excludes).unwrap().is_none(),
+            "globally-excluded junk must not make a freshly-snapshotted unit dirty"
+        );
+
+        // Size-changing edit — see the dotfile version of this test above
+        // for why a same-size swap would pass for the wrong reason (mtime
+        // truncated to whole seconds can make a same-second rewrite
+        // indistinguishable regardless of whether exclusion runs at all).
+        std::fs::write(
+            tmp.path().join("Thumbs.db"),
+            b"much bigger junk content now, definitely a different size",
+        )
+        .unwrap();
+        assert!(
+            classify(&conn, &unit, &global_excludes).unwrap().is_none(),
+            "must stay clean on a second scan too — not perpetually dirty \
+             (issue #36's own trap, now for the global-exclude half)"
+        );
+
+        // Sanity check the other direction: a REAL (non-excluded) change
+        // must still be caught.
+        std::fs::write(tmp.path().join("f.txt"), b"hello, world! now longer").unwrap();
+        let p = classify(&conn, &unit, &global_excludes)
+            .unwrap()
+            .expect("a real, non-excluded change must still be detected");
+        assert_eq!(p.reason, PendingReason::Dirty);
+        assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
+    }
+
+    /// Proves the fix reaches the actual `collection status`/`sync`/`plan`
+    /// entry point (`pending_units_for_collection`), not just `classify`
+    /// directly — the exact regression the coordinator flagged as worse
+    /// than the original bug: once `snapshot_create` starts filtering
+    /// globals out of `files`, a caller of `pending_units_for_collection`
+    /// that did NOT also receive `global_excludes` would see every
+    /// globally-excluded file as a permanent phantom `added` entry.
+    #[test]
+    fn pending_units_for_collection_does_not_flag_globally_excluded_junk_as_pending() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'media'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let unit_dir = root.path().join("alpha");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(unit_dir.join("f.txt"), b"hello").unwrap();
+        std::fs::write(unit_dir.join("Thumbs.db"), b"AAAA").unwrap();
+
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES (?1, 'testlib/alpha', ?2, ?3, 'active')",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                tenant_id,
+                unit_dir.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        let global_excludes = vec!["Thumbs.db".to_string()];
+        crate::staging::snapshot_create(&conn, "testlib/alpha", &global_excludes).unwrap();
+
+        let lib = crate::config::CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+
+        let pending = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
+        assert!(
+            pending.is_empty(),
+            "a freshly-snapshotted unit with only globally-excluded junk must \
+             not be pending — got {pending:?}"
+        );
+
+        // Second scan: the junk file changes (still excluded) — must still
+        // not be flagged (the #36 perpetual-dirtiness trap, at the
+        // collection-scan entry point this time).
+        std::fs::write(
+            unit_dir.join("Thumbs.db"),
+            b"much bigger junk content, definitely a different size",
+        )
+        .unwrap();
+        let pending = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
+        assert!(
+            pending.is_empty(),
+            "must stay clean on a second scan too — got {pending:?}"
+        );
     }
 }

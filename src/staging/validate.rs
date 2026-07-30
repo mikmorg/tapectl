@@ -38,10 +38,16 @@ use crate::util::HashingReader;
 /// straight to `backfill_checksums`, whose own `sha256 IS NULL` guard —
 /// not any filtering here — is what actually prevents overwriting an
 /// existing baseline.
+///
+/// `global_excludes` is `config.defaults.global_excludes` (issue #49) —
+/// passed through to the internal `walk_directory` call the NEW-file check
+/// below uses, so a globally-excluded file appearing after `snapshot
+/// create` is not falsely reported NEW (see that check's own doc comment).
 pub fn validate_source(
     conn: &Connection,
     snapshot_id: i64,
     source_path: &str,
+    global_excludes: &[String],
 ) -> Result<Vec<(String, String)>> {
     let base = Path::new(source_path);
 
@@ -74,8 +80,11 @@ pub fn validate_source(
     // rather than a second walk implementation that could silently
     // disagree with what `snapshot_create` itself considered "the files" —
     // this is an extra O(file count) directory walk every stage, accepted
-    // for the walk-parity guarantee.
-    let (_, _, disk_entries) = super::walk_directory(source_path)?;
+    // for the walk-parity guarantee. Passing `global_excludes` through
+    // keeps this walk in the same lockstep with `snapshot_create` that
+    // issue #49 already established between `walk_directory` and
+    // `collection::fingerprint::walk_fingerprint`.
+    let (_, _, disk_entries) = super::walk_directory(source_path, global_excludes)?;
     let manifest_paths: HashSet<&str> = all_entries.iter().map(|(p, ..)| p.as_str()).collect();
     let mut new_files: Vec<&str> = disk_entries
         .iter()
@@ -96,20 +105,19 @@ pub fn validate_source(
         // .DS_Store, a cache entry — would block staging outright for content
         // dar was never going to archive.
         //
-        // Issue #49 landed: `walk_directory` now applies the unit's own
-        // dotfile `[excludes] patterns` (via the shared `staging::exclude`
-        // matcher, also used by `collection::fingerprint::walk_fingerprint`
-        // and merged into `stage_create`'s dar `-X` arguments alongside
-        // `global_excludes`). That closes the false-positive source for any
-        // pattern listed in the unit's own dotfile. It does NOT yet close it
-        // for a file excluded ONLY via `config.defaults.global_excludes` with
-        // no per-unit dotfile override — `walk_directory`'s sole caller
-        // (`snapshot_create`) has no `Config` in scope, and threading one to
-        // it ripples into caller graphs outside #49's fence (see
-        // `exclude::dotfile_patterns`'s doc comment and the PR report). So a
-        // *global*-only exclude can still surface a false NEW warning today —
-        // a real, acknowledged, narrower residual, tracked separately from
-        // this fix.
+        // Issue #49 landed in two halves. The first wired `walk_directory`
+        // through the unit's own dotfile `[excludes] patterns` (via the
+        // shared `staging::exclude` matcher, also used by
+        // `collection::fingerprint::walk_fingerprint` and merged into
+        // `stage_create`'s dar `-X` arguments alongside `global_excludes`),
+        // closing the false-positive source for any pattern listed in the
+        // unit's own dotfile. The second threaded `global_excludes`
+        // (`config.defaults.global_excludes`) through `walk_directory`
+        // (and this call site) too, closing it for a globally-excluded
+        // file with no per-unit dotfile override as well — the same
+        // effective-excludes set now reaches every consumer: dar, the
+        // recorded `files`/manifest tables, `collection::fingerprint`'s
+        // dirty scan, and this NEW-file check.
         //
         // A gate whose false positives halt legitimate work is worse than no
         // gate: operators learn to bypass it. The real cost of NEW is a catalog
@@ -404,7 +412,7 @@ mod tests {
         std::fs::write(tmp.path().join("b.bin"), b"world!!").unwrap();
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None), ("b.bin", 7, None)]);
-        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
         assert_eq!(result.len(), 2);
         // Sha256 of "hello" is 2cf24d...
         let hello = result
@@ -426,7 +434,7 @@ mod tests {
 
         let (conn, sid) =
             setup_conn_with_snapshot(&[("present.txt", 2, None), ("missing.txt", 10, None)]);
-        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
             .err()
             .unwrap();
         let msg = format!("{err}");
@@ -442,7 +450,7 @@ mod tests {
         std::fs::write(tmp.path().join("growing.txt"), b"actually longer").unwrap();
 
         let (conn, sid) = setup_conn_with_snapshot(&[("growing.txt", 3, None)]);
-        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
             .err()
             .unwrap();
         let msg = format!("{err}");
@@ -476,7 +484,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
-        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
         assert_eq!(checksums.len(), 1);
         let (path, hex) = &checksums[0];
         assert_eq!(path, "a.txt");
@@ -505,7 +513,7 @@ mod tests {
         let baseline = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline))]);
-        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
         assert_eq!(checksums[0].1, baseline);
 
         crate::staging::backfill_checksums(&conn, sid, &checksums).unwrap();
@@ -536,7 +544,7 @@ mod tests {
         );
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(stale_baseline.as_str()))]);
-        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
             .err()
             .unwrap();
         let msg = format!("{err}");
@@ -580,7 +588,7 @@ mod tests {
         let baseline = direct_hash(b"hello");
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline.as_str()))]);
-        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap())
+        let err = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
             .err()
             .unwrap();
         let msg = format!("{err}");
@@ -595,18 +603,19 @@ mod tests {
 
     #[test]
     fn new_file_on_disk_not_in_manifest_warns_but_does_not_refuse() {
-        // NEW is a WARNING, not a gate — see the rationale at the check itself.
-        // The design doc (§2.13) files NEW as a check-integrity report status,
-        // and this detection has a known false-positive source (walk_directory
-        // applies no excludes, dar does), so blocking staging on it would halt
-        // legitimate work over files dar was never going to archive.
+        // NEW is a WARNING, not a gate — see the rationale at the check
+        // itself. The design doc (§2.13) files NEW as a check-integrity
+        // report status, so blocking staging on it would halt legitimate
+        // work for a file that is genuinely new (not excluded by anything
+        // — `stray.tmp` matches neither a dotfile nor a global pattern
+        // here), which must still surface as a WARNing, not an error.
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
         std::fs::write(tmp.path().join("stray.tmp"), b"appeared after snapshot").unwrap();
         let baseline = direct_hash(b"hello");
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline.as_str()))]);
 
-        let out = validate_source(&conn, sid, tmp.path().to_str().unwrap());
+        let out = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]);
         assert!(
             out.is_ok(),
             "a NEW file must warn, not refuse staging: {out:?}"
@@ -731,7 +740,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "subdir/f.txt");
     }
@@ -957,7 +966,7 @@ mod tests {
         // message for why).
         insert_nonregular_file(&conn, sid, "link-ok", 10, "symlink", Some("target.txt"));
 
-        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap());
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]);
         assert!(
             result.is_ok(),
             "a mismatched-length symlink must not produce a false DIRTY: {result:?}"
@@ -989,7 +998,7 @@ mod tests {
             Some("does-not-exist.txt"),
         );
 
-        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap());
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]);
         assert!(
             result.is_ok(),
             "a broken symlink must not error at all — excluded from validation: {result:?}"
@@ -1022,7 +1031,7 @@ mod tests {
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
         insert_nonregular_file(&conn, sid, "a.fifo", 0, "special", None);
 
-        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap()).unwrap();
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
         assert_eq!(
             checksums.len(),
             1,
