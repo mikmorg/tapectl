@@ -1425,7 +1425,9 @@ mod tests {
     /// issue #92), dotfile policy fields are now `Option` and are omitted
     /// from newly-written dotfiles unless the operator sets them
     /// explicitly — so `init_unit`'s dotfile no longer shadows this
-    /// archive_set field, and this test proves that end to end.
+    /// archive_set field, and this test proves that end to end. Because the
+    /// archive set names a real compressor, it also runs dar's `-z` codepath,
+    /// which #92 made reachable for the first time.
     #[test]
     fn stage_create_uses_archive_set_resolved_slice_size_not_global_default() {
         let tmp = TempDir::new().unwrap();
@@ -1443,22 +1445,22 @@ mod tests {
         config.dar.binary = "/usr/bin/dar".to_string();
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
         config.defaults.slice_size = "100M".to_string();
-        // A non-"none" default so the archive_set's "none" override below is
-        // distinguishable from "the default happened to already be none" —
-        // deliberately "none" (rather than e.g. "gzip") so this test never
-        // exercises dar's `-z` codepath at all (kept out of scope here; see
-        // the final report for the pre-existing `-z`-argv-splitting defect
-        // in src/dar/create.rs this sidesteps).
-        config.defaults.compression = "bzip2".to_string();
+        // Leave the default at "none" and have the archive set override it to
+        // a real compressor. That direction is the one that actually proves
+        // the fix: pre-#92, `init_unit`'s dotfile hardcoded `compression =
+        // "none"`, so an assertion expecting "none" would have passed for the
+        // wrong reason. Expecting "gzip" can only succeed if the dotfile has
+        // stopped shadowing. It also drives dar's real `-z` codepath.
+        config.defaults.compression = "none".to_string();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
 
         // Archive set overriding both slice_size and compression away from
-        // config.defaults' "100M"/"bzip2" above.
+        // config.defaults' "100M"/"none" above.
         conn.execute(
             "INSERT INTO archive_sets (name, slice_size, compression) VALUES ('cold', ?1, ?2)",
-            params![50i64 * 1024 * 1024, "none"],
+            params![50i64 * 1024 * 1024, "gzip"],
         )
         .unwrap();
 
@@ -1509,9 +1511,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            compression, "none",
-            "stage_sets.compression must reflect the archive_set's override (none), \
-             not config.defaults.compression (bzip2), and must not be shadowed by \
+            compression, "gzip",
+            "stage_sets.compression must reflect the archive_set's override (gzip), \
+             not config.defaults.compression (none), and must not be shadowed by \
              a concrete value baked into the unit's dotfile — proves the \
              archive_set's compression is actually reachable (issue #92)"
         );

@@ -537,6 +537,13 @@ pub fn run(
             let mut created = 0;
             let mut updated = 0;
             for as_cfg in &config.archive_sets {
+                // Same guard as create/edit: `sync` writes archive_sets rows
+                // straight from config.toml, so without this a bogus
+                // `compression` in the config file walks past the CLI
+                // validation and only fails later at `dar -z` (issue #92).
+                if let Some(c) = &as_cfg.compression {
+                    validate_compression(c)?;
+                }
                 let locations_json = as_cfg
                     .required_locations
                     .as_ref()

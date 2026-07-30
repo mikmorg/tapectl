@@ -38,7 +38,12 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
     cmd.arg("-s").arg(params.slice_size);
 
     if params.compression != "none" {
-        cmd.arg("-z").arg(params.compression);
+        // dar's `-z` takes an OPTIONAL argument, so getopt only sees it when
+        // it is glued to the flag. Passing `-z gzip` as two argv tokens makes
+        // dar read the algorithm as a user target and abort with
+        // "Given user target(s) could not be found: gzip". Latent until
+        // issue #92 made archive-set compression reachable at all.
+        cmd.arg(format!("-z{}", params.compression));
     }
 
     cmd.arg("-an"); // case-insensitive masks
