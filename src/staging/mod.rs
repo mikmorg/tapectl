@@ -1413,19 +1413,19 @@ mod tests {
     /// keys via `tenant::add_tenant`) so the assertion is against what
     /// actually lands in `stage_sets`, not a mocked shortcut.
     ///
-    /// Deliberately asserts on `slice_size` only, not `compression`:
-    /// `unit::init_unit` always writes a dotfile whose `[policy]` section
-    /// carries a concrete `compression` value (see the design doc's own
-    /// §2.2 example), and `policy::resolve`'s dotfile layer outranks
-    /// archive_set whenever a dotfile is present — so for a real,
-    /// dotfile-backed unit, `compression` resolves to the dotfile's value
-    /// regardless of any archive_set override. That is a separate,
-    /// pre-existing defect in how `init_unit` writes dotfiles (out of this
-    /// fix's scope — see the final report), not a gap in this wiring.
-    /// `slice_size` is never written into the dotfile's `[policy]` section
-    /// by `write_dotfile` (only `checksum_mode`/`compression` are part of
-    /// the structured model), so it is unaffected and is the correct
-    /// field to prove `stage_create`'s resolver wiring on.
+    /// Also asserts on `compression`: prior to issue #92's fix,
+    /// `unit::init_unit` always wrote a dotfile whose `[policy]` section
+    /// carried a concrete `compression` value (see the design doc's own
+    /// §2.2 example), and `policy::resolve`'s dotfile layer unconditionally
+    /// outranks archive_set whenever a dotfile is present — so for every
+    /// real, dotfile-backed unit, `compression` resolved to the dotfile's
+    /// hardcoded value regardless of any archive_set override, making the
+    /// archive set's `compression` structurally unreachable. Per the CTO's
+    /// ratified fix ("Recast of v4.0 §2.2" in docs/design-errata.md,
+    /// issue #92), dotfile policy fields are now `Option` and are omitted
+    /// from newly-written dotfiles unless the operator sets them
+    /// explicitly — so `init_unit`'s dotfile no longer shadows this
+    /// archive_set field, and this test proves that end to end.
     #[test]
     fn stage_create_uses_archive_set_resolved_slice_size_not_global_default() {
         let tmp = TempDir::new().unwrap();
@@ -1443,15 +1443,22 @@ mod tests {
         config.dar.binary = "/usr/bin/dar".to_string();
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
         config.defaults.slice_size = "100M".to_string();
+        // A non-"none" default so the archive_set's "none" override below is
+        // distinguishable from "the default happened to already be none" —
+        // deliberately "none" (rather than e.g. "gzip") so this test never
+        // exercises dar's `-z` codepath at all (kept out of scope here; see
+        // the final report for the pre-existing `-z`-argv-splitting defect
+        // in src/dar/create.rs this sidesteps).
+        config.defaults.compression = "bzip2".to_string();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
 
-        // Archive set overriding slice_size away from config.defaults'
-        // "100M" above.
+        // Archive set overriding both slice_size and compression away from
+        // config.defaults' "100M"/"bzip2" above.
         conn.execute(
-            "INSERT INTO archive_sets (name, slice_size) VALUES ('cold', ?1)",
-            params![50i64 * 1024 * 1024],
+            "INSERT INTO archive_sets (name, slice_size, compression) VALUES ('cold', ?1, ?2)",
+            params![50i64 * 1024 * 1024, "none"],
         )
         .unwrap();
 
@@ -1491,6 +1498,22 @@ mod tests {
             "stage_sets.slice_size must reflect the archive_set's override (50M), \
              not config.defaults.slice_size (100M) — proves stage_create resolves \
              policy instead of reading config.defaults directly"
+        );
+
+        let compression: String = conn
+            .query_row(
+                "SELECT compression FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            compression, "none",
+            "stage_sets.compression must reflect the archive_set's override (none), \
+             not config.defaults.compression (bzip2), and must not be shadowed by \
+             a concrete value baked into the unit's dotfile — proves the \
+             archive_set's compression is actually reachable (issue #92)"
         );
     }
 
