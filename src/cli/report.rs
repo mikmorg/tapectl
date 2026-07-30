@@ -1066,8 +1066,8 @@ mod tests {
         )
         .unwrap();
 
-        crate::staging::snapshot_create(&conn, "clean_unit", &[]).unwrap();
-        crate::staging::snapshot_create(&conn, "dirty_unit", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "clean_unit", &Config::default()).unwrap();
+        crate::staging::snapshot_create(&conn, "dirty_unit", &Config::default()).unwrap();
 
         // Mutate dirty_unit's directory after its snapshot was taken.
         std::fs::write(dirty_dir.join("g.txt"), b"new file").unwrap();

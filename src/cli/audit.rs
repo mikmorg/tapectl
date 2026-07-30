@@ -917,7 +917,7 @@ mod tests {
             )
             .unwrap();
 
-            crate::staging::snapshot_create(&conn, "dirty_unit", &[]).unwrap();
+            crate::staging::snapshot_create(&conn, "dirty_unit", &Config::default()).unwrap();
             // Mark the snapshot 'current' (snapshot_create alone leaves it
             // 'created') so `no_archive` doesn't also fire here — this test
             // isolates the `dirty` check specifically.

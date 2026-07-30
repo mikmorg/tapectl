@@ -491,6 +491,7 @@ pub fn pending_units_for_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::db;
     use rusqlite::params;
 
@@ -560,7 +561,7 @@ mod tests {
             .unwrap();
 
         // Simulate a real snapshot_create by using it directly.
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         assert!(
             classify(&conn, &unit, &[]).unwrap().is_none(),
@@ -584,7 +585,7 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         // Mutate after the snapshot: add a new file.
         std::fs::write(tmp.path().join("g.txt"), b"world!!").unwrap();
@@ -615,7 +616,7 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         std::fs::remove_file(&file_path).unwrap();
 
@@ -643,7 +644,7 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         // A different size is enough for mtime_size to see this without
         // needing to fuss with mtime precision.
@@ -692,7 +693,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unit.checksum_mode, "mtime_size");
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
         std::fs::write(&file_path, b"REPLACED content!").unwrap(); // same length (17 bytes)
@@ -733,7 +734,7 @@ mod tests {
             .unwrap();
         assert_eq!(unit.checksum_mode, "sha256");
 
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         // Establish the sha256 baseline for the original content — what a
         // real `stage_create` would have backfilled via the exact same
@@ -790,7 +791,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
         // Never staged — files.sha256 stays NULL for f.txt.
 
         assert!(
@@ -832,7 +833,7 @@ mod tests {
 
         // snapshot_create's real walk records the symlink's file_type
         // ('symlink') and leaves its sha256 NULL — nothing to backfill.
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         // Run the scan twice: the trap is specifically about a symlink
         // being flagged dirty *forever*, not just once.
@@ -876,7 +877,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
         // snapshot_create leaves sha256 NULL (only staging populates it),
         // and a NULL baseline is skipped — so give it one, which is what a
         // previously-staged unit would have.
@@ -1114,7 +1115,7 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
             .unwrap()
             .unwrap();
-        crate::staging::snapshot_create(&conn, &unit.name, &[]).unwrap();
+        crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
 
         assert!(
             classify(&conn, &unit, &[]).unwrap().is_none(),
@@ -1184,7 +1185,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let global_excludes = vec!["Thumbs.db".to_string()];
-        crate::staging::snapshot_create(&conn, &unit.name, &global_excludes).unwrap();
+        let mut cfg = Config::default();
+        cfg.defaults.global_excludes = global_excludes.clone();
+        crate::staging::snapshot_create(&conn, &unit.name, &cfg).unwrap();
 
         assert!(
             classify(&conn, &unit, &global_excludes).unwrap().is_none(),
@@ -1255,7 +1258,9 @@ mod tests {
         .unwrap();
 
         let global_excludes = vec!["Thumbs.db".to_string()];
-        crate::staging::snapshot_create(&conn, "testlib/alpha", &global_excludes).unwrap();
+        let mut cfg = Config::default();
+        cfg.defaults.global_excludes = global_excludes.clone();
+        crate::staging::snapshot_create(&conn, "testlib/alpha", &cfg).unwrap();
 
         let lib = crate::config::CollectionConfig {
             name: "testlib".into(),

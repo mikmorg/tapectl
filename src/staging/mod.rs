@@ -17,16 +17,14 @@ use crate::util::{HashingReader, HashingWriter};
 
 /// Create a snapshot: fast directory walk, manifest, files table.
 ///
-/// `global_excludes` is `config.defaults.global_excludes` (issue #49 item
-/// 5) — passed through to `walk_directory` so the recorded `files`/manifest
-/// rows never include a file dar itself was never going to archive (the
-/// unit's own dotfile excludes are read internally by `walk_directory`,
-/// keyed off `source_path`, unchanged from before this parameter existed).
-pub fn snapshot_create(
-    conn: &Connection,
-    unit_name: &str,
-    global_excludes: &[String],
-) -> Result<i64> {
+/// `config.defaults.global_excludes` (issue #49 item 5) is passed through
+/// to `walk_directory` so the recorded `files`/manifest rows never include
+/// a file dar itself was never going to archive (the unit's own dotfile
+/// excludes are read internally by `walk_directory`, keyed off
+/// `source_path`). `config` also supplies `defaults.large_file_warn_threshold`
+/// for the large-file warning (issue #52, design line 203).
+pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> Result<i64> {
+    let global_excludes = &config.defaults.global_excludes;
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
@@ -39,6 +37,13 @@ pub fn snapshot_create(
         return Err(TapectlError::UnitPathNotFound(source_path.to_string()));
     }
 
+    // Nested unit detection (design line 184): "unit init and snapshot
+    // create check parent/child. Both errors." Excludes the unit's own
+    // row (change 3, issue #52) so a snapshot of an already-registered
+    // unit doesn't trip on itself. Runs before the directory walk to fail
+    // fast, before doing expensive work.
+    crate::unit::nesting::check_nesting_excluding(conn, source_path, Some(unit.id))?;
+
     // Determine next version number
     let next_version: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM snapshots WHERE unit_id = ?1",
@@ -48,6 +53,28 @@ pub fn snapshot_create(
 
     // Walk directory and build manifest
     let (total_size, file_count, manifest_entries) = walk_directory(source_path, global_excludes)?;
+
+    // Empty units: warn but allow (design line 185). Gated on `file_count`,
+    // not `total_size` — a unit full of zero-byte files is not empty.
+    if file_count == 0 {
+        tracing::warn!(unit = %unit_name, "unit has no files; snapshot will be empty");
+    }
+
+    // Large files: warn on any file exceeding `large_file_warn_threshold`
+    // (design line 203). Threshold computed once, outside the loop.
+    // `parse_size_to_bytes` inherits its known parsing defects (issue #59,
+    // still open) — not addressed here.
+    let large_file_threshold = parse_size_to_bytes(&config.defaults.large_file_warn_threshold);
+    for entry in &manifest_entries {
+        if !entry.is_dir && entry.size > large_file_threshold {
+            tracing::warn!(
+                path = %entry.path,
+                size_bytes = entry.size,
+                threshold_bytes = large_file_threshold,
+                "file exceeds large_file_warn_threshold"
+            );
+        }
+    }
 
     // Insert snapshot
     conn.execute(
@@ -1680,7 +1707,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let slice_size: i64 = conn
@@ -1770,7 +1797,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let result = stage_create(&conn, &paths, &config, snap_id);
 
         assert!(
@@ -1945,6 +1972,172 @@ mod tests {
         (conn, paths, config, src)
     }
 
+    /// Issue #52 change 2 — the self-match trap. `snapshot_create` for an
+    /// ordinary, already-registered unit must succeed: the nesting check
+    /// must exclude the unit's own row, or `check_path.starts_with(existing)`
+    /// is trivially true for a unit against itself (`check_path == existing`)
+    /// and every snapshot would fail with "X is inside existing unit X".
+    /// Written and run BEFORE the naive (non-excluding) nesting-check wire-up
+    /// existed, to prove the trap: with a bare
+    /// `nesting::check_nesting(conn, source_path)` call (no exclusion), this
+    /// test failed with:
+    ///
+    /// ```text
+    /// called `Result::unwrap()` on an `Err` value: NestedUnit(
+    ///     "/tmp/.../src is inside existing unit \"unit1\" at /tmp/.../src",
+    /// )
+    /// ```
+    ///
+    /// After wiring `check_nesting_excluding(conn, source_path, Some(unit.id))`
+    /// instead, it passes.
+    #[test]
+    fn snapshot_create_does_not_trip_nesting_check_against_its_own_unit() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, _config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("f.txt"), b"ordinary file").unwrap();
+
+        let result = snapshot_create(&conn, "unit1", &Config::default());
+        assert!(
+            result.is_ok(),
+            "snapshot_create must not match a unit against its own row: {result:?}"
+        );
+    }
+
+    /// Issue #52 change 3, design line 184: "unit init and snapshot create
+    /// check parent/child. Both errors." Built with raw `INSERT INTO units`
+    /// rows (not `init_unit`, which would itself refuse to create the
+    /// nested unit) so both a parent and a genuinely nested child unit
+    /// exist, and `snapshot_create` on the child must error.
+    #[test]
+    fn snapshot_create_errors_on_genuinely_nested_unit() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let parent = tmp.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        conn.execute(
+            "INSERT INTO units (uuid, tenant_id, name, current_path, status)
+             VALUES (?1, ?2, 'parent-unit', ?3, 'active')",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                tenant_id,
+                parent.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, tenant_id, name, current_path, status)
+             VALUES (?1, ?2, 'child-unit', ?3, 'active')",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                tenant_id,
+                child.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        let result = snapshot_create(&conn, "child-unit", &Config::default());
+        assert!(
+            matches!(result, Err(TapectlError::NestedUnit(_))),
+            "nested unit must error per design line 184, got: {result:?}"
+        );
+    }
+
+    /// Design line 185: "Empty units: warn but allow." An empty unit still
+    /// produces a snapshot row with `file_count = 0` — proving "allow", not
+    /// "refuse" — since asserting on `tracing::warn!` output directly is
+    /// awkward in this crate's existing test style.
+    #[test]
+    fn snapshot_create_allows_empty_unit_with_warning() {
+        // Built with a raw `INSERT INTO units` row rather than
+        // `setup_unit_with_excludes`/`init_unit` — `init_unit` always
+        // writes a `.tapectl-unit.toml` dotfile into the unit's directory,
+        // and that dotfile is itself a real file `walk_directory` (rightly)
+        // counts, so a unit created that way is never genuinely empty.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let src = tmp.path().join("empty-src");
+        fs::create_dir_all(&src).unwrap();
+
+        conn.execute(
+            "INSERT INTO units (uuid, tenant_id, name, current_path, status)
+             VALUES (?1, ?2, 'unit1', ?3, 'active')",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                tenant_id,
+                src.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default())
+            .expect("empty unit must be allowed, only warned about");
+
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT file_count FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            file_count, 0,
+            "empty unit's snapshot must record file_count = 0"
+        );
+    }
+
+    /// Design line 203: "Warns on files > large_file_warn_threshold." A
+    /// file over threshold is only warned about, never blocking — the
+    /// snapshot succeeds and the manifest still records the file (proving
+    /// "warn", not "refuse" or "skip").
+    #[test]
+    fn snapshot_create_allows_large_file_with_warning() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.defaults.large_file_warn_threshold = "10B".to_string();
+        fs::write(src.join("big.bin"), vec![0u8; 1024]).unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &config)
+            .expect("a file over the large-file threshold must only warn, not fail");
+
+        let recorded_size: i64 = conn
+            .query_row(
+                "SELECT size_bytes FROM files WHERE snapshot_id = ?1 AND path = 'big.bin'",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded_size, 1024,
+            "the large file must still be recorded in the manifest, not skipped"
+        );
+    }
+
     /// THE core claim of issue #49 (its own re-triage escalation): a unit
     /// must not be permanently blocked from staging by content drift in a
     /// file dar was never going to archive. Write this FIRST — it must
@@ -1962,7 +2155,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
         fs::write(src.join("junk.tmp"), b"AAAA").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
 
         // The excluded junk file's content drifts at an UNCHANGED size —
@@ -1990,7 +2183,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         let files_count: i64 = conn
             .query_row(
@@ -2037,7 +2230,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
         fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let junk_row_exists: i64 = conn
@@ -2077,7 +2270,7 @@ mod tests {
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let dar_command: String = conn
@@ -2120,7 +2313,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::write(src.join("media_file.dat"), b"ordinary archival content").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let file_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1",
@@ -2166,7 +2359,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
         fs::write(src.join("Thumbs.db"), b"AAAA").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &config.defaults.global_excludes).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
         stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
 
         // Thumbs.db regenerates at an UNCHANGED size — exactly the
@@ -2189,7 +2382,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &config.defaults.global_excludes).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
 
         let files_count: i64 = conn
             .query_row(
@@ -2236,7 +2429,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
 
-        let snap_id = snapshot_create(&conn, "unit1", &config.defaults.global_excludes).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
         stage_create(&conn, &paths, &config, snap_id).unwrap();
 
         let junk_row_exists: i64 = conn

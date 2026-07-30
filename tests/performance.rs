@@ -146,7 +146,7 @@ fn perf_many_files_single_unit() {
         None,
     )
     .unwrap();
-    let sid = staging::snapshot_create(&h.conn, "many-unit", &[]).unwrap();
+    let sid = staging::snapshot_create(&h.conn, "many-unit", &Config::default()).unwrap();
     report("many_files", "init_unit + snapshot_create", t.elapsed());
 
     let t = Instant::now();
@@ -303,7 +303,7 @@ fn perf_large_single_file() {
         None,
     )
     .unwrap();
-    let sid = staging::snapshot_create(&h.conn, "big-unit", &[]).unwrap();
+    let sid = staging::snapshot_create(&h.conn, "big-unit", &Config::default()).unwrap();
     report("large_file", "init_unit + snapshot_create", t.elapsed());
 
     let t = Instant::now();

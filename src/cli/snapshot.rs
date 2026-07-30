@@ -97,8 +97,7 @@ pub fn run(
 ) -> Result<()> {
     match command {
         SnapshotCommands::Create { name } => {
-            let snapshot_id =
-                staging::snapshot_create(conn, name, &config.defaults.global_excludes)?;
+            let snapshot_id = staging::snapshot_create(conn, name, config)?;
 
             let (version, total_size, file_count): (i64, Option<i64>, Option<i64>) = conn
                 .query_row(

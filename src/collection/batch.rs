@@ -86,8 +86,7 @@ pub fn execute_batch(
     // Stage once: snapshot + stage every unit in this batch, in the
     // batch's own (name-ordered) sequence.
     for u in &batch.units {
-        let snapshot_id =
-            crate::staging::snapshot_create(conn, &u.name, &config.defaults.global_excludes)?;
+        let snapshot_id = crate::staging::snapshot_create(conn, &u.name, config)?;
         crate::staging::stage_create(conn, paths, config, snapshot_id)?;
     }
 

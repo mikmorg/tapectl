@@ -1502,7 +1502,7 @@ mod tests {
         let file_path = tmp.path().join("f.txt");
         std::fs::write(&file_path, b"hello").unwrap();
         let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
 
         let config = config_with_zero_tape_only_thresholds();
@@ -1531,7 +1531,7 @@ mod tests {
         let file_path = tmp.path().join("f.txt");
         std::fs::write(&file_path, b"hello").unwrap();
         let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
 
         let config = config_with_zero_tape_only_thresholds();
@@ -1547,7 +1547,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
         let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
-        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         // No mutation after the snapshot — stays clean.
 
         let config = config_with_zero_tape_only_thresholds();

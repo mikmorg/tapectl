@@ -474,7 +474,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
-        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
         let status = dirty_status(&conn, &unit, &[]).unwrap();
@@ -500,7 +500,7 @@ mod tests {
         let file_path = tmp.path().join("f.txt");
         std::fs::write(&file_path, b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
-        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
 
@@ -520,7 +520,7 @@ mod tests {
         let file_path = tmp.path().join("f.txt");
         std::fs::write(&file_path, b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
-        crate::staging::snapshot_create(&conn, "unit1", &[]).unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
 
         show_dirty_status(&conn, "unit1", false, &[]).expect("plain output must succeed");

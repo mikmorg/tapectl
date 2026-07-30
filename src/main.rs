@@ -241,8 +241,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
             println!("unit \"{unit_name}\" initialized");
             // Step 2: snapshot
-            let snap_id =
-                crate::staging::snapshot_create(&conn, &unit_name, &cfg.defaults.global_excludes)?;
+            let snap_id = crate::staging::snapshot_create(&conn, &unit_name, &cfg)?;
             println!("snapshot created (id={snap_id})");
             // Step 3: stage
             let ss_id = crate::staging::stage_create(&conn, &paths, &cfg, snap_id)?;
