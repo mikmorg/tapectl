@@ -29,9 +29,19 @@ the normative design set named in the Policy block below.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
-  #53 closed 2026-07-30; #97/#98 filed as residuals.) **Remaining mediums:
-  #44, #46, #93. Then lows: #43, #59, #61, #62, #63, #83, #91, #95, #97, #98,
-  #51, #50.** (#50/#51 keep their cross-issue note below.)
+  #53, #93 closed 2026-07-30; #97/#98 filed as residuals.) **Remaining
+  mediums: #44, #46. Then lows: #43, #59, #61, #62, #63, #83, #91, #95, #97,
+  #98, #51, #50.** (#50/#51 keep their cross-issue note below.)
+  **The gate now has leg 5: interrupt+resume (#93), 3 arms + verify/restore,
+  and it RUNS LAST because it erases the tape legs 1-4 wrote.** Gate is now
+  ~1m50s. Two facts any future gate work needs: **bash sets SIGINT to IGNORED
+  for background jobs** in a non-interactive shell, so a signal sent before
+  tapectl's `ctrlc::set_handler` runs is silently dropped; and `volume write`
+  spends its first seconds in build/validate (full-hashing every staged
+  slice) with the front zone + envelopes written before any slice — so
+  "sleep N then signal" is unreliable at both ends. Wait on a DB precondition
+  instead; the observed wait for one arm varied 4s..30s across runs.
+  **#44 is unblocked** — its stated blocker (#45, exit codes) is closed.
   **Staging file naming is now `{uuid12}_v{version}_s{stage_set_id}.`** (#53)
   and lives in ONE place: `archive_base_name` / `archive_base_prefix` in
   `staging/mod.rs`. `stage_create` and `cleanup_failed_stage_set` both call
