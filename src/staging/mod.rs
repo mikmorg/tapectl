@@ -592,7 +592,7 @@ fn check_staging_space(staging_dir: &Path, source_size: i64) -> Result<()> {
 /// order of operations as before — `age::Encryptor` doesn't retain any
 /// reference into `pubkey_strings` or the intermediate boxed recipients
 /// once constructed, so returning it by value is safe.
-fn build_encryptor(pubkey_strings: &[String]) -> Result<age::Encryptor> {
+pub(crate) fn build_encryptor(pubkey_strings: &[String]) -> Result<age::Encryptor> {
     let recipients: Vec<age::x25519::Recipient> = pubkey_strings
         .iter()
         .map(|k| {
@@ -614,6 +614,28 @@ fn build_encryptor(pubkey_strings: &[String]) -> Result<age::Encryptor> {
     .map_err(|e| TapectlError::Encryption(format!("failed to create encryptor: {e}")))
 }
 
+/// Whole-buffer age encryption: holds the full plaintext AND full ciphertext
+/// in RAM at once. Superseded on all production paths by
+/// `encrypt_file_streaming` (slices, H9/#35) and `volume::build`'s streaming
+/// envelope path (H9 residual, #87). Retained as a small, easy-to-audit
+/// reference implementation for tests that want a one-shot encrypt/decrypt
+/// round trip without standing up a file-backed streaming pipeline —
+/// including several integration-test crates (`tests/tenant_isolation.rs`,
+/// `tests/format_v2.rs`, `tests/failure_modes.rs`, `tests/integration.rs`)
+/// that call it as `tapectl::staging::encrypt_data`.
+///
+/// NOT `#[cfg(test)]`-gated: `cfg(test)` only applies when this crate is
+/// compiled in test mode for its own unit tests (`cargo test --lib`) — it
+/// does not propagate to the integration-test binaries above, which link
+/// the normally-built library. Gating this behind `cfg(test)` would make it
+/// disappear for exactly those external callers and break the build; see
+/// the issue #87 final report for the full account. The actual negative
+/// control for the H9 residual this retirement was meant to guard against
+/// is structural instead: `volume::build`'s envelope call sites
+/// (`materialize_envelope_streaming`) no longer call this function at all,
+/// so a regression toward whole-object envelope buffering would have to
+/// reintroduce a call here, which is visible in review/diff even without a
+/// compiler gate.
 pub fn encrypt_data(data: &[u8], pubkey_strings: &[String]) -> Result<Vec<u8>> {
     let encryptor = build_encryptor(pubkey_strings)?;
 
