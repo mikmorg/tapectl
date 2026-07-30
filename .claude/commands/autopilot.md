@@ -28,20 +28,33 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96 closed 2026-07-30.)
+  set when parallelising. (#94, #90, #96, #92 closed 2026-07-30.)
   **Status-predicate discipline (from #96):** every `volumes.status` read
   filter now routes through `policy::coverage` — `eligible` ("is a finished
   copy", `sealed`), `in_service` ("holds bytes we account for", + `active`/
   legacy `full`), `in_service_or_provisioned` (+ `initialized`). Never inline
   a status list again; five inlined copies are how #96 happened.
-  **#92 UNBLOCKED — take it next.** CTO ratified Option 1 (2026-07-30):
-  dotfile policy fields become `Option`, omitted from newly-written dotfiles
-  unless explicitly set, absent = defer upward. Recorded in
-  `docs/design-errata.md` as a Recast of v4.0 §2.2 (whose example is why the
-  bug survived). Accepted costs: the on-disk dotfile contract changes and it
-  cascades into `unit/discovery.rs` + `collection/sync.rs`; pre-existing
-  dotfiles keep shadowing until rewritten, and `config check` flags them
-  rather than silently rewriting operator-owned files.
+  **Dotfile policy contract (from #92, landed 2026-07-30).** Dotfile
+  `[policy]` fields are `Option`; `write_dotfile` omits the whole `[policy]`
+  table when unset; absent = defer upward. `policy::resolve` was NOT changed —
+  its layer 1 reads raw TOML, so absent keys always fell through correctly;
+  the bug was purely in the writer. Never reintroduce a serde `default` on a
+  policy field: a filled default is indistinguishable from an operator choice
+  and silently outranks the archive set. `config check` flags pre-existing
+  shadowing dotfiles via `policy::shadowing::scan` — it advises, never
+  rewrites operator-owned files, never changes the exit code.
+  **Lesson from #92 (worth generalising): a field nothing could reach hides
+  the bugs behind it.** Making archive-set `compression` reachable
+  immediately exposed that `dar/create.rs` had *never* worked for any
+  non-`none` value — it passed `-z` and the algorithm as two argv tokens, but
+  dar's `-z` takes an *optional* argument, so getopt only binds a glued
+  `-zgzip`. Both defects were invisible for the same reason. When unblocking a
+  dead config path, budget for the code downstream of it being untested too.
+  Also: the worker weakened the acceptance test (archive_set `"none"`) to
+  route around that dar defect — but `"none"` was exactly the old hardcoded
+  dotfile value, so it passed for the wrong reason. **Check that a
+  regression test still fails against the pre-fix code**, not just that it
+  passes after.
   **Cross-issue sequencing (recorded on the issues too):** #50/#51 must also
   patch the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or
   the heir path keeps the fixed-away behavior; #50's remedies are impossible
