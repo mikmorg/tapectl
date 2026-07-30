@@ -473,8 +473,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
 
     entries.sort_by_key(|e| e.position);
 
-    Ok(BuiltLayout {
-        layout: Layout {
+    let layout = Layout {
             label: inputs.label.clone(),
             volume_uuid: inputs.volume_uuid.clone(),
             media_type: inputs.media_type.clone(),
@@ -483,11 +482,44 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
                 available_bytes: inputs.usable_bytes,
                 reserve_bytes: inputs.enospc_buffer,
             },
-            entries,
-        },
+        entries,
+    };
+
+    // The rehydration sidecar (issue #25). Written AFTER every entry is
+    // materialized, so it describes the frozen bytes exactly as they landed.
+    //
+    // This is a staging-side artifact: it is deliberately NOT a
+    // `LayoutEntry`, occupies no tape position, and never reaches the medium
+    // — `entries` is already final above and nothing here appends to it. The
+    // name `layout.json` cannot collide with a generated zone's filename
+    // either, since those are all `{position:04}_{name}`.
+    //
+    // Its reason for existing: a resume after a process restart must re-hash
+    // these frozen files, never re-run `build()`. `BuildInputs::created_at`
+    // (`chrono::Utc::now()` at call time, persisted nowhere) and `mam_loads`
+    // (increments on every cartridge load) both drift across a restart, so a
+    // regenerated Layout would carry different ID-thunk bytes than the tape
+    // already holds and `SealedPending::confirm` would quarantine a good
+    // volume. `docs/design/layout-session.md`'s Resume rule requires the
+    // frozen zones to "re-hash byte-identical"; this is what makes that
+    // reachable from a cold start.
+    let sidecar = session_dir.join(LAYOUT_SIDECAR);
+    let json = serde_json::to_vec_pretty(&layout).map_err(|e| {
+        TapectlError::Other(format!("build: serializing the layout sidecar: {e}"))
+    })?;
+    fs::write(&sidecar, &json)
+        .map_err(|e| TapectlError::Other(format!("build: writing {}: {e}", sidecar.display())))?;
+
+    Ok(BuiltLayout {
+        layout,
         session_dir: session_dir.to_path_buf(),
     })
 }
+
+/// Filename of the rehydration sidecar `build()` writes into the session
+/// staging directory, and that `InterruptedSession::rehydrate` reads back
+/// (issue #25). Not a tape file — see the write site above.
+pub const LAYOUT_SIDECAR: &str = "layout.json";
 
 // ── BuiltLayout::validate ──
 

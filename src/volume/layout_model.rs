@@ -20,7 +20,7 @@ use thiserror::Error;
 /// Which zone of the volume layout (v2, ADR-0007) an entry is. Slice and
 /// envelope variants carry the id they map to so metadata generation (#24)
 /// and the session cursor (#22) can tie an entry back to its source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ZoneKind {
     IdThunk,
     SystemGuide,
@@ -114,7 +114,7 @@ impl ZoneKind {
 /// thunk and seal marker embed real timestamps, so regenerating them on
 /// resume would silently produce different bytes than what is already on
 /// tape; materializing once and re-reading the frozen file avoids that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentSource {
     /// An ephemeral staged slice file (`stage_slices.staging_path`). Never
     /// regenerated or re-encrypted by the Layout — it arrives already
@@ -143,7 +143,7 @@ pub enum ContentSource {
 }
 
 /// One file the volume will hold, at a fixed position.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LayoutEntry {
     /// Tape file position (File 0 = ID thunk).
     pub position: i32,
@@ -174,7 +174,7 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 /// The capacity a Layout must fit inside. `available_bytes` is the usable
 /// figure (nominal × usable factor); `reserve_bytes` folds together the
 /// manifest reserve and the ENOSPC buffer (design §2.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapacityBudget {
     pub available_bytes: u64,
     pub reserve_bytes: u64,
@@ -264,7 +264,16 @@ pub enum LayoutError {
 }
 
 /// The complete file plan for one volume.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` exist for exactly one purpose (issue #25):
+/// `build()` freezes the Layout to `session_dir/layout.json` so a restarted
+/// process can REHYDRATE an interrupted session instead of regenerating it
+/// (see [`ContentSource`] above for why regeneration is unsafe). That sidecar
+/// is a staging-side artifact only — it is never a [`LayoutEntry`], never
+/// occupies a tape position, and never reaches the medium. Nothing in
+/// `volume-format-v2.md` describes it, and nothing should: the on-tape
+/// self-describing record is the front index and the seal marker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub label: String,
     pub volume_uuid: String,
