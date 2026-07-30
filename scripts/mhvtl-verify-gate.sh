@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mhvtl verify gate — tapectl's release-verify analog (renovation ticket #7).
 #
-# Four legs over a real mhvtl tape, driven through the tapectl BINARY:
+# Five legs over a real mhvtl tape, driven through the tapectl BINARY:
 #   1. tapectl round trip: init → tenants → units → snapshot → stage →
 #      volume init/write/verify → restore → diff -r
 #   2. Heir leg (no tapectl, no DB): dd RESTORE.sh off the tape and run
@@ -9,6 +9,10 @@
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
 #      contain plaintext canaries
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
+#   5. Interrupt + resume (issue #93): interrupt a real write three ways and
+#      prove `volume resume` finishes each one — the recovery command that
+#      would otherwise never be rehearsed before it is needed. RUNS LAST: it
+#      erases the tape legs 1-4 wrote.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -358,6 +362,211 @@ check heir_info           step_heir_info
 check heir_find_envelope  step_heir_find
 check heir_restore        step_heir_restore
 check heir_restore_symlink_unit step_heir_restore_symlinks
+
+# ---------- leg 4: interrupt + resume (issue #93) ----------
+#
+# MUST BE LAST. It erases the tape written by legs 1-3, so every check that
+# reads $LABEL has to have run already.
+#
+# Why this leg exists: `volume resume` is the one command that only ever runs
+# after something has already gone wrong, so it is the one that will never
+# have been rehearsed before it is needed. Its inner machinery is covered by
+# tests/resume_session.rs over MemStore, but the orchestrator opens a real
+# TapeStore and had zero end-to-end coverage.
+#
+# `src/main.rs` installs the SIGINT handler, so a SIGINT here is a CLEAN
+# interrupt, not a kill: `session.rs`'s run_entries checks the flag BETWEEN
+# entries and marks `writes.status = 'interrupted'` itself. That is what we
+# assert. (A hard crash leaves rows `in_progress` until the next db::open()
+# sweep converts them — a different arm, noted as uncovered at the end.)
+RLABEL1="MHVTLR1"   # arm 1: interrupted before any content — resume from BOT
+RLABEL2="MHVTLR2"   # arm 2: interrupted mid-run — resume repositions
+RLABEL3="MHVTLR3"   # arm 3: hard-killed — startup sweep then resume
+
+# Start a write in the background and SIGINT it once the DB shows the state
+# this arm needs. Polling beats a fixed sleep for two reasons found the hard
+# way on the first run of this leg:
+#
+#   1. Bash sets SIGINT to *ignored* for background jobs in a non-interactive
+#      shell, and the tapectl process inherits that until ctrlc::set_handler
+#      overrides it. A SIGINT sent at t=0 is therefore silently dropped and
+#      the write runs to completion.
+#   2. `volume write` spends its first seconds in build/validate/plan
+#      (validate full-hashes every staged slice) before any byte reaches tape,
+#      and the front zone + envelopes are written before the first slice. A
+#      3s sleep landed before ANY slice — the window where slices are in
+#      flight is short and machine-dependent.
+#
+# So each arm names the condition it needs and we wait for it. The binary is
+# invoked directly rather than through TCTL() so $! is the tapectl process
+# itself and not a wrapping subshell that would swallow the signal.
+interrupt_write() { # interrupt_write <label> <sql-ready> <what> [signal=INT]
+    local label="$1" ready_sql="$2" what="$3" sig="${4:-INT}" pid start waited
+    start=$SECONDS
+    "$BIN" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+    pid=$!
+    # Wait for the condition, but never past the process exiting or 120s.
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$(python3 -c "
+import sqlite3,sys
+c=sqlite3.connect('file:$HOME_DIR/tapectl.db?mode=ro',uri=True)
+print(1 if c.execute(\"\"\"$ready_sql\"\"\").fetchone()[0] else 0)
+" 2>/dev/null)" = "1" ]; then
+            break
+        fi
+        if [ $(( SECONDS - start )) -ge 120 ]; then
+            echo "interrupt_write: TIMEOUT waiting for: $what"; break
+        fi
+        sleep 0.1
+    done
+    waited=$(( SECONDS - start ))
+    kill -"$sig" "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    # Logged so drift is visible BEFORE it becomes a flake.
+    echo "interrupt_write: label=$label sig=$sig waited=${waited}s for: $what"
+}
+
+# Assert the interrupt actually happened, and report how far it got.
+# Without this the leg would false-pass whenever the write simply finished
+# before the SIGINT landed — the failure mode that makes a timing-based
+# check worthless.
+assert_interrupted() { # assert_interrupted <label> <min-written> <max-written>
+    python3 - "$HOME_DIR/tapectl.db" "$1" "$2" "$3" <<'PY'
+import sqlite3, sys
+db, label, lo, hi = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+c = sqlite3.connect(db)
+status = c.execute("SELECT status FROM volumes WHERE label=?", (label,)).fetchone()[0]
+assert status != 'sealed', (
+    f"{label}: volume is already 'sealed' — the write COMPLETED before the SIGINT "
+    f"landed, so nothing was resumed and this leg proved nothing. "
+    f"Remedy: raise the sleep in interrupt_write, or enlarge the fixture payload.")
+rows = c.execute(
+    """SELECT w.status, COUNT(*) FROM writes w
+       JOIN volumes v ON v.id = w.volume_id WHERE v.label=? GROUP BY w.status""",
+    (label,)).fetchall()
+by = dict(rows)
+assert by.get('interrupted', 0) > 0, (
+    f"{label}: expected >=1 write row 'interrupted' (main.rs installs the SIGINT "
+    f"handler, so the run_entries loop marks them itself); got {by}. "
+    f"If these are 'in_progress' the signal killed the process instead of being "
+    f"handled — check that install_handler() still runs before the write.")
+written = c.execute(
+    """SELECT COUNT(*) FROM write_positions wp
+       JOIN writes w ON w.id = wp.write_id
+       JOIN volumes v ON v.id = w.volume_id
+       WHERE v.label=? AND wp.status='written'""", (label,)).fetchone()[0]
+assert lo <= written <= hi, (
+    f"{label}: expected between {lo} and {hi} confirmed-written positions for this "
+    f"arm, got {written}. Retune the sleep in interrupt_write.")
+print(f"{label}: interrupted cleanly, writes={by}, confirmed-written positions={written}")
+PY
+}
+
+assert_sealed() { # assert_sealed <label>
+    python3 - "$HOME_DIR/tapectl.db" "$1" <<'PY'
+import sqlite3, sys
+db, label = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(db)
+status = c.execute("SELECT status FROM volumes WHERE label=?", (label,)).fetchone()[0]
+assert status == 'sealed', f"{label}: expected volume 'sealed' after resume, got {status!r}"
+bad = c.execute(
+    """SELECT w.status, COUNT(*) FROM writes w JOIN volumes v ON v.id=w.volume_id
+       WHERE v.label=? AND w.status <> 'completed' GROUP BY w.status""", (label,)).fetchall()
+assert not bad, f"{label}: writes not all 'completed' after resume: {bad}"
+print(f"{label}: sealed, all writes completed")
+PY
+}
+
+# --- arm 1: interrupted before ANY content entry (cursor at BOT) ---
+# SIGINT at t~0 lands on the check that precedes entry 0, so nothing is
+# confirmed written and resume must restart from the beginning of tape.
+step_resume_bot() {
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase \
+    && TCTL volume init "$RLABEL1" --device "$TAPE_DEV" \
+    && interrupt_write "$RLABEL1" \
+        "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id=w.volume_id
+         WHERE v.label='$RLABEL1' AND w.status='in_progress'" \
+        "the session to start writing (no slice confirmed yet)" \
+    && assert_interrupted "$RLABEL1" 0 0 \
+    && TCTL volume resume "$RLABEL1" --device "$TAPE_DEV" \
+    && assert_sealed "$RLABEL1"
+}
+
+# --- arm 2: interrupted mid-run (cursor mid-tape, resume repositions) ---
+# The uninterrupted write takes ~9s on mhvtl, so 3s reliably lands with
+# several entries confirmed and several still to go. assert_interrupted
+# turns a mistimed run into a FAIL with a remedy, never a silent pass.
+step_resume_midwrite() {
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase \
+    && TCTL volume init "$RLABEL2" --device "$TAPE_DEV" \
+    && interrupt_write "$RLABEL2" \
+        "SELECT COUNT(*) FROM write_positions wp
+           JOIN writes w ON w.id=wp.write_id
+           JOIN volumes v ON v.id=w.volume_id
+         WHERE v.label='$RLABEL2' AND wp.status='written'" \
+        "at least one slice confirmed written (reposition arm)" \
+    && assert_interrupted "$RLABEL2" 1 100000 \
+    && TCTL volume resume "$RLABEL2" --device "$TAPE_DEV" \
+    && assert_sealed "$RLABEL2"
+}
+
+# --- arm 3: hard crash (SIGKILL), the power-loss case ---
+# Distinct code from arms 1-2: SIGKILL gives the process no chance to mark
+# anything, so the rows stay 'in_progress' and only become 'interrupted' when
+# `recover_orphaned_sessions` sweeps them at the next db::open() — which is
+# the `volume resume` invocation itself. Arguably the likeliest real-world
+# interruption, and until now the sweep-to-resume handoff was never exercised
+# end to end on real tape.
+step_resume_after_crash() {
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase \
+    && TCTL volume init "$RLABEL3" --device "$TAPE_DEV" \
+    && interrupt_write "$RLABEL3" \
+        "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id=w.volume_id
+         WHERE v.label='$RLABEL3' AND w.status='in_progress'" \
+        "the session to start writing, then KILL it uncleanly" KILL \
+    && assert_crashed "$RLABEL3" \
+    && TCTL volume resume "$RLABEL3" --device "$TAPE_DEV" \
+    && assert_sealed "$RLABEL3"
+}
+
+# The crash arm's precondition is the OPPOSITE of assert_interrupted's: rows
+# must still be 'in_progress', proving nothing had a chance to mark them and
+# that the startup sweep is what rescues the session.
+assert_crashed() { # assert_crashed <label>
+    python3 - "$HOME_DIR/tapectl.db" "$1" <<'PYX'
+import sqlite3, sys
+db, label = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(db)
+status = c.execute("SELECT status FROM volumes WHERE label=?", (label,)).fetchone()[0]
+assert status != 'sealed', f"{label}: write completed before the KILL landed — nothing to resume"
+by = dict(c.execute(
+    """SELECT w.status, COUNT(*) FROM writes w JOIN volumes v ON v.id=w.volume_id
+       WHERE v.label=? GROUP BY w.status""", (label,)).fetchall())
+assert by.get('in_progress', 0) > 0, (
+    f"{label}: expected >=1 write row still 'in_progress' after SIGKILL (a hard kill "
+    f"leaves the process no chance to mark them; the startup sweep converts them on "
+    f"the next db::open()); got {by}")
+print(f"{label}: crashed uncleanly, writes={by} — resume must rely on the startup sweep")
+PYX
+}
+
+# A resumed tape must be indistinguishable from a straight-through one:
+# verify passes and a real unit round-trips byte-for-byte.
+step_resume_verify() {
+    TCTL volume verify "$RLABEL2" --device "$TAPE_DEV" --json | tee "$RUN/verify-resumed.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify-resumed.json"
+}
+step_resume_restore() {
+    TCTL restore unit --unit unitA --from "$RLABEL2" --to "$RUN/restored-resumed" --device "$TAPE_DEV" \
+    && diff -r "$SRC/unitA" "$RUN/restored-resumed"
+}
+
+echo "gate: leg 4 — interrupt + resume (volume resume, issue #93)"
+check resume_bot        step_resume_bot
+check resume_midwrite   step_resume_midwrite
+check resume_after_crash step_resume_after_crash
+check resume_verify     step_resume_verify
+check resume_restore    step_resume_restore
 
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
