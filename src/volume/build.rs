@@ -264,18 +264,20 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         let catalogs = catalogs_for_tenant(inputs, tenant_id);
         // PLAN.toml is operator-only (`volume-format-v2.md` §1's middle-zone
         // table: "PLAN.toml (op only)") — tenant envelopes never carry it.
-        let tar = build_envelope_tar(&manifest, &recovery, &catalogs, None)?;
 
         let mut recipients: Vec<String> = tenant.public_keys.clone();
         recipients.extend(inputs.operator_public_keys.iter().cloned());
         let recipients = with_escrow(recipients, &inputs.escrow_public_key);
-        let encrypted = staging::encrypt_data(&tar, &recipients)?;
 
         let pos = first_envelope_pos + i as i32;
-        let (path, size, hash) = materialize(
+        let (path, size, hash) = materialize_envelope_streaming(
             session_dir,
             &format!("{pos:04}_tenant_envelope_{tenant_id}"),
-            &encrypted,
+            &manifest,
+            &recovery,
+            &catalogs,
+            None,
+            &recipients,
         )?;
         entries.push(LayoutEntry {
             position: pos,
@@ -307,37 +309,43 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     // generator itself, `generate_planning_header`, is unchanged — only its
     // caller and packaging change here).
     let plan_toml = layout::generate_planning_header(&inputs.label, &plan_units_all(inputs));
-    let op_tar = build_envelope_tar(&op_manifest, &op_recovery, &all_catalogs, Some(&plan_toml))?;
 
     let op_recipients = with_escrow(
         inputs.operator_public_keys.clone(),
         &inputs.escrow_public_key,
     );
-    let op_encrypted = staging::encrypt_data(&op_tar, &op_recipients)?;
-
-    let (op_path, op_size, op_hash) = materialize(
+    let (op_path, op_size, op_hash) = materialize_envelope_streaming(
         session_dir,
         &format!("{op_pos:04}_operator_envelope"),
-        &op_encrypted,
+        &op_manifest,
+        &op_recovery,
+        &all_catalogs,
+        Some(&plan_toml),
+        &op_recipients,
     )?;
     entries.push(LayoutEntry {
         position: op_pos,
         kind: ZoneKind::OperatorEnvelope,
         size_bytes: Some(op_size),
-        sha256: Some(op_hash),
-        source: ContentSource::Materialized(op_path),
+        sha256: Some(op_hash.clone()),
+        source: ContentSource::Materialized(op_path.clone()),
     });
 
-    let (op_backup_path, op_backup_size, op_backup_hash) = materialize(
-        session_dir,
-        &format!("{op_backup_pos:04}_operator_envelope_backup"),
-        &op_encrypted,
-    )?;
+    // Backup: byte-for-byte copy of the primary, NOT a second streaming
+    // encrypt. `age::Encryptor` is randomized per call and the tar layer
+    // stamps `set_mtime(now)`, so re-running `materialize_envelope_streaming`
+    // would produce a second, unrelated ciphertext that happens to decrypt
+    // to the same plaintext — defeating the point of a redundant copy (see
+    // the comment above on the pre-#87 `op_encrypted` bytes-reuse, and T5b's
+    // report). Reusing the primary's already-verified size/hash keeps that
+    // invariant under streaming.
+    let op_backup_path = session_dir.join(format!("{op_backup_pos:04}_operator_envelope_backup"));
+    fs::copy(&op_path, &op_backup_path)?;
     entries.push(LayoutEntry {
         position: op_backup_pos,
         kind: ZoneKind::OperatorEnvelopeBackup,
-        size_bytes: Some(op_backup_size),
-        sha256: Some(op_backup_hash),
+        size_bytes: Some(op_size),
+        sha256: Some(op_hash),
         source: ContentSource::Materialized(op_backup_path),
     });
 
@@ -747,22 +755,22 @@ fn build_manifest_units_all(
         .collect()
 }
 
-fn catalogs_for_tenant(inputs: &BuildInputs, tenant_id: i64) -> Vec<(String, Vec<u8>)> {
+fn catalogs_for_tenant(inputs: &BuildInputs, tenant_id: i64) -> Vec<(String, PathBuf)> {
     inputs
         .units
         .iter()
         .filter(|u| u.tenant_id == tenant_id)
         .filter_map(|u| u.catalog_path.as_deref())
-        .flat_map(read_catalog_files)
+        .flat_map(catalog_file_paths)
         .collect()
 }
 
-fn catalogs_for_all(inputs: &BuildInputs) -> Vec<(String, Vec<u8>)> {
+fn catalogs_for_all(inputs: &BuildInputs) -> Vec<(String, PathBuf)> {
     inputs
         .units
         .iter()
         .filter_map(|u| u.catalog_path.as_deref())
-        .flat_map(read_catalog_files)
+        .flat_map(catalog_file_paths)
         .collect()
 }
 
@@ -785,11 +793,14 @@ fn plan_units_all(inputs: &BuildInputs) -> Vec<(String, String, i64, i64)> {
         .collect()
 }
 
-/// Read a unit's isolated dar catalogue slice files (`catalog_base.N.dar`)
-/// for inclusion in an envelope tar. Mirrors `write.rs::read_catalog_files`
-/// (private there — replicated here per the T5b scope fence rather than
-/// widening write.rs's visibility, which is out of scope for this task).
-fn read_catalog_files(catalog_path: &str) -> Vec<(String, Vec<u8>)> {
+/// Find a unit's isolated dar catalogue slice files (`catalog_base.N.dar`)
+/// for inclusion in an envelope tar, returning names and paths rather than
+/// bytes (issue #87: catalogue bytes stream straight into the envelope tar
+/// at materialize time, never collected here). Mirrors
+/// `write.rs::read_catalog_files`'s discovery logic (private there —
+/// replicated here per the T5b scope fence rather than widening write.rs's
+/// visibility, which is out of scope for this task).
+fn catalog_file_paths(catalog_path: &str) -> Vec<(String, PathBuf)> {
     let base = std::path::Path::new(catalog_path);
     let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|f| f.to_str())) else {
         return Vec::new();
@@ -800,9 +811,7 @@ fn read_catalog_files(catalog_path: &str) -> Vec<(String, Vec<u8>)> {
         for e in rd.flatten() {
             let fname = e.file_name().to_string_lossy().into_owned();
             if fname.starts_with(&prefix) && fname.ends_with(".dar") {
-                if let Ok(bytes) = fs::read(e.path()) {
-                    out.push((fname, bytes));
-                }
+                out.push((fname, e.path()));
             }
         }
     }
@@ -810,33 +819,72 @@ fn read_catalog_files(catalog_path: &str) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Envelope tar builder: MANIFEST.toml + RECOVERY.md + `catalogs/*`, plus
-/// PLAN.toml when `plan_toml` is `Some` (T8: the operator envelope only,
-/// `volume-format-v2.md` §1/§8 — tenant envelope call sites pass `None`).
-/// Mirrors `write.rs::build_envelope_tar` (private there, and now deleted —
-/// the v1 write pipeline this replicated is gone per the T8 flip).
-fn build_envelope_tar(
+/// Build an envelope tar directly into the age encryption stream, which
+/// writes directly to `session_dir/filename` — issue #87's single-pass
+/// streaming redesign of the old buffer-the-whole-tar-then-encrypt-the-
+/// whole-thing path (`staging::encrypt_data`, now `#[cfg(test)]`-only). The
+/// wrapping order, innermost-to-disk first, is:
+///
+/// `File` → [`crate::util::HashingWriter`] → age `StreamWriter` →
+/// `tar::Builder`
+///
+/// `HashingWriter` sits on the *ciphertext* side (closest to the file), so
+/// the sha256 this returns is the ciphertext hash the front index must
+/// record (`docs/design/volume-format-v2.md` §1/§3) — matching
+/// `staging::encrypt_file_streaming`'s same layering for data slices (H9
+/// fix, issue #35). Only MANIFEST.toml, RECOVERY.md, and PLAN.toml (all
+/// small, generated strings) are buffered as `&str`; every catalogue member
+/// streams straight from its file on disk via `append_tar_file_member`, so
+/// peak RAM tracks `staging::STREAM_COPY_BUFFER` plus age's own constant
+/// STREAM chunk buffers, never total catalogue size.
+///
+/// Recipients determine which envelope this is: tenant envelopes pass this
+/// tenant's keys + operator + escrow with `plan_toml: None` (PLAN.toml is
+/// operator-only); the operator envelope passes operator + escrow with
+/// `plan_toml: Some(..)`.
+fn materialize_envelope_streaming(
+    session_dir: &Path,
+    filename: &str,
     manifest: &str,
     recovery: &str,
-    catalogs: &[(String, Vec<u8>)],
+    catalogs: &[(String, PathBuf)],
     plan_toml: Option<&str>,
-) -> Result<Vec<u8>> {
-    let mut tar_buf = Vec::new();
+    recipients: &[String],
+) -> Result<(PathBuf, u64, String)> {
+    let path = session_dir.join(filename);
+    let file = fs::File::create(&path)?;
+    let hashing_output = crate::util::HashingWriter::new(file);
+
+    let encryptor = staging::build_encryptor(recipients)?;
+    let mut age_writer = encryptor
+        .wrap_output(hashing_output)
+        .map_err(|e| TapectlError::Encryption(format!("wrap_output failed: {e}")))?;
+
     {
-        let mut builder = tar::Builder::new(&mut tar_buf);
+        let mut builder = tar::Builder::new(&mut age_writer);
         append_tar_member(&mut builder, "MANIFEST.toml", manifest.as_bytes())?;
         append_tar_member(&mut builder, "RECOVERY.md", recovery.as_bytes())?;
         if let Some(plan) = plan_toml {
             append_tar_member(&mut builder, "PLAN.toml", plan.as_bytes())?;
         }
-        for (name, bytes) in catalogs {
-            append_tar_member(&mut builder, &format!("catalogs/{name}"), bytes)?;
+        for (name, catalog_path) in catalogs {
+            append_tar_file_member(&mut builder, &format!("catalogs/{name}"), catalog_path)?;
         }
         builder
             .finish()
             .map_err(|e| TapectlError::Other(format!("envelope tar finish: {e}")))?;
     }
-    Ok(tar_buf)
+
+    // Mandatory: without this the STREAM's final chunk is never written,
+    // producing a file that hashes fine but cannot be decrypted (mirrors
+    // `staging::encrypt_file_streaming_inner`'s identical comment).
+    let hashing_output = age_writer
+        .finish()
+        .map_err(|e| TapectlError::Encryption(format!("finish failed: {e}")))?;
+    let hash = hashing_output.finalize_hex();
+    let size = hashing_output.bytes_written();
+
+    Ok((path, size, hash))
 }
 
 fn append_tar_member<W: std::io::Write>(
@@ -854,6 +902,36 @@ fn append_tar_member<W: std::io::Write>(
     header.set_cksum();
     builder
         .append(&header, bytes)
+        .map_err(|e| TapectlError::Other(format!("tar append {path}: {e}")))?;
+    Ok(())
+}
+
+/// File-backed sibling of `append_tar_member`: streams `file_path`'s bytes
+/// into the tar member instead of taking them as an in-memory slice, so
+/// catalogue members (which scale with file count, unboundedly for the
+/// operator envelope) never sit fully in RAM. Uses the exact same
+/// `tar::Header::new_gnu()` hand-rolled header shape as `append_tar_member`
+/// — deliberately *not* `tar::Builder::append_file`/`append_path_with_name`,
+/// which can emit pax/ustar extension records the bash-`tar` heir recovery
+/// path (`RESTORE.sh`) was never proven against (issue #87).
+fn append_tar_file_member<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    path: &str,
+    file_path: &Path,
+) -> Result<()> {
+    let file = fs::File::open(file_path)?;
+    let size = file.metadata()?.len();
+
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path(path)
+        .map_err(|e| TapectlError::Other(format!("tar path {path}: {e}")))?;
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_mtime(chrono::Utc::now().timestamp() as u64);
+    header.set_cksum();
+    builder
+        .append(&header, file)
         .map_err(|e| TapectlError::Other(format!("tar append {path}: {e}")))?;
     Ok(())
 }
@@ -1532,6 +1610,110 @@ mod tests {
         assert!(
             op_members.contains(&"PLAN.toml".to_string()),
             "operator envelope must carry PLAN.toml: {op_members:?}"
+        );
+    }
+
+    // ── streaming envelope construction (issue #87) ──
+
+    /// A catalogue substantially larger than `staging::STREAM_COPY_BUFFER`
+    /// (128 KiB) round-trips through the streaming envelope path byte-for-
+    /// byte, proving `materialize_envelope_streaming` doesn't truncate,
+    /// corrupt, or otherwise mishandle a file-backed tar member that spans
+    /// many copy-buffer refills. Deliberately non-uniform bytes (not all
+    /// zero) so a bug that only zeroes/duplicates a chunk would show up as
+    /// a mismatch rather than passing by accident.
+    #[test]
+    fn large_catalog_file_round_trips_through_streaming_envelope() {
+        let src = tempfile::tempdir().unwrap();
+        let tenant_kp = crate::crypto::keys::generate_keypair();
+        let op_kp = crate::crypto::keys::generate_keypair();
+
+        // ~1 MiB of non-uniform bytes, well over STREAM_COPY_BUFFER's 128 KiB.
+        let big_catalog_bytes: Vec<u8> = (0..(1024 * 1024 + 12345))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let catalog_stem = src.path().join("catalog_base");
+        std::fs::write(
+            format!("{}.1.dar", catalog_stem.display()),
+            &big_catalog_bytes,
+        )
+        .unwrap();
+
+        let slice = fake_slice(src.path(), 1, 1, b"slice bytes for the large-catalog test");
+        let unit = BuildUnit {
+            stage_set_id: 1,
+            snapshot_id: 1,
+            unit_name: "unit-alpha".to_string(),
+            unit_uuid: Uuid::new_v4().to_string(),
+            tenant_id: 1,
+            dar_version: Some("2.7.20".to_string()),
+            dar_command: Some("dar -c base -R /src".to_string()),
+            catalog_path: Some(catalog_stem.to_string_lossy().into_owned()),
+            snapshot_version: 1,
+            slices: vec![slice],
+        };
+        let inputs = base_inputs(
+            "550e8400-e29b-41d4-a716-446655440001",
+            vec![TenantInfo {
+                tenant_id: 1,
+                tenant_name: "alpha".to_string(),
+                public_keys: vec![tenant_kp.public_key.clone()],
+            }],
+            vec![unit],
+        );
+        // base_inputs generates its own operator keypair; override with ours
+        // so the test can decrypt the operator envelope below.
+        let inputs = BuildInputs {
+            operator_public_keys: vec![op_kp.public_key.clone()],
+            ..inputs
+        };
+
+        let session = tempfile::tempdir().unwrap();
+        let built = build(&inputs, session.path()).unwrap();
+
+        // Ciphertext (not plaintext) hash is what's recorded on the entry —
+        // confirm it matches a fresh hash of the materialized file's bytes,
+        // which is exactly what `Layout::validate`'s full-hash re-check does
+        // against a real staging directory.
+        let tenant_entry = built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::TenantEnvelope { .. }))
+            .unwrap();
+        let ContentSource::Materialized(tenant_path) = &tenant_entry.source else {
+            panic!("expected Materialized");
+        };
+        let on_disk = std::fs::read(tenant_path).unwrap();
+        assert_eq!(
+            tenant_entry.sha256.as_deref(),
+            Some(sha_hex(&on_disk).as_str())
+        );
+        assert_eq!(tenant_entry.size_bytes, Some(on_disk.len() as u64));
+
+        let tenant_tar = decrypt_envelope_tar(
+            &built,
+            |k| matches!(k, ZoneKind::TenantEnvelope { .. }),
+            &tenant_kp.secret_key,
+        );
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tenant_tar));
+        let mut seen = std::collections::HashMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+            seen.insert(name, bytes);
+        }
+        assert!(seen.contains_key("MANIFEST.toml"));
+        assert!(seen.contains_key("RECOVERY.md"));
+        assert!(!seen.contains_key("PLAN.toml"));
+        let recovered = seen
+            .get("catalogs/catalog_base.1.dar")
+            .expect("large catalog member present in tenant envelope tar");
+        assert_eq!(
+            recovered, &big_catalog_bytes,
+            "large catalog file must round-trip byte-for-byte through the streaming envelope path"
         );
     }
 }
