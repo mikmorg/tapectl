@@ -618,15 +618,38 @@ pub fn count_active_units_for_tenant(conn: &Connection, tenant_id: i64) -> Resul
 
 /// Check if any unit in the database has a path that is a parent or child of the given path.
 pub fn check_nesting_conflict(conn: &Connection, path: &str) -> Result<Option<String>> {
+    check_nesting_conflict_excluding(conn, path, None)
+}
+
+/// Same as `check_nesting_conflict`, but skips the row whose `units.id`
+/// matches `exclude_unit_id` (issue #52). This is what lets
+/// `snapshot_create` reuse the nesting predicate for an already-registered
+/// unit without tripping on the unit's own row (`check_path == existing`
+/// makes `starts_with` true for a unit against itself). Exclusion is by
+/// unit id, never by comparing paths — two units can legitimately share a
+/// `current_path` after a bad `unit discover`, and that must still be
+/// reported as a conflict.
+pub fn check_nesting_conflict_excluding(
+    conn: &Connection,
+    path: &str,
+    exclude_unit_id: Option<i64>,
+) -> Result<Option<String>> {
     let mut stmt =
-        conn.prepare("SELECT name, current_path FROM units WHERE status != 'retired'")?;
+        conn.prepare("SELECT id, name, current_path FROM units WHERE status != 'retired'")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
 
     let check_path = std::path::Path::new(path);
     for row in rows {
-        let (name, existing_path) = row?;
+        let (id, name, existing_path) = row?;
+        if Some(id) == exclude_unit_id {
+            continue;
+        }
         if let Some(existing) = existing_path {
             let existing = std::path::Path::new(&existing);
             if check_path.starts_with(existing) {

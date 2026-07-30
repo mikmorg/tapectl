@@ -8,7 +8,19 @@ use crate::error::{Result, TapectlError};
 /// Check if the given path would create a nesting conflict with existing units.
 /// Both parent-contains-child and child-inside-parent are errors.
 pub fn check_nesting(conn: &Connection, path: &str) -> Result<()> {
-    if let Some(conflict) = queries::check_nesting_conflict(conn, path)? {
+    check_nesting_excluding(conn, path, None)
+}
+
+/// Same as `check_nesting`, but skips the unit whose id matches
+/// `exclude_unit_id` (issue #52) — lets `snapshot_create` run the nesting
+/// check for an already-registered unit without matching against itself.
+pub fn check_nesting_excluding(
+    conn: &Connection,
+    path: &str,
+    exclude_unit_id: Option<i64>,
+) -> Result<()> {
+    if let Some(conflict) = queries::check_nesting_conflict_excluding(conn, path, exclude_unit_id)?
+    {
         return Err(TapectlError::NestedUnit(conflict));
     }
 
