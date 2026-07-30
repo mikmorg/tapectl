@@ -28,7 +28,19 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96, #92, #87 closed 2026-07-30.)
+  set when parallelising. (#94, #90, #96, #92, #87, #56 closed 2026-07-30.)
+  **`audit` now implements all six §2.20 checks** (#56). Its dirty check
+  reuses `report.rs::dirty_rows` (now `pub(crate)`) — one scan, one place.
+  Note `audit` with no `--unit` now walks the filesystem per active unit;
+  `tests/performance.rs::perf_many_units_audit` replicates the *queries*, not
+  `run`, so it will not track that cost.
+  **Watch refactors that move a `println!` across a `json_output` branch.**
+  #56's `collect_findings` extraction hoisted the summary line out of the
+  non-JSON arm, so `audit --json` emitted JSON plus a human trailer. Every
+  test asserted on findings or exit codes, so nothing caught it. The fix
+  shape is reusable: make rendering a pure `render() -> String` and assert
+  the WHOLE output parses. Any command with a `--json` mode is exposed to
+  this; there is no test that pins the others.
   **H9 (whole-object buffering) is fully closed with #87.** Envelopes now
   stream `File -> util::HashingWriter -> age StreamWriter -> tar::Builder`;
   the HashingWriter must stay on the *ciphertext* side or the front index
