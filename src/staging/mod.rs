@@ -365,15 +365,14 @@ fn stage_create_inner(
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".sha512")
-                    && name.starts_with(
-                        &archive_base
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .to_string(),
-                    )
-                {
+                // The trailing dot is load-bearing: dar names every slice
+                // `{base}.{N}.dar`, so `{base}.` is the real prefix. Matching
+                // on the bare base makes `..._v1` a prefix of `..._v10.1.dar`
+                // — a concurrent stage of v10 of the same unit would have its
+                // hash files deleted by v1's cleanup. Same convention as
+                // `volume::build::catalog_file_paths`.
+                let prefix = format!("{}.", archive_base.file_name().unwrap().to_string_lossy());
+                if name.ends_with(".sha512") && name.starts_with(&prefix) {
                     let _ = fs::remove_file(entry.path());
                 }
             }
@@ -517,8 +516,15 @@ fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i6
         .ok()
     {
         Some((uuid, version)) => {
+            // The trailing dot is load-bearing. dar names every slice
+            // `{base}.{N}.dar`, so the real prefix is `{base}.`. Without it,
+            // `..._v1` is a prefix of `..._v10.1.dar`, and cleaning up a
+            // failed stage of version 1 would delete the plaintext slices of
+            // a concurrent stage of version 10 of the same unit — the exact
+            // cross-stage-set deletion this function is otherwise careful to
+            // avoid. Same convention as `volume::build::catalog_file_paths`.
             format!(
-                "{}_v{}",
+                "{}_v{}.",
                 uuid.replace('-', "").get(..12).unwrap_or(&uuid),
                 version
             )
@@ -1803,6 +1809,84 @@ mod tests {
             "stage_sets row must survive stage_create's failure so the startup \
              sweep can still mark it 'failed' — cleanup must never delete or \
              re-status it"
+        );
+    }
+
+    /// Cleanup must not reach across snapshot versions of the same unit.
+    ///
+    /// `archive_base` is `{uuid12}_v{version}` and dar names slices
+    /// `{base}.{N}.dar`, so the scan prefix must carry a trailing dot.
+    /// Without it `..._v1` is a prefix of `..._v10.1.dar`, and a failed
+    /// stage of version 1 deletes the in-flight plaintext of a concurrent
+    /// stage of version 10 — silent cross-stage data destruction, the exact
+    /// hazard the `.age` cleanup is deliberately DB-row-keyed to avoid.
+    ///
+    /// Drives `cleanup_failed_stage_set` directly against hand-placed decoy
+    /// files, because provoking two concurrent real dar runs at versions 1
+    /// and 10 is not worth the fixture cost to prove a string-prefix rule.
+    #[test]
+    fn cleanup_does_not_delete_a_higher_version_stage_of_the_same_unit() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let mut config = Config::default();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        let tid = crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+
+        // A unit whose uuid12 prefix we control, with snapshots at v1 and v10.
+        let uuid = "aaaaaaaabbbbccccddddeeeeeeeeeeee";
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, 'u', ?2, 'mtime_size', 1, 'active')",
+            params![uuid, tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, source_path, status)
+             VALUES (?1, 1, '/src', 'created')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_v1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
+             VALUES (?1, 1024, 'none', 1)",
+            params![snap_v1],
+        )
+        .unwrap();
+        let failed_set = conn.last_insert_rowid();
+
+        let base12 = &uuid[..12];
+        let v1_slice = staging_dir.join(format!("{base12}_v1.1.dar"));
+        let v10_slice = staging_dir.join(format!("{base12}_v10.1.dar"));
+        let v10_hash = staging_dir.join(format!("{base12}_v10.1.dar.sha512"));
+        for f in [&v1_slice, &v10_slice, &v10_hash] {
+            fs::write(f, b"x").unwrap();
+        }
+
+        cleanup_failed_stage_set(&conn, &config, failed_set);
+
+        assert!(
+            !v1_slice.exists(),
+            "v1's own orphaned plaintext slice must be removed"
+        );
+        assert!(
+            v10_slice.exists(),
+            "v10's in-flight plaintext slice must survive v1's cleanup — a bare \
+             `_v1` prefix would have deleted it"
+        );
+        assert!(
+            v10_hash.exists(),
+            "v10's hash file must survive v1's cleanup for the same reason"
         );
     }
 
