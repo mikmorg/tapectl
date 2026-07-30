@@ -296,6 +296,12 @@ fn stage_create_inner(
         |row| row.get(0),
     )?;
 
+    // `catalog_base` is deliberately PER-SNAPSHOT ({uuid8}_v{version}), NOT
+    // per-stage-set like `archive_base` above (issue #53) — the dar catalog
+    // is a pure function of the snapshot's content, so the `existing_catalogs
+    // == 0` guard below extracts it once per snapshot and every later stage
+    // set of that snapshot reuses it. Do not change this to include
+    // stage_set_id "for consistency" with archive_base.
     let catalog_dir = paths.catalogs_dir.join(&unit.uuid[..8]);
     let catalog_base = catalog_dir.join(format!("{}_v{}", &unit.uuid[..8], snapshot.version));
     if existing_catalogs == 0 {
