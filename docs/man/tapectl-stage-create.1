@@ -4,13 +4,16 @@
 .SH NAME
 tapectl\-stage\-create \- Create staged slices (validate → dar → encrypt → checksums)
 .SH SYNOPSIS
-\fBtapectl stage create\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl stage create\fR [\fB\-\-json\fR] [\fB\-\-version\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Create staged slices (validate → dar → encrypt → checksums)
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
+.TP
+\fB\-\-version\fR \fI<VERSION>\fR
+Re\-stage a specific snapshot version instead of the latest unstaged one — for when `staging clean` already released the first stage set\*(Aqs slices and another copy is wanted (issue #53). Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `staging clean` to release them first
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes

@@ -143,6 +143,19 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> R
     Ok(snapshot_id)
 }
 
+/// Stage set statuses that mean "live slices already exist for this
+/// snapshot" — re-staging on top of one is pointless (the existing slices
+/// should go to `volume write`) and would silently produce a second,
+/// unrelated copy. Under migration 001's `CHECK(status IN ('staging',
+/// 'staged','failed','cleaned'))`, this is exactly the complement of
+/// `'cleaned'`/`'failed'`, but it's named after the blocking condition
+/// (what `stage create --version`'s refusal message describes), not the
+/// allowed one — the single place this status list is written (issue #96:
+/// five inlined status lists is how that issue happened).
+pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
+    matches!(status, "staging" | "staged")
+}
+
 /// Full stage pipeline: validate → dar → encrypt → checksums.
 ///
 /// Thin wrapper around `stage_create_inner` mirroring
