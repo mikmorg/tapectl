@@ -453,10 +453,22 @@ fn resume_with_zero_slices_written_restarts_from_bot() {
     // Stop after 5 entries (id_thunk .. operator_envelope): plenty written,
     // but the first slice is at index 7, so no slice has a 'written' cursor
     // row. Per the cursor rule that means restart from BOT, not "continue at
-    // 5" — and MemStore's reposition truncates, so the final file count
-    // proves the whole layout was re-laid from position 0.
+    // 5".
     let mut store = interrupt_after(&f, 5);
     assert_eq!(store.files.len(), 5);
+
+    // Discriminate the two branches. A final file COUNT cannot: MemStore's
+    // `reposition_for_resume` truncates to the given index, so restarting at
+    // 0 (9 content entries + seal) and wrongly continuing at 5 (4 remaining
+    // + seal, atop the 5 survivors) both leave exactly 10 files, and both
+    // would confirm clean.
+    //
+    // So corrupt a byte of an already-written FRONT file, in place and at
+    // the same length (padding untouched). A BOT restart discards and
+    // rewrites position 2, so Integrity-tier confirm still passes. A resume
+    // that repositioned to 5 leaves the scribble in place, and the chain
+    // walk's per-file hash reports it — `Quarantined`, and this test fails.
+    store.files[2][0] ^= 0xFF;
 
     let conn = db::open(&f.db_path).unwrap();
     let written: i64 = conn
@@ -491,8 +503,7 @@ fn resume_with_zero_slices_written_restarts_from_bot() {
     assert_eq!(
         store.files.len(),
         f.built.layout.entries.len(),
-        "restarting from BOT re-lays every entry exactly once — a resume that had \
-         continued from position 5 instead would leave a longer recording"
+        "every entry is on the medium exactly once"
     );
     let volume_status: String = conn
         .query_row(

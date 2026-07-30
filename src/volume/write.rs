@@ -443,13 +443,10 @@ pub fn volume_resume(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    let session = session::InterruptedSession::rehydrate(conn, volume_id)?.ok_or_else(|| {
-        TapectlError::Other(format!(
-            "volume \"{label}\" has no interrupted write session to resume — its `writes` rows \
-             are all resolved (completed/aborted) or none exist. Run `tapectl volume write` to \
-             start a new session."
-        ))
-    })?;
+    let session = match session::InterruptedSession::rehydrate(conn, volume_id)? {
+        Some(s) => s,
+        None => return Err(nothing_to_resume(conn, volume_id, label)),
+    };
 
     // Snapshot before `resume` consumes the session (same reason
     // `volume_write` clones its Layout: the terminal `SealedSession` exposes
@@ -496,6 +493,62 @@ pub fn volume_resume(
     collect_health_best_effort(conn, config, device, volume_id);
 
     result
+}
+
+/// Explain a `rehydrate` that found nothing, naming the `writes` statuses
+/// that actually exist for this volume rather than asserting there are none.
+///
+/// This matters for one status in particular. `volume_write`'s existing-session
+/// refusal counts `planned`/`in_progress`/`interrupted` and points the
+/// operator here, but `rehydrate` adopts only `interrupted` — so without this,
+/// a `planned` row would make the two commands contradict each other, each
+/// pointing at the other. A `planned` row is reachable (`plan` inserts
+/// `'planned'` and `execute` is what flips it to `'in_progress'`, so a kill in
+/// that window sticks) and is never swept by `recover_orphaned_sessions`,
+/// which only touches `in_progress`. Nothing has been written to tape at that
+/// point, so the honest instruction is to clear it and start over, not to
+/// resume it.
+fn nothing_to_resume(conn: &Connection, volume_id: i64, label: &str) -> TapectlError {
+    let statuses: Vec<String> = match conn
+        .prepare("SELECT DISTINCT status FROM writes WHERE volume_id = ?1 ORDER BY status")
+        .and_then(|mut s| {
+            s.query_map(params![volume_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        }) {
+        Ok(v) => v,
+        Err(e) => return e.into(),
+    };
+
+    if statuses.is_empty() {
+        return TapectlError::Other(format!(
+            "volume \"{label}\" has no write sessions at all — there is nothing to resume. Run \
+             `tapectl volume write {label}` to start one."
+        ));
+    }
+    if statuses.iter().any(|s| s == "planned") {
+        return TapectlError::Other(format!(
+            "volume \"{label}\" has a `planned` write session, not an interrupted one: it was \
+             killed after planning but before execution began, so nothing was ever written to \
+             tape and there is no partial recording to continue. Mark its `writes` rows \
+             'aborted' and run `tapectl volume write {label}` again. (Existing statuses: {}.)",
+            statuses.join(", ")
+        ));
+    }
+    if statuses.iter().any(|s| s == "in_progress") {
+        return TapectlError::Other(format!(
+            "volume \"{label}\" has an `in_progress` write session. `tapectl` sweeps crashed \
+             sessions to 'interrupted' when it opens the database, so a row still 'in_progress' \
+             means ANOTHER PROCESS IS WRITING THIS TAPE RIGHT NOW. Refusing to resume — two \
+             writers on one cartridge would destroy it. (Existing statuses: {}.)",
+            statuses.join(", ")
+        ));
+    }
+    TapectlError::Other(format!(
+        "volume \"{label}\" has no interrupted write session to resume — its write sessions are \
+         all resolved (existing statuses: {}). Run `tapectl volume write {label}` to start a \
+         new one.",
+        statuses.join(", ")
+    ))
 }
 
 /// Everything a write session needs from the tenant/key tables, assembled
