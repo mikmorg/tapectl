@@ -117,11 +117,35 @@ pub fn snapshot_create(
 }
 
 /// Full stage pipeline: validate → dar → encrypt → checksums.
+///
+/// Thin wrapper around `stage_create_inner` mirroring
+/// `encrypt_file_streaming`'s "wrapper does cleanup on `Err`" pattern
+/// (issue #54): on failure, best-effort cleanup runs before the original
+/// error is returned unchanged — cleanup never masks the real error.
 pub fn stage_create(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
     snapshot_id: i64,
+) -> Result<i64> {
+    let stage_set_id_holder: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
+    match stage_create_inner(conn, paths, config, snapshot_id, &stage_set_id_holder) {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            if let Some(stage_set_id) = stage_set_id_holder.get() {
+                cleanup_failed_stage_set(conn, config, stage_set_id);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn stage_create_inner(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    snapshot_id: i64,
+    stage_set_id_holder: &std::cell::Cell<Option<i64>>,
 ) -> Result<i64> {
     let snapshot = get_snapshot(conn, snapshot_id)?;
     let unit = get_unit_for_snapshot(conn, &snapshot)?;
@@ -177,6 +201,7 @@ pub fn stage_create(
         params![snapshot_id, resolved.slice_size, compression],
     )?;
     let stage_set_id = conn.last_insert_rowid();
+    stage_set_id_holder.set(Some(stage_set_id));
 
     // Step 1: SHA256 source validation
     info!("validating source checksums");
@@ -355,8 +380,29 @@ pub fn stage_create(
         }
     }
 
+    // Issue #54: finalization only, not the whole pipeline, runs inside a
+    // transaction — matching the `conn.unchecked_transaction()` pattern
+    // already established at `src/volume/session.rs:778`,
+    // `src/volume/write.rs:1262`, `src/cli/operations.rs:38`
+    // (`snapshot_purge`), and `src/cli/key.rs:224`.
+    //
+    // Deliberately NOT wrapping the whole of `stage_create`: `unchecked_transaction`
+    // is DEFERRED, so it takes SQLite's single write lock at the first write
+    // inside it and holds it until commit — around the dar run (which can
+    // take hours) that would block every other tapectl invocation for the
+    // duration. Worse, a crash mid-dar would roll back the `stage_sets`
+    // INSERT itself, destroying the `status='staging'` row that
+    // `recover_orphaned_sessions` (`src/db/mod.rs`) relies on to mark the
+    // set `'failed'` on the next `db::open()` — the operator's only signal
+    // that something went wrong. So the incremental progress writes above
+    // (the initial INSERT, the `source_validated_at`/`dar_version`/
+    // `catalog_path` UPDATEs, and the per-slice `stage_slices` INSERTs)
+    // stay outside any transaction; only the finalization below — which
+    // only ever runs once the pipeline has fully succeeded — is atomic.
+    let tx = conn.unchecked_transaction()?;
+
     // Update stage_set
-    conn.execute(
+    tx.execute(
         "UPDATE stage_sets SET status = 'staged', num_slices = ?1, total_dar_size = ?2,
          total_encrypted_size = ?3, key_fingerprints = ?4, staged_at = datetime('now')
          WHERE id = ?5",
@@ -370,13 +416,13 @@ pub fn stage_create(
     )?;
 
     // Update snapshot status
-    let updated = conn.execute(
+    let updated = tx.execute(
         "UPDATE snapshots SET status = 'staged' WHERE id = ?1 AND status = 'created'",
         params![snapshot_id],
     )?;
     if updated > 0 {
         events::log_field_change(
-            conn,
+            &tx,
             "snapshot",
             snapshot_id,
             &format!("{} v{}", unit.name, snapshot.version),
@@ -396,10 +442,13 @@ pub fn stage_create(
     // `backfill_checksums`'s own `sha256 IS NULL` guard on both UPDATEs —
     // not this `is_empty()` check, which only skips a no-op call.
     if !checksums.is_empty() {
-        backfill_checksums(conn, snapshot_id, &checksums)?;
+        backfill_checksums(&tx, snapshot_id, &checksums)?;
     }
 
-    // Generate receipt
+    tx.commit()?;
+
+    // Receipt writing is filesystem work and must not sit inside a DB
+    // transaction — done here, after commit, along with the creation event.
     let receipt = generate_receipt(conn, stage_set_id, &unit, &snapshot, &tenant)?;
     let _receipt_path = write_stage_receipt(paths, stage_set_id, &receipt)?;
 
@@ -412,6 +461,126 @@ pub fn stage_create(
     )?;
 
     Ok(stage_set_id)
+}
+
+/// Best-effort cleanup of a `stage_set` that `stage_create` failed to
+/// finish, run from the `stage_create` wrapper's `Err` path (issue #54).
+///
+/// Two different discovery strategies are used deliberately, for two
+/// different classes of leftover file:
+///
+/// - **Plaintext `.dar`/`.sha512` are found by filesystem prefix, NOT by DB
+///   rows.** `dar -c` creates every slice up front; the encryption loop
+///   only deletes a `.dar` (and inserts its `stage_slices` row) *after*
+///   writing its `.age`. So a failure partway through the encryption loop
+///   — or any failure before it even starts, e.g. the zero-active-keys
+///   refusal — leaves plaintext `.dar` files with no `stage_slices` row at
+///   all. Iterating `stage_slices` would find exactly the files that are
+///   already safe (already encrypted, already deleted) and miss every one
+///   that actually matters. `archive_base`'s file name is unique per
+///   snapshot (`{uuid12}_v{version}`) and no other stage set shares it, so
+///   a prefix scan of `staging_dir` for `{archive_base_name}*.dar` /
+///   `*.sha512` is safe here in a way it would NOT be for `.age` files
+///   below.
+///
+/// - **`.age` files are found by DB row (`stage_slices.staging_path`), NOT
+///   by prefix.** `archive_base` — and therefore its `.age` outputs'
+///   shared prefix — is per-*snapshot*, not per-*stage_set*: every stage
+///   set created for the same snapshot (e.g. a retried `stage create`
+///   after an earlier one failed) shares that prefix. A prefix-glob
+///   delete of `.age` files would therefore also delete a different,
+///   already-successfully-staged stage set's slices. Deleting only the
+///   rows this specific `stage_set_id` owns keeps the blast radius
+///   correct.
+///
+/// The `stage_sets` row itself is deliberately left alone — not deleted,
+/// not re-statused. Leaving it `status='staging'` is exactly what lets
+/// `recover_orphaned_sessions` (`src/db/mod.rs`) mark it `'failed'` on the
+/// next `db::open()`, which is the operator's only signal that this stage
+/// attempt didn't complete.
+fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i64) {
+    let staging_dir = Path::new(&config.staging.directory);
+
+    // Resolve this stage set's per-snapshot archive_base prefix, the same
+    // way stage_create_inner computed it, so the plaintext scan matches
+    // exactly the files this snapshot's dar run could have produced.
+    let prefix = match conn
+        .query_row(
+            "SELECT u.uuid, sn.version
+             FROM stage_sets ss
+             JOIN snapshots sn ON sn.id = ss.snapshot_id
+             JOIN units u ON u.id = sn.unit_id
+             WHERE ss.id = ?1",
+            params![stage_set_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .ok()
+    {
+        Some((uuid, version)) => {
+            format!(
+                "{}_v{}",
+                uuid.replace('-', "").get(..12).unwrap_or(&uuid),
+                version
+            )
+        }
+        None => {
+            tracing::warn!(
+                stage_set_id,
+                "cleanup: could not resolve stage set, skipping"
+            );
+            return;
+        }
+    };
+
+    let mut removed = 0u64;
+
+    // Plaintext .dar / dar's .sha512 — prefix-keyed (see doc comment above).
+    if let Ok(entries) = fs::read_dir(staging_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix)
+                && (name.ends_with(".dar") || name.ends_with(".sha512"))
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+
+    // Encrypted .age — DB-row-keyed to this stage_set_id only (see doc
+    // comment above); never a prefix scan.
+    let age_paths: Vec<String> = match conn
+        .prepare("SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![stage_set_id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        }) {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::warn!(stage_set_id, error = %e, "cleanup: could not list stage_slices");
+            Vec::new()
+        }
+    };
+    for p in &age_paths {
+        if fs::remove_file(p).is_ok() {
+            removed += 1;
+        }
+    }
+
+    if let Err(e) = conn.execute(
+        "DELETE FROM stage_slices WHERE stage_set_id = ?1",
+        params![stage_set_id],
+    ) {
+        tracing::warn!(stage_set_id, error = %e, "cleanup: could not delete stage_slices rows");
+    }
+
+    tracing::warn!(
+        stage_set_id,
+        files_removed = removed,
+        "stage_create failed — removed orphaned staging files for this stage set; \
+         the stage_sets row itself was left as status='staging' so the next \
+         `db::open()` sweep marks it 'failed'"
+    );
 }
 
 /// Write a stage receipt to `paths.receipts_dir` (creating it if needed)
@@ -1538,6 +1707,102 @@ mod tests {
              not config.defaults.compression (none), and must not be shadowed by \
              a concrete value baked into the unit's dotfile — proves the \
              archive_set's compression is actually reachable (issue #92)"
+        );
+    }
+
+    // ── issue #54: stage failure hygiene ──
+
+    /// Proves the leak: a tenant with zero active keys makes `stage_create`
+    /// fail *after* `dar -c` has written every plaintext `.dar` slice (and
+    /// after catalog extraction) but *before* the encryption loop starts —
+    /// the worst case, where every slice is orphaned as plaintext. Before
+    /// the change-2 fix, those `.dar` files are never cleaned up.
+    #[test]
+    fn stage_create_failure_orphans_plaintext_dar_slices() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let mut config = Config::default();
+        config.dar.binary = "/usr/bin/dar".to_string();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        let alice_id = crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+
+        // Strip alice's active keys so stage_create's "no active keys"
+        // refusal fires after dar has already produced plaintext slices.
+        conn.execute(
+            "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1",
+            params![alice_id],
+        )
+        .unwrap();
+
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("f.txt"),
+            b"content that will be orphaned as plaintext",
+        )
+        .unwrap();
+
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &[]).unwrap();
+        let result = stage_create(&conn, &paths, &config, snap_id);
+
+        assert!(
+            result.is_err(),
+            "expected stage_create to fail on zero active keys"
+        );
+
+        let leaked: Vec<_> = fs::read_dir(&staging_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.ends_with(".dar") || name.ends_with(".sha512")
+            })
+            .collect();
+
+        assert!(
+            leaked.is_empty(),
+            "expected the change-2 cleanup fix to have removed every orphaned \
+             plaintext .dar/.sha512 file — found: {:?}",
+            leaked.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+
+        // The stage_sets row must survive the failure — that 'staging'
+        // status is what recover_orphaned_sessions (src/db/mod.rs) sweeps
+        // to 'failed' on the next db::open(), the operator's actual signal.
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "stage_sets row must survive stage_create's failure so the startup \
+             sweep can still mark it 'failed' — cleanup must never delete or \
+             re-status it"
         );
     }
 
