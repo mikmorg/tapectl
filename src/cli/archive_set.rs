@@ -6,6 +6,24 @@ use crate::config::Config;
 use crate::db::events;
 use crate::error::{Result, TapectlError};
 
+/// Compression values `dar` accepts via `-z`. An archive_set's `compression`
+/// now reaches the dar invocation directly (issue #92 made the dotfile
+/// policy layer stop unconditionally shadowing it), so a bogus value must be
+/// rejected here rather than surfacing as a runtime dar failure later.
+const VALID_COMPRESSION_VALUES: &[&str] =
+    &["none", "gzip", "bzip2", "lzo", "xz", "lzma", "zstd", "lz4"];
+
+fn validate_compression(value: &str) -> Result<()> {
+    if VALID_COMPRESSION_VALUES.contains(&value) {
+        Ok(())
+    } else {
+        Err(TapectlError::Other(format!(
+            "invalid compression \"{value}\": accepted values are {}",
+            VALID_COMPRESSION_VALUES.join(", ")
+        )))
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ArchiveSetCommands {
     /// Create a new archive set policy
@@ -113,6 +131,9 @@ pub fn run(
             verify_interval_days,
             description,
         } => {
+            if let Some(c) = compression {
+                validate_compression(c)?;
+            }
             let locations_json = required_locations.as_ref().map(|locs| {
                 let arr: Vec<&str> = locs.split(',').map(|s| s.trim()).collect();
                 serde_json::to_string(&arr).unwrap()
@@ -158,6 +179,9 @@ pub fn run(
             verify_interval_days,
             description,
         } => {
+            if let Some(c) = compression {
+                validate_compression(c)?;
+            }
             let id: i64 = conn
                 .query_row(
                     "SELECT id FROM archive_sets WHERE name = ?1",
@@ -624,6 +648,38 @@ mod tests {
             verify_interval_days: None,
             description: None,
         }
+    }
+
+    /// Issue #92: since a dotfile no longer unconditionally shadows the
+    /// archive_set's `compression`, a bogus value now actually reaches
+    /// `dar -z <value>` at write time — reject it here instead of letting
+    /// it surface as a runtime dar failure.
+    #[test]
+    fn create_rejects_invalid_compression() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let err = run(
+            &conn,
+            &config,
+            &create_cmd("cold", None, Some("not-a-real-codec")),
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not-a-real-codec"),
+            "error must name the invalid value, got: {msg}"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap()
+                == 0,
+            "no archive_set row should be created when compression is invalid"
+        );
     }
 
     /// Issue #48 item 4: the `unit_count` subqueries in `List`/`Info` were
