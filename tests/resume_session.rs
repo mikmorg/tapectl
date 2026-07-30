@@ -540,3 +540,90 @@ fn build_writes_a_layout_json_sidecar_that_is_never_a_layout_entry() {
         );
     }
 }
+
+/// Issue #94. A failed revalidation must NOT consume the session.
+///
+/// `resume_checking` step 1 used to mark the session's `writes` rows
+/// `aborted` on any `Layout::validate` failure, and `rehydrate` adopts only
+/// `interrupted` rows — so one transient failure permanently abandoned a
+/// physically fine tape. The failure induced here is deliberately transient
+/// in nature (a staged slice file that is momentarily absent, exactly what an
+/// unmounted staging filesystem looks like), and `LayoutError::SliceFileMissing`
+/// cannot tell that apart from a deleted file. That is why the fix is "never
+/// auto-abort" rather than an error-classification table: the information
+/// that decides it is not in the variant, it is in the operator's head.
+///
+/// The load-bearing assertion is (c): a fresh `rehydrate` still returns
+/// `Some`. A status string alone would not prove the session is still usable.
+#[test]
+fn revalidation_failure_leaves_the_session_resumable() {
+    let f = make_fixture();
+    let mut store = interrupt_after(&f, 8);
+
+    let conn = db::open(&f.db_path).unwrap();
+    let keys = rebuild_keys(&conn, vec![f.units[0].tenant_id]);
+
+    // Make one staged slice temporarily absent — the staging filesystem
+    // being unmounted, not the file being deleted. Nothing distinguishes
+    // the two from inside `validate`.
+    let staged = f.units[0].slices[0].staging_path.clone();
+    let stashed = staged.with_extension("age.stashed");
+    std::fs::rename(&staged, &stashed).unwrap();
+
+    let session = InterruptedSession::rehydrate(&conn, f.volume_id)
+        .unwrap()
+        .expect("session should be resumable before the failed attempt");
+    let err = match session.resume(&conn, &keys, &mut store) {
+        Err(e) => e,
+        Ok(ResumeOutcome::Aborted(a)) => panic!(
+            "a revalidation failure must never auto-abort the session: {}",
+            a.reason
+        ),
+        Ok(_) => panic!("revalidation failure must not report success"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("volume resume"),
+        "error must name the operation: {msg}"
+    );
+    assert!(
+        msg.contains("volume abort"),
+        "error must offer the deliberate-abandonment path: {msg}"
+    );
+
+    // (b) the rows are untouched...
+    let statuses: Vec<String> = conn
+        .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+        .unwrap()
+        .query_map(params![f.volume_id], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        !statuses.is_empty() && statuses.iter().all(|s| s == "interrupted"),
+        "a failed revalidation must leave the writes rows 'interrupted', got {statuses:?}"
+    );
+
+    // (c) ...and the session is still genuinely resumable.
+    let session = InterruptedSession::rehydrate(&conn, f.volume_id)
+        .unwrap()
+        .expect("a failed revalidation must not consume the resumable session");
+
+    // Fix the transient cause and prove the second attempt goes all the way.
+    std::fs::rename(&stashed, &staged).unwrap();
+
+    let ready = match session.resume(&conn, &keys, &mut store).unwrap() {
+        ResumeOutcome::Ready(r) => r,
+        ResumeOutcome::Quarantined(q) => panic!("unexpected quarantine: {:?}", q.reason),
+        ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
+        ResumeOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+    };
+    let sealed_pending = ready.seal(&mut store).unwrap();
+    match sealed_pending
+        .confirm(&conn, &mut store, Tier::Integrity)
+        .unwrap()
+    {
+        ConfirmOutcome::Sealed(s) => assert_eq!(s.label, "RESUMETEST"),
+        ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got quarantine: {:?}", q.reason),
+    }
+}

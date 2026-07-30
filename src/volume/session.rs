@@ -658,15 +658,38 @@ impl InterruptedSession {
     ) -> Result<ResumeOutcome> {
         // 1. Revalidate: staged slices unchanged, frozen zones re-hash
         // byte-identical (re-runs the same tri-layer-L1 + materialized-zone
-        // checks `into_validated` ran originally). Failure here is
-        // unrecoverable — Aborted, not Quarantined (this isn't "wrong tape,"
-        // it's "this tape's own inputs no longer check out").
+        // checks `into_validated` ran originally). Failure here NEVER
+        // auto-aborts (issue #94): it reports and leaves the session
+        // `interrupted`, so a later `resume` can still adopt it.
+        //
+        // `docs/design/layout-session.md`'s Aborted row says a resume
+        // revalidation failure aborts only when it fails *unrecoverably* —
+        // and nothing here can judge that. `LayoutError::SliceFileMissing`
+        // and `MaterializedZoneMissing` cannot distinguish "staging
+        // filesystem is temporarily unmounted" (transient) from "the file was
+        // deleted" (terminal); the fact that decides it is not carried by the
+        // variant, so no classification table can be written. The asymmetry
+        // settles the default: treating a terminal failure as retryable costs
+        // the operator one extra command, while treating a transient failure
+        // as terminal permanently abandons a good tape and forces a full
+        // re-stage and re-write. So the operator — who knows whether the disk
+        // is unmounted or wiped — judges "unrecoverably", via
+        // `tapectl volume abort`.
         if let Err(errs) = self.built.validate(keys) {
-            mark_writes(conn, &self.write_ids, "aborted")?;
-            return Ok(ResumeOutcome::Aborted(AbortedSession {
-                volume_id: self.volume_id,
-                reason: format!("resume: revalidation failed: {errs:?}"),
-            }));
+            let detail = errs
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(TapectlError::Other(format!(
+                "volume resume: revalidation failed, so nothing was written and the session was \
+                 left untouched in the `interrupted` state — the cartridge is unharmed. Causes: \
+                 {detail}. Fix the cause (a staging filesystem that is not mounted, or a key \
+                 that is temporarily absent, are both transient and are indistinguishable here \
+                 from permanent loss) and run `tapectl volume resume` again; or, if the inputs \
+                 are genuinely gone, abandon the session deliberately with \
+                 `tapectl volume abort`."
+            )));
         }
 
         // 2+2b. File-0 identity, then (independently) the seal-marker
