@@ -267,6 +267,119 @@ tapectl report compaction-candidates
 tapectl report events --days 30
 ```
 
+## Cadence
+
+Everything below is a **manual rhythm you run**. tapectl schedules nothing and
+has no daemon or listener — that shape is permanently out of scope (issue #13's
+ratified verdict: every cost of a server exists to serve multi-machine access
+this system does not have). Scheduling the read-only advisory half via a systemd
+timer is a separate, still-unbuilt phase-3 item (#70); `volume write` stays
+manual forever, because it needs a human and a physically-present cartridge.
+
+The two operations that need no tape in the drive are the ones worth doing
+often, because they cost nothing but attention:
+
+```bash
+tapectl audit               # 0 = clean, 1 = warnings, 2 = violations
+tapectl report verify-status
+```
+
+### Weekly — cheap, no tape
+
+Run `tapectl audit`. It implements all six compliance checks, including copy
+count, location presence, and **verification age against each unit's resolved
+`verify_interval_days`**. That last check is what produces your "what is overdue"
+list — you do not track it yourself. Per ADR-0004 it is advisory: it warns, it
+never blocks, and a stale volume still counts as a copy.
+
+`tapectl report dirty` and `tapectl report pending` are the companion glance —
+what has drifted since its last snapshot, and what is staged but not yet on tape.
+
+### Monthly — verify a rotating slice of the library
+
+Do **not** try to verify every volume every month. The rotation exists to bound
+drive and tape wear, which is the same reason snapraid scrubs ~8% of an array
+per pass rather than all of it. tapectl has no percentage selector and computes
+no rotation for you — this is a human procedure driven by one report:
+
+```bash
+tapectl report verify-status          # verification recency, oldest first
+tapectl volume verify L6-0003         # --full is the default
+```
+
+Pick the N oldest-evidence volumes such that **every volume gets one full pass
+within its `verify_interval_days`** — if you hold 24 volumes on a 12-month
+interval, that is roughly 2 per month. `verify_interval_days` resolves through
+the usual three layers (dotfile > archive set > defaults) and is set with
+`tapectl archive-set edit <name> --verify-interval-days N`.
+
+Two tiers, and the distinction matters:
+
+| Tier | Cost | What it proves |
+|---|---|---|
+| `volume verify --full` (default) | Reads and hashes every content file | Media still returns the exact bytes the front index recorded |
+| `volume verify --quick` | Seal binding + front index self-consistency only | Tape is still *navigable* — nothing about content integrity |
+
+`--quick` is a triage tool for a tape you are about to move or a suspicion you
+want to rule out fast. It is not a substitute for a full pass, and a `--quick`
+run should not reset your sense of when that volume was really verified.
+
+### Annually — the heir-path restore drill
+
+The drill that matters is not "can tapectl restore this" — it is **can someone
+who is not you, without this database and without this binary, get the data
+back**. Run it from real media once a year.
+
+The procedure already exists in
+[`docs/lto6-validation-checklist.md`](lto6-validation-checklist.md) — see its
+*Raw-recovery drill* section. Follow it there rather than a second copy here; two
+drifting checklists is the failure this repo keeps finding in code, and Markdown
+is no safer. The drill's essentials: load a real tape, pull `RESTORE.sh` off the
+plaintext front zone with `mt` + `dd`, and run it using **only** `mt`, `dd`,
+`age`, `dar`, and `sha256sum` — no `tapectl` — against nothing but the printed
+key material.
+
+A drill is a CTO-scheduled session on real hardware. Nothing automated performs
+one.
+
+While you are there, confirm your off-tape recovery inputs are current:
+
+```bash
+tapectl db backup --to /path/to/backup        # add --include-keys only if the
+                                              # destination is treated as secret
+tapectl key list --tenant <name>              # find the aliases, then
+tapectl key export <alias>                    # public half, for the record
+```
+
+> **Heir Kit — pending #69.** The design calls for a printed Heir Kit (key
+> material in tamper-evident envelopes) refreshed at the end of each write
+> session, with the annual drill checking its legibility and freshness — both
+> envelopes present, seals intact, catalog snapshot within one write session of
+> reality. **`tapectl` does not generate that kit yet**; there is no
+> `key escrow-kit` command, and #69 is deferred because printing and sealing are
+> physical steps. Until it lands, the commands above are the closest equivalent
+> and they are *not* a Heir Kit — they produce no printed artifact and no sealed
+> envelope. Do not record a kit-refresh step as done on the strength of them.
+
+### Before moving a tape
+
+`volume move` records a location change; it does not inspect the cartridge.
+Check coverage **before** the tape leaves, not after:
+
+```bash
+tapectl report copies --unit <name>    # does anything depend on this tape alone?
+tapectl report verify-status --volume <label>
+tapectl volume move <label> --to <location>
+tapectl cartridge info <barcode>       # physical cartridge, tracked separately
+```
+
+Note that tapectl will **not** currently warn you at the moment of a destructive
+or coverage-reducing operation that the evidence it is relying on is years old —
+ADR-0004/0008 describe that display, but it is not yet implemented (issue #91 is
+open). Until it is, `report verify-status` before the fact is the only thing
+standing in for it. `volume retire` is the exception: it does show impact
+analysis of which units lose copies.
+
 ## Compaction
 
 When tapes become underutilized (snapshots superseded and marked reclaimable):
