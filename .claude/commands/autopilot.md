@@ -28,7 +28,22 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96, #92 closed 2026-07-30.)
+  set when parallelising. (#94, #90, #96, #92, #87 closed 2026-07-30.)
+  **H9 (whole-object buffering) is fully closed with #87.** Envelopes now
+  stream `File -> util::HashingWriter -> age StreamWriter -> tar::Builder`;
+  the HashingWriter must stay on the *ciphertext* side or the front index
+  records a plaintext hash. Two envelope traps are now pinned by tests, but
+  keep them in mind for any future envelope work: (a) `OperatorEnvelopeBackup`
+  is an `fs::copy` of the primary, never a second encrypt — age is randomized
+  per call and the tar layer stamps `set_mtime(now)`, so re-encrypting yields
+  an unrelated ciphertext that defeats the redundant copy; (b) envelope tars
+  keep the hand-rolled `Header::new_gnu()` shape — never `append_file` /
+  `append_path_with_name`, whose pax/ustar extension records pass every Rust
+  test and break only the bash-`tar` heir legs.
+  **`#[cfg(test)]` is not a usable negative control in this crate.** It does
+  not propagate to integration-test binaries, which link the library
+  normally; gating a `pub fn` they use breaks the build. #87 tried this and
+  had to back it out.
   **Status-predicate discipline (from #96):** every `volumes.status` read
   filter now routes through `policy::coverage` — `eligible` ("is a finished
   copy", `sealed`), `in_service` ("holds bytes we account for", + `active`/
