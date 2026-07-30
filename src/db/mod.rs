@@ -12,12 +12,44 @@ use tracing::warn;
 use crate::error::{Result, TapectlError};
 
 /// Open (or create) the database and run migrations.
+///
+/// Issue #41: `tapectl.db` holds every filename, path, size, mtime, sha256,
+/// and tenant/unit name tapectl has recorded — precisely the plaintext
+/// content-metadata index the on-tape format works hard to keep out of
+/// plaintext. `Connection::open` sets no mode of its own, so this used to
+/// land at whatever the process umask handed out. Tightened here (not just
+/// on creation) since this function runs on *every* command invocation —
+/// unlike `TapectlPaths::ensure_dirs` (init-only until this same change
+/// wired it into `main.rs`'s general dispatch), this is the one fix that
+/// reaches an already-initialized `~/.tapectl` on its own. `secure_path`
+/// warns rather than fails, so a database this process doesn't own doesn't
+/// break every command that touches it.
 pub fn open(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
     configure(&conn)?;
     migrate(&mut conn)?;
     recover_orphaned_sessions(&conn)?;
+    crate::config::secure_path(path, 0o600);
+    // WAL mode (set in `configure`) writes pending pages to `<path>-wal`
+    // (and its `-shm` index) — the exact same content as the main db file,
+    // just not checkpointed into it yet. Tighten them too, if SQLite has
+    // created them by this point; best-effort, since whether they exist
+    // yet is a SQLite-internal timing detail this function doesn't control.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sidecar_path(path, suffix);
+        if sidecar.exists() {
+            crate::config::secure_path(&sidecar, 0o600);
+        }
+    }
     Ok(conn)
+}
+
+/// Build `<path>-wal` / `<path>-shm` the way SQLite itself names them —
+/// appended directly to the full filename, not swapping the extension.
+fn sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    std::path::PathBuf::from(os)
 }
 
 /// Open an in-memory database for testing.
@@ -181,6 +213,59 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #41: `db::open` used to `Connection::open(path)` with no mode
+    /// of its own, leaving `tapectl.db` — which holds every filename, path,
+    /// size, mtime, sha256, and tenant/unit name tapectl has recorded — at
+    /// whatever the process umask handed out (0644 on a stock box). This is
+    /// the one fix that reaches an *already-initialized* `~/.tapectl` too:
+    /// `db::open` runs on every command invocation, unlike `ensure_dirs`
+    /// (which was init-only until this same change wired it into the
+    /// general dispatch path in `main.rs`).
+    #[test]
+    fn open_sets_db_file_mode_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+
+        let conn = open(&db_path).unwrap();
+        drop(conn);
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "tapectl.db should be 0600, was {mode:o}");
+    }
+
+    /// Umask-independent companion to the above (see the analogous
+    /// `config::tests::ensure_dirs_tightens_a_pre_existing_loose_directory`
+    /// doc comment for why this shape is needed): a *re-opened*,
+    /// pre-existing db file at a loose mode must be tightened too, not just
+    /// a freshly-created one — `db::open` is called on every invocation
+    /// against a file that (pre-fix) already exists from a prior run.
+    #[test]
+    fn open_tightens_a_pre_existing_loose_db_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+
+        // Create it once, then loosen it, simulating a pre-fix database
+        // left over from before this change.
+        drop(open(&db_path).unwrap());
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "fixture must start loose"
+        );
+
+        let conn = open(&db_path).unwrap();
+        drop(conn);
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "re-opening must tighten a loose db file to 0600"
+        );
+    }
 
     #[test]
     fn test_open_memory() {

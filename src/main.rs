@@ -116,6 +116,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         bail!("tapectl is not initialized — run `tapectl init` first");
     }
 
+    // Issue #41: `ensure_dirs` tightens `~/.tapectl`'s directory tree to
+    // 0700 (idempotent, warn-not-fail internally — see its doc comment).
+    // `cmd_init` below already calls it for a brand-new home, but that
+    // alone would only ever protect installs created *after* this fix.
+    // Calling it here too is what makes the tightening reach an
+    // already-initialized `~/.tapectl` on ordinary use, not just a fresh
+    // `tapectl init`.
+    paths
+        .ensure_dirs()
+        .context("failed to secure tapectl home directories")?;
+
     let cfg = Config::load(&paths.config_file).context("failed to load config")?;
     let conn = db::open(&paths.db_file).context("failed to open database")?;
 

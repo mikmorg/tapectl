@@ -241,7 +241,19 @@ pub fn stage_create(
     let catalog_base = catalog_dir.join(format!("{}_v{}", &unit.uuid[..8], snapshot.version));
     if existing_catalogs == 0 {
         info!("extracting dar catalog");
+        // Issue #41: `catalogs_dir` itself is secured by `ensure_dirs`, but
+        // this per-unit subdirectory is a fresh, nested `create_dir_all`
+        // that gets whatever the process umask hands out unless tightened
+        // explicitly — a parent's mode does not propagate to children it
+        // didn't create. Pre-create it 0700 so dar's own `create_dir_all`
+        // (inside `extract_catalog`, a no-op once it already exists) never
+        // gets a chance to leave it loose.
+        fs::create_dir_all(&catalog_dir)?;
+        crate::config::secure_path(&catalog_dir, 0o700);
         dar::create::extract_catalog(&config.dar.binary, &archive_base, &catalog_base)?;
+        // dar wrote the catalog file(s) itself via subprocess, with no mode
+        // of its own — tighten what it produced after the fact.
+        secure_catalog_files(&catalog_dir);
     }
     conn.execute(
         "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
@@ -389,13 +401,7 @@ pub fn stage_create(
 
     // Generate receipt
     let receipt = generate_receipt(conn, stage_set_id, &unit, &snapshot, &tenant)?;
-    let receipt_path = paths.receipts_dir.join(format!(
-        "{}_{}.txt",
-        chrono::Utc::now().format("%Y%m%d"),
-        stage_set_id
-    ));
-    fs::create_dir_all(&paths.receipts_dir)?;
-    fs::write(&receipt_path, &receipt)?;
+    let _receipt_path = write_stage_receipt(paths, stage_set_id, &receipt)?;
 
     events::log_created(
         conn,
@@ -406,6 +412,47 @@ pub fn stage_create(
     )?;
 
     Ok(stage_set_id)
+}
+
+/// Write a stage receipt to `paths.receipts_dir` (creating it if needed)
+/// and return the path written.
+///
+/// Issue #41: receipts hold the same plaintext content-metadata index
+/// `tapectl.db` does (unit/tenant names, paths, sizes, checksums) — they
+/// get `write_private_file`'s 0600-from-creation treatment instead of a
+/// plain `fs::write` at whatever mode the process umask hands out.
+/// Factored out of `stage_create` so it's testable without a real dar
+/// binary or a full stage pipeline.
+fn write_stage_receipt(paths: &TapectlPaths, stage_set_id: i64, receipt: &str) -> Result<PathBuf> {
+    let receipt_path = paths.receipts_dir.join(format!(
+        "{}_{}.txt",
+        chrono::Utc::now().format("%Y%m%d"),
+        stage_set_id
+    ));
+    fs::create_dir_all(&paths.receipts_dir)?;
+    crate::config::write_private_file(&receipt_path, receipt.as_bytes(), 0o600)?;
+    Ok(receipt_path)
+}
+
+/// Best-effort tighten every regular file dar's `-C` catalog extraction
+/// wrote inside `catalog_dir` to 0600.
+///
+/// dar writes these itself via subprocess, so unlike `write_private_file`
+/// there's no `open()` call under our control to set the mode at creation
+/// time — this tightens what dar produced after the fact instead. Same
+/// content-metadata exposure as issue #41's `tapectl.db`/receipts, just
+/// produced by an external process. Non-fatal by design (`secure_path`):
+/// a directory listing failure here must not sink an otherwise-successful
+/// stage.
+fn secure_catalog_files(catalog_dir: &Path) {
+    let Ok(entries) = fs::read_dir(catalog_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            crate::config::secure_path(&entry.path(), 0o600);
+        }
+    }
 }
 
 /// The literal STRING to hand `dar -s` for this unit's stage, resolved
@@ -1820,5 +1867,107 @@ mod tests {
             kept_sha.is_some(),
             "the non-excluded file must still get its baseline established"
         );
+    }
+
+    /// Issue #41: `write_stage_receipt` and `secure_catalog_files` tested
+    /// directly and hermetically — no dar binary, no full `stage_create`
+    /// pipeline — per the same reasoning `crypto::keys`'s tests already
+    /// apply to secret keys: a permission bug belongs to the function that
+    /// sets (or fails to set) the mode, not to everything that happens to
+    /// call it three layers up.
+    mod file_custody {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        fn test_paths(tmp: &TempDir) -> TapectlPaths {
+            let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+            paths.ensure_dirs().unwrap();
+            paths
+        }
+
+        #[test]
+        fn write_stage_receipt_creates_file_at_0600() {
+            let tmp = TempDir::new().unwrap();
+            let paths = test_paths(&tmp);
+
+            let path = write_stage_receipt(&paths, 42, "receipt body\n").unwrap();
+
+            assert!(path.exists());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "receipt body\n");
+            assert_eq!(mode_of(&path), 0o600, "receipt should be 0600");
+        }
+
+        #[test]
+        fn write_stage_receipt_creates_receipts_dir_if_missing() {
+            let tmp = TempDir::new().unwrap();
+            // Deliberately do NOT call ensure_dirs — this exercises
+            // write_stage_receipt's own fs::create_dir_all.
+            let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+            assert!(!paths.receipts_dir.exists());
+
+            let path = write_stage_receipt(&paths, 7, "body").unwrap();
+
+            assert!(path.exists());
+            assert_eq!(mode_of(&path), 0o600);
+        }
+
+        #[test]
+        fn secure_catalog_files_tightens_a_loose_file_dar_wrote() {
+            let tmp = TempDir::new().unwrap();
+            let catalog_dir = tmp.path().join("catalogs").join("abcd1234");
+            fs::create_dir_all(&catalog_dir).unwrap();
+            // Simulate what dar's `-C` extraction leaves behind: a file
+            // written by an external subprocess, at whatever mode the
+            // process umask handed out — not tapectl's own `OpenOptions`.
+            let catalog_file = catalog_dir.join("abcd1234_v1.1.dar");
+            fs::write(&catalog_file, b"fake dar catalog bytes").unwrap();
+            fs::set_permissions(&catalog_file, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(mode_of(&catalog_file), 0o644, "fixture must start loose");
+
+            secure_catalog_files(&catalog_dir);
+
+            assert_eq!(
+                mode_of(&catalog_file),
+                0o600,
+                "a catalog file dar wrote should be tightened to 0600"
+            );
+        }
+
+        #[test]
+        fn secure_catalog_files_tightens_every_file_present() {
+            let tmp = TempDir::new().unwrap();
+            let catalog_dir = tmp.path().join("catalogs").join("multi");
+            fs::create_dir_all(&catalog_dir).unwrap();
+            for name in ["a.1.dar", "a.2.dar", "a.3.dar"] {
+                let p = catalog_dir.join(name);
+                fs::write(&p, b"slice").unwrap();
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+
+            secure_catalog_files(&catalog_dir);
+
+            for name in ["a.1.dar", "a.2.dar", "a.3.dar"] {
+                assert_eq!(
+                    mode_of(&catalog_dir.join(name)),
+                    0o600,
+                    "{name} should be 0600"
+                );
+            }
+        }
+
+        #[test]
+        fn secure_catalog_files_on_missing_dir_does_not_panic() {
+            let tmp = TempDir::new().unwrap();
+            let ghost = tmp.path().join("does-not-exist");
+            // Best-effort: must not panic even if the directory somehow
+            // isn't there (e.g. dar failed before this is ever reached in
+            // the real call site, though that path already returns `?`
+            // earlier and never gets here).
+            secure_catalog_files(&ghost);
+        }
     }
 }

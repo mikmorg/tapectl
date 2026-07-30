@@ -4,6 +4,51 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TapectlError};
 
+/// Best-effort tighten `path` to `mode`. Never fails the caller — a chmod
+/// that can't be applied (non-Unix filesystem, path not owned by this
+/// process, a backup destination on removable media, etc.) only logs and
+/// moves on rather than aborting an otherwise-fine command. Used everywhere
+/// under `~/.tapectl` — and on operator-chosen backup destinations — that
+/// used to get whatever the process umask handed out (issue #41/#40).
+pub fn secure_path(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:o}"),
+            error = %e,
+            "could not set restrictive permissions; leaving as-is"
+        );
+    }
+}
+
+/// Write `contents` to `path`, created with `mode` from the very first
+/// `open()` call — no umask-derived default in between. Mirrors
+/// `crypto::keys::save_secret_key`'s pattern. Unlike `secure_path`, a
+/// failure here IS propagated: this is for brand-new files this process is
+/// creating itself under its own home directory, where failure indicates a
+/// real problem (e.g. disk full) worth surfacing, not a foreign-owned or
+/// removable-media destination we should tolerate not being able to touch.
+pub fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    file.write_all(contents)?;
+    // `.mode()` on `OpenOptions` only applies when `O_CREAT` actually
+    // creates a new inode. If `path` already existed (e.g. a receipt
+    // regenerated on a re-run), `open()` reuses the existing inode and its
+    // existing permission bits survive untouched — so force the mode
+    // explicitly too, otherwise a stale, looser mode from a prior run can
+    // outlive a rewrite.
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
 /// Default tapectl home directory.
 pub fn default_home() -> PathBuf {
     dirs_home().join(".tapectl")
@@ -424,7 +469,19 @@ impl TapectlPaths {
         Self::new(default_home())
     }
 
-    /// Create all directories if they don't exist.
+    /// Create all directories if they don't exist, and tighten every one
+    /// (freshly created or pre-existing) to 0700.
+    ///
+    /// Issue #41: `~/.tapectl` holds the plaintext content-metadata index
+    /// (`tapectl.db`, receipts, dar catalogs) the on-tape format works hard
+    /// to keep out of plaintext — leaving the directory tree at whatever
+    /// the process umask hands out (0755 on a stock single-user box)
+    /// contradicts that. Tightening runs every call, not just on first
+    /// creation, so an already-initialized `~/.tapectl` gets the same
+    /// treatment as a fresh `init` — this is idempotent and, via
+    /// `secure_path`, never fails the caller: a directory this process
+    /// does not own (e.g. a shared multi-user box) only logs a warning
+    /// rather than aborting an otherwise-fine command.
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [
             &self.home,
@@ -434,6 +491,7 @@ impl TapectlPaths {
             &self.logs_dir,
         ] {
             std::fs::create_dir_all(dir)?;
+            secure_path(dir, 0o700);
         }
         Ok(())
     }
@@ -441,5 +499,163 @@ impl TapectlPaths {
     /// Check if tapectl has been initialized (DB exists).
     pub fn is_initialized(&self) -> bool {
         self.db_file.exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Issue #41: `~/.tapectl` was created with no explicit mode anywhere,
+    //! so it ends up whatever the process umask hands out — on a stock
+    //! single-user box (umask 022) that's 0755 dirs / 0644 files, which
+    //! leaves the plaintext content-metadata index (tapectl.db, receipts,
+    //! dar catalogs) world-readable. These tests assert actual mode bits,
+    //! never "does it not error", since that's exactly the class of test
+    //! that would pass whether or not the fix is present.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("metadata({}) failed: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn all_dirs(paths: &TapectlPaths) -> Vec<(&'static str, &Path)> {
+        vec![
+            ("home", &paths.home),
+            ("keys_dir", &paths.keys_dir),
+            ("catalogs_dir", &paths.catalogs_dir),
+            ("receipts_dir", &paths.receipts_dir),
+            ("logs_dir", &paths.logs_dir),
+        ]
+    }
+
+    #[test]
+    fn ensure_dirs_creates_home_and_every_subdir_at_0700() {
+        let tmp = TempDir::new().unwrap();
+        // home itself is the "intermediate" relative to the four subdirs
+        // (the "leaves") — this single assertion set covers both, per the
+        // task's requirement to verify leaf AND intermediate.
+        let home = tmp.path().join(".tapectl");
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+
+        for (name, dir) in all_dirs(&paths) {
+            assert!(dir.is_dir(), "{name} should exist");
+            assert_eq!(
+                mode_of(dir),
+                0o700,
+                "{name} ({}) should be 0700, was {:o}",
+                dir.display(),
+                mode_of(dir)
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_dirs_is_idempotent_and_does_not_error() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join(".tapectl");
+        let paths = TapectlPaths::new(home);
+
+        paths.ensure_dirs().unwrap();
+        // Second call must not error, and modes must remain 0700.
+        paths.ensure_dirs().unwrap();
+
+        for (name, dir) in all_dirs(&paths) {
+            assert_eq!(mode_of(dir), 0o700, "{name} should stay 0700 on re-run");
+        }
+    }
+
+    /// Umask-independent mutation detector (advisor guidance): this box's
+    /// umask (0002) happens to make a *freshly created* dir land at 0755,
+    /// which already differs from 0700 — so the "fresh creation" test above
+    /// would also catch a reverted fix here. But on a box with umask 077, a
+    /// freshly created dir would coincidentally already be 0700 even with
+    /// no chmod call at all, and that test would falsely "pass" against
+    /// reverted code. Seeding an explicitly-loose pre-existing directory and
+    /// asserting it gets *tightened* is independent of umask entirely: with
+    /// the fix reverted, a pre-existing 0755 dir is left completely
+    /// untouched (create_dir_all no-ops on a dir that already exists), so
+    /// this test fails identically no matter what the ambient umask is.
+    #[test]
+    fn ensure_dirs_tightens_a_pre_existing_loose_directory() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join(".tapectl");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&home), 0o755, "fixture must start loose");
+
+        let paths = TapectlPaths::new(home.clone());
+        paths.ensure_dirs().unwrap();
+
+        assert_eq!(
+            mode_of(&home),
+            0o700,
+            "a pre-existing 0755 home dir must be tightened to 0700"
+        );
+    }
+
+    #[test]
+    fn secure_path_sets_directory_mode() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("loose");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        secure_path(&dir, 0o700);
+
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[test]
+    fn secure_path_sets_file_mode() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("loose.txt");
+        std::fs::write(&file, b"content").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        secure_path(&file, 0o600);
+
+        assert_eq!(mode_of(&file), 0o600);
+    }
+
+    #[test]
+    fn secure_path_on_missing_path_does_not_panic_or_propagate() {
+        let tmp = TempDir::new().unwrap();
+        let ghost = tmp.path().join("does-not-exist");
+        // Best-effort: must not panic. There is nothing to assert on the
+        // filesystem afterward — the guarantee under test is "doesn't
+        // crash the caller", which a successful return from this call
+        // (never a Result, so nothing to unwrap) demonstrates directly.
+        secure_path(&ghost, 0o700);
+        assert!(!ghost.exists());
+    }
+
+    #[test]
+    fn write_private_file_creates_with_requested_mode() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("secret.txt");
+
+        write_private_file(&path, b"top secret", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"top secret");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn write_private_file_overwrites_existing_content_and_keeps_mode() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("secret.txt");
+        std::fs::write(&path, b"stale, world-readable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, b"fresh", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        assert_eq!(mode_of(&path), 0o600);
     }
 }
