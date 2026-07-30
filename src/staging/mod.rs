@@ -245,10 +245,17 @@ fn stage_create_inner(
     )?;
 
     // Step 2: Run dar
-    let archive_base = staging_dir.join(format!(
-        "{}_v{}",
-        unit.uuid.replace('-', "").get(..12).unwrap_or(&unit.uuid),
+    //
+    // `archive_base` is per-*stage-set* (issue #53): it carries
+    // `stage_set_id` so two stage sets of the SAME snapshot (a re-stage
+    // after `staging clean` released the first one) never write
+    // identically-named `.age` files and silently overwrite each other.
+    // `cleanup_failed_stage_set`'s prefix derivation below must move in
+    // lockstep with this — both go through `archive_base_name`.
+    let archive_base = staging_dir.join(archive_base_name(
+        &unit.uuid,
         snapshot.version,
+        stage_set_id,
     ));
 
     // Issue #49 items 2/5: dar's -X masks must see BOTH layers of
@@ -394,10 +401,11 @@ fn stage_create_inner(
                 let name = entry.file_name().to_string_lossy().to_string();
                 // The trailing dot is load-bearing: dar names every slice
                 // `{base}.{N}.dar`, so `{base}.` is the real prefix. Matching
-                // on the bare base makes `..._v1` a prefix of `..._v10.1.dar`
-                // — a concurrent stage of v10 of the same unit would have its
-                // hash files deleted by v1's cleanup. Same convention as
-                // `volume::build::catalog_file_paths`.
+                // on the bare base makes `..._v1` a prefix of `..._v10.1.dar`.
+                // `archive_base` is per-stage-set (issue #53) so this is
+                // already narrower than "per-unit-version", but the trailing
+                // dot still matters against sibling stage-set ids (`_s1` vs
+                // `_s10`). Same convention as `volume::build::catalog_file_paths`.
                 let prefix = format!("{}.", archive_base.file_name().unwrap().to_string_lossy());
                 if name.ends_with(".sha512") && name.starts_with(&prefix) {
                     let _ = fs::remove_file(entry.path());
@@ -489,6 +497,30 @@ fn stage_create_inner(
     Ok(stage_set_id)
 }
 
+/// The `archive_base` file-name stem for one stage set: `{uuid12}_v{version}_s{stage_set_id}`.
+///
+/// Per-*stage-set*, not per-snapshot (issue #53) — the single place this
+/// shape is computed, so `stage_create_inner`'s dar run and
+/// `cleanup_failed_stage_set`'s prefix scan can never drift apart again.
+/// `catalog_base` is deliberately NOT built this way — it stays
+/// per-snapshot on purpose (see `stage_create_inner`'s catalog step).
+fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
+    format!(
+        "{}_v{}_s{}",
+        unit_uuid.replace('-', "").get(..12).unwrap_or(unit_uuid),
+        version,
+        stage_set_id,
+    )
+}
+
+/// `archive_base_name(..)` plus the load-bearing trailing dot: dar names
+/// every slice `{base}.{N}.dar`, so the real filesystem prefix is
+/// `{base}.`, not the bare base — without the dot, `_s1` would prefix-match
+/// `_s10.1.dar`.
+fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
+    format!("{}.", archive_base_name(unit_uuid, version, stage_set_id))
+}
+
 /// Best-effort cleanup of a `stage_set` that `stage_create` failed to
 /// finish, run from the `stage_create` wrapper's `Err` path (issue #54).
 ///
@@ -503,21 +535,19 @@ fn stage_create_inner(
 ///   refusal — leaves plaintext `.dar` files with no `stage_slices` row at
 ///   all. Iterating `stage_slices` would find exactly the files that are
 ///   already safe (already encrypted, already deleted) and miss every one
-///   that actually matters. `archive_base`'s file name is unique per
-///   snapshot (`{uuid12}_v{version}`) and no other stage set shares it, so
-///   a prefix scan of `staging_dir` for `{archive_base_name}*.dar` /
-///   `*.sha512` is safe here in a way it would NOT be for `.age` files
-///   below.
+///   that actually matters. `archive_base_name` (issue #53) carries
+///   `stage_set_id`, so it is unique per stage set, not just per snapshot —
+///   a prefix scan of `staging_dir` for `{archive_base_prefix}*.dar` /
+///   `*.sha512` can never collide with a sibling stage set of the same
+///   snapshot, which is what makes this safe.
 ///
 /// - **`.age` files are found by DB row (`stage_slices.staging_path`), NOT
-///   by prefix.** `archive_base` — and therefore its `.age` outputs'
-///   shared prefix — is per-*snapshot*, not per-*stage_set*: every stage
-///   set created for the same snapshot (e.g. a retried `stage create`
-///   after an earlier one failed) shares that prefix. A prefix-glob
-///   delete of `.age` files would therefore also delete a different,
-///   already-successfully-staged stage set's slices. Deleting only the
-///   rows this specific `stage_set_id` owns keeps the blast radius
-///   correct.
+///   by prefix.** This is strictly more precise than a prefix scan and
+///   doesn't depend on the prefix reasoning above at all — deleting only
+///   the rows this specific `stage_set_id` owns keeps the blast radius
+///   correct regardless of how `archive_base` is shaped. Left unchanged by
+///   issue #53; do not "simplify" it into a prefix scan just because one
+///   would now be safe.
 ///
 /// The `stage_sets` row itself is deliberately left alone — not deleted,
 /// not re-statused. Leaving it `status='staging'` is exactly what lets
@@ -527,9 +557,10 @@ fn stage_create_inner(
 fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i64) {
     let staging_dir = Path::new(&config.staging.directory);
 
-    // Resolve this stage set's per-snapshot archive_base prefix, the same
-    // way stage_create_inner computed it, so the plaintext scan matches
-    // exactly the files this snapshot's dar run could have produced.
+    // Resolve this stage set's archive_base prefix via the SAME
+    // `archive_base_name`/`archive_base_prefix` helpers `stage_create_inner`
+    // used to build it — the lockstep issue #53 requires: this is not a
+    // parallel re-derivation, it's the identical computation.
     let prefix = match conn
         .query_row(
             "SELECT u.uuid, sn.version
@@ -542,20 +573,7 @@ fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i6
         )
         .ok()
     {
-        Some((uuid, version)) => {
-            // The trailing dot is load-bearing. dar names every slice
-            // `{base}.{N}.dar`, so the real prefix is `{base}.`. Without it,
-            // `..._v1` is a prefix of `..._v10.1.dar`, and cleaning up a
-            // failed stage of version 1 would delete the plaintext slices of
-            // a concurrent stage of version 10 of the same unit — the exact
-            // cross-stage-set deletion this function is otherwise careful to
-            // avoid. Same convention as `volume::build::catalog_file_paths`.
-            format!(
-                "{}_v{}.",
-                uuid.replace('-', "").get(..12).unwrap_or(&uuid),
-                version
-            )
-        }
+        Some((uuid, version)) => archive_base_prefix(&uuid, version, stage_set_id),
         None => {
             tracing::warn!(
                 stage_set_id,
@@ -1628,6 +1646,37 @@ mod tests {
         assert_eq!(file_count, 2, "the FIFO still counts toward file_count");
     }
 
+    // ── issue #53: archive_base is per-stage-set, not per-snapshot ──
+
+    #[test]
+    fn archive_base_name_differs_for_two_stage_sets_of_the_same_snapshot() {
+        // The core anti-collision claim: same unit uuid, same version, two
+        // different stage_set_ids must never produce the same file-name
+        // stem — otherwise a re-stage of the same snapshot would silently
+        // overwrite the first stage set's `.age` slices.
+        let a = archive_base_name("abcdef0123456789", 3, 7);
+        let b = archive_base_name("abcdef0123456789", 3, 8);
+        assert_ne!(a, b);
+        assert_eq!(a, "abcdef012345_v3_s7");
+        assert_eq!(b, "abcdef012345_v3_s8");
+    }
+
+    #[test]
+    fn archive_base_prefix_is_the_name_plus_a_trailing_dot_and_stays_lockstep_with_cleanup() {
+        // `cleanup_failed_stage_set` derives its plaintext-scan prefix via
+        // this exact helper (not a parallel re-derivation) — this test
+        // proves the shape stays what dar's `{base}.{N}.dar` naming needs,
+        // and that the dot prevents `_s1` from prefix-matching `_s10.1.dar`.
+        let p1 = archive_base_prefix("abcdef0123456789", 3, 1);
+        let p10 = archive_base_prefix("abcdef0123456789", 3, 10);
+        assert_eq!(p1, "abcdef012345_v3_s1.");
+        assert_eq!(p10, "abcdef012345_v3_s10.");
+        assert!(
+            !"abcdef012345_v3_s10.1.dar".starts_with(&p1),
+            "trailing dot must stop _s1 from prefix-matching _s10's files"
+        );
+    }
+
     // ── issue #47: stage_create must resolve policy, not read config.defaults directly ──
 
     /// The core claim of issue #47: `stage_create` must resolve
@@ -1740,6 +1789,81 @@ mod tests {
              not config.defaults.compression (none), and must not be shadowed by \
              a concrete value baked into the unit's dotfile — proves the \
              archive_set's compression is actually reachable (issue #92)"
+        );
+    }
+
+    /// End-to-end proof (real dar, real encryption) that two stage sets of
+    /// the SAME snapshot never collide: their `.age` slice paths differ,
+    /// and both sets of ciphertext survive on disk simultaneously —
+    /// something the old per-snapshot `archive_base` could not guarantee.
+    #[test]
+    fn two_stage_sets_of_the_same_snapshot_do_not_collide_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let mut config = Config::default();
+        config.staging.directory = staging_dir.to_string_lossy().to_string();
+        config.dar.binary = "dar".to_string();
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f.txt"), b"collision-test content").unwrap();
+
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        // Two stage sets of the SAME snapshot — the flow issue #53 makes
+        // reachable via `stage create --version`. Calling `stage_create`
+        // directly here (bypassing the CLI gate) is deliberate: this test
+        // is about `archive_base` collision, not about the gate.
+        let stage_set_1 = stage_create(&conn, &paths, &config, snap_id).unwrap();
+        let stage_set_2 = stage_create(&conn, &paths, &config, snap_id).unwrap();
+        assert_ne!(stage_set_1, stage_set_2);
+
+        let paths_for = |stage_set_id: i64| -> Vec<String> {
+            conn.prepare("SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1")
+                .unwrap()
+                .query_map(params![stage_set_id], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .unwrap()
+        };
+        let slices_1 = paths_for(stage_set_1);
+        let slices_2 = paths_for(stage_set_2);
+        assert!(!slices_1.is_empty());
+        assert!(!slices_2.is_empty());
+
+        // Distinct paths, and both must still exist on disk — proof the
+        // second stage set never overwrote the first's ciphertext.
+        for p in slices_1.iter().chain(slices_2.iter()) {
+            assert!(Path::new(p).exists(), "{p} must exist on disk");
+        }
+        let set1: std::collections::HashSet<_> = slices_1.iter().collect();
+        let set2: std::collections::HashSet<_> = slices_2.iter().collect();
+        assert!(
+            set1.is_disjoint(&set2),
+            "the two stage sets' slice paths must never overlap: {slices_1:?} vs {slices_2:?}"
         );
     }
 
@@ -1892,28 +2016,40 @@ mod tests {
         .unwrap();
         let failed_set = conn.last_insert_rowid();
 
+        // A second stage set of the SAME snapshot (issue #53: two stage
+        // sets can now coexist for one snapshot) whose files must survive
+        // `failed_set`'s cleanup untouched.
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
+             VALUES (?1, 1024, 'none', 1)",
+            params![snap_v1],
+        )
+        .unwrap();
+        let sibling_set = conn.last_insert_rowid();
+
         let base12 = &uuid[..12];
-        let v1_slice = staging_dir.join(format!("{base12}_v1.1.dar"));
-        let v10_slice = staging_dir.join(format!("{base12}_v10.1.dar"));
-        let v10_hash = staging_dir.join(format!("{base12}_v10.1.dar.sha512"));
-        for f in [&v1_slice, &v10_slice, &v10_hash] {
+        let failed_slice = staging_dir.join(format!("{base12}_v1_s{failed_set}.1.dar"));
+        let sibling_slice = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar"));
+        let sibling_hash = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar.sha512"));
+        for f in [&failed_slice, &sibling_slice, &sibling_hash] {
             fs::write(f, b"x").unwrap();
         }
 
         cleanup_failed_stage_set(&conn, &config, failed_set);
 
         assert!(
-            !v1_slice.exists(),
-            "v1's own orphaned plaintext slice must be removed"
+            !failed_slice.exists(),
+            "the failed stage set's own orphaned plaintext slice must be removed"
         );
         assert!(
-            v10_slice.exists(),
-            "v10's in-flight plaintext slice must survive v1's cleanup — a bare \
-             `_v1` prefix would have deleted it"
+            sibling_slice.exists(),
+            "a sibling stage set's in-flight plaintext slice must survive this \
+             cleanup — a prefix without the stage_set_id/trailing-dot discipline \
+             would have deleted it"
         );
         assert!(
-            v10_hash.exists(),
-            "v10's hash file must survive v1's cleanup for the same reason"
+            sibling_hash.exists(),
+            "the sibling's hash file must survive this cleanup for the same reason"
         );
     }
 
