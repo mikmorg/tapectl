@@ -95,13 +95,17 @@ _Avoid_: backup, replica
 **Current**:
 A snapshot that has been sealed onto a volume and still counts. **More than one
 snapshot of a unit may be current at once** — archiving a new version does not
-demote the old one, and there is no automatic supersession. Age alone therefore
-decides nothing: only the highest-versioned current snapshot of a unit counts as
-live in a derivation, and the earlier ones remain current until an operator
-makes them **Reclaimable**, which is the sole demotion. A derivation that counts
-every current snapshot of a unit as live is wrong.
+demote the old one, and there is no automatic supersession. Age alone decides
+nothing, and that cuts both ways: an older current snapshot is **still live**,
+because compaction carries its slices forward until an operator has explicitly
+made it **Reclaimable**, which is the sole demotion. So every current snapshot
+counts as live, not just the newest, and a derivation that reports otherwise
+would promise reclaimable space that compaction will not actually reclaim.
+The cost is that superseded versions accumulate silently until someone marks
+them — an operator-action gap, not an arithmetic one.
 _Avoid_: superseded (nothing writes that status; it is vestigial and must not be
-read as a lifecycle stage), latest (says nothing about whether it is sealed)
+read as a lifecycle stage), latest (says nothing about whether it is sealed),
+stale (an old current snapshot is not stale — it is coverage nobody has released)
 
 ### Restoring
 
