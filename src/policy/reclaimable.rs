@@ -35,8 +35,15 @@ pub enum ReclaimVerdict {
     },
     /// A precondition fails. `reason` is the exact error text the gate
     /// produces, "(use --force to override)" suffix included.
+    ///
+    /// `freeable_bytes` is carried here too, and is the same number the
+    /// `Releasable` arm would report. A blocked candidate is the one an
+    /// operator most needs the figure for: it is what clearing the
+    /// blocker would buy back. Reporting a hard 0 on these rows would
+    /// say the opposite.
     Blocked {
         superseding_version: Option<i64>,
+        freeable_bytes: i64,
         reason: String,
     },
 }
@@ -68,6 +75,24 @@ pub fn assess(
     unit: &Unit,
     version: i64,
 ) -> Result<ReclaimVerdict> {
+    // The candidate's own bytes, resolved once for every return path.
+    // `.ok()` rather than `?`: `assess` is public API, and a version
+    // that does not exist is not an error condition it should invent --
+    // it has nothing to free. (The gate rejects a missing version with
+    // its own message before ever calling here, and `candidates` only
+    // ever passes rows it just read.)
+    let freeable = match conn
+        .query_row(
+            "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+            params![unit.id, version],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    {
+        Some(snap_id) => freeable_bytes(conn, snap_id)?,
+        None => 0,
+    };
+
     // Precondition 1: A superseding snapshot must exist and be current
     let superseding: Option<(i64, i64)> = conn
         .query_row(
@@ -81,12 +106,15 @@ pub fn assess(
 
     let superseding = match superseding {
         Some(s) => s,
-        None => return Ok(ReclaimVerdict::Blocked {
-            superseding_version: None,
-            reason: format!(
+        None => {
+            return Ok(ReclaimVerdict::Blocked {
+                superseding_version: None,
+                freeable_bytes: freeable,
+                reason: format!(
                 "no superseding current snapshot exists for v{version} (use --force to override)"
             ),
-        }),
+            })
+        }
     };
 
     // Precondition 2: Superseding snapshot meets policy
@@ -120,6 +148,7 @@ pub fn assess(
     if copy_count < required_copies {
         return Ok(ReclaimVerdict::Blocked {
             superseding_version: Some(superseding.1),
+            freeable_bytes: freeable,
             reason: format!(
                 "superseding v{} has {copy_count} copies, needs {required_copies}{} (use --force to override)",
                 superseding.1,
@@ -142,6 +171,7 @@ pub fn assess(
     if required_locations > 0 && location_count < required_locations {
         return Ok(ReclaimVerdict::Blocked {
             superseding_version: Some(superseding.1),
+            freeable_bytes: freeable,
             reason: format!(
                 "superseding v{} in {location_count} locations, needs {required_locations} (use --force to override)",
                 superseding.1,
@@ -149,15 +179,9 @@ pub fn assess(
         });
     }
 
-    let snap_id: i64 = conn.query_row(
-        "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
-        params![unit.id, version],
-        |row| row.get(0),
-    )?;
-
     Ok(ReclaimVerdict::Releasable {
         superseding_version: superseding.1,
-        freeable_bytes: freeable_bytes(conn, snap_id)?,
+        freeable_bytes: freeable,
     })
 }
 
@@ -364,9 +388,14 @@ pub(crate) mod tests {
         match verdict {
             ReclaimVerdict::Blocked {
                 superseding_version,
+                freeable_bytes,
                 reason,
             } => {
                 assert_eq!(superseding_version, Some(2));
+                assert_eq!(
+                    freeable_bytes, 1000,
+                    "a blocked candidate must still report what clearing the blocker would buy"
+                );
                 assert!(
                     reason.contains("superseding v2 has 1 copies, needs 2"),
                     "status {status}: {reason}"
@@ -416,6 +445,7 @@ pub(crate) mod tests {
             verdict,
             ReclaimVerdict::Blocked {
                 superseding_version: None,
+                freeable_bytes: 1000,
                 reason: "no superseding current snapshot exists for v2 (use --force to override)"
                     .to_string(),
             }

@@ -66,6 +66,8 @@ pub enum ReportCommands {
     },
     /// Volumes flagged for compaction
     CompactionCandidates,
+    /// Superseded snapshot versions that could be marked reclaimable
+    Supersedable,
 }
 
 pub fn run(
@@ -98,7 +100,129 @@ pub fn run(
         ReportCommands::CompactionCandidates => {
             report_compaction_candidates(conn, config, json_output)
         }
+        ReportCommands::Supersedable => report_supersedable(conn, config, json_output),
     }
+}
+
+/// Issue #90 (as re-scoped): superseded versions accumulate silently
+/// because `snapshot mark-reclaimable` is a manual step nothing prompts.
+/// This is the prompt.
+///
+/// Deliberately a sibling of `compaction-candidates` rather than an
+/// extension of it: that report is per-VOLUME and its `live_bytes` must
+/// not change (it agrees with `compact_read`/`compact_finish` today, and
+/// making it "smarter" would advertise space compaction carries forward
+/// anyway). This signal is per-UNIT/per-snapshot — a different grain.
+///
+/// Releasability is NOT recomputed here. It comes from
+/// `policy::reclaimable::assess`, the same function `snapshot
+/// mark-reclaimable` gates on, so the two can never disagree. Blocked
+/// candidates are listed with their reason rather than hidden: that is
+/// strictly more useful and cannot over-promise, and only the releasable
+/// ones are summed into the total.
+fn report_supersedable(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    use crate::policy::reclaimable::ReclaimVerdict;
+
+    let found = crate::policy::reclaimable::candidates(conn, config)?;
+    let summary = supersedable_summary(&found);
+
+    if json_output {
+        println!("{summary}");
+    } else if found.is_empty() {
+        println!("supersedable: nothing to release (no unit has more than one current snapshot)");
+    } else {
+        println!("supersedable snapshots ({} candidate(s)):", found.len());
+        for c in &found {
+            match &c.verdict {
+                ReclaimVerdict::Releasable {
+                    superseding_version,
+                    freeable_bytes,
+                } => println!(
+                    "  {} v{}: superseded by v{superseding_version} — RELEASABLE, frees {} MB\n      tapectl snapshot mark-reclaimable {} --version {}",
+                    c.unit_name,
+                    c.version,
+                    freeable_bytes / (1024 * 1024),
+                    c.unit_name,
+                    c.version,
+                ),
+                ReclaimVerdict::Blocked {
+                    freeable_bytes,
+                    reason,
+                    ..
+                } => println!(
+                    "  {} v{}: BLOCKED ({} MB would be freed) — {reason}",
+                    c.unit_name,
+                    c.version,
+                    freeable_bytes / (1024 * 1024),
+                ),
+            }
+        }
+        let releasable = summary["releasable"].as_u64().unwrap_or(0);
+        if releasable == 0 {
+            println!("nothing to release: every candidate is blocked");
+        } else {
+            println!(
+                "{releasable} releasable, freeing {} MB total",
+                summary["total_freeable_bytes"].as_i64().unwrap_or(0) / (1024 * 1024)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `--json` payload, built separately from printing so tests can
+/// assert the numbers rather than only that rendering did not error.
+/// The total sums the RELEASABLE candidates only — a blocked one's bytes
+/// are shown per-row (they are what clearing the blocker would buy) but
+/// must never be advertised as available.
+fn supersedable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serde_json::Value {
+    use crate::policy::reclaimable::ReclaimVerdict;
+
+    let mut total_freeable: i64 = 0;
+    let mut releasable = 0usize;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+
+    for c in found {
+        let (is_releasable, superseding, bytes, reason) = match &c.verdict {
+            ReclaimVerdict::Releasable {
+                superseding_version,
+                freeable_bytes,
+            } => {
+                releasable += 1;
+                total_freeable += freeable_bytes;
+                (
+                    true,
+                    Some(*superseding_version),
+                    *freeable_bytes,
+                    serde_json::Value::Null,
+                )
+            }
+            ReclaimVerdict::Blocked {
+                superseding_version,
+                freeable_bytes,
+                reason,
+            } => (
+                false,
+                *superseding_version,
+                *freeable_bytes,
+                serde_json::Value::String(reason.clone()),
+            ),
+        };
+        rows.push(serde_json::json!({
+            "unit": c.unit_name, "version": c.version,
+            "superseding_version": superseding,
+            "freeable_bytes": bytes,
+            "releasable": is_releasable,
+            "blocked_reason": reason,
+        }));
+    }
+
+    serde_json::json!({
+        "supersedable": rows.len(),
+        "releasable": releasable,
+        "total_freeable_bytes": total_freeable,
+        "candidates": rows,
+    })
 }
 
 fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
@@ -1117,6 +1241,79 @@ mod tests {
             report_fire_risk(&conn, &config, false).expect("fire-risk plain output must succeed");
             report_tape_only(&conn, Some("rep-e2e"), false)
                 .expect("tape-only plain output must succeed");
+        }
+    }
+
+    /// Issue #90: `report supersedable` must run end-to-end in both
+    /// output modes, and must not perturb `report compaction-candidates`
+    /// -- the whole reason it is a sibling report rather than an
+    /// extension of that one.
+    mod supersedable {
+        use super::*;
+        use crate::policy::reclaimable::tests::setup;
+
+        fn summary_for(conn: &Connection) -> serde_json::Value {
+            let found = crate::policy::reclaimable::candidates(conn, &Config::default()).unwrap();
+            supersedable_summary(&found)
+        }
+
+        #[test]
+        fn a_releasable_candidate_is_counted_and_summed() {
+            let (conn, _unit) = setup("rep-sup-ok", 2, "sealed", "active");
+            let s = summary_for(&conn);
+            assert_eq!(s["supersedable"], 1);
+            assert_eq!(s["releasable"], 1);
+            assert_eq!(s["total_freeable_bytes"], 1000);
+            let row = &s["candidates"][0];
+            assert_eq!(row["unit"], "rep-sup-ok");
+            assert_eq!(row["version"], 1);
+            assert_eq!(row["superseding_version"], 2);
+            assert_eq!(row["freeable_bytes"], 1000);
+            assert_eq!(row["releasable"], true);
+            assert!(row["blocked_reason"].is_null());
+
+            report_supersedable(&conn, &Config::default(), false).unwrap();
+            report_supersedable(&conn, &Config::default(), true).unwrap();
+        }
+
+        /// A blocked candidate carries the gate's own refusal text AND
+        /// its byte figure (what clearing the blocker would buy), but
+        /// must NOT be summed into the advertised total.
+        #[test]
+        fn a_blocked_candidate_reports_its_reason_and_bytes_but_is_not_summed() {
+            let (conn, _unit) = setup("rep-sup-blocked", 2, "quarantined", "active");
+            let s = summary_for(&conn);
+            assert_eq!(s["supersedable"], 1);
+            assert_eq!(s["releasable"], 0);
+            assert_eq!(
+                s["total_freeable_bytes"], 0,
+                "blocked bytes must never be advertised as available"
+            );
+            let row = &s["candidates"][0];
+            assert_eq!(row["releasable"], false);
+            assert_eq!(row["freeable_bytes"], 1000);
+            assert!(
+                row["blocked_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("has 1 copies, needs 2"),
+                "{row}"
+            );
+
+            report_supersedable(&conn, &Config::default(), false).unwrap();
+            report_supersedable(&conn, &Config::default(), true).unwrap();
+        }
+
+        #[test]
+        fn empty_case_renders() {
+            let (conn, _unit) = setup("rep-sup-single", 1, "sealed", "active");
+            report_supersedable(&conn, &Config::default(), false).unwrap();
+        }
+
+        #[test]
+        fn compaction_candidates_still_runs_unchanged() {
+            let (conn, _unit) = setup("rep-sup-compact", 2, "sealed", "active");
+            report_compaction_candidates(&conn, &Config::default(), false).unwrap();
         }
     }
 }
