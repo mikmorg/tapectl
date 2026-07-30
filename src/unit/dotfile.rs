@@ -13,10 +13,15 @@ pub struct UnitDotfile {
     pub tags: Vec<String>,
     pub tenant: String,
     pub archive_set: Option<String>,
-    pub checksum_mode: String,
-    pub compression: String,
+    pub checksum_mode: Option<String>,
+    pub compression: Option<String>,
     pub exclude_patterns: Vec<String>,
 }
+
+/// Fallback checksum mode used at DB insert sites when a dotfile omits
+/// `[policy] checksum_mode` (absent means defer to archive_set/defaults for
+/// resolving policy, but the `units.checksum_mode` DB column is non-null).
+pub const DEFAULT_CHECKSUM_MODE: &str = "mtime_size";
 
 // ── TOML structure matching design Section 2.2 ──
 //
@@ -38,8 +43,8 @@ pub struct UnitDotfile {
 #[derive(Serialize, Deserialize)]
 struct DotfileToml {
     unit: UnitSection,
-    #[serde(default)]
-    policy: PolicySection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy: Option<PolicySection>,
     #[serde(default)]
     excludes: ExcludesSection,
 }
@@ -56,28 +61,12 @@ struct UnitSection {
     archive_set: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct PolicySection {
-    #[serde(default = "default_checksum_mode")]
-    checksum_mode: String,
-    #[serde(default = "default_compression")]
-    compression: String,
-}
-
-impl Default for PolicySection {
-    fn default() -> Self {
-        Self {
-            checksum_mode: default_checksum_mode(),
-            compression: default_compression(),
-        }
-    }
-}
-
-fn default_checksum_mode() -> String {
-    "mtime_size".to_string()
-}
-fn default_compression() -> String {
-    "none".to_string()
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checksum_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -88,6 +77,15 @@ struct ExcludesSection {
 
 /// Write dotfile to disk in the design-specified TOML format.
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
+    let policy = if data.checksum_mode.is_none() && data.compression.is_none() {
+        None
+    } else {
+        Some(PolicySection {
+            checksum_mode: data.checksum_mode.clone(),
+            compression: data.compression.clone(),
+        })
+    };
+
     let wrapper = DotfileToml {
         unit: UnitSection {
             uuid: data.uuid.clone(),
@@ -97,10 +95,7 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
             tenant: data.tenant.clone(),
             archive_set: data.archive_set.clone(),
         },
-        policy: PolicySection {
-            checksum_mode: data.checksum_mode.clone(),
-            compression: data.compression.clone(),
-        },
+        policy,
         excludes: ExcludesSection {
             patterns: data.exclude_patterns.clone(),
         },
@@ -125,8 +120,11 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
         tags: wrapper.unit.tags,
         tenant: wrapper.unit.tenant,
         archive_set: wrapper.unit.archive_set,
-        checksum_mode: wrapper.policy.checksum_mode,
-        compression: wrapper.policy.compression,
+        checksum_mode: wrapper
+            .policy
+            .as_ref()
+            .and_then(|p| p.checksum_mode.clone()),
+        compression: wrapper.policy.as_ref().and_then(|p| p.compression.clone()),
         exclude_patterns: wrapper.excludes.patterns,
     })
 }
@@ -144,8 +142,8 @@ mod tests {
             tags: vec!["media".into(), "personal".into()],
             tenant: "alice".into(),
             archive_set: Some("cold".into()),
-            checksum_mode: "sha256".into(),
-            compression: "lzma".into(),
+            checksum_mode: Some("sha256".into()),
+            compression: Some("lzma".into()),
             exclude_patterns: vec!["*.tmp".into(), ".cache/".into()],
         }
     }
@@ -169,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn read_applies_defaults_for_missing_policy_and_excludes() {
+    fn read_leaves_policy_fields_none_when_absent() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(".tapectl-unit.toml");
         std::fs::write(
@@ -189,9 +187,53 @@ tenant = "alice"
         assert_eq!(r.tenant, "alice");
         assert!(r.tags.is_empty());
         assert!(r.archive_set.is_none());
-        assert_eq!(r.checksum_mode, "mtime_size");
-        assert_eq!(r.compression, "none");
+        assert!(
+            r.checksum_mode.is_none(),
+            "absent [policy] checksum_mode must defer upward (Recast of v4.0 §2.2, issue #92), not fill a default"
+        );
+        assert!(
+            r.compression.is_none(),
+            "absent [policy] compression must defer upward (Recast of v4.0 §2.2, issue #92), not fill a default"
+        );
         assert!(r.exclude_patterns.is_empty());
+    }
+
+    #[test]
+    fn read_explicit_policy_compression_round_trips_as_some() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        std::fs::write(
+            &path,
+            r#"
+[unit]
+uuid = "u-1"
+name = "docs"
+created = "2026-01-01T00:00:00Z"
+tenant = "alice"
+
+[policy]
+compression = "gzip"
+"#,
+        )
+        .unwrap();
+        let r = read_dotfile(&path).unwrap();
+        assert_eq!(r.compression, Some("gzip".to_string()));
+        assert!(r.checksum_mode.is_none());
+    }
+
+    #[test]
+    fn write_omits_policy_table_when_both_fields_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        let mut d = sample();
+        d.checksum_mode = None;
+        d.compression = None;
+        write_dotfile(&path, &d).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("[policy]"),
+            "no [policy] header should be written when both fields are None, got: {raw}"
+        );
     }
 
     #[test]
