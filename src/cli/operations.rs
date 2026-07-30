@@ -947,76 +947,15 @@ pub fn snapshot_mark_reclaimable(
         )));
     }
 
+    // Issue #90: the preconditions live in `policy::reclaimable::assess`,
+    // not here, so that `report supersedable` measures releasability with
+    // this exact code rather than a second copy of it. `Blocked.reason`
+    // IS this function's historical error text.
     if !force {
-        // Precondition 1: A superseding snapshot must exist and be current
-        let superseding: Option<(i64, i64)> = conn
-            .query_row(
-                "SELECT id, version FROM snapshots
-                 WHERE unit_id = ?1 AND version > ?2 AND status = 'current'
-                 ORDER BY version DESC LIMIT 1",
-                params![unit.id, version],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-
-        let superseding = superseding.ok_or_else(|| {
-            TapectlError::Other(format!(
-                "no superseding current snapshot exists for v{version} (use --force to override)"
-            ))
-        })?;
-
-        // Precondition 2: Superseding snapshot meets policy
-        let resolved = crate::policy::resolve(conn, config, &unit);
-        let mut required_copies = resolved.min_copies;
-        let mut required_locations = resolved.required_locations.len() as i64;
-
-        // Precondition 3: tape-only units get multiplied requirements
-        if unit.status == "tape_only" {
-            let multiplier = config.compaction.tape_only_safety_multiplier as i64;
-            required_copies *= multiplier;
-            required_locations *= multiplier;
-        }
-
-        // ADR-0004 (issue #89): this query previously had no JOIN to
-        // volumes at all, so it counted every completed write regardless
-        // of whether the volume holding it had since been quarantined,
-        // retired, erased, or reported missing. The shared eligibility
-        // predicate re-qualifies at use time instead of trusting
-        // write-time status forever.
-        let sql = format!(
-            "SELECT COUNT(DISTINCT w.volume_id)
-             FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN volumes v ON v.id = w.volume_id
-             WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND {}",
-            crate::policy::coverage::eligible("v")
-        );
-        let copy_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
-
-        if copy_count < required_copies {
-            return Err(TapectlError::Other(format!(
-                "superseding v{} has {copy_count} copies, needs {required_copies}{} (use --force to override)",
-                superseding.1,
-                if unit.status == "tape_only" { " (tape-only 2x)" } else { "" }
-            )));
-        }
-
-        let sql = format!(
-            "SELECT COUNT(DISTINCT v.location_id)
-             FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN volumes v ON v.id = w.volume_id
-             WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND v.location_id IS NOT NULL
-               AND {}",
-            crate::policy::coverage::eligible("v")
-        );
-        let location_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
-
-        if required_locations > 0 && location_count < required_locations {
-            return Err(TapectlError::Other(format!(
-                "superseding v{} in {location_count} locations, needs {required_locations} (use --force to override)",
-                superseding.1,
-            )));
+        if let crate::policy::reclaimable::ReclaimVerdict::Blocked { reason, .. } =
+            crate::policy::reclaimable::assess(conn, config, &unit, version)?
+        {
+            return Err(TapectlError::Other(reason));
         }
     }
 

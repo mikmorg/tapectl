@@ -52,28 +52,178 @@ pub struct Candidate {
 
 /// Assess whether `version` of `unit` may be marked reclaimable without
 /// `--force`.
+///
+/// The message text of every [`ReclaimVerdict::Blocked`] is the gate's
+/// own error text, verbatim: `snapshot_mark_reclaimable` returns it
+/// unchanged, and the report prints it as the blocker. One string, one
+/// meaning, in both places.
+///
+/// `policy::resolve` is called here rather than passed in — it reads the
+/// unit's dotfile from disk, so a caller resolving separately could
+/// diverge from the gate on exactly the axis this function exists to
+/// pin down.
 pub fn assess(
     conn: &Connection,
     config: &Config,
     unit: &Unit,
     version: i64,
 ) -> Result<ReclaimVerdict> {
-    let _ = (conn, config, unit, version);
-    unimplemented!()
+    // Precondition 1: A superseding snapshot must exist and be current
+    let superseding: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT id, version FROM snapshots
+             WHERE unit_id = ?1 AND version > ?2 AND status = 'current'
+             ORDER BY version DESC LIMIT 1",
+            params![unit.id, version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let superseding = match superseding {
+        Some(s) => s,
+        None => return Ok(ReclaimVerdict::Blocked {
+            superseding_version: None,
+            reason: format!(
+                "no superseding current snapshot exists for v{version} (use --force to override)"
+            ),
+        }),
+    };
+
+    // Precondition 2: Superseding snapshot meets policy
+    let resolved = super::resolve(conn, config, unit);
+    let mut required_copies = resolved.min_copies;
+    let mut required_locations = resolved.required_locations.len() as i64;
+
+    // Precondition 3: tape-only units get multiplied requirements
+    if unit.status == "tape_only" {
+        let multiplier = config.compaction.tape_only_safety_multiplier as i64;
+        required_copies *= multiplier;
+        required_locations *= multiplier;
+    }
+
+    // ADR-0004 (issue #89): this query previously had no JOIN to
+    // volumes at all, so it counted every completed write regardless
+    // of whether the volume holding it had since been quarantined,
+    // retired, erased, or reported missing. The shared eligibility
+    // predicate re-qualifies at use time instead of trusting
+    // write-time status forever.
+    let sql = format!(
+        "SELECT COUNT(DISTINCT w.volume_id)
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND {}",
+        super::coverage::eligible("v")
+    );
+    let copy_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
+
+    if copy_count < required_copies {
+        return Ok(ReclaimVerdict::Blocked {
+            superseding_version: Some(superseding.1),
+            reason: format!(
+                "superseding v{} has {copy_count} copies, needs {required_copies}{} (use --force to override)",
+                superseding.1,
+                if unit.status == "tape_only" { " (tape-only 2x)" } else { "" }
+            ),
+        });
+    }
+
+    let sql = format!(
+        "SELECT COUNT(DISTINCT v.location_id)
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND v.location_id IS NOT NULL
+           AND {}",
+        super::coverage::eligible("v")
+    );
+    let location_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
+
+    if required_locations > 0 && location_count < required_locations {
+        return Ok(ReclaimVerdict::Blocked {
+            superseding_version: Some(superseding.1),
+            reason: format!(
+                "superseding v{} in {location_count} locations, needs {required_locations} (use --force to override)",
+                superseding.1,
+            ),
+        });
+    }
+
+    let snap_id: i64 = conn.query_row(
+        "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+        params![unit.id, version],
+        |row| row.get(0),
+    )?;
+
+    Ok(ReclaimVerdict::Releasable {
+        superseding_version: superseding.1,
+        freeable_bytes: freeable_bytes(conn, snap_id)?,
+    })
 }
 
 /// Enumerate every supersedable snapshot across all units: for each unit
 /// with two or more `current` snapshots, the highest version is the
 /// keeper and every lower-versioned `current` snapshot is a candidate.
+///
+/// Nothing here demotes anything — `reclaimable` stays the operator's
+/// sole, manual demotion (CONTEXT.md **Current**). This only reports.
 pub fn candidates(conn: &Connection, config: &Config) -> Result<Vec<Candidate>> {
-    let _ = (conn, config);
-    unimplemented!()
+    let mut stmt = conn.prepare(
+        "SELECT u.name, s.version
+         FROM units u
+         JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
+         WHERE s.version < (SELECT MAX(s2.version) FROM snapshots s2
+                            WHERE s2.unit_id = u.id AND s2.status = 'current')
+         ORDER BY u.name, s.version",
+    )?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (unit_name, version) in rows {
+        // `queries::get_unit_by_name` rather than a by-id helper: the
+        // latter does not exist, and `db/queries.rs` is out of scope.
+        let Some(unit) = crate::db::queries::get_unit_by_name(conn, &unit_name)? else {
+            continue;
+        };
+        let verdict = assess(conn, config, &unit, version)?;
+        out.push(Candidate {
+            unit_name,
+            version,
+            verdict,
+        });
+    }
+    Ok(out)
 }
 
-/// Bytes that releasing `snapshot_id` would free.
+/// Bytes that releasing `snapshot_id` would free: the sum of its
+/// `stage_slices.encrypted_bytes`.
+///
+/// Deliberately NOT the `report compaction-candidates` join shape. That
+/// one reaches `stage_slices` *through* `writes`, which is right when
+/// grouping per volume but would multiply a per-snapshot figure by the
+/// snapshot's copy count. Here `writes` appears only inside an EXISTS
+/// guard, which cannot fan out. The guard itself is not optional: an
+/// unwritten (staging/failed/cleaned) stage_set occupies no tape, so
+/// counting it would advertise space that does not exist. The volume
+/// behind that write is re-qualified with the shared ADR-0004 predicate
+/// for the same reason the copy count is: a retired or erased volume's
+/// space is not the operator's to reclaim here.
 fn freeable_bytes(conn: &Connection, snapshot_id: i64) -> Result<i64> {
-    let _ = (conn, snapshot_id);
-    unimplemented!()
+    let sql = format!(
+        "SELECT COALESCE(SUM(sl.encrypted_bytes), 0)
+         FROM stage_sets ss
+         JOIN stage_slices sl ON sl.stage_set_id = ss.id
+         WHERE ss.snapshot_id = ?1
+           AND EXISTS (SELECT 1 FROM writes w
+                       JOIN volumes v ON v.id = w.volume_id
+                       WHERE w.stage_set_id = ss.id AND w.status = 'completed'
+                         AND {})",
+        super::coverage::eligible("v")
+    );
+    let bytes: i64 = conn.query_row(&sql, params![snapshot_id], |row| row.get(0))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
