@@ -28,7 +28,29 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96, #92, #87, #56 closed 2026-07-30.)
+  set when parallelising. (#94, #90, #96, #92, #87, #56, #54 closed
+  2026-07-30; #97/#98 filed as residuals.)
+  **Staging-file prefixes must be dot-terminated (from #54).** dar names
+  slices `{base}.{N}.dar` and `archive_base` is `{uuid12}_v{version}`, so a
+  bare-base prefix makes `_v1` match `_v10.1.dar` and one stage's cleanup
+  eats another's live plaintext. Matching rules, both load-bearing: plaintext
+  `.dar`/`.sha512` by dot-terminated filesystem prefix (dar writes all slices
+  up front, so most orphans have NO db rows); `.age` strictly by
+  `stage_slices.stage_set_id` (`archive_base` is per-*snapshot*, so a prefix
+  scan crosses stage sets).
+  **Never wire cleanup to `stage_sets.status='failed'`** — `db/mod.rs`'s
+  startup sweep marks every `'staging'` row failed and cannot see that
+  another process is mid-stage, so cleanup keyed on that status deletes live
+  files. Inert only because nothing targets `'failed'` today. Tracked in #98.
+  **#53 has a hidden prerequisite:** `archive_base` is per-snapshot, so
+  allowing a second stage set per snapshot makes two stage sets write
+  identically-named `.age` files. Make `archive_base` per-stage-set as part
+  of #53, or it silently corrupts.
+  **Long-running work must not sit in one transaction.** `unchecked_transaction`
+  is DEFERRED — it takes SQLite's single write lock at the first write. #54
+  transactions only `stage_create`'s finalization block, not the dar run:
+  a whole-function transaction would hold the lock for hours AND roll back
+  the `stage_sets` row a crash needs to leave behind as its signal.
   **`audit` now implements all six §2.20 checks** (#56). Its dirty check
   reuses `report.rs::dirty_rows` (now `pub(crate)`) — one scan, one place.
   Note `audit` with no `--unit` now walks the filesystem per active unit;
