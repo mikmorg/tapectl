@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
@@ -1150,7 +1150,7 @@ fn get_file_map(
 }
 
 /// DB backup using SQLite backup API.
-pub fn db_backup(paths: &TapectlPaths, dest: &str) -> Result<()> {
+pub fn db_backup(paths: &TapectlPaths, dest: &str, include_keys: bool) -> Result<()> {
     let src_conn = rusqlite::Connection::open(&paths.db_file)?;
     let mut dst_conn = rusqlite::Connection::open(dest)?;
 
@@ -1159,10 +1159,25 @@ pub fn db_backup(paths: &TapectlPaths, dest: &str) -> Result<()> {
         .run_to_completion(100, std::time::Duration::from_millis(10), None)
         .map_err(TapectlError::Database)?;
 
-    // Also copy keys directory
-    let keys_backup = Path::new(dest).with_extension("keys");
-    if paths.keys_dir.exists() {
-        copy_dir_all(&paths.keys_dir, &keys_backup)?;
+    // Issue #40: unconditionally copying every private key to an arbitrary
+    // operator-chosen destination (USB stick, network share, cloud-synced
+    // folder) with no flag and no warning made that destination a silent
+    // key-escrow point. `--include-keys` is opt-in (default off — the DB
+    // alone is the common case), and the copy path still ONLY existed
+    // because ADR-0005's Heir Kit (#69) is deferred and unbuilt: gating +
+    // warning is the right call today, not deprecating the only key-export
+    // path there is.
+    if include_keys {
+        if paths.keys_dir.exists() {
+            let keys_backup = Path::new(dest).with_extension("keys");
+            copy_dir_all(&paths.keys_dir, &keys_backup)?;
+            warn!(
+                destination = %keys_backup.display(),
+                "private key material copied to backup destination — treat this location as secret"
+            );
+        }
+    } else {
+        info!("--include-keys not set; private keys were not copied to this backup");
     }
 
     info!(dest = dest, "database backup complete");
@@ -1301,8 +1316,16 @@ pub struct FsckReport {
     pub repaired: usize,
 }
 
+/// Recursively copy `src` into `dst`, creating `dst` and every directory
+/// under it 0700 as it goes (issue #41 addendum on #40: `db backup`'s
+/// `<dest>.keys/` directory used to be created with no mode of its own,
+/// even though the `.key` files inside stay 0600 via `fs::copy` preserving
+/// source permissions). `secure_path` is best-effort — an operator-chosen
+/// backup destination can be a non-Unix filesystem (FAT/exFAT USB stick),
+/// and a chmod failing there must not sink an otherwise-good backup.
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
+    crate::config::secure_path(dst, 0o700);
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let dest = dst.join(entry.file_name());
@@ -2360,6 +2383,106 @@ mod tests {
                 "dest-original",
                 "a rejected import must not touch the destination"
             );
+        }
+    }
+
+    /// Issue #40: `db backup` used to copy the entire private-key
+    /// directory to `<dest>.keys` unconditionally — no flag, no warning,
+    /// no way to get a keys-free backup. `--include-keys` makes that
+    /// opt-in (default off). Paired with issue #41's directory-mode fix:
+    /// the `.keys` destination directory itself must be 0700 (the `.key`
+    /// files inside were already 0600 even before this fix, since
+    /// `fs::copy` preserves `crypto::keys::save_secret_key`'s mode).
+    mod db_backup_keys {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        /// A fresh tapectl home with one real generated tenant keypair, so
+        /// there's actual key material under `keys_dir` to (not) copy, and
+        /// a real sqlite `tapectl.db` for `db_backup`'s `Connection::open`
+        /// to read from.
+        fn temp_home_with_a_key() -> (TempDir, TapectlPaths) {
+            let tmp = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+            paths.ensure_dirs().unwrap();
+            crate::crypto::keys::generate_and_save(&paths.keys_dir, "alice", "primary").unwrap();
+            drop(crate::db::open(&paths.db_file).unwrap());
+            (tmp, paths)
+        }
+
+        #[test]
+        fn without_include_keys_copies_the_db_but_no_keys() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+
+            db_backup(&paths, dest.to_str().unwrap(), false).unwrap();
+
+            assert!(dest.exists(), "the database copy itself must still happen");
+            let keys_backup = dest.with_extension("keys");
+            assert!(
+                !keys_backup.exists(),
+                "without --include-keys, no .keys directory should be created at all"
+            );
+        }
+
+        #[test]
+        fn with_include_keys_copies_keys_dir_0700_and_key_files_stay_0600() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+
+            db_backup(&paths, dest.to_str().unwrap(), true).unwrap();
+
+            let keys_backup = dest.with_extension("keys");
+            assert!(keys_backup.is_dir(), ".keys directory should be created");
+            assert_eq!(
+                mode_of(&keys_backup),
+                0o700,
+                ".keys directory should be 0700"
+            );
+
+            let mut found_key_file = false;
+            for entry in fs::read_dir(&keys_backup).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().ends_with(".age.key") {
+                    found_key_file = true;
+                    assert_eq!(
+                        mode_of(&entry.path()),
+                        0o600,
+                        "{:?} should be 0600",
+                        entry.file_name()
+                    );
+                }
+            }
+            assert!(
+                found_key_file,
+                "fixture should have produced at least one .age.key file to check"
+            );
+        }
+
+        #[test]
+        fn with_include_keys_but_no_keys_dir_present_does_not_error() {
+            let tmp = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+            paths.ensure_dirs().unwrap();
+            drop(crate::db::open(&paths.db_file).unwrap());
+            // keys_dir legitimately doesn't exist — e.g. an operator tenant
+            // with keys generated some other way, or a very fresh home.
+            fs::remove_dir_all(&paths.keys_dir).unwrap();
+
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+
+            db_backup(&paths, dest.to_str().unwrap(), true)
+                .expect("a missing keys_dir must not turn --include-keys into an error");
+
+            assert!(dest.exists());
+            assert!(!dest.with_extension("keys").exists());
         }
     }
 }

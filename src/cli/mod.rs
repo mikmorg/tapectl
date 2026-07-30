@@ -219,11 +219,18 @@ pub enum Commands {
 /// Database operations.
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Backup database, keys, and catalogs
+    /// Backup database, and optionally keys, and catalogs
     Backup {
         /// Destination path
         #[arg(long)]
         to: String,
+        /// Also copy the private key directory to `<dest>.keys`. Off by
+        /// default — the database alone is the common backup case.
+        /// Private key material copied this way must be treated as secret
+        /// wherever the destination ends up (USB stick, network share,
+        /// cloud-synced folder, ...) — issue #40.
+        #[arg(long)]
+        include_keys: bool,
     },
     /// Check database integrity
     Fsck {

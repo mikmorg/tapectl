@@ -270,12 +270,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Db { ref command } => match command {
-            cli::DbCommands::Backup { to } => {
-                cli::operations::db_backup(&paths, to)?;
+            cli::DbCommands::Backup { to, include_keys } => {
+                cli::operations::db_backup(&paths, to, *include_keys)?;
                 if cli.json {
-                    println!("{}", serde_json::json!({"backup": to}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"backup": to, "keys_included": include_keys})
+                    );
+                } else if *include_keys {
+                    println!("database and keys backed up to {to}");
                 } else {
-                    println!("database backed up to {to}");
+                    println!(
+                        "database backed up to {to} (private keys not included — pass --include-keys to copy them)"
+                    );
                 }
             }
             cli::DbCommands::Fsck { repair } => {
