@@ -783,18 +783,71 @@ impl SealedPending {
                     params![write_id],
                 )?;
             }
+            // Snapshot promotions, plus what each one needs for its audit row
+            // (issue #58). The pre-flip status is read BEFORE the update so the
+            // event records a real old->new transition rather than guessing,
+            // and so nothing is logged when the guard matches no row.
+            let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
             for (_, snapshot_id) in &self.write_ids {
-                tx.execute(
+                let before: Option<(String, String, i64)> = tx
+                    .query_row(
+                        "SELECT s.status, u.name, u.tenant_id
+                         FROM snapshots s JOIN units u ON u.id = s.unit_id
+                         WHERE s.id = ?1",
+                        params![snapshot_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .ok();
+
+                let changed = tx.execute(
                     "UPDATE snapshots SET status = 'current'
                      WHERE id = ?1 AND status IN ('created', 'staged')",
                     params![snapshot_id],
                 )?;
+
+                if changed > 0 {
+                    if let Some((old_status, unit_name, tenant_id)) = before {
+                        promoted.push((*snapshot_id, old_status, unit_name, tenant_id));
+                    }
+                }
             }
             tx.execute(
                 "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
                 params![self.volume_id],
             )?;
             tx.commit()?;
+
+            // Audit rows are emitted AFTER the commit, deliberately, and a
+            // failure here is warned about rather than propagated (issue #58).
+            //
+            // Inside the transaction, a failing audit insert would roll back
+            // the seal — leaving a tape that is physically sealed (the seal
+            // marker is already on it; `seal` ran before `confirm`) while the
+            // catalog still calls the volume unsealed. That is a divergence
+            // ADR-0001 would quarantine on at next contact, traded for an
+            // advisory row. The audit trail is advisory; the seal record is
+            // not. Losing an event is strictly the cheaper failure, so the
+            // ordering is chosen rather than incidental.
+            for (snapshot_id, old_status, unit_name, tenant_id) in promoted {
+                if let Err(e) = crate::db::events::log_field_change(
+                    conn,
+                    "snapshot",
+                    snapshot_id,
+                    &unit_name,
+                    "sealed_current",
+                    "status",
+                    Some(&old_status),
+                    "current",
+                    Some(tenant_id),
+                ) {
+                    tracing::warn!(
+                        snapshot_id,
+                        unit = %unit_name,
+                        error = %e,
+                        "sealed successfully, but the snapshot-promotion audit row could not be written"
+                    );
+                }
+            }
             Ok(ConfirmOutcome::Sealed(SealedSession {
                 volume_id: self.volume_id,
                 label: self.built.layout.label.clone(),
@@ -1310,6 +1363,36 @@ mod tests {
 
         // The store actually holds every entry, seal marker included.
         assert_eq!(store.files.len(), expected_file_count);
+
+        // Issue #58: the created/staged -> current promotion is auditable.
+        // Before this, confirm logged only a volume-level `write_completed`,
+        // so `events` could not answer when or why a snapshot became current
+        // — the transition that makes it count as coverage.
+        let (action, field, old_value, new_value): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = f
+            .conn
+            .query_row(
+                "SELECT action, field, old_value, new_value FROM events
+                     WHERE entity_type = 'snapshot' AND action = 'sealed_current'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("confirm must log the snapshot promotion");
+        assert_eq!(action, "sealed_current");
+        assert_eq!(field, "status");
+        assert_eq!(
+            new_value.as_deref(),
+            Some("current"),
+            "the event must record the new status"
+        );
+        assert!(
+            matches!(old_value.as_deref(), Some("created") | Some("staged")),
+            "the event must record the REAL pre-flip status, not a guess — got {old_value:?}"
+        );
     }
 
     // --- behavior 2: injected hash mismatch mid-execute -------------------
