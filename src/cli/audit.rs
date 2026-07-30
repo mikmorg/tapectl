@@ -127,39 +127,10 @@ pub fn run(
 
     // Check compaction candidates (volume-level, not per-unit)
     if unit_filter.is_none() {
-        let threshold = config.compaction.utilization_threshold;
-        let mut stmt = conn.prepare(
-            "SELECT v.label, v.bytes_written,
-                    SUM(CASE WHEN s.status NOT IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as live_bytes
-             FROM volumes v
-             JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
-             JOIN stage_sets sts ON sts.id = w.stage_set_id
-             JOIN snapshots s ON s.id = sts.snapshot_id
-             JOIN stage_slices ss ON ss.stage_set_id = sts.id
-             WHERE v.status IN ('active','full')
-             GROUP BY v.id",
-        )?;
-        let candidates: Vec<(String, i64, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        for (label, total, live) in &candidates {
-            if *total > 0 {
-                let utilization = *live as f64 / *total as f64;
-                if utilization < threshold {
-                    warnings.push(AuditFinding {
-                        unit: format!("volume:{label}"),
-                        check: "compaction_candidate".into(),
-                        message: format!(
-                            "utilization {:.0}% < {:.0}% threshold",
-                            utilization * 100.0,
-                            threshold * 100.0
-                        ),
-                        action: format!("tapectl volume compact-read {label}"),
-                    });
-                }
-            }
-        }
+        warnings.extend(compaction_findings(
+            conn,
+            config.compaction.utilization_threshold,
+        )?);
     }
 
     // Output
@@ -232,6 +203,59 @@ pub fn run(
 /// Routes through the shared ADR-0004 predicate
 /// (`policy::coverage::eligible`): a write's own `status = 'completed'`
 /// only proves its volume was sealed at write time, not that it still is.
+/// The audit's volume-level compaction check: every volume whose live-byte
+/// utilization has fallen below `threshold` yields one `compaction_candidate`
+/// warning.
+///
+/// Group-A (issue #96): compaction targets a *finished* volume, so the
+/// candidate set is the ADR-0004 `sealed` predicate. Before that fix this
+/// query filtered `status IN ('active','full')` — a set no v2 write has ever
+/// left behind (`SealedPending::confirm` writes `sealed`) — so the loop
+/// iterated nothing and the audit passed *silently*, which is
+/// indistinguishable from a clean result. That is the failure ADR-0001
+/// exists to prevent.
+///
+/// The caller keeps the `unit_filter.is_none()` gate: this is a volume-level
+/// check and must not start firing for `audit --unit X`.
+fn compaction_findings(conn: &Connection, threshold: f64) -> Result<Vec<AuditFinding>> {
+    let sql = format!(
+        "SELECT v.label, v.bytes_written,
+                SUM(CASE WHEN s.status NOT IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as live_bytes
+         FROM volumes v
+         JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+         JOIN stage_sets sts ON sts.id = w.stage_set_id
+         JOIN snapshots s ON s.id = sts.snapshot_id
+         JOIN stage_slices ss ON ss.stage_set_id = sts.id
+         WHERE {}
+         GROUP BY v.id",
+        "v.status IN ('active','full')"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let candidates: Vec<(String, i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut findings = Vec::new();
+    for (label, total, live) in &candidates {
+        if *total > 0 {
+            let utilization = *live as f64 / *total as f64;
+            if utilization < threshold {
+                findings.push(AuditFinding {
+                    unit: format!("volume:{label}"),
+                    check: "compaction_candidate".into(),
+                    message: format!(
+                        "utilization {:.0}% < {:.0}% threshold",
+                        utilization * 100.0,
+                        threshold * 100.0
+                    ),
+                    action: format!("tapectl volume compact-read {label}"),
+                });
+            }
+        }
+    }
+    Ok(findings)
+}
+
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(DISTINCT w.volume_id)
@@ -439,5 +463,150 @@ mod tests {
             exit_code, 2,
             "a unit with only 1 eligible copy (min_copies=2 default) must be a violation, not clean"
         );
+    }
+
+    /// Issue #96: the volume-status drift. `SealedPending::confirm` writes
+    /// `volumes.status = 'sealed'`, but this check filtered `IN
+    /// ('active','full')` — a set no v2 write ever leaves behind — so the
+    /// candidate loop iterated nothing and the audit passed *silently*.
+    /// A silently-clean audit is indistinguishable from a real clean
+    /// result, which is exactly the failure ADR-0001 exists to prevent.
+    mod issue96_volume_status_drift {
+        use super::*;
+
+        /// A conn with one tenant + one active unit; returns `(conn, unit_id)`.
+        fn setup() -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-96', 'u96', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            (conn, unit_id)
+        }
+
+        /// One volume of `status` holding `bytes_written` of media, of which
+        /// `live` bytes belong to a `current` snapshot and `reclaimable`
+        /// bytes to a `reclaimable` one. Every write is `completed`, so the
+        /// only thing standing between this volume and the compaction query
+        /// is `volumes.status`.
+        fn seed_written_volume(
+            conn: &Connection,
+            unit_id: i64,
+            label: &str,
+            status: &str,
+            bytes_written: i64,
+            live: i64,
+            reclaimable: i64,
+        ) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, bytes_written, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000000, ?2, ?3)",
+                params![label, bytes_written, status],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+
+            for (n, snap_status, bytes) in
+                [(0i64, "current", live), (1i64, "reclaimable", reclaimable)]
+            {
+                if bytes <= 0 {
+                    continue;
+                }
+                let version = vol_id * 10 + n;
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, ?2, 'full', ?3, '/src')",
+                    params![unit_id, version, snap_status],
+                )
+                .unwrap();
+                let snap_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                     VALUES (?1, 'staged', 524288)",
+                    params![snap_id],
+                )
+                .unwrap();
+                let stage_set_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                               encrypted_bytes, sha256_plain, sha256_encrypted)
+                     VALUES (?1, 0, ?2, ?2, 'p', 'e')",
+                    params![stage_set_id, bytes],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![stage_set_id, snap_id, vol_id],
+                )
+                .unwrap();
+            }
+        }
+
+        /// The severity case: a `sealed` volume 10% utilized must produce a
+        /// real `compaction_candidate` finding. Asserted on the finding
+        /// itself, not on an exit code — an exit code of 1 could come from
+        /// any other warning.
+        #[test]
+        fn compaction_check_fires_for_a_sealed_volume_under_threshold() {
+            let (conn, unit_id) = setup();
+            seed_written_volume(&conn, unit_id, "SEAL01", "sealed", 1000, 100, 900);
+
+            let findings = compaction_findings(&conn, 0.50).unwrap();
+            assert_eq!(
+                findings.len(),
+                1,
+                "a sealed volume at 10% utilization must be flagged"
+            );
+            assert_eq!(findings[0].unit, "volume:SEAL01");
+            assert_eq!(findings[0].check, "compaction_candidate");
+        }
+
+        /// A sealed volume above the threshold must NOT be flagged — proves
+        /// the test above is measuring utilization, not merely presence.
+        #[test]
+        fn compaction_check_ignores_a_sealed_volume_above_threshold() {
+            let (conn, unit_id) = setup();
+            seed_written_volume(&conn, unit_id, "SEAL02", "sealed", 1000, 900, 100);
+
+            assert!(compaction_findings(&conn, 0.50).unwrap().is_empty());
+        }
+
+        /// A retired volume is not a compaction target.
+        #[test]
+        fn compaction_check_ignores_a_retired_volume() {
+            let (conn, unit_id) = setup();
+            seed_written_volume(&conn, unit_id, "RET01", "retired", 1000, 100, 900);
+
+            assert!(compaction_findings(&conn, 0.50).unwrap().is_empty());
+        }
+
+        /// End-to-end through `run`: the finding must actually reach the
+        /// warning list, so the audit cannot report clean while a sealed
+        /// volume sits at 10% utilization.
+        #[test]
+        fn run_surfaces_the_compaction_warning_for_a_sealed_volume() {
+            let (conn, unit_id) = setup();
+            seed_written_volume(&conn, unit_id, "SEAL03", "sealed", 1000, 100, 900);
+
+            let exit_code = run(&conn, &Config::default(), None, false, false).unwrap();
+            assert_ne!(exit_code, 0, "audit must not report clean");
+            assert_eq!(
+                compaction_findings(&conn, Config::default().compaction.utilization_threshold)
+                    .unwrap()
+                    .len(),
+                1,
+            );
+        }
     }
 }

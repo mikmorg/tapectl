@@ -225,6 +225,13 @@ fn supersedable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serd
     })
 }
 
+/// Count of volumes whose physical media is in service and accounted for
+/// (`report summary`). Group-B (issue #96): inventory, not copy-counting.
+fn in_service_volume_count(conn: &Connection) -> Result<i64> {
+    let sql = "SELECT COUNT(*) FROM volumes WHERE status IN ('active','full')".to_string();
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
 fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
     let unit_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM units WHERE status = 'active'",
@@ -237,11 +244,7 @@ fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
         |r| r.get(0),
     )?;
     let snapshot_count: i64 = conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?;
-    let volume_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM volumes WHERE status IN ('active','full')",
-        [],
-        |r| r.get(0),
-    )?;
+    let volume_count: i64 = in_service_volume_count(conn)?;
     let write_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM writes WHERE status = 'completed'",
         [],
@@ -738,18 +741,38 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
     Ok(())
 }
 
+/// Per-volume capacity rows: `(label, capacity_bytes, bytes_written, status)`.
+/// Group-B (issue #96) plus `initialized` — this listing deliberately shows
+/// provisioned-but-not-yet-written media too, so the operator can see a tape
+/// that is ready to receive bytes.
+fn per_volume_capacity_rows(conn: &Connection) -> Result<Vec<(String, i64, i64, String)>> {
+    let sql = "SELECT label, capacity_bytes, bytes_written, status FROM volumes
+             WHERE status IN ('active','full','initialized')
+             ORDER BY label"
+        .to_string();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Aggregate capacity across in-service media: `(total_capacity,
+/// total_bytes_written, volume_count)`. Group-B (issue #96).
+fn capacity_totals(conn: &Connection) -> Result<(i64, i64, i64)> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(capacity_bytes),0), COALESCE(SUM(bytes_written),0), COUNT(*)
+         FROM volumes WHERE {}",
+        "status IN ('active','full')"
+    );
+    Ok(conn.query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
+}
+
 fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Result<()> {
     if per_volume {
-        let mut stmt = conn.prepare(
-            "SELECT label, capacity_bytes, bytes_written, status FROM volumes
-             WHERE status IN ('active','full','initialized')
-             ORDER BY label",
-        )?;
-        let rows: Vec<(String, i64, i64, String)> = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = per_volume_capacity_rows(conn)?;
 
         if json_output {
             let json: Vec<serde_json::Value> = rows.iter().map(|(label, cap, written, status)| {
@@ -771,21 +794,7 @@ fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Re
             }
         }
     } else {
-        let total_cap: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(capacity_bytes),0) FROM volumes WHERE status IN ('active','full')",
-            [],
-            |r| r.get(0),
-        )?;
-        let total_written: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(bytes_written),0) FROM volumes WHERE status IN ('active','full')",
-            [],
-            |r| r.get(0),
-        )?;
-        let vol_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM volumes WHERE status IN ('active','full')",
-            [],
-            |r| r.get(0),
-        )?;
+        let (total_cap, total_written, vol_count) = capacity_totals(conn)?;
 
         if json_output {
             println!(
@@ -913,14 +922,11 @@ fn report_events(
     Ok(())
 }
 
-fn report_compaction_candidates(
-    conn: &Connection,
-    config: &Config,
-    json_output: bool,
-) -> Result<()> {
-    let threshold = config.compaction.utilization_threshold;
-
-    let mut stmt = conn.prepare(
+/// Compaction-candidate rows: `(label, total_bytes, live_bytes,
+/// reclaimable_bytes)`. Group-A (issue #96): compaction only ever targets a
+/// *finished* volume, so this is the ADR-0004 `sealed` predicate.
+fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<(String, i64, i64, i64)>> {
+    let sql = format!(
         "SELECT v.label, v.bytes_written,
                 SUM(CASE WHEN s.status NOT IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as live_bytes,
                 SUM(CASE WHEN s.status IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as reclaimable_bytes
@@ -929,15 +935,28 @@ fn report_compaction_candidates(
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots s ON s.id = sts.snapshot_id
          JOIN stage_slices ss ON ss.stage_set_id = sts.id
-         WHERE v.status IN ('active','full')
+         WHERE {}
          GROUP BY v.id
          ORDER BY live_bytes * 1.0 / NULLIF(v.bytes_written, 0) ASC",
-    )?;
-    let rows: Vec<(String, i64, i64, i64)> = stmt
+        "v.status IN ('active','full')"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn report_compaction_candidates(
+    conn: &Connection,
+    config: &Config,
+    json_output: bool,
+) -> Result<()> {
+    let threshold = config.compaction.utilization_threshold;
+
+    let rows = compaction_candidate_rows(conn)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
@@ -1314,6 +1333,185 @@ mod tests {
         fn compaction_candidates_still_runs_unchanged() {
             let (conn, _unit) = setup("rep-sup-compact", 2, "sealed", "active");
             report_compaction_candidates(&conn, &Config::default(), false).unwrap();
+        }
+    }
+
+    /// Issue #96: the volume-status drift. Five inventory/capacity queries
+    /// and `report compaction-candidates` filtered `volumes.status IN
+    /// ('active','full')` — a set no v2 write ever leaves behind, since
+    /// `SealedPending::confirm` writes `sealed`
+    /// (`docs/design/layout-session.md`: `blank -> initialized -> active ->
+    /// sealed`). Against a v2-only catalog every one of them returned the
+    /// empty set. These tests pin BOTH halves of the ruling: the
+    /// inventory/capacity surfaces must count `sealed` AND keep legacy
+    /// `full`, while compaction must be `sealed`-only.
+    mod issue96_volume_status_drift {
+        use super::*;
+
+        /// One volume of `status` holding `bytes_written` of media, of which
+        /// `live` bytes belong to a `current` snapshot and `reclaimable`
+        /// bytes to a `reclaimable` one. Every write is `completed`, so the
+        /// only thing standing between this volume and each query under test
+        /// is `volumes.status`.
+        fn seed_written_volume(
+            conn: &Connection,
+            unit_id: i64,
+            label: &str,
+            status: &str,
+            capacity: i64,
+            bytes_written: i64,
+            live: i64,
+            reclaimable: i64,
+        ) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, bytes_written, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', ?2, ?3, ?4)",
+                params![label, capacity, bytes_written, status],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+
+            for (n, snap_status, bytes) in
+                [(0i64, "current", live), (1i64, "reclaimable", reclaimable)]
+            {
+                if bytes <= 0 {
+                    continue;
+                }
+                let version = vol_id * 10 + n;
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, ?2, 'full', ?3, '/src')",
+                    params![unit_id, version, snap_status],
+                )
+                .unwrap();
+                let snap_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                     VALUES (?1, 'staged', 524288)",
+                    params![snap_id],
+                )
+                .unwrap();
+                let stage_set_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                               encrypted_bytes, sha256_plain, sha256_encrypted)
+                     VALUES (?1, 0, ?2, ?2, 'p', 'e')",
+                    params![stage_set_id, bytes],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![stage_set_id, snap_id, vol_id],
+                )
+                .unwrap();
+            }
+        }
+
+        fn setup() -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-96r', 'u96r', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            (conn, unit_id)
+        }
+
+        // --- Group A: compaction is sealed-only -------------------------
+
+        #[test]
+        fn compaction_rows_see_a_sealed_volume() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "SEAL01", "sealed", 1000, 1000, 100, 900);
+
+            let rows = compaction_candidate_rows(&conn).unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "a sealed volume must be evaluated, got {rows:?}"
+            );
+            assert_eq!(rows[0].0, "SEAL01");
+            assert_eq!((rows[0].1, rows[0].2, rows[0].3), (1000, 100, 900));
+        }
+
+        #[test]
+        fn compaction_rows_exclude_a_retired_volume() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "RET01", "retired", 1000, 1000, 100, 900);
+
+            assert!(compaction_candidate_rows(&conn).unwrap().is_empty());
+        }
+
+        // --- Group B: inventory counts sealed AND legacy full -----------
+
+        #[test]
+        fn summary_counts_a_sealed_volume() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "SEAL02", "sealed", 1000, 1000, 100, 900);
+
+            assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
+        }
+
+        /// The regression an `eligible`-everywhere fix would introduce:
+        /// legacy `full` is sealed-equivalent for pre-renovation volumes and
+        /// its physical media still exists, so dropping it would silently
+        /// under-report inventory.
+        #[test]
+        fn summary_still_counts_a_legacy_full_volume() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "FULL01", "full", 1000, 1000, 100, 900);
+
+            assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
+        }
+
+        #[test]
+        fn summary_excludes_retired_and_erased_volumes() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "RET02", "retired", 1000, 1000, 100, 0);
+            seed_written_volume(&conn, unit, "ERA01", "erased", 1000, 1000, 100, 0);
+
+            assert_eq!(in_service_volume_count(&conn).unwrap(), 0);
+        }
+
+        #[test]
+        fn capacity_totals_include_sealed_and_legacy_full() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "SEAL03", "sealed", 1000, 400, 400, 0);
+            seed_written_volume(&conn, unit, "FULL02", "full", 1000, 600, 600, 0);
+            seed_written_volume(&conn, unit, "RET03", "retired", 9999, 9999, 100, 0);
+
+            let (cap, written, count) = capacity_totals(&conn).unwrap();
+            assert_eq!(count, 2, "sealed + full count; retired does not");
+            assert_eq!(cap, 2000);
+            assert_eq!(written, 1000);
+        }
+
+        /// Site 745 keeps `initialized` — a provisioned-but-unwritten tape is
+        /// deliberately visible in the per-volume listing.
+        #[test]
+        fn per_volume_rows_list_sealed_full_and_initialized_but_not_retired() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "SEAL04", "sealed", 1000, 400, 400, 0);
+            seed_written_volume(&conn, unit, "FULL03", "full", 1000, 600, 600, 0);
+            seed_written_volume(&conn, unit, "INIT01", "initialized", 1000, 0, 0, 0);
+            seed_written_volume(&conn, unit, "RET04", "retired", 1000, 100, 100, 0);
+
+            let labels: Vec<String> = per_volume_capacity_rows(&conn)
+                .unwrap()
+                .into_iter()
+                .map(|(l, _, _, _)| l)
+                .collect();
+            assert_eq!(labels, vec!["FULL03", "INIT01", "SEAL04"]);
         }
     }
 }
