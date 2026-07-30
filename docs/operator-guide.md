@@ -373,12 +373,17 @@ tapectl volume move <label> --to <location>
 tapectl cartridge info <barcode>       # physical cartridge, tracked separately
 ```
 
-Note that tapectl will **not** currently warn you at the moment of a destructive
-or coverage-reducing operation that the evidence it is relying on is years old —
-ADR-0004/0008 describe that display, but it is not yet implemented (issue #91 is
-open). Until it is, `report verify-status` before the fact is the only thing
-standing in for it. `volume retire` is the exception: it does show impact
-analysis of which units lose copies.
+`volume retire` shows an impact analysis of which units lose copies, and — for
+every affected unit that still retains coverage after the retirement — which
+volume that remaining coverage rests on and how old its last passing
+verification is (ADR-0004 Tier 1, issue #91). This appears in the plain-text
+impact analysis, in `--json` (an `evidence` array plus an `evidence_summary`
+string per affected unit), and again in the Tier-2 consent prompt when some
+*other* unit in the same retirement is genuinely at risk. It is advisory and
+never blocks — a stale or missing verification never stops the retirement, it
+just tells you what you're trusting. `report verify-status` before the fact
+remains the right way to check coverage across the fleet, not just at the one
+volume you're about to retire.
 
 ## Compaction
 
