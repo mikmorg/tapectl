@@ -34,11 +34,14 @@ the normative design set named in the Policy block below.
   copy", `sealed`), `in_service` ("holds bytes we account for", + `active`/
   legacy `full`), `in_service_or_provisioned` (+ `initialized`). Never inline
   a status list again; five inlined copies are how #96 happened.
-  **Blocked on CTO:** **#92** — archive-set `compression`/`checksum_mode` are
-  shadowed because `UnitDotfile`'s fields are non-`Option` with serde
-  defaults, so a dotfile can never say "defer upward". The three options
-  change the on-disk dotfile contract or drop a feature; escalated, not
-  guessed.
+  **#92 UNBLOCKED — take it next.** CTO ratified Option 1 (2026-07-30):
+  dotfile policy fields become `Option`, omitted from newly-written dotfiles
+  unless explicitly set, absent = defer upward. Recorded in
+  `docs/design-errata.md` as a Recast of v4.0 §2.2 (whose example is why the
+  bug survived). Accepted costs: the on-disk dotfile contract changes and it
+  cascades into `unit/discovery.rs` + `collection/sync.rs`; pre-existing
+  dotfiles keep shadowing until rewritten, and `config check` flags them
+  rather than silently rewriting operator-owned files.
   **Cross-issue sequencing (recorded on the issues too):** #50/#51 must also
   patch the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or
   the heir path keeps the fixed-away behavior; #50's remedies are impossible
