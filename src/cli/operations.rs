@@ -2177,6 +2177,49 @@ mod tests {
         }
     }
 
+    /// Issue #90 (re-scoped): `report supersedable` and `snapshot
+    /// mark-reclaimable` must never disagree about what is releasable.
+    /// They share `policy::reclaimable::assess`; these tests are the
+    /// property that sharing exists to guarantee.
+    mod supersedable_agreement {
+        use super::*;
+        use crate::policy::reclaimable::{assess, tests::setup, ReclaimVerdict};
+
+        #[test]
+        fn a_blocked_verdict_means_mark_reclaimable_refuses() {
+            let (conn, unit) = setup("agree-blocked", 2, "quarantined", "active");
+            let config = Config::default();
+            let verdict = assess(&conn, &config, &unit, 1).unwrap();
+            let reason = match verdict {
+                ReclaimVerdict::Blocked { reason, .. } => reason,
+                other => panic!("expected Blocked, got {other:?}"),
+            };
+
+            let err = snapshot_mark_reclaimable(&conn, &config, "agree-blocked", 1, false, false)
+                .expect_err("assess said Blocked, so the gate must refuse");
+            assert_eq!(
+                err.to_string(),
+                reason,
+                "the report's reason text IS the gate's error text"
+            );
+        }
+
+        #[test]
+        fn a_releasable_verdict_means_mark_reclaimable_succeeds() {
+            let (conn, unit) = setup("agree-ok", 2, "sealed", "active");
+            let config = Config::default();
+            assert!(
+                matches!(
+                    assess(&conn, &config, &unit, 1).unwrap(),
+                    ReclaimVerdict::Releasable { .. }
+                ),
+                "fixture must be releasable"
+            );
+            snapshot_mark_reclaimable(&conn, &config, "agree-ok", 1, false, false)
+                .expect("assess said Releasable, so the gate must accept");
+        }
+    }
+
     /// Issue #38/H12: `cartridge_mark_erased`'s ADR-0008 Tier-2 lifecycle
     /// gate, plus the volume -> 'erased' transition (Change 5). Same
     /// no-real-stdin discipline as `volume_retire_consent` above: every
