@@ -627,3 +627,52 @@ fn revalidation_failure_leaves_the_session_resumable() {
         ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got quarantine: {:?}", q.reason),
     }
 }
+
+/// Issue #94's other half: the operator path that makes "never auto-abort"
+/// safe. `docs/design/layout-session.md`'s Aborted row opens with "Operator
+/// explicitly abandoned an interrupted session" — before `volume abort` there
+/// was no implementation of that clause at all, which is why the automatic
+/// abort was load-bearing.
+///
+/// `assume_yes: true` is mandatory here, not a convenience: it short-circuits
+/// `cli::consent::confirm` before it can ever consult a real stdin.
+#[test]
+fn abort_marks_the_session_aborted_and_unresumable() {
+    let f = make_fixture();
+    let _store = interrupt_after(&f, 8);
+
+    let conn = db::open(&f.db_path).unwrap();
+    assert!(
+        InterruptedSession::rehydrate(&conn, f.volume_id)
+            .unwrap()
+            .is_some(),
+        "precondition: the session is resumable before the abort"
+    );
+
+    tapectl::volume::write::volume_abort(&conn, "RESUMETEST", true).expect("abort should succeed");
+
+    let statuses: Vec<String> = conn
+        .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+        .unwrap()
+        .query_map(params![f.volume_id], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        !statuses.is_empty() && statuses.iter().all(|s| s == "aborted"),
+        "abort must mark every unfinished writes row 'aborted', got {statuses:?}"
+    );
+
+    assert!(
+        InterruptedSession::rehydrate(&conn, f.volume_id)
+            .unwrap()
+            .is_none(),
+        "abort must be final — rehydrate must never adopt an aborted session"
+    );
+
+    // Idempotence is not silence: a second abort must say there is nothing
+    // left to abort rather than pretending it did something.
+    let err = tapectl::volume::write::volume_abort(&conn, "RESUMETEST", true)
+        .expect_err("a second abort has nothing to do");
+    assert!(err.to_string().contains("no unfinished write session"));
+}

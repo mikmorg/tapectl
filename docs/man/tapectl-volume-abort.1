@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-abort 1  "tapectl-volume-abort " 
+.SH NAME
+tapectl\-volume\-abort \- Deliberately abandon a volume\*(Aqs unfinished write session (issue #94): `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
+.SH SYNOPSIS
+\fBtapectl volume abort\fR [\fB\-\-json\fR] [\fB\-\-yes\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+.SH DESCRIPTION
+Deliberately abandon a volume\*(Aqs unfinished write session (issue #94): `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
+.PP
+The tape is never contacted (hence no \-\-device): the cartridge is left unsealed and physically unharmed, and the staged files stay pinned until `staging clean` runs. The session, however, becomes unresumable for good.
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-yes\fR
+Skip the confirmation prompt (ADR\-0008 Tier 2). Required in a non\-interactive session, which otherwise refuses rather than assuming consent
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fILABEL\fR>
+Volume label

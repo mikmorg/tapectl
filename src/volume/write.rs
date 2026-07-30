@@ -495,6 +495,127 @@ pub fn volume_resume(
     result
 }
 
+/// Deliberately abandon a volume's unfinished write session (issue #94) —
+/// the implementation of `docs/design/layout-session.md`'s Aborted row, first
+/// clause: "Operator explicitly abandoned an interrupted session."
+///
+/// This is the operator path that makes it safe for `resume_checking` to stop
+/// auto-aborting on a revalidation failure. Nothing here can tell a transient
+/// cause from a permanent one — only the operator can — so the judgement is
+/// spelled as its own command rather than inferred from a `LayoutError`
+/// variant.
+///
+/// It never contacts the tape (hence no device argument): the cartridge is
+/// left exactly as the interrupted session left it — unsealed, physically
+/// unharmed, and reusable after a bulk erase plus `cartridge mark-erased`.
+/// Only the `writes` rows move. `write_positions`, `volumes.status`, the
+/// staged slices and the session directory are all untouched; the staged
+/// files stay pinned until `staging clean` runs.
+///
+/// It refuses outright if any row is still `in_progress`. Per `rehydrate`'s
+/// own reasoning, `db::open` sweeps `in_progress` to `interrupted` before any
+/// command holds a `Connection`, so a surviving `in_progress` row means
+/// another process is writing this tape right now, and aborting it would
+/// corrupt a live session.
+pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<()> {
+    let volume_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    let rows: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT id, status FROM writes
+             WHERE volume_id = ?1 AND status IN ('planned', 'in_progress', 'interrupted')
+             ORDER BY id",
+        )?
+        .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if rows.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\" has no unfinished write session to abort — nothing is in the \
+             `planned`, `in_progress` or `interrupted` state."
+        )));
+    }
+
+    if rows.iter().any(|(_, s)| s == "in_progress") {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\" has an `in_progress` write session. `tapectl` sweeps crashed \
+             sessions to 'interrupted' when it opens the database, so a row still 'in_progress' \
+             means ANOTHER PROCESS IS WRITING THIS TAPE RIGHT NOW. Refusing to abort — cutting \
+             a live writer's session out from under it would destroy the cartridge."
+        )));
+    }
+
+    let write_ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let mut slice_count: i64 = 0;
+    for id in &write_ids {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM write_positions WHERE write_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        slice_count += n;
+    }
+    let statuses: Vec<&str> = rows.iter().map(|(_, s)| s.as_str()).collect();
+
+    let facts = vec![
+        format!(
+            "volume \"{label}\": {} unfinished write session row(s) ({}), covering {slice_count} \
+             planned slice position(s).",
+            write_ids.len(),
+            statuses.join(", ")
+        ),
+        "The session becomes ABORTED and can never be resumed — `tapectl volume resume` adopts \
+         only interrupted sessions."
+            .to_string(),
+        "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
+         bulk-erased and reused (`cartridge mark-erased`)."
+            .to_string(),
+        "The staged slices stay pinned on disk until `tapectl staging clean` runs, so the data \
+         can be re-staged or written to another volume."
+            .to_string(),
+    ];
+    crate::cli::consent::confirm(
+        &format!("abandon the unfinished write session on volume \"{label}\""),
+        &facts,
+        assume_yes,
+    )?;
+
+    let tx = conn.unchecked_transaction()?;
+    for id in &write_ids {
+        tx.execute(
+            "UPDATE writes SET status = 'aborted' WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    events::log_event(
+        &tx,
+        "volume",
+        volume_id,
+        Some(label),
+        "write_aborted",
+        None,
+        None,
+        Some("operator abandoned the unfinished write session (`volume abort`)"),
+        None,
+        None,
+    )?;
+    tx.commit()?;
+
+    info!(
+        label,
+        volume_id,
+        sessions = write_ids.len(),
+        "operator aborted unfinished write session"
+    );
+    Ok(())
+}
+
 /// Explain a `rehydrate` that found nothing, naming the `writes` statuses
 /// that actually exist for this volume rather than asserting there are none.
 ///
@@ -529,8 +650,9 @@ fn nothing_to_resume(conn: &Connection, volume_id: i64, label: &str) -> TapectlE
         return TapectlError::Other(format!(
             "volume \"{label}\" has a `planned` write session, not an interrupted one: it was \
              killed after planning but before execution began, so nothing was ever written to \
-             tape and there is no partial recording to continue. Mark its `writes` rows \
-             'aborted' and run `tapectl volume write {label}` again. (Existing statuses: {}.)",
+             tape and there is no partial recording to continue. Clear it with \
+             `tapectl volume abort {label}` and run `tapectl volume write {label}` again. \
+             (Existing statuses: {}.)",
             statuses.join(", ")
         ));
     }

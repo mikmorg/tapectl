@@ -54,6 +54,28 @@ pub enum VolumeCommands {
         device: String,
     },
 
+    /// Deliberately abandon a volume's unfinished write session (issue #94):
+    /// `docs/design/layout-session.md`'s Aborted row, first clause. Use this
+    /// when a `volume resume` reports a revalidation failure you know to be
+    /// permanent (the staged data is really gone), or to clear a `planned`
+    /// session that was killed before anything was written. Nothing can tell
+    /// a transient cause from a permanent one but you, which is why resume
+    /// never decides this on its own.
+    ///
+    /// The tape is never contacted (hence no --device): the cartridge is left
+    /// unsealed and physically unharmed, and the staged files stay pinned
+    /// until `staging clean` runs. The session, however, becomes unresumable
+    /// for good.
+    Abort {
+        /// Volume label
+        label: String,
+        /// Skip the confirmation prompt (ADR-0008 Tier 2). Required in a
+        /// non-interactive session, which otherwise refuses rather than
+        /// assuming consent.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Verify volume contents via the keyless chain walk (seal -> front index
     /// -> content). Default tier is `--full` (integrity: hashes every
     /// content file); `--quick` opts down to navigable (seal binding + front
@@ -218,6 +240,22 @@ pub fn run(
                 );
             } else {
                 println!("volume \"{label}\" write resumed and completed");
+            }
+        }
+
+        VolumeCommands::Abort { label, yes } => {
+            write::volume_abort(conn, label, *yes)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"label": label, "status": "aborted"})
+                );
+            } else {
+                println!(
+                    "volume \"{label}\" write session aborted — the session can no longer be \
+                     resumed. The cartridge is unsealed and unharmed; the staged slices stay \
+                     pinned until `tapectl staging clean`."
+                );
             }
         }
 

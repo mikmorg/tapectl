@@ -37,6 +37,9 @@ Write staged data to volume
 tapectl\-volume\-resume(1)
 Resume an interrupted write session (issue #25). Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them, and it refuses (quarantining the volume) if the loaded tape\*(Aqs File 0 does not match, or if the tape is already sealed. There is no \-\-force: `volume write \-\-force` overrides a wrong\-cartridge finding before anything is written, which has no meaning for a tape this session has already partly written
 .TP
+tapectl\-volume\-abort(1)
+Deliberately abandon a volume\*(Aqs unfinished write session (issue #94): `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
+.TP
 tapectl\-volume\-verify(1)
 Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
 .TP
