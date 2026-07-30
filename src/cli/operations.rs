@@ -1357,10 +1357,9 @@ mod tests {
     }
 
     fn setup_conn_with_unit(current_path: &str) -> (Connection, i64) {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        let schema = include_str!("../db/migrations/001_initial.sql");
-        conn.execute_batch(schema).unwrap();
+        // Full ordered migration chain (issue #44) — was a hand-applied
+        // 001-only snapshot.
+        let conn = crate::db::open_memory().unwrap();
 
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
@@ -2527,10 +2526,9 @@ mod tests {
     /// rows point at real files on disk, plus manifest/file rows, so a
     /// delete has something to cascade through.
     fn setup_deletable_snapshot(dir: &Path) -> (Connection, i64, Vec<std::path::PathBuf>) {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        conn.execute_batch(include_str!("../db/migrations/001_initial.sql"))
-            .unwrap();
+        // Full ordered migration chain (issue #44) — was a hand-applied
+        // 001-only snapshot.
+        let conn = crate::db::open_memory().unwrap();
 
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",

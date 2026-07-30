@@ -157,11 +157,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn fresh_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        let schema = include_str!("../db/migrations/001_initial.sql");
-        conn.execute_batch(schema).unwrap();
-        conn
+        // Full ordered migration chain (issue #44) — was a hand-applied
+        // 001-only snapshot.
+        crate::db::open_memory().unwrap()
     }
 
     fn make_unit(archive_set_id: Option<i64>, path: Option<String>) -> Unit {

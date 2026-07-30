@@ -674,11 +674,9 @@ mod tests {
     use super::*;
 
     fn fresh_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        let schema = include_str!("migrations/001_initial.sql");
-        conn.execute_batch(schema).unwrap();
-        conn
+        // Full ordered migration chain (issue #44) — was a hand-applied
+        // 001-only snapshot.
+        crate::db::open_memory().unwrap()
     }
 
     #[test]
@@ -814,15 +812,9 @@ mod tests {
     // need the full schema rather than `fresh_conn`'s 001-only snapshot.
 
     fn fresh_conn_full() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        conn.execute_batch(include_str!("migrations/001_initial.sql"))
-            .unwrap();
-        conn.execute_batch(include_str!("migrations/002_fts5_catalog.sql"))
-            .unwrap();
-        conn.execute_batch(include_str!("migrations/003_v2_lifecycle.sql"))
-            .unwrap();
-        conn
+        // Full ordered migration chain (issue #44) — this used to hand-apply
+        // 001+002+003 only, non-contiguously skipping 004-006.
+        crate::db::open_memory().unwrap()
     }
 
     #[test]

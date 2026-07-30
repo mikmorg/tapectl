@@ -343,16 +343,12 @@ mod tests {
     /// commitment point hasn't happened); `Some(hex)` simulates a re-stage
     /// with an already-established baseline to compare against.
     fn setup_conn_with_snapshot(files: &[(&str, i64, Option<&str>)]) -> (Connection, i64) {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        let schema = include_str!("../db/migrations/001_initial.sql");
-        conn.execute_batch(schema).unwrap();
-        // 005 adds file_type/link_target (issue #33/H7) — applied directly
-        // on top of 001 alone (it only touches files/manifest_entries,
-        // both already defined there), matching this helper's existing
-        // lightweight-schema convention rather than pulling in 002-004.
-        conn.execute_batch(include_str!("../db/migrations/005_file_types.sql"))
-            .unwrap();
+        // Full ordered migration chain (issue #44) — this used to hand-apply
+        // 001 + 005 directly, skipping 002-004. That was non-contiguous: any
+        // schema fact 002-004 establish (e.g. the FTS5 `files_fts` shadow
+        // table + triggers from 002) was silently absent here while every
+        // other real code path already went through the full chain.
+        let conn = crate::db::open_memory().unwrap();
 
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
@@ -701,12 +697,8 @@ mod tests {
 
         // Insert a directory row alongside the file — validate_source
         // must filter it out and not try to read it as a file.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        let schema = include_str!("../db/migrations/001_initial.sql");
-        conn.execute_batch(schema).unwrap();
-        conn.execute_batch(include_str!("../db/migrations/005_file_types.sql"))
-            .unwrap();
+        // Full ordered migration chain (issue #44) — see setup_conn_with_snapshot.
+        let conn = crate::db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
             [],

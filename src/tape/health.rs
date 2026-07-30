@@ -253,10 +253,9 @@ Write error counter page [0x2]
 
     #[test]
     fn record_inserts_row() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        let schema = include_str!("../db/migrations/001_initial.sql");
-        conn.execute_batch(schema).unwrap();
+        // Full ordered migration chain (issue #44) — was a hand-applied
+        // 001-only snapshot.
+        let conn = crate::db::open_memory().unwrap();
 
         // Minimal volume row
         conn.execute(
