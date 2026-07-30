@@ -145,7 +145,15 @@ If anything fails or is unclear, STOP and report — don't paper over it.
    src/crypto, generated RESTORE.sh/RECOVERY.md), run
    `TAPECTL_MHVTL=1 ./scripts/mhvtl-verify-gate.sh` before the branch leaves
    your hands.
-6. `git worktree remove .claude/worktrees/pm-<task>` once integrated.
+6. `git worktree remove .claude/worktrees/pm-<task>` once integrated — **and delete
+   its `CARGO_TARGET_DIR` in the same breath**:
+   `sudo rm -rf /scratch/tapectl-target-pm<task>`.
+   Removing only the worktree leaks a ~7 GB target dir per agent. On
+   2026-07-30 that filled `/scratch` to 100% (6 MB free) across 21 orphans,
+   ~159 GB, and blocked an agent mid-task until it cleaned up after the
+   coordinator. Cheap to prevent, disruptive to hit. Sanity check when idle:
+   `ls -d /scratch/tapectl-target-* 2>/dev/null` should list only dirs whose
+   worktree still exists under `.claude/worktrees/`.
 
 ## Model default
 
