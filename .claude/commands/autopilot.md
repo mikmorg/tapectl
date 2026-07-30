@@ -26,9 +26,17 @@ the normative design set named in the Policy block below.
   then lows. **#69 (Heir Kit) deferred by CTO** — it has a physical step
   (printing, tamper-evident envelopes) no agent can perform. Skip `epic`,
   `wontfix`, `needs-human`.
-  **Next up (mediums, no hard order — pick by blast radius):** #92, #90,
-  #87, #56, #55, #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside
-  the gate's path set when parallelising. (#94 closed 2026-07-30.)
+  **Next up:** **#96 first** (new high — `confirm` writes `volumes.status =
+  'sealed'` but seven queries still filter `('active','full')`; the
+  `audit.rs:139` site passes *silently* on an empty set). Then mediums, no
+  hard order, pick by blast radius: #87, #56, #55, #54, #53, #52, #44, #46,
+  #93, #95, #51. Prefer ones outside the gate's path set when parallelising.
+  (#94, #90 closed 2026-07-30.)
+  **Blocked on CTO:** **#92** — archive-set `compression`/`checksum_mode` are
+  shadowed because `UnitDotfile`'s fields are non-`Option` with serde
+  defaults, so a dotfile can never say "defer upward". The three options
+  change the on-disk dotfile contract or drop a feature; escalated, not
+  guessed.
   **Cross-issue sequencing (recorded on the issues too):** #50/#51 must also
   patch the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or
   the heir path keeps the fixed-away behavior; #50's remedies are impossible
