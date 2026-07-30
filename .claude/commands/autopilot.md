@@ -26,10 +26,9 @@ the normative design set named in the Policy block below.
   then lows. **#69 (Heir Kit) deferred by CTO** — it has a physical step
   (printing, tamper-evident envelopes) no agent can perform. Skip `epic`,
   `wontfix`, `needs-human`.
-  **Next up (mediums, no hard order — pick by blast radius):** #94 (new,
-  high — a transient revalidation failure permanently consumes a resumable
-  session; take this first), #92, #90, #87, #56, #55, #54, #53, #52, #44,
-  #46, #93, #51. Prefer ones outside the gate's path set when parallelising.
+  **Next up (mediums, no hard order — pick by blast radius):** #92, #90,
+  #87, #56, #55, #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside
+  the gate's path set when parallelising. (#94 closed 2026-07-30.)
   **Cross-issue sequencing (recorded on the issues too):** #50/#51 must also
   patch the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or
   the heir path keeps the fixed-away behavior; #50's remedies are impossible
