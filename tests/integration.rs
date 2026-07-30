@@ -2204,3 +2204,65 @@ watch_roots = ["{bogus_root_str}"]
         "expected the discovery warning on stderr, got: {stderr:?}"
     );
 }
+
+/// Issue #40: `db backup` without `--include-keys` must not just silently
+/// skip the keys — it must say so, somewhere an operator running with
+/// `--json` can actually observe deterministically. A tracing log line is
+/// easy to miss (and awkward to assert on: prose, a separate stream,
+/// subject to log-level filtering); the `--json` stdout payload is the
+/// contract a `--json` consumer actually depends on, so that's what this
+/// test pins down — real subprocess, real CLI parsing, both flag states.
+#[test]
+fn test_db_backup_json_reports_whether_keys_were_included() {
+    let (_tmp, conn, home) = setup();
+    let config_path = home.join("config.toml");
+    // The subprocess opens the same sqlite file — drop this connection
+    // first so there's no WAL lock contention between the two processes
+    // (same reasoning as test_tracing_warning_goes_to_stderr_not_stdout).
+    drop(conn);
+
+    let run_backup = |dest: &std::path::Path, include_keys: bool| -> serde_json::Value {
+        let mut args = vec![
+            "--config".to_string(),
+            config_path.to_str().unwrap().to_string(),
+            "--json".to_string(),
+            "db".to_string(),
+            "backup".to_string(),
+            "--to".to_string(),
+            dest.to_str().unwrap().to_string(),
+        ];
+        if include_keys {
+            args.push("--include-keys".to_string());
+        }
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args(&args)
+            .output()
+            .expect("failed to run the tapectl binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "db backup should exit 0; stdout: {stdout:?}, stderr: {stderr:?}"
+        );
+        serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"))
+    };
+
+    let without = run_backup(&home.join("backup-no-keys.db"), false);
+    assert_eq!(
+        without.get("keys_included"),
+        Some(&serde_json::json!(false)),
+        "without --include-keys, the JSON output must say keys were not \
+         included, not just silently omit them: {without}"
+    );
+
+    let with = run_backup(&home.join("backup-with-keys.db"), true);
+    assert_eq!(
+        with.get("keys_included"),
+        Some(&serde_json::json!(true)),
+        "with --include-keys, the JSON output must confirm keys were \
+         included: {with}"
+    );
+}
