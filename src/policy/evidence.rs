@@ -111,6 +111,18 @@ fn weakness_rank(w: &Weakness) -> i64 {
 ///
 /// Takes `now` as a parameter rather than reading `Utc::now()` internally
 /// so the age arithmetic is deterministically testable.
+///
+/// The single-copy case is worded exactly as ADR-0004 words it
+/// (`rests on L6-0003, last verified N days ago`). The multi-copy case
+/// MUST NOT reuse that wording: "rests on <label>" asserts sole
+/// dependence, and with two copies — one verified yesterday, one never —
+/// naming only the weakest would tell the operator their coverage hangs
+/// on an unverified tape when it does not. That misreading is not
+/// hypothetical at the one place it matters most: `cli::consent::confirm`
+/// prints each fact as a STANDALONE line, with none of the surrounding
+/// copy-count context that `print_retire_impact` and the `--json`
+/// `evidence` array supply. So the plural case states the count first and
+/// labels the named volume as the weakest of them.
 pub fn describe(
     unit_name: &str,
     evidence: &[CoverageEvidence],
@@ -129,10 +141,15 @@ pub fn describe(
         ),
     };
 
-    Some(format!(
-        "coverage for unit \"{unit_name}\" rests on {}, {detail}",
-        weakest.volume_label
-    ))
+    let label = &weakest.volume_label;
+    Some(if evidence.len() == 1 {
+        format!("coverage for unit \"{unit_name}\" rests on {label}, {detail}")
+    } else {
+        format!(
+            "coverage for unit \"{unit_name}\" rests on {} copies; weakest is {label}, {detail}",
+            evidence.len()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -201,7 +218,7 @@ mod tests {
         let line = describe("photos", &evidence, now()).unwrap();
         assert_eq!(
             line,
-            "coverage for unit \"photos\" rests on L6-0002, never verified"
+            "coverage for unit \"photos\" rests on 3 copies; weakest is L6-0002, never verified"
         );
     }
 
@@ -212,6 +229,52 @@ mod tests {
             ev("L6-0003", Some("2020-01-01 00:00:00")), // oldest
         ];
         let line = describe("photos", &evidence, now()).unwrap();
-        assert!(line.starts_with("coverage for unit \"photos\" rests on L6-0003, last verified "));
+        assert!(line.starts_with(
+            "coverage for unit \"photos\" rests on 2 copies; weakest is L6-0003, last verified "
+        ));
+    }
+
+    /// The plural wording is not cosmetic. `cli::consent::confirm` prints
+    /// each fact as a standalone line, so a multi-copy unit rendered with
+    /// the singular "rests on <label>" would tell the operator, at the
+    /// irreversible moment, that their coverage hangs on a never-verified
+    /// tape when a freshly-verified copy also exists. Pin both halves: the
+    /// count must be stated, and the singular sole-dependence phrasing must
+    /// NOT appear.
+    #[test]
+    fn multi_copy_line_never_claims_sole_dependence() {
+        let evidence = vec![
+            ev("L6-0001", Some("2026-07-29 12:00:00")), // verified yesterday
+            ev("L6-0009", None),                        // never verified — weakest
+        ];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert!(
+            line.contains("rests on 2 copies"),
+            "multi-copy line must state the count: {line}"
+        );
+        assert!(
+            !line.contains("rests on L6-0009"),
+            "multi-copy line must not assert sole dependence on the weakest copy: {line}"
+        );
+        assert!(
+            line.contains("weakest is L6-0009, never verified"),
+            "the weakest copy must still be named and dated: {line}"
+        );
+    }
+
+    /// ADR-0004's own example wording, pinned verbatim: with exactly one
+    /// remaining copy the line must read as the ADR writes it.
+    #[test]
+    fn single_copy_matches_adr_0004_wording_exactly() {
+        let evidence = vec![ev("L6-0003", Some("2011-07-30 12:00:00"))];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert!(
+            line.starts_with("coverage for unit \"photos\" rests on L6-0003, last verified "),
+            "single-copy wording must match ADR-0004's example: {line}"
+        );
+        assert!(
+            !line.contains("copies"),
+            "single-copy wording must not pluralize: {line}"
+        );
     }
 }
