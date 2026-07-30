@@ -28,8 +28,22 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96, #92, #87, #56, #54 closed
+  set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55 closed
   2026-07-30; #97/#98 filed as residuals.)
+  **`stage_slices.staging_path` rows are the ONLY handle on staged `.age`
+  files** — `clean_staging` finds them exclusively by joining that table.
+  Any code path that deletes those rows must unlink the files first, or the
+  ciphertext is stranded forever, invisible to every cleanup path. #54 and
+  #55 were the same defect at two entry points; assume more exist and check
+  before deleting `stage_slices` anywhere. Order: collect paths, commit the
+  DB change, THEN unlink — unlinking first strands a live snapshot pointing
+  at nothing, which is worse than an orphaned file.
+  **Verify the negative control mutated what you think it did.** Chasing
+  #55, two attempts silently hit the wrong code (`snapshot_purge`'s
+  transaction instead of `snapshot_delete`'s; then leaving `let tx = ...`
+  alive so `conn.execute` still joined the open transaction). Both times the
+  test "passed" and looked like weak coverage — the control was wrong, not
+  the test. Print/grep the mutated region before believing a passing NC.
   **Staging-file prefixes must be dot-terminated (from #54).** dar names
   slices `{base}.{N}.dar` and `archive_base` is `{uuid12}_v{version}`, so a
   bare-base prefix makes `_v1` match `_v10.1.dar` and one stage's cleanup
