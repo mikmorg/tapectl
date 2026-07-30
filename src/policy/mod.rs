@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::db::models::Unit;
 
 pub mod coverage;
+pub mod evidence;
 pub mod reclaimable;
 pub mod shadowing;
 
