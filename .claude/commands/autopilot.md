@@ -28,8 +28,19 @@ the normative design set named in the Policy block below.
   `wontfix`, `needs-human`.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
-  set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55 closed
-  2026-07-30; #97/#98 filed as residuals.)
+  set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52
+  closed 2026-07-30; #97/#98 filed as residuals.)
+  **`snapshot_create` now takes `config: &Config`** (replaced its
+  `global_excludes` param, #52) and enforces design lines 184/185/203:
+  nesting is an ERROR, empty units warn (gated on `file_count`, never
+  `total_size`), large files warn. Warnings go through `tracing::warn!` —
+  a `println!` on this path corrupts `--json` (the #56 defect).
+  **Nesting predicates exclude by unit id, never by path.** A unit's own row
+  makes `check_path.starts_with(existing)` trivially true, so a naive
+  `check_nesting` call from `snapshot_create` fails EVERY snapshot. Two units
+  can legitimately share a `current_path` after a bad `unit discover`, so
+  path-comparison exclusion would hide a real conflict.
+  `check_nesting{,_conflict}` now delegate to their `_excluding` forms.
   **`stage_slices.staging_path` rows are the ONLY handle on staged `.age`
   files** — `clean_staging` finds them exclusively by joining that table.
   Any code path that deletes those rows must unlink the files first, or the
