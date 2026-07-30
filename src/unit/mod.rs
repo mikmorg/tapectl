@@ -92,8 +92,8 @@ pub fn init_unit(
         tags: tags.to_vec(),
         tenant: tenant_name.to_string(),
         archive_set: archive_set.map(|s| s.to_string()),
-        checksum_mode: "mtime_size".to_string(),
-        compression: "none".to_string(),
+        checksum_mode: None,
+        compression: None,
         exclude_patterns: Vec::new(),
     };
     dotfile::write_dotfile(&dotfile_path, &dotfile_data)?;
@@ -238,25 +238,20 @@ mod tests {
     /// silently falling back to the global defaults it would use forever
     /// if `archive_set_id` stayed NULL.
     ///
-    /// Deliberately asserts on `min_copies`/`required_locations`, not
-    /// `compression`/`checksum_mode`: `init_unit`'s dotfile always carries
-    /// concrete values for the latter two (see the design doc's own §2.2
-    /// example dotfile), and `policy::resolve`'s dotfile layer outranks
-    /// archive_set whenever the dotfile is present — so for a real,
-    /// dotfile-backed unit those two fields are structurally shadowed
-    /// regardless of this fix. That is a separate, pre-existing defect
-    /// (the dotfile *writer* baking in what looks like a per-unit
-    /// override that was never actually chosen), not something #48 claims
-    /// to fix — see the commit message / final report for the full
-    /// analysis. `min_copies` and `required_locations` are never written
-    /// into the dotfile, so they resolve through archive_set exactly as
-    /// designed and are the correct fields to prove this wiring on.
+    /// Asserts on `min_copies`/`required_locations` (never written into the
+    /// dotfile, so they always resolve through archive_set) as well as
+    /// `compression`/`checksum_mode`: as of issue #92's fix, `init_unit`'s
+    /// dotfile now omits the `[policy]` table entirely when the operator
+    /// hasn't set those fields explicitly, so `policy::resolve`'s dotfile
+    /// layer has nothing to shadow with and archive_set's values reach
+    /// through for a real, dotfile-backed unit too (Recast of v4.0 §2.2,
+    /// docs/design-errata.md).
     #[test]
     fn init_unit_with_archive_set_persists_id_and_unlocks_policy_layer_2() {
         let (conn, tmp, paths) = harness();
         conn.execute(
-            "INSERT INTO archive_sets (name, min_copies, required_locations) \
-             VALUES ('cold', 5, '[\"vault\"]')",
+            "INSERT INTO archive_sets (name, min_copies, required_locations, compression) \
+             VALUES ('cold', 5, '[\"vault\"]', 'gzip')",
             [],
         )
         .unwrap();
@@ -292,6 +287,11 @@ mod tests {
             resolved.required_locations,
             vec!["vault".to_string()],
             "must resolve the archive_set's required_locations, not the global default (empty)"
+        );
+        assert_eq!(
+            resolved.compression, "gzip",
+            "must resolve the archive_set's compression, not be shadowed by a \
+             concrete value baked into the unit's dotfile (issue #92)"
         );
     }
 
