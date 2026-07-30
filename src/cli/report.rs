@@ -487,12 +487,12 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
 /// One unit's dirty-scan row, split out from `report_dirty`'s printing so
 /// the computed result is directly assertable in tests without capturing
 /// stdout.
-struct DirtyRow {
-    name: String,
-    state: &'static str, // "clean" | "new" | "dirty"
-    added: Vec<String>,
-    removed: Vec<String>,
-    modified: Vec<String>,
+pub(crate) struct DirtyRow {
+    pub(crate) name: String,
+    pub(crate) state: &'static str, // "clean" | "new" | "dirty"
+    pub(crate) added: Vec<String>,
+    pub(crate) removed: Vec<String>,
+    pub(crate) modified: Vec<String>,
 }
 
 /// The scan behind `report dirty`: reuses `fingerprint::classify` — the
@@ -502,7 +502,7 @@ struct DirtyRow {
 /// scan should second-guess), optionally narrowed to one unit by name.
 /// `global_excludes` is `config.defaults.global_excludes` (issue #49),
 /// kept in lockstep with those other callers.
-fn dirty_rows(
+pub(crate) fn dirty_rows(
     conn: &Connection,
     unit_filter: Option<&str>,
     global_excludes: &[String],
