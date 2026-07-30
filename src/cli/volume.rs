@@ -39,6 +39,21 @@ pub enum VolumeCommands {
         force: bool,
     },
 
+    /// Resume an interrupted write session (issue #25). Reload the SAME
+    /// cartridge first: the session continues from its frozen staging files
+    /// rather than rebuilding them, and it refuses (quarantining the volume)
+    /// if the loaded tape's File 0 does not match, or if the tape is already
+    /// sealed. There is no --force: `volume write --force` overrides a
+    /// wrong-cartridge finding before anything is written, which has no
+    /// meaning for a tape this session has already partly written.
+    Resume {
+        /// Volume label
+        label: String,
+        /// Tape device path
+        #[arg(long, default_value = "/dev/nst0")]
+        device: String,
+    },
+
     /// Verify volume contents via the keyless chain walk (seal -> front index
     /// -> content). Default tier is `--full` (integrity: hashes every
     /// content file); `--quick` opts down to navigable (seal binding + front
@@ -191,6 +206,18 @@ pub fn run(
                 );
             } else {
                 println!("volume \"{label}\" write completed");
+            }
+        }
+
+        VolumeCommands::Resume { label, device } => {
+            write::volume_resume(conn, paths, config, label, device, DEFAULT_BLOCK_SIZE)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"label": label, "status": "completed", "resumed": true})
+                );
+            } else {
+                println!("volume \"{label}\" write resumed and completed");
             }
         }
 

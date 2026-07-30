@@ -356,7 +356,11 @@ fn resume_after_restart_seals_rather_than_quarantines() {
     // slice_2 is opened — one slice written, which is the two-case cursor
     // rule's "reposition and continue" branch.
     let mut store = interrupt_after(&f, 8);
-    assert_eq!(store.files.len(), 8, "8 entries landed before the interrupt");
+    assert_eq!(
+        store.files.len(),
+        8,
+        "8 entries landed before the interrupt"
+    );
 
     // --- the process restarts: a fresh Connection is all we carry forward ---
     let conn = db::open(&f.db_path).unwrap();
