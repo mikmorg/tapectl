@@ -19,37 +19,31 @@ the normative design set named in the Policy block below.
 - **Mode: phase-2 hardening (from 2026-07-28).** R&D has exited: the v2 regear
   is merged to master and the design docs are settled reference, not fluid.
   Issue work is live again — re-spec, close, and file as needed.
-- **Queue (re-triaged 2026-07-29 — order is evidence-based, follow it):**
+- **Queue (re-triaged 2026-07-29; highs cleared 2026-07-30):**
   **CTO ruled ALL phase-2 issues gate exit**, so severity drives *ordering*,
-  not scope. Highs first, in this order:
-  1. **#45** — `volume verify`/`db fsck` exit 0 on real corruption, and NO
-     `tracing_subscriber` is installed anywhere, so the `tracing::warn!`
-     fixes shipped for #32 and #36 reach nobody. Cheap, isolated, and it
-     un-mutes two already-landed fixes. Also closes #3's ignored `--verbose`.
-  2. **#89** — copy-count gates ignore `volumes.status`; a quarantined or
-     retired copy still satisfies `min_copies`. **ADR-0008's consent tiers
-     are computed from this count**, so #38's guarantees are only as sound
-     as this. Land it close behind #38.
-  3. **#48 + #47 together** — `units.archive_set_id` has no writer (resolver
-     layer 2 inert) *and* `stage_create` never calls the resolver. Fixing
-     either alone leaves archive-set policy inert.
-  4. **#49** — most delicate in the backlog. MUST move
-     `collection/fingerprint.rs::walk_fingerprint` in lockstep; making
-     `files` exclude-aware alone regresses #36's dirty scan into permanent
-     false positives. Prefer ONE shared parameterized walk, not two.
-     Landing it lets #32's NEW check be tightened back to a hard error.
-  Then mediums, then lows. **#69 (Heir Kit) deferred by CTO** — it has a
-  physical step (printing, tamper-evident envelopes) no agent can perform.
-  Skip `epic`, `wontfix`, `needs-human`.
-  **Cross-issue sequencing (recorded on the issues too):** #45 before #44
-  (else the smoke test pins the broken exit codes); #50/#51 must also patch
-  the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or the
-  heir path keeps the fixed-away behavior; #50's remedies are impossible as
-  written (`dar --acl` does not exist, `--hash sha256` is invalid) — remove,
-  don't implement.
+  not scope. **Every phase-1/phase-2 high is now closed** — the four numbered
+  highs (#45, #89, #48+#47, #49) plus #27 and #25. What remains is mediums,
+  then lows. **#69 (Heir Kit) deferred by CTO** — it has a physical step
+  (printing, tamper-evident envelopes) no agent can perform. Skip `epic`,
+  `wontfix`, `needs-human`.
+  **Next up (mediums, no hard order — pick by blast radius):** #94 (new,
+  high — a transient revalidation failure permanently consumes a resumable
+  session; take this first), #92, #90, #87, #56, #55, #54, #53, #52, #44,
+  #46, #93, #51. Prefer ones outside the gate's path set when parallelising.
+  **Cross-issue sequencing (recorded on the issues too):** #50/#51 must also
+  patch the generated RESTORE.sh in `layout.rs` (`-O` appears there too) or
+  the heir path keeps the fixed-away behavior; #50's remedies are impossible
+  as written (`dar --acl` does not exist, `--hash sha256` is invalid) —
+  remove, don't implement. (#45-before-#44 is discharged: #45 is closed.)
   *Landed and closed:* #27, #35/#84/#85/#86 (H9 streaming class), #32,
-  #34 (slice numbering), #33 (symlinks), #36 (dirty detection). #25's
-  CLI-resume wiring remains open and unqueued.
+  #34 (slice numbering), #33 (symlinks), #36 (dirty detection), #45, #89,
+  #48, #47, #49, #38, and #25 (CLI resume — rehydrate-don't-regenerate;
+  see the new cross-process bullet in `layout-session.md`).
+  **Lesson from #25 (2026-07-30):** an issue can be *implemented but never
+  closed* — #27 was fully landed on master while its issue sat open, and the
+  Policy block said "closed" while `gh` said otherwise. Survey by grepping
+  the code for the symbol, not by trusting either. `EXPECTED_FAIL=()` is now
+  empty, so the mhvtl gate has **zero slack**: any failure is a hard stop.
 - **Issues were re-triaged 2026-07-29 against shipped code** — verdicts and
   rescopes are in each issue's comments and supersede the original text.
   Four were partly/wholly stale, four over-severed, three escalated, one
