@@ -29,9 +29,14 @@ the normative design set named in the Policy block below.
   **Next up (mediums, no hard order — pick by blast radius):** #87, #56, #55,
   #54, #53, #52, #44, #46, #93, #95, #51. Prefer ones outside the gate's path
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
-  #53, #93, #44 closed 2026-07-30; #97/#98 filed as residuals.) **Remaining
-  medium: #46 (docs-only). Then lows: #43, #59, #61, #62, #63, #83, #91, #95,
-  #97, #98, #51, #50.** (#50/#51 keep their cross-issue note below.)
+  #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
+  **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
+  **#51, #50 (paired — see the cross-issue note below), #43, #59, #61, #62,
+  #63, #83, #91, #95, #97, #98.** #91 is worth taking early despite being a
+  low: the #46 runbook now documents its absence in prose, so landing it means
+  editing `docs/operator-guide.md`'s "Before moving a tape" block in the same
+  commit — otherwise the guide keeps telling operators a shipped feature
+  doesn't exist.
   **The gate now has leg 5: interrupt+resume (#93), 3 arms + verify/restore,
   and it RUNS LAST because it erases the tape legs 1-4 wrote.** Gate is now
   ~1m50s. Two facts any future gate work needs: **bash sets SIGINT to IGNORED
@@ -222,6 +227,15 @@ the normative design set named in the Policy block below.
 - **Single-drive rule:** the gate takes `/tmp/tapectl-tape.lock` (flock);
   never run two tape-touching processes. Sub-agents never touch `/dev/nst*` —
   the coordinator runs the gate (see `worktree-agent.md`).
+- **Docs cite commands; commands drift.** Nothing gates a wrong flag in prose,
+  so hand-verify every `tapectl …` line you write against real `--help` output
+  — `--help` short-circuits clap, so `<cmd> --bogus --help` still exits 0 and
+  proves nothing about the flags. Writing #46's runbook this way caught three
+  errors in the first draft. Write docs from `--help` and shipped code, never
+  from the ADRs: ADRs describe intent, and open issues (#91, #69, #70) are
+  exactly where intent is not yet reality. `docs/operator-guide.md` now names
+  those gaps explicitly, so closing one of those issues means editing the guide
+  in the same commit.
 - **Man pages:** any clap change regenerates `docs/man` in the same commit
   (`cargo run --example gen_man`).
 - **Model tactics:** you keep judgment (task selection, review, integration,
