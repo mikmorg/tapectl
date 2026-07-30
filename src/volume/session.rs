@@ -150,11 +150,16 @@ impl ValidatedLayout {
     ) -> Result<PlannedSession> {
         let mut write_ids = Vec::with_capacity(units.len());
         let mut slice_write_id = HashMap::new();
+        // The frozen staging directory is recorded here, and only here
+        // (migration 006, issue #25): plan is the sole `writes`-row writer,
+        // and after a process restart this path is the ONLY way back to the
+        // materialized zones a resume must re-hash rather than regenerate.
+        let session_dir = self.built.session_dir.to_string_lossy().to_string();
         for u in units {
             conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
-                 VALUES (?1, ?2, ?3, 'planned')",
-                params![u.stage_set_id, u.snapshot_id, volume_id],
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+                 VALUES (?1, ?2, ?3, 'planned', ?4)",
+                params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
             )?;
             let write_id = conn.last_insert_rowid();
             write_ids.push((write_id, u.snapshot_id));
@@ -1393,6 +1398,32 @@ mod tests {
             matches!(old_value.as_deref(), Some("created") | Some("staged")),
             "the event must record the REAL pre-flip status, not a guess — got {old_value:?}"
         );
+    }
+
+    /// Migration 006 / issue #25: `plan` is the only writer of
+    /// `writes.session_dir`, and every row it inserts must carry the frozen
+    /// staging directory — without it a restarted process has no way back to
+    /// the materialized zones, and the session is abortable but not
+    /// resumable.
+    #[test]
+    fn plan_records_the_session_dir_on_every_writes_row() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let expected = f.built.session_dir.to_string_lossy().to_string();
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        let recorded: Vec<Option<String>> = f
+            .conn
+            .prepare("SELECT session_dir FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].as_deref(), Some(expected.as_str()));
     }
 
     // --- behavior 2: injected hash mismatch mid-execute -------------------

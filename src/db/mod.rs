@@ -89,6 +89,11 @@ fn migrations() -> Migrations<'static> {
         // the validator filters its content-validation set on it directly. See
         // the migration for the full defect history.
         M::up(include_str!("migrations/005_file_types.sql")),
+        // 006 adds writes.session_dir (issue #25): the pointer to the frozen
+        // staging directory a restarted process needs to REHYDRATE an
+        // interrupted session's Layout. It cannot be regenerated — see the
+        // migration for the `created_at`/`mam_loads` proof.
+        M::up(include_str!("migrations/006_write_session_dir.sql")),
     ])
 }
 
