@@ -592,20 +592,40 @@ mod tests {
         }
 
         /// End-to-end through `run`: the finding must actually reach the
-        /// warning list, so the audit cannot report clean while a sealed
-        /// volume sits at 10% utilization.
+        /// warning list, so the audit cannot report clean while sealed
+        /// volumes sit at 10% utilization.
+        ///
+        /// The fixture is built so that a compaction warning is the ONLY
+        /// finding `run` can produce, which is what makes `exit_code == 1`
+        /// proof of propagation rather than a coincidence:
+        ///   - TWO sealed volumes, so `copy_count` (2) meets the default
+        ///     `min_copies` (2) and raises no violation. With one volume
+        ///     this test passed off the copy_count violation alone and
+        ///     would have survived deleting the `warnings.extend(...)`
+        ///     call from `run` entirely.
+        ///   - `required_locations` is empty and `verify_interval_days` is
+        ///     `None` by default (`policy::resolve`), so neither
+        ///     `location_presence` nor `verify_age` can fire.
+        ///   - each volume has a `current` snapshot, so `no_archive` is out.
         #[test]
         fn run_surfaces_the_compaction_warning_for_a_sealed_volume() {
             let (conn, unit_id) = setup();
             seed_written_volume(&conn, unit_id, "SEAL03", "sealed", 1000, 100, 900);
+            seed_written_volume(&conn, unit_id, "SEAL04", "sealed", 1000, 100, 900);
 
-            let exit_code = run(&conn, &Config::default(), None, false, false).unwrap();
-            assert_ne!(exit_code, 0, "audit must not report clean");
+            let config = Config::default();
             assert_eq!(
-                compaction_findings(&conn, Config::default().compaction.utilization_threshold)
-                    .unwrap()
-                    .len(),
-                1,
+                copy_count_for_unit(&conn, unit_id).unwrap(),
+                2,
+                "fixture guard: copy_count must clear min_copies so no violation masks the result"
+            );
+
+            let exit_code = run(&conn, &config, None, false, false).unwrap();
+            assert_eq!(
+                exit_code, 1,
+                "exactly one warning class is reachable here — the compaction check — \
+                 so exit 1 means the finding really reached the warning list, and \
+                 exit 0 means audit passed silently on two under-utilized sealed tapes"
             );
         }
     }
