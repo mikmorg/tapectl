@@ -100,25 +100,36 @@ pub fn is_excluded(path: &Path, compiled: &[Pattern]) -> bool {
 /// unreadable, or fails to parse: a directory with no unit dotfile yet (or
 /// one that predates `unit init`) must behave exactly as before this fix,
 /// and one malformed dotfile must never abort a walk.
-///
-/// NOTE (residual scope gap, see commit message / PR report): this is only
-/// the per-unit half of "effective excludes = globals + dotfile"
-/// (`config.defaults.global_excludes` is the other half). Both
-/// `walk_directory` and `walk_fingerprint` currently call ONLY this
-/// function — `snapshot_create`/`classify`, their sole respective callers,
-/// have no `Config` in scope, and threading one to them ripples into
-/// caller graphs outside this fix's fence (`src/cli/*`,
-/// `src/collection/{status,plan,sync}.rs`, `src/collection/batch.rs`,
-/// `src/main.rs`). `stage_create`'s dar arguments already merge both
-/// halves (it has `Config` and the unit's path in scope directly), so dar
-/// and both walks stay in lockstep with EACH OTHER for anything the
-/// dotfile lists, and are unchanged (not made worse) for anything only
-/// `global_excludes` lists.
 pub fn dotfile_patterns(dir_path: &Path) -> Vec<String> {
     let dotfile_path = dir_path.join(".tapectl-unit.toml");
     crate::unit::dotfile::read_dotfile(&dotfile_path)
         .map(|d| d.exclude_patterns)
         .unwrap_or_default()
+}
+
+/// The full, compiled "effective excludes" set for `dir_path`: the caller's
+/// `global_excludes` (`config.defaults.global_excludes` — issue #49 item
+/// 5's other half, previously reaching dar only, never either walk) plus
+/// this directory's own dotfile `[excludes] patterns` (`dotfile_patterns`,
+/// item 2, already wired).
+///
+/// This is the ONE place the two layers are combined. Both
+/// `staging::walk_directory` and `collection::fingerprint::walk_fingerprint`
+/// call this instead of each independently concatenating the two pattern
+/// lists — so the combination step itself cannot drift between the two
+/// walks, on top of `dotfile_patterns` already guaranteeing that for the
+/// per-unit half alone. That's the exact failure shape issues #33/#36/#48
+/// each hit once: two independent scanners quietly disagreeing about one
+/// fact. `global_excludes` is passed in (never read from a config file
+/// here) for the same reason `dotfile_patterns` reads its dotfile directly
+/// rather than requiring one: hidden I/O inside a walk is untestable and
+/// lets production and test paths diverge — the caller already has
+/// `Config` (or the test already has whatever list it wants to assert on)
+/// and passes the slice in explicitly.
+pub fn effective_compiled(dir_path: &Path, global_excludes: &[String]) -> Vec<Pattern> {
+    let mut patterns = global_excludes.to_vec();
+    patterns.extend(dotfile_patterns(dir_path));
+    compile(&patterns)
 }
 
 #[cfg(test)]
@@ -197,5 +208,60 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".tapectl-unit.toml"), b"not valid toml [[[").unwrap();
         assert!(dotfile_patterns(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn effective_compiled_is_empty_with_no_globals_and_no_dotfile() {
+        // Issue #49 trap: the no-excludes case must behave exactly as
+        // today — empty globals, no dotfile, nothing excluded.
+        let tmp = TempDir::new().unwrap();
+        let compiled = effective_compiled(tmp.path(), &[]);
+        assert!(!is_excluded(Path::new("Thumbs.db"), &compiled));
+        assert!(!is_excluded(Path::new("anything.tmp"), &compiled));
+    }
+
+    #[test]
+    fn effective_compiled_merges_globals_and_dotfile_patterns() {
+        let tmp = TempDir::new().unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &tmp.path().join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: "u".into(),
+                name: "n".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "t".into(),
+                archive_set: None,
+                checksum_mode: "mtime_size".into(),
+                compression: "none".into(),
+                exclude_patterns: vec!["*.secret".into()],
+            },
+        )
+        .unwrap();
+
+        let global_excludes = vec!["Thumbs.db".to_string()];
+        let compiled = effective_compiled(tmp.path(), &global_excludes);
+
+        assert!(
+            is_excluded(Path::new("Thumbs.db"), &compiled),
+            "the global pattern must be included"
+        );
+        assert!(
+            is_excluded(Path::new("x.secret"), &compiled),
+            "the dotfile pattern must also be included"
+        );
+        assert!(!is_excluded(Path::new("keep.txt"), &compiled));
+    }
+
+    #[test]
+    fn effective_compiled_applies_globals_even_with_no_dotfile_at_all() {
+        // The ticket's own headline gap: a unit with NO dotfile override
+        // must still have config.defaults.global_excludes applied.
+        let tmp = TempDir::new().unwrap();
+        let global_excludes = vec!["Thumbs.db".to_string(), "*.tmp".to_string()];
+        let compiled = effective_compiled(tmp.path(), &global_excludes);
+        assert!(is_excluded(Path::new("Thumbs.db"), &compiled));
+        assert!(is_excluded(Path::new("junk.tmp"), &compiled));
+        assert!(!is_excluded(Path::new("keep.txt"), &compiled));
     }
 }
