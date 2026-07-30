@@ -46,17 +46,16 @@ fn parses_init_with_operator() {
 
 #[test]
 fn parses_global_json_flag_before_and_after_subcommand() {
-    // `--json` is a global arg — clap should accept it on either side of
-    // the subcommand name.
-    let before = Cli::try_parse_from(["tapectl", "--json", "audit"]).unwrap();
+    // `--json` is declared `#[arg(long, global = true)]` on `Cli`, so clap
+    // propagates it into every subcommand: both orderings must parse AND
+    // both must land on the same top-level `cli.json` field. The process
+    // smoke below invokes `audit --json` (flag last), so if propagation
+    // ever regressed, that ordering would start silently emitting human
+    // output instead of JSON — pin both sides explicitly.
+    let before = Cli::try_parse_from(["tapectl", "--json", "audit"]).expect("--json before");
     assert!(before.json);
-    let after = Cli::try_parse_from(["tapectl", "audit", "--json"]);
-    // clap global args are not automatically valid *after* a subcommand
-    // unless declared with `global = true` propagation reaching that far;
-    // `audit` itself defines no `--json`, so this only succeeds if clap's
-    // global-arg propagation covers it. Either parse outcome is a valid
-    // pin — assert only that it doesn't panic.
-    let _ = after;
+    let after = Cli::try_parse_from(["tapectl", "audit", "--json"]).expect("--json after");
+    assert!(after.json);
 }
 
 #[test]

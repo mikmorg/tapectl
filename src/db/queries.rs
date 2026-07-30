@@ -808,25 +808,22 @@ mod tests {
     }
 
     // ── Escrow recipient (ADR-0005) ──
-    // `encryption_keys.is_escrow` only exists from migration 003 on, so these
-    // need the full schema rather than `fresh_conn`'s 001-only snapshot.
-
-    fn fresh_conn_full() -> Connection {
-        // Full ordered migration chain (issue #44) — this used to hand-apply
-        // 001+002+003 only, non-contiguously skipping 004-006.
-        crate::db::open_memory().unwrap()
-    }
+    // `encryption_keys.is_escrow` only exists from migration 003 on. These
+    // used to need a separate `fresh_conn_full` helper because `fresh_conn`
+    // hand-applied a 001-only snapshot; since issue #44 every fixture runs
+    // the real ordered chain, so the distinction is gone and keeping two
+    // names would imply a schema difference that no longer exists.
 
     #[test]
     fn escrow_public_key_and_exists_are_none_when_absent() {
-        let conn = fresh_conn_full();
+        let conn = fresh_conn();
         assert_eq!(escrow_public_key(&conn).unwrap(), None);
         assert!(!escrow_key_exists(&conn).unwrap());
     }
 
     #[test]
     fn escrow_public_key_found_after_insert() {
-        let conn = fresh_conn_full();
+        let conn = fresh_conn();
         let op_id = insert_tenant(&conn, "op", None, true).unwrap();
         insert_escrow_key(&conn, op_id, "op-escrow", "age1fake", "age1fake", None).unwrap();
 
@@ -839,7 +836,7 @@ mod tests {
 
     #[test]
     fn recipient_list_with_escrow_appends_when_present_and_no_ops_when_absent() {
-        let conn = fresh_conn_full();
+        let conn = fresh_conn();
         let base = vec!["age1tenant".to_string()];
 
         // No escrow registered yet: list passes through unchanged.
@@ -858,7 +855,7 @@ mod tests {
 
     #[test]
     fn recipient_list_with_escrow_does_not_duplicate() {
-        let conn = fresh_conn_full();
+        let conn = fresh_conn();
         let op_id = insert_tenant(&conn, "op", None, true).unwrap();
         insert_escrow_key(&conn, op_id, "op-escrow", "age1esc", "age1esc", None).unwrap();
 
@@ -876,7 +873,7 @@ mod tests {
     /// deactivation UPDATE. It must be invisible to this query.
     #[test]
     fn get_active_keys_for_tenant_excludes_escrow_row_even_under_operator_tenant() {
-        let conn = fresh_conn_full();
+        let conn = fresh_conn();
         let op_id = insert_tenant(&conn, "op", None, true).unwrap();
         insert_key(
             &conn,
