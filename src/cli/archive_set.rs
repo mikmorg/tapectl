@@ -536,14 +536,24 @@ pub fn run(
         ArchiveSetCommands::Sync => {
             let mut created = 0;
             let mut updated = 0;
+
+            // Same guard as create/edit: `sync` writes archive_sets rows
+            // straight from config.toml, so without this a bogus `compression`
+            // in the config file walks past the CLI validation and only fails
+            // later at `dar -z` (issue #92). Validated for EVERY entry up
+            // front, before any row is written — validating inside the loop
+            // would abort partway and leave the entries ahead of the bad one
+            // already committed, so `sync` would be all-or-nothing only when
+            // the config happened to be clean.
             for as_cfg in &config.archive_sets {
-                // Same guard as create/edit: `sync` writes archive_sets rows
-                // straight from config.toml, so without this a bogus
-                // `compression` in the config file walks past the CLI
-                // validation and only fails later at `dar -z` (issue #92).
                 if let Some(c) = &as_cfg.compression {
-                    validate_compression(c)?;
+                    validate_compression(c).map_err(|e| {
+                        TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
+                    })?;
                 }
+            }
+
+            for as_cfg in &config.archive_sets {
                 let locations_json = as_cfg
                     .required_locations
                     .as_ref()
