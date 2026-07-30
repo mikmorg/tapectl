@@ -203,8 +203,8 @@ pub fn volume_retire(
 
     let at_risk: Vec<String> = impacts
         .iter()
-        .filter(|(_, _, other_copies)| *other_copies == 0)
-        .map(|(name, _, _)| name.clone())
+        .filter(|impact| impact.other_copies == 0)
+        .map(|impact| impact.unit_name.clone())
         .collect();
 
     // --dry-run: report the impact analysis and stop, before any consent
@@ -231,12 +231,26 @@ pub fn volume_retire(
     // same as before this change.
     if !at_risk.is_empty() {
         let action = format!("retire volume \"{label}\"");
-        let facts: Vec<String> = at_risk
+        let mut facts: Vec<String> = at_risk
             .iter()
             .map(|name| {
                 format!("unit \"{name}\" would have ZERO copies remaining after this retirement")
             })
             .collect();
+        // ADR-0004 Tier 1: also show evidence age for any OTHER impacted
+        // unit that still retains coverage, so the prompt carries the full
+        // picture, not just the zero-copy units (issue #91). Tier 1 is
+        // display-only here too -- these units never gate the prompt.
+        let now = chrono::Utc::now().naive_utc();
+        for impact in &impacts {
+            if impact.other_copies != 0 {
+                if let Some(line) =
+                    crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now)
+                {
+                    facts.push(line);
+                }
+            }
+        }
 
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
             let reason = e.to_string();
@@ -285,13 +299,23 @@ pub fn volume_retire(
     Ok(())
 }
 
-/// `(unit_name, unit_status, other_copies)` for every unit with a
-/// completed write on `vol_id` — the impact analysis behind
-/// `volume_retire`. Split out from the call site (same reasoning as
-/// `report::copies_rows`/`audit::copy_count_for_unit`) so the
-/// `other_copies` derivation is directly testable without going anywhere
-/// near `volume_retire`'s consent gate — which reads real stdin when
-/// `assume_yes` is false and a unit is genuinely at risk, exactly the
+/// One impacted unit's retire-impact row: its name/status, its remaining
+/// ADR-0004-eligible copy count after the volume being retired is
+/// excluded, and (issue #91) the per-volume evidence backing that
+/// remaining coverage.
+struct RetireImpact {
+    unit_name: String,
+    unit_status: String,
+    other_copies: i64,
+    evidence: Vec<crate::policy::evidence::CoverageEvidence>,
+}
+
+/// The impact analysis behind `volume_retire`: one [`RetireImpact`] per
+/// unit with a completed write on `vol_id`. Split out from the call site
+/// (same reasoning as `report::copies_rows`/`audit::copy_count_for_unit`)
+/// so the `other_copies` derivation is directly testable without going
+/// anywhere near `volume_retire`'s consent gate — which reads real stdin
+/// when `assume_yes` is false and a unit is genuinely at risk, exactly the
 /// hazard `volume_retire_consent`'s tests are written to avoid.
 ///
 /// `other_copies` is the ADR-0004 coverage derivation: does this unit
@@ -302,9 +326,9 @@ pub fn volume_retire(
 /// (issue #89). The volume being retired (`vol_id`) is excluded from its
 /// own "other copies" by identity, not by status, since we are retiring
 /// it regardless of what its current status happens to be.
-fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<(String, String, i64)>> {
+fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<RetireImpact>> {
     let sql = format!(
-        "SELECT DISTINCT u.name, u.status,
+        "SELECT DISTINCT u.id, u.name, u.status,
                 (SELECT COUNT(DISTINCT w2.volume_id)
                  FROM writes w2
                  JOIN stage_sets ss2 ON ss2.id = w2.stage_set_id
@@ -321,19 +345,44 @@ fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<(String, String,
         crate::policy::coverage::eligible("v2")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let impacts: Vec<(String, String, i64)> = stmt
+    let rows: Vec<(i64, String, String, i64)> = stmt
         .query_map(params![vol_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut impacts = Vec::with_capacity(rows.len());
+    for (unit_id, unit_name, unit_status, other_copies) in rows {
+        let evidence = crate::policy::evidence::remaining_coverage_evidence(conn, unit_id, vol_id)?;
+        impacts.push(RetireImpact {
+            unit_name,
+            unit_status,
+            other_copies,
+            evidence,
+        });
+    }
     Ok(impacts)
 }
 
-fn retire_impacts_json(impacts: &[(String, String, i64)]) -> Vec<serde_json::Value> {
+fn retire_impacts_json(impacts: &[RetireImpact]) -> Vec<serde_json::Value> {
     impacts
         .iter()
-        .map(|(name, status, copies)| {
-            serde_json::json!({"unit": name, "status": status, "remaining_copies": copies})
+        .map(|impact| {
+            let evidence: Vec<serde_json::Value> = impact
+                .evidence
+                .iter()
+                .map(|e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}))
+                .collect();
+            let now = chrono::Utc::now().naive_utc();
+            let evidence_summary =
+                crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now);
+            serde_json::json!({
+                "unit": impact.unit_name,
+                "status": impact.unit_status,
+                "remaining_copies": impact.other_copies,
+                "evidence": evidence,
+                "evidence_summary": evidence_summary,
+            })
         })
         .collect()
 }
@@ -346,7 +395,7 @@ fn retire_impacts_json(impacts: &[(String, String, i64)]) -> Vec<serde_json::Val
 /// exit").
 fn retire_refusal_json(
     label: &str,
-    impacts: &[(String, String, i64)],
+    impacts: &[RetireImpact],
     at_risk: &[String],
     reason: &str,
 ) -> serde_json::Value {
@@ -359,22 +408,32 @@ fn retire_refusal_json(
     })
 }
 
-fn print_retire_impact(
-    label: &str,
-    status: &str,
-    impacts: &[(String, String, i64)],
-    at_risk: &[String],
-) {
+fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_risk: &[String]) {
     println!("Retiring volume \"{label}\"");
     println!("  Current status: {status}");
     println!("  Affected units:");
-    for (name, unit_status, other_copies) in impacts {
-        let warning = if *other_copies == 0 {
+    let now = chrono::Utc::now().naive_utc();
+    for impact in impacts {
+        let warning = if impact.other_copies == 0 {
             " *** ZERO copies remaining! ***"
         } else {
             ""
         };
-        println!("    {name} [{unit_status}]: {other_copies} other copy/copies{warning}");
+        println!(
+            "    {} [{}]: {} other copy/copies{warning}",
+            impact.unit_name, impact.unit_status, impact.other_copies
+        );
+        // ADR-0004 Tier 1: display evidence age wherever a destructive
+        // operation consumes copy coverage -- never gate, never a flag.
+        // Zero-copy units have no evidence to describe (they keep only the
+        // ZERO-copies line above).
+        if impact.other_copies != 0 {
+            if let Some(line) =
+                crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now)
+            {
+                println!("      {line}");
+            }
+        }
     }
     if !at_risk.is_empty() {
         println!(
@@ -1790,10 +1849,10 @@ mod tests {
 
             let impacts = retire_impacts(&conn, vol_id).unwrap();
             assert_eq!(impacts.len(), 1);
-            let (name, _status, other_copies) = &impacts[0];
-            assert_eq!(name, "unitA");
+            let impact = &impacts[0];
+            assert_eq!(impact.unit_name, "unitA");
             assert_eq!(
-                *other_copies, 0,
+                impact.other_copies, 0,
                 "a quarantined second volume must not count as another copy"
             );
         }
@@ -1805,7 +1864,12 @@ mod tests {
             // non-zero exit. Tests the exact function the refusal branch
             // calls, so production and test share one code path -- no
             // stdout capture needed to prove the object's shape.
-            let impacts = vec![("unitA".to_string(), "active".to_string(), 0i64)];
+            let impacts = vec![RetireImpact {
+                unit_name: "unitA".to_string(),
+                unit_status: "active".to_string(),
+                other_copies: 0,
+                evidence: vec![],
+            }];
             let at_risk = vec!["unitA".to_string()];
             let reason = "retire volume \"L6-0001\" refused: non-interactive session with no \
                            confirmation given — refusing rather than assuming consent \

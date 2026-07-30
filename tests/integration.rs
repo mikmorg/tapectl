@@ -2266,3 +2266,299 @@ fn test_db_backup_json_reports_whether_keys_were_included() {
          included: {with}"
     );
 }
+
+/// Issue #91 / ADR-0004: `volume retire`'s impact analysis must DISPLAY
+/// evidence age wherever a destructive operation consumes copy coverage —
+/// never gate, never require a flag.
+///
+/// Scenario: two units both have a copy on the volume being retired
+/// (`L6-RETIRE`).
+/// - `zero_copy_unit` has NO other copy anywhere -- this is the existing
+///   Tier-2 at-risk case and must still fire the consent gate.
+/// - `covered_unit` ALSO has a copy on a second, already-sealed volume
+///   (`L6-OTHER`) whose only passing verification is far in the past.
+///
+/// This mixes the zero-copy (Tier 2) and evidence-bearing (Tier 1) cases in
+/// one retirement, which is deliberate: the evidence line must appear only
+/// for the unit that still has coverage, and the naive "forgot to exclude
+/// the retiring volume" bug would cite `L6-RETIRE` itself as the covered
+/// unit's remaining evidence -- so the retiring volume's label must be
+/// ABSENT from that unit's evidence.
+#[test]
+fn test_volume_retire_shows_coverage_evidence_age() {
+    let (_tmp, conn, home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    // Two units.
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'zero_copy_unit', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let zero_unit_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u2', 'covered_unit', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let covered_unit_id = conn.last_insert_rowid();
+
+    // Snapshots + stage sets, one per unit.
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp/u1')",
+        [zero_unit_id],
+    )
+    .unwrap();
+    let zero_snap_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [zero_snap_id],
+    )
+    .unwrap();
+    let zero_ss_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp/u2')",
+        [covered_unit_id],
+    )
+    .unwrap();
+    let covered_snap_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [covered_snap_id],
+    )
+    .unwrap();
+    let covered_ss_id = conn.last_insert_rowid();
+
+    // A second stage_set for covered_unit's copy on the OTHER volume.
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [covered_snap_id],
+    )
+    .unwrap();
+    let covered_ss2_id = conn.last_insert_rowid();
+
+    // Volumes: the one being retired, sealed, plus a second sealed volume
+    // that still provides coverage.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-RETIRE', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let retire_vol_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-OTHER', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let other_vol_id = conn.last_insert_rowid();
+
+    // A third, eligible-but-never-verified volume covering zero_copy_unit
+    // would defeat the "zero copies" scenario, so it is NOT added there --
+    // instead prove the never-verified rendering via a THIRD unit that has
+    // its only other copy on a volume with no passed verification session
+    // at all.
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u3', 'never_verified_unit', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let never_unit_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp/u3')",
+        [never_unit_id],
+    )
+    .unwrap();
+    let never_snap_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [never_snap_id],
+    )
+    .unwrap();
+    let never_ss_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [never_snap_id],
+    )
+    .unwrap();
+    let never_ss2_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-NEVER', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let never_vol_id = conn.last_insert_rowid();
+
+    // Writes: zero_copy_unit only on the retiring volume.
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![zero_ss_id, zero_snap_id, retire_vol_id],
+    )
+    .unwrap();
+
+    // covered_unit: one write on the retiring volume, one on L6-OTHER.
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![covered_ss_id, covered_snap_id, retire_vol_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![covered_ss2_id, covered_snap_id, other_vol_id],
+    )
+    .unwrap();
+
+    // never_verified_unit: one write on the retiring volume, one on
+    // L6-NEVER (no verification session at all).
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![never_ss_id, never_snap_id, retire_vol_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![never_ss2_id, never_snap_id, never_vol_id],
+    )
+    .unwrap();
+
+    // A passing verification session on L6-OTHER, far in the past.
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+         VALUES (?1, '2011-08-01 00:00:00', 'passed')",
+        [other_vol_id],
+    )
+    .unwrap();
+    // A FAILED verification session on L6-NEVER -- must not count as
+    // evidence (a failed session is not evidence).
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+         VALUES (?1, '2026-01-01 00:00:00', 'failed')",
+        [never_vol_id],
+    )
+    .unwrap();
+
+    drop(conn); // release the connection before the subprocess opens the same file
+
+    let config_path = home.join("config.toml");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "--yes",
+            "volume",
+            "retire",
+            "L6-RETIRE",
+        ])
+        .output()
+        .expect("failed to run the tapectl binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "volume retire --yes should exit 0 even with an at-risk unit present \
+         (Tier 2, --yes waives it); stdout: {stdout:?}, stderr: {stderr:?}"
+    );
+
+    // Parse the WHOLE stdout as JSON -- a stray println! outside the
+    // json_output branch is a real defect class here (issue #56).
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"));
+
+    let affected = parsed["affected_units"]
+        .as_array()
+        .expect("affected_units must be an array");
+
+    let covered = affected
+        .iter()
+        .find(|u| u["unit"] == "covered_unit")
+        .expect("covered_unit must appear in affected_units");
+    let covered_evidence = covered["evidence"]
+        .as_array()
+        .expect("covered_unit must carry an evidence array");
+    assert_eq!(covered_evidence.len(), 1, "evidence: {covered_evidence:?}");
+    assert_eq!(covered_evidence[0]["volume"], "L6-OTHER");
+    assert!(
+        !covered_evidence.iter().any(|e| e["volume"] == "L6-RETIRE"),
+        "the retiring volume must never appear as a unit's own remaining \
+         coverage evidence: {covered_evidence:?}"
+    );
+    let summary = covered["evidence_summary"]
+        .as_str()
+        .expect("covered_unit must carry a non-null evidence_summary");
+    assert!(summary.contains("L6-OTHER"), "summary: {summary}");
+    assert!(summary.contains("days ago"), "summary: {summary}");
+
+    let never = affected
+        .iter()
+        .find(|u| u["unit"] == "never_verified_unit")
+        .expect("never_verified_unit must appear in affected_units");
+    let never_evidence = never["evidence"]
+        .as_array()
+        .expect("never_verified_unit must carry an evidence array");
+    assert_eq!(never_evidence.len(), 1, "evidence: {never_evidence:?}");
+    assert_eq!(never_evidence[0]["volume"], "L6-NEVER");
+    assert!(
+        never_evidence[0]["last_verified"].is_null(),
+        "an eligible-but-never-passed volume must render as never-verified, \
+         not be omitted: {never_evidence:?}"
+    );
+    let never_summary = never["evidence_summary"]
+        .as_str()
+        .expect("never_verified_unit must carry a non-null evidence_summary");
+    assert!(
+        never_summary.contains("never verified"),
+        "summary: {never_summary}"
+    );
+
+    // The zero-copy unit alone must NOT trigger the "unparseable" or
+    // evidence machinery -- it has zero remaining copies, so no evidence at
+    // all, and it must still be flagged at_risk (Tier 2 unchanged).
+    let zero = affected
+        .iter()
+        .find(|u| u["unit"] == "zero_copy_unit")
+        .expect("zero_copy_unit must appear in affected_units");
+    assert_eq!(zero["remaining_copies"], 0);
+    let zero_evidence = zero["evidence"]
+        .as_array()
+        .expect("zero_copy_unit must carry an evidence array (empty)");
+    assert!(
+        zero_evidence.is_empty(),
+        "a zero-copy unit has no remaining-coverage evidence: {zero_evidence:?}"
+    );
+    assert!(
+        zero["evidence_summary"].is_null(),
+        "a zero-copy unit's evidence_summary must be null, not a fabricated line: {zero:?}"
+    );
+
+    // The success-path JSON (this ran with --yes, so it succeeded, not
+    // refused) doesn't carry a top-level at_risk_units array -- that's
+    // only on the refusal object. Confirm via remaining_copies instead
+    // that only zero_copy_unit is at zero and the other two are not.
+    assert_eq!(covered["remaining_copies"], 1);
+    assert_eq!(never["remaining_copies"], 1);
+}
