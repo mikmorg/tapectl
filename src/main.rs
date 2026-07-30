@@ -1,4 +1,4 @@
-use tapectl::{cli, config, db, error, signal, staging, tenant, unit, volume};
+use tapectl::{cli, config, db, error, policy, signal, staging, tenant, unit, volume};
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -367,13 +367,59 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             cli::ConfigCommands::Check => {
                 let toml_str = std::fs::read_to_string(&paths.config_file)?;
+
+                // Advisory scan for pre-existing dotfiles that still shadow
+                // an archive_set's policy fields (Recast of v4.0 §2.2,
+                // docs/design-errata.md, issue #92). Never affects the
+                // exit code and never rewrites anything — the operator
+                // owns these files.
+                let shadowing_hits = if paths.db_file.exists() {
+                    policy::shadowing::scan(&conn)
+                } else {
+                    Vec::new()
+                };
+
                 match toml_str.parse::<toml::Value>() {
                     Ok(_) => {
                         let _ = config::Config::load(&paths.config_file)?;
                         if cli.json {
-                            println!("{}", serde_json::json!({"valid": true}));
+                            let shadowing_json: Vec<_> = shadowing_hits
+                                .iter()
+                                .map(|h| {
+                                    serde_json::json!({
+                                        "unit": h.unit_name,
+                                        "dotfile_path": h.dotfile_path.display().to_string(),
+                                        "checksum_mode_set": h.checksum_mode_set,
+                                        "compression_set": h.compression_set,
+                                    })
+                                })
+                                .collect();
+                            println!(
+                                "{}",
+                                serde_json::json!({"valid": true, "shadowing_dotfiles": shadowing_json})
+                            );
                         } else {
                             println!("config: valid");
+                            for hit in &shadowing_hits {
+                                let mut fields = Vec::new();
+                                if hit.checksum_mode_set {
+                                    fields.push("checksum_mode");
+                                }
+                                if hit.compression_set {
+                                    fields.push("compression");
+                                }
+                                println!(
+                                    "warning: unit '{}' dotfile sets [policy] {} — this overrides its archive set ({})",
+                                    hit.unit_name,
+                                    fields.join(", "),
+                                    hit.dotfile_path.display()
+                                );
+                            }
+                            if !shadowing_hits.is_empty() {
+                                println!(
+                                    "  hint: remove the shadowing key(s) from each dotfile's [policy] table to defer to the archive set"
+                                );
+                            }
                         }
                     }
                     Err(e) => {
