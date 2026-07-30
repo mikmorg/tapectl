@@ -58,6 +58,13 @@ shared target dir serializes builds on cargo's lock.
    docs/design/v2-open-questions.md (resolved decisions), and
    docs/design/v2-implementation-plan.md (the task playbook).
 4. Do not create files under docs/audits/. Do not file GitHub issues.
+   **Never put a GitHub closing keyword in a commit message** — no
+   `Fixes #N`, `Closes #N`, `Resolves #N`. Cite the issue as `(issue #N)` or
+   `(#N)` instead. The coordinator pushes, so a closing trailer auto-closes
+   the issue the instant it lands — before review, and regardless of whether
+   the work was any good. On 2026-07-30 that closed #40 and #41 out from
+   under the verification step; the work happened to hold up, which is luck,
+   not process. Closing is the coordinator's decision, made after the gate.
 5. No new dependencies without coordinator approval.
 
 **SCOPE FENCE.** You own exactly these files: {{LIST}}. Other agents are
