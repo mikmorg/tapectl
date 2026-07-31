@@ -536,21 +536,38 @@ mod tests {
 
         let serviceable_count = rows.iter().filter(|r| r.serviceable == "yes").count() as i64;
 
-        let sealed = crate::policy::coverage::eligible("v");
+        // Routed through the gates' own expression rather than a seventh
+        // hand-written copy of it (issue #73). Note the scope of the
+        // claim: `serviceable` counts TAPE rows, while the gate count also
+        // includes warehouse deposits (ADR-0006), so these are equal for
+        // an ALL-TAPE unit -- which this fixture is, deliberately. Add a
+        // deposit here and the two must diverge; that is correct, not a
+        // regression.
         let gate_count: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END)
-                     FROM snapshots s
-                     JOIN stage_sets ss ON ss.snapshot_id = s.id
-                     JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
-                     JOIN volumes v ON v.id = w.volume_id
-                     WHERE s.unit_id = ?1"
+                    "SELECT {}",
+                    crate::policy::coverage::copy_count_expr(
+                        &crate::policy::coverage::CoverageQuery {
+                            scope: crate::policy::coverage::CoverageScope::Unit {
+                                id_expr: "?1",
+                                current_only: false,
+                            },
+                            exclude_volume: None,
+                        }
+                    )
                 ),
                 params![unit_id],
                 |r| r.get(0),
             )
             .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM volume_deposits", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "this equality only holds for an all-tape unit"
+        );
 
         assert_eq!(
             serviceable_count, gate_count,
