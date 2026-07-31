@@ -31,9 +31,30 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#51, #50 (paired — see the cross-issue note below), #43, #61, #62,
-  #63, #83, #95, #97, #98, #99.** (#91 closed 2026-07-30; #99 filed as its
-  scope residual. #59 closed 2026-07-31.)
+  **#43, #61, #62, #63, #83, #95, #97, #98, #99.** (#91 closed 2026-07-30;
+  #99 filed as its scope residual. #59, #50, #51 closed 2026-07-31.)
+  **Two CTO decisions ratified 2026-07-31 and recorded in
+  `docs/design-errata.md`** — read the rows there before touching either:
+  `preserve_acls` KEEPS its config field and column (dar has no
+  independent ACL switch; ACLs ride EAs), with the no-op surfaced by
+  `config check` via `policy::subsumed`; and restore uses **detect-and-fail**
+  on overwrite collisions.
+  **The restore-collision detector is counter-intuitive — do not
+  "simplify" it.** dar under `-Q` silently skips a colliding file and
+  EXITS 0. The skip is tallied under `ignored (excluded by filters)`,
+  while `not restored (overwriting policy decision)` — the counter whose
+  name fits — reads **0**. The only per-file signal is the stdout line
+  `<path> not restored (user choice)` (stdout, not stderr). A test pins
+  the real captured output and asserts a skip is found despite that zero,
+  precisely to stop a future refactor from reading the summary block.
+  **`#62` inherits two decorative keys from #59** (`backends.lto[].block_size`,
+  `packing.min_free_for_append`) — parsed by serde, read by nothing.
+  **A real-dar test pattern now exists** (`src/dar/restore.rs`'s
+  `real_dar_collision_is_reported_as_a_failed_restore`): it shells out to
+  `dar` and skips when absent, keeping the ungated suite free of
+  external-binary requirements. Use that shape if wiring needs real-dar
+  coverage — and note the mhvtl gate does NOT cover restore collisions,
+  since its restore legs use fresh destinations.
   **`parse_size_to_bytes` now returns `Result` (#59) and `policy::resolve`
   with it.** Sizes are validated at `Config::load` (`validate_sizes`), so a
   bad `defaults.*` or backend value fails loudly at the boundary. A bare
