@@ -415,7 +415,11 @@ fn stage_create_inner(
         );
     }
 
-    // Also remove sha512 hash files that dar created
+    // Also remove any leftover sha512 hash files. dar no longer creates
+    // these (create.rs dropped `-3`/`--hash sha512`, issues #50/#51 — the
+    // files were never read, pure wasted I/O), but a staging dir can still
+    // hold `.sha512` files left behind by archives created before that
+    // change, so this cleanup path must keep matching them.
     if let Some(parent) = archive_base.parent() {
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {

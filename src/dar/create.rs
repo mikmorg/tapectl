@@ -48,13 +48,21 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
 
     cmd.arg("-an"); // case-insensitive masks
     cmd.arg("-D"); // store excluded dirs as empty
-    cmd.arg("-3").arg("sha512"); // slice hashing
+    // No dar slice hashing (`-3`/`--hash`) — dar hashed every slice but
+    // nothing ever read the `.sha512` files it produced (issues #50/#51).
+    // tapectl's own sha256_plain/sha256_encrypted, computed over the whole
+    // archive before/after encryption, are the real integrity mechanism.
     cmd.arg("-Q"); // quiet (no tty prompt)
 
     if params.preserve_xattrs {
         cmd.arg("-am");
     }
-    // ACLs are preserved via -am (xattrs include POSIX ACLs in dar 2.7.x)
+    // ACLs: on Linux, dar carries POSIX ACLs as Extended Attributes whenever
+    // EA support is compiled in (it is in the system dar), and this code
+    // passes no -u/-U EA-exclusion mask on create or restore, so ACL data is
+    // preserved via ordinary EA carriage. `-am` is `--alter=mask`, a mask
+    // *ordering* toggle unrelated to EAs/ACLs — it does not itself preserve
+    // anything (issues #50/#51).
     if params.preserve_fsa {
         cmd.arg("--fsa-scope").arg("extX");
     }
