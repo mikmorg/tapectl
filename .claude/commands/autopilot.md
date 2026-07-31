@@ -31,8 +31,20 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#83 is the LAST open phase-2 item.** (#91 closed 2026-07-30. #59, #50,
-  #51, #98, #62, #43, #61, #97, #99, #95, #63 closed 2026-07-31.)
+  **THE PHASE-2 QUEUE IS EMPTY (2026-07-31).** Every phase-2 issue is
+  closed except **#69 (Heir Kit)**, which the CTO deferred because it has a
+  physical step — printing, tamper-evident envelopes — that no agent can
+  perform. `EXPECTED_FAIL=()` is empty, so the mhvtl gate has zero slack.
+  Closed 2026-07-30: #91. Closed 2026-07-31: #59, #50, #51, #98, #62, #43,
+  #61, #97, #99, #95, #63, #83.
+  **Before starting new work, re-triage.** The remaining backlog is phase-3
+  (#70 scheduled advisory ops, #72 WarehouseStore, #73 warehouse locations)
+  plus the LOW umbrellas (#65/#66/#67) and the epic (#20) / map (#1). Those
+  were written pre-v2 and against older code — the single most valuable
+  habit from this session was **auditing each issue against shipped code
+  before implementing it**; roughly half of phase-2 turned out materially
+  stale. Do that first, and expect phase-3 to need re-specing more, not
+  less, since ADR-0006's store seam landed after those issues were filed.
   **`restore raw-volume` exists (#63)** — `src/volume/raw.rs`, DB-less by
   signature (`restore_raw(device, block_size, dest, expect_label)`),
   read-only (`TapeStore::open_read`), streaming. It dumps by position from
