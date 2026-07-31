@@ -267,6 +267,105 @@ tapectl report compaction-candidates
 tapectl report events --days 30
 ```
 
+## Warehouse Copies (Cold Cloud)
+
+A **warehouse** is a location kind (ADR-0006) that holds cold cloud storage —
+S3 Glacier / Deep Archive and equivalents — rather than physical cartridges.
+It sits alongside your shelves in the same location list, and a copy recorded
+there counts toward `min_copies` and toward distinct-location counts exactly
+like a tape does.
+
+**tapectl does not upload anything.** The scope was settled deliberately: you
+move the bytes yourself with the documented external procedure (`rclone` or
+`aws-cli` against the sealed volume), and then you *record* that copy in the
+catalog so every derivation — `audit`, `report fire-risk`, `report copies`,
+the retire and mark-tape-only gates — can reason about it. There is no
+upload command, no polling, and no credentials anywhere in the config.
+
+### Creating a warehouse location
+
+The endpoint or prefix goes in the description. There is no separate URI
+field, on purpose.
+
+```bash
+tapectl location add glacier --kind warehouse \
+  --description "s3://my-archive-bucket/tapectl"
+
+tapectl location list
+tapectl location info glacier
+```
+
+### Recording a deposit
+
+Copy the sealed volume's bytes out first, by your own procedure, then:
+
+```bash
+tapectl volume deposit add L6-0003 --to glacier \
+  --receipt <provider-object-version-id> \
+  --storage-class DEEP_ARCHIVE \
+  --notes "rclone copy, 2026-01-02"
+
+tapectl volume deposit list
+tapectl volume deposit list --volume L6-0003
+```
+
+`deposit add` refuses two things and nothing else: a location that is not a
+warehouse, and a volume that is not `sealed` (unsealed bytes are not final, so
+there is nothing durable to have deposited). There is deliberately **no
+checksum field** — tapectl did not perform the copy, so a checksum you typed
+in would be a claim about a claim. What gets recorded is what is actually
+attestable: which volume, which warehouse, when, and the provider's receipt.
+
+### Asking for warehouse copies by policy
+
+`warehouse_copies` resolves through the usual three layers — unit dotfile
+`[policy]` > archive set > `[defaults]` in `config.toml` — and defaults to 0,
+so an all-tape fleet never sees a warehouse finding.
+
+```bash
+tapectl archive-set create irreplaceable --min-copies 2 --warehouse-copies 1
+tapectl archive-set edit irreplaceable --warehouse-copies 2
+```
+
+`tapectl audit` then reports a `warehouse_copies` VIOLATION for any unit with
+fewer recorded deposits than its policy asks for, with the `volume deposit
+add` command as its action. Like every other audit finding it is advisory: it
+changes the exit code and nothing else.
+
+### The honest caveats
+
+Read these before you treat a warehouse copy as equivalent to a tape.
+
+**It is never re-verified.** Tape evidence comes from physically loading the
+cartridge and running `volume verify`, and it refreshes every time you do.
+Warehouse evidence is the deposit receipt plus the provider's attestation, and
+it ages without refresh — re-verification would mean paying to retrieve the
+whole volume, which realistically never happens. tapectl says so out loud
+wherever coverage is consumed:
+
+```
+coverage for unit "photos" rests on a warehouse deposit of L6-0003 at glacier
+(2026-01-02) — never re-verified, and warehouse copies do not refresh
+```
+
+`report copies` and `report fire-risk` likewise print how many of a unit's
+copies are deposits rather than folding them into one number.
+
+**It dies weeks after payment stops.** ADR-0006 states it plainly: a warehouse
+copy dies weeks after payment stops; tapes are the durable line. A card
+expiring, an account lapsing, or a billing dispute silently deletes every copy
+you have there, on a timescale of weeks. A cartridge in a drawer does not care
+whether you paid anyone this month. Treat warehouse copies as the extra leg
+the irreplaceable core earns — never as the primary line, and never as a
+reason to retire a tape.
+
+**A deposit stops counting when its source volume does.** Deposits are gated
+on the source volume still being `sealed`, so quarantining or retiring the
+cartridge also removes its deposit from every count — even though the cloud
+object itself is unaffected. That is the conservative reading, chosen so a
+deposit can never be the thing that keeps a unit looking covered after its
+tape went bad.
+
 ## Cadence
 
 Everything below is a **manual rhythm you run**. tapectl schedules nothing and
