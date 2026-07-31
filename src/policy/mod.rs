@@ -8,6 +8,7 @@ pub mod coverage;
 pub mod evidence;
 pub mod reclaimable;
 pub mod shadowing;
+pub mod subsumed;
 
 /// Resolved policy for a unit after 3-level resolution:
 /// unit dotfile [policy] > archive_set > system [defaults].

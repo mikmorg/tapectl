@@ -380,7 +380,23 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
                 match toml_str.parse::<toml::Value>() {
                     Ok(_) => {
-                        let _ = config::Config::load(&paths.config_file)?;
+                        let loaded = config::Config::load(&paths.config_file)?;
+
+                        // Advisory scan for `preserve_acls = false`, which
+                        // cannot take effect: dar has no independent ACL
+                        // switch, so ACLs ride EAs (CTO decision
+                        // 2026-07-31, issue #50; docs/design-errata.md).
+                        // Same contract as the shadowing scan above —
+                        // advises, rewrites nothing, never changes the
+                        // exit code.
+                        let subsumed_hits = if paths.db_file.exists() {
+                            policy::subsumed::scan(&loaded, &conn)
+                        } else {
+                            policy::subsumed::scan(
+                                &loaded,
+                                &rusqlite::Connection::open_in_memory()?,
+                            )
+                        };
                         if cli.json {
                             let shadowing_json: Vec<_> = shadowing_hits
                                 .iter()
@@ -393,9 +409,23 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                     })
                                 })
                                 .collect();
+                            let subsumed_json: Vec<_> = subsumed_hits
+                                .iter()
+                                .map(|h| {
+                                    serde_json::json!({
+                                        "source": h.source,
+                                        "field": "preserve_acls",
+                                        "note": policy::subsumed::describe(h),
+                                    })
+                                })
+                                .collect();
                             println!(
                                 "{}",
-                                serde_json::json!({"valid": true, "shadowing_dotfiles": shadowing_json})
+                                serde_json::json!({
+                                    "valid": true,
+                                    "shadowing_dotfiles": shadowing_json,
+                                    "subsumed_policy_fields": subsumed_json,
+                                })
                             );
                         } else {
                             println!("config: valid");
@@ -418,6 +448,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                 println!(
                                     "  hint: remove the shadowing key(s) from each dotfile's [policy] table to defer to the archive set"
                                 );
+                            }
+                            for hit in &subsumed_hits {
+                                println!("{}", policy::subsumed::describe(hit));
                             }
                         }
                     }
