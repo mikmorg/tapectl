@@ -307,25 +307,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 exit_if_nonzero(fsck_exit_code(&report));
             }
             cli::DbCommands::Export => {
-                // Export key table counts as JSON
-                let tables = [
-                    "tenants",
-                    "units",
-                    "snapshots",
-                    "stage_sets",
-                    "volumes",
-                    "writes",
-                    "events",
-                ];
-                let mut counts = serde_json::Map::new();
-                for table in &tables {
-                    let count: i64 =
-                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                            row.get(0)
-                        })?;
-                    counts.insert(table.to_string(), serde_json::json!(count));
-                }
-                println!("{}", serde_json::to_string_pretty(&counts).unwrap());
+                // Full streaming JSON dump of the database (issue #61):
+                // schema_version + every user table, enumerated from
+                // sqlite_master at runtime. `--json` is a no-op here since
+                // the output is unconditionally JSON. Nothing but the JSON
+                // document itself may go to stdout on this path.
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::new(stdout.lock());
+                db::export::export_json(&conn, &mut writer)?;
             }
             cli::DbCommands::Import { path: import_path } => {
                 cli::operations::db_import(&paths, import_path, cli.yes, cli.dry_run, cli.json)?;

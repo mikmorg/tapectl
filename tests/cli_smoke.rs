@@ -230,6 +230,60 @@ fn db_fsck_before_init_is_not_a_silent_success() {
     );
 }
 
+/// Issue #61: `db export` must emit one complete JSON document — schema
+/// version plus every table — to stdout, not the old seven hardcoded
+/// per-table counts. Cheap on purpose (init + one tenant only): the point
+/// is proving the whole-stdout-parses and shape-present properties, not
+/// exercising a large table.
+#[test]
+fn db_export_emits_one_parseable_json_document() {
+    let home = TempDir::new().expect("tempdir");
+
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init_out.status.success(),
+        "init failed: stderr={}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let tenant_out = run_tapectl(home.path(), &["tenant", "add", "acme"]);
+    assert!(
+        tenant_out.status.success(),
+        "tenant add failed: stderr={}",
+        String::from_utf8_lossy(&tenant_out.stderr)
+    );
+
+    let export_out = run_tapectl(home.path(), &["db", "export"]);
+    assert_eq!(
+        export_out.status.code(),
+        Some(0),
+        "db export should exit 0: stderr={}",
+        String::from_utf8_lossy(&export_out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&export_out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("db export stdout did not parse as one JSON document: {e}\nstdout={stdout:?}")
+    });
+
+    assert!(
+        parsed.get("schema_version").is_some(),
+        "db export JSON missing 'schema_version': {parsed}"
+    );
+    let tables = parsed
+        .get("tables")
+        .unwrap_or_else(|| panic!("db export JSON missing 'tables': {parsed}"));
+    assert!(
+        tables.get("tenants").is_some(),
+        "db export 'tables' missing 'tenants': {tables}"
+    );
+    let tenants = tables["tenants"].as_array().expect("tenants is an array");
+    assert!(
+        tenants.iter().any(|row| row["name"] == "acme"),
+        "expected tenant 'acme' in exported tenants table: {tenants:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Issue #98: two-real-process concurrency tests for the stage_create flock.
 //
