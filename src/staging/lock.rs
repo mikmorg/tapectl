@@ -29,8 +29,7 @@ pub struct StageLock(Flock<File>);
 /// files." Does not require the directory to exist.
 pub fn lock_path(db_file: &Path, stage_set_id: i64) -> PathBuf {
     let dir = db_file.parent().unwrap_or_else(|| Path::new("."));
-    dir.join("locks")
-        .join(format!("stage-{stage_set_id}.lock"))
+    dir.join("locks").join(format!("stage-{stage_set_id}.lock"))
 }
 
 /// Acquire the exclusive, non-blocking lock for `stage_set_id`, creating
@@ -45,6 +44,7 @@ pub fn acquire(db_file: &Path, stage_set_id: i64) -> Result<StageLock> {
     }
     let file = File::options()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&path)
         .map_err(|e| {
@@ -83,7 +83,12 @@ pub fn is_crashed(db_file: &Path, stage_set_id: i64) -> bool {
             return false;
         }
     }
-    let file = match File::options().create(true).write(true).open(&path) {
+    let file = match File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(_) => return false,
     };

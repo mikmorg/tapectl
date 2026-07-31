@@ -101,7 +101,7 @@ pub fn execute_batch(
     }
 
     // Release staging: only reachable once every copy above sealed.
-    let cleaned = crate::staging::clean::clean_staging(conn, false)?;
+    let cleaned = crate::staging::clean::clean_staging(conn, config, false)?;
 
     Ok(BatchExecutionReport {
         units_staged: batch.units.len(),

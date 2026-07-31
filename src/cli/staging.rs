@@ -2,6 +2,7 @@ use clap::Subcommand;
 use rusqlite::Connection;
 use tabled::{Table, Tabled};
 
+use crate::config::Config;
 use crate::error::Result;
 use crate::staging::clean;
 
@@ -38,7 +39,12 @@ struct StagingRow {
     staged: String,
 }
 
-pub fn run(conn: &Connection, command: &StagingCommands, json_output: bool) -> Result<()> {
+pub fn run(
+    conn: &Connection,
+    config: &Config,
+    command: &StagingCommands,
+    json_output: bool,
+) -> Result<()> {
     match command {
         StagingCommands::Status => {
             let info = clean::staging_status(conn)?;
@@ -82,7 +88,7 @@ pub fn run(conn: &Connection, command: &StagingCommands, json_output: bool) -> R
         }
 
         StagingCommands::Clean { force } => {
-            let report = clean::clean_staging(conn, *force)?;
+            let report = clean::clean_staging(conn, config, *force)?;
             if json_output {
                 println!(
                     "{}",
