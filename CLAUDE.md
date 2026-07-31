@@ -109,6 +109,14 @@ cargo run --example gen_man   # writes docs/man/*.1
 Default `cargo test` runs unit + integration + tenant-isolation + failure-mode tests;
 none need tape hardware or mhvtl.
 
+**`dar` must be on `PATH` (issue #43).** The ungated suite is *not* hermetic: 13
+tests shell out to a real dar — the staging-pipeline regression guards plus the
+restore-collision test. `tests/test_dependencies.rs` asserts this once, by name,
+so a missing dar fails with instructions instead of a dozen cryptic `dar -c
+failed` panics. It is a hard *runtime* dependency anyway, so testing needs
+nothing extra. Fixtures resolve it as plain `"dar"` via `PATH` — never hardcode
+`/usr/bin/dar`, which is wrong on any distro installing to `/usr/local/bin`.
+
 ```bash
 cargo test                              # everything ungated
 cargo test --lib                        # unit tests only (in-module)

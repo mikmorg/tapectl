@@ -1882,7 +1882,7 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "/usr/bin/dar".to_string();
+        config.dar.binary = "dar".to_string(); // PATH, not a hardcoded distro path (issue #43)
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
         config.defaults.slice_size = "100M".to_string();
         // Leave the default at "none" and have the archive set override it to
@@ -2055,7 +2055,7 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "/usr/bin/dar".to_string();
+        config.dar.binary = "dar".to_string(); // PATH, not a hardcoded distro path (issue #43)
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -2245,7 +2245,7 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         let mut config = Config::default();
-        config.dar.binary = "/usr/bin/dar".to_string();
+        config.dar.binary = "dar".to_string(); // PATH, not a hardcoded distro path (issue #43)
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();

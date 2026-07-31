@@ -168,6 +168,13 @@ require tape hardware or mhvtl:
 cargo test
 ```
 
+**`dar` must be installed and on `PATH`.** The ungated suite is not
+hermetic: 13 tests build and extract real archives, so they need the same
+`dar >= 2.6` the tool itself requires (Debian/Ubuntu: `sudo apt install
+dar`). `tests/test_dependencies.rs` checks this once and fails with
+instructions naming what would otherwise break, rather than letting the
+absence surface as a dozen unexplained archive errors.
+
 Two gated test suites exist for heavier validation:
 
 ```bash

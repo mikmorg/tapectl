@@ -252,6 +252,23 @@ fn prepare_home_for_staging(
     source_dir: &std::path::Path,
     staging_dir: &std::path::Path,
 ) -> String {
+    // Fail FAST if dar is missing (issue #43). Without this, `stage create`
+    // dies immediately but the callers' `poll_stage_set_status` sits out its
+    // full 60-second timeout first, so a dar-less machine pays two silent
+    // 60s hangs before seeing an error that never names dar.
+    // `tests/test_dependencies.rs` reports the dependency properly; this is
+    // only here so these two tests fail in milliseconds rather than minutes.
+    assert!(
+        Command::new("dar")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "`dar` not on PATH — see tests/test_dependencies.rs for what this costs"
+    );
+
     let init_out = run_tapectl(home, &["init"]);
     assert!(
         init_out.status.success(),

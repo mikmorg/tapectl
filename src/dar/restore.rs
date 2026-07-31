@@ -232,9 +232,15 @@ mod tests {
     /// The mhvtl gate does not cover this: its restore legs extract into
     /// fresh destinations, so they never produce a collision.
     ///
-    /// Skips when `dar` is absent rather than failing — the rest of the
-    /// ungated suite deliberately needs no external binaries, and this
-    /// single test should not change that contract.
+    /// Requires `dar`, like the ten staging-pipeline tests it now sits
+    /// alongside (issue #43). This test used to carry its own skip guard,
+    /// justified as "keeping the ungated suite free of external-binary
+    /// requirements" — a premise the #43 audit disproved: the suite already
+    /// required dar in ten other places, and CI had been red for months
+    /// because of it. `tests/test_dependencies.rs` now asserts the
+    /// dependency once, by name; a bespoke skip here would be the only one
+    /// of thirteen dar-dependent tests that quietly passes without dar,
+    /// which is worse than either consistent policy.
     #[test]
     fn real_dar_collision_is_reported_as_a_failed_restore() {
         use std::process::Stdio;
@@ -246,10 +252,11 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if !have_dar {
-            eprintln!("SKIP real_dar_collision_is_reported_as_a_failed_restore: no dar binary");
-            return;
-        }
+        assert!(
+            have_dar,
+            "`dar` not on PATH — see tests/test_dependencies.rs, which reports \
+             this dependency once with instructions"
+        );
 
         let tmp = tempfile::TempDir::new().unwrap();
         let src = tmp.path().join("src");
