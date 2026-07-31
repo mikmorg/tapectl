@@ -73,7 +73,7 @@ pub fn run(
             capacity,
             notes,
         } => {
-            let cap = staging::parse_size_to_bytes(capacity);
+            let cap = staging::parse_size_to_bytes(capacity)?;
             conn.execute(
                 "INSERT INTO cartridges (barcode, media_type, nominal_capacity, notes)
                  VALUES (?1, ?2, ?3, ?4)",

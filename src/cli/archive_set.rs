@@ -140,7 +140,8 @@ pub fn run(
             });
             let slice_bytes = slice_size
                 .as_ref()
-                .map(|s| crate::staging::parse_size_to_bytes(s));
+                .map(|s| crate::staging::parse_size_to_bytes(s))
+                .transpose()?;
 
             conn.execute(
                 "INSERT INTO archive_sets (name, description, min_copies, required_locations,
@@ -327,7 +328,7 @@ pub fn run(
                 )?;
             }
             if let Some(v) = slice_size {
-                let bytes = crate::staging::parse_size_to_bytes(v);
+                let bytes = crate::staging::parse_size_to_bytes(v)?;
                 tx.execute(
                     "UPDATE archive_sets SET slice_size = ?1, updated_at = datetime('now') WHERE id = ?2",
                     params![bytes, id],
@@ -551,6 +552,15 @@ pub fn run(
                         TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
                     })?;
                 }
+                // Issue #59: same all-or-nothing discipline as the
+                // compression guard above — a malformed slice_size in the
+                // config file must not silently become 0 or the wrong
+                // magnitude in the DB, and must not partially commit.
+                if let Some(s) = &as_cfg.slice_size {
+                    crate::staging::parse_size_to_bytes(s).map_err(|e| {
+                        TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
+                    })?;
+                }
             }
 
             for as_cfg in &config.archive_sets {
@@ -561,7 +571,8 @@ pub fn run(
                 let slice_bytes = as_cfg
                     .slice_size
                     .as_ref()
-                    .map(|s| crate::staging::parse_size_to_bytes(s));
+                    .map(|s| crate::staging::parse_size_to_bytes(s))
+                    .transpose()?;
                 let encrypt_int = as_cfg.encrypt.map(|b| b as i64);
 
                 let existing: Option<i64> = conn

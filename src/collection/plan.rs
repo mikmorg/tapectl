@@ -56,9 +56,13 @@ pub fn plan_for_collection(
         .lto
         .first()
         .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
-    let nominal = crate::staging::parse_size_to_bytes(&backend.nominal_capacity).max(0) as u64;
+    // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
+    // negative value with `Err` rather than letting one flow through as a
+    // valid byte count, so a successfully parsed `Ok` is already guaranteed
+    // non-negative here.
+    let nominal = crate::staging::parse_size_to_bytes(&backend.nominal_capacity)? as u64;
     let usable = (nominal as f64 * backend.usable_capacity_factor) as u64;
-    let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer).max(0) as u64;
+    let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
     let budget = usable.saturating_sub(enospc_buffer);
 
     selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {

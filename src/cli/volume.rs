@@ -393,7 +393,7 @@ pub fn run(
                     let backend = config.backends.lto.first().ok_or_else(|| {
                         crate::error::TapectlError::Config("no LTO backend configured".into())
                     })?;
-                    let tape_cap = crate::staging::parse_size_to_bytes(&backend.nominal_capacity);
+                    let tape_cap = crate::staging::parse_size_to_bytes(&backend.nominal_capacity)?;
                     let factor = backend.usable_capacity_factor;
                     let usable = (tape_cap as f64 * factor) as i64;
                     let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;

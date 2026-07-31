@@ -123,7 +123,7 @@ pub fn volume_init(
         .first()
         .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
 
-    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
+    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
     let media_type = &backend.media_type;
 
     // Generated here (not deferred to the `volume_uuid()` self-heal helper)
@@ -256,13 +256,15 @@ pub fn volume_write(
         .lto
         .first()
         .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
-    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
+    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
     // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
     // gone (T10 config cleanup: nothing read it after this path stopped, and
     // this was that "nothing").
-    let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer).max(0) as u64;
+    // `.max(0)` dropped (issue #59): a negative value is now rejected by
+    // the parser itself, so a successful `Ok` is already non-negative.
+    let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
 
     let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
     distinct_tenant_ids.sort_unstable();
@@ -473,7 +475,7 @@ pub fn volume_resume(
         .lto
         .first()
         .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
-    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity);
+    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
@@ -1053,15 +1055,13 @@ pub fn volume_verify(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    let usable_bytes = config
-        .backends
-        .lto
-        .first()
-        .map(|b| {
-            (staging::parse_size_to_bytes(&b.nominal_capacity) as f64 * b.usable_capacity_factor)
+    let usable_bytes = match config.backends.lto.first() {
+        Some(b) => {
+            (staging::parse_size_to_bytes(&b.nominal_capacity)? as f64 * b.usable_capacity_factor)
                 as u64
-        })
-        .unwrap_or(0);
+        }
+        None => 0,
+    };
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     // Read File 3 (front index) raw; its true (pre-padding) length is
