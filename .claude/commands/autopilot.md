@@ -32,11 +32,36 @@ the normative design set named in the Policy block below.
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
   **#51, #50 (paired — see the cross-issue note below), #43, #59, #61, #62,
-  #63, #83, #91, #95, #97, #98.** #91 is worth taking early despite being a
-  low: the #46 runbook now documents its absence in prose, so landing it means
-  editing `docs/operator-guide.md`'s "Before moving a tape" block in the same
-  commit — otherwise the guide keeps telling operators a shipped feature
-  doesn't exist.
+  #63, #83, #95, #97, #98, #99.** (#91 closed 2026-07-30; #99 filed as its
+  scope residual.)
+  **Lesson from #91 (2026-07-30): scope the issue against the ADR, not just
+  against the issue's own Acceptance clause.** #91's Acceptance named only
+  `volume retire`, but ADR-0004 names THREE destructive ops that must show
+  the Tier-1 display (retire, `unit mark-tape-only`, `compact-finish`). The
+  worker satisfied the issue exactly and still left two-thirds of the ADR
+  unimplemented — and did not flag it, because nothing in its prompt asked
+  it to read past the issue. #99 tracks the remainder. When an issue cites
+  an ADR, read the ADR and diff its claims against the issue's scope before
+  writing the worker prompt.
+  **Second #91 lesson — a formatter is only as honest as its narrowest
+  render context.** `describe` named the WEAKEST remaining copy using
+  ADR-0004's single-copy wording ("coverage ... rests on L6-0009, never
+  verified"), which asserts sole dependence. In `print_retire_impact` and
+  the `--json` array the copy count sits alongside, so it reads correctly;
+  but `cli::consent::confirm` prints each fact as a STANDALONE line, and
+  ADR-0008 calls that prompt the one moment the operator is guaranteed to
+  read. The misleading render landed exactly where it hurt most. Any string
+  destined for `confirm`'s `facts` must be true read alone, with zero
+  surrounding context — check every new fact line against that bar.
+  **`src/policy/evidence.rs` is now the single place for evidence-age
+  derivation** (`remaining_coverage_evidence` + pure `describe`). It
+  deliberately does NOT match `audit.rs`'s `verify_age` query: per-volume
+  rows not a unit-level MAX, `outcome='passed'` in a LEFT JOIN's ON clause
+  (a WHERE turns it back into an inner join and never-verified volumes
+  vanish), `coverage::eligible` on the volumes alias, and exclusion of the
+  volume being consumed. Copy `audit.rs`'s query into a new evidence call
+  site and the line will cite the very volume being retired as its own
+  remaining coverage.
   **The gate now has leg 5: interrupt+resume (#93), 3 arms + verify/restore,
   and it RUNS LAST because it erases the tape legs 1-4 wrote.** Gate is now
   ~1m50s. Two facts any future gate work needs: **bash sets SIGINT to IGNORED
