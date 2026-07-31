@@ -45,10 +45,30 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Install dar
+        # The ungated suite is NOT hermetic, despite what this file claimed
+        # until 2026-07-31. `staging::tests` and `cli::stage::tests` shell out
+        # to a real dar to build archives, and `tests/cli_smoke.rs` spawns
+        # `stage create`, which does the same. Without dar those tests fail,
+        # and they had been failing here for many commits while every local
+        # `cargo test` passed — this job was reporting red so consistently
+        # that its signal had stopped meaning anything.
+        #
+        # Installing dar is the honest fix: dar >= 2.6 is a documented hard
+        # dependency of the tool (CLAUDE.md, README), so a CI run without it
+        # is not testing the product as shipped. Ubuntu's `dar` package is
+        # 2.7.x, comfortably above the minimum enforced by src/dar/version.rs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dar
+          dar --version | head -2
+
       - name: Run tests
         # Debug profile on purpose — release builds are for publishing and the
-        # perf suite only (house build rule). The ungated suite is hermetic:
-        # no external binaries, no $HOME, no devices (audit, measured baseline).
+        # perf suite only (house build rule). No $HOME dependence and no tape
+        # devices: the mhvtl e2e and perf suites stay gated out (see the
+        # header). dar is the one external binary this suite genuinely needs,
+        # installed above.
         run: cargo test --locked
 
   man-drift:
