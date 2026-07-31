@@ -265,6 +265,192 @@ pub struct CleanReport {
     pub files_removed: usize,
     pub bytes_freed: i64,
     pub errors: usize,
+    /// `sessions/*` directories removed because every `writes` row
+    /// referencing them reached a terminal state (`completed`, `failed`,
+    /// `aborted`) — see `reclaim_session_dirs`.
+    pub session_dirs_reclaimed: usize,
+    /// `sessions/*` directories left untouched because at least one
+    /// referencing `writes` row is still `planned`, `in_progress`, or
+    /// `interrupted` (§3.5: a resumable session's rewrite source).
+    pub session_dirs_retained: usize,
+    /// `sessions/*` directories with NO referencing `writes` row at all —
+    /// could be crash garbage from a `build()` that never reached `plan()`,
+    /// or a concurrent write's session dir created moments ago. Never
+    /// removed unless `force` is set.
+    pub session_dirs_orphaned: usize,
+    /// `locks/stage-<id>.lock` files removed because their stage_set
+    /// reached a terminal state (`staged`, `failed`, `cleaned`).
+    pub lockfiles_reclaimed: usize,
+}
+
+/// Reclaim `{staging.directory}/sessions/*` directories and terminal
+/// `locks/stage-<id>.lock` files (issue #95).
+///
+/// ## Session directories
+///
+/// `build()` (`src/volume/write.rs`) materializes every generated zone of a
+/// volume write into `{staging.directory}/sessions/{label}-{uuid}/`, and
+/// nothing else in the write path ever deletes that directory. Since #25 it
+/// is also the **only** rehydrate source for a resumable session (`writes`
+/// rows carry it in `session_dir`), so it cannot be swept blindly.
+///
+/// A session dir is matched to `writes` rows by an EXACT equality compare —
+/// `writes.session_dir = <dir path>` — never a prefix or label match: two
+/// write attempts for the same volume label differ only by the trailing
+/// uuid, and a prefix match would silently reap the live one.
+///
+/// - **RETAIN** (untouched) while any referencing row is `planned`,
+///   `in_progress`, or `interrupted`. `v2-open-questions.md` §3.5's guard is
+///   "not in a terminal-success state" read literally, but that wording
+///   would also retain `failed`/`aborted` rows forever, recreating exactly
+///   the leak this issue exists to fix. §3.5's own parenthetical states the
+///   real intent: "a GC that reaps an **interrupted** session's slices
+///   silently converts 'resumable' into 'aborted'" — only `interrupted`
+///   (plus the still-live `planned`/`in_progress`) is resumable
+///   (`layout-session.md`'s rehydrate adopts only `interrupted` rows), so
+///   those are the only statuses that must block reclamation.
+/// - **RECLAIM** (remove recursively, size added to `bytes_freed`) once at
+///   least one row references the dir and every one of them is
+///   `completed`, `failed`, or `aborted` — none of those states leave a
+///   resumable session behind.
+/// - **ORPHAN** (report only, `session_dirs_orphaned`) when no `writes` row
+///   references the dir at all. This is indistinguishable from a
+///   concurrent `volume write` whose `build()` has created the directory
+///   but whose `plan()` has not yet committed its `writes` rows — the same
+///   race #98 eliminated from the staging sweep. Deleting it here would
+///   destroy a live session's frozen zones mid-build, so an orphan is only
+///   removed when the operator explicitly passes `force` (a leaked
+///   directory is strictly better than racing a live writer).
+///
+/// ## Lockfiles
+///
+/// `lock::lock_path` (issue #98) never has a matching remover, so one
+/// lockfile accumulates per stage_set forever. A lockfile is safe to
+/// unlink only once its stage_set is terminal (`staged`, `failed`,
+/// `cleaned` — the full non-`staging` set of `stage_sets.status`'s CHECK
+/// constraint): `stage_set_id`s are unique and monotonic, so a terminal
+/// set's lock can never be re-acquired by a future stage attempt, and thus
+/// a stale inode can never be raced by a fresh flock on a same-named file
+/// the way it theoretically could for a still-`staging` set (a live holder
+/// plus a second process recreating the path would each lock a different
+/// inode and both believe they hold it). `staging` is deliberately excluded
+/// even though the CHECK only has four values.
+pub fn reclaim_session_dirs_and_lockfiles(
+    conn: &Connection,
+    config: &Config,
+    db_file: &Path,
+    force: bool,
+    report: &mut CleanReport,
+) -> Result<()> {
+    reclaim_session_dirs(conn, config, force, report)?;
+    reclaim_lockfiles(conn, db_file, report)?;
+    Ok(())
+}
+
+fn reclaim_session_dirs(
+    conn: &Connection,
+    config: &Config,
+    force: bool,
+    report: &mut CleanReport,
+) -> Result<()> {
+    let sessions_root = Path::new(&config.staging.directory).join("sessions");
+    let entries = match fs::read_dir(&sessions_root) {
+        Ok(e) => e,
+        Err(_) => return Ok(()), // no sessions dir yet — nothing to do
+    };
+
+    const NON_TERMINAL: [&str; 3] = ["planned", "in_progress", "interrupted"];
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+
+        let statuses: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT status FROM writes WHERE session_dir = ?1")?;
+            let rows = stmt
+                .query_map(params![path_str], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        if statuses.is_empty() {
+            report.session_dirs_orphaned += 1;
+            if force {
+                remove_dir_and_account(&path, report);
+            }
+            continue;
+        }
+
+        let any_non_terminal = statuses.iter().any(|s| NON_TERMINAL.contains(&s.as_str()));
+        if any_non_terminal {
+            report.session_dirs_retained += 1;
+            continue;
+        }
+
+        // Every referencing row is completed/failed/aborted — reclaim.
+        remove_dir_and_account(&path, report);
+        report.session_dirs_reclaimed += 1;
+    }
+
+    Ok(())
+}
+
+fn remove_dir_and_account(path: &Path, report: &mut CleanReport) {
+    let size = dir_size(path);
+    match fs::remove_dir_all(path) {
+        Ok(()) => {
+            report.bytes_freed += size;
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "failed to remove session dir");
+            report.errors += 1;
+        }
+    }
+}
+
+fn dir_size(path: &Path) -> i64 {
+    let mut total = 0i64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += dir_size(&p);
+            } else if let Ok(meta) = fs::metadata(&p) {
+                total += meta.len() as i64;
+            }
+        }
+    }
+    total
+}
+
+fn reclaim_lockfiles(conn: &Connection, db_file: &Path, report: &mut CleanReport) -> Result<()> {
+    let terminal_sets: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM stage_sets WHERE status IN ('staged', 'failed', 'cleaned')")?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    for stage_set_id in terminal_sets {
+        let path = crate::staging::lock::lock_path(db_file, stage_set_id);
+        if !path.exists() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => report.lockfiles_reclaimed += 1,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to remove stage lockfile");
+                report.errors += 1;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -557,6 +743,194 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "cleaned");
+    }
+
+    // --- Change 1: session directory reclamation (issue #95) ---
+
+    /// A `writes` row referencing a session dir, at the given status, plus a
+    /// small file inside the dir to prove size accounting.
+    fn seed_session_dir_with_write(conn: &Connection, staging_dir: &Path, status: &str) -> PathBuf {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('u-uuid-s', 'u', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snapshot_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V-SESS', 'lto', 'lto0', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+
+        let session_dir = staging_dir
+            .join("sessions")
+            .join(format!("V-SESS-{status}"));
+        fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("0000_id_thunk"), b"frozen bytes").unwrap();
+
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stage_set_id,
+                snapshot_id,
+                volume_id,
+                status,
+                session_dir.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+
+        session_dir
+    }
+
+    /// §3.5's explicit requirement: a session dir referenced by an
+    /// `interrupted`/`planned`/`in_progress` row must survive reclamation —
+    /// deleting it would silently convert a resumable session into an
+    /// unrecoverable one.
+    #[test]
+    fn session_dir_survives_while_any_write_is_non_terminal() {
+        for status in ["planned", "in_progress", "interrupted"] {
+            let conn = db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let session_dir = seed_session_dir_with_write(&conn, dir.path(), status);
+
+            let mut report = CleanReport::default();
+            reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+
+            assert!(
+                session_dir.exists(),
+                "session dir must survive while a write is '{status}'"
+            );
+            assert_eq!(report.session_dirs_reclaimed, 0);
+            assert_eq!(report.session_dirs_retained, 1);
+        }
+    }
+
+    /// A session dir whose only referencing write is `completed` is removed
+    /// and its bytes counted.
+    #[test]
+    fn session_dir_reclaimed_when_write_is_completed() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "completed");
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+
+        assert!(!session_dir.exists());
+        assert_eq!(report.session_dirs_reclaimed, 1);
+        assert_eq!(report.bytes_freed, 12); // "frozen bytes".len()
+    }
+
+    /// Pins the wording-vs-intent decision: `failed` (with no non-terminal
+    /// row) is reclaimable, not retained forever under a literal
+    /// "terminal-success" reading.
+    #[test]
+    fn session_dir_reclaimed_when_write_is_failed() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "failed");
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+
+        assert!(!session_dir.exists());
+        assert_eq!(report.session_dirs_reclaimed, 1);
+    }
+
+    /// A session dir with NO referencing `writes` row is an orphan: left
+    /// alone by default (indistinguishable from a concurrent build() that
+    /// hasn't reached plan() yet), removed only with `force`.
+    #[test]
+    fn orphan_session_dir_survives_without_force_and_is_removed_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions").join("V-ORPHAN-uuid");
+        fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("stray"), b"orphan bytes").unwrap();
+
+        let conn = db::open_memory().unwrap();
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+        assert!(session_dir.exists(), "orphan must survive without force");
+        assert_eq!(report.session_dirs_orphaned, 1);
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), true, &mut report).unwrap();
+        assert!(!session_dir.exists(), "orphan must be removed with force");
+    }
+
+    // --- Change 2: lockfile reclamation (issue #95) ---
+
+    /// A lockfile for a `staging` (non-terminal) stage_set must survive —
+    /// the load-bearing precondition: unlinking a lockfile that a live
+    /// process might still hold (or re-acquire) risks a second flock
+    /// succeeding on a fresh inode at the same path while the original
+    /// holder's flock is still live on the old one. `staging` sets are the
+    /// only ones this can happen to, since `stage_set_id`s are unique and
+    /// monotonic — a terminal set's lock can never be contended again.
+    #[test]
+    fn lockfile_for_staging_stage_set_survives() {
+        let (conn, stage_set_id, _path, _dir) = seed_stage_set_with_status("staging");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let _lock = crate::staging::lock::acquire(&db_file, stage_set_id).unwrap();
+        let path = crate::staging::lock::lock_path(&db_file, stage_set_id);
+        assert!(path.exists());
+
+        let mut report = CleanReport::default();
+        reclaim_lockfiles(&conn, &db_file, &mut report).unwrap();
+        assert!(path.exists(), "lockfile for a 'staging' set must survive");
+        assert_eq!(report.lockfiles_reclaimed, 0);
+    }
+
+    /// Lockfiles for terminal stage_sets (`staged`, `failed`, `cleaned`) are
+    /// removed.
+    #[test]
+    fn lockfile_for_terminal_stage_set_is_removed() {
+        for status in ["staged", "failed", "cleaned"] {
+            let (conn, stage_set_id, _path, _dir) = seed_stage_set_with_status(status);
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db_file = tmp.path().join("tapectl.db");
+            let _lock = crate::staging::lock::acquire(&db_file, stage_set_id).unwrap();
+            drop(_lock);
+            let path = crate::staging::lock::lock_path(&db_file, stage_set_id);
+            assert!(path.exists());
+
+            let mut report = CleanReport::default();
+            reclaim_lockfiles(&conn, &db_file, &mut report).unwrap();
+            assert!(
+                !path.exists(),
+                "lockfile for a '{status}' set must be removed"
+            );
+            assert_eq!(report.lockfiles_reclaimed, 1);
+        }
     }
 
     /// A sibling stage_set's plaintext files must never be swept up by
