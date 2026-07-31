@@ -199,3 +199,312 @@ fn db_fsck_before_init_is_not_a_silent_success() {
         "db fsck against an uninitialized home must not exit 0"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #98: two-real-process concurrency tests for the stage_create flock.
+//
+// A same-process test with two `Connection`s would prove nothing about
+// process death — the kernel only releases a `flock` when the *process*
+// holding it exits, so these tests spawn the real binary as a genuine
+// child process, kill (or leave running) that child, and observe the
+// effect from a second, independent `tapectl` invocation / DB connection.
+// ---------------------------------------------------------------------
+
+/// Bring up a throwaway `HOME` far enough to run `stage create`: init,
+/// operator tenant already created by `init`, a fresh tenant + key, a unit
+/// pointing at `source_dir`, and one snapshot of it. Also repoints
+/// `config.toml`'s `staging.directory` at `staging_dir` — `init`'s default
+/// (`/mnt/staging`) is an arbitrary system path this test must never touch.
+///
+/// Returns the unit name to pass to `stage create`.
+fn prepare_home_for_staging(
+    home: &std::path::Path,
+    source_dir: &std::path::Path,
+    staging_dir: &std::path::Path,
+) -> String {
+    let init_out = run_tapectl(home, &["init"]);
+    assert!(
+        init_out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    // Repoint staging.directory at our own TempDir before anything stages,
+    // and dar.binary at wherever this box actually has dar installed —
+    // `Config::default`'s `/opt/dar/bin/dar` is very unlikely to exist.
+    let config_path = home.join(".tapectl").join("config.toml");
+    let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
+    cfg.staging.directory = staging_dir.to_string_lossy().to_string();
+    cfg.dar.binary = std::env::var("TAPECTL_TEST_DAR_BIN").unwrap_or_else(|_| "dar".to_string());
+    cfg.save(&config_path).expect("save repointed config");
+
+    // `tenant add` already generates a keypair automatically (see
+    // `TenantCommands::Add`'s own doc comment) — no separate `key generate`
+    // needed, and calling one anyway would collide on the default alias.
+    let tenant_out = run_tapectl(home, &["tenant", "add", "acme"]);
+    assert!(
+        tenant_out.status.success(),
+        "tenant add failed: {}",
+        String::from_utf8_lossy(&tenant_out.stderr)
+    );
+
+    let unit_name = "unit1";
+    let unit_out = run_tapectl(
+        home,
+        &[
+            "unit",
+            "init",
+            &source_dir.to_string_lossy(),
+            "--tenant",
+            "acme",
+            "--name",
+            unit_name,
+        ],
+    );
+    assert!(
+        unit_out.status.success(),
+        "unit init failed: {}",
+        String::from_utf8_lossy(&unit_out.stderr)
+    );
+
+    let snap_out = run_tapectl(home, &["snapshot", "create", unit_name]);
+    assert!(
+        snap_out.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&snap_out.stderr)
+    );
+
+    unit_name.to_string()
+}
+
+/// A source directory with one large-ish, incompressible file — big enough
+/// that `stage create`'s sha256 validation + dar run take a real,
+/// observable amount of wall-clock time, giving the polling loops below a
+/// wide window to catch the process mid-flight. Zero-filled data compresses
+/// to nothing and would race dar to completion in milliseconds; pseudo-random
+/// bytes don't.
+fn make_slow_source_dir() -> tempfile::TempDir {
+    use std::io::Write;
+    let dir = tempfile::TempDir::new().expect("source tempdir");
+    let path = dir.path().join("bulk.bin");
+    let mut f = std::fs::File::create(&path).expect("create bulk file");
+    let mut buf = vec![0u8; 1024 * 1024];
+    for i in 0..250 {
+        // A cheap, non-cryptographic fill that isn't just zeros or a
+        // repeating byte (both of which dar's compression would flatten to
+        // near-nothing): vary the byte value per megabyte per offset.
+        for (j, b) in buf.iter_mut().enumerate() {
+            *b = ((i * 2654435761u64 + j as u64) % 251) as u8;
+        }
+        f.write_all(&buf).expect("write bulk chunk");
+    }
+    dir
+}
+
+/// Poll `stage_sets` (via a fresh, independent `rusqlite::Connection` — a
+/// second process's-eye view of the same DB, not the harness's own
+/// `tapectl::db::open`, which would run the sweep itself) until a row
+/// reaches `want_status`, returning `(stage_set_id, staging_path_of_slice_1)`
+/// once found. Bounded by `timeout`; panics with a clear message on
+/// expiry rather than hanging the suite.
+fn poll_stage_set_status(
+    db_path: &std::path::Path,
+    want_status: &str,
+    timeout: std::time::Duration,
+) -> i64 {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            let row: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT id, status FROM stage_sets ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            if let Some((id, status)) = row {
+                if status == want_status {
+                    return id;
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "timed out after {:?} waiting for a stage_sets row at status='{want_status}'",
+                timeout
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Poll `staging_dir` until at least one plaintext `.dar` file appears —
+/// proof dar has actually started producing output, not just that
+/// `stage_create` got as far as its initial INSERT. Bounded by `timeout`.
+fn poll_for_any_dar_file(
+    staging_dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::path::PathBuf {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(entries) = std::fs::read_dir(staging_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".dar") {
+                    return entry.path();
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "timed out after {:?} waiting for a .dar file to appear under {}",
+                timeout,
+                staging_dir.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// SIGKILL a child by pid via the system `kill` utility — deliberately NOT
+/// `nix::sys::signal::kill` (the `nix` crate here has no `signal` feature
+/// enabled, and issue #98's guardrails forbid adding one).
+fn sigkill(pid: u32) {
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .expect("failed to invoke kill(1)");
+    assert!(status.success(), "kill -KILL {pid} failed");
+}
+
+/// Test A (issue #98): a stage crashed by SIGKILL is detected as such by
+/// the next `db::open()` sweep — its row moves 'staging' -> 'failed' — and
+/// `staging clean` then removes the plaintext it left behind.
+#[test]
+fn crashed_stage_is_detected_and_then_cleanable() {
+    let home = TempDir::new().expect("home tempdir");
+    let staging_dir = TempDir::new().expect("staging tempdir");
+    let source_dir = make_slow_source_dir();
+
+    let unit_name = prepare_home_for_staging(home.path(), source_dir.path(), staging_dir.path());
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["stage", "create", &unit_name])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn stage create");
+
+    // Precondition 1: the row exists and is 'staging' — proves the INSERT
+    // + flock + COMMIT sequence has happened.
+    poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
+    // Precondition 2: dar has actually produced plaintext output — gives
+    // `staging clean`'s prefix scan something real to find and remove.
+    let dar_file = poll_for_any_dar_file(staging_dir.path(), std::time::Duration::from_secs(60));
+    assert!(dar_file.exists());
+
+    sigkill(child.id());
+    let _ = child.wait();
+
+    // Trigger the sweep via any other command's `db::open()`.
+    let status_out = run_tapectl(home.path(), &["staging", "status"]);
+    assert!(
+        status_out.status.success(),
+        "staging status failed: {}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM stage_sets ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status, "failed",
+        "a SIGKILLed stage must be swept to 'failed' by the next db::open()"
+    );
+    drop(conn);
+
+    assert!(
+        dar_file.exists(),
+        "the sweep must mark status only, never touch files"
+    );
+
+    let clean_out = run_tapectl(home.path(), &["staging", "clean"]);
+    assert!(
+        clean_out.status.success(),
+        "staging clean failed: {}",
+        String::from_utf8_lossy(&clean_out.stderr)
+    );
+    assert!(
+        !dar_file.exists(),
+        "staging clean must remove the crashed stage's plaintext .dar file"
+    );
+}
+
+/// Test B (issue #98) — the safety property: a LIVE stage (still running,
+/// lock held) must NOT be disturbed by a concurrent read-only command's
+/// `db::open()` sweep. Its row must stay 'staging' and its plaintext files
+/// must stay on disk.
+#[test]
+fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
+    let home = TempDir::new().expect("home tempdir");
+    let staging_dir = TempDir::new().expect("staging tempdir");
+    let source_dir = make_slow_source_dir();
+
+    let unit_name = prepare_home_for_staging(home.path(), source_dir.path(), staging_dir.path());
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["stage", "create", &unit_name])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn stage create");
+
+    poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
+    let dar_file = poll_for_any_dar_file(staging_dir.path(), std::time::Duration::from_secs(60));
+    assert!(dar_file.exists());
+
+    // The live stage is still running (never killed) — run a read-only
+    // command in a second, independent process while it's in flight.
+    let report_out = run_tapectl(home.path(), &["db", "fsck"]);
+    assert!(
+        report_out.status.success(),
+        "db fsck failed: {}",
+        String::from_utf8_lossy(&report_out.stderr)
+    );
+
+    // The safety assertion: the live stage's row and files must be
+    // untouched by that concurrent sweep.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM stage_sets ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        status, "staging",
+        "a live stage's row must not be marked 'failed' by a concurrent sweep"
+    );
+    assert!(
+        dar_file.exists(),
+        "a live stage's plaintext files must not be touched by a concurrent sweep"
+    );
+
+    // Clean up: this test never needs the child to finish, and must not
+    // leak it. Kill it now that the assertions are done.
+    sigkill(child.id());
+    let _ = child.wait();
+}
