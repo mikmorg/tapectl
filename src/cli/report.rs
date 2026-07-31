@@ -301,10 +301,13 @@ fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    let min_copies = config.defaults.min_copies_for_tape_only as i64;
-    let mut risks: Vec<serde_json::Value> = Vec::new();
+/// Per-unit `(name, status, copies, locations)` rows behind `report
+/// fire-risk`, split out from the printing so the computed counts are
+/// directly assertable in tests without capturing stdout — the same
+/// pattern as [`copies_rows`] and `dirty_rows`.
+pub(crate) type FireRiskRow = (String, String, i64, i64);
 
+pub(crate) fn fire_risk_rows(conn: &Connection, min_copies: i64) -> Result<Vec<FireRiskRow>> {
     // Units with fewer copies than min_copies. ADR-0004 (issue #89): a
     // non-sealed volume's write must not count, but this query LEFT JOINs
     // volumes to preserve units with zero writes (so they still surface
@@ -330,11 +333,18 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
          HAVING copies < ?1 OR copies = 0"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let at_risk: Vec<(String, String, i64, i64)> = stmt
+    let at_risk: Vec<FireRiskRow> = stmt
         .query_map(params![min_copies], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(at_risk)
+}
+
+fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    let min_copies = config.defaults.min_copies_for_tape_only as i64;
+    let mut risks: Vec<serde_json::Value> = Vec::new();
+    let at_risk = fire_risk_rows(conn, min_copies)?;
 
     for (name, status, copies, locations) in &at_risk {
         risks.push(serde_json::json!({
@@ -434,7 +444,15 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
     Ok(())
 }
 
-fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+/// Per-unit `(name, copies, locations)` rows behind `report tape-only`,
+/// split out from the printing for the same testability reason as
+/// [`copies_rows`] and [`fire_risk_rows`].
+pub(crate) type TapeOnlyRow = (String, i64, i64);
+
+pub(crate) fn tape_only_rows(
+    conn: &Connection,
+    unit_filter: Option<&str>,
+) -> Result<Vec<TapeOnlyRow>> {
     // Same ADR-0004 CASE-in-aggregate treatment as `report_fire_risk` and
     // `copies_rows` above (issue #89): the volumes LEFT JOIN must stay a
     // LEFT JOIN (to keep tape-only units with zero eligible copies in the
@@ -461,11 +479,16 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(String, i64, i64)> = stmt
+    let rows: Vec<TapeOnlyRow> = stmt
         .query_map(params_ref.as_slice(), |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+    let rows = tape_only_rows(conn, unit_filter)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
