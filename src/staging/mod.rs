@@ -62,9 +62,11 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> R
 
     // Large files: warn on any file exceeding `large_file_warn_threshold`
     // (design line 203). Threshold computed once, outside the loop.
-    // `parse_size_to_bytes` inherits its known parsing defects (issue #59,
-    // still open) — not addressed here.
-    let large_file_threshold = parse_size_to_bytes(&config.defaults.large_file_warn_threshold);
+    // `parse_size_to_bytes` (issue #59) now rejects a malformed threshold
+    // rather than silently miscomputing it; `config.defaults.*` is also
+    // validated at config load, so in practice this only fails if that
+    // guard is ever bypassed.
+    let large_file_threshold = parse_size_to_bytes(&config.defaults.large_file_warn_threshold)?;
     for entry in &manifest_entries {
         if !entry.is_dir && entry.size > large_file_threshold {
             tracing::warn!(
@@ -205,7 +207,7 @@ fn stage_create_inner(
     // stage_create used to read config.defaults.* unconditionally, so an
     // archive_set or dotfile override of slice_size/compression/preserve_*
     // was silently discarded even where #48 gives archive_set_id a writer.
-    let resolved = crate::policy::resolve(conn, config, &unit);
+    let resolved = crate::policy::resolve(conn, config, &unit)?;
 
     // `ResolvedPolicy.slice_size` is bytes-only at every layer (even
     // `policy::resolve`'s own default layer runs `config.defaults.slice_size`
@@ -1087,21 +1089,130 @@ fn generate_receipt(
     Ok(receipt)
 }
 
-pub fn parse_size_to_bytes(s: &str) -> i64 {
-    let s = s.trim();
-    let (num_str, suffix) = s
+/// Parse an operator-facing size string (e.g. `"10G"`, `"500M"`, or a bare
+/// byte count like `"1024"`) into a byte count.
+///
+/// A bare number with no suffix is valid and means bytes. Anything else that
+/// doesn't parse cleanly — an unparseable number, an unrecognized suffix, a
+/// negative value, or a magnitude too large to represent — is an ERROR
+/// (issue #59): this value feeds `stage_sets.slice_size`, capacity math, and
+/// bin-packing, so a silent fallback (0 bytes for a bad number; multiplier-1
+/// for a bad suffix, e.g. `"2500GG"` silently becoming 2500 bytes) is worse
+/// than a loud rejection.
+pub fn parse_size_to_bytes(s: &str) -> Result<i64> {
+    let trimmed = s.trim();
+    let invalid = || {
+        TapectlError::Config(format!(
+            "{trimmed:?} is not a valid size (expected e.g. 2500G, 500M, or a bare byte count)"
+        ))
+    };
+
+    let (num_str, suffix) = trimmed
         .find(|c: char| c.is_alphabetic())
-        .map(|i| (&s[..i], &s[i..]))
-        .unwrap_or((s, ""));
-    let num: f64 = num_str.parse().unwrap_or(0.0);
-    let multiplier = match suffix.to_uppercase().as_str() {
+        .map(|i| (&trimmed[..i], &trimmed[i..]))
+        .unwrap_or((trimmed, ""));
+
+    let num: f64 = num_str.parse().map_err(|_| invalid())?;
+    if num.is_nan() || num < 0.0 {
+        return Err(invalid());
+    }
+
+    let multiplier: f64 = match suffix.to_uppercase().as_str() {
+        "" => 1.0,
         "K" | "KB" => 1024.0,
         "M" | "MB" => 1024.0 * 1024.0,
         "G" | "GB" => 1024.0 * 1024.0 * 1024.0,
         "T" | "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => 1.0,
+        _ => return Err(invalid()),
     };
-    (num * multiplier) as i64
+
+    let bytes = num * multiplier;
+    if !bytes.is_finite() || bytes > i64::MAX as f64 {
+        return Err(invalid());
+    }
+    Ok(bytes as i64)
+}
+
+#[cfg(test)]
+mod parse_size_to_bytes_tests {
+    //! Issue #59: `parse_size_to_bytes` used to silently paper over both an
+    //! unparseable number (`.unwrap_or(0.0)` -> 0 bytes) and an unknown
+    //! suffix (falls through to multiplier 1.0, so `"2500GG"` became 2500
+    //! bytes instead of erroring). Both are now `Err`.
+    use super::parse_size_to_bytes;
+
+    #[test]
+    fn bare_number_means_bytes() {
+        assert_eq!(parse_size_to_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_size_to_bytes("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn every_known_suffix_case_insensitive() {
+        assert_eq!(parse_size_to_bytes("2K").unwrap(), 2 * 1024);
+        assert_eq!(parse_size_to_bytes("2k").unwrap(), 2 * 1024);
+        assert_eq!(parse_size_to_bytes("2KB").unwrap(), 2 * 1024);
+        assert_eq!(parse_size_to_bytes("2kb").unwrap(), 2 * 1024);
+        assert_eq!(parse_size_to_bytes("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size_to_bytes("2MB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size_to_bytes("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_to_bytes("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_size_to_bytes("2T").unwrap(),
+            2 * 1024 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_size_to_bytes("2TB").unwrap(),
+            2 * 1024 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn unknown_suffix_is_an_error() {
+        let err = parse_size_to_bytes("2500GG").unwrap_err().to_string();
+        assert!(err.contains("2500GG"), "error must name the value: {err}");
+        assert!(
+            err.contains("2500G") || err.to_lowercase().contains("valid size"),
+            "error must show accepted forms: {err}"
+        );
+
+        assert!(parse_size_to_bytes("5X").is_err());
+    }
+
+    #[test]
+    fn unknown_suffix_does_not_silently_become_bytes() {
+        // The historic defect: "2500GG" silently became 2500 bytes via
+        // multiplier 1.0. It must now be an error, never 2500.
+        assert!(parse_size_to_bytes("2500GG").is_err());
+    }
+
+    #[test]
+    fn unparseable_number_is_an_error() {
+        assert!(parse_size_to_bytes("").is_err());
+        assert!(parse_size_to_bytes("abc").is_err());
+        assert!(parse_size_to_bytes("1.2.3").is_err());
+    }
+
+    #[test]
+    fn negative_value_is_an_error() {
+        assert!(parse_size_to_bytes("-5G").is_err());
+        assert!(parse_size_to_bytes("-1").is_err());
+    }
+
+    #[test]
+    fn absurd_magnitude_errors_rather_than_producing_garbage() {
+        // Historically `(num * multiplier) as i64` on an out-of-range f64
+        // silently saturates/truncates. Must error deliberately instead.
+        assert!(parse_size_to_bytes("99999999999999999999G").is_err());
+    }
+
+    #[test]
+    fn whitespace_is_trimmed() {
+        assert_eq!(
+            parse_size_to_bytes("  10G  ").unwrap(),
+            10 * 1024 * 1024 * 1024
+        );
+    }
 }
 
 /// Walk a directory and collect manifest entries. `global_excludes` is
@@ -2274,7 +2385,12 @@ mod tests {
     fn snapshot_create_allows_large_file_with_warning() {
         let tmp = TempDir::new().unwrap();
         let (conn, _paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        config.defaults.large_file_warn_threshold = "10B".to_string();
+        // Issue #59: "10B" was never a documented valid suffix (only
+        // K/KB/M/MB/G/GB/T/TB, or a bare number meaning bytes) — it only
+        // "worked" before because an unrecognized suffix silently fell
+        // back to multiplier 1.0. A bare "10" is the correct spelling for
+        // ten bytes now that an unknown suffix is a hard error.
+        config.defaults.large_file_warn_threshold = "10".to_string();
         fs::write(src.join("big.bin"), vec![0u8; 1024]).unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &config)
