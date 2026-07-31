@@ -31,8 +31,13 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#43, #61, #62, #63, #83, #95, #97, #99.** (#91 closed 2026-07-30;
-  #99 filed as its scope residual. #59, #50, #51, #98 closed 2026-07-31.)
+  **#43, #61, #63, #83, #95, #97, #99.** (#91 closed 2026-07-30;
+  #99 filed as its scope residual. #59, #50, #51, #98, #62 closed
+  2026-07-31.)
+  **#43 (test truth) is now the natural next pick** — the CI finding above
+  is squarely its subject matter: the ungated suite's dar dependency was
+  undocumented and unhonoured for months, which is exactly the
+  "honest skips / test truth" gap #43 exists to close.
   **Staging is now flock-guarded (#98).** `stage_create` holds an exclusive
   flock on `<db_parent>/locks/stage-<id>.lock` for its lifetime; the
   `db::open` sweep probes that lock to tell a crash from a live run.
@@ -299,6 +304,25 @@ the normative design set named in the Policy block below.
   check wall-clock, not just pass counts. Sub-agent reports are leads, not
   evidence. Treat a flagged residual as a decision you must make, not an FYI
   to file.
+- **After pushing, actually READ the CI result** (`gh run list` / `gh run
+  watch --exit-status`). On 2026-07-31 CI was found red going back past #56
+  — 12 tests, every commit — because the ungated suite shells out to `dar`
+  and the workflow never installed it, while the workflow's own comment
+  claimed "the ungated suite is hermetic: no external binaries". Fixed in
+  `8485f73`. Five pushes in one session treated CI as an independent check
+  while it was providing no signal at all. A job that is red on every
+  commit is not a check; confirm green, don't assume it.
+- **Issue key/file lists go stale — re-audit before implementing.** #62
+  named 8 "parsed-but-ignored" config keys; 5 were wrong (already wired by
+  #52/#59, or never existed). Verify each claim against shipped code and
+  report the corrected table, exactly as with #50/#51's dar flags.
+- **"Wire-or-delete" on operator-facing surface now resolves to SURFACE**
+  (CTO precedent, #50/#92, in `docs/design-errata.md`): keep the knob and
+  report the no-op via `config check`. `policy::subsumed`, `policy::
+  decorative` and `policy::depth_check` are the established shape — a
+  `scan()` plus a pure `describe()`, advisory, never touching the exit code.
+  Never delete a key whose consumer is merely *deferred* (`block_size` is
+  owned by #20 / the open 512K-vs-1M hardware question).
 - **Restore-path gate:** any diff touching `src/volume/`, `src/tape/`,
   `src/staging/`, `src/crypto/`, or generated RESTORE.sh/RECOVERY.md content
   MUST pass `TAPECTL_MHVTL=1 ./scripts/mhvtl-verify-gate.sh` before the branch
