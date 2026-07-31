@@ -1,0 +1,40 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-deposit 1  "tapectl-volume-deposit " 
+.SH NAME
+tapectl\-volume\-deposit \- Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR\-0006)
+.SH SYNOPSIS
+\fBtapectl volume deposit\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR\-0006).
+.PP
+tapectl does NOT move the bytes. Issue #72 was rescoped by CTO decision: an operator copies a sealed volume\*(Aqs bytes to cold cloud storage by the documented external procedure (rclone / aws\-cli) and then RECORDS that copy here, so the catalog can reason about it.
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+tapectl\-volume\-deposit\-add(1)
+Record that a sealed volume\*(Aqs bytes now also exist at a warehouse
+.TP
+tapectl\-volume\-deposit\-list(1)
+List recorded deposits
+.TP
+tapectl\-volume\-deposit\-help(1)
+Print this message or the help of the given subcommand(s)

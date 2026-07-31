@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-archive\-set\-edit \- Edit an existing archive set
 .SH SYNOPSIS
-\fBtapectl archive\-set edit\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl archive\-set edit\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Edit an existing archive set
 .SH OPTIONS
@@ -54,6 +54,9 @@ Slice size (e.g., "2400G")
 .TP
 \fB\-\-verify\-interval\-days\fR \fI<VERIFY_INTERVAL_DAYS>\fR
 Verify interval in days
+.TP
+\fB\-\-warehouse\-copies\fR \fI<WAREHOUSE_COPIES>\fR
+Warehouse copies expected (ADR\-0006). Omitted leaves the field NULL, which means "defer to the system default"
 .TP
 \fB\-d\fR, \fB\-\-description\fR \fI<DESCRIPTION>\fR
 Description

@@ -4,19 +4,32 @@
 .SH NAME
 tapectl\-location\-add \- Add a storage location
 .SH SYNOPSIS
-\fBtapectl location add\fR [\fB\-d\fR|\fB\-\-description\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl location add\fR [\fB\-d\fR|\fB\-\-description\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-kind\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Add a storage location
 .SH OPTIONS
 .TP
 \fB\-d\fR, \fB\-\-description\fR \fI<DESCRIPTION>\fR
-Description
+Description. For a warehouse this is where the endpoint or prefix goes (e.g. "s3://bucket/prefix") \-\- there is deliberately no separate URI column (issue #73)
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
+.TP
+\fB\-\-kind\fR \fI<KIND>\fR [default: shelf]
+Kind of location (ADR\-0006). A `shelf` holds physical cartridges; a `warehouse` is cold cloud storage that can only receive recorded deposits (`volume deposit add`)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+shelf
+.IP \(bu 2
+warehouse
+.RE
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

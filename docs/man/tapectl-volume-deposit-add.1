@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-deposit-add 1  "tapectl-volume-deposit-add " 
+.SH NAME
+tapectl\-volume\-deposit\-add \- Record that a sealed volume\*(Aqs bytes now also exist at a warehouse
+.SH SYNOPSIS
+\fBtapectl volume deposit add\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-dry\-run\fR] [\fB\-\-receipt\fR] [\fB\-\-storage\-class\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-notes\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+.SH DESCRIPTION
+Record that a sealed volume\*(Aqs bytes now also exist at a warehouse
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-to\fR \fI<TO>\fR
+Warehouse location name (must be a location of kind `warehouse`)
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-receipt\fR \fI<RECEIPT>\fR
+The provider\*(Aqs receipt / object\-version identifier, if it gave one. There is deliberately no checksum field: tapectl did not perform the copy, so a typed\-in checksum would be a claim about a claim (issue #73)
+.TP
+\fB\-\-storage\-class\fR \fI<STORAGE_CLASS>\fR
+Storage class the bytes were placed in (e.g. DEEP_ARCHIVE)
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-notes\fR \fI<NOTES>\fR
+Free\-text note
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fILABEL\fR>
+Volume label whose bytes were deposited

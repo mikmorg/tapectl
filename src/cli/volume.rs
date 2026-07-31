@@ -171,6 +171,48 @@ pub enum VolumeCommands {
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
     },
+
+    /// Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006).
+    ///
+    /// tapectl does NOT move the bytes. Issue #72 was rescoped by CTO
+    /// decision: an operator copies a sealed volume's bytes to cold cloud
+    /// storage by the documented external procedure (rclone / aws-cli) and
+    /// then RECORDS that copy here, so the catalog can reason about it.
+    Deposit {
+        #[command(subcommand)]
+        command: DepositCommands,
+    },
+}
+
+/// `volume deposit` -- record and list warehouse copies (ADR-0006).
+#[derive(Subcommand, Debug)]
+pub enum DepositCommands {
+    /// Record that a sealed volume's bytes now also exist at a warehouse.
+    Add {
+        /// Volume label whose bytes were deposited
+        label: String,
+        /// Warehouse location name (must be a location of kind `warehouse`)
+        #[arg(long)]
+        to: String,
+        /// The provider's receipt / object-version identifier, if it gave
+        /// one. There is deliberately no checksum field: tapectl did not
+        /// perform the copy, so a typed-in checksum would be a claim about
+        /// a claim (issue #73).
+        #[arg(long)]
+        receipt: Option<String>,
+        /// Storage class the bytes were placed in (e.g. DEEP_ARCHIVE)
+        #[arg(long)]
+        storage_class: Option<String>,
+        /// Free-text note
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// List recorded deposits
+    List {
+        /// Only deposits of this volume
+        #[arg(long)]
+        volume: Option<String>,
+    },
 }
 
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
@@ -499,8 +541,140 @@ pub fn run(
                 println!("\ncompaction complete: {label} → {dest_label}");
             }
         }
+
+        VolumeCommands::Deposit { command } => run_deposit(conn, command, json_output)?,
     }
     Ok(exit_code)
+}
+
+/// `volume deposit` (ADR-0006, issue #73).
+///
+/// Two refusals, and only two. Both are validation of the recorded FACT,
+/// not policy gates -- ADR-0004 keeps every coverage judgement advisory,
+/// so nothing here warns, blocks, or grows a `--force`:
+///
+/// 1. The target location must be a `warehouse`. Recording a deposit at a
+///    shelf would claim a copy exists in a place nothing was copied to,
+///    and it would then be counted as one by every derivation.
+/// 2. The volume must pass `coverage::eligible` (sealed). You cannot have
+///    deposited bytes that were never sealed -- an unsealed volume's bytes
+///    are not final, so a copy of them is a copy of nothing durable.
+fn run_deposit(conn: &Connection, command: &DepositCommands, json_output: bool) -> Result<()> {
+    use crate::error::TapectlError;
+    use rusqlite::params;
+
+    match command {
+        DepositCommands::Add {
+            label,
+            to,
+            receipt,
+            storage_class,
+            notes,
+        } => {
+            let (vol_id, status): (i64, String) = conn
+                .query_row(
+                    "SELECT id, status FROM volumes WHERE label = ?1",
+                    params![label],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| TapectlError::VolumeNotFound(label.clone()))?;
+
+            let (loc_id, kind): (i64, String) = conn
+                .query_row(
+                    "SELECT id, kind FROM locations WHERE name = ?1",
+                    params![to],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| TapectlError::Other(format!("location \"{to}\" not found")))?;
+
+            if kind != "warehouse" {
+                return Err(TapectlError::Other(format!(
+                    "location \"{to}\" is a {kind}, not a warehouse; a deposit records bytes \
+                     copied to cold cloud storage. Create one with: \
+                     tapectl location add <NAME> --kind warehouse"
+                )));
+            }
+            if status != "sealed" {
+                return Err(TapectlError::Other(format!(
+                    "volume \"{label}\" is {status}, not sealed; only a sealed volume's bytes \
+                     are final, so there is nothing durable to have deposited"
+                )));
+            }
+
+            conn.execute(
+                "INSERT INTO volume_deposits (volume_id, location_id, receipt, storage_class, notes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![vol_id, loc_id, receipt, storage_class, notes],
+            )?;
+            let id = conn.last_insert_rowid();
+            crate::db::events::log_created(conn, "volume_deposit", id, label, None)?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"id": id, "volume": label, "location": to,
+                                       "receipt": receipt, "storage_class": storage_class})
+                );
+            } else {
+                println!(
+                    "recorded warehouse deposit of \"{label}\" at \"{to}\" (id={id}) — \
+                     never re-verified, and warehouse copies do not refresh"
+                );
+            }
+        }
+
+        DepositCommands::List { volume } => {
+            let mut sql = String::from(
+                "SELECT v.label, l.name, d.deposited_at, d.receipt, d.storage_class, d.notes
+                 FROM volume_deposits d
+                 JOIN volumes v ON v.id = d.volume_id
+                 JOIN locations l ON l.id = d.location_id",
+            );
+            let mut binds: Vec<String> = Vec::new();
+            if let Some(v) = volume {
+                sql.push_str(" WHERE v.label = ?1");
+                binds.push(v.clone());
+            }
+            sql.push_str(" ORDER BY v.label, l.name");
+            let mut stmt = conn.prepare(&sql)?;
+            let bind_refs: Vec<&dyn rusqlite::types::ToSql> = binds
+                .iter()
+                .map(|b| b as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows: Vec<serde_json::Value> = stmt
+                .query_map(bind_refs.as_slice(), |row| {
+                    Ok(serde_json::json!({
+                        "volume": row.get::<_, String>(0)?,
+                        "location": row.get::<_, String>(1)?,
+                        "deposited_at": row.get::<_, String>(2)?,
+                        "receipt": row.get::<_, Option<String>>(3)?,
+                        "storage_class": row.get::<_, Option<String>>(4)?,
+                        "notes": row.get::<_, Option<String>>(5)?,
+                    }))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+            } else if rows.is_empty() {
+                println!("no warehouse deposits recorded");
+            } else {
+                for r in &rows {
+                    println!(
+                        "  {} at {} — deposited {}{}",
+                        r["volume"].as_str().unwrap_or("?"),
+                        r["location"].as_str().unwrap_or("?"),
+                        r["deposited_at"].as_str().unwrap_or("?"),
+                        r["receipt"]
+                            .as_str()
+                            .map(|x| format!(", receipt {x}"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// ADR-0004 Tier 1: print the remaining-coverage evidence for every unit
@@ -557,6 +731,121 @@ fn verify_exit_code(report: &write::VerifyReport) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `volume deposit` validation (issue #73 / ADR-0006). These are the
+    /// only two refusals the whole feature adds; everything else about a
+    /// deposit is advisory.
+    mod deposits {
+        use super::*;
+        use rusqlite::params;
+
+        fn fixture() -> Connection {
+            let (conn, _unit, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            conn.execute("DELETE FROM volume_deposits", []).unwrap();
+            conn
+        }
+
+        fn add(conn: &Connection, label: &str, to: &str) -> Result<()> {
+            run_deposit(
+                conn,
+                &DepositCommands::Add {
+                    label: label.to_string(),
+                    to: to.to_string(),
+                    receipt: Some("rcpt-9".into()),
+                    storage_class: Some("DEEP_ARCHIVE".into()),
+                    notes: None,
+                },
+                true,
+            )
+        }
+
+        #[test]
+        fn records_a_deposit_of_a_sealed_volume_at_a_warehouse() {
+            let conn = fixture();
+            add(&conn, "L6-0003", "glacier").expect("sealed volume + warehouse must be accepted");
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM volume_deposits", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1);
+            let receipt: Option<String> = conn
+                .query_row("SELECT receipt FROM volume_deposits", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(receipt.as_deref(), Some("rcpt-9"));
+        }
+
+        #[test]
+        fn refuses_a_shelf_location() {
+            let conn = fixture();
+            let err = add(&conn, "L6-0003", "home").expect_err(
+                "a shelf is not a warehouse; recording a deposit there would \
+                             claim a copy in a place nothing was copied to",
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("is a shelf, not a warehouse"), "{msg}");
+        }
+
+        #[test]
+        fn refuses_a_volume_that_is_not_sealed() {
+            let conn = fixture();
+            conn.execute("UPDATE volumes SET status = 'active'", [])
+                .unwrap();
+            let err = add(&conn, "L6-0003", "glacier")
+                .expect_err("unsealed bytes are not final, so nothing durable was deposited");
+            let msg = err.to_string();
+            assert!(msg.contains("is active, not sealed"), "{msg}");
+        }
+
+        #[test]
+        fn refuses_an_unknown_location_and_an_unknown_volume() {
+            let conn = fixture();
+            assert!(add(&conn, "L6-0003", "nowhere").is_err());
+            assert!(add(&conn, "NO-SUCH-VOL", "glacier").is_err());
+        }
+
+        /// The UNIQUE(volume_id, location_id) constraint: the same volume
+        /// cannot be deposited twice at one warehouse, which would
+        /// double-count it as two copies.
+        #[test]
+        fn refuses_a_duplicate_deposit_of_the_same_volume_at_the_same_warehouse() {
+            let conn = fixture();
+            add(&conn, "L6-0003", "glacier").unwrap();
+            assert!(add(&conn, "L6-0003", "glacier").is_err());
+        }
+
+        #[test]
+        fn list_filters_by_volume_and_json_stdout_stays_parseable() {
+            let conn = fixture();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('L6-0004', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            add(&conn, "L6-0003", "glacier").unwrap();
+            add(&conn, "L6-0004", "glacier").unwrap();
+
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM volume_deposits d JOIN volumes v ON v.id = d.volume_id
+                     WHERE v.label = ?1",
+                    params!["L6-0003"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+
+            run_deposit(
+                &conn,
+                &DepositCommands::List {
+                    volume: Some("L6-0003".into()),
+                },
+                true,
+            )
+            .unwrap();
+        }
+    }
 
     #[test]
     fn verify_exit_code_clean_report_is_success() {

@@ -75,6 +75,13 @@ struct LocationRow {
     /// about whether coverage exists.
     #[tabled(rename = "Serviceable")]
     serviceable: String,
+    /// The warehouse location(s) this volume has been DEPOSITED to
+    /// (ADR-0006), or `-`. `locate` answers "where do I go to get this
+    /// back", and for a deposited volume one of the answers is not a
+    /// building. Rendered as a separate column rather than folded into
+    /// `Location`, which means "where the cartridge physically sits".
+    #[tabled(rename = "Warehouse")]
+    warehouse: String,
 }
 
 /// Where a unit's completed writes live, and whether each can actually
@@ -97,7 +104,11 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     let sql = format!(
         "SELECT v.label, v.status, COALESCE(l.name, 'unknown'),
                 s.version, ss.num_slices, w.completed_at,
-                CASE WHEN {sealed} THEN 1 ELSE 0 END
+                CASE WHEN {sealed} THEN 1 ELSE 0 END,
+                (SELECT GROUP_CONCAT(dl.name)
+                   FROM volume_deposits d
+                   JOIN locations dl ON dl.id = d.location_id
+                  WHERE d.volume_id = v.id)
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
@@ -118,6 +129,9 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                 slices: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 written: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 serviceable: if serviceable == 1 { "yes" } else { "NO" }.to_string(),
+                warehouse: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| "-".into()),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -254,6 +268,11 @@ pub fn run(conn: &Connection, command: &CatalogCommands, json_output: bool) -> R
                             "slices": r.slices,
                             "written": r.written,
                             "serviceable": r.serviceable == "yes",
+                            "warehouse_deposits": if r.warehouse == "-" {
+                                Vec::new()
+                            } else {
+                                r.warehouse.split(',').map(str::to_string).collect::<Vec<_>>()
+                            },
                         })
                     })
                     .collect();
@@ -478,6 +497,31 @@ mod tests {
             unplaced.location, "unknown",
             "a volume with NULL location_id must appear as unknown, not vanish"
         );
+    }
+
+    /// Issue #73 / ADR-0006: `locate` answers "where do I go to get this
+    /// back". For a deposited volume one of the answers is a warehouse,
+    /// and it must be visible as its own column -- never folded into
+    /// `Location`, which means where the CARTRIDGE physically sits.
+    #[test]
+    fn locate_shows_a_volumes_warehouse_deposits() {
+        let (conn, unit_id, vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        let rows = locate_rows(&conn, unit_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].location, "home",
+            "the cartridge is still on a shelf"
+        );
+        assert_eq!(rows[0].warehouse, "glacier");
+
+        conn.execute(
+            "DELETE FROM volume_deposits WHERE volume_id = ?1",
+            params![vol],
+        )
+        .unwrap();
+        let rows = locate_rows(&conn, unit_id).unwrap();
+        assert_eq!(rows[0].warehouse, "-", "no deposits renders as a dash");
     }
 
     #[test]

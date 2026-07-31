@@ -11,9 +11,16 @@ pub enum LocationCommands {
     Add {
         /// Location name (e.g., "home-rack", "parents-house")
         name: String,
-        /// Description
+        /// Description. For a warehouse this is where the endpoint or
+        /// prefix goes (e.g. "s3://bucket/prefix") -- there is
+        /// deliberately no separate URI column (issue #73).
         #[arg(long, short)]
         description: Option<String>,
+        /// Kind of location (ADR-0006). A `shelf` holds physical
+        /// cartridges; a `warehouse` is cold cloud storage that can only
+        /// receive recorded deposits (`volume deposit add`).
+        #[arg(long, default_value = "shelf", value_parser = ["shelf", "warehouse"])]
+        kind: String,
     },
     /// List locations
     List,
@@ -35,31 +42,46 @@ pub enum LocationCommands {
 struct LocationRow {
     #[tabled(rename = "Name")]
     name: String,
+    /// ADR-0006 location kind: `shelf` or `warehouse`. Shown because the
+    /// two are operationally nothing alike -- one you can drive to.
+    #[tabled(rename = "Kind")]
+    kind: String,
     #[tabled(rename = "Volumes")]
     volumes: i64,
+    #[tabled(rename = "Deposits")]
+    deposits: i64,
     #[tabled(rename = "Description")]
     description: String,
 }
 
 pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> Result<()> {
     match command {
-        LocationCommands::Add { name, description } => {
+        LocationCommands::Add {
+            name,
+            description,
+            kind,
+        } => {
             conn.execute(
-                "INSERT INTO locations (name, description) VALUES (?1, ?2)",
-                params![name, description],
+                "INSERT INTO locations (name, description, kind) VALUES (?1, ?2, ?3)",
+                params![name, description, kind],
             )?;
             let id = conn.last_insert_rowid();
             events::log_created(conn, "location", id, name, None)?;
             if json_output {
-                println!("{}", serde_json::json!({"id": id, "name": name}));
+                println!(
+                    "{}",
+                    serde_json::json!({"id": id, "name": name, "kind": kind})
+                );
             } else {
-                println!("location \"{name}\" added (id={id})");
+                println!("location \"{name}\" added (id={id}, kind={kind})");
             }
         }
         LocationCommands::List => {
             let mut stmt = conn.prepare(
                 "SELECT l.name, l.description,
-                        (SELECT COUNT(*) FROM volumes v WHERE v.location_id = l.id) as vol_count
+                        (SELECT COUNT(*) FROM volumes v WHERE v.location_id = l.id) as vol_count,
+                        l.kind,
+                        (SELECT COUNT(*) FROM volume_deposits d WHERE d.location_id = l.id)
                  FROM locations l ORDER BY l.name",
             )?;
             let rows: Vec<LocationRow> = stmt
@@ -68,6 +90,8 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                         name: row.get(0)?,
                         description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                         volumes: row.get(2)?,
+                        kind: row.get(3)?,
+                        deposits: row.get(4)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -76,7 +100,8 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!(rows
                         .iter()
-                        .map(|r| serde_json::json!({"name": r.name, "volumes": r.volumes}))
+                        .map(|r| serde_json::json!({"name": r.name, "kind": r.kind,
+                              "volumes": r.volumes, "deposits": r.deposits}))
                         .collect::<Vec<_>>()))
                     .unwrap()
                 );
@@ -87,11 +112,11 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
             }
         }
         LocationCommands::Info { name } => {
-            let (id, desc, created): (i64, Option<String>, String) = conn
+            let (id, desc, created, kind): (i64, Option<String>, String, String) = conn
                 .query_row(
-                    "SELECT id, description, created_at FROM locations WHERE name = ?1",
+                    "SELECT id, description, created_at, kind FROM locations WHERE name = ?1",
                     params![name],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(|_| TapectlError::Other(format!("location \"{name}\" not found")))?;
 
@@ -102,13 +127,32 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                 .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
+            let mut dep_stmt = conn.prepare(
+                "SELECT v.label, d.deposited_at, d.receipt, d.storage_class
+                 FROM volume_deposits d JOIN volumes v ON v.id = d.volume_id
+                 WHERE d.location_id = ?1 ORDER BY v.label",
+            )?;
+            #[allow(clippy::type_complexity)]
+            let deposits: Vec<(String, String, Option<String>, Option<String>)> = dep_stmt
+                .query_map(params![id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"name": name, "description": desc, "volumes": volumes})
+                    serde_json::json!({"name": name, "kind": kind, "description": desc,
+                                       "volumes": volumes,
+                                       "deposits": deposits.iter().map(|(label, at, receipt, class)|
+                                           serde_json::json!({"volume": label, "deposited_at": at,
+                                                              "receipt": receipt,
+                                                              "storage_class": class}))
+                                           .collect::<Vec<_>>()})
                 );
             } else {
                 println!("Location: {name}");
+                println!("  Kind:        {kind}");
                 if let Some(d) = &desc {
                     println!("  Description: {d}");
                 }
@@ -116,6 +160,22 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                 println!("  Volumes:     {}", volumes.len());
                 for (label, status) in &volumes {
                     println!("    {label} [{status}]");
+                }
+                if !deposits.is_empty() {
+                    println!("  Deposits:    {}", deposits.len());
+                    for (label, at, receipt, class) in &deposits {
+                        println!(
+                            "    {label} deposited {at}{}{}",
+                            receipt
+                                .as_deref()
+                                .map(|r| format!(" receipt={r}"))
+                                .unwrap_or_default(),
+                            class
+                                .as_deref()
+                                .map(|c| format!(" class={c}"))
+                                .unwrap_or_default()
+                        );
+                    }
                 }
             }
         }
