@@ -2,7 +2,7 @@ use clap::Subcommand;
 use rusqlite::Connection;
 use tabled::{Table, Tabled};
 
-use crate::config::Config;
+use crate::config::{Config, TapectlPaths};
 use crate::error::Result;
 use crate::staging::clean;
 
@@ -41,6 +41,7 @@ struct StagingRow {
 
 pub fn run(
     conn: &Connection,
+    paths: &TapectlPaths,
     config: &Config,
     command: &StagingCommands,
     json_output: bool,
@@ -88,7 +89,14 @@ pub fn run(
         }
 
         StagingCommands::Clean { force } => {
-            let report = clean::clean_staging(conn, config, *force)?;
+            let mut report = clean::clean_staging(conn, config, *force)?;
+            clean::reclaim_session_dirs_and_lockfiles(
+                conn,
+                config,
+                &paths.db_file,
+                *force,
+                &mut report,
+            )?;
             if json_output {
                 println!(
                     "{}",
@@ -97,6 +105,10 @@ pub fn run(
                         "files_removed": report.files_removed,
                         "bytes_freed": report.bytes_freed,
                         "errors": report.errors,
+                        "session_dirs_reclaimed": report.session_dirs_reclaimed,
+                        "session_dirs_retained": report.session_dirs_retained,
+                        "session_dirs_orphaned": report.session_dirs_orphaned,
+                        "lockfiles_reclaimed": report.lockfiles_reclaimed,
                     })
                 );
             } else {
@@ -105,6 +117,13 @@ pub fn run(
                     report.sets_cleaned,
                     report.files_removed,
                     report.bytes_freed / (1024 * 1024),
+                );
+                println!(
+                    "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed",
+                    report.session_dirs_reclaimed,
+                    report.session_dirs_retained,
+                    report.session_dirs_orphaned,
+                    report.lockfiles_reclaimed,
                 );
                 if report.errors > 0 {
                     println!("  {} errors", report.errors);

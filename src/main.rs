@@ -150,7 +150,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::stage::run(&conn, &paths, &cfg, command, cli.json)?;
         }
         Commands::Staging { ref command } => {
-            cli::staging::run(&conn, &cfg, command, cli.json)?;
+            cli::staging::run(&conn, &paths, &cfg, command, cli.json)?;
         }
         Commands::Volume { ref command } => {
             // issue #45/H10: `volume::run` now returns a process exit code

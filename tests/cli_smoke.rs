@@ -618,3 +618,50 @@ fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
     sigkill(child.id());
     let _ = child.wait();
 }
+
+/// `staging clean --json` (issue #95) must emit *pure* JSON (issue #56
+/// defect shape) that includes the new session-dir/lockfile reclamation
+/// counters, on a freshly initialized database with nothing to clean.
+#[test]
+fn staging_clean_json_is_pure_and_reports_session_and_lockfile_counters() {
+    let home = TempDir::new().expect("home tempdir");
+
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init_out.status.success(),
+        "init failed: stderr={}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let clean_out = run_tapectl(home.path(), &["staging", "clean", "--json"]);
+    assert!(
+        clean_out.status.success(),
+        "staging clean --json failed: stderr={}",
+        String::from_utf8_lossy(&clean_out.stderr)
+    );
+
+    // Parse the WHOLE stdout — a stray println! trailer alongside the JSON
+    // payload must fail this, per the #56 defect class.
+    let stdout = String::from_utf8_lossy(&clean_out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("staging clean --json stdout did not parse as pure JSON: {e}\nstdout={stdout:?}")
+    });
+
+    for key in [
+        "sets_cleaned",
+        "files_removed",
+        "bytes_freed",
+        "errors",
+        "session_dirs_reclaimed",
+        "session_dirs_retained",
+        "session_dirs_orphaned",
+        "lockfiles_reclaimed",
+    ] {
+        assert!(
+            parsed.get(key).is_some(),
+            "staging clean --json missing key '{key}': {parsed}"
+        );
+    }
+    assert_eq!(parsed["session_dirs_reclaimed"], 0);
+    assert_eq!(parsed["lockfiles_reclaimed"], 0);
+}
