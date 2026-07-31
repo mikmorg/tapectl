@@ -133,7 +133,37 @@ fn collect_findings(
         crate::cli::report::dirty_rows(conn, unit_filter, &config.defaults.global_excludes)?;
 
     for unit in &units {
-        let resolved = policy::resolve(conn, config, unit);
+        // `audit` is advisory, never blocking (design: exit 0=clean,
+        // 1=warn, 2=violation) — so a `resolve` failure (issue #59: a
+        // malformed `.tapectl-unit.toml` `[policy] slice_size`, the only
+        // layer `resolve` parses at USE time rather than at config load)
+        // must degrade to a finding, not propagate and abort the whole
+        // audit run. But `audit` also must never report a unit it never
+        // actually checked as clean: with no resolved policy, none of
+        // min_copies/required_locations/verify_interval_days/encrypt are
+        // known, so every policy-dependent check below (copy_count,
+        // location_presence, verify_age, encryption) is skipped for this
+        // unit — and that gap is itself reported as a VIOLATION (an
+        // unreadable policy is strictly worse than a known-noncompliant
+        // unit, because the tool cannot even tell).
+        let resolved = match policy::resolve(conn, config, unit) {
+            Ok(r) => r,
+            Err(e) => {
+                violations.push(AuditFinding {
+                    unit: unit.name.clone(),
+                    check: "policy_unresolvable".into(),
+                    message: format!(
+                        "policy could not be resolved ({e}); copy_count/location_presence/\
+                         verify_age/encryption checks were SKIPPED for this unit"
+                    ),
+                    action: format!(
+                        "fix the [policy] section in {}/.tapectl-unit.toml",
+                        unit.current_path.as_deref().unwrap_or("<unit path>")
+                    ),
+                });
+                continue;
+            }
+        };
 
         // Check copy count. Routes through the same ADR-0004 eligibility
         // predicate (issue #89) the gates use, so `audit` and `unit
@@ -851,6 +881,68 @@ mod tests {
             assert_eq!(violations.len(), 1);
             assert_eq!(violations[0].check, "encryption");
             assert_eq!(violations[0].unit, "audit-plain");
+        }
+
+        /// Issue #59 / Change 4: a unit whose `.tapectl-unit.toml`
+        /// `[policy] slice_size` is unparseable must NOT abort the whole
+        /// audit run (`audit` is advisory, never blocking) and must NOT be
+        /// reported clean (its policy-dependent checks literally could not
+        /// run). It must instead surface as a VIOLATION naming the unit and
+        /// stating its policy checks were skipped, and `run()`'s exit code
+        /// must be 2.
+        #[test]
+        fn unresolvable_policy_is_a_violation_not_a_silent_skip_or_abort() {
+            let root = TempDir::new().unwrap();
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+
+            let dir = root.path().join("bad_policy_unit");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".tapectl-unit.toml"),
+                "[policy]\nslice_size = \"2500GG\"\n",
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES ('u-bad-policy', 'bad_policy_unit', ?1, ?2, 'mtime_size', 1, 'active')",
+                params![tid, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+
+            let config = Config::default();
+
+            // (a) + (b): a named finding, classified as a violation (not
+            // clean, not a warning).
+            let (violations, warnings) =
+                collect_findings(&conn, &config, Some("bad_policy_unit")).unwrap();
+            assert_eq!(
+                warnings.len(),
+                0,
+                "an unresolvable policy must not be downgraded to a warning"
+            );
+            assert_eq!(
+                violations.len(),
+                1,
+                "an unresolvable policy must be reported, not silently skipped"
+            );
+            assert_eq!(violations[0].unit, "bad_policy_unit");
+            assert!(
+                violations[0].message.to_lowercase().contains("skipped"),
+                "finding must state policy checks were skipped: {}",
+                violations[0].message
+            );
+
+            // (c): run()'s exit code must be 2 (violation), not 0 (clean)
+            // or an early Err from resolve() aborting the whole audit.
+            let exit_code = run(&conn, &config, Some("bad_policy_unit"), false, false).unwrap();
+            assert_eq!(exit_code, 2);
         }
 
         /// Same fixture, but `encrypted = 1`: must NOT fire.
