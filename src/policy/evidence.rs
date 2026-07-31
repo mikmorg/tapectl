@@ -24,8 +24,19 @@ pub struct CoverageEvidence {
     pub last_verified: Option<String>,
 }
 
-/// Per-volume remaining-coverage evidence for `unit_id`, excluding
-/// `exclude_volume_id` (the volume being retired/consumed) by identity.
+/// Per-volume remaining-coverage evidence for `unit_id`, optionally
+/// excluding `exclude_volume_id` (the volume being retired/consumed) by
+/// identity.
+///
+/// `exclude_volume_id`:
+/// - `Some(vol_id)` — the caller is retiring/consuming `vol_id` and wants
+///   the coverage that would REMAIN after it (`compact_finish`,
+///   `retire_impacts`).
+/// - `None` — there is no volume to exclude; the caller wants ALL eligible
+///   coverage for the unit (`unit_mark_tape_only`, which asks "what
+///   coverage exists at all?", not "what would remain"). This is a real
+///   SQL branch, not a sentinel volume id that happens to match nothing —
+///   see issue #99.
 ///
 /// Divergences from `cli::audit`'s `verify_age` query (deliberate, see
 /// module doc and issue #91's trap list):
@@ -39,13 +50,17 @@ pub struct CoverageEvidence {
 /// - [`crate::policy::coverage::eligible`] is applied to the `volumes`
 ///   alias directly in the join condition, per that module's doc for plain
 ///   inner joins with no `GROUP BY`;
-/// - the volume being excluded (`exclude_volume_id`) is excluded by
-///   identity (`w.volume_id != ?`), matching `retire_impacts`.
+/// - the volume being excluded, when present, is excluded by identity
+///   (`w.volume_id != ?`), matching `retire_impacts`.
 pub fn remaining_coverage_evidence(
     conn: &Connection,
     unit_id: i64,
-    exclude_volume_id: i64,
+    exclude_volume_id: Option<i64>,
 ) -> Result<Vec<CoverageEvidence>> {
+    let exclude_clause = match exclude_volume_id {
+        Some(_) => "AND w.volume_id != ?2",
+        None => "",
+    };
     let sql = format!(
         "SELECT v.label, MAX(vs.completed_at) as last_verified
          FROM writes w
@@ -55,21 +70,31 @@ pub fn remaining_coverage_evidence(
          LEFT JOIN verification_sessions vs
                 ON vs.volume_id = v.id AND vs.outcome = 'passed'
          WHERE s.unit_id = ?1 AND w.status = 'completed'
-           AND w.volume_id != ?2
+           {exclude_clause}
            AND {}
          GROUP BY v.id, v.label
          ORDER BY v.label",
         crate::policy::coverage::eligible("v")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<CoverageEvidence> = stmt
-        .query_map(params![unit_id, exclude_volume_id], |row| {
-            Ok(CoverageEvidence {
-                volume_label: row.get(0)?,
-                last_verified: row.get(1)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let rows: Vec<CoverageEvidence> = match exclude_volume_id {
+        Some(exclude_id) => stmt
+            .query_map(params![unit_id, exclude_id], |row| {
+                Ok(CoverageEvidence {
+                    volume_label: row.get(0)?,
+                    last_verified: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => stmt
+            .query_map(params![unit_id], |row| {
+                Ok(CoverageEvidence {
+                    volume_label: row.get(0)?,
+                    last_verified: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
     Ok(rows)
 }
 

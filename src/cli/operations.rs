@@ -353,7 +353,8 @@ fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<RetireImpact>> {
 
     let mut impacts = Vec::with_capacity(rows.len());
     for (unit_id, unit_name, unit_status, other_copies) in rows {
-        let evidence = crate::policy::evidence::remaining_coverage_evidence(conn, unit_id, vol_id)?;
+        let evidence =
+            crate::policy::evidence::remaining_coverage_evidence(conn, unit_id, Some(vol_id))?;
         impacts.push(RetireImpact {
             unit_name,
             unit_status,
