@@ -528,7 +528,7 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
             let evidence: Vec<serde_json::Value> = unit
                 .evidence
                 .iter()
-                .map(|e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}))
+                .map(crate::cli::operations::evidence_json)
                 .collect();
             let evidence_summary =
                 crate::policy::evidence::describe(&unit.unit_name, &unit.evidence, now);

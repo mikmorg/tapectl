@@ -367,15 +367,34 @@ fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<RetireImpact>> {
     Ok(impacts)
 }
 
+/// The `--json` shape for ONE piece of remaining-coverage evidence,
+/// written once so `volume retire`, `unit mark-tape-only` and
+/// `volume compact-finish` cannot drift (issue #99 wired all three).
+///
+/// `kind` and `deposited_at` are ADDITIVE (issue #73): `last_verified`
+/// keeps its meaning and stays `null` for a warehouse deposit, which has
+/// never been verified and never will be. A consumer that folded
+/// `deposited_at` into `last_verified` would be asserting a verification
+/// that did not happen.
+pub(crate) fn evidence_json(e: &crate::policy::evidence::CoverageEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "volume": e.volume_label,
+        "kind": match e.kind {
+            crate::policy::evidence::EvidenceKind::Tape => "tape",
+            crate::policy::evidence::EvidenceKind::WarehouseDeposit => "warehouse_deposit",
+        },
+        "last_verified": e.last_verified,
+        "deposited_at": e.deposited_at,
+        "location": e.location,
+    })
+}
+
 fn retire_impacts_json(impacts: &[RetireImpact]) -> Vec<serde_json::Value> {
     impacts
         .iter()
         .map(|impact| {
-            let evidence: Vec<serde_json::Value> = impact
-                .evidence
-                .iter()
-                .map(|e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}))
-                .collect();
+            let evidence: Vec<serde_json::Value> =
+                impact.evidence.iter().map(evidence_json).collect();
             let now = chrono::Utc::now().naive_utc();
             let evidence_summary =
                 crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now);
@@ -727,12 +746,7 @@ pub fn unit_mark_tape_only(
     let evidence_summary = crate::policy::evidence::describe(unit_name, &evidence, now);
 
     if json_output {
-        let evidence_json: Vec<serde_json::Value> = evidence
-            .iter()
-            .map(
-                |e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}),
-            )
-            .collect();
+        let evidence_json: Vec<serde_json::Value> = evidence.iter().map(evidence_json).collect();
         println!(
             "{}",
             serde_json::json!({

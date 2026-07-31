@@ -14,14 +14,43 @@ use rusqlite::{params, Connection};
 
 use crate::error::Result;
 
-/// One volume's contribution to a unit's remaining coverage, after the
-/// volume being retired/consumed is excluded, together with that volume's
-/// most recent PASSED verification timestamp (or `None` if it has never
-/// passed a verification).
+/// Which EVIDENCE CLASS a piece of remaining coverage belongs to
+/// (ADR-0006). The two are not interchangeable and the display must never
+/// let them read as if they were:
+///
+/// - `Tape` — evidence comes from physical re-verification at contact and
+///   decays with the medium. It can be refreshed: load the cartridge, run
+///   `volume verify`, and the age resets.
+/// - `WarehouseDeposit` — evidence is the deposit receipt plus provider
+///   attestation, "aging without refresh (re-verification costs retrieval
+///   and realistically never happens)". There is no verification session
+///   for a deposit and there never will be, so the honest thing to state
+///   is when it was deposited and that nothing has checked it since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceKind {
+    Tape,
+    WarehouseDeposit,
+}
+
+/// One contribution to a unit's remaining coverage, after the volume being
+/// retired/consumed is excluded.
+///
+/// For a `Tape` row, `last_verified` is that volume's most recent PASSED
+/// verification timestamp (`None` = never verified) and `deposited_at` /
+/// `location` are `None`.
+///
+/// For a `WarehouseDeposit` row, `last_verified` is ALWAYS `None` — by
+/// design, not by accident — and `deposited_at` carries the recorded
+/// deposit time. The two are deliberately separate fields: folding a
+/// deposit date into `last_verified` would make a never-checked cloud
+/// object render exactly like a verified cartridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageEvidence {
+    pub kind: EvidenceKind,
     pub volume_label: String,
     pub last_verified: Option<String>,
+    pub deposited_at: Option<String>,
+    pub location: Option<String>,
 }
 
 /// Per-volume remaining-coverage evidence for `unit_id`, optionally
@@ -77,24 +106,70 @@ pub fn remaining_coverage_evidence(
         crate::policy::coverage::eligible("v")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<CoverageEvidence> = match exclude_volume_id {
+    let tape_row = |row: &rusqlite::Row| -> rusqlite::Result<CoverageEvidence> {
+        Ok(CoverageEvidence {
+            kind: EvidenceKind::Tape,
+            volume_label: row.get(0)?,
+            last_verified: row.get(1)?,
+            deposited_at: None,
+            location: None,
+        })
+    };
+    let mut rows: Vec<CoverageEvidence> = match exclude_volume_id {
         Some(exclude_id) => stmt
-            .query_map(params![unit_id, exclude_id], |row| {
-                Ok(CoverageEvidence {
-                    volume_label: row.get(0)?,
-                    last_verified: row.get(1)?,
-                })
-            })?
+            .query_map(params![unit_id, exclude_id], tape_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?,
         None => stmt
-            .query_map(params![unit_id], |row| {
-                Ok(CoverageEvidence {
-                    volume_label: row.get(0)?,
-                    last_verified: row.get(1)?,
-                })
-            })?
+            .query_map(params![unit_id], tape_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?,
     };
+
+    // ADR-0006 warehouse deposits (issue #73). A separate query rather than
+    // a UNION with the query above: the two halves select different
+    // columns and carry genuinely different evidence, and the point of the
+    // whole module is that they stay distinguishable all the way to the
+    // printed line. Scope and exclusion match the tape half exactly --
+    // including that the deposit's SOURCE VOLUME must still pass
+    // `coverage::eligible`, the same gate `coverage::copy_count_expr`
+    // applies, so the two can never disagree about what coverage exists.
+    let deposit_exclude = match exclude_volume_id {
+        Some(_) => "AND w.volume_id != ?2",
+        None => "",
+    };
+    let deposit_sql = format!(
+        "SELECT v.label, l.name, d.deposited_at
+         FROM volume_deposits d
+         JOIN volumes v ON v.id = d.volume_id
+         JOIN locations l ON l.id = d.location_id
+         WHERE {} AND d.volume_id IN (
+             SELECT w.volume_id
+             FROM writes w
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             WHERE s.unit_id = ?1 AND w.status = 'completed' {deposit_exclude}
+         )
+         ORDER BY v.label, l.name",
+        crate::policy::coverage::eligible("v")
+    );
+    let mut deposit_stmt = conn.prepare(&deposit_sql)?;
+    let deposit_row = |row: &rusqlite::Row| -> rusqlite::Result<CoverageEvidence> {
+        Ok(CoverageEvidence {
+            kind: EvidenceKind::WarehouseDeposit,
+            volume_label: row.get(0)?,
+            last_verified: None,
+            location: row.get(1)?,
+            deposited_at: row.get(2)?,
+        })
+    };
+    let deposits: Vec<CoverageEvidence> = match exclude_volume_id {
+        Some(exclude_id) => deposit_stmt
+            .query_map(params![unit_id, exclude_id], deposit_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => deposit_stmt
+            .query_map(params![unit_id], deposit_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
+    rows.extend(deposits);
     Ok(rows)
 }
 
@@ -153,28 +228,120 @@ pub fn describe(
     evidence: &[CoverageEvidence],
     now: chrono::NaiveDateTime,
 ) -> Option<String> {
-    let weakest = evidence
+    if evidence.is_empty() {
+        return None;
+    }
+    let tapes: Vec<&CoverageEvidence> = evidence
         .iter()
-        .max_by_key(|e| weakness_rank(&weakness(e, now)))?;
+        .filter(|e| e.kind == EvidenceKind::Tape)
+        .collect();
+    let deposits: Vec<&CoverageEvidence> = evidence
+        .iter()
+        .filter(|e| e.kind == EvidenceKind::WarehouseDeposit)
+        .collect();
 
-    let detail = match weakness(weakest, now) {
+    // Whom to NAME as the weakest. A warehouse deposit and a
+    // never-verified tape are not on one scale (ADR-0006: different
+    // evidence classes), and totally ordering them means a mixed case can
+    // name the deposit and leave the never-verified TAPE unmentioned on
+    // the one line `cli::consent::confirm` guarantees the operator reads.
+    // So: if any tape is present, the named weakest is the weakest TAPE,
+    // and the composition clause states the deposits. Only an
+    // all-deposit unit names a deposit.
+    let weakest_tape = tapes
+        .iter()
+        .max_by_key(|e| weakness_rank(&weakness(e, now)));
+    let named: &CoverageEvidence = match weakest_tape {
+        Some(t) => t,
+        // Oldest deposit first: `deposited_at` sorts lexicographically as
+        // an ISO-ish stamp, and a missing stamp sorts weakest of all.
+        None => deposits
+            .iter()
+            .min_by_key(|e| e.deposited_at.clone().unwrap_or_default())
+            .copied()?,
+    };
+
+    if evidence.len() == 1 {
+        return Some(match named.kind {
+            EvidenceKind::Tape => format!(
+                "coverage for unit \"{unit_name}\" rests on {}, {}",
+                named.volume_label,
+                tape_detail(named, now)
+            ),
+            EvidenceKind::WarehouseDeposit => format!(
+                "coverage for unit \"{unit_name}\" rests on {} — never re-verified, \
+                 and warehouse copies do not refresh",
+                deposit_phrase(named)
+            ),
+        });
+    }
+
+    // The composition clause appears ONLY when a deposit is involved. An
+    // all-tape fleet's wording is untouched (ADR-0004's example, pinned by
+    // `weakest_of_several_is_selected_never_ranks_weakest`).
+    let composition = if deposits.is_empty() {
+        String::new()
+    } else {
+        let d = deposits.len();
+        let deposit_words = if d == 1 {
+            "1 warehouse deposit".to_string()
+        } else {
+            format!("{d} warehouse deposits")
+        };
+        let tape_words = match tapes.len() {
+            0 => "no tape copies".to_string(),
+            1 => "1 tape".to_string(),
+            n => format!("{n} tapes"),
+        };
+        format!(" ({tape_words}, {deposit_words})")
+    };
+
+    let weakest_clause = match named.kind {
+        EvidenceKind::Tape => format!(
+            "weakest is {}, {}",
+            named.volume_label,
+            tape_detail(named, now)
+        ),
+        EvidenceKind::WarehouseDeposit => format!(
+            "weakest is {} — never re-verified, and warehouse copies do not refresh",
+            deposit_phrase(named)
+        ),
+    };
+
+    Some(format!(
+        "coverage for unit \"{unit_name}\" rests on {} copies{composition}; {weakest_clause}",
+        evidence.len()
+    ))
+}
+
+/// The age half of a TAPE evidence line.
+fn tape_detail(e: &CoverageEvidence, now: chrono::NaiveDateTime) -> String {
+    match weakness(e, now) {
         Weakness::Never => "never verified".to_string(),
         Weakness::Age(days) => format!("last verified {days} days ago"),
         Weakness::Unparseable => format!(
             "last verified at {} (unparseable timestamp)",
-            weakest.last_verified.as_deref().unwrap_or("?")
+            e.last_verified.as_deref().unwrap_or("?")
         ),
-    };
+    }
+}
 
-    let label = &weakest.volume_label;
-    Some(if evidence.len() == 1 {
-        format!("coverage for unit \"{unit_name}\" rests on {label}, {detail}")
-    } else {
-        format!(
-            "coverage for unit \"{unit_name}\" rests on {} copies; weakest is {label}, {detail}",
-            evidence.len()
-        )
-    })
+/// A warehouse deposit named the way it must always be named: as a
+/// DEPOSIT, of a specific volume, at a specific warehouse, on a specific
+/// date. Never as a bare volume label — "rests on L6-0003" would send the
+/// operator looking for a cartridge that is not the thing being described.
+fn deposit_phrase(e: &CoverageEvidence) -> String {
+    let at = match &e.location {
+        Some(l) => format!(" at {l}"),
+        None => String::new(),
+    };
+    let when = match &e.deposited_at {
+        // Deposit stamps are `datetime('now')` ("YYYY-MM-DD HH:MM:SS");
+        // the date alone is what the operator needs.
+        Some(d) => format!(" ({})", d.split(' ').next().unwrap_or(d.as_str())),
+        None => " (deposit date not recorded)".to_string(),
+    };
+    format!("a warehouse deposit of {}{at}{when}", e.volume_label)
 }
 
 #[cfg(test)]
@@ -187,8 +354,22 @@ mod tests {
 
     fn ev(label: &str, last_verified: Option<&str>) -> CoverageEvidence {
         CoverageEvidence {
+            kind: EvidenceKind::Tape,
             volume_label: label.to_string(),
             last_verified: last_verified.map(str::to_string),
+            deposited_at: None,
+            location: None,
+        }
+    }
+
+    /// A warehouse-deposit evidence row.
+    fn dep(label: &str, location: &str, deposited_at: &str) -> CoverageEvidence {
+        CoverageEvidence {
+            kind: EvidenceKind::WarehouseDeposit,
+            volume_label: label.to_string(),
+            last_verified: None,
+            deposited_at: Some(deposited_at.to_string()),
+            location: Some(location.to_string()),
         }
     }
 
@@ -384,6 +565,133 @@ mod tests {
             labels,
             vec!["V1", "V2"],
             "None must exclude nothing: {labels:?}"
+        );
+    }
+
+    /// ADR-0006's evidence class, rendered so that the line is TRUE READ
+    /// ALONE. `cli::consent::confirm` prints each fact as a standalone
+    /// line with zero surrounding context (issue #91's second lesson), so
+    /// this string must not be mistakable for a verified cartridge: it
+    /// says "warehouse deposit", it names the warehouse, it gives the
+    /// deposit date, and it says outright that nothing has re-verified it
+    /// and nothing ever will.
+    #[test]
+    fn a_lone_warehouse_deposit_never_reads_as_a_verified_tape() {
+        let evidence = vec![dep("L6-0003", "glacier", "2026-01-02 03:04:05")];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert_eq!(
+            line,
+            "coverage for unit \"photos\" rests on a warehouse deposit of L6-0003 at glacier \
+             (2026-01-02) — never re-verified, and warehouse copies do not refresh"
+        );
+        assert!(
+            !line.contains("last verified"),
+            "a deposit has never been verified; saying otherwise is the defect: {line}"
+        );
+        assert!(
+            !line.contains("rests on L6-0003,"),
+            "must not read as a bare cartridge the operator could go fetch: {line}"
+        );
+    }
+
+    /// A mixed unit must state the composition, and must name the TAPE as
+    /// the weakest rather than the deposit -- otherwise a never-verified
+    /// cartridge vanishes from the only line the operator is guaranteed to
+    /// read, which is the exact failure
+    /// `multi_copy_line_never_claims_sole_dependence` exists to prevent.
+    #[test]
+    fn a_mixed_unit_states_the_composition_and_still_names_the_tape() {
+        let evidence = vec![
+            ev("L6-0001", None),
+            dep("L6-0001", "glacier", "2026-01-02 03:04:05"),
+        ];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert_eq!(
+            line,
+            "coverage for unit \"photos\" rests on 2 copies (1 tape, 1 warehouse deposit); \
+             weakest is L6-0001, never verified"
+        );
+    }
+
+    /// All copies in the warehouse and none on tape is the case that most
+    /// needs saying out loud: ADR-0006 records that "a warehouse copy dies
+    /// weeks after payment stops; tapes are the durable line".
+    #[test]
+    fn an_all_deposit_unit_says_there_are_no_tape_copies() {
+        let evidence = vec![
+            dep("L6-0003", "glacier", "2026-01-02 03:04:05"),
+            dep("L6-0009", "deep-archive", "2025-06-01 00:00:00"),
+        ];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert_eq!(
+            line,
+            "coverage for unit \"photos\" rests on 2 copies (no tape copies, 2 warehouse \
+             deposits); weakest is a warehouse deposit of L6-0009 at deep-archive (2025-06-01) \
+             — never re-verified, and warehouse copies do not refresh"
+        );
+    }
+
+    /// An all-tape unit's wording must be BYTE-IDENTICAL to before this
+    /// change: the composition clause is added only when a deposit exists.
+    #[test]
+    fn an_all_tape_unit_keeps_the_pre_existing_wording() {
+        let evidence = vec![
+            ev("L6-0001", Some("2026-07-29 12:00:00")),
+            ev("L6-0002", None),
+        ];
+        assert_eq!(
+            describe("photos", &evidence, now()).unwrap(),
+            "coverage for unit \"photos\" rests on 2 copies; weakest is L6-0002, never verified"
+        );
+    }
+
+    /// A unit whose only surviving coverage is a deposit must produce a
+    /// line, not `None` -- `None` is the "no remaining coverage" signal at
+    /// all three call sites, and rendering a covered unit that way is
+    /// false and alarming.
+    #[test]
+    fn deposit_only_coverage_is_never_none() {
+        let (conn, unit_id, vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        let evidence = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        let deposits_only: Vec<CoverageEvidence> = evidence
+            .into_iter()
+            .filter(|e| e.kind == EvidenceKind::WarehouseDeposit)
+            .collect();
+        assert_eq!(deposits_only.len(), 1);
+        let line = describe("photos", &deposits_only, now())
+            .expect("deposit-only coverage must describe itself, never render as none");
+        assert!(
+            line.contains("warehouse deposit of L6-0003 at glacier"),
+            "{line}"
+        );
+        let _ = vol;
+    }
+
+    /// Exclusion still excludes, and it takes the excluded volume's
+    /// deposit with it (deposits are gated on their source volume passing
+    /// `coverage::eligible`, the same rule the copy counts apply).
+    #[test]
+    fn excluding_a_volume_also_drops_its_deposit() {
+        let (conn, unit_id, vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        let evidence = remaining_coverage_evidence(&conn, unit_id, Some(vol)).unwrap();
+        assert!(evidence.is_empty(), "{evidence:?}");
+    }
+
+    /// Issue #73 / ADR-0006: a recorded warehouse deposit is remaining
+    /// coverage. A unit whose only surviving copy is a deposit must not
+    /// render as "no remaining coverage" -- that is false, and at a
+    /// destructive moment it is alarming in exactly the wrong direction.
+    #[test]
+    fn a_warehouse_deposit_is_remaining_coverage() {
+        let (conn, unit_id, _vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        let evidence = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        assert_eq!(
+            evidence.len(),
+            2,
+            "one sealed tape plus one recorded deposit is two pieces of evidence: {evidence:?}"
         );
     }
 
