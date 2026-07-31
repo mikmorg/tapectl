@@ -2562,3 +2562,356 @@ fn test_volume_retire_shows_coverage_evidence_age() {
     assert_eq!(covered["remaining_copies"], 1);
     assert_eq!(never["remaining_copies"], 1);
 }
+
+/// Issue #99: `unit mark-tape-only` surfaces ADR-0004 evidence for the
+/// coverage the unit is now relying on, in both text and `--json`, without
+/// changing the existing Tier-2/Tier-3 guard behavior or exit code.
+#[test]
+fn test_unit_mark_tape_only_shows_coverage_evidence() {
+    let (_tmp, conn, home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let unit_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp/u1')",
+        [unit_id],
+    )
+    .unwrap();
+    let snap_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap_id],
+    )
+    .unwrap();
+    let ss1_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap_id],
+    )
+    .unwrap();
+    let ss2_id = conn.last_insert_rowid();
+
+    conn.execute("INSERT INTO locations (name) VALUES ('site-a')", [])
+        .unwrap();
+    let loc_a = conn.last_insert_rowid();
+    conn.execute("INSERT INTO locations (name) VALUES ('site-b')", [])
+        .unwrap();
+    let loc_b = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, location_id)
+         VALUES ('L6-A', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed', ?1)",
+        [loc_a],
+    )
+    .unwrap();
+    let vol_a = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, location_id)
+         VALUES ('L6-B', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed', ?1)",
+        [loc_b],
+    )
+    .unwrap();
+    let vol_b = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![ss1_id, snap_id, vol_a],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![ss2_id, snap_id, vol_b],
+    )
+    .unwrap();
+
+    // Only L6-B has a passed verification session -- L6-A must render
+    // "never verified" and, being older/weaker (never beats any age), be
+    // the volume `describe()` names.
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+         VALUES (?1, '2020-01-01 00:00:00', 'passed')",
+        [vol_b],
+    )
+    .unwrap();
+
+    drop(conn);
+
+    let config_path = home.join("config.toml");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "unit",
+            "mark-tape-only",
+            "unit1",
+        ])
+        .output()
+        .expect("failed to run the tapectl binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "unit mark-tape-only should succeed with 2 copies/2 locations; \
+         stdout: {stdout:?}, stderr: {stderr:?}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"));
+
+    assert_eq!(parsed["status"], "tape_only");
+    assert_eq!(parsed["copies"], 2);
+    assert_eq!(parsed["locations"], 2);
+
+    let evidence = parsed["evidence"]
+        .as_array()
+        .expect("evidence must be an array");
+    let labels: Vec<&str> = evidence
+        .iter()
+        .map(|e| e["volume"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"L6-A"), "evidence: {labels:?}");
+    assert!(labels.contains(&"L6-B"), "evidence: {labels:?}");
+
+    let summary = parsed["evidence_summary"]
+        .as_str()
+        .expect("mark-tape-only must carry a non-null evidence_summary");
+    assert!(summary.contains("unit1"), "summary: {summary}");
+    assert!(summary.contains("never verified"), "summary: {summary}");
+    assert!(summary.contains("2 copies"), "summary: {summary}");
+
+    // Text mode: re-running mark-tape-only on unit1 (idempotent -- no
+    // status precondition beyond the copy/location/dirty guards) must show
+    // the same evidence line alongside the existing summary line.
+    let text_output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "unit",
+            "mark-tape-only",
+            "unit1",
+        ])
+        .output()
+        .expect("failed to run the tapectl binary");
+    assert!(text_output.status.success());
+    let text_stdout = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        text_stdout.contains("marked tape-only"),
+        "existing summary line must be unchanged: {text_stdout}"
+    );
+    assert!(
+        text_stdout.contains("unit1") && text_stdout.contains("never verified"),
+        "text mode must show the evidence line too: {text_stdout}"
+    );
+
+    // Guard/exit-code behavior is unaffected: a below-threshold unit still
+    // refuses with a non-zero exit and unchanged wording.
+    let db_path = home.join("tapectl.db");
+    let conn2 = tapectl_test_db(&db_path);
+    conn2
+        .execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op2', 1, 'active')",
+            [],
+        )
+        .unwrap();
+    let tid2 = conn2.last_insert_rowid();
+    conn2
+        .execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u2', 'unit2', ?1, 'mtime_size', 1, 'active')",
+            [tid2],
+        )
+        .unwrap();
+    // Deliberately no snapshot/writes -- below the copy threshold.
+    drop(conn2);
+
+    let guard_output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "unit",
+            "mark-tape-only",
+            "unit2",
+        ])
+        .output()
+        .expect("failed to run the tapectl binary");
+    assert!(
+        !guard_output.status.success(),
+        "a below-threshold unit must still refuse without --force (guard unchanged)"
+    );
+    let guard_stderr = String::from_utf8_lossy(&guard_output.stderr);
+    assert!(
+        guard_stderr.contains("insufficient copies"),
+        "guard wording must be unchanged: {guard_stderr}"
+    );
+}
+
+/// Issue #99: `volume compact-finish` surfaces ADR-0004 evidence for a unit
+/// that retains coverage on another volume after the source volume retires,
+/// without changing the existing no-copy-elsewhere refusal guard or exit
+/// code.
+#[test]
+fn test_compact_finish_shows_coverage_evidence() {
+    let (_tmp, conn, home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let unit_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp/u1')",
+        [unit_id],
+    )
+    .unwrap();
+    let snap_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap_id],
+    )
+    .unwrap();
+    let ss_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+         VALUES (?1, 1, 100, 100, 'plain', 'enc')",
+        [ss_id],
+    )
+    .unwrap();
+    let slice_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-SRC', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let vol_src = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-DST', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let vol_dst = conn.last_insert_rowid();
+
+    // Same stage_slice, written (as two copies) to both volumes -- so
+    // compact_finish's own "live slice has no copy elsewhere" guard sees
+    // this slice as protected and lets retirement proceed.
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![ss_id, snap_id, vol_src],
+    )
+    .unwrap();
+    let write_src = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![ss_id, snap_id, vol_dst],
+    )
+    .unwrap();
+    let write_dst = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+         VALUES (?1, ?2, '0', 'written')",
+        rusqlite::params![write_src, slice_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+         VALUES (?1, ?2, '0', 'written')",
+        rusqlite::params![write_dst, slice_id],
+    )
+    .unwrap();
+
+    // L6-DST has a passed verification session; the evidence line should
+    // name it.
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+         VALUES (?1, '2020-01-01 00:00:00', 'passed')",
+        [vol_dst],
+    )
+    .unwrap();
+
+    drop(conn);
+
+    let config_path = home.join("config.toml");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "volume",
+            "compact-finish",
+            "L6-SRC",
+        ])
+        .output()
+        .expect("failed to run the tapectl binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "compact-finish must succeed: the live slice has a copy on L6-DST; \
+         stdout: {stdout:?}, stderr: {stderr:?}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"));
+
+    assert_eq!(parsed["label"], "L6-SRC");
+    assert_eq!(parsed["status"], "retired");
+
+    let affected = parsed["affected_units"]
+        .as_array()
+        .expect("affected_units must be an array");
+    let unit1 = affected
+        .iter()
+        .find(|u| u["unit"] == "unit1")
+        .expect("unit1 must appear in affected_units");
+    let evidence = unit1["evidence"]
+        .as_array()
+        .expect("unit1 must carry an evidence array");
+    assert_eq!(evidence.len(), 1, "evidence: {evidence:?}");
+    assert_eq!(evidence[0]["volume"], "L6-DST");
+    assert!(
+        !evidence.iter().any(|e| e["volume"] == "L6-SRC"),
+        "the retired source volume must never appear as remaining coverage: {evidence:?}"
+    );
+    let summary = unit1["evidence_summary"]
+        .as_str()
+        .expect("unit1 must carry a non-null evidence_summary");
+    assert!(summary.contains("L6-DST"), "summary: {summary}");
+}

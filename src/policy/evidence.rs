@@ -287,6 +287,106 @@ mod tests {
         );
     }
 
+    /// Fixture: one unit with completed writes on two volumes, `V1` and
+    /// `V2`, with `V2` carrying a passed verification session.
+    fn setup_two_volume_unit() -> (Connection, i64, i64, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/tmp/u1')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss1_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss2_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V1', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let v1_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V2', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let v2_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss1_id, snap_id, v1_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss2_id, snap_id, v2_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+             VALUES (?1, '2020-01-01 00:00:00', 'passed')",
+            params![v2_id],
+        )
+        .unwrap();
+
+        (conn, unit_id, v1_id, v2_id)
+    }
+
+    /// `Some(v1)` excludes V1's own coverage row: only V2 remains. This is
+    /// the defect #91's test was written to catch -- exclusion must
+    /// actually exclude, not just fail to match a sentinel (issue #99).
+    #[test]
+    fn some_excludes_named_volume() {
+        let (conn, unit_id, v1_id, _v2_id) = setup_two_volume_unit();
+        let evidence = remaining_coverage_evidence(&conn, unit_id, Some(v1_id)).unwrap();
+        let labels: Vec<&str> = evidence.iter().map(|e| e.volume_label.as_str()).collect();
+        assert_eq!(labels, vec!["V2"], "V1 must be absent: {labels:?}");
+    }
+
+    /// `None` excludes nothing: both eligible volumes' coverage appears.
+    #[test]
+    fn none_excludes_nothing() {
+        let (conn, unit_id, _v1_id, _v2_id) = setup_two_volume_unit();
+        let evidence = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        let mut labels: Vec<&str> = evidence.iter().map(|e| e.volume_label.as_str()).collect();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec!["V1", "V2"],
+            "None must exclude nothing: {labels:?}"
+        );
+    }
+
     /// ADR-0004's own example wording, pinned verbatim: with exactly one
     /// remaining copy the line must read as the ADR writes it.
     #[test]
