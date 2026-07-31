@@ -16,20 +16,46 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **Mode: PHASE-2 COMPLETE (2026-07-31) — awaiting a CTO call on what's next.**
-  R&D exited 2026-07-28; the v2 regear is merged and the design docs are
-  settled reference, not fluid. Phase-2 hardening then ran to completion:
-  every phase-2 issue is closed except **#69 (Heir Kit)**, deferred by the
+- **Mode: PHASE 3 (from 2026-07-31), CTO-scoped.** Phase 2 ran to completion
+  — every phase-2 issue closed except **#69 (Heir Kit)**, deferred by the
   CTO for a physical step (printing, tamper-evident envelopes) no agent can
-  perform. Master `3221483`, CI green, mhvtl gate 26/26, `EXPECTED_FAIL=()`.
-  **There is no automatically-correct next task.** What remains is phase-3
-  (#70, #72, #73), the LOW umbrellas (#65/#66/#67), the epic (#20) and the
-  map (#1) — none of which the CTO has scoped as gate-exit the way phase 2
-  was. **Do not just start on phase-3.** Either the CTO names the next
-  stage, or the first iteration's job is a re-triage pass that reports what
-  each remaining issue actually means against shipped code and asks. The
-  three hard stops remain untouched and are all CTO calls: the first
+  perform. R&D exited 2026-07-28; the design docs are settled reference.
+  Gate `EXPECTED_FAIL=()`, so zero slack — any failure is a hard stop.
+  The three hard stops are untouched and remain CTO calls: the first
   production write, the LTO-6 hardware session, and #69's physical step.
+- **Phase-3 queue, re-triaged 2026-07-31 against shipped code. Take in
+  this order — the ordering is a dependency, not a preference:**
+  1. **#70** (systemd timer for `audit` + `report verify-status`). Its
+     stated hard dependency #45 is CLOSED and verified in code
+     (`fsck_exit_code`, `exit_if_nonzero`, `init_tracing` → stderr), so the
+     scheduled jobs can signal failure. #13 permanently rejected the daemon
+     shape; a **timer is the sanctioned alternative** — do not drift toward
+     a daemon. Metadata-only: no tape, no restore path, no new deps.
+     Scheduling changes *when* the audit runs, never *whether* it blocks.
+  2. **#73** (warehouse locations: model, policy knob, evidence semantics).
+     Lands in full. **Read its 2026-07-31 comment first** — the issue is
+     wrong twice: `locations` has NO `kind` column, so a migration IS
+     needed (only `volumes.storage_class` pre-exists, unpopulated); and its
+     "coordinates with #57" note is misdirected — #57 is `catalog locate`,
+     while the evidence machinery is `policy::evidence` from #91/#99.
+     Warehouse copies that count toward coverage must route through
+     `policy::coverage`, never a new inlined status list (that is #96).
+  3. **#72** — **RESCOPED by CTO decision, do NOT implement literally.**
+     Native S3 is out; the target is the documented rclone/aws-cli
+     procedure over sealed volumes that the issue itself named, plus the
+     runbook and heir-kit text (billing-fragility warning, restore-request
+     wait). No `WarehouseStore` Rust impl, no in-process polling, no new
+     dependency. Full reasoning in `docs/design-errata.md`'s ADR-0006
+     scope row; ADR-0006 is NOT amended and native S3 stays open later.
+- **Not in the phase-3 queue, but needing a CTO call soon:** **#20** is an
+  open `severity:high` epic whose stated acceptance — *"verify-gate legs 1
+  and 4 green with EXPECTED_FAIL empty"* — is literally the current state,
+  with its Store-seam child #71 closed and the typestate session shipped in
+  the v2 regear. It looks complete-but-unclosed (the #27 pattern) and is
+  misrepresenting project state. Surface it; do not close an epic
+  unilaterally. The LOW umbrellas (#65/#66/#67) are 2026-07-20 grab-bags
+  that likely overlap work #61/#62/#97 already landed — decompose or close
+  them, never implement as written.
 - **Queue (re-triaged 2026-07-29; highs cleared 2026-07-30):**
   **CTO ruled ALL phase-2 issues gate exit**, so severity drives *ordering*,
   not scope. **Every phase-1/phase-2 high is now closed** — the four numbered
