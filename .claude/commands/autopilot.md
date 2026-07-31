@@ -31,8 +31,16 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#63, #83, #95, #99.** (#91 closed 2026-07-30; #99 filed as its scope
-  residual. #59, #50, #51, #98, #62, #43, #61, #97 closed 2026-07-31.)
+  **#63, #83, #95.** (#91 closed 2026-07-30. #59, #50, #51, #98, #62, #43,
+  #61, #97, #99 closed 2026-07-31.)
+  **ADR-0004 Tier-1 evidence display is now COMPLETE (#99)** at all three
+  destructive ops the ADR names — `volume retire`, `unit mark-tape-only`,
+  `compact-finish`. `remaining_coverage_evidence` takes `Option<i64>`
+  (`None` = "all eligible coverage", a real SQL branch, never a sentinel).
+  If a fourth destructive op ever appears, wire it here too.
+  **`compact_finish` returns a per-unit report** and BOTH its CLI call
+  sites print it (`CompactFinish` and the combined `Compact`) — wiring one
+  and not the other is the easy miss.
   **External-capability checks must FAIL OPEN (#97).** `dar -V` capability
   parsing (`dar::version::parse_capabilities`) starts with everything
   supported and only REMOVES on a positively-parsed `NO`; a missing block,
