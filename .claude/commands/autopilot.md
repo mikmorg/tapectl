@@ -31,9 +31,27 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#51, #50 (paired — see the cross-issue note below), #43, #59, #61, #62,
+  **#51, #50 (paired — see the cross-issue note below), #43, #61, #62,
   #63, #83, #95, #97, #98, #99.** (#91 closed 2026-07-30; #99 filed as its
-  scope residual.)
+  scope residual. #59 closed 2026-07-31.)
+  **`parse_size_to_bytes` now returns `Result` (#59) and `policy::resolve`
+  with it.** Sizes are validated at `Config::load` (`validate_sizes`), so a
+  bad `defaults.*` or backend value fails loudly at the boundary. A bare
+  number is VALID and means bytes — do not "tighten" this into a suffix
+  allowlist. `audit` catches `resolve`'s Err and reports
+  `policy_unresolvable` as a VIOLATION that names the skipped checks;
+  keep that shape, because a unit whose policy won't resolve has none of
+  its other checks run and would otherwise read as clean.
+  **`backends.lto[].block_size` and `packing.min_free_for_append` are
+  decorative** — parsed by serde, read by nothing. #59 deliberately left
+  them unvalidated (validating a field that does nothing gives false
+  assurance). They belong to **#62**'s decorative-key honesty work.
+  **`slice_arg_for_dar` (`staging/mod.rs` ~695–770) stays as-is.** Its doc
+  justifies handing dar the operator's raw string BECAUSE the parser was
+  untrustworthy. That premise is now gone, so "simplify it to use the
+  parsed byte count" looks obvious and correct — it is not: it moves real
+  on-tape slice boundaries for every unit. Leave it alone absent a ticket
+  that decides that explicitly.
   **Lesson from #91 (2026-07-30): scope the issue against the ADR, not just
   against the issue's own Acceptance clause.** #91's Acceptance named only
   `volume retire`, but ADR-0004 names THREE destructive ops that must show
