@@ -31,8 +31,22 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#63, #83, #95, #97, #99.** (#91 closed 2026-07-30; #99 filed as its
-  scope residual. #59, #50, #51, #98, #62, #43, #61 closed 2026-07-31.)
+  **#63, #83, #95, #99.** (#91 closed 2026-07-30; #99 filed as its scope
+  residual. #59, #50, #51, #98, #62, #43, #61, #97 closed 2026-07-31.)
+  **External-capability checks must FAIL OPEN (#97).** `dar -V` capability
+  parsing (`dar::version::parse_capabilities`) starts with everything
+  supported and only REMOVES on a positively-parsed `NO`; a missing block,
+  absent line, odd verdict, garbage, or an unrunnable dar all leave the
+  algorithm accepted. Hard-rejecting on unrecognised external output turns
+  a helpful check into a tool that refuses to run on someone else's distro.
+  Same rule for any future probe of an external binary.
+  **This box reports YES for every dar compression algorithm**, so
+  rejection cannot be tested against the real dar — use synthetic `-V`
+  text for the parser, and a stub `dar` script for the end-to-end wiring.
+  Parser tests alone would pass even if the caller propagated the error
+  instead of failing open, which is the defect that actually matters.
+  `lzma` rides the `xz compression (liblzma)` line; all eight allowlist
+  entries are verified-valid dar names — do not "clean up" that list.
   **`meta.schema_version` is a STALE RELIC — never trust it (#61).**
   Migration 001 writes it as `'1'` and nothing bumps it;
   `rusqlite_migration` keeps the real applied level in `PRAGMA
