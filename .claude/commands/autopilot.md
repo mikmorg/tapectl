@@ -31,8 +31,27 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#43, #61, #62, #63, #83, #95, #97, #98, #99.** (#91 closed 2026-07-30;
-  #99 filed as its scope residual. #59, #50, #51 closed 2026-07-31.)
+  **#43, #61, #62, #63, #83, #95, #97, #99.** (#91 closed 2026-07-30;
+  #99 filed as its scope residual. #59, #50, #51, #98 closed 2026-07-31.)
+  **Staging is now flock-guarded (#98).** `stage_create` holds an exclusive
+  flock on `<db_parent>/locks/stage-<id>.lock` for its lifetime; the
+  `db::open` sweep probes that lock to tell a crash from a live run.
+  Three rules any future change here must keep:
+  (a) **the sweep MARKS ONLY, never touches files** — it runs on every
+  `db::open` including read-only commands, so deleting there means a read
+  can destroy staging data; deletion belongs to `clean_staging`;
+  (b) **order is INSERT → flock → COMMIT** — under WAL the row is invisible
+  until commit, which is what stops a concurrent sweeper seeing a live row
+  with a free lock;
+  (c) **the `writes` sweep stays NOT lock-aware** — `layout-session.md`
+  (~line 157) makes "still `in_progress` at open ⇒ live writer" load-bearing
+  for `rehydrate`, and `interrupted` degrades safely anyway.
+  Use `nix::fcntl::Flock` (guard type); the free `flock` fn is deprecated
+  since nix 0.28 and fails the clippy gate.
+  **`tests/cli_smoke.rs` now costs ~37s** (was ~0.2s): #98's two tests need
+  dar to run long enough to be caught mid-flight, on a deliberately
+  incompressible fixture. Accepted — shrinking it would make a safety test
+  racy. Budget for it when judging suite wall-clock.
   **Two CTO decisions ratified 2026-07-31 and recorded in
   `docs/design-errata.md`** — read the rows there before touching either:
   `preserve_acls` KEEPS its config field and column (dar has no
