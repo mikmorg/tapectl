@@ -293,7 +293,6 @@ fn stage_create_inner(
         exclude_patterns: &dar_exclude_patterns,
         exclude_paths: &[],
         preserve_xattrs: resolved.preserve_xattrs,
-        preserve_acls: resolved.preserve_acls,
         preserve_fsa: resolved.preserve_fsa,
     })?;
 

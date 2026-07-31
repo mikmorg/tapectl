@@ -15,8 +15,6 @@ pub struct DarCreateParams<'a> {
     pub exclude_patterns: &'a [String],
     pub exclude_paths: &'a [String],
     pub preserve_xattrs: bool,
-    #[allow(dead_code)]
-    pub preserve_acls: bool,
     pub preserve_fsa: bool,
 }
 
