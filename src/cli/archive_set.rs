@@ -24,6 +24,40 @@ fn validate_compression(value: &str) -> Result<()> {
     }
 }
 
+/// Syntactic check first, then capability check against the locally
+/// installed `dar` binary (issue #97): a value from `VALID_COMPRESSION_VALUES`
+/// can still be one the local dar was not compiled to support (`lzo`,
+/// `zstd`, `lz4`, `lzma` are commonly absent from distro builds), which
+/// otherwise only surfaces as a runtime `dar -z` failure at archive time.
+///
+/// Fails open on capability-probe trouble: if `dar::version::capabilities`
+/// itself errors (binary missing, unreadable, etc.), that is a pre-existing,
+/// separately-reported condition (`config check`'s dar depth-check) — this
+/// function does not pile a second, redundant error on top, and simply lets
+/// the value through so the syntactic check remains authoritative in that
+/// case.
+fn validate_compression_capability(value: &str, config: &Config) -> Result<()> {
+    validate_compression(value)?;
+
+    if let Ok(caps) = crate::dar::version::capabilities(&config.dar.binary) {
+        if !caps.supports(value) {
+            let supported: Vec<&str> = VALID_COMPRESSION_VALUES
+                .iter()
+                .filter(|alg| caps.supports(alg))
+                .copied()
+                .collect();
+            return Err(TapectlError::Other(format!(
+                "compression \"{value}\" is not supported by the local dar binary ({}): \
+                 it supports {}",
+                config.dar.binary,
+                supported.join(", ")
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ArchiveSetCommands {
     /// Create a new archive set policy
@@ -132,7 +166,7 @@ pub fn run(
             description,
         } => {
             if let Some(c) = compression {
-                validate_compression(c)?;
+                validate_compression_capability(c, config)?;
             }
             let locations_json = required_locations.as_ref().map(|locs| {
                 let arr: Vec<&str> = locs.split(',').map(|s| s.trim()).collect();
@@ -181,7 +215,7 @@ pub fn run(
             description,
         } => {
             if let Some(c) = compression {
-                validate_compression(c)?;
+                validate_compression_capability(c, config)?;
             }
             let id: i64 = conn
                 .query_row(
@@ -548,7 +582,7 @@ pub fn run(
             // the config happened to be clean.
             for as_cfg in &config.archive_sets {
                 if let Some(c) = &as_cfg.compression {
-                    validate_compression(c).map_err(|e| {
+                    validate_compression_capability(c, config).map_err(|e| {
                         TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
                     })?;
                 }
@@ -707,6 +741,125 @@ mod tests {
             .unwrap()
                 == 0,
             "no archive_set row should be created when compression is invalid"
+        );
+    }
+
+    /// Writes a fake `dar` executable to a tempdir that answers `-V` with a
+    /// synthetic capability block missing `lzo`, and answers `--version`
+    /// with a real-looking version line so `validate_compression` (via
+    /// `dar::version::check`/`capabilities`, both invoked through the same
+    /// `Command::new(dar_binary)` shape) works against it. Real dar on this
+    /// dev machine reports YES for every codec (per issue #97's context),
+    /// so capability *rejection* can only be exercised against a synthetic
+    /// binary, never the real one.
+    fn fake_dar_missing_lzo() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dar");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+if [ "$1" = "-V" ]; then
+  echo " Using libdar 6.7.1 built with compilation time options:"
+  echo "   gzip compression (libz)      : YES"
+  echo "   bzip2 compression (libbzip2) : YES"
+  echo "   lzo compression (liblzo2)    : NO"
+  echo "   xz compression (liblzma)     : YES"
+  echo "   zstd compression (libzstd)   : YES"
+  echo "   lz4 compression (liblz4)     : YES"
+else
+  echo "dar version 2.7.13, Copyright (C) 2002-2052 Denis Corbin"
+fi
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (tmp, path.to_str().unwrap().to_string())
+    }
+
+    /// Issue #97: an algorithm from `VALID_COMPRESSION_VALUES` that the
+    /// local (synthetic) dar was not compiled to support must be rejected,
+    /// and the error must name what the binary DOES support.
+    #[test]
+    fn create_rejects_syntactically_valid_but_locally_unsupported_compression() {
+        let (_tmp, dar_path) = fake_dar_missing_lzo();
+        let conn = fresh_conn();
+        let mut config = Config::default();
+        config.dar.binary = dar_path;
+
+        let err = run(
+            &conn,
+            &config,
+            &create_cmd("cold", None, Some("lzo")),
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("lzo"), "must name the rejected value: {msg}");
+        assert!(
+            msg.contains("gzip"),
+            "must name a supported value in the message: {msg}"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "no archive_set row should be created when compression is unsupported"
+        );
+    }
+
+    /// Issue #97: an outright invalid name must still hit the syntactic
+    /// error path, not the capability-check path — even against a dar
+    /// binary that would otherwise reject it for a different reason.
+    #[test]
+    fn create_rejects_invalid_name_with_syntactic_error_even_with_capability_probe_available() {
+        let (_tmp, dar_path) = fake_dar_missing_lzo();
+        let conn = fresh_conn();
+        let mut config = Config::default();
+        config.dar.binary = dar_path;
+
+        let err = run(
+            &conn,
+            &config,
+            &create_cmd("cold", None, Some("bogus")),
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("accepted values are"), "got: {msg}");
+    }
+
+    /// Issue #97: a syntactically valid, locally-supported algorithm must
+    /// still succeed against the synthetic capability-aware dar.
+    #[test]
+    fn create_accepts_locally_supported_compression() {
+        let (_tmp, dar_path) = fake_dar_missing_lzo();
+        let conn = fresh_conn();
+        let mut config = Config::default();
+        config.dar.binary = dar_path;
+
+        run(
+            &conn,
+            &config,
+            &create_cmd("cold", None, Some("gzip")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
     }
 
