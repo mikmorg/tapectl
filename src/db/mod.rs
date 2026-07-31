@@ -28,7 +28,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
     configure(&conn)?;
     migrate(&mut conn)?;
-    recover_orphaned_sessions(&conn)?;
+    recover_orphaned_sessions(&conn, path)?;
     crate::config::secure_path(path, 0o600);
     // WAL mode (set in `configure`) writes pending pages to `<path>-wal`
     // (and its `-shm` index) — the exact same content as the main db file,
@@ -140,7 +140,19 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 /// action, and re-matching it on every `db::open()` would log a spurious
 /// "recovered N sessions" event each time an unresolved interrupted session
 /// simply sits there.
-fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
+/// Issue #98 asymmetry, deliberate: the `writes` sweep just above stays
+/// exactly as it was — NOT made lock-aware. `docs/design/layout-session.md`
+/// (~line 157) makes "still `in_progress` at open ⇒ a live writer in
+/// another process" load-bearing for `InterruptedSession::rehydrate`, and
+/// changing that inference to a flock check would invalidate a documented
+/// contract this function does not own. It also degrades safely as-is:
+/// `interrupted` is resumable and revalidation still runs on resume, so a
+/// live writer wrongly marked `interrupted` by this sweep loses nothing.
+/// The `stage_sets` sweep below has no such safety net — marking a live
+/// `staging` row `failed` while something else could later target `failed`
+/// rows for deletion would be actively destructive — which is exactly why
+/// it, and only it, gets the flock treatment.
+fn recover_orphaned_sessions(conn: &Connection, db_path: &Path) -> Result<()> {
     let updated = conn.execute(
         "UPDATE writes SET status = 'interrupted'
          WHERE status = 'in_progress'",
@@ -165,14 +177,43 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    let updated = conn.execute(
-        "UPDATE stage_sets SET status = 'failed'
-         WHERE status = 'staging'",
-        [],
-    )?;
-    if updated > 0 {
+    // Issue #98: lock-aware. A `status = 'staging'` row alone cannot tell a
+    // crashed stage from one running right now in another process — this
+    // sweep runs on *every* `db::open()`, including read-only commands, so
+    // a plain status-only UPDATE (the pre-fix version of this sweep) would
+    // mark a live invocation's row `'failed'` out from under it. Each
+    // candidate row is instead probed via its per-stage-set flock
+    // (`staging::lock::is_crashed`): free ⇒ no live holder ⇒ crashed ⇒ mark
+    // `'failed'`; held ⇒ a live process owns it ⇒ left untouched.
+    //
+    // Marking ONLY — this never touches the filesystem beyond the lockfiles
+    // `is_crashed` itself opens/probes (and releases immediately). Deleting
+    // any staging content here would mean opening the DB for a read (e.g.
+    // `report copies`, `catalog ls`) could destroy staging data; actual
+    // file cleanup for a `'failed'` set happens later, and only via
+    // `staging::clean::clean_staging`.
+    let staging_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM stage_sets WHERE status = 'staging'")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids
+    };
+
+    let mut crashed = 0u64;
+    for stage_set_id in staging_ids {
+        if crate::staging::lock::is_crashed(db_path, stage_set_id) {
+            conn.execute(
+                "UPDATE stage_sets SET status = 'failed'
+                 WHERE id = ?1 AND status = 'staging'",
+                [stage_set_id],
+            )?;
+            crashed += 1;
+        }
+    }
+    if crashed > 0 {
         warn!(
-            count = updated,
+            count = crashed,
             "recovered orphaned staging sessions — marked as failed"
         );
         events::log_event(
@@ -184,7 +225,7 @@ fn recover_orphaned_sessions(conn: &Connection) -> Result<()> {
             Some("stage_sets.status"),
             None,
             Some("failed"),
-            Some(&format!("{updated} sessions")),
+            Some(&format!("{crashed} sessions")),
             None,
         )?;
     }

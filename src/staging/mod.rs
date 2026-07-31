@@ -1,5 +1,6 @@
 pub mod clean;
 pub mod exclude;
+pub mod lock;
 pub mod validate;
 
 use std::fs;
@@ -171,7 +172,21 @@ pub fn stage_create(
     snapshot_id: i64,
 ) -> Result<i64> {
     let stage_set_id_holder: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
-    match stage_create_inner(conn, paths, config, snapshot_id, &stage_set_id_holder) {
+    // Holds the stage set's flock guard for the entire lifetime of this
+    // function call, success or error (issue #98) — `lock::StageLock`
+    // unlocks on drop, and this `Cell` lives until `stage_create` returns,
+    // so the lock is released only once the caller gets control back
+    // (after `cleanup_failed_stage_set` has already run on the error path
+    // below).
+    let lock_holder: std::cell::Cell<Option<lock::StageLock>> = std::cell::Cell::new(None);
+    match stage_create_inner(
+        conn,
+        paths,
+        config,
+        snapshot_id,
+        &stage_set_id_holder,
+        &lock_holder,
+    ) {
         Ok(id) => Ok(id),
         Err(e) => {
             if let Some(stage_set_id) = stage_set_id_holder.get() {
@@ -188,6 +203,7 @@ fn stage_create_inner(
     config: &Config,
     snapshot_id: i64,
     stage_set_id_holder: &std::cell::Cell<Option<i64>>,
+    lock_holder: &std::cell::Cell<Option<lock::StageLock>>,
 ) -> Result<i64> {
     let snapshot = get_snapshot(conn, snapshot_id)?;
     let unit = get_unit_for_snapshot(conn, &snapshot)?;
@@ -236,14 +252,32 @@ fn stage_create_inner(
         );
     }
 
-    // Create stage_set record
-    conn.execute(
+    // Create stage_set record.
+    //
+    // Issue #98: the row must never be visible to another connection at
+    // `status = 'staging'` without its flock already held, or a concurrent
+    // `db::open()` sweep (`recover_orphaned_sessions`) could probe-lock it,
+    // find it free, and mark a genuinely live stage_set `'failed'`. Under
+    // WAL a row is invisible to other connections until commit, so this
+    // whole sequence — INSERT, read back the new id, acquire the flock —
+    // happens INSIDE one explicit transaction, and the flock is acquired
+    // BEFORE that transaction commits. Acquiring a flock is microseconds,
+    // so this does not reintroduce the long-running-transaction problem the
+    // rest of this function's comments warn about (the dar run below stays
+    // entirely outside any transaction, exactly as before).
+    let insert_tx = conn.unchecked_transaction()?;
+    insert_tx.execute(
         "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
          VALUES (?1, ?2, ?3, 1)",
         params![snapshot_id, resolved.slice_size, compression],
     )?;
-    let stage_set_id = conn.last_insert_rowid();
+    let stage_set_id = insert_tx.last_insert_rowid();
     stage_set_id_holder.set(Some(stage_set_id));
+
+    let stage_lock = lock::acquire(&paths.db_file, stage_set_id)?;
+    lock_holder.set(Some(stage_lock));
+
+    insert_tx.commit()?;
 
     // Step 1: SHA256 source validation
     info!("validating source checksums");
@@ -528,7 +562,7 @@ fn stage_create_inner(
 /// `cleanup_failed_stage_set`'s prefix scan can never drift apart again.
 /// `catalog_base` is deliberately NOT built this way — it stays
 /// per-snapshot on purpose (see `stage_create_inner`'s catalog step).
-fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
+pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!(
         "{}_v{}_s{}",
         unit_uuid.replace('-', "").get(..12).unwrap_or(unit_uuid),
@@ -541,7 +575,7 @@ fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String
 /// every slice `{base}.{N}.dar`, so the real filesystem prefix is
 /// `{base}.`, not the bare base — without the dot, `_s1` would prefix-match
 /// `_s10.1.dar`.
-fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
+pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!("{}.", archive_base_name(unit_uuid, version, stage_set_id))
 }
 
