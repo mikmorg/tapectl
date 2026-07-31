@@ -1559,9 +1559,19 @@ pub fn compact_write(
     volume_write(conn, paths, config, dest_label, device, block_size, false)
 }
 
+/// One unit affected by `compact_finish`'s retirement, together with the
+/// ADR-0004 remaining-coverage evidence for it after the source volume is
+/// excluded (issue #99). Mirrors `cli::operations::RetireImpact`'s
+/// evidence half — `compact_finish` retires a volume exactly like
+/// `volume_retire` does, so it consumes coverage the same way.
+pub struct CompactFinishReport {
+    pub unit_name: String,
+    pub evidence: Vec<crate::policy::evidence::CoverageEvidence>,
+}
+
 /// Compact-finish: retire the source volume after compaction.
 /// Refuses if any live slice on this volume has no copy on another volume.
-pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
+pub fn compact_finish(conn: &Connection, label: &str) -> Result<Vec<CompactFinishReport>> {
     let (vol_id, status): (i64, String) = conn
         .query_row(
             "SELECT id, status FROM volumes WHERE label = ?1",
@@ -1607,6 +1617,32 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
         )));
     }
 
+    // Units with a completed write on this volume -- the population whose
+    // coverage this retirement consumes (ADR-0004, issue #99). Gathered
+    // before the transaction below since retiring this volume doesn't
+    // change which units it touched.
+    let mut affected_stmt = conn.prepare(
+        "SELECT DISTINCT u.id, u.name
+         FROM units u
+         JOIN snapshots s ON s.unit_id = u.id
+         JOIN stage_sets ss ON ss.snapshot_id = s.id
+         JOIN writes w ON w.stage_set_id = ss.id
+         WHERE w.volume_id = ?1 AND w.status = 'completed'
+         ORDER BY u.name",
+    )?;
+    let affected_units: Vec<(i64, String)> = affected_stmt
+        .query_map(params![vol_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut report = Vec::with_capacity(affected_units.len());
+    for (unit_id, unit_name) in affected_units {
+        let evidence =
+            crate::policy::evidence::remaining_coverage_evidence(conn, unit_id, Some(vol_id))?;
+        report.push(CompactFinishReport {
+            unit_name,
+            evidence,
+        });
+    }
+
     // Retire volume + update cartridge atomically
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -1636,7 +1672,7 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<()> {
     tx.commit()?;
 
     info!(label = label, "compact-finish: volume retired");
-    Ok(())
+    Ok(report)
 }
 
 // ── Internal helpers ──

@@ -722,7 +722,9 @@ pub fn unit_mark_tape_only(
     if json_output {
         let evidence_json: Vec<serde_json::Value> = evidence
             .iter()
-            .map(|e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}))
+            .map(
+                |e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}),
+            )
             .collect();
         println!(
             "{}",

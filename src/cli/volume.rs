@@ -437,14 +437,19 @@ pub fn run(
         }
 
         VolumeCommands::CompactFinish { label } => {
-            write::compact_finish(conn, label)?;
+            let report = write::compact_finish(conn, label)?;
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"label": label, "status": "retired"})
+                    serde_json::json!({
+                        "label": label,
+                        "status": "retired",
+                        "affected_units": compact_finish_evidence_json(&report),
+                    })
                 );
             } else {
                 println!("compact-finish \"{label}\": volume retired");
+                print_compact_finish_evidence(&report);
             }
         }
 
@@ -474,13 +479,21 @@ pub fn run(
             println!("  Write completed");
 
             println!("=== Step 3: Retiring source volume \"{label}\" ===");
-            write::compact_finish(conn, label)?;
+            let report = write::compact_finish(conn, label)?;
             println!("  Volume \"{label}\" retired");
+            if !json_output {
+                print_compact_finish_evidence(&report);
+            }
 
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"source": label, "destination": dest_label, "status": "completed"})
+                    serde_json::json!({
+                        "source": label,
+                        "destination": dest_label,
+                        "status": "completed",
+                        "affected_units": compact_finish_evidence_json(&report),
+                    })
                 );
             } else {
                 println!("\ncompaction complete: {label} → {dest_label}");
@@ -488,6 +501,44 @@ pub fn run(
         }
     }
     Ok(exit_code)
+}
+
+/// ADR-0004 Tier 1: print the remaining-coverage evidence for every unit
+/// `compact_finish` retired coverage for. Display-only, matching
+/// `cli::operations::print_retire_impact`'s evidence lines -- compaction
+/// retires the source volume exactly like `volume retire` does.
+fn print_compact_finish_evidence(report: &[write::CompactFinishReport]) {
+    let now = chrono::Utc::now().naive_utc();
+    for unit in report {
+        if let Some(line) = crate::policy::evidence::describe(&unit.unit_name, &unit.evidence, now)
+        {
+            println!("  {line}");
+        }
+    }
+}
+
+/// JSON shape for `compact_finish`'s per-unit evidence, mirroring
+/// `cli::operations::retire_impacts_json`'s `evidence`/`evidence_summary`
+/// fields.
+fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<serde_json::Value> {
+    let now = chrono::Utc::now().naive_utc();
+    report
+        .iter()
+        .map(|unit| {
+            let evidence: Vec<serde_json::Value> = unit
+                .evidence
+                .iter()
+                .map(|e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}))
+                .collect();
+            let evidence_summary =
+                crate::policy::evidence::describe(&unit.unit_name, &unit.evidence, now);
+            serde_json::json!({
+                "unit": unit.unit_name,
+                "evidence": evidence,
+                "evidence_summary": evidence_summary,
+            })
+        })
+        .collect()
 }
 
 /// Decide the process exit code for `volume verify` from its report
