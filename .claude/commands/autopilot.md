@@ -31,8 +31,25 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#63, #83, #95.** (#91 closed 2026-07-30. #59, #50, #51, #98, #62, #43,
-  #61, #97, #99 closed 2026-07-31.)
+  **#63, #83.** (#91 closed 2026-07-30. #59, #50, #51, #98, #62, #43, #61,
+  #97, #99, #95 closed 2026-07-31.)
+  **Session-dir GC is live (#95).** `staging clean` reclaims
+  `{staging.directory}/sessions/*` matched to `writes.session_dir` by
+  **exact equality** (never prefix/label — two attempts on one volume
+  differ only by uuid). RETAIN while any row is `planned`/`in_progress`/
+  `interrupted` (the resumable set); RECLAIM when all are `completed`/
+  `failed`/`aborted`. §3.5 literally says "terminal-success", which would
+  retain failed dirs forever; its own parenthetical names `interrupted` as
+  the thing that must not be reaped, so the retention set is the resumable
+  set. Reasoning is in the code comment — do not "correct" it back.
+  **Orphan session dirs (zero referencing rows) are NOT deleted without
+  `--force`** — a live `build()` that hasn't committed its `plan()` rows
+  yet is indistinguishable from crash garbage. Leaking beats racing a
+  writer. Same instinct as #98's sweep.
+  **Lockfiles are reclaimed only for terminal stage sets** (`staged`/
+  `failed`/`cleaned`, never `staging`) — deleting one while a process
+  holds the flock lets a second process lock a different inode at the same
+  path with both believing they hold it.
   **ADR-0004 Tier-1 evidence display is now COMPLETE (#99)** at all three
   destructive ops the ADR names — `volume retire`, `unit mark-tape-only`,
   `compact-finish`. `remaining_coverage_evidence` takes `Option<i64>`
