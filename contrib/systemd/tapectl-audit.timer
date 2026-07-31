@@ -1,0 +1,21 @@
+[Unit]
+Description=Weekly tapectl advisory audit
+Documentation=file:/usr/share/doc/tapectl/operator-guide.md
+
+[Timer]
+# Weekly is the cadence the operator guide recommends: the audit costs nothing
+# but attention, and every check it runs is measured in days, not minutes.
+OnCalendar=Mon *-*-* 09:00:00
+
+# A machine that was off at 09:00 Monday still needs its audit — catch up on
+# the next boot rather than silently skipping a week.
+Persistent=true
+
+# Nothing here is time-critical, and spreading the start avoids colliding with
+# whatever else the machine does on the hour.
+RandomizedDelaySec=30m
+
+Unit=tapectl-audit.service
+
+[Install]
+WantedBy=timers.target

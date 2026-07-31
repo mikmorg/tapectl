@@ -1,0 +1,38 @@
+[Unit]
+Description=tapectl scheduled advisory audit (read-only, no tape)
+Documentation=file:/usr/share/doc/tapectl/operator-guide.md
+# Ordering only — this unit is harmless if the network never comes up.
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# tapectl resolves its config root purely from $HOME (src/config.rs), so BOTH
+# of these must be set and must match the operator whose ~/.tapectl holds the
+# database. A systemd service has no inherited $HOME; leave it out and the run
+# resolves a config root you did not intend.
+User=CHANGEME
+Environment=HOME=/home/CHANGEME
+
+# Optional healthchecks.io-style endpoint. Leave unset for no pinging.
+#Environment=TAPECTL_HEALTHCHECK_URL=https://hc-ping.com/YOUR-UUID
+
+# Absolute path to the wrapper (adjust to wherever you installed it).
+ExecStart=/usr/local/lib/tapectl/tapectl-scheduled-audit.sh
+
+# The wrapper propagates `tapectl audit`'s real exit code so it is visible in
+# `systemctl status`, but exit 1 means "advisory warnings" and must not be a
+# unit failure — ADR-0004's audit warns, it never blocks. Only exit 2
+# (violations) is a real failure.
+SuccessExitStatus=1
+
+# Read-only advisory work: no tape device, no writes outside the tapectl home.
+# `audit` still walks each active unit's source directory, so reads must stay
+# broad — do not add ProtectHome=, which would hide the very trees it checks.
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/home/CHANGEME/.tapectl
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

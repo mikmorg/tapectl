@@ -272,9 +272,11 @@ tapectl report events --days 30
 Everything below is a **manual rhythm you run**. tapectl schedules nothing and
 has no daemon or listener — that shape is permanently out of scope (issue #13's
 ratified verdict: every cost of a server exists to serve multi-machine access
-this system does not have). Scheduling the read-only advisory half via a systemd
-timer is a separate, still-unbuilt phase-3 item (#70); `volume write` stays
-manual forever, because it needs a human and a physically-present cartridge.
+this system does not have). The read-only advisory half *can* be put on a
+systemd timer — see [Scheduling the advisory half](#scheduling-the-advisory-half)
+below — but that is a wrapper around the same manual commands, not a daemon.
+`volume write` stays manual forever, because it needs a human and a
+physically-present cartridge.
 
 The two operations that need no tape in the drive are the ones worth doing
 often, because they cost nothing but attention:
@@ -294,6 +296,64 @@ never blocks, and a stale volume still counts as a copy.
 
 `tapectl report dirty` and `tapectl report pending` are the companion glance —
 what has drifted since its last snapshot, and what is staged but not yet on tape.
+
+### Scheduling the advisory half
+
+The weekly glance is the one part of the cadence a machine can do for you,
+because it is read-only and needs no tape in the drive. `contrib/systemd/`
+carries a timer, a service, and a wrapper script for exactly that:
+
+```bash
+sudo install -Dm755 contrib/systemd/tapectl-scheduled-audit.sh \
+    /usr/local/lib/tapectl/tapectl-scheduled-audit.sh
+sudo install -Dm644 contrib/systemd/tapectl-audit.service \
+    /etc/systemd/system/tapectl-audit.service
+sudo install -Dm644 contrib/systemd/tapectl-audit.timer \
+    /etc/systemd/system/tapectl-audit.timer
+
+# Both CHANGEME placeholders in the .service must become your username —
+# tapectl resolves ~/.tapectl from $HOME, and a systemd service inherits none.
+sudoedit /etc/systemd/system/tapectl-audit.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now tapectl-audit.timer
+systemctl start tapectl-audit.service   # run once now to check it works
+journalctl -u tapectl-audit.service -n 50
+```
+
+The wrapper runs `tapectl audit` followed by `tapectl report verify-status`, and
+its exit status is `audit`'s:
+
+| exit | meaning | unit result |
+|---|---|---|
+| 0 | clean | success |
+| 1 | warnings only | **success** (`SuccessExitStatus=1`) |
+| 2 | violations | failure |
+
+Warnings are not a failure on purpose. `audit` warns for ordinary drift — an
+overdue verification, a unit one copy short — and ADR-0004 is explicit that the
+audit advises and never blocks. A timer that alerts on exit 1 would turn the
+advisory audit into a blocking one by the back door.
+
+`report verify-status` always exits 0; it runs for the journal record, not as a
+check. The verification-age *check* with real exit codes is one of `audit`'s six
+compliance checks, so nothing is lost.
+
+Set `TAPECTL_HEALTHCHECK_URL` in the service to ping a healthchecks.io-style
+endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2). It is off unless
+set, and a missing `curl` or a failed ping never changes the run's own result.
+
+Two things the timer does **not** change:
+
+- **It never writes.** No tape command is scheduled, ever. The service sets
+  `PrivateDevices=true` so it cannot reach `/dev/nst*` even by mistake.
+- **It is safe to fire during other work, with one cosmetic caveat.** Opening
+  the database runs the startup sweep, which marks an `in_progress` write
+  session `interrupted` — so an audit landing in the middle of a `volume write`
+  produces a spurious "recovered orphaned write sessions" event. The session
+  stays fully resumable and revalidates on resume, so nothing is lost, but
+  prefer a schedule outside your usual write window to keep the event log
+  honest.
 
 ### Monthly — verify a rotating slice of the library
 
