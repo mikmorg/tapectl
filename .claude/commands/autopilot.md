@@ -31,8 +31,21 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#63, #83.** (#91 closed 2026-07-30. #59, #50, #51, #98, #62, #43, #61,
-  #97, #99, #95 closed 2026-07-31.)
+  **#83 is the LAST open phase-2 item.** (#91 closed 2026-07-30. #59, #50,
+  #51, #98, #62, #43, #61, #97, #99, #95, #63 closed 2026-07-31.)
+  **`restore raw-volume` exists (#63)** — `src/volume/raw.rs`, DB-less by
+  signature (`restore_raw(device, block_size, dest, expect_label)`),
+  read-only (`TapeStore::open_read`), streaming. It dumps by position from
+  the front index, naming files `{position:04}_{type_label}.bin` — the
+  index carries no unit/tenant names by invariant, so friendlier naming is
+  impossible without reintroducing the DB dependency the command exists to
+  avoid. Verified on a real sealed tape: 23 files, 21 verified, 0
+  mismatched, from a home whose DB had never seen that volume.
+  **#83 changes what is written into the operator envelope — i.e. bytes on
+  tape.** It is the one remaining item that touches the tape format, so it
+  needs the envelope traps from #87 (hand-rolled `Header::new_gnu()`, never
+  `append_file`/`append_path_with_name`, whose pax/ustar records pass every
+  Rust test and break only the bash-`tar` heir legs) and a full mhvtl gate.
   **Session-dir GC is live (#95).** `staging clean` reclaims
   `{staging.directory}/sessions/*` matched to `writes.session_dir` by
   **exact equality** (never prefix/label — two attempts on one volume
