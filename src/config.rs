@@ -415,7 +415,47 @@ impl Config {
             return Err(TapectlError::ConfigNotFound(path.display().to_string()));
         }
         let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|e| TapectlError::Config(e.to_string()))
+        let config: Config =
+            toml::from_str(&content).map_err(|e| TapectlError::Config(e.to_string()))?;
+        config.validate_sizes()?;
+        Ok(config)
+    }
+
+    /// Reject unparseable size strings (issue #59) at config-load time,
+    /// rather than letting a bad value silently become 0 bytes or the wrong
+    /// magnitude downstream in capacity math / bin-packing. Every
+    /// size-typed field is named in its own error so the operator can find
+    /// it without grepping the TOML: `defaults.slice_size`,
+    /// `defaults.large_file_warn_threshold`, and each configured LTO
+    /// backend's `nominal_capacity`/`enospc_buffer`.
+    ///
+    /// `backends.lto[].block_size` and `packing.min_free_for_append` are
+    /// size-typed strings too but are dead config — nothing in the write
+    /// path reads either (see `collection/plan.rs`'s `BLOCK_SIZE` comment
+    /// for `block_size`; `min_free_for_append` has no reader at all) — so
+    /// they are deliberately NOT validated here to avoid rejecting a config
+    /// file over a field tapectl never acts on.
+    fn validate_sizes(&self) -> Result<()> {
+        crate::staging::parse_size_to_bytes(&self.defaults.slice_size)
+            .map_err(|e| TapectlError::Config(format!("defaults.slice_size = {e}")))?;
+        crate::staging::parse_size_to_bytes(&self.defaults.large_file_warn_threshold).map_err(
+            |e| TapectlError::Config(format!("defaults.large_file_warn_threshold = {e}")),
+        )?;
+        for (i, backend) in self.backends.lto.iter().enumerate() {
+            crate::staging::parse_size_to_bytes(&backend.nominal_capacity).map_err(|e| {
+                TapectlError::Config(format!(
+                    "backends.lto[{i}] (\"{}\").nominal_capacity = {e}",
+                    backend.name
+                ))
+            })?;
+            crate::staging::parse_size_to_bytes(&backend.enospc_buffer).map_err(|e| {
+                TapectlError::Config(format!(
+                    "backends.lto[{i}] (\"{}\").enospc_buffer = {e}",
+                    backend.name
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Load config or use defaults if the file doesn't exist yet (for `init`).
