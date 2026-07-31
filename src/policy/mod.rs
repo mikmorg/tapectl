@@ -28,6 +28,10 @@ pub struct ResolvedPolicy {
     pub preserve_acls: bool,
     pub preserve_fsa: bool,
     pub dirty_on_metadata_change: bool,
+    /// ADR-0006: how many recorded WAREHOUSE deposits this unit should
+    /// carry, on top of its tape copies. 0 (the default) means none are
+    /// expected and `audit` says nothing about warehouses for this unit.
+    pub warehouse_copies: i64,
 }
 
 /// Resolve the effective policy for a unit.
@@ -59,6 +63,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         preserve_acls: defaults.preserve_acls,
         preserve_fsa: defaults.preserve_fsa,
         dirty_on_metadata_change: defaults.dirty_on_metadata_change,
+        warehouse_copies: defaults.warehouse_copies,
     };
 
     // Layer 2: Archive set (if unit has one)
@@ -66,7 +71,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         if let Ok(row) = conn.query_row(
             "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
-                    preserve_fsa, dirty_on_metadata_change
+                    preserve_fsa, dirty_on_metadata_change, warehouse_copies
              FROM archive_sets WHERE id = ?1",
             params![as_id],
             |row| {
@@ -82,6 +87,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
                 ))
             },
         ) {
@@ -97,6 +103,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 preserve_acls,
                 preserve_fsa,
                 dirty_on_meta,
+                warehouse_copies,
             ) = row;
 
             if let Some(v) = min_copies {
@@ -134,6 +141,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             if let Some(v) = dirty_on_meta {
                 policy.dirty_on_metadata_change = v != 0;
             }
+            if let Some(v) = warehouse_copies {
+                policy.warehouse_copies = v;
+            }
         }
     }
 
@@ -153,6 +163,16 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         }
                         if let Some(v) = pol.get("slice_size").and_then(|v| v.as_str()) {
                             policy.slice_size = crate::staging::parse_size_to_bytes(v)?;
+                        }
+                        // ADR-0006 / issue #73. Read straight off the TOML
+                        // table, like every other dotfile knob here: absent
+                        // means "defer to the archive set", so there is
+                        // deliberately no default filled in anywhere on the
+                        // way in (issue #92 -- a filled default is
+                        // indistinguishable from an operator choice and
+                        // would silently outrank the archive set).
+                        if let Some(v) = pol.get("warehouse_copies").and_then(|v| v.as_integer()) {
+                            policy.warehouse_copies = v;
                         }
                     }
                 }
@@ -281,6 +301,55 @@ slice_size = "500M"
         assert_eq!(p.checksum_mode, "full_hash");
         assert_eq!(p.compression, "gzip");
         assert_eq!(p.slice_size, 500 * 1024 * 1024);
+    }
+
+    /// ADR-0006 / issue #73: `warehouse_copies` resolves through the same
+    /// three layers as every other knob, and each layer only speaks when
+    /// it has actually been set.
+    #[test]
+    fn warehouse_copies_resolves_dotfile_over_archive_set_over_defaults() {
+        let conn = fresh_conn();
+        let config = Config::default();
+
+        // Layer 3: system default, nothing else set.
+        let p = resolve(&conn, &config, &make_unit(None, None)).unwrap();
+        assert_eq!(p.warehouse_copies, 0, "default is opt-in, i.e. none");
+
+        // Layer 2: archive set.
+        conn.execute(
+            "INSERT INTO archive_sets (name, warehouse_copies) VALUES ('core', 2)",
+            [],
+        )
+        .unwrap();
+        let as_id = conn.last_insert_rowid();
+        let p = resolve(&conn, &config, &make_unit(Some(as_id), None)).unwrap();
+        assert_eq!(p.warehouse_copies, 2);
+
+        // A NULL archive-set column must defer, not read as 0.
+        conn.execute(
+            "INSERT INTO archive_sets (name, min_copies) VALUES ('silent', 3)",
+            [],
+        )
+        .unwrap();
+        let silent = conn.last_insert_rowid();
+        let mut cfg = Config::default();
+        cfg.defaults.warehouse_copies = 1;
+        let p = resolve(&conn, &cfg, &make_unit(Some(silent), None)).unwrap();
+        assert_eq!(
+            p.warehouse_copies, 1,
+            "NULL means defer to the next layer, never 0"
+        );
+
+        // Layer 1: the unit dotfile outranks the archive set.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\nwarehouse_copies = 4\n",
+        )
+        .unwrap();
+        let unit = make_unit(Some(as_id), Some(tmp.path().to_str().unwrap().to_string()));
+        let p = resolve(&conn, &config, &unit).unwrap();
+        assert_eq!(p.warehouse_copies, 4);
     }
 
     #[test]

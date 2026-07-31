@@ -177,6 +177,7 @@ mod tests {
             archive_set: archive_set.map(|s| s.to_string()),
             checksum_mode: Some("mtime_size".to_string()),
             compression: Some("none".to_string()),
+            warehouse_copies: None,
             exclude_patterns: vec![],
         };
         dotfile::write_dotfile(&dir.join(".tapectl-unit.toml"), &df).unwrap();

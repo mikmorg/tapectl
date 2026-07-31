@@ -94,6 +94,7 @@ pub fn init_unit(
         archive_set: archive_set.map(|s| s.to_string()),
         checksum_mode: None,
         compression: None,
+        warehouse_copies: None,
         exclude_patterns: Vec::new(),
     };
     dotfile::write_dotfile(&dotfile_path, &dotfile_data)?;

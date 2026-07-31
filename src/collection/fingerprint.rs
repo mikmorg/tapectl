@@ -968,6 +968,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                warehouse_copies: None,
                 exclude_patterns: vec!["*.tmp".into(), "Thumbs.db".into()],
             },
         )
@@ -1097,6 +1098,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                warehouse_copies: None,
                 exclude_patterns: vec!["*.tmp".into()],
             },
         )

@@ -15,6 +15,13 @@ pub struct UnitDotfile {
     pub archive_set: Option<String>,
     pub checksum_mode: Option<String>,
     pub compression: Option<String>,
+    /// ADR-0006 / issue #73: how many warehouse deposits this unit should
+    /// carry. `None` means the dotfile is SILENT, so the archive set (then
+    /// the system default) decides. It is an `Option` with no serde
+    /// `default` for the reason issue #92 records: a filled-in default is
+    /// indistinguishable from a deliberate operator choice and would
+    /// silently outrank the archive-set layer it is supposed to defer to.
+    pub warehouse_copies: Option<i64>,
     pub exclude_patterns: Vec<String>,
 }
 
@@ -67,6 +74,9 @@ struct PolicySection {
     checksum_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compression: Option<String>,
+    /// No `#[serde(default)]` -- see `UnitDotfile::warehouse_copies`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warehouse_copies: Option<i64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -77,12 +87,16 @@ struct ExcludesSection {
 
 /// Write dotfile to disk in the design-specified TOML format.
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
-    let policy = if data.checksum_mode.is_none() && data.compression.is_none() {
+    let policy = if data.checksum_mode.is_none()
+        && data.compression.is_none()
+        && data.warehouse_copies.is_none()
+    {
         None
     } else {
         Some(PolicySection {
             checksum_mode: data.checksum_mode.clone(),
             compression: data.compression.clone(),
+            warehouse_copies: data.warehouse_copies,
         })
     };
 
@@ -125,6 +139,7 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
             .as_ref()
             .and_then(|p| p.checksum_mode.clone()),
         compression: wrapper.policy.as_ref().and_then(|p| p.compression.clone()),
+        warehouse_copies: wrapper.policy.as_ref().and_then(|p| p.warehouse_copies),
         exclude_patterns: wrapper.excludes.patterns,
     })
 }
@@ -144,6 +159,7 @@ mod tests {
             archive_set: Some("cold".into()),
             checksum_mode: Some("sha256".into()),
             compression: Some("lzma".into()),
+            warehouse_copies: None,
             exclude_patterns: vec!["*.tmp".into(), ".cache/".into()],
         }
     }
@@ -234,6 +250,45 @@ compression = "gzip"
             !raw.contains("[policy]"),
             "no [policy] header should be written when both fields are None, got: {raw}"
         );
+    }
+
+    /// Issue #92's contract, extended to `warehouse_copies` (issue #73):
+    /// an unset knob must not be materialised into the file. A written
+    /// `warehouse_copies = 0` is indistinguishable from an operator
+    /// deliberately choosing zero, and would silently outrank the archive
+    /// set forever after.
+    #[test]
+    fn write_omits_warehouse_copies_when_unset_and_round_trips_when_set() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        let mut d = sample();
+        d.warehouse_copies = None;
+        write_dotfile(&path, &d).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("warehouse_copies"),
+            "an unset warehouse_copies must not be written, got: {raw}"
+        );
+        assert!(read_dotfile(&path).unwrap().warehouse_copies.is_none());
+
+        d.warehouse_copies = Some(2);
+        write_dotfile(&path, &d).unwrap();
+        assert_eq!(read_dotfile(&path).unwrap().warehouse_copies, Some(2));
+    }
+
+    /// `[policy]` must still vanish entirely when EVERY policy knob is
+    /// unset -- adding a third field must not resurrect the header.
+    #[test]
+    fn write_omits_policy_table_when_warehouse_copies_is_the_only_unset_addition() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        let mut d = sample();
+        d.checksum_mode = None;
+        d.compression = None;
+        d.warehouse_copies = None;
+        write_dotfile(&path, &d).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("[policy]"), "got: {raw}");
     }
 
     #[test]

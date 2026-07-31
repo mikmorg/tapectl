@@ -192,6 +192,12 @@ pub struct DefaultsConfig {
     pub min_copies_for_tape_only: i32,
     #[serde(default = "default_min_locations")]
     pub min_locations_for_tape_only: i32,
+    /// ADR-0006: how many WAREHOUSE copies a unit should carry, as the
+    /// bottom layer of the three-level policy chain. 0 means "tape only is
+    /// fine" — LTO is the primary line and the irreplaceable core earns
+    /// the extra leg, so this is opt-in, per class, not fleet-wide.
+    #[serde(default)]
+    pub warehouse_copies: i64,
 }
 
 fn default_slice_size() -> String {
@@ -246,6 +252,7 @@ impl Default for DefaultsConfig {
             large_file_warn_threshold: default_large_file_warn(),
             min_copies_for_tape_only: default_min_copies(),
             min_locations_for_tape_only: default_min_locations(),
+            warehouse_copies: 0,
         }
     }
 }

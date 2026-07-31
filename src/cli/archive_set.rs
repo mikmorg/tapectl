@@ -85,6 +85,10 @@ pub enum ArchiveSetCommands {
         /// Verify interval in days
         #[arg(long)]
         verify_interval_days: Option<i64>,
+        /// Warehouse copies expected (ADR-0006). Omitted leaves the field
+        /// NULL, which means "defer to the system default".
+        #[arg(long)]
+        warehouse_copies: Option<i64>,
         /// Description
         #[arg(long, short)]
         description: Option<String>,
@@ -115,6 +119,10 @@ pub enum ArchiveSetCommands {
         /// Verify interval in days
         #[arg(long)]
         verify_interval_days: Option<i64>,
+        /// Warehouse copies expected (ADR-0006). Omitted leaves the field
+        /// NULL, which means "defer to the system default".
+        #[arg(long)]
+        warehouse_copies: Option<i64>,
         /// Description
         #[arg(long, short)]
         description: Option<String>,
@@ -163,6 +171,7 @@ pub fn run(
             checksum_mode,
             slice_size,
             verify_interval_days,
+            warehouse_copies,
             description,
         } => {
             if let Some(c) = compression {
@@ -179,8 +188,9 @@ pub fn run(
 
             conn.execute(
                 "INSERT INTO archive_sets (name, description, min_copies, required_locations,
-                 encrypt, compression, checksum_mode, slice_size, verify_interval_days)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 encrypt, compression, checksum_mode, slice_size, verify_interval_days,
+                 warehouse_copies)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     name,
                     description,
@@ -191,6 +201,7 @@ pub fn run(
                     checksum_mode,
                     slice_bytes,
                     verify_interval_days,
+                    warehouse_copies,
                 ],
             )?;
             let id = conn.last_insert_rowid();
@@ -212,6 +223,7 @@ pub fn run(
             checksum_mode,
             slice_size,
             verify_interval_days,
+            warehouse_copies,
             description,
         } => {
             if let Some(c) = compression {
@@ -237,6 +249,7 @@ pub fn run(
                 old_checksum_mode,
                 old_slice_size,
                 old_verify_days,
+                old_warehouse_copies,
                 old_description,
             ): (
                 Option<i64>,
@@ -246,10 +259,11 @@ pub fn run(
                 Option<String>,
                 Option<i64>,
                 Option<i64>,
+                Option<i64>,
                 Option<String>,
             ) = conn.query_row(
                 "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
-                        slice_size, verify_interval_days, description
+                        slice_size, verify_interval_days, warehouse_copies, description
                  FROM archive_sets WHERE id = ?1",
                 params![id],
                 |row| {
@@ -262,6 +276,7 @@ pub fn run(
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )?;
@@ -392,6 +407,23 @@ pub fn run(
                     "edited",
                     "verify_interval_days",
                     old_verify_days.map(|v| v.to_string()).as_deref(),
+                    &v.to_string(),
+                    None,
+                )?;
+            }
+            if let Some(v) = warehouse_copies {
+                tx.execute(
+                    "UPDATE archive_sets SET warehouse_copies = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    params![v, id],
+                )?;
+                events::log_field_change(
+                    &tx,
+                    "archive_set",
+                    id,
+                    name,
+                    "edited",
+                    "warehouse_copies",
+                    old_warehouse_copies.map(|v| v.to_string()).as_deref(),
                     &v.to_string(),
                     None,
                 )?;
@@ -708,6 +740,7 @@ mod tests {
             checksum_mode: None,
             slice_size: None,
             verify_interval_days: None,
+            warehouse_copies: None,
             description: None,
         }
     }
@@ -959,6 +992,7 @@ fi
                 checksum_mode: None,
                 slice_size: None,
                 verify_interval_days: None,
+                warehouse_copies: None,
                 description: None,
             },
             false,
@@ -1036,6 +1070,7 @@ fi
                 checksum_mode: Some("REJECT_ME_TEST_SENTINEL".to_string()),
                 slice_size: None,
                 verify_interval_days: None,
+                warehouse_copies: None,
                 description: None,
             },
             false,

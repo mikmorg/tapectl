@@ -104,6 +104,7 @@ mod tests {
             archive_set: None,
             checksum_mode: None,
             compression: None,
+            warehouse_copies: None,
             exclude_patterns: vec![],
         }
     }
