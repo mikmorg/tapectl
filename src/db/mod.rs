@@ -1,3 +1,4 @@
+pub mod catalog_snapshot;
 pub mod events;
 pub mod export;
 #[allow(dead_code)]

@@ -294,6 +294,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
             .collect(),
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: None,
+        catalog_db_path: None,
     };
 
     let session_dir = tempfile::tempdir().unwrap();
@@ -446,6 +447,7 @@ fn build_layout_only(volume_uuid: &str, created_at: &str) -> BuiltLayout {
         ],
         operator_public_keys: vec![op_key.public_key],
         escrow_public_key: None,
+        catalog_db_path: None,
     };
 
     let session_dir = tempfile::tempdir().unwrap();

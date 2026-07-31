@@ -307,6 +307,19 @@ pub fn volume_write(
         .join("sessions")
         .join(format!("{label}-{}", Uuid::new_v4()));
 
+    // Filtered catalog.db (issue #83): generated here, where `conn` is
+    // available — `build()` deliberately stays `Connection`-free (T5b). The
+    // scope is exactly this write's stage_sets (`units`, just gathered by
+    // `find_staged_data` above) — everything `status = 'staged'` right now
+    // is what is about to become this volume's `writes`/`write_positions`
+    // rows below, and nothing else is staged at this instant (the
+    // unresolved-write-session check above refuses a second concurrent
+    // write). `build()` appends it to the OPERATOR envelope only.
+    fs::create_dir_all(&session_dir)?;
+    let catalog_db_path = session_dir.join("catalog_snapshot.db");
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    crate::db::catalog_snapshot::build_catalog_snapshot(conn, &stage_set_ids, &catalog_db_path)?;
+
     let inputs = BuildInputs {
         label: label.to_string(),
         volume_uuid,
@@ -326,6 +339,7 @@ pub fn volume_write(
         tenants,
         operator_public_keys,
         escrow_public_key,
+        catalog_db_path: Some(catalog_db_path),
     };
 
     let built = build::build(&inputs, &session_dir)?;
