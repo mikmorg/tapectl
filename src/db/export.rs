@@ -76,34 +76,80 @@ pub fn write_json_value<W: Write>(out: &mut W, value: ValueRef<'_>) -> std::io::
     }
 }
 
-/// Stream a full JSON dump of the database to `out`.
+/// The tables worth exporting: every real user table, minus SQLite's own
+/// `sqlite_%` internals, minus FTS5 virtual tables and their shadows.
 ///
-/// Enumerates tables from `sqlite_master` at runtime (never a hardcoded
-/// list), reads `schema_version` from the `meta` table, and streams each
-/// table's rows one at a time so peak memory tracks a single row.
-pub fn export_json<W: Write>(conn: &Connection, out: &mut W) -> Result<()> {
-    // schema_version: read from the real `meta` table, not a constant.
-    let schema_version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
+/// Enumerated at runtime rather than hardcoded — a fixed list silently
+/// stops exporting whatever the next migration adds, which is the drift
+/// that made the old seven-table count block wrong in the first place.
+///
+/// **Why FTS is excluded.** `files_fts` is a `CREATE VIRTUAL TABLE ... fts5`
+/// index over `files`, and SQLite materializes it as four shadow tables
+/// (`_data`, `_idx`, `_docsize`, `_config`). Those hold the serialized
+/// inverted index as opaque BLOBs — hex-encoding them would bloat the dump
+/// enormously with bytes that mean nothing outside SQLite's FTS
+/// implementation, and they cannot be restored by inserting rows anyway:
+/// FTS rebuilds them from `files`, which IS exported. Dumping derived
+/// binary state alongside its own source is worse than useless — it invites
+/// an importer to try replaying it.
+///
+/// The exclusion is derived, not a name blocklist: any `CREATE VIRTUAL
+/// TABLE` is skipped along with anything prefixed `<vtab>_`, so a future
+/// virtual table is handled without editing this function.
+fn exportable_tables(conn: &Connection) -> Result<Vec<String>> {
+    let mut vtab_stmt = conn.prepare(
+        "SELECT name FROM sqlite_master \
+         WHERE type='table' AND sql LIKE 'CREATE VIRTUAL TABLE%'",
+    )?;
+    let virtual_tables: Vec<String> = vtab_stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(vtab_stmt);
 
-    out.write_all(b"{\"schema_version\":")?;
-    match &schema_version {
-        Some(v) => write_json_string(out, v)?,
-        None => out.write_all(b"null")?,
-    }
-    out.write_all(b",\"tables\":{")?;
-
-    let mut table_stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
-    let table_names: Vec<String> = table_stmt
+    let mut table_stmt = conn.prepare(
+        "SELECT name FROM sqlite_master \
+         WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let all: Vec<String> = table_stmt
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     drop(table_stmt);
+
+    Ok(all
+        .into_iter()
+        .filter(|t| {
+            !virtual_tables
+                .iter()
+                .any(|v| t == v || t.starts_with(&format!("{v}_")))
+        })
+        .collect())
+}
+
+/// Stream a full JSON dump of the database to `out`.
+///
+/// Enumerates tables from `sqlite_master` at runtime (never a hardcoded
+/// list) and streams each table's rows one at a time so peak memory tracks
+/// a single row.
+///
+/// **`schema_version` is `PRAGMA user_version`, NOT `meta.schema_version`.**
+/// `rusqlite_migration` records the applied migration level in
+/// `user_version`; the `meta` row is a relic written once by migration 001
+/// and never bumped since, so on a current database it still reads `1`
+/// while `user_version` reads `6`. An importer told "1" would conclude it
+/// was holding a pre-v2 database — exactly the wrong call, and silently
+/// wrong. The stale `meta` row is a separate pre-existing defect (it is
+/// read by nothing else); this function simply does not trust it.
+///
+/// FTS5 virtual tables and their shadow tables are excluded — see
+/// [`exportable_tables`].
+pub fn export_json<W: Write>(conn: &Connection, out: &mut W) -> Result<()> {
+    let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+    out.write_all(b"{\"schema_version\":")?;
+    out.write_all(schema_version.to_string().as_bytes())?;
+    out.write_all(b",\"tables\":{")?;
+
+    let table_names = exportable_tables(conn)?;
 
     for (ti, table) in table_names.iter().enumerate() {
         if ti > 0 {
@@ -200,26 +246,93 @@ mod tests {
 
     #[test]
     fn export_json_produces_parseable_document_with_runtime_enumerated_table() {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '6');
+            "PRAGMA user_version = 6;
              CREATE TABLE locations (id INTEGER PRIMARY KEY, name TEXT, blob_col BLOB, notes TEXT);
              INSERT INTO locations (id, name, blob_col, notes) VALUES (1, 'vault', X'ab', NULL);",
         )
         .unwrap();
-        let _ = &mut conn;
 
         let mut buf = Vec::new();
         export_json(&conn, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["schema_version"], "6");
+        assert_eq!(parsed["schema_version"], 6);
         let locations = &parsed["tables"]["locations"];
         assert_eq!(locations[0]["id"], 1);
         assert_eq!(locations[0]["name"], "vault");
         assert_eq!(locations[0]["blob_col"], "ab");
         assert!(locations[0]["notes"].is_null());
+    }
+
+    /// `schema_version` must be `PRAGMA user_version` (what
+    /// `rusqlite_migration` actually maintains), NOT `meta.schema_version`
+    /// — a relic written once by migration 001 and never bumped, which on a
+    /// real current database reads `1` while `user_version` reads `6`.
+    ///
+    /// This test sets the two to *different* values on purpose: an importer
+    /// told "1" would conclude it held a pre-v2 database and act on it.
+    /// Reading the wrong one is silently wrong, which is why it is pinned
+    /// rather than left to the doc comment.
+    #[test]
+    fn schema_version_comes_from_user_version_not_the_stale_meta_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 6;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        export_json(&conn, &mut buf).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
+
+        assert_eq!(
+            parsed["schema_version"], 6,
+            "must report user_version (6), not the stale meta row (1)"
+        );
+        assert_ne!(
+            parsed["schema_version"], 1,
+            "reading meta.schema_version would report a pre-v2 database"
+        );
+    }
+
+    /// FTS5 virtual tables and their four shadow tables must not appear.
+    /// `files_fts_data`/`_idx` hold the serialized inverted index as opaque
+    /// BLOBs: hex-encoding them bloats the dump with bytes meaningless
+    /// outside SQLite, and they cannot be restored by inserting rows —
+    /// FTS rebuilds them from `files`, which IS exported.
+    #[test]
+    fn fts_virtual_and_shadow_tables_are_excluded_but_the_source_table_is_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT);
+             INSERT INTO files (id, path) VALUES (1, 'a/b.txt');
+             CREATE VIRTUAL TABLE files_fts USING fts5(path);
+             INSERT INTO files_fts (path) VALUES ('a/b.txt');",
+        )
+        .unwrap();
+
+        let tables = exportable_tables(&conn).unwrap();
+        assert!(
+            tables.contains(&"files".to_string()),
+            "the real source table must still be exported: {tables:?}"
+        );
+        for excluded in [
+            "files_fts",
+            "files_fts_data",
+            "files_fts_idx",
+            "files_fts_docsize",
+            "files_fts_config",
+        ] {
+            assert!(
+                !tables.contains(&excluded.to_string()),
+                "{excluded} is FTS-internal and must not be exported: {tables:?}"
+            );
+        }
     }
 }
