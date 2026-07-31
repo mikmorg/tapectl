@@ -710,15 +710,38 @@ pub fn unit_mark_tape_only(
         Some(unit.tenant_id),
     )?;
 
+    // ADR-0004 Tier 1: display evidence age for the coverage this unit is
+    // now relying on -- marking tape-only is exactly the point at which
+    // local data may be deleted, so the operator should see how strong
+    // that remaining coverage is. Display-only: never gates, never changes
+    // the tier logic above, never affects the exit code.
+    let evidence = crate::policy::evidence::remaining_coverage_evidence(conn, unit.id, None)?;
+    let now = chrono::Utc::now().naive_utc();
+    let evidence_summary = crate::policy::evidence::describe(unit_name, &evidence, now);
+
     if json_output {
+        let evidence_json: Vec<serde_json::Value> = evidence
+            .iter()
+            .map(|e| serde_json::json!({"volume": e.volume_label, "last_verified": e.last_verified}))
+            .collect();
         println!(
             "{}",
-            serde_json::json!({"unit": unit_name, "status": "tape_only", "copies": copy_count, "locations": location_count})
+            serde_json::json!({
+                "unit": unit_name,
+                "status": "tape_only",
+                "copies": copy_count,
+                "locations": location_count,
+                "evidence": evidence_json,
+                "evidence_summary": evidence_summary,
+            })
         );
     } else {
         println!(
             "unit \"{unit_name}\" marked tape-only ({copy_count} copies, {location_count} locations)"
         );
+        if let Some(line) = &evidence_summary {
+            println!("  {line}");
+        }
     }
     Ok(())
 }
