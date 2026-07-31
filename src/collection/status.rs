@@ -52,15 +52,22 @@ pub fn status_for_collection(
     // — reused, not reinvented.
     for unit in tracked.iter().filter(|u| u.status == "active") {
         let resolved = crate::policy::resolve(conn, config, unit)?;
-        let copy_count: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT w.volume_id)
-             FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'",
-            params![unit.id],
-            |row| row.get(0),
-        )?;
+        // Routed through `policy::coverage`'s shared expression (issue
+        // #73) rather than the hand-written query this used to carry.
+        // That query joined only writes/stage_sets/snapshots -- no
+        // `volumes` join at all -- so it never applied ADR-0004
+        // eligibility and counted quarantined, retired, erased and
+        // missing volumes as live copies (the #89 defect, missed here),
+        // and it could not see warehouse deposits (ADR-0006). Both are
+        // compared against the same `resolved.min_copies` the audit
+        // check uses, so the two surfaces have to agree.
+        let sql = format!(
+            "SELECT {}",
+            crate::policy::coverage::copy_count_expr(
+                &crate::policy::coverage::CoverageQuery::current_unit("?1")
+            )
+        );
+        let copy_count: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
         if copy_count < resolved.min_copies {
             status.under_copied += 1;
         }
