@@ -31,13 +31,19 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#43, #61, #63, #83, #95, #97, #99.** (#91 closed 2026-07-30;
-  #99 filed as its scope residual. #59, #50, #51, #98, #62 closed
-  2026-07-31.)
-  **#43 (test truth) is now the natural next pick** — the CI finding above
-  is squarely its subject matter: the ungated suite's dar dependency was
-  undocumented and unhonoured for months, which is exactly the
-  "honest skips / test truth" gap #43 exists to close.
+  **#61, #63, #83, #95, #97, #99.** (#91 closed 2026-07-30; #99 filed as
+  its scope residual. #59, #50, #51, #98, #62, #43 closed 2026-07-31.)
+  **`dar` is a documented HARD test dependency (#43).** The ungated suite
+  is NOT hermetic — 13 tests shell out to a real dar.
+  `tests/test_dependencies.rs` asserts it once by name and **fails** rather
+  than skipping: those tests are the staging-pipeline regression guards, so
+  a silent skip yields a green suite that verified none of the pipeline.
+  If you add a dar-dependent test, add it to that file's list. Fixtures
+  resolve `"dar"` via PATH — never hardcode `/usr/bin/dar`.
+  **"Honest skips" means VISIBLE, not merely present.** #43's tempting fix
+  was to skip the 13; that would have converted 12 loud failures into
+  invisible non-events one iteration after a months-long signal loss was
+  found. When a test can't run, prefer a named failure over a quiet pass.
   **Staging is now flock-guarded (#98).** `stage_create` holds an exclusive
   flock on `<db_parent>/locks/stage-<id>.lock` for its lifetime; the
   `db::open` sweep probes that lock to tell a crash from a live run.
