@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-deposit-remove 1  "tapectl-volume-deposit-remove " 
+.SH NAME
+tapectl\-volume\-deposit\-remove \- Un\-record a deposit whose bytes are gone from the warehouse
+.SH SYNOPSIS
+\fBtapectl volume deposit remove\fR <\fB\-\-from\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+.SH DESCRIPTION
+Un\-record a deposit whose bytes are gone from the warehouse.
+.PP
+ADR\-0006 names the reason this must exist: "a warehouse copy dies weeks after payment stops". A lapsed bill or a provider lifecycle rule deletes the object without telling tapectl, and a deposit row that outlives its bytes keeps counting as a copy at exactly the gates that decide whether local data may be deleted.
+.SH OPTIONS
+.TP
+\fB\-\-from\fR \fI<FROM>\fR
+Warehouse location the deposit was recorded at
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fILABEL\fR>
+Volume label whose deposit is gone

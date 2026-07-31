@@ -293,7 +293,21 @@ pub fn describe(
             1 => "1 tape".to_string(),
             n => format!("{n} tapes"),
         };
-        format!(" ({tape_words}, {deposit_words})")
+        // When a TAPE is the named weakest, the deposits are mentioned
+        // only by this clause -- so the clause has to carry their
+        // evidence class itself. Without it the line reads "2 copies
+        // (1 tape, 1 warehouse deposit); weakest is L6-0001, last
+        // verified 3 days ago", which read ALONE (the only way
+        // `cli::consent::confirm` ever renders it) implies both copies
+        // are as good as that 3-day-old verification. They are not: a
+        // deposit is never re-verified and never will be. When a deposit
+        // is itself the named weakest, `weakest_clause` already says so
+        // and repeating it here would stutter.
+        let caveat = match named.kind {
+            EvidenceKind::Tape => " — never re-verified, and warehouse copies do not refresh",
+            EvidenceKind::WarehouseDeposit => "",
+        };
+        format!(" ({tape_words}, {deposit_words}{caveat})")
     };
 
     let weakest_clause = match named.kind {
@@ -599,6 +613,14 @@ mod tests {
     /// cartridge vanishes from the only line the operator is guaranteed to
     /// read, which is the exact failure
     /// `multi_copy_line_never_claims_sole_dependence` exists to prevent.
+    ///
+    /// The composition clause must ALSO carry the deposit's evidence class,
+    /// because when a tape is named as weakest the deposit is mentioned
+    /// nowhere else on the line. Read alone -- the only way
+    /// `cli::consent::confirm` ever renders it -- "2 copies (1 tape, 1
+    /// warehouse deposit); weakest is L6-0001, last verified 3 days ago"
+    /// implies both copies are as good as that 3-day-old check. They are
+    /// not, and never will be.
     #[test]
     fn a_mixed_unit_states_the_composition_and_still_names_the_tape() {
         let evidence = vec![
@@ -608,8 +630,40 @@ mod tests {
         let line = describe("photos", &evidence, now()).unwrap();
         assert_eq!(
             line,
-            "coverage for unit \"photos\" rests on 2 copies (1 tape, 1 warehouse deposit); \
-             weakest is L6-0001, never verified"
+            "coverage for unit \"photos\" rests on 2 copies (1 tape, 1 warehouse deposit — never \
+             re-verified, and warehouse copies do not refresh); weakest is L6-0001, never verified"
+        );
+    }
+
+    /// The caveat is not decorative on the never-verified case alone: a
+    /// unit whose tape was verified RECENTLY is exactly where a reader is
+    /// most likely to assume the whole line is reassuring.
+    #[test]
+    fn a_mixed_unit_with_a_freshly_verified_tape_still_flags_the_deposit() {
+        let evidence = vec![
+            ev("L6-0001", Some("2026-07-29 12:00:00")),
+            dep("L6-0001", "glacier", "2026-01-02 03:04:05"),
+        ];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert!(
+            line.contains("never re-verified, and warehouse copies do not refresh"),
+            "the deposit's evidence class must survive a reassuring tape age: {line}"
+        );
+    }
+
+    /// ...and it must not stutter when the deposit is itself the named
+    /// weakest, where `weakest_clause` already says it.
+    #[test]
+    fn the_deposit_caveat_is_stated_exactly_once() {
+        let evidence = vec![
+            dep("L6-0003", "glacier", "2026-01-02 03:04:05"),
+            dep("L6-0009", "deep-archive", "2025-06-01 00:00:00"),
+        ];
+        let line = describe("photos", &evidence, now()).unwrap();
+        assert_eq!(
+            line.matches("warehouse copies do not refresh").count(),
+            1,
+            "caveat stuttered: {line}"
         );
     }
 

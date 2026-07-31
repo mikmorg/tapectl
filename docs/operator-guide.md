@@ -316,6 +316,20 @@ checksum field** — tapectl did not perform the copy, so a checksum you typed
 in would be a claim about a claim. What gets recorded is what is actually
 attestable: which volume, which warehouse, when, and the provider's receipt.
 
+### When a deposit is gone
+
+Nothing tells tapectl that a cloud object was deleted — a lapsed bill or a
+provider lifecycle rule removes it silently, and the row would keep counting
+as a copy at the two gates that decide whether local data may be deleted. So
+when you find a deposit is gone, un-record it:
+
+```bash
+tapectl volume deposit remove L6-0003 --from glacier
+```
+
+It errors rather than shrugging if no such deposit was recorded, so a typo in
+the label cannot look like a successful correction.
+
 ### Asking for warehouse copies by policy
 
 `warehouse_copies` resolves through the usual three layers — unit dotfile

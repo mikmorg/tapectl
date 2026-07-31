@@ -213,6 +213,20 @@ pub enum DepositCommands {
         #[arg(long)]
         volume: Option<String>,
     },
+    /// Un-record a deposit whose bytes are gone from the warehouse.
+    ///
+    /// ADR-0006 names the reason this must exist: "a warehouse copy dies
+    /// weeks after payment stops". A lapsed bill or a provider lifecycle
+    /// rule deletes the object without telling tapectl, and a deposit row
+    /// that outlives its bytes keeps counting as a copy at exactly the
+    /// gates that decide whether local data may be deleted.
+    Remove {
+        /// Volume label whose deposit is gone
+        label: String,
+        /// Warehouse location the deposit was recorded at
+        #[arg(long)]
+        from: String,
+    },
 }
 
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
@@ -673,6 +687,44 @@ fn run_deposit(conn: &Connection, command: &DepositCommands, json_output: bool) 
                 }
             }
         }
+
+        DepositCommands::Remove { label, from } => {
+            let deleted = conn.execute(
+                "DELETE FROM volume_deposits
+                  WHERE volume_id = (SELECT id FROM volumes WHERE label = ?1)
+                    AND location_id = (SELECT id FROM locations WHERE name = ?2)",
+                params![label, from],
+            )?;
+            if deleted == 0 {
+                return Err(TapectlError::Other(format!(
+                    "no recorded deposit of \"{label}\" at \"{from}\""
+                )));
+            }
+            crate::db::events::log_event(
+                conn,
+                "volume_deposit",
+                0,
+                Some(label),
+                "deleted",
+                None,
+                None,
+                None,
+                Some(&format!("deposit at {from} un-recorded")),
+                None,
+            )?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"volume": label, "location": from, "removed": deleted})
+                );
+            } else {
+                println!(
+                    "removed the recorded deposit of \"{label}\" at \"{from}\"; \
+                     it no longer counts as a copy"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -794,6 +846,54 @@ mod tests {
                 .expect_err("unsealed bytes are not final, so nothing durable was deposited");
             let msg = err.to_string();
             assert!(msg.contains("is active, not sealed"), "{msg}");
+        }
+
+        /// ADR-0006: "a warehouse copy dies weeks after payment stops."
+        /// When it does, the row must be removable -- a deposit that
+        /// outlives its bytes keeps counting as a copy at `unit
+        /// mark-tape-only` and `snapshot mark-reclaimable`, the two gates
+        /// that decide whether local data may be deleted.
+        #[test]
+        fn a_deposit_can_be_un_recorded_and_stops_counting_as_a_copy() {
+            let conn = fixture();
+            add(&conn, "L6-0003", "glacier").unwrap();
+            let before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM volume_deposits", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(before, 1);
+
+            run_deposit(
+                &conn,
+                &DepositCommands::Remove {
+                    label: "L6-0003".into(),
+                    from: "glacier".into(),
+                },
+                true,
+            )
+            .expect("a recorded deposit must be removable");
+
+            let after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM volume_deposits", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, 0, "the row must be gone, not merely flagged");
+        }
+
+        /// Removing something that was never recorded is an error, not a
+        /// silent success -- a quiet no-op would let an operator believe
+        /// they had corrected the catalog when they had typoed a label.
+        #[test]
+        fn removing_a_deposit_that_was_never_recorded_errors() {
+            let conn = fixture();
+            let err = run_deposit(
+                &conn,
+                &DepositCommands::Remove {
+                    label: "L6-0003".into(),
+                    from: "glacier".into(),
+                },
+                true,
+            )
+            .expect_err("nothing was recorded there");
+            assert!(err.to_string().contains("no recorded deposit"), "{err}");
         }
 
         #[test]
