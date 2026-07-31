@@ -16,9 +16,20 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **Mode: phase-2 hardening (from 2026-07-28).** R&D has exited: the v2 regear
-  is merged to master and the design docs are settled reference, not fluid.
-  Issue work is live again — re-spec, close, and file as needed.
+- **Mode: PHASE-2 COMPLETE (2026-07-31) — awaiting a CTO call on what's next.**
+  R&D exited 2026-07-28; the v2 regear is merged and the design docs are
+  settled reference, not fluid. Phase-2 hardening then ran to completion:
+  every phase-2 issue is closed except **#69 (Heir Kit)**, deferred by the
+  CTO for a physical step (printing, tamper-evident envelopes) no agent can
+  perform. Master `3221483`, CI green, mhvtl gate 26/26, `EXPECTED_FAIL=()`.
+  **There is no automatically-correct next task.** What remains is phase-3
+  (#70, #72, #73), the LOW umbrellas (#65/#66/#67), the epic (#20) and the
+  map (#1) — none of which the CTO has scoped as gate-exit the way phase 2
+  was. **Do not just start on phase-3.** Either the CTO names the next
+  stage, or the first iteration's job is a re-triage pass that reports what
+  each remaining issue actually means against shipped code and asks. The
+  three hard stops remain untouched and are all CTO calls: the first
+  production write, the LTO-6 hardware session, and #69's physical step.
 - **Queue (re-triaged 2026-07-29; highs cleared 2026-07-30):**
   **CTO ruled ALL phase-2 issues gate exit**, so severity drives *ordering*,
   not scope. **Every phase-1/phase-2 high is now closed** — the four numbered
