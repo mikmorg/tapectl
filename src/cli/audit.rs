@@ -183,6 +183,30 @@ fn collect_findings(
             });
         }
 
+        // Check warehouse copies (ADR-0006, issue #73). VIOLATION, not
+        // warning, and for the same reason the copy-count shortfall above
+        // is one: it is the identical failure -- fewer durable copies than
+        // policy demands -- and it can only fire when an operator has
+        // explicitly set `warehouse_copies > 0` somewhere in the chain
+        // (the default is 0, so an all-tape fleet never sees this check).
+        // ADR-0004 is not weakened: `audit` remains advisory, exit code 2
+        // as before, nothing is gated or refused.
+        if resolved.warehouse_copies > 0 {
+            let deposits = deposit_count_for_unit(conn, unit.id)?;
+            if deposits < resolved.warehouse_copies {
+                violations.push(AuditFinding {
+                    unit: unit.name.clone(),
+                    check: "warehouse_copies".into(),
+                    message: format!(
+                        "has {deposits} warehouse deposit(s), needs {}",
+                        resolved.warehouse_copies
+                    ),
+                    action: "copy the volume's bytes out by the documented external procedure, then: tapectl volume deposit add <LABEL> --to <warehouse-location>"
+                        .to_string(),
+                });
+            }
+        }
+
         // Check location presence
         let location_count = location_count_for_unit(conn, unit.id)?;
 
@@ -437,6 +461,21 @@ pub(crate) fn location_count_for_unit(conn: &Connection, unit_id: i64) -> Result
     Ok(conn.query_row(&sql, params![unit_id], |row| row.get(0))?)
 }
 
+/// How many of `unit_id`'s copies are recorded warehouse deposits
+/// (ADR-0006), for `audit`'s `warehouse_copies` check. Same shared
+/// expression, same scope, as [`copy_count_for_unit`] -- the deposit count
+/// is always a subset of the copy count.
+pub(crate) fn deposit_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT {}",
+        crate::policy::coverage::deposit_count_expr(
+            &crate::policy::coverage::CoverageQuery::current_unit("?1")
+        )
+    );
+    Ok(conn.query_row(&sql, params![unit_id], |row| row.get(0))?)
+}
+
+#[derive(Debug)]
 struct AuditFinding {
     unit: String,
     check: String,
@@ -900,6 +939,70 @@ mod tests {
             assert_eq!(violations.len(), 1);
             assert_eq!(violations[0].check, "encryption");
             assert_eq!(violations[0].unit, "audit-plain");
+        }
+
+        /// Issue #73 / ADR-0006: a unit whose resolved `warehouse_copies`
+        /// exceeds its recorded deposit count is a VIOLATION naming the
+        /// `warehouse_copies` check. Its action must be a command that
+        /// exists -- `volume deposit add`, NOT an upload: tapectl never
+        /// moves the bytes.
+        #[test]
+        fn warehouse_copies_shortfall_is_a_violation() {
+            let (conn, unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            conn.execute(
+                "INSERT INTO archive_sets (name, warehouse_copies) VALUES ('core', 2)",
+                [],
+            )
+            .unwrap();
+            let as_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE id = ?2",
+                params![as_id, unit_id],
+            )
+            .unwrap();
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 0;
+
+            let (violations, _warnings) = collect_findings(&conn, &config, Some("photos")).unwrap();
+            let f = violations
+                .iter()
+                .find(|f| f.check == "warehouse_copies")
+                .unwrap_or_else(|| panic!("expected a warehouse_copies finding: {violations:?}"));
+            assert!(
+                f.message.contains("has 1 warehouse deposit(s), needs 2"),
+                "{}",
+                f.message
+            );
+            assert!(
+                f.action.contains("tapectl volume deposit add"),
+                "the fix must be a command that exists: {}",
+                f.action
+            );
+            assert!(
+                f.action.contains("external procedure"),
+                "the action must say the operator moves the bytes, not tapectl                  (issue #72 rescope): {}",
+                f.action
+            );
+        }
+
+        /// The check is silent for the default (0) -- an all-tape fleet
+        /// must never see a warehouse finding it did not ask for.
+        #[test]
+        fn warehouse_copies_check_is_silent_when_the_knob_is_unset() {
+            let (conn, _unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 0;
+            assert_eq!(config.defaults.warehouse_copies, 0);
+            let (violations, warnings) = collect_findings(&conn, &config, Some("photos")).unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .chain(warnings.iter())
+                    .any(|f| f.check == "warehouse_copies"),
+                "{violations:?} {warnings:?}"
+            );
         }
 
         /// Issue #59 / Change 4: a unit whose `.tapectl-unit.toml`
