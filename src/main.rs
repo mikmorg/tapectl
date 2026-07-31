@@ -397,6 +397,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                 &rusqlite::Connection::open_in_memory()?,
                             )
                         };
+                        // Decorative-key advisory (issue #62, #92/#50
+                        // precedent): keys that are parsed but have no
+                        // reader yet get surfaced, not deleted.
+                        let decorative_hits = policy::decorative::scan(&loaded);
+
+                        // Depth checks (issue #62): does the config
+                        // actually work, not just parse? Warnings only —
+                        // never touches the exit code. Never opens a tape
+                        // device — existence checks only.
+                        let dar_check = policy::depth_check::check_dar(&loaded.dar.binary);
+                        let staging_check =
+                            policy::depth_check::check_staging(&loaded.staging.directory);
+                        let tape_device_checks = policy::depth_check::scan_tape_devices(&loaded);
+
                         if cli.json {
                             let shadowing_json: Vec<_> = shadowing_hits
                                 .iter()
@@ -419,12 +433,69 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                     })
                                 })
                                 .collect();
+                            let decorative_json: Vec<_> = decorative_hits
+                                .iter()
+                                .map(|h| {
+                                    serde_json::json!({
+                                        "key": h.key,
+                                        "note": policy::decorative::describe(h),
+                                    })
+                                })
+                                .collect();
+                            let dar_json = match &dar_check {
+                                policy::depth_check::DarCheck::Missing { path } => {
+                                    serde_json::json!({"status": "missing", "path": path})
+                                }
+                                policy::depth_check::DarCheck::NotExecutable { path } => {
+                                    serde_json::json!({"status": "not_executable", "path": path})
+                                }
+                                policy::depth_check::DarCheck::Unreadable { path, detail } => {
+                                    serde_json::json!({"status": "unreadable", "path": path, "detail": detail})
+                                }
+                                policy::depth_check::DarCheck::TooOld {
+                                    path,
+                                    found,
+                                    minimum,
+                                } => {
+                                    serde_json::json!({"status": "too_old", "path": path, "found": found, "minimum": minimum})
+                                }
+                                policy::depth_check::DarCheck::Ok { path, version } => {
+                                    serde_json::json!({"status": "ok", "path": path, "version": version})
+                                }
+                            };
+                            let staging_json = match &staging_check {
+                                policy::depth_check::StagingCheck::Missing { path } => {
+                                    serde_json::json!({"status": "missing", "path": path})
+                                }
+                                policy::depth_check::StagingCheck::NotWritable { path, detail } => {
+                                    serde_json::json!({"status": "not_writable", "path": path, "detail": detail})
+                                }
+                                policy::depth_check::StagingCheck::Writable { path } => {
+                                    serde_json::json!({"status": "writable", "path": path})
+                                }
+                            };
+                            let tape_devices_json: Vec<_> = tape_device_checks
+                                .iter()
+                                .map(|c| {
+                                    serde_json::json!({
+                                        "backend": c.backend_name,
+                                        "device_tape": c.device_tape,
+                                        "device_tape_exists": c.device_tape_exists,
+                                        "device_sg": c.device_sg,
+                                        "device_sg_exists": c.device_sg_exists,
+                                    })
+                                })
+                                .collect();
                             println!(
                                 "{}",
                                 serde_json::json!({
                                     "valid": true,
                                     "shadowing_dotfiles": shadowing_json,
                                     "subsumed_policy_fields": subsumed_json,
+                                    "decorative_keys": decorative_json,
+                                    "dar": dar_json,
+                                    "staging": staging_json,
+                                    "tape_devices": tape_devices_json,
                                 })
                             );
                         } else {
@@ -451,6 +522,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             }
                             for hit in &subsumed_hits {
                                 println!("{}", policy::subsumed::describe(hit));
+                            }
+                            println!("{}", policy::depth_check::describe_dar(&dar_check));
+                            println!("{}", policy::depth_check::describe_staging(&staging_check));
+                            for check in &tape_device_checks {
+                                println!("{}", policy::depth_check::describe_tape_device(check));
+                            }
+                            for hit in &decorative_hits {
+                                println!("{}", policy::decorative::describe(hit));
                             }
                         }
                     }

@@ -170,6 +170,36 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
     });
     assert_eq!(parsed["valid"], serde_json::json!(true));
 
+    // 3b. issue #62 depth checks: the new fields must be present and the
+    // whole payload must still parse as one JSON object (the #56 defect
+    // class — a stray println! outside the json branch corrupts the
+    // stream) with the exit code unchanged (asserted above via
+    // `.success()`, i.e. still 0 with these fields added).
+    assert!(
+        parsed.get("dar").is_some(),
+        "config check --json missing 'dar' depth-check field: {parsed}"
+    );
+    assert!(
+        parsed.get("staging").is_some(),
+        "config check --json missing 'staging' depth-check field: {parsed}"
+    );
+    assert!(
+        parsed.get("tape_devices").is_some(),
+        "config check --json missing 'tape_devices' field: {parsed}"
+    );
+    assert!(
+        parsed.get("decorative_keys").is_some(),
+        "config check --json missing 'decorative_keys' field: {parsed}"
+    );
+    // Fresh init's default dar.binary (/opt/dar/bin/dar) does not exist on
+    // this machine — the headline case this ticket exists for. It must be
+    // reported, not silently absent, and it must not fail the command.
+    assert_eq!(
+        parsed["dar"]["status"],
+        serde_json::json!("missing"),
+        "expected the default dar.binary to be reported missing: {parsed}"
+    );
+
     // 4. db fsck — a clean fresh db must exit 0. (#45 fixed fsck so it
     // cannot exit 0 while reporting a real integrity failure or issues;
     // this pins the healthy-path exit code so a regression that makes

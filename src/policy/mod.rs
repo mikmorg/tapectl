@@ -5,6 +5,8 @@ use crate::db::models::Unit;
 use crate::error::Result;
 
 pub mod coverage;
+pub mod decorative;
+pub mod depth_check;
 pub mod evidence;
 pub mod reclaimable;
 pub mod shadowing;
