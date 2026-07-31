@@ -301,41 +301,70 @@ fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// Per-unit `(name, status, copies, locations)` rows behind `report
-/// fire-risk`, split out from the printing so the computed counts are
-/// directly assertable in tests without capturing stdout — the same
-/// pattern as [`copies_rows`] and `dirty_rows`.
-pub(crate) type FireRiskRow = (String, String, i64, i64);
+/// Per-unit `(name, status, copies, locations, warehouse_deposits)` rows
+/// behind `report fire-risk`, split out from the printing so the computed
+/// counts are directly assertable in tests without capturing stdout — the
+/// same pattern as [`copies_rows`] and `dirty_rows`.
+///
+/// `warehouse_deposits` is reported separately from `copies` on purpose
+/// (issue #73): a deposit counts as a copy, but ADR-0006 names its
+/// evidence a different class — never re-verified, and it "dies weeks
+/// after payment stops". Folding it invisibly into one number would let an
+/// operator read "2 copies" as two cartridges.
+pub(crate) type FireRiskRow = (String, String, i64, i64, i64);
+
+/// The parenthetical the human-readable copy/location surfaces append when
+/// some of a unit's copies are warehouse deposits (issue #73). Empty when
+/// there are none, so nothing changes for an all-tape fleet.
+///
+/// Every word has to be true read alone: a deposit IS a copy (it is inside
+/// the count it qualifies) and it is NOT a cartridge on a shelf.
+fn warehouse_note(deposits: i64) -> String {
+    match deposits {
+        0 => String::new(),
+        1 => " (1 is a warehouse deposit, never re-verified)".to_string(),
+        n => format!(" ({n} are warehouse deposits, never re-verified)"),
+    }
+}
 
 pub(crate) fn fire_risk_rows(conn: &Connection, min_copies: i64) -> Result<Vec<FireRiskRow>> {
-    // Units with fewer copies than min_copies. ADR-0004 (issue #89): a
-    // non-sealed volume's write must not count, but this query LEFT JOINs
-    // volumes to preserve units with zero writes (so they still surface
-    // with copies=0 rather than vanishing from the result) — putting the
-    // predicate in the JOIN's ON clause wouldn't work, since
-    // `COUNT(DISTINCT w.volume_id)` reads from the `writes` row, which
-    // stays non-NULL even when the volumes join fails to match. Wrapping
-    // it in a CASE instead correctly nulls out (and so excludes from
-    // COUNT DISTINCT) exactly the non-sealed writes, while leaving a
-    // unit with no writes at all still NULL -> copies=0, same as before.
-    let sealed = crate::policy::coverage::eligible("v");
+    // Units with fewer copies than min_copies. Copies and locations come
+    // from the shared deposit-aware expressions (issue #73), correlated to
+    // `u.id`: they re-qualify volume eligibility at use time per ADR-0004
+    // (issue #89) AND count recorded warehouse deposits per ADR-0006. A
+    // correlated subquery rather than the old `COUNT(DISTINCT CASE WHEN
+    // ...)` aggregate because deposits are not reachable from the
+    // writes/volumes join at all — and it keeps units with zero writes in
+    // the result (they simply evaluate to 0) without needing the LEFT JOIN
+    // chain the aggregate form required.
+    //
+    // The threshold filter has to sit in an OUTER query: with the joins
+    // gone there is no GROUP BY, so a HAVING clause would be a
+    // single-group aggregate filter, not a per-row one.
+    let scope = crate::policy::coverage::CoverageQuery::current_unit("u.id");
     let sql = format!(
-        "SELECT u.name, u.status,
-                COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END) as copies,
-                COUNT(DISTINCT CASE WHEN {sealed} THEN v.location_id END) as locations
-         FROM units u
-         LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
-         LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
-         LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
-         LEFT JOIN volumes v ON v.id = w.volume_id
-         WHERE u.status = 'active'
-         GROUP BY u.id
-         HAVING copies < ?1 OR copies = 0"
+        "SELECT * FROM (
+            SELECT u.name, u.status,
+                   {} as copies,
+                   {} as locations,
+                   {} as deposits
+            FROM units u
+            WHERE u.status = 'active'
+         ) WHERE copies < ?1 OR copies = 0",
+        crate::policy::coverage::copy_count_expr(&scope),
+        crate::policy::coverage::location_count_expr(&scope),
+        crate::policy::coverage::deposit_count_expr(&scope),
     );
     let mut stmt = conn.prepare(&sql)?;
     let at_risk: Vec<FireRiskRow> = stmt
         .query_map(params![min_copies], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(at_risk)
@@ -346,9 +375,10 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
     let mut risks: Vec<serde_json::Value> = Vec::new();
     let at_risk = fire_risk_rows(conn, min_copies)?;
 
-    for (name, status, copies, locations) in &at_risk {
+    for (name, status, copies, locations, deposits) in &at_risk {
         risks.push(serde_json::json!({
             "unit": name, "status": status, "copies": copies, "locations": locations,
+            "warehouse_deposits": deposits,
             "risk": if *copies == 0 { "no_copies" } else { "below_minimum" },
         }));
     }
@@ -362,13 +392,16 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
         println!("fire-risk: all units meet minimum copy requirements");
     } else {
         println!("FIRE RISK: {} unit(s) at risk", risks.len());
-        for (name, _status, copies, locations) in &at_risk {
+        for (name, _status, copies, locations, deposits) in &at_risk {
             let severity = if *copies == 0 {
                 "ZERO COPIES"
             } else {
                 "below minimum"
             };
-            println!("  {name}: {copies} copies, {locations} locations — {severity}");
+            println!(
+                "  {name}: {copies} copies{}, {locations} locations — {severity}",
+                warehouse_note(*deposits)
+            );
         }
     }
     Ok(())
@@ -385,24 +418,39 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
 /// `cli::audit::copy_count_for_unit`'s doc comment for why that
 /// cross-file equality is worth proving explicitly.
 ///
-/// Routes copies/locations/volume-labels all through the shared ADR-0004
-/// predicate: see the comment in `report_fire_risk` above for why it must
-/// be a `CASE` inside the aggregate rather than a join condition.
-pub(crate) type CopyRow = (String, i64, i64, Option<String>);
+/// Copies and locations route through `policy::coverage`'s shared
+/// deposit-aware expressions, so this report can never disagree with the
+/// gates about either count (ADR-0004 eligibility + ADR-0006 deposits).
+/// The trailing `i64` is how many of `copies` are warehouse deposits —
+/// see [`FireRiskRow`] for why that is a separate number.
+pub(crate) type CopyRow = (String, i64, i64, Option<String>, i64);
 
 pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<CopyRow>> {
     let sealed = crate::policy::coverage::eligible("v");
+    let scope = crate::policy::coverage::CoverageQuery::current_unit("u.id");
+    // Copies/locations/deposits come from the shared deposit-aware
+    // expressions (issue #73). The LEFT JOIN chain survives only for
+    // `volumes` — the GROUP_CONCAT of TAPE labels, which is a list of
+    // cartridges to go fetch and deliberately does not list warehouse
+    // deposits; the deposit count is reported as its own column instead.
     let mut sql = format!(
         "SELECT u.name,
-                COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END) as copies,
-                COUNT(DISTINCT CASE WHEN {sealed} THEN v.location_id END) as locations,
-                GROUP_CONCAT(DISTINCT CASE WHEN {sealed} THEN v.label END) as volumes
-         FROM units u
+                {} as copies,
+                {} as locations,
+                GROUP_CONCAT(DISTINCT CASE WHEN {sealed} THEN v.label END) as volumes,
+                {} as deposits
+         FROM units u",
+        crate::policy::coverage::copy_count_expr(&scope),
+        crate::policy::coverage::location_count_expr(&scope),
+        crate::policy::coverage::deposit_count_expr(&scope),
+    );
+    sql.push_str(
+        "
          LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
          LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
          LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
          LEFT JOIN volumes v ON v.id = w.volume_id
-         WHERE u.status IN ('active', 'tape_only')"
+         WHERE u.status IN ('active', 'tape_only')",
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(name) = unit_filter {
@@ -416,7 +464,13 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<CopyRow> = stmt
         .query_map(params_ref.as_slice(), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -428,15 +482,17 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, copies, locs, vols)| {
-                serde_json::json!({"unit": name, "copies": copies, "locations": locs, "volumes": vols})
+            .map(|(name, copies, locs, vols, deposits)| {
+                serde_json::json!({"unit": name, "copies": copies, "locations": locs,
+                                   "volumes": vols, "warehouse_deposits": deposits})
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        for (name, copies, locs, vols) in &rows {
+        for (name, copies, locs, vols, deposits) in &rows {
             println!(
-                "  {name}: {copies} copies, {locs} locations [{}]",
+                "  {name}: {copies} copies{}, {locs} locations [{}]",
+                warehouse_note(*deposits),
                 vols.as_deref().unwrap_or("-")
             );
         }
@@ -444,44 +500,48 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
     Ok(())
 }
 
-/// Per-unit `(name, copies, locations)` rows behind `report tape-only`,
-/// split out from the printing for the same testability reason as
-/// [`copies_rows`] and [`fire_risk_rows`].
-pub(crate) type TapeOnlyRow = (String, i64, i64);
+/// Per-unit `(name, copies, locations, warehouse_deposits)` rows behind
+/// `report tape-only`, split out from the printing for the same
+/// testability reason as [`copies_rows`] and [`fire_risk_rows`].
+///
+/// Tape-only is where the deposit distinction bites hardest: the source
+/// directory is gone, so the copies listed here are all that exists. See
+/// [`FireRiskRow`] for why the deposit count is reported separately.
+pub(crate) type TapeOnlyRow = (String, i64, i64, i64);
 
 pub(crate) fn tape_only_rows(
     conn: &Connection,
     unit_filter: Option<&str>,
 ) -> Result<Vec<TapeOnlyRow>> {
-    // Same ADR-0004 CASE-in-aggregate treatment as `report_fire_risk` and
-    // `copies_rows` above (issue #89): the volumes LEFT JOIN must stay a
-    // LEFT JOIN (to keep tape-only units with zero eligible copies in the
-    // result), so the predicate goes inside the aggregate, not the join.
-    let sealed = crate::policy::coverage::eligible("v");
+    // Same shared deposit-aware expressions as `report_fire_risk` and
+    // `copies_rows` (issues #89 and #73): ADR-0004 eligibility re-checked
+    // at use time, ADR-0006 warehouse deposits counted, one expression for
+    // every surface so they cannot disagree.
+    let scope = crate::policy::coverage::CoverageQuery::current_unit("u.id");
     let mut sql = format!(
         "SELECT u.name,
-                COUNT(DISTINCT CASE WHEN {sealed} THEN w.volume_id END) as copies,
-                COUNT(DISTINCT CASE WHEN {sealed} THEN v.location_id END) as locations
+                {} as copies,
+                {} as locations,
+                {} as deposits
          FROM units u
-         LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
-         LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
-         LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
-         LEFT JOIN volumes v ON v.id = w.volume_id
-         WHERE u.status = 'tape_only'"
+         WHERE u.status = 'tape_only'",
+        crate::policy::coverage::copy_count_expr(&scope),
+        crate::policy::coverage::location_count_expr(&scope),
+        crate::policy::coverage::deposit_count_expr(&scope),
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(name) = unit_filter {
         sql.push_str(" AND u.name = ?");
         param_values.push(Box::new(name.to_string()));
     }
-    sql.push_str(" GROUP BY u.id ORDER BY u.name");
+    sql.push_str(" ORDER BY u.name");
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<TapeOnlyRow> = stmt
         .query_map(params_ref.as_slice(), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -493,15 +553,21 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, copies, locs)| serde_json::json!({"unit": name, "copies": copies, "locations": locs}))
+            .map(|(name, copies, locs, deposits)| {
+                serde_json::json!({"unit": name, "copies": copies,
+                 "locations": locs, "warehouse_deposits": deposits})
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         println!("no tape-only units");
     } else {
         println!("tape-only units:");
-        for (name, copies, locs) in &rows {
-            println!("  {name}: {copies} copies, {locs} locations");
+        for (name, copies, locs, deposits) in &rows {
+            println!(
+                "  {name}: {copies} copies{}, {locs} locations",
+                warehouse_note(*deposits)
+            );
         }
     }
     Ok(())
@@ -1054,6 +1120,61 @@ mod tests {
     //! scan and confirm the filter now actually narrows the result.
     use super::*;
     use tempfile::TempDir;
+
+    /// Issue #73 / ADR-0006: the three advisory surfaces that print a
+    /// copies/locations pair must all see a recorded warehouse deposit.
+    /// A unit whose second copy is a deposit is NOT at fire risk and is
+    /// NOT single-location, and saying otherwise sends the operator to
+    /// buy a tape they do not need.
+    mod warehouse_deposits_count {
+        use super::*;
+
+        #[test]
+        fn copies_rows_counts_the_deposit() {
+            let (conn, _unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            let rows = copies_rows(&conn, Some("photos")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, 2, "copies must include the warehouse deposit");
+            assert_eq!(rows[0].2, 2, "locations must include the warehouse");
+        }
+
+        #[test]
+        fn fire_risk_rows_counts_the_deposit() {
+            let (conn, _unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            // min_copies = 3 keeps the unit in the at-risk set either way,
+            // so the assertion is about the COUNT, not about membership.
+            let rows = fire_risk_rows(&conn, 3).unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.0 == "photos")
+                .expect("photos listed");
+            assert_eq!(row.2, 2, "copies must include the warehouse deposit");
+            assert_eq!(row.3, 2, "locations must include the warehouse");
+        }
+
+        #[test]
+        fn fire_risk_drops_a_unit_whose_second_copy_is_a_deposit() {
+            let (conn, _unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            let rows = fire_risk_rows(&conn, 2).unwrap();
+            assert!(
+                !rows.iter().any(|r| r.0 == "photos"),
+                "a unit with a tape copy AND a warehouse deposit meets min_copies=2: {rows:?}"
+            );
+        }
+
+        #[test]
+        fn tape_only_rows_counts_the_deposit() {
+            let (conn, _unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("tape_only");
+            let rows = tape_only_rows(&conn, Some("photos")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, 2, "copies must include the warehouse deposit");
+            assert_eq!(rows[0].2, 2, "locations must include the warehouse");
+        }
+    }
 
     /// Two active units under one temp root: one left clean after its
     /// snapshot, one mutated (a new file) after its snapshot — full

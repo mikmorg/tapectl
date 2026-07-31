@@ -135,14 +135,11 @@ pub fn assess(
     // retired, erased, or reported missing. The shared eligibility
     // predicate re-qualifies at use time instead of trusting
     // write-time status forever.
-    let sql = format!(
-        "SELECT COUNT(DISTINCT w.volume_id)
-         FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         JOIN volumes v ON v.id = w.volume_id
-         WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND {}",
-        super::coverage::eligible("v")
-    );
+    let scoped = super::coverage::CoverageQuery {
+        scope: super::coverage::CoverageScope::Snapshot { id_expr: "?1" },
+        exclude_volume: None,
+    };
+    let sql = format!("SELECT {}", super::coverage::copy_count_expr(&scoped));
     let copy_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
 
     if copy_count < required_copies {
@@ -157,15 +154,7 @@ pub fn assess(
         });
     }
 
-    let sql = format!(
-        "SELECT COUNT(DISTINCT v.location_id)
-         FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         JOIN volumes v ON v.id = w.volume_id
-         WHERE ss.snapshot_id = ?1 AND w.status = 'completed' AND v.location_id IS NOT NULL
-           AND {}",
-        super::coverage::eligible("v")
-    );
+    let sql = format!("SELECT {}", super::coverage::location_count_expr(&scoped));
     let location_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
 
     if required_locations > 0 && location_count < required_locations {
@@ -467,5 +456,107 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert_eq!(freeable_bytes(&conn, snap2).unwrap(), 1000);
+    }
+
+    /// Issue #73 / ADR-0006: the reclaim gate's copy precondition must
+    /// count a recorded warehouse deposit. Negative control: the
+    /// superseding snapshot's second volume is retired, so the tape half
+    /// alone is ONE copy and the gate blocks; recording a deposit of the
+    /// surviving sealed volume makes it two and the gate releases.
+    #[test]
+    fn a_warehouse_deposit_satisfies_the_copy_precondition() {
+        let (conn, unit) = setup("sup-deposit-copies", 2, "retired", "active");
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+            [],
+        )
+        .unwrap();
+        let loc = conn.last_insert_rowid();
+        let vol: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = 'sup-deposit-copies-SEALED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volume_deposits (volume_id, location_id) VALUES (?1, ?2)",
+            params![vol, loc],
+        )
+        .unwrap();
+
+        let verdict = assess(&conn, &Config::default(), &unit, 1).unwrap();
+        assert_eq!(
+            verdict,
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            },
+            "a recorded warehouse deposit is the second copy"
+        );
+    }
+
+    /// Issue #73 / ADR-0006: the reclaim gate's LOCATION precondition
+    /// must count the warehouse as a distinct location. Both tape
+    /// volumes sit at `home`, so the tape half alone is one location.
+    #[test]
+    fn a_warehouse_deposit_satisfies_the_location_precondition() {
+        let (conn, _unit) = setup("sup-deposit-locs", 2, "sealed", "active");
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+            [],
+        )
+        .unwrap();
+        let home = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+            [],
+        )
+        .unwrap();
+        let glacier = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE volumes SET location_id = ?1 WHERE label LIKE 'sup-deposit-locs-%'",
+            params![home],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_sets (name, required_locations)
+             VALUES ('two-places', '[\"home\",\"glacier\"]')",
+            [],
+        )
+        .unwrap();
+        let as_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE units SET archive_set_id = ?1 WHERE name = 'sup-deposit-locs'",
+            params![as_id],
+        )
+        .unwrap();
+        let unit = crate::db::queries::get_unit_by_name(&conn, "sup-deposit-locs")
+            .unwrap()
+            .unwrap();
+
+        // Negative control: without the deposit this blocks at 1 location.
+        let vol: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = 'sup-deposit-locs-SEALED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volume_deposits (volume_id, location_id) VALUES (?1, ?2)",
+            params![vol, glacier],
+        )
+        .unwrap();
+
+        let verdict = assess(&conn, &Config::default(), &unit, 1).unwrap();
+        assert_eq!(
+            verdict,
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            },
+            "glacier is a second distinct location"
+        );
     }
 }

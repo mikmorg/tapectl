@@ -325,24 +325,26 @@ struct RetireImpact {
 /// proves its volume was sealed at write time, not that it still is
 /// (issue #89). The volume being retired (`vol_id`) is excluded from its
 /// own "other copies" by identity, not by status, since we are retiring
-/// it regardless of what its current status happens to be.
+/// it regardless of what its current status happens to be. Issue #73: it
+/// goes through `coverage::copy_count_expr`, so a recorded warehouse
+/// deposit of some OTHER eligible volume counts as another copy.
 fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<RetireImpact>> {
     let sql = format!(
         "SELECT DISTINCT u.id, u.name, u.status,
-                (SELECT COUNT(DISTINCT w2.volume_id)
-                 FROM writes w2
-                 JOIN stage_sets ss2 ON ss2.id = w2.stage_set_id
-                 JOIN snapshots s2 ON s2.id = ss2.snapshot_id
-                 JOIN volumes v2 ON v2.id = w2.volume_id
-                 WHERE s2.unit_id = u.id AND w2.status = 'completed' AND w2.volume_id != ?1
-                   AND {}) as other_copies
+                {} as other_copies
          FROM units u
          JOIN snapshots s ON s.unit_id = u.id
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
          WHERE w.volume_id = ?1 AND w.status = 'completed'
          ORDER BY u.name",
-        crate::policy::coverage::eligible("v2")
+        crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
+            scope: crate::policy::coverage::CoverageScope::Unit {
+                id_expr: "u.id",
+                current_only: false,
+            },
+            exclude_volume: Some("?1"),
+        })
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<(i64, String, String, i64)> = stmt
@@ -601,14 +603,19 @@ pub fn unit_mark_tape_only(
     // `volumes.status` keeps moving afterwards (retired/quarantined/
     // erased/missing), so eligibility must be re-checked at USE time via
     // the shared predicate (issue #89).
+    //
+    // Issue #73: both counts now come from the shared deposit-aware
+    // expressions, so a recorded warehouse deposit counts as a copy and as
+    // a location here exactly as it does in `audit` and the reports. This
+    // also retires this site's private `COUNT(DISTINCT w.id)` shape — it
+    // counted WRITES, so a unit staged twice onto one cartridge read as
+    // two copies and this gate was quietly more permissive than every
+    // other one. Copies are distinct volumes everywhere now.
+    let unit_scope = crate::policy::coverage::CoverageQuery::current_unit("?1");
     let sql = format!(
-        "SELECT COUNT(DISTINCT w.id), COUNT(DISTINCT v.location_id)
-         FROM snapshots s
-         JOIN stage_sets ss ON ss.snapshot_id = s.id
-         JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
-         JOIN volumes v ON v.id = w.volume_id
-         WHERE s.unit_id = ?1 AND s.status = 'current' AND {}",
-        crate::policy::coverage::eligible("v")
+        "SELECT {}, {}",
+        crate::policy::coverage::copy_count_expr(&unit_scope),
+        crate::policy::coverage::location_count_expr(&unit_scope)
     );
     let (copy_count, location_count): (i64, i64) =
         conn.query_row(&sql, params![unit.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -1883,6 +1890,41 @@ mod tests {
             );
         }
 
+        /// Issue #73 / ADR-0006: `retire_impacts`'s `other_copies` must
+        /// count a recorded warehouse deposit of an eligible OTHER volume.
+        /// Retiring a cartridge when a second copy sits in a warehouse is
+        /// not a zero-coverage event, and reporting it as one would push
+        /// the operator through a consent gate that is simply untrue.
+        #[test]
+        fn other_copies_includes_a_warehouse_deposit_of_another_volume() {
+            let (conn, vol_id) = setup_volume_with_one_unit("L6-DEP", true);
+            conn.execute(
+                "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+                [],
+            )
+            .unwrap();
+            let loc = conn.last_insert_rowid();
+            let other: i64 = conn
+                .query_row(
+                    "SELECT id FROM volumes WHERE label = 'OTHER-VOL'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO volume_deposits (volume_id, location_id) VALUES (?1, ?2)",
+                params![other, loc],
+            )
+            .unwrap();
+
+            let impacts = retire_impacts(&conn, vol_id).unwrap();
+            assert_eq!(impacts.len(), 1);
+            assert_eq!(
+                impacts[0].other_copies, 2,
+                "the sealed other volume AND its warehouse deposit are both copies"
+            );
+        }
+
         #[test]
         fn refusal_json_carries_the_volume_and_the_reason() {
             // Change 3's explicit requirement: a JSON consumer must be
@@ -2061,6 +2103,23 @@ mod tests {
             let config = config_isolating_copy_count();
             unit_mark_tape_only(&conn, &config, "mto-both-sealed", false, false).expect(
                 "two sealed volumes must satisfy min_copies=2 -- the guard must not false-positive",
+            );
+        }
+
+        /// Issue #73 / ADR-0006: `unit mark-tape-only`'s copy AND location
+        /// gates must count a recorded warehouse deposit. The fixture has
+        /// exactly one sealed tape at `home` plus a deposit at `glacier`,
+        /// so the tape half alone is 1 copy / 1 location and BOTH default
+        /// thresholds (2/2) fail; with the deposit counted both are met.
+        #[test]
+        fn mark_tape_only_counts_a_warehouse_deposit_toward_copies_and_locations() {
+            let (conn, _unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            let config = Config::default();
+            assert_eq!(config.defaults.min_copies_for_tape_only, 2);
+            assert_eq!(config.defaults.min_locations_for_tape_only, 2);
+            unit_mark_tape_only(&conn, &config, "photos", false, false).expect(
+                "one sealed tape at home plus a warehouse deposit at glacier is 2 copies in 2 locations",
             );
         }
 

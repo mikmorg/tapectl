@@ -416,13 +416,10 @@ fn compaction_findings(conn: &Connection, threshold: f64) -> Result<Vec<AuditFin
 
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
     let sql = format!(
-        "SELECT COUNT(DISTINCT w.volume_id)
-         FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         JOIN volumes v ON v.id = w.volume_id
-         WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed' AND {}",
-        crate::policy::coverage::eligible("v")
+        "SELECT {}",
+        crate::policy::coverage::copy_count_expr(
+            &crate::policy::coverage::CoverageQuery::current_unit("?1")
+        )
     );
     Ok(conn.query_row(&sql, params![unit_id], |row| row.get(0))?)
 }
@@ -432,14 +429,10 @@ pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64
 /// [`copy_count_for_unit`] and for the same reason.
 pub(crate) fn location_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
     let sql = format!(
-        "SELECT COUNT(DISTINCT v.location_id)
-         FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         JOIN volumes v ON v.id = w.volume_id
-         WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
-           AND v.location_id IS NOT NULL AND {}",
-        crate::policy::coverage::eligible("v")
+        "SELECT {}",
+        crate::policy::coverage::location_count_expr(
+            &crate::policy::coverage::CoverageQuery::current_unit("?1")
+        )
     );
     Ok(conn.query_row(&sql, params![unit_id], |row| row.get(0))?)
 }
@@ -542,6 +535,32 @@ mod tests {
         .unwrap();
 
         (conn, unit_id)
+    }
+
+    /// Issue #73 / ADR-0006: a recorded warehouse deposit is a copy and a
+    /// location. `audit`'s two derivations must see it, or a unit whose
+    /// second copy lives in a warehouse reads as under-copied and
+    /// single-location forever.
+    #[test]
+    fn copy_count_includes_a_warehouse_deposit() {
+        let (conn, unit_id, _vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        assert_eq!(
+            copy_count_for_unit(&conn, unit_id).unwrap(),
+            2,
+            "one sealed tape + one recorded warehouse deposit is two copies"
+        );
+    }
+
+    #[test]
+    fn location_count_includes_a_warehouse_deposit() {
+        let (conn, unit_id, _vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        assert_eq!(
+            location_count_for_unit(&conn, unit_id).unwrap(),
+            2,
+            "home (shelf) + glacier (warehouse) is two distinct locations"
+        );
     }
 
     fn assert_copy_count_excludes_status(status: &str) {
