@@ -116,7 +116,34 @@ pub struct Location {
     pub id: i64,
     pub name: String,
     pub description: Option<String>,
+    /// ADR-0006 location kind: `shelf` (physical whereabouts of a cartridge)
+    /// or `warehouse` (cold cloud storage). Migration 007 defaults every
+    /// pre-existing row to `shelf`. The endpoint/bucket/prefix lives in
+    /// `description` — deliberately no decorative URI columns (issue #73).
+    pub kind: String,
     pub created_at: String,
+}
+
+// ── Volume deposits (ADR-0006 warehouse copies) ──
+
+/// A RECORDED copy of an already-sealed volume's bytes at a warehouse
+/// location. tapectl never moved these bytes: the operator did, by the
+/// documented external procedure, and then recorded the fact here (issue
+/// #73, `docs/design-errata.md`).
+///
+/// There is deliberately no checksum field — tapectl did not perform the
+/// upload, so a typed-in checksum would be a claim about a claim. What is
+/// attestable is which volume, which location, when, and the provider's
+/// receipt identifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeDeposit {
+    pub id: i64,
+    pub volume_id: i64,
+    pub location_id: i64,
+    pub deposited_at: String,
+    pub receipt: Option<String>,
+    pub storage_class: Option<String>,
+    pub notes: Option<String>,
 }
 
 // ── Cartridges ──

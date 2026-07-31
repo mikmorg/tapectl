@@ -96,6 +96,12 @@ fn migrations() -> Migrations<'static> {
         // interrupted session's Layout. It cannot be regenerated — see the
         // migration for the `created_at`/`mam_loads` proof.
         M::up(include_str!("migrations/006_write_session_dir.sql")),
+        // 007 adds locations.kind, archive_sets.warehouse_copies and the
+        // volume_deposits table (issue #73, ADR-0006): a warehouse copy is a
+        // RECORDED deposit of an already-sealed volume, not a second volume and
+        // not a change of the cartridge's location. See the migration header for
+        // why it is not a volume_locations join table.
+        M::up(include_str!("migrations/007_warehouse_locations.sql")),
     ])
 }
 
