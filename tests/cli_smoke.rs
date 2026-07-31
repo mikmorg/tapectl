@@ -191,6 +191,15 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
         parsed.get("decorative_keys").is_some(),
         "config check --json missing 'decorative_keys' field: {parsed}"
     );
+    // Issue #97: the pre-existing-unsupported-compression advisory field
+    // must be present (empty here — a fresh db has no archive_sets rows)
+    // and, per its contract, must never affect the exit code (already
+    // asserted above via `.success()`).
+    assert_eq!(
+        parsed.get("unsupported_compression"),
+        Some(&serde_json::json!([])),
+        "config check --json missing/non-empty 'unsupported_compression' field on a fresh db: {parsed}"
+    );
     // Fresh init's default dar.binary (/opt/dar/bin/dar) does not exist on
     // this machine — the headline case this ticket exists for. It must be
     // reported, not silently absent, and it must not fail the command.

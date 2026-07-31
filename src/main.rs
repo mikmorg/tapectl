@@ -391,6 +391,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         // reader yet get surfaced, not deleted.
                         let decorative_hits = policy::decorative::scan(&loaded);
 
+                        // Advisory scan (issue #97): a pre-existing
+                        // archive_sets row whose compression the local dar
+                        // cannot perform — validation only runs at write
+                        // time, so a row written before that guard (or
+                        // against a different dar build) can still be
+                        // sitting there. Never rewrites, never touches the
+                        // exit code.
+                        let unsupported_compression_hits = if paths.db_file.exists() {
+                            policy::compression_capability::scan(&conn, &loaded.dar.binary)
+                        } else {
+                            Vec::new()
+                        };
+
                         // Depth checks (issue #62): does the config
                         // actually work, not just parse? Warnings only —
                         // never touches the exit code. Never opens a tape
@@ -475,6 +488,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                     })
                                 })
                                 .collect();
+                            let unsupported_compression_json: Vec<_> = unsupported_compression_hits
+                                .iter()
+                                .map(|h| {
+                                    serde_json::json!({
+                                        "archive_set": h.archive_set_name,
+                                        "compression": h.compression,
+                                        "note": policy::compression_capability::describe(h),
+                                    })
+                                })
+                                .collect();
                             println!(
                                 "{}",
                                 serde_json::json!({
@@ -485,6 +508,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                                     "dar": dar_json,
                                     "staging": staging_json,
                                     "tape_devices": tape_devices_json,
+                                    "unsupported_compression": unsupported_compression_json,
                                 })
                             );
                         } else {
@@ -519,6 +543,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             }
                             for hit in &decorative_hits {
                                 println!("{}", policy::decorative::describe(hit));
+                            }
+                            for hit in &unsupported_compression_hits {
+                                println!("{}", policy::compression_capability::describe(hit));
                             }
                         }
                     }

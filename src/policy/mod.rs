@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::db::models::Unit;
 use crate::error::Result;
 
+pub mod compression_capability;
 pub mod coverage;
 pub mod decorative;
 pub mod depth_check;
