@@ -278,7 +278,7 @@ mod tests {
         );
 
         let config = crate::config::Config::default();
-        let resolved = crate::policy::resolve(&conn, &config, &unit);
+        let resolved = crate::policy::resolve(&conn, &config, &unit).unwrap();
         assert_eq!(
             resolved.min_copies, 5,
             "must resolve the archive_set's min_copies, not the global default (2)"
@@ -354,7 +354,7 @@ mod tests {
         assert!(unit.archive_set_id.is_none());
 
         let config = crate::config::Config::default();
-        let resolved = crate::policy::resolve(&conn, &config, &unit);
+        let resolved = crate::policy::resolve(&conn, &config, &unit).unwrap();
         assert_eq!(resolved.min_copies, 2);
         assert_eq!(resolved.compression, "none");
     }

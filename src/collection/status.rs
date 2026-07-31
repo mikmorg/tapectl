@@ -51,7 +51,7 @@ pub fn status_for_collection(
     // its "copy_count" violation check (§11: "from the audit derivations")
     // — reused, not reinvented.
     for unit in tracked.iter().filter(|u| u.status == "active") {
-        let resolved = crate::policy::resolve(conn, config, unit);
+        let resolved = crate::policy::resolve(conn, config, unit)?;
         let copy_count: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT w.volume_id)
              FROM writes w

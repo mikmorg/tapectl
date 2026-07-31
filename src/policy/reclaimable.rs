@@ -118,7 +118,7 @@ pub fn assess(
     };
 
     // Precondition 2: Superseding snapshot meets policy
-    let resolved = super::resolve(conn, config, unit);
+    let resolved = super::resolve(conn, config, unit)?;
     let mut required_copies = resolved.min_copies;
     let mut required_locations = resolved.required_locations.len() as i64;
 

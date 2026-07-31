@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::config::Config;
 use crate::db::models::Unit;
+use crate::error::Result;
 
 pub mod coverage;
 pub mod evidence;
@@ -31,7 +32,14 @@ pub struct ResolvedPolicy {
 /// 1. Unit dotfile [policy] section (read from disk if available)
 /// 2. Archive set (from DB via unit.archive_set_id)
 /// 3. System defaults (from config.toml)
-pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> ResolvedPolicy {
+///
+/// Returns `Err` if the unit dotfile's own `[policy] slice_size` (the only
+/// layer parsed at USE time, not at config load — see below) is not a valid
+/// size string (issue #59). `config.defaults.slice_size` and any
+/// `archive_sets.slice_size` are already validated at config load /
+/// archive-set write time respectively, so in practice this can only fail on
+/// a bad operator-authored dotfile value.
+pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<ResolvedPolicy> {
     let defaults = &config.defaults;
 
     // Start with system defaults
@@ -41,7 +49,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> ResolvedPolic
         encrypt: defaults.encrypt,
         compression: defaults.compression.clone(),
         checksum_mode: defaults.checksum_mode.clone(),
-        slice_size: crate::staging::parse_size_to_bytes(&defaults.slice_size),
+        slice_size: crate::staging::parse_size_to_bytes(&defaults.slice_size)?,
         verify_interval_days: None,
         preserve_xattrs: defaults.preserve_xattrs,
         preserve_acls: defaults.preserve_acls,
@@ -140,7 +148,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> ResolvedPolic
                             policy.compression = v.to_string();
                         }
                         if let Some(v) = pol.get("slice_size").and_then(|v| v.as_str()) {
-                            policy.slice_size = crate::staging::parse_size_to_bytes(v);
+                            policy.slice_size = crate::staging::parse_size_to_bytes(v)?;
                         }
                     }
                 }
@@ -148,7 +156,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> ResolvedPolic
         }
     }
 
-    policy
+    Ok(policy)
 }
 
 #[cfg(test)]
@@ -186,7 +194,7 @@ mod tests {
         let config = Config::default();
         let unit = make_unit(None, None);
 
-        let p = resolve(&conn, &config, &unit);
+        let p = resolve(&conn, &config, &unit).unwrap();
         assert_eq!(p.min_copies, 2);
         assert_eq!(p.checksum_mode, "mtime_size");
         assert_eq!(p.compression, "none");
@@ -208,7 +216,7 @@ mod tests {
 
         let config = Config::default();
         let unit = make_unit(Some(as_id), None);
-        let p = resolve(&conn, &config, &unit);
+        let p = resolve(&conn, &config, &unit).unwrap();
 
         assert_eq!(p.min_copies, 3);
         assert_eq!(p.compression, "lzma");
@@ -230,7 +238,7 @@ mod tests {
 
         let config = Config::default();
         let unit = make_unit(Some(as_id), None);
-        let p = resolve(&conn, &config, &unit);
+        let p = resolve(&conn, &config, &unit).unwrap();
 
         assert_eq!(p.min_copies, 4);
         assert_eq!(p.compression, "none"); // from defaults
@@ -263,7 +271,7 @@ slice_size = "500M"
 
         let config = Config::default();
         let unit = make_unit(Some(as_id), Some(unit_path));
-        let p = resolve(&conn, &config, &unit);
+        let p = resolve(&conn, &config, &unit).unwrap();
 
         // Dotfile wins
         assert_eq!(p.checksum_mode, "full_hash");
@@ -277,7 +285,7 @@ slice_size = "500M"
         let config = Config::default();
         // archive_set_id points to a non-existent row — resolver must not panic
         let unit = make_unit(Some(999), None);
-        let p = resolve(&conn, &config, &unit);
+        let p = resolve(&conn, &config, &unit).unwrap();
         assert_eq!(p.min_copies, 2);
     }
 }
