@@ -31,8 +31,20 @@ the normative design set named in the Policy block below.
   set when parallelising. (#94, #90, #96, #92, #87, #56, #54, #55, #52,
   #53, #93, #44, #46 closed 2026-07-30; #97/#98 filed as residuals.)
   **ALL phase-2 mediums are now closed.** Remaining queue is lows only:
-  **#61, #63, #83, #95, #97, #99.** (#91 closed 2026-07-30; #99 filed as
-  its scope residual. #59, #50, #51, #98, #62, #43 closed 2026-07-31.)
+  **#63, #83, #95, #97, #99.** (#91 closed 2026-07-30; #99 filed as its
+  scope residual. #59, #50, #51, #98, #62, #43, #61 closed 2026-07-31.)
+  **`meta.schema_version` is a STALE RELIC — never trust it (#61).**
+  Migration 001 writes it as `'1'` and nothing bumps it;
+  `rusqlite_migration` keeps the real applied level in `PRAGMA
+  user_version` (currently 6). Any code needing the schema version reads
+  `user_version`. The stale row is inert only because nothing else reads
+  it — do not wire anything to it.
+  **`db export` streams a full dump** (`src/db/export.rs`): tables
+  enumerated from `sqlite_master` at runtime (never hardcode — that drift
+  is what made the old version wrong), rows written straight to a
+  `BufWriter<StdoutLock>` so peak RAM is one row, and FTS5 virtual tables
+  plus their `<vtab>_*` shadows excluded as derived binary state. If you
+  add a virtual table, the exclusion handles it automatically.
   **`dar` is a documented HARD test dependency (#43).** The ungated suite
   is NOT hermetic — 13 tests shell out to a real dar.
   `tests/test_dependencies.rs` asserts it once by name and **fails** rather
