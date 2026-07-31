@@ -25,7 +25,25 @@ the normative design set named in the Policy block below.
   production write, the LTO-6 hardware session, and #69's physical step.
 - **Phase-3 queue, re-triaged 2026-07-31 against shipped code. Take in
   this order — the ordering is a dependency, not a preference:**
-  1. **#70** (systemd timer for `audit` + `report verify-status`). Its
+  1. ~~**#70**~~ — **LANDED 2f62aad, closed 2026-07-31, CI green.**
+     `contrib/systemd/` (wrapper + service + timer) plus an operator-guide
+     section; no Rust change. Three decisions worth not re-litigating:
+     `report verify-status` KEEPS exit 0 (the verification-age check with
+     real exit codes is already one of `audit`'s six §2.20 checks — do not
+     give a report command an exit code to serve a wrapper); **audit exit 1
+     is a unit SUCCESS** via `SuccessExitStatus=1`, only exit 2 fails,
+     because alerting on advisory warnings makes the audit blocking by the
+     back door (ADR-0004); and healthcheck pinging **fails open** — unset
+     URL, missing curl, or a failed ping never changes the run's exit
+     status (same rule as #97's dar probe). The service must set `User=`
+     AND `Environment=HOME=` explicitly: `src/config.rs` resolves the
+     config root purely from `$HOME` and a systemd service inherits none.
+     Documented caveat, not a defect: an audit firing during a
+     `volume write` logs a spurious "recovered orphaned write sessions"
+     event, because `db::open`'s sweep marks `in_progress` sessions
+     `interrupted` (resumable, revalidates on resume — nothing is lost).
+     The original entry, for context: **#70** (systemd timer for `audit` +
+     `report verify-status`). Its
      stated hard dependency #45 is CLOSED and verified in code
      (`fsck_exit_code`, `exit_if_nonzero`, `init_tracing` → stderr), so the
      scheduled jobs can signal failure. #13 permanently rejected the daemon
