@@ -1,0 +1,37 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-restore-raw-volume 1  "tapectl-restore-raw-volume " 
+.SH NAME
+tapectl\-restore\-raw\-volume \- Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
+.SH SYNOPSIS
+\fBtapectl restore raw\-volume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-to\fR> [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
+.SH OPTIONS
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
+Tape device
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-to\fR \fI<TO>\fR
+Destination directory
+.TP
+\fB\-\-from\fR \fI<FROM>\fR
+Refuse unless the tape\*(Aqs own reported label matches (wrong\-tape guard) — not a database lookup
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
