@@ -46,10 +46,10 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
 
     cmd.arg("-an"); // case-insensitive masks
     cmd.arg("-D"); // store excluded dirs as empty
-    // No dar slice hashing (`-3`/`--hash`) — dar hashed every slice but
-    // nothing ever read the `.sha512` files it produced (issues #50/#51).
-    // tapectl's own sha256_plain/sha256_encrypted, computed over the whole
-    // archive before/after encryption, are the real integrity mechanism.
+                   // No dar slice hashing (`-3`/`--hash`) — dar hashed every slice but
+                   // nothing ever read the `.sha512` files it produced (issues #50/#51).
+                   // tapectl's own sha256_plain/sha256_encrypted, computed over the whole
+                   // archive before/after encryption, are the real integrity mechanism.
     cmd.arg("-Q"); // quiet (no tty prompt)
 
     if params.preserve_xattrs {

@@ -28,7 +28,7 @@ age = { version = "0.11", features = ["cli-common"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 ctrlc = "3"
-nix = { version = "0.29", features = ["ioctl", "fs"] }
+nix = { version = "0.29", features = ["ioctl", "fs", "user"] }
 indicatif = "0.17"
 rand = "0.9"
 tar = "0.4"
