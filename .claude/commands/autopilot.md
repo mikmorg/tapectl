@@ -50,14 +50,39 @@ the normative design set named in the Policy block below.
      shape; a **timer is the sanctioned alternative** — do not drift toward
      a daemon. Metadata-only: no tape, no restore path, no new deps.
      Scheduling changes *when* the audit runs, never *whether* it blocks.
-  2. **#73** (warehouse locations: model, policy knob, evidence semantics).
-     Lands in full. **Read its 2026-07-31 comment first** — the issue is
-     wrong twice: `locations` has NO `kind` column, so a migration IS
-     needed (only `volumes.storage_class` pre-exists, unpopulated); and its
-     "coordinates with #57" note is misdirected — #57 is `catalog locate`,
-     while the evidence machinery is `policy::evidence` from #91/#99.
-     Warehouse copies that count toward coverage must route through
-     `policy::coverage`, never a new inlined status list (that is #96).
+  2. ~~**#73**~~ — **LANDED `654093a..4ac27aa` (11 commits), closed
+     2026-07-31. Gate GREEN 26/26, CI green, 694 tests (was 656).**
+     Migration 007 (`locations.kind`, `archive_sets.warehouse_copies`,
+     `volume_deposits`), the `warehouse_copies` knob through all three
+     policy layers, `location add --kind`, `volume deposit add|list|
+     remove`, deposits first-class in every copy/location derivation, an
+     `audit` check, warehouse evidence as its own class, operator-guide
+     section. What to know before touching any of it:
+     - **A warehouse copy is a DEPOSIT of an existing sealed volume**, in
+       `volume_deposits` — never a new `volumes` row, never a change to
+       `volumes.location_id` (single-valued on purpose: "where do I go to
+       fetch this cartridge"). The migration header argues this at length
+       so nobody "unifies" it into a `volume_locations` join table.
+     - **No checksum / uri / credential columns**, ever. tapectl did not
+       perform the upload, so a typed-in checksum is a claim about a
+       claim; `locations.description` holds `s3://bucket/prefix`.
+     - **`policy::coverage` now owns `copy_count_expr` /
+       `location_count_expr`.** SIX sites hand-wrote the location count
+       and would each have under-counted a warehouse copy — #96's failure
+       mode in a new dimension. Twelve call sites route through them now.
+       Never inline either expression again.
+     - **`unit mark-tape-only` and `snapshot mark-reclaimable` now pass on
+       one tape + one deposit.** Intended (ADR-0006: the catalog claims
+       the copy so it can reason about it; ADR-0004 keeps it advisory),
+       but both greenlight deleting local data, so the evidence line at
+       those moments names the deposit and says it is never re-verified.
+     - **A deposit stops counting when its source volume stops being
+       `sealed`.** Conservative by choice: a deposit can never be the
+       thing that keeps a unit looking covered after its tape went bad.
+     - Residuals filed: **#100** (`volume move` still accepts a warehouse
+       destination) and **#101** (`volumes.storage_class` did NOT "become
+       meaningful with #73" as errata row 32 claims — decide populate/
+       surface/drop and correct the errata row in the same commit).
   3. **#72** — **RESCOPED by CTO decision, do NOT implement literally.**
      Native S3 is out; the target is the documented rclone/aws-cli
      procedure over sealed volumes that the issue itself named, plus the
