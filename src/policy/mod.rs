@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::config::Config;
 use crate::db::models::Unit;
-use crate::error::Result;
+use crate::error::{Result, TapectlError};
 
 pub mod compression_capability;
 pub mod coverage;
@@ -47,6 +47,21 @@ pub struct ResolvedPolicy {
 /// `archive_sets.slice_size` are already validated at config load /
 /// archive-set write time respectively, so in practice this can only fail on
 /// a bad operator-authored dotfile value.
+///
+/// **Every layer now fails loudly rather than falling through (issue #105.)**
+/// Each layer used to be wrapped in `if let Ok(..)`, so a database error, a
+/// dangling `archive_set_id`, a corrupt `required_locations` JSON, or an
+/// unreadable/unparseable dotfile all degraded *silently* to the weaker
+/// system defaults — and the unit then read as compliant against a policy
+/// its operator never chose. That is strictly worse than a known-violating
+/// unit, because the tool cannot tell. `audit` catches the `Err` and reports
+/// `policy_unresolvable` as a VIOLATION naming the checks it skipped (the
+/// shape #59 established); do not add a second error style here.
+///
+/// The one deliberate silence: **an ABSENT dotfile is normal** and defers
+/// upward (the #92 contract). Only a dotfile that is *present* and cannot be
+/// read or parsed is an error. Conflating the two makes every unit without a
+/// dotfile start failing.
 pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<ResolvedPolicy> {
     let defaults = &config.defaults;
 
@@ -68,82 +83,111 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 
     // Layer 2: Archive set (if unit has one)
     if let Some(as_id) = unit.archive_set_id {
-        if let Ok(row) = conn.query_row(
-            "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
+        // A dangling `archive_set_id` is corruption, not a normal state:
+        // nothing in tapectl deletes an `archive_sets` row, and `db::open*`
+        // runs with `PRAGMA foreign_keys = ON`, so the reference cannot go
+        // stale through any supported path. Silently skipping the layer
+        // would hand the unit the system defaults it was explicitly moved
+        // off — so it is mapped to a message that names the unit and the id
+        // rather than propagating rusqlite's bare "Query returned no rows",
+        // which an operator cannot act on.
+        let row = conn
+            .query_row(
+                "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
                     preserve_fsa, dirty_on_metadata_change, warehouse_copies
              FROM archive_sets WHERE id = ?1",
-            params![as_id],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
-                    row.get::<_, Option<i64>>(11)?,
-                ))
-            },
-        ) {
-            let (
-                min_copies,
-                locations_json,
-                encrypt,
-                compression,
-                checksum_mode,
-                slice_size,
-                verify_days,
-                preserve_xattrs,
-                preserve_acls,
-                preserve_fsa,
-                dirty_on_meta,
-                warehouse_copies,
-            ) = row;
+                params![as_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                    ))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => TapectlError::Other(format!(
+                    "unit \"{}\" references archive_set_id {} but no such archive set \
+                     exists — the catalog is inconsistent; re-point the unit with \
+                     `tapectl unit init --archive-set <name>` or restore the archive set",
+                    unit.name, as_id
+                )),
+                other => TapectlError::Database(other),
+            })?;
 
-            if let Some(v) = min_copies {
-                policy.min_copies = v;
-            }
-            if let Some(locs) = locations_json {
-                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&locs) {
-                    policy.required_locations = arr;
-                }
-            }
-            if let Some(v) = encrypt {
-                policy.encrypt = v != 0;
-            }
-            if let Some(v) = compression {
-                policy.compression = v;
-            }
-            if let Some(v) = checksum_mode {
-                policy.checksum_mode = v;
-            }
-            if let Some(v) = slice_size {
-                policy.slice_size = v;
-            }
-            if let Some(v) = verify_days {
-                policy.verify_interval_days = Some(v);
-            }
-            if let Some(v) = preserve_xattrs {
-                policy.preserve_xattrs = v != 0;
-            }
-            if let Some(v) = preserve_acls {
-                policy.preserve_acls = v != 0;
-            }
-            if let Some(v) = preserve_fsa {
-                policy.preserve_fsa = v != 0;
-            }
-            if let Some(v) = dirty_on_meta {
-                policy.dirty_on_metadata_change = v != 0;
-            }
-            if let Some(v) = warehouse_copies {
-                policy.warehouse_copies = v;
-            }
+        let (
+            min_copies,
+            locations_json,
+            encrypt,
+            compression,
+            checksum_mode,
+            slice_size,
+            verify_days,
+            preserve_xattrs,
+            preserve_acls,
+            preserve_fsa,
+            dirty_on_meta,
+            warehouse_copies,
+        ) = row;
+
+        if let Some(v) = min_copies {
+            policy.min_copies = v;
+        }
+        if let Some(locs) = locations_json {
+            // Every writer (`archive-set create`, `edit`, `sync`) stores this
+            // via `serde_json::to_string` on a `Vec`, and stores NULL when the
+            // operator sets none — so a non-NULL value that will not parse is
+            // corruption, never a legitimate shape. Swallowing it yielded an
+            // EMPTY vec, i.e. "no locations required", which is precisely the
+            // silent downgrade this function no longer performs. (Not named by
+            // issue #105; same class, same function.)
+            policy.required_locations =
+                serde_json::from_str::<Vec<String>>(&locs).map_err(|e| {
+                    TapectlError::Other(format!(
+                        "archive set {as_id} has an unparseable required_locations value \
+                         ({e}); expected a JSON array of location names, found: {locs}"
+                    ))
+                })?;
+        }
+        if let Some(v) = encrypt {
+            policy.encrypt = v != 0;
+        }
+        if let Some(v) = compression {
+            policy.compression = v;
+        }
+        if let Some(v) = checksum_mode {
+            policy.checksum_mode = v;
+        }
+        if let Some(v) = slice_size {
+            policy.slice_size = v;
+        }
+        if let Some(v) = verify_days {
+            policy.verify_interval_days = Some(v);
+        }
+        if let Some(v) = preserve_xattrs {
+            policy.preserve_xattrs = v != 0;
+        }
+        if let Some(v) = preserve_acls {
+            policy.preserve_acls = v != 0;
+        }
+        if let Some(v) = preserve_fsa {
+            policy.preserve_fsa = v != 0;
+        }
+        if let Some(v) = dirty_on_meta {
+            policy.dirty_on_metadata_change = v != 0;
+        }
+        if let Some(v) = warehouse_copies {
+            policy.warehouse_copies = v;
         }
     }
 
@@ -151,30 +195,46 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
     // Read from disk if the unit has a path
     if let Some(ref path) = unit.current_path {
         let dotfile_path = std::path::Path::new(path).join(".tapectl-unit.toml");
+        // `exists()` is the whole absent-vs-present split: a unit with no
+        // dotfile defers upward in silence (#92). Past this point the file
+        // IS there, so both an IO failure and a parse failure are real —
+        // including the TOCTOU case where it is removed between the check
+        // and the read, which is NOT the same as never having existed and
+        // must not be quietly folded back into "absent".
         if dotfile_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&dotfile_path) {
-                if let Ok(toml) = contents.parse::<toml::Table>() {
-                    if let Some(pol) = toml.get("policy").and_then(|v| v.as_table()) {
-                        if let Some(v) = pol.get("checksum_mode").and_then(|v| v.as_str()) {
-                            policy.checksum_mode = v.to_string();
-                        }
-                        if let Some(v) = pol.get("compression").and_then(|v| v.as_str()) {
-                            policy.compression = v.to_string();
-                        }
-                        if let Some(v) = pol.get("slice_size").and_then(|v| v.as_str()) {
-                            policy.slice_size = crate::staging::parse_size_to_bytes(v)?;
-                        }
-                        // ADR-0006 / issue #73. Read straight off the TOML
-                        // table, like every other dotfile knob here: absent
-                        // means "defer to the archive set", so there is
-                        // deliberately no default filled in anywhere on the
-                        // way in (issue #92 -- a filled default is
-                        // indistinguishable from an operator choice and
-                        // would silently outrank the archive set).
-                        if let Some(v) = pol.get("warehouse_copies").and_then(|v| v.as_integer()) {
-                            policy.warehouse_copies = v;
-                        }
-                    }
+            let contents = std::fs::read_to_string(&dotfile_path).map_err(|e| {
+                TapectlError::Other(format!(
+                    "unit \"{}\" has a .tapectl-unit.toml at {} that cannot be read ({e})",
+                    unit.name,
+                    dotfile_path.display()
+                ))
+            })?;
+            let toml = contents.parse::<toml::Table>().map_err(|e| {
+                TapectlError::Other(format!(
+                    "unit \"{}\" has a malformed .tapectl-unit.toml at {} ({e})",
+                    unit.name,
+                    dotfile_path.display()
+                ))
+            })?;
+            if let Some(pol) = toml.get("policy").and_then(|v| v.as_table()) {
+                if let Some(v) = pol.get("checksum_mode").and_then(|v| v.as_str()) {
+                    policy.checksum_mode = v.to_string();
+                }
+                if let Some(v) = pol.get("compression").and_then(|v| v.as_str()) {
+                    policy.compression = v.to_string();
+                }
+                if let Some(v) = pol.get("slice_size").and_then(|v| v.as_str()) {
+                    policy.slice_size = crate::staging::parse_size_to_bytes(v)?;
+                }
+                // ADR-0006 / issue #73. Read straight off the TOML
+                // table, like every other dotfile knob here: absent
+                // means "defer to the archive set", so there is
+                // deliberately no default filled in anywhere on the
+                // way in (issue #92 -- a filled default is
+                // indistinguishable from an operator choice and
+                // would silently outrank the archive set).
+                if let Some(v) = pol.get("warehouse_copies").and_then(|v| v.as_integer()) {
+                    policy.warehouse_copies = v;
                 }
             }
         }
@@ -352,13 +412,90 @@ slice_size = "500M"
         assert_eq!(p.warehouse_copies, 4);
     }
 
+    /// Issue #105. This test previously asserted that a dangling
+    /// `archive_set_id` **falls back to defaults**, which is the exact
+    /// silent downgrade #105 exists to remove. Its own comment shows the
+    /// real intent was panic-safety ("resolver must not panic") — an `Err`
+    /// satisfies that just as well as an `Ok`, so the assertion is
+    /// tightened rather than the behavior loosened: a unit pointed at an
+    /// archive set that is not there must be REPORTED, not quietly handed
+    /// the weaker system defaults it was deliberately moved off.
     #[test]
-    fn resolve_missing_archive_set_id_falls_back_to_defaults() {
+    fn resolve_dangling_archive_set_id_errors_instead_of_downgrading() {
         let conn = fresh_conn();
         let config = Config::default();
-        // archive_set_id points to a non-existent row — resolver must not panic
         let unit = make_unit(Some(999), None);
-        let p = resolve(&conn, &config, &unit).unwrap();
-        assert_eq!(p.min_copies, 2);
+
+        let err = resolve(&conn, &config, &unit)
+            .expect_err("a dangling archive_set_id must not resolve to system defaults");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("999") && msg.contains("archive_set_id"),
+            "the error must name the dangling id so an operator can act on it, \
+             not propagate rusqlite's bare \"Query returned no rows\"; got: {msg}"
+        );
+    }
+
+    /// The absent-vs-present split, which is the one thing #105 must NOT
+    /// change: a unit with no dotfile defers upward in silence (#92). If
+    /// this ever starts erroring, every unit without a dotfile fails.
+    #[test]
+    fn resolve_with_no_dotfile_present_is_silent_not_an_error() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        let p = resolve(&conn, &config, &unit).expect("an absent dotfile defers upward");
+        assert_eq!(
+            p.min_copies,
+            config.defaults.min_copies_for_tape_only as i64
+        );
+    }
+
+    /// A dotfile that is PRESENT but not valid TOML is corruption, and the
+    /// resolver must say so rather than handing back system defaults.
+    #[test]
+    fn resolve_with_a_malformed_dotfile_errors() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy\nthis is not valid toml = = =\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        let err = resolve(&conn, &config, &unit)
+            .expect_err("a malformed dotfile must not resolve to system defaults");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".tapectl-unit.toml"),
+            "the error must name the file the operator has to fix; got: {msg}"
+        );
+    }
+
+    /// A corrupt `required_locations` used to yield an EMPTY vec — i.e. "no
+    /// locations required" — the same silent downgrade in a third place
+    /// (not named by issue #105). Every writer stores a `serde_json`
+    /// array or NULL, so an unparseable non-NULL value is only ever
+    /// corruption.
+    #[test]
+    fn resolve_with_corrupt_required_locations_errors_instead_of_requiring_none() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO archive_sets (name, required_locations) VALUES ('broken', ?1)",
+            params!["{not json at all"],
+        )
+        .unwrap();
+        let as_id = conn.last_insert_rowid();
+        let unit = make_unit(Some(as_id), None);
+
+        let err = resolve(&conn, &config, &unit).expect_err(
+            "corrupt required_locations must not silently resolve to \"none required\"",
+        );
+        assert!(err.to_string().contains("required_locations"), "got: {err}");
     }
 }
