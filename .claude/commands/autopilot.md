@@ -133,11 +133,35 @@ the normative design set named in the Policy block below.
   binding fails exactly that test and none of the three guard tests. The
   mhvtl gate does NOT cover this path: its restore legs use fresh
   destinations and succeed, so they never fail partway.
-  **#103** (unvalidated tenant/unit names
-  interpolated into key paths — gate). **Its "grandfather-vs-migrate"
-  question is NOT a CTO call**: validate at CREATION time only (`tenant
-  add`, `unit init`), never at load time, and existing installs are
-  untouched by construction. Take that and record the reasoning. **#104** (`db fsck`), **#105** (policy resolver silent
+  ~~**#103**~~ — **LANDED b46ffe1, closed 2026-08-01. CI green, gate GREEN
+  26/26 (see the flake note below), 726 tests.** New `src/naming.rs`:
+  `validate_tenant_name` / `validate_unit_name` / `validate_volume_label`,
+  called at the FOUR creation sites (`tenant add`, `unit init`, `unit
+  rename`, `volume init`) and **never on the load path** — which is what
+  makes it safe for existing installs and dissolves the
+  grandfather-vs-migrate question entirely. Keep in mind:
+  - **It was a real defect, demonstrated:** with validation removed,
+    `add_tenant("../../escaped")` returns `Ok(1)` and writes BOTH PRIVATE
+    KEYS two directory levels above `keys/`. That capture is the negative
+    control.
+  - **Unit names are hierarchical** (`tv/breaking-bad/s01`, and
+    `collection sync` generates `{collection}/{relative path}`), so `/` is
+    a validated SEPARATOR for units and a rejected character for tenants
+    and labels. Never "simplify" the three functions into one.
+  - **Volume labels were the same defect at a third site** the issue did
+    not name (`{staging}/clone-{from_label}-{unit_name}`).
+  - Allowlist, not blocklist; leading `-` and `.` also refused.
+  **THE GATE HAS A KNOWN FLAKE — #113, found during this land.**
+  `resume_bot` failed 1 run in 3 with "expected between 0 and 0
+  confirmed-written positions, got 1". It is structural, not tuning: the
+  arm waits on `writes.status='in_progress'` (true at `plan()`, before any
+  entry) and then signals, so the writer can confirm entry 0 inside the
+  delivery window. **Do NOT widen the bound to `0 1`** — that converts arm
+  1 into a duplicate of `resume_midwrite` and deletes the BOT case. Also
+  note the assertion's own remedy text ("retune the sleep") is stale;
+  there is no sleep any more. If the gate reds on `resume_bot`, check
+  #113 before assuming your change caused it — but never just re-run
+  until green. **#104** (`db fsck`), **#105** (policy resolver silent
   fallback), **#106** (fire-risk global threshold), **#107**
   (`tape_alerts` — gate, migration 009), **#108** (staging-clean permanent
   orphan — gate), **#109** (`--home`/`--config` — looks gate-free, is NOT:
