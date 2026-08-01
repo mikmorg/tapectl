@@ -16,6 +16,33 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
+- **CTO BATCH ANSWERED 2026-08-01 (five decisions, recorded in ADR-0009,
+  commit 9ee0658). #69 IS UNBLOCKED AND IS NEXT — it is the only open
+  `severity:high`.** The deferral covers the **ceremony** (printing,
+  tamper-evident envelopes, distribution), NOT the command; #68 is closed
+  and the escrow recipient is live in the write path. Ratified:
+  1. Build `key escrow-kit` end-to-end, stop at the printed artifact.
+  2. The bundle is the **full `tapectl.db`**, not #83's filtered
+     `catalog.db` — the filtered schema has no `locations`/`cartridges`, so
+     it tells an heir what exists but not which cartridge to fetch. Safe
+     because the DB holds no secret material (only `tenants.public_key`;
+     private halves are files under `keys/`).
+  3. Output is **self-contained HTML (inline SVG QR, print styling) + a
+     plain-text `COVER.txt` twin** carrying the same words and the key in
+     retypable Bech32. The `.txt` is the decades-scale artifact. PDF was
+     rejected (heavy dependency, less inspectable).
+  4. **Kit staleness is recorded and warned about advisorily** — an
+     `events` row on generation, and an `audit` check at exit 1, never 2,
+     when volumes were sealed since. ADR-0005 names that failure and
+     rejects *enforced* discipline; an advisory check is neither
+     enforcement nor memory, so it sits in the gap. ADR-0004 holds.
+  5. #113's fix was the deterministic park hook — **landed first on
+     purpose**, so the gate is trustworthy before it is used to validate
+     #69. Fix the measuring instrument before the measurement.
+  Open risks named to the CTO and not yet decided: the **QR crate is a new
+  dependency** in a tree that pins deliberately (pick one with no
+  transitive image stack, pin it), and #69 grows `audit` to a **seventh**
+  operator-facing check. #69 lands in `src/crypto/` ⇒ full mhvtl gate.
 - **Mode: PHASE 3 (from 2026-07-31), CTO-scoped.** Phase 2 ran to completion
   — every phase-2 issue closed except **#69 (Heir Kit)**, deferred by the
   CTO for a physical step (printing, tamper-evident envelopes) no agent can
@@ -151,7 +178,29 @@ the normative design set named in the Policy block below.
   - **Volume labels were the same defect at a third site** the issue did
     not name (`{staging}/clone-{from_label}-{unit_name}`).
   - Allowlist, not blocklist; leading `-` and `.` also refused.
-  **THE GATE HAS A KNOWN FLAKE — #113, found during this land.**
+  ~~**#113 — THE GATE FLAKE IS FIXED.**~~ **LANDED f5e716e, closed
+  2026-08-01. Five consecutive gate runs GREEN 26/26, CI green, 718 tests.**
+  Fixed at the source, not tuned: `TAPECTL_TEST_PAUSE_AFTER_PLAN` names a
+  marker path, `execute` parks at exactly the BOT state and creates that
+  file, and the gate waits for **the file** — a fact, not a timing guess —
+  before signalling. No sleeps anywhere in that arm. What to keep:
+  - **The env var is read at ONE boundary (`park_marker_from_env`) and
+    passed into `run_entries` as a parameter.** Not decoration: env vars
+    are process-global, so an in-process test that set one would leak into
+    every other test running in parallel in the same binary — the exact
+    nondeterminism being removed. Never move the lookup back inside.
+  - **A test hook on the production write path is justified, not hidden:**
+    runtime check because `#[cfg(test)]` can't reach integration binaries
+    (#87); unset ⇒ not one branch taken (pinned by a test); warns loudly so
+    it can never park silently on a real tape; times out after 120s into a
+    normal write so a gate that never signals fails on its assertion rather
+    than hanging.
+  - **One green run proves nothing about a 1-in-3 flake.** Five consecutive
+    full runs was the bar (~13% under the old behavior). Use that standard
+    for any future flake fix.
+  - The two "retune the sleep" remedy strings were stale and are fixed; they
+    now name the park hook and forbid widening the bound.
+  **Historical note — the flake as originally recorded:**
   `resume_bot` failed 1 run in 3 with "expected between 0 and 0
   confirmed-written positions, got 1". It is structural, not tuning: the
   arm waits on `writes.status='in_progress'` (true at `plan()`, before any
