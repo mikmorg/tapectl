@@ -83,13 +83,32 @@ the normative design set named in the Policy block below.
        destination) and **#101** (`volumes.storage_class` did NOT "become
        meaningful with #73" as errata row 32 claims — decide populate/
        surface/drop and correct the errata row in the same commit).
-  3. **#72** — **RESCOPED by CTO decision, do NOT implement literally.**
-     Native S3 is out; the target is the documented rclone/aws-cli
-     procedure over sealed volumes that the issue itself named, plus the
-     runbook and heir-kit text (billing-fragility warning, restore-request
-     wait). No `WarehouseStore` Rust impl, no in-process polling, no new
-     dependency. Full reasoning in `docs/design-errata.md`'s ADR-0006
-     scope row; ADR-0006 is NOT amended and native S3 stays open later.
+  3. ~~**#72**~~ — **LANDED 7a92dce, closed 2026-08-01, CI green.** The
+     documented rclone/aws-cli procedure (native S3 stays out; ADR-0006 is
+     NOT amended and `WarehouseStore` stays open on the same seam). Docs
+     only, composing `restore raw-volume` (#63) + `volume deposit add`
+     (#73). **The retrieval path was verified end-to-end on a real dumped
+     volume before it was written**, which caught two traps that
+     transcribing the on-tape system guide would have got wrong:
+     - **The front index and seal marker dump as FULL NUL-PADDED tape
+       blocks** (524288 bytes, 520311 NUL) — they are the two files that
+       cannot carry their own hash, so there is no length to truncate to.
+       Content files ARE trimmed exact. Applying `tr -d '\0'` uniformly,
+       or omitting it, is wrong for half the files.
+     - **Slice number is NOT tape position, and slices do not start at 0**
+       (position 8 on the verified volume, after the envelopes). The
+       mapping is each `[[units.slices]]` block's `number` +
+       `tape_position` in the envelope MANIFEST.toml. Filename order
+       yields a broken archive.
+     Proof: decrypted slice matched manifest `sha256_plain`; `dar -x` was
+     `diff -r`-identical to source. The guide states which of its own
+     lines were executed (tapectl/age/dar) and which were not (rclone/aws
+     — not installable from apt here). Heir-kit obligation recorded on #69.
+
+  **THE PHASE-3 QUEUE IS EMPTY (2026-08-01).** Everything remaining is a
+  CTO call: **#20** (epic complete-but-unclosed), **#65/#66/#67** (LOW
+  umbrellas — decompose or close, never implement as written), **#69**
+  (physical step), and residuals **#100**/**#101**.
 - **Not in the phase-3 queue, but needing a CTO call soon:** **#20** is an
   open `severity:high` epic whose stated acceptance — *"verify-gate legs 1
   and 4 green with EXPECTED_FAIL empty"* — is literally the current state,
