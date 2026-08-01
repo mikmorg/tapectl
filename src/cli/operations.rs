@@ -1357,14 +1357,38 @@ pub fn db_import(
 }
 
 /// DB fsck: integrity check with optional repair.
+///
+/// Issue #104 fixed three defects here, all worth not reintroducing:
+///
+/// 1. `PRAGMA integrity_check` returns **many** rows on a damaged database
+///    — one per problem, up to SQLite's built-in cap of 100. The old code
+///    read it with `query_row`, so a corrupt catalog reported exactly one
+///    issue no matter how bad it was, and `fsck` looked *more* reassuring
+///    the worse things got. Every row is collected now. The clean case is
+///    not "empty" and not "contains ok": a healthy database returns
+///    exactly one row whose text is `ok`, so that is the predicate.
+/// 2. `--repair`'s DELETEs ran unwrapped, so a failure between them left
+///    the catalog half-repaired. Both now share one transaction.
+/// 3. A repair deletes records of what is on tape and logged nothing. It
+///    now writes an `events` row — **inside** the transaction, so an event
+///    can never outlive a rolled-back repair.
+///
+/// `repaired` counts deleted **rows**, not categories (it is rendered as
+/// "repaired=N", where a category count is close to meaningless).
 pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
     let mut report = FsckReport::default();
 
-    // Run integrity check
-    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    report.integrity_ok = integrity == "ok";
+    // Run integrity check — collect every row, not just the first.
+    let integrity: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    report.integrity_ok = integrity.len() == 1 && integrity[0] == "ok";
     if !report.integrity_ok {
-        report.issues.push(format!("integrity_check: {integrity}"));
+        for line in &integrity {
+            report.issues.push(format!("integrity_check: {line}"));
+        }
     }
 
     // Check for orphaned records
@@ -1377,13 +1401,6 @@ pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
         report
             .issues
             .push(format!("{orphan_writes} orphaned write records"));
-        if repair {
-            conn.execute(
-                "DELETE FROM writes WHERE volume_id NOT IN (SELECT id FROM volumes)",
-                [],
-            )?;
-            report.repaired += 1;
-        }
     }
 
     let orphan_slices: i64 = conn.query_row(
@@ -1395,13 +1412,40 @@ pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
         report
             .issues
             .push(format!("{orphan_slices} orphaned stage slices"));
-        if repair {
-            conn.execute(
+    }
+
+    if repair && (orphan_writes > 0 || orphan_slices > 0) {
+        let tx = conn.unchecked_transaction()?;
+        let mut deleted = 0usize;
+        if orphan_writes > 0 {
+            deleted += tx.execute(
+                "DELETE FROM writes WHERE volume_id NOT IN (SELECT id FROM volumes)",
+                [],
+            )?;
+        }
+        if orphan_slices > 0 {
+            deleted += tx.execute(
                 "DELETE FROM stage_slices WHERE stage_set_id NOT IN (SELECT id FROM stage_sets)",
                 [],
             )?;
-            report.repaired += 1;
         }
+        events::log_event(
+            &tx,
+            "system",
+            0,
+            None,
+            "db_fsck_repair",
+            None,
+            None,
+            None,
+            Some(&format!(
+                "deleted {orphan_writes} orphaned write records, \
+                 {orphan_slices} orphaned stage slices"
+            )),
+            None,
+        )?;
+        tx.commit()?;
+        report.repaired = deleted;
     }
 
     Ok(report)
@@ -1411,6 +1455,7 @@ pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
 pub struct FsckReport {
     pub integrity_ok: bool,
     pub issues: Vec<String>,
+    /// Number of rows deleted by `--repair` (0 when `--repair` was not passed).
     pub repaired: usize,
 }
 
@@ -2829,5 +2874,102 @@ mod tests {
                 f.display()
             );
         }
+    }
+
+    /// Issue #104: insert orphans into BOTH tables `db_fsck` repairs, then
+    /// repair. Three properties at once: `repaired` is a row count (3, not
+    /// the old category count of 2), both tables are actually emptied by
+    /// the one transaction, and exactly one `events` row records it.
+    ///
+    /// This is the test that fails against pre-#104 code: it asserted
+    /// `repaired == 2` there, and found no event at all.
+    #[test]
+    fn fsck_repair_is_transactional_row_counted_and_audited() {
+        let conn = crate::db::open_memory().unwrap();
+
+        // Two writes and one stage slice, all pointing at ids that do not
+        // exist. Deliberately asymmetric so a category count (2) and a row
+        // count (3) cannot be confused for each other.
+        //
+        // `db::open*` sets `PRAGMA foreign_keys = ON`, so orphans of this
+        // shape cannot be *created* through tapectl today — they arrive
+        // from an older database, a hand-edited one, or a partial restore,
+        // which is exactly the population `fsck` exists to serve. The
+        // pragma is dropped only to build the fixture, then restored so
+        // the repair itself runs under production FK semantics.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        for set_id in [9001, 9002] {
+            conn.execute(
+                "INSERT INTO writes (volume_id, stage_set_id, snapshot_id, status)
+                 VALUES (9999, ?1, 9999, 'completed')",
+                params![set_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                       encrypted_bytes, sha256_plain, sha256_encrypted,
+                                       staging_path)
+             VALUES (9999, 0, 1, 1, 'aa', 'bb', '/nonexistent/orphan.age')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        // Without --repair: reported, not touched.
+        let dry = db_fsck(&conn, false).unwrap();
+        assert!(dry.integrity_ok, "in-memory db must pass integrity_check");
+        assert_eq!(dry.issues.len(), 2, "issues: {:?}", dry.issues);
+        assert_eq!(dry.repaired, 0, "a dry run must delete nothing");
+
+        let report = db_fsck(&conn, true).unwrap();
+        assert!(report.integrity_ok);
+        assert_eq!(
+            report.repaired, 3,
+            "`repaired` counts deleted rows (2 writes + 1 slice), not the \
+             two categories they fall into"
+        );
+
+        for table in ["writes", "stage_slices"] {
+            let left: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{table} still holds orphans after repair");
+        }
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE action = 'db_fsck_repair'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "a repair must leave exactly one audit event");
+
+        // A repair that finds nothing must not log an event.
+        let noop = db_fsck(&conn, true).unwrap();
+        assert_eq!(noop.repaired, 0);
+        let events_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE action = 'db_fsck_repair'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_after, 1, "a no-op repair must not log an event");
+    }
+
+    /// The clean-database predicate, pinned on its own. A healthy SQLite
+    /// database returns exactly one `integrity_check` row reading `ok` —
+    /// never zero rows — so `integrity_ok` must not be derived from
+    /// emptiness. The genuinely-corrupt multi-row path is NOT covered here:
+    /// it needs a real damaged file, which the ungated suite cannot
+    /// synthesize portably.
+    #[test]
+    fn fsck_integrity_ok_on_a_clean_database() {
+        let conn = crate::db::open_memory().unwrap();
+        let report = db_fsck(&conn, false).unwrap();
+        assert!(report.integrity_ok);
+        assert!(report.issues.is_empty(), "issues: {:?}", report.issues);
     }
 }
