@@ -105,10 +105,33 @@ the normative design set named in the Policy block below.
      lines were executed (tapectl/age/dar) and which were not (rclone/aws
      — not installable from apt here). Heir-kit obligation recorded on #69.
 
-  **THE PHASE-3 QUEUE IS EMPTY (2026-08-01).** Everything remaining is a
-  CTO call: **#20** (epic complete-but-unclosed), **#65/#66/#67** (LOW
-  umbrellas — decompose or close, never implement as written), **#69**
-  (physical step), and residuals **#100**/**#101**.
+  **THE PHASE-3 QUEUE IS EMPTY (2026-08-01), and the three CTO calls it
+  raised have all been executed:**
+  - **#20 CLOSED as delivered.** All 15 children closed, gate GREEN 26/26
+    with `EXPECTED_FAIL=()`. #26 (EOT) was *rejected* by ADR-0007, not
+    built. The block-size question survives independently in
+    `v2-open-questions.md` §5 — closing the epic did not lose it.
+  - **#65/#66/#67 AUDITED, DECOMPOSED, CLOSED.** Full item-by-item verdict
+    tables are recorded as closing comments on each. Roughly a third were
+    already DONE or SUPERSEDED — the usual rate; **#66's `key export --qr`
+    rider was correct**, and **#65's `--depth` item was invalid as
+    written** (no such flag exists; it is a vestigial fn parameter).
+  - **#101 DROPPED the column** (migration 008, `7b546f4`), errata row 32
+    corrected in the same commit. Note **migration 008 is now taken** —
+    #107 (`tape_alerts`) is 009.
+  **PHASE 4 = the decomposed backlog, severity then value:**
+  **#102** (restore leaves decrypted plaintext in the destination on any
+  mid-restore failure — gate), **#103** (unvalidated tenant/unit names
+  interpolated into key paths — gate; needs a grandfather-vs-migrate
+  decision first), **#104** (`db fsck`), **#105** (policy resolver silent
+  fallback), **#106** (fire-risk global threshold), **#107**
+  (`tape_alerts` — gate, migration 009), **#108** (staging-clean permanent
+  orphan — gate), **#109** (`--home`/`--config` — looks gate-free, is NOT:
+  the gate script depends on the hijack), **#110** (grouped one-liners),
+  **#111** (harness hygiene), **#112** (`main.rs` extraction), **#100**
+  (`volume move` to a warehouse). Every one was verified against shipped
+  code on 2026-08-01, so for once the backlog is NOT stale — but re-check
+  anything that sat unworked for a while.
 - **Not in the phase-3 queue, but needing a CTO call soon:** **#20** is an
   open `severity:high` epic whose stated acceptance — *"verify-gate legs 1
   and 4 green with EXPECTED_FAIL empty"* — is literally the current state,
