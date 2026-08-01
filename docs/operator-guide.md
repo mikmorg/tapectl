@@ -295,6 +295,69 @@ tapectl location list
 tapectl location info glacier
 ```
 
+### The deposit procedure
+
+This is the documented external procedure (issue #72). tapectl does not run
+any of step 2 for you — it produces the bytes and records the result.
+
+> **Which lines here have been executed.** Every `tapectl`, `age`, `dar`,
+> `tr` and `sha256sum` invocation in this section and the next was run against
+> a real dumped volume, and the outputs quoted are the real ones. The `rclone`
+> and `aws` lines were **not** — neither tool is installed on the development
+> box, so they are transcribed from vendor documentation and are the one part
+> of this procedure to re-check against your own installed version before you
+> rely on it. Do a dry run against a scratch bucket before your first real
+> deposit; `rclone copy --dry-run` will tell you if a flag has moved.
+
+**1. Dump the sealed volume to a directory.** `restore raw-volume` reads a
+tape using only what is on the tape itself, verifies every file against the
+front index as it goes, and needs no database:
+
+```bash
+tapectl restore raw-volume --device /dev/nst0 --to /staging/MHVTLR3 \
+  --from MHVTLR3
+```
+
+`--from` is a wrong-tape guard against the tape's own reported label, not a
+catalog lookup. Expect output like `dumped 23 files … verified: 21
+mismatched: 0 unverifiable: 2`. **`mismatched` must be 0.** The two
+unverifiable files are always the front index and the seal marker — neither
+can carry its own hash — so `2` is the correct number, not a warning.
+
+Files land named `{position:04}_{type}.bin`, e.g.:
+
+```
+0000_id_thunk.bin           0006_operator_envelope.bin
+0001_system_guide.bin       0007_operator_envelope_backup.bin
+0002_restore_sh.bin         0008_data_slice.bin  …  0021_data_slice.bin
+0003_front_index.bin        0022_seal_marker.bin
+0004_tenant_envelope.bin
+0005_tenant_envelope.bin
+```
+
+**2. Upload, splitting hot from cold.** ADR-0006's zone split is the whole
+point: metadata at instant-access, slices at deep-archive. Everything that is
+*not* a `data_slice` is metadata and must stay instantly readable — an
+operator who cold-stores the front index cannot even enumerate what they
+deposited without paying for a restore request first, which defeats the split.
+
+```bash
+# Metadata zone -> instant access. Small: a few hundred KB in total.
+rclone copy /staging/MHVTLR3 s3:my-archive-bucket/MHVTLR3/ \
+  --exclude '*_data_slice.bin' --s3-storage-class STANDARD
+
+# Slices -> deep archive. This is the volume's bulk.
+rclone copy /staging/MHVTLR3 s3:my-archive-bucket/MHVTLR3/ \
+  --include '*_data_slice.bin' --s3-storage-class DEEP_ARCHIVE
+```
+
+The `aws-cli` equivalent is `aws s3 cp --storage-class …` over the same two
+file sets. Either way, **verify before you record**: `rclone check
+/staging/MHVTLR3 s3:my-archive-bucket/MHVTLR3/ --checksum` compares hashes
+rather than sizes. Record the deposit only after that passes.
+
+**3. Record it**, per the next section.
+
 ### Recording a deposit
 
 Copy the sealed volume's bytes out first, by your own procedure, then:
@@ -329,6 +392,89 @@ tapectl volume deposit remove L6-0003 --from glacier
 
 It errors rather than shrugging if no such deposit was recorded, so a typo in
 the label cannot look like a successful correction.
+
+### Getting the bytes back
+
+Assume the tapes are gone and this warehouse copy is all that is left. That is
+the only scenario this path exists for, so it is written for someone who has
+tapectl's key files and nothing else — an heir, or you after a fire.
+
+**1. Issue a restore request and wait.** Deep-archive objects cannot be read
+until the provider stages them, and that wait is measured in **hours**, not
+minutes — standard retrieval from Deep Archive is on the order of 12 hours,
+bulk up to 48. Nothing you can do shortens it, and the metadata zone is at
+instant access precisely so you can read the front index and decide *which*
+slices to pay to thaw before you start that clock.
+
+```bash
+# Metadata is already instant — fetch it first and read it.
+rclone copy s3:my-archive-bucket/MHVTLR3/ /recover/MHVTLR3/ \
+  --exclude '*_data_slice.bin'
+
+# Then thaw the slices and wait.
+aws s3api restore-object --bucket my-archive-bucket \
+  --key MHVTLR3/0008_data_slice.bin \
+  --restore-request Days=7,GlacierJobParameters={Tier=Standard}
+# ... repeat per slice, then poll:
+aws s3api head-object --bucket my-archive-bucket \
+  --key MHVTLR3/0008_data_slice.bin --query Restore
+```
+
+Once `Restore` reports `ongoing-request="false"`, download normally.
+
+**2. Read the front index.** It is plain text, but it is dumped as a **full
+tape block**, so it has a large tail of NUL padding — strip it before reading:
+
+```bash
+tr -d '\0' < /recover/MHVTLR3/0003_front_index.bin | less
+```
+
+Content files (envelopes, slices) are dumped at their exact length and need no
+stripping. Only the front index and seal marker carry padding, because they
+are the two files that cannot carry their own hash.
+
+**3. Open an envelope by trial decryption.** Try each key you hold against
+each envelope; the one that works is yours. A tenant key opens only that
+tenant's envelope, and the operator key opens every one:
+
+```bash
+age -d -i ~/.tapectl/keys/YOURKEY.age.key \
+  < /recover/MHVTLR3/0004_tenant_envelope.bin | tar -xv
+```
+
+You get `MANIFEST.toml`, `RECOVERY.md`, and the dar catalogs.
+
+**4. Map slices using MANIFEST.toml — not the filename order.** Each unit's
+`[[units.slices]]` block gives both `number` (dar's slice number) and
+`tape_position` (which dumped file holds it). **These are not the same, and
+slices do not start at position 0** — on a real volume they typically start
+after the envelopes. Decrypt each slice into a working directory named by its
+`number`:
+
+```toml
+[[units.slices]]
+number = 1
+tape_position = 8
+sha256_plain = "0c507128…"
+```
+
+```bash
+mkdir -p /recover/dar
+age -d -i ~/.tapectl/keys/YOURKEY.age.key \
+  < /recover/MHVTLR3/0008_data_slice.bin > /recover/dar/restore.1.dar
+# verify against sha256_plain from the manifest:
+sha256sum /recover/dar/restore.1.dar
+```
+
+**5. Extract.** dar takes the base name, with no `.N.dar` suffix:
+
+```bash
+dar -x /recover/dar/restore -R /destination -O -Q
+```
+
+This whole path was verified end-to-end against a real dumped volume: the
+decrypted slice matched its manifest `sha256_plain`, and the extraction was
+`diff -r`-identical to the original source tree.
 
 ### Asking for warehouse copies by policy
 
@@ -372,6 +518,20 @@ you have there, on a timescale of weeks. A cartridge in a drawer does not care
 whether you paid anyone this month. Treat warehouse copies as the extra leg
 the irreplaceable core earns — never as the primary line, and never as a
 reason to retire a tape.
+
+**You cannot read it today.** A tape is slow; a deep-archive object is
+*unavailable* until you ask for it and wait hours (12 for standard retrieval,
+up to 48 for bulk). If someone needs a file back this afternoon, a warehouse
+copy cannot give it to them and a cartridge can. Budget the wait into any
+recovery plan that starts from the warehouse, and thaw only the slices the
+manifest says you need — see "Getting the bytes back" above.
+
+> **Heir Kit obligation (issue #69).** The two caveats above — the billing
+> fragility and the retrieval wait — are exactly what the printed Heir Kit
+> must say, because an heir will meet this copy with no context at all. #69
+> is deferred for its physical step, so the text lives here for now; when the
+> kit is built, it carries these two warnings and the "Getting the bytes
+> back" procedure verbatim.
 
 **A deposit stops counting when its source volume does.** Deposits are gated
 on the source volume still being `sealed`, so quarantining or retiring the
