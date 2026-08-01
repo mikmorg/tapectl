@@ -184,8 +184,34 @@ the normative design set named in the Policy block below.
   Not covered, stated rather than implied: the genuinely-corrupt multi-row
   integrity path needs a real damaged file the ungated suite cannot
   synthesize portably.
-  **#105** (policy resolver silent
-  fallback), **#106** (fire-risk global threshold), **#107**
+  ~~**#105**~~ — **LANDED f41c339, closed 2026-08-01. CI green, 715 ungated
+  tests (was 712). No gate — only `src/policy/mod.rs` touched.** Every layer
+  of `policy::resolve` now propagates instead of falling through to the
+  weaker system defaults. Four things to keep:
+  - **THREE sites, not the two the issue names.** `required_locations` was
+    `if let Ok(arr) = serde_json::from_str(..)`, so corrupt JSON yielded an
+    EMPTY vec — "no locations required" — the same downgrade in a third
+    place. Checked all three writers first: each stores a `serde_json`
+    array or NULL, so a non-NULL unparseable value is only ever corruption.
+    Had any writer been able to store `''`, propagating would have newly
+    failed healthy units.
+  - **The absent dotfile MUST stay silent.** `dotfile_path.exists()` is the
+    whole absent-vs-present split (#92: absent = defer upward). A test pins
+    it, because conflating the two makes every unit without a dotfile fail.
+    TOCTOU (present at the check, gone at the read) deliberately errors.
+  - **A dangling `archive_set_id` is MAPPED, not propagated raw** — bare
+    "Query returned no rows" reaching an operator through `audit`'s message
+    is unactionable, so the error names the unit and the id.
+  - **A pre-existing test asserted the defect as intended behavior.** Its
+    own comment showed the real intent was panic-safety, which `Err`
+    satisfies as well as `Ok` — so the assertion was TIGHTENED, not the
+    behavior loosened. Worth expecting more of these: a silent-fallback
+    fix will often collide with a test that pinned the fallback.
+  Residual filed as **#114** (`audit`'s `policy_unresolvable` action line
+  always blames the dotfile; now often wrong). Deliberately NOT folded in —
+  the honest fix needs a policy-source discriminant on the error, and the
+  cheap alternative trades wrong advice for vague advice.
+  **#106** (fire-risk global threshold), **#107**
   (`tape_alerts` — gate, migration 009), **#108** (staging-clean permanent
   orphan — gate), **#109** (`--home`/`--config` — looks gate-free, is NOT:
   the gate script depends on the hijack), **#110** (grouped one-liners),
