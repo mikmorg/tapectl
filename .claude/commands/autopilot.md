@@ -161,7 +161,30 @@ the normative design set named in the Policy block below.
   note the assertion's own remedy text ("retune the sleep") is stale;
   there is no sleep any more. If the gate reds on `resume_bot`, check
   #113 before assuming your change caused it — but never just re-run
-  until green. **#104** (`db fsck`), **#105** (policy resolver silent
+  until green.
+  ~~**#104**~~ — **LANDED e1def28, closed 2026-08-01. CI green, 712 ungated
+  tests (was 704). No gate — no tape-path file touched.** `db fsck` now
+  collects every `PRAGMA integrity_check` row, shares one transaction across
+  both `--repair` DELETEs, and logs a `system`/0/`db_fsck_repair` event
+  **inside** that transaction. Three things to keep:
+  - **The clean-case predicate is `len()==1 && [0]=="ok"`.** A healthy
+    SQLite DB returns exactly one row reading `ok`, never zero — so
+    `integrity_ok` must not be derived from emptiness, from
+    `contains("ok")`, or from "first row is ok" (which *was* the bug).
+    Fixing the loop and leaving that test naive only relocates it.
+  - **`db::open*` sets `PRAGMA foreign_keys = ON`, so orphans of this shape
+    can no longer be created through tapectl at all.** The orphan checks
+    serve older, hand-edited, or partially-restored databases. The fixture
+    drops the pragma only to insert, then restores it so the repair runs
+    under production FK semantics — don't "simplify" that away.
+  - **`FsckReport::repaired` counts deleted ROWS, not categories.** Nothing
+    reads it (`fsck_exit_code` does not); it renders as `repaired=N`, where
+    a category count is meaningless. The fixture is deliberately asymmetric
+    (2 writes + 1 slice) so the two cannot be confused.
+  Not covered, stated rather than implied: the genuinely-corrupt multi-row
+  integrity path needs a real damaged file the ungated suite cannot
+  synthesize portably.
+  **#105** (policy resolver silent
   fallback), **#106** (fire-risk global threshold), **#107**
   (`tape_alerts` — gate, migration 009), **#108** (staging-clean permanent
   orphan — gate), **#109** (`--home`/`--config` — looks gate-free, is NOT:
