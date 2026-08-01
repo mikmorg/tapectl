@@ -186,7 +186,9 @@ pub struct Volume {
     pub has_manifest: bool,
     pub location_id: Option<i64>,
     pub status: String,
-    pub storage_class: Option<String>,
+    // `storage_class` was dropped in migration 008 (issue #101): dead since
+    // 001, and a cartridge has a `media_type`, not a storage class. The
+    // storage class of a *warehouse deposit* lives on `VolumeDeposit`.
     pub first_write: Option<String>,
     pub last_write: Option<String>,
     pub notes: Option<String>,

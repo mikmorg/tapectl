@@ -1,0 +1,29 @@
+-- 008: drop the dead `volumes.storage_class` column (issue #101).
+--
+-- The column has existed since `001_initial.sql:242` (re-declared through the
+-- 003 rebuild) and has NEVER held a value: nothing writes it, nothing reads it,
+-- and no CLI flag sets it. `docs/design-errata.md` row 32 predicted it would
+-- "become meaningful with #73". It did not, and that prediction is corrected in
+-- the same commit as this migration.
+--
+-- WHY IT DID NOT BECOME MEANINGFUL, AND WHY IT GOES RATHER THAN STAYING
+-- --------------------------------------------------------------------
+-- #73 put the storage class where the fact actually lives:
+-- `volume_deposits.storage_class`. A *deposit* is placed in DEEP_ARCHIVE or an
+-- instant-access class; an LTO cartridge is not placed in a storage class at
+-- all — it has a media type (`LTO-6`), which `volumes.media_type` already
+-- records. So the two columns were never the same fact wearing one name.
+--
+-- Leaving it would have been cheaper, and was considered. It was rejected
+-- because after #73 the dead column has a same-named sibling meaning something
+-- different, and the next reader will reasonably assume they are the same
+-- field and wire to the wrong one. A column that has never held a value costs
+-- nothing to remove and everything to misread.
+--
+-- Plain DROP COLUMN suffices — no 003-style table rebuild. SQLite refuses
+-- DROP COLUMN only for a column named in an index, view, trigger, CHECK or
+-- generated column; `storage_class` is in none (the `volumes` CHECK covers
+-- `status`, and `idx_volumes_location`/`idx_volumes_status` cover other
+-- columns). Verified against the real migration runner, not assumed.
+
+ALTER TABLE volumes DROP COLUMN storage_class;

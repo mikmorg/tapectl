@@ -102,6 +102,11 @@ fn migrations() -> Migrations<'static> {
         // not a change of the cartridge's location. See the migration header for
         // why it is not a volume_locations join table.
         M::up(include_str!("migrations/007_warehouse_locations.sql")),
+        // 008 drops volumes.storage_class (issue #101): dead since 001, and
+        // after 007 it collides by name with volume_deposits.storage_class,
+        // which means something different. A cartridge has a media_type, not a
+        // storage class. See the migration header.
+        M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
     ])
 }
 
