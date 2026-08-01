@@ -400,6 +400,37 @@ RLABEL3="MHVTLR3"   # arm 3: hard-killed — startup sweep then resume
 # So each arm names the condition it needs and we wait for it. The binary is
 # invoked directly rather than through TCTL() so $! is the tapectl process
 # itself and not a wrapping subshell that would swallow the signal.
+# Issue #113: the beginning-of-tape arm cannot be reached by POLLING. Its
+# condition — session planned, zero entries confirmed — is a moment, not a
+# state: `writes.status='in_progress'` is already true at plan(), so by the
+# time a poller sees it and delivers a signal, entry 0 may already be
+# confirmed. That arm reddened ~1 run in 3.
+#
+# Instead of guessing at the timing, we make the writer PARK there:
+# TAPECTL_TEST_PAUSE_AFTER_PLAN names a marker path, execute() stops at
+# exactly that state and creates the file, and we wait for the file to exist
+# — a fact, not a race — before signalling. No sleeps, no tuning.
+interrupt_write_parked() { # interrupt_write_parked <label> [signal=INT]
+    local label="$1" sig="${2:-INT}" pid start waited marker
+    marker="$RUN/parked-$label"
+    rm -f "$marker"
+    start=$SECONDS
+    TAPECTL_TEST_PAUSE_AFTER_PLAN="$marker" \
+        "$BIN" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        [ -e "$marker" ] && break
+        if [ $(( SECONDS - start )) -ge 120 ]; then
+            echo "interrupt_write_parked: TIMEOUT waiting for the park marker"; break
+        fi
+        sleep 0.1
+    done
+    waited=$(( SECONDS - start ))
+    kill -"$sig" "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    echo "interrupt_write_parked: label=$label sig=$sig waited=${waited}s (parked at BOT)"
+}
+
 interrupt_write() { # interrupt_write <label> <sql-ready> <what> [signal=INT]
     local label="$1" ready_sql="$2" what="$3" sig="${4:-INT}" pid start waited
     start=$SECONDS
@@ -439,7 +470,9 @@ status = c.execute("SELECT status FROM volumes WHERE label=?", (label,)).fetchon
 assert status != 'sealed', (
     f"{label}: volume is already 'sealed' — the write COMPLETED before the SIGINT "
     f"landed, so nothing was resumed and this leg proved nothing. "
-    f"Remedy: raise the sleep in interrupt_write, or enlarge the fixture payload.")
+    f"Remedy: for the BOT arm, the park hook (TAPECTL_TEST_PAUSE_AFTER_PLAN) did not "
+    f"engage; for the others, wait on a later DB precondition or enlarge the fixture "
+    f"payload. There is no sleep to raise (issue #113).")
 rows = c.execute(
     """SELECT w.status, COUNT(*) FROM writes w
        JOIN volumes v ON v.id = w.volume_id WHERE v.label=? GROUP BY w.status""",
@@ -457,7 +490,12 @@ written = c.execute(
        WHERE v.label=? AND wp.status='written'""", (label,)).fetchone()[0]
 assert lo <= written <= hi, (
     f"{label}: expected between {lo} and {hi} confirmed-written positions for this "
-    f"arm, got {written}. Retune the sleep in interrupt_write.")
+    f"arm, got {written}. There is no sleep to retune (issue #113): the BOT arm parks "
+    f"the writer via TAPECTL_TEST_PAUSE_AFTER_PLAN and the others wait on a DB "
+    f"precondition. A BOT failure here means the park hook did not engage — check that "
+    f"the env var reached the process and that run_entries still honours it. Do NOT "
+    f"widen this bound to 0..1: that makes this arm a duplicate of resume_midwrite and "
+    f"deletes the beginning-of-tape case.")
 print(f"{label}: interrupted cleanly, writes={by}, confirmed-written positions={written}")
 PY
 }
@@ -483,10 +521,7 @@ PY
 step_resume_bot() {
     mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase \
     && TCTL volume init "$RLABEL1" --device "$TAPE_DEV" \
-    && interrupt_write "$RLABEL1" \
-        "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id=w.volume_id
-         WHERE v.label='$RLABEL1' AND w.status='in_progress'" \
-        "the session to start writing (no slice confirmed yet)" \
+    && interrupt_write_parked "$RLABEL1" \
     && assert_interrupted "$RLABEL1" 0 0 \
     && TCTL volume resume "$RLABEL1" --device "$TAPE_DEV" \
     && assert_sealed "$RLABEL1"

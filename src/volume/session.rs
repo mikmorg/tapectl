@@ -474,6 +474,7 @@ impl PlannedSession {
             self.slice_write_id,
             0,
             &mut is_interrupted,
+            park_marker_from_env(),
         )
     }
 }
@@ -791,7 +792,11 @@ impl InterruptedSession {
             self.write_ids,
             self.slice_write_id,
             start_index,
+            // A resume never parks: `start_index` is non-zero on any real
+            // resume, and the hook is scoped to the fresh beginning-of-tape
+            // execute it exists to make reachable.
             &mut is_interrupted,
+            park_marker_from_env(),
         )?;
         Ok(outcome.into())
     }
@@ -1048,6 +1053,24 @@ impl SealedPending {
 /// but not called, since the public `execute_checking`/`resume_checking`
 /// signatures are already the final ones the four behaviors need).
 #[allow(clippy::too_many_arguments)]
+/// The ONE place the park hook's environment variable is read (issue #113).
+///
+/// Deliberately a boundary function rather than a lookup inside `run_entries`:
+/// environment variables are process-global, so an in-process test that set
+/// one would leak into every other test running in parallel in the same
+/// binary — reintroducing exactly the nondeterminism #113 exists to remove.
+/// With the marker passed in as a parameter, the hook is testable by passing
+/// `Some(path)` and no test ever touches the environment.
+fn park_marker_from_env() -> Option<String> {
+    std::env::var("TAPECTL_TEST_PAUSE_AFTER_PLAN").ok()
+}
+
+// Nine parameters, one over clippy's threshold. Grouping them into a struct
+// would be churn for its own sake: this is a private function with exactly
+// two call sites, and every argument is already a distinct piece of session
+// state that the typestate deliberately keeps separate. Same allow the audit
+// trail's `log_event` carries for the same reason.
+#[allow(clippy::too_many_arguments)]
 fn run_entries(
     conn: &Connection,
     store: &mut dyn Store,
@@ -1057,6 +1080,7 @@ fn run_entries(
     slice_write_id: HashMap<i64, i64>,
     start_index: usize,
     is_interrupted: &mut dyn FnMut() -> bool,
+    park_marker: Option<String>,
 ) -> Result<ExecuteOutcome> {
     let content_entries: Vec<&LayoutEntry> = built
         .layout
@@ -1064,6 +1088,70 @@ fn run_entries(
         .iter()
         .filter(|e| !matches!(e.kind, ZoneKind::SealMarker))
         .collect();
+
+    // Issue #113: the beginning-of-tape resume arm of the mhvtl gate used to
+    // race. It waited on `writes.status='in_progress'` — true from `plan()`,
+    // BEFORE any entry is confirmed — and then signalled, so the writer could
+    // confirm entry 0 inside the signal-delivery window and break the arm's
+    // "zero confirmed" assertion. It reds roughly 1 run in 3.
+    //
+    // That is structural, not tuning: "in_progress with zero confirmed" is a
+    // MOMENT, not a state a poller can latch onto. Widening the bound to 0..1
+    // was rejected — it turns the BOT arm into a duplicate of the midwrite arm
+    // and deletes the beginning-of-tape case entirely. So the race is removed
+    // at its source: when this variable names a path, execute parks HERE, at
+    // exactly the BOT state, and announces it by creating that file. The gate
+    // waits for the file (a fact, not a timing guess), then signals.
+    //
+    // The park loop reuses `is_interrupted` rather than inventing a second
+    // mechanism, so the wake-up path is the very code the arm exists to test.
+    // Three safety properties, all deliberate:
+    //   - unset variable => not one branch taken, zero production behavior
+    //     change (this is a runtime check because `#[cfg(test)]` does not
+    //     reach integration binaries — the #87 finding);
+    //   - it warns LOUDLY, so it can never be doing this silently on a real
+    //     tape;
+    //   - it TIMES OUT back into the normal write rather than parking
+    //     forever, so a gate that never signals fails on its assertion with a
+    //     sealed volume instead of hanging the suite.
+    if start_index == 0 {
+        if let Some(marker) = park_marker {
+            tracing::warn!(
+                marker = %marker,
+                "TAPECTL_TEST_PAUSE_AFTER_PLAN is set — parking after plan() with no \
+                 entry written, waiting to be interrupted. This is a TEST hook; it must \
+                 never be set for a real write."
+            );
+            std::fs::write(&marker, "parked\n").map_err(|e| {
+                TapectlError::Other(format!(
+                    "TAPECTL_TEST_PAUSE_AFTER_PLAN: cannot create readiness marker {marker}: {e}"
+                ))
+            })?;
+
+            let parked_at = std::time::Instant::now();
+            let limit = std::time::Duration::from_secs(120);
+            while !is_interrupted() {
+                if parked_at.elapsed() >= limit {
+                    tracing::warn!(
+                        "TAPECTL_TEST_PAUSE_AFTER_PLAN: no interrupt within 120s — \
+                         proceeding with a normal write so the caller fails on its own \
+                         assertion rather than hanging"
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if is_interrupted() {
+                mark_writes(conn, &write_ids, "interrupted")?;
+                return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
+                    built,
+                    volume_id,
+                    write_ids,
+                    slice_write_id,
+                }));
+            }
+        }
+    }
 
     for entry in &content_entries[start_index..] {
         // Checked BETWEEN entries only — a mid-file kill is a crash, handled
@@ -1226,6 +1314,7 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tempfile::TempDir;
 
     const BS: u64 = 512 * 1024;
 
@@ -2417,5 +2506,112 @@ mod tests {
         let mut store = MemStore::new(BS as usize);
         let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(5));
         assert_eq!(outcome, ContactOutcome::Blank);
+    }
+
+    // --- issue #113: the beginning-of-tape park hook ---------------------
+
+    /// The property the mhvtl gate's BOT arm depends on: with a park marker
+    /// supplied, `execute` stops at exactly the beginning-of-tape state —
+    /// session planned, **nothing written** — announces itself by creating
+    /// the marker, and comes back `Interrupted`.
+    ///
+    /// Deterministic with no sleeps and no threads: `is_interrupted` is
+    /// `|| marker.exists()`, and the hook itself creates that file, so the
+    /// park loop observes the interrupt on its very first poll. That is the
+    /// same ordering the gate produces with a real signal, minus the race.
+    #[test]
+    fn park_hook_stops_at_bot_with_nothing_written_and_reports_interrupted() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("parked");
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        let marker_for_check = marker.clone();
+        let outcome = run_entries(
+            &f.conn,
+            &mut store,
+            planned.built,
+            planned.volume_id,
+            planned.write_ids,
+            planned.slice_write_id,
+            0,
+            &mut || marker_for_check.exists(),
+            Some(marker.to_string_lossy().into_owned()),
+        )
+        .expect("a parked execute must not error");
+
+        assert!(
+            matches!(outcome, ExecuteOutcome::Interrupted(_)),
+            "the park hook must yield Interrupted, not Ready"
+        );
+        assert!(
+            marker.exists(),
+            "the hook must announce readiness by creating the marker — the gate \
+             waits on this file instead of guessing at timing"
+        );
+
+        // The whole point of the BOT arm: zero entries confirmed. If the hook
+        // let even one through, the arm becomes a duplicate of resume_midwrite.
+        let written: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions WHERE status = 'written'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            written, 0,
+            "parking after plan() must confirm NOTHING; got {written} written positions"
+        );
+    }
+
+    /// The production-safety guarantee: with no marker supplied — which is
+    /// what `park_marker_from_env()` returns whenever the variable is unset —
+    /// not one branch of the hook is taken and the write proceeds normally.
+    /// This is the assertion that keeps a test hook on the production write
+    /// path defensible.
+    #[test]
+    fn without_a_park_marker_the_hook_is_entirely_inert() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        let outcome = run_entries(
+            &f.conn,
+            &mut store,
+            planned.built,
+            planned.volume_id,
+            planned.write_ids,
+            planned.slice_write_id,
+            0,
+            &mut || false,
+            None,
+        )
+        .expect("execute should not error");
+
+        assert!(
+            matches!(outcome, ExecuteOutcome::Ready(_)),
+            "with no park marker the session must run to Ready exactly as before"
+        );
+    }
+
+    /// `park_marker_from_env` is the single boundary where the variable is
+    /// read (never inside `run_entries`), so that no test has to mutate
+    /// process-global environment state to exercise the hook — doing so
+    /// would leak into every other test running in parallel in this binary,
+    /// which is the very nondeterminism #113 removes.
+    #[test]
+    fn park_marker_is_absent_by_default() {
+        assert!(
+            park_marker_from_env().is_none(),
+            "TAPECTL_TEST_PAUSE_AFTER_PLAN must not be set in the test environment; \
+             if this fails, something is exporting it and every write is parking"
+        );
     }
 }
