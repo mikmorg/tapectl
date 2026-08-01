@@ -104,6 +104,13 @@ pub fn volume_init(
     block_size: usize,
     force: bool,
 ) -> Result<i64> {
+    // Creation-time label validation (issue #103). A label reaches the
+    // filesystem too: `volume_read_slices` below joins
+    // `{staging}/clone-{from_label}-{unit_name}`. Same defect, third entry
+    // point — this codebase's recurring lesson is that one of these is never
+    // the only one.
+    crate::naming::validate_volume_label(label)?;
+
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM volumes WHERE label = ?1",

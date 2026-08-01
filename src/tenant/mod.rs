@@ -13,6 +13,11 @@ pub fn add_tenant(
     description: Option<&str>,
     is_operator: bool,
 ) -> Result<i64> {
+    // Creation-time name validation (issue #103). This one matters most:
+    // the name becomes part of a key FILENAME via `keys::key_paths`, so an
+    // unvalidated name can put a private key outside `keys/`.
+    crate::naming::validate_tenant_name(name)?;
+
     // Check for duplicate
     if queries::get_tenant_by_name(conn, name)?.is_some() {
         return Err(TapectlError::TenantAlreadyExists(name.to_string()));
@@ -105,4 +110,66 @@ pub fn delete_tenant(conn: &Connection, name: &str) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wiring tests for issue #103. `naming.rs` proves the *rule*; these
+    //! prove `add_tenant` actually applies it — and, more importantly, that
+    //! rejection happens BEFORE any key material touches the disk. A
+    //! validator that runs after `generate_and_save` would pass every unit
+    //! test in `naming.rs` while still writing the private key it exists to
+    //! keep inside `keys/`.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fixture() -> (Connection, TempDir, TapectlPaths) {
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open_memory().unwrap();
+        (conn, tmp, paths)
+    }
+
+    #[test]
+    fn a_traversing_tenant_name_is_rejected_and_writes_no_key_anywhere() {
+        let (conn, tmp, paths) = fixture();
+
+        let err = add_tenant(&conn, &paths, "../../escaped", None, false)
+            .expect_err("a tenant name containing .. must be refused");
+        assert!(err.to_string().contains("invalid tenant name"), "{err}");
+
+        // The whole point: nothing was written, inside keys/ or out of it.
+        let stray: Vec<_> = walkdir::WalkDir::new(tmp.path())
+            .into_iter()
+            .flatten()
+            .filter(|e| {
+                e.file_type().is_file()
+                    && e.path()
+                        .extension()
+                        .is_some_and(|x| x == "key" || x == "pub")
+            })
+            .map(|e| e.path().display().to_string())
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "key material was written despite the name being rejected: {stray:?}"
+        );
+
+        // ...and no row was inserted either.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a rejected tenant must leave no row behind");
+    }
+
+    #[test]
+    fn an_ordinary_tenant_name_still_works_end_to_end() {
+        let (conn, _tmp, paths) = fixture();
+        add_tenant(&conn, &paths, "alice", Some("test"), false)
+            .expect("a normal name must still be accepted");
+        let (pub_path, key_path) =
+            crate::crypto::keys::key_paths(&paths.keys_dir, "alice", "primary");
+        assert!(pub_path.exists() && key_path.exists());
+    }
 }

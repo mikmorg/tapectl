@@ -56,6 +56,13 @@ pub fn init_unit(
         auto_name_from_path(&abs_str)
     };
 
+    // Creation-time name validation (issue #103). Covers the derived name
+    // too, not just `--name`: `auto_name_from_path` takes its segments from
+    // a real directory path, which can legitimately contain characters that
+    // have no business in an identifier this codebase interpolates into
+    // staging paths.
+    crate::naming::validate_unit_name(&unit_name)?;
+
     // Check name uniqueness
     if queries::get_unit_by_name(conn, &unit_name)?.is_some() {
         return Err(TapectlError::UnitAlreadyExists(unit_name));
@@ -141,6 +148,12 @@ pub fn init_bulk(
 pub fn rename_unit(conn: &Connection, current_name: &str, new_name: &str) -> Result<()> {
     let unit = queries::get_unit_by_name(conn, current_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(current_name.to_string()))?;
+
+    // A rename CHOOSES a name, so it validates (issue #103). Note only the
+    // NEW name is checked — `current_name` is looked up, never validated, so
+    // a unit registered before this rule existed can still be renamed *out*
+    // of a name this rule would now reject. That asymmetry is the point.
+    crate::naming::validate_unit_name(new_name)?;
 
     // Check new name doesn't conflict
     if queries::get_unit_by_name(conn, new_name)?.is_some() {
