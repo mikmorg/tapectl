@@ -120,10 +120,24 @@ the normative design set named in the Policy block below.
     corrected in the same commit. Note **migration 008 is now taken** —
     #107 (`tape_alerts`) is 009.
   **PHASE 4 = the decomposed backlog, severity then value:**
-  **#102** (restore leaves decrypted plaintext in the destination on any
-  mid-restore failure — gate), **#103** (unvalidated tenant/unit names
-  interpolated into key paths — gate; needs a grandfather-vs-migrate
-  decision first), **#104** (`db fsck`), **#105** (policy resolver silent
+  ~~**#102**~~ — **LANDED 57d731e, closed 2026-08-01. Gate GREEN 26/26, CI
+  green, 704 tests (was 694).** `RestoreScratch` RAII guard removes
+  `.tapectl-restore-tmp` on every path out of `restore_unit`. Keep three
+  things: it is **not** `tempfile::tempdir()` on purpose (the scratch dir
+  must sit under the destination — dar extracts from it, and a slice set
+  can be hundreds of GB, so a tmpfs `/tmp` is the wrong home);
+  removal failure **warns naming the path and does not escalate** (the
+  operator must know plaintext remains, but a cleanup error must not mask
+  the original failure, and `Drop` cannot return one); and the **wiring
+  test** is the one that matters — deleting only the `let _scratch = ...`
+  binding fails exactly that test and none of the three guard tests. The
+  mhvtl gate does NOT cover this path: its restore legs use fresh
+  destinations and succeed, so they never fail partway.
+  **#103** (unvalidated tenant/unit names
+  interpolated into key paths — gate). **Its "grandfather-vs-migrate"
+  question is NOT a CTO call**: validate at CREATION time only (`tenant
+  add`, `unit init`), never at load time, and existing installs are
+  untouched by construction. Take that and record the reasoning. **#104** (`db fsck`), **#105** (policy resolver silent
   fallback), **#106** (fire-risk global threshold), **#107**
   (`tape_alerts` — gate, migration 009), **#108** (staging-clean permanent
   orphan — gate), **#109** (`--home`/`--config` — looks gate-free, is NOT:
