@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{Config, TapectlPaths};
 use crate::crypto::keys;
@@ -12,6 +12,48 @@ use crate::db::queries;
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
 use crate::util::{HashingWriter, TruncatingWriter};
+
+/// Removes the restore scratch directory when it goes out of scope, on every
+/// path out of [`restore_unit`] — success, `?`, panic (issue #102).
+///
+/// The scratch directory holds **decrypted** dar slices. Before this guard,
+/// cleanup lived at the end of the happy path only, so any failure between
+/// creating the directory and finishing the extract — a checksum mismatch, a
+/// dar error, a full disk, a missing key, a tape read error — left plaintext
+/// archive content sitting in the destination directory the operator chose,
+/// with nothing said about it. Everywhere else in this tool plaintext exists
+/// only transiently inside staging; this was the one place it could be left
+/// behind outside it, and it was on the failure path.
+///
+/// The directory deliberately lives *under the destination* rather than in
+/// `std::env::temp_dir()`: dar extracts from it into the destination, and a
+/// slice set can be hundreds of gigabytes, so a system temp dir on a small
+/// tmpfs (or a different filesystem) is the wrong home for it. That is why
+/// this is a hand-written guard and not `tempfile::tempdir()` — `restore_file`
+/// uses `tempfile` correctly for a *different* directory, one it wants placed
+/// by the system.
+///
+/// A removal failure is reported at `warn!` naming the path, never swallowed
+/// and never escalated: the operator needs to know plaintext remains, but a
+/// cleanup error must not mask the original failure that triggered it — and
+/// `Drop` cannot return one anyway.
+struct RestoreScratch(PathBuf);
+
+impl Drop for RestoreScratch {
+    fn drop(&mut self) {
+        if !self.0.exists() {
+            return;
+        }
+        if let Err(e) = fs::remove_dir_all(&self.0) {
+            warn!(
+                path = %self.0.display(),
+                error = %e,
+                "could not remove the restore scratch directory — it may still \
+                 contain DECRYPTED archive slices; remove it by hand",
+            );
+        }
+    }
+}
 
 /// Restore a unit from a volume to a destination directory.
 // 9 args reflects the CLI's flat shape (unit/volume/dest/device/block_size/
@@ -58,9 +100,11 @@ pub fn restore_unit(
         });
     }
 
-    // Create temp dir for decrypted slices
+    // Scratch dir for decrypted slices. The guard removes it on EVERY path
+    // out of this function, not just the happy one — see `RestoreScratch`.
     let restore_tmp = Path::new(dest_dir).join(".tapectl-restore-tmp");
     fs::create_dir_all(&restore_tmp)?;
+    let _scratch = RestoreScratch(restore_tmp.clone());
 
     // Load all secret keys for trial-decryption (tenant + operator)
     let mut identities = keys::load_all_identities(&paths.keys_dir, &tenant.name)?;
@@ -118,17 +162,11 @@ pub fn restore_unit(
     info!("extracting dar archive to {dest_dir}");
     dar::restore::extract(&config.dar.binary, &archive_base, Path::new(dest_dir))?;
 
-    // Clean up temp files
-    for path in &dar_slices {
-        let _ = fs::remove_file(path);
-    }
-    // Remove hash files too
-    if let Ok(entries) = fs::read_dir(&restore_tmp) {
-        for entry in entries.flatten() {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-    let _ = fs::remove_dir(&restore_tmp);
+    // No explicit cleanup here on purpose: `_scratch` removes the whole
+    // directory on the way out. The hand-rolled version this replaces walked
+    // `dar_slices`, then swept the directory for hash files, then removed the
+    // directory — three steps that only ran if every `?` above succeeded.
+    drop(dar_slices);
 
     info!(unit = unit_name, volume = volume_label, "restore complete");
 
@@ -463,6 +501,163 @@ mod tests {
         };
 
         (store, wp)
+    }
+
+    // --- RestoreScratch (issue #102) -------------------------------------
+
+    /// The guard's whole point: the directory goes away when the scope does,
+    /// with no explicit cleanup call anywhere.
+    #[test]
+    fn scratch_dir_is_removed_when_the_guard_drops() {
+        let tmp = TempDir::new().unwrap();
+        let scratch = tmp.path().join(".tapectl-restore-tmp");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("restore.1.dar"), b"decrypted archive bytes").unwrap();
+
+        {
+            let _guard = RestoreScratch(scratch.clone());
+            assert!(scratch.exists());
+        }
+
+        assert!(
+            !scratch.exists(),
+            "the scratch directory outlived its guard, so decrypted slices \
+             would be left in the operator's destination"
+        );
+    }
+
+    /// The case that motivated the issue: an error propagating out of the
+    /// scope with `?` must still clean up. A guard that only cleaned on the
+    /// happy path would pass the test above and fail this one.
+    #[test]
+    fn scratch_dir_is_removed_when_the_scope_exits_via_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let scratch = tmp.path().join(".tapectl-restore-tmp");
+
+        fn fails_after_creating(scratch: &Path) -> Result<()> {
+            fs::create_dir_all(scratch)?;
+            let _guard = RestoreScratch(scratch.to_path_buf());
+            fs::write(scratch.join("restore.1.dar"), b"decrypted archive bytes")?;
+            Err(TapectlError::Other("checksum mismatch".into()))
+        }
+
+        assert!(fails_after_creating(&scratch).is_err());
+        assert!(
+            !scratch.exists(),
+            "a failure mid-restore left decrypted slices behind"
+        );
+    }
+
+    /// Removal failure must not panic and must not mask the original error —
+    /// `Drop` cannot report one, so it warns and moves on. Simulated by
+    /// pointing the guard at a path that no longer exists, which is also the
+    /// real double-cleanup case (`restore_file`'s outer `TempDir` can remove
+    /// the tree first).
+    #[test]
+    fn a_missing_scratch_dir_is_not_an_error_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        drop(RestoreScratch(tmp.path().join("never-created")));
+    }
+
+    /// **Wiring test.** The three above prove the guard; this proves
+    /// `restore_unit` actually uses it. Without it, all three still pass
+    /// while the scratch directory leaks — the exact "test the wiring, not
+    /// just the pure function" trap this repo has hit before.
+    ///
+    /// Drives a REAL failure through `restore_unit`: the fixture has a unit,
+    /// a volume and a write position (so the function gets past its early
+    /// returns and creates the scratch dir), but the keys directory is empty,
+    /// so identity loading fails immediately afterwards. No tape needed.
+    #[test]
+    fn restore_unit_leaves_no_scratch_dir_when_it_fails_partway() {
+        let home = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().join(".tapectl"));
+        paths.ensure_dirs().unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'photos', ?1, 'mtime_size', 1, 'active')",
+            [tid],
+        )
+        .unwrap();
+        let uid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/tmp')",
+            [uid],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             VALUES (?1, 'staged', 104857600)",
+            [snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                       encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (?1, 1, 1000, 1100, 'abc123', 'def456')",
+            [ss_id],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let vol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss_id, snap_id, vol_id],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             VALUES (?1, ?2, '8', 'written')",
+            params![write_id, slice_id],
+        )
+        .unwrap();
+
+        let dest_str = dest.path().to_string_lossy().to_string();
+        let result = restore_unit(
+            &conn,
+            &paths,
+            &Config::default(),
+            "photos",
+            "L6-0001",
+            &dest_str,
+            "/dev/null",
+            524288,
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "fixture is supposed to fail (no keys) — if this ever succeeds the \
+             test is no longer exercising the failure path"
+        );
+        let scratch = dest.path().join(".tapectl-restore-tmp");
+        assert!(
+            !scratch.exists(),
+            "restore_unit failed and left {} behind — that directory holds \
+             DECRYPTED archive slices in the operator's destination",
+            scratch.display()
+        );
     }
 
     // --- restore_one_slice (the 4 required scenarios) --------------------
