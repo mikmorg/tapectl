@@ -1,13 +1,13 @@
 # Handoff: what autopilot finishes, and what only you can do
 
-Written 2026-08-01, master at `5d99c48`. This document exists so that the
+Written 2026-08-01; updated 2026-08-02, master at `d0c8503`. This document exists so that the
 autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **ten software issues and one hardware measurement harness
-are agent work. Three things are irreducibly yours** — the Heir Kit ceremony,
-the LTO-6 session on real media, and the first production write.
+The short version: **nine software issues and one hardware measurement harness
+remain agent work. Three things are irreducibly yours** — the Heir Kit
+ceremony, the LTO-6 session on real media, and the first production write.
 
 ## Where the project actually stands
 
@@ -16,9 +16,10 @@ the LTO-6 session on real media, and the first production write.
   zero slack, so any gate failure is a hard stop rather than a known-defect
   pin. Verified across five consecutive runs on 2026-08-01 when the last
   nondeterminism (#113) was removed.
-- 718 ungated tests; CI green; `cargo fmt`/`clippy -D warnings` clean.
-- Every phase-1, phase-2 and phase-3 issue is closed. What remains is one
-  `severity:high` (#69), nine `severity:low` issues, and the wayfinder map.
+- 729 ungated tests; CI green; `cargo fmt`/`clippy -D warnings` clean.
+- **Every issue of every severity above `low` is now closed** (#69, the last
+  `severity:high`, landed 2026-08-02). What remains is nine `severity:low`
+  issues and the wayfinder map.
 
 One correction to `CLAUDE.md`, which is stale on this point:
 `docs/lto6-validation-checklist.md` is **not** a "procedure stub". It is 143
@@ -27,11 +28,11 @@ fidelity gap. Read it before the hardware session; it is usable as-is.
 
 ## Tier A — pure software, no human needed
 
-Taken in severity order. #69 is first because it is the only open high.
+Taken in severity order. All that remain are lows.
 
 | Issue | What it is |
 |---|---|
-| **#69** | `key escrow-kit` — the Heir Kit generator. Contents ratified in ADR-0009. |
+| ~~#69~~ | **DONE (`d0c8503`).** `key escrow-kit` ships; `audit` reports kit staleness. Only the ceremony remains, under Tier C. |
 | #114 | `audit`'s `policy_unresolvable` action line always blames the dotfile; now often wrong. Needs a policy-source discriminant on the error. |
 | #112 | Move four inlined command bodies out of `main.rs` into `src/cli/`. |
 | #111 | Test-harness hygiene: hardcoded roots and devices. |
@@ -75,7 +76,9 @@ restore end to end, so a synthetic rehearsal would mostly re-prove that.
 
 ### 1. The Heir Kit ceremony (the remainder of #69)
 
-Autopilot builds the command and stops at the generated artifacts. Yours:
+**The command shipped in `d0c8503`** — run
+`tapectl key escrow-kit --out <dir>`, which writes `COVER.txt`,
+`escrow-kit.html` and `catalog.db.age` and then stops. Yours:
 
 - print `COVER.txt` (and/or the HTML page) — the `.txt` is the artifact with
   the decades-scale claim, readable with `cat` when no browser exists;
