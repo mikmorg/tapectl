@@ -526,12 +526,12 @@ copy cannot give it to them and a cartridge can. Budget the wait into any
 recovery plan that starts from the warehouse, and thaw only the slices the
 manifest says you need — see "Getting the bytes back" above.
 
-> **Heir Kit obligation (issue #69).** The two caveats above — the billing
-> fragility and the retrieval wait — are exactly what the printed Heir Kit
-> must say, because an heir will meet this copy with no context at all. #69
-> is deferred for its physical step, so the text lives here for now; when the
-> kit is built, it carries these two warnings and the "Getting the bytes
-> back" procedure verbatim.
+> **Carried by the Heir Kit (issue #69, discharged).** The two caveats above
+> — the billing fragility and the retrieval wait — are exactly what an heir
+> needs, because they will meet this copy with no context at all. The printed
+> cover sheet now says both, in plain language, and only when the catalog
+> actually records a deposit (a tape-only archive gets no cloud paragraph).
+> See "The Heir Kit" below.
 
 **A deposit stops counting when its source volume does.** Deposits are gated
 on the source volume still being `sealed`, so quarantining or retiring the
@@ -684,15 +684,43 @@ tapectl key list --tenant <name>              # find the aliases, then
 tapectl key export <alias>                    # public half, for the record
 ```
 
-> **Heir Kit — pending #69.** The design calls for a printed Heir Kit (key
-> material in tamper-evident envelopes) refreshed at the end of each write
-> session, with the annual drill checking its legibility and freshness — both
-> envelopes present, seals intact, catalog snapshot within one write session of
-> reality. **`tapectl` does not generate that kit yet**; there is no
-> `key escrow-kit` command, and #69 is deferred because printing and sealing are
-> physical steps. Until it lands, the commands above are the closest equivalent
-> and they are *not* a Heir Kit — they produce no printed artifact and no sealed
-> envelope. Do not record a kit-refresh step as done on the strength of them.
+### The Heir Kit
+
+`key escrow-kit` generates the kit (ADR-0005 / ADR-0009, issue #69):
+
+```bash
+tapectl key escrow-kit --out ~/heir-kit
+```
+
+It writes three files:
+
+| file | what to do with it |
+|---|---|
+| `COVER.txt` | **Print this.** The plain-text cover sheet, carrying the escrow key in retypable Bech32. It is the artifact with the decades-scale claim — readable with `cat` when no browser exists. |
+| `escrow-kit.html` | Same content with the key as a QR. Open it and use the browser's print dialog. Self-contained: it renders with no network. |
+| `catalog.db.age` | The whole catalog, encrypted to the escrow recipient. Put it on the media that travels with the paper. |
+
+**The command stops at the files. The rest is yours, and the kit is worth
+nothing until you do it:**
+
+1. print `COVER.txt` (and/or the HTML page);
+2. seal into a **tamper-evident envelope**;
+3. store copies in **at least two independent failure domains** — not two
+   shelves in one building;
+4. paper in a UL-350 safe; Class-125 if stored together with tape.
+
+**Re-run it after every write session.** A kit made before newer tapes were
+written still opens the older ones and silently misses the new — which is the
+failure mode ADR-0005 names explicitly. You are not expected to remember:
+`audit` warns (`escrow_kit_stale`, or `escrow_kit_missing` if you have sealed
+tapes and no kit at all) whenever volumes were sealed after the last
+generation. It is advisory and never blocks — exit 1, never 2.
+
+The bundle deliberately contains the **whole** `tapectl.db`, not the filtered
+subset that rides on tape: without `locations` and `cartridges` an heir would
+learn what the archive holds but not which cartridge to fetch or where it is.
+It is safe to escrow because the database stores no private keys — only public
+halves and fingerprints; every secret is a file under `keys/`.
 
 ### Before moving a tape
 

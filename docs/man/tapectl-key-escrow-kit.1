@@ -1,0 +1,35 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-key-escrow-kit 1  "tapectl-key-escrow-kit " 
+.SH NAME
+tapectl\-key\-escrow\-kit \- Generate the printed Heir Kit and the encrypted catalog bundle (ADR\-0005 / ADR\-0009, issue #69)
+.SH SYNOPSIS
+\fBtapectl key escrow\-kit\fR [\fB\-\-json\fR] <\fB\-\-out\fR> [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Generate the printed Heir Kit and the encrypted catalog bundle (ADR\-0005 / ADR\-0009, issue #69).
+.PP
+Writes three files: COVER.txt (the plain\-text cover sheet — the artifact with the decades\-scale claim), escrow\-kit.html (the same content with an inline QR, for printing), and catalog.db.age (the whole catalog encrypted to the escrow recipient).
+.PP
+This command stops at the files. Printing them, sealing them into tamper\-evident envelopes and distributing them across at least two independent failure domains is the operator\*(Aqs part, and the cover sheet states those requirements. Re\-run after each production write session; `audit` warns when the kit has fallen behind the tapes.
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-out\fR \fI<OUT>\fR
+Directory to write the kit into (created if absent, mode 0700)
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

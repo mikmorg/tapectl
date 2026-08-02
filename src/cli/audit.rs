@@ -368,9 +368,98 @@ fn collect_findings(
             conn,
             config.compaction.utilization_threshold,
         )?);
+        warnings.extend(escrow_kit_findings(conn)?);
     }
 
     Ok((violations, warnings))
+}
+
+/// Heir Kit staleness (ADR-0009, issue #69) — archive-wide, so the caller
+/// gates it on `unit_filter.is_none()` exactly like the compaction check.
+///
+/// ADR-0005 names this failure precisely — "paper keeps decrypting old tapes
+/// and quietly misses new ones" — and then rejects *enforced* re-escrow
+/// discipline, which leaves a line printed on a cover sheet as the only
+/// defence: discipline-by-memory, which the same paragraph calls "not a
+/// mechanism". This closes that gap without crossing the rejection, because
+/// an advisory warning is neither enforcement nor memory.
+///
+/// It WARNS and never violates, so `audit`'s exit code can still only reach 1
+/// here (ADR-0004: the audit is advisory and must never block). Two distinct
+/// conditions, both worth saying out loud rather than collapsing:
+///   - sealed volumes exist and no kit was ever generated;
+///   - a kit exists but volumes were sealed after it.
+///
+/// Deliberately silent when there are no sealed volumes at all: a fresh
+/// install nagging about a kit for an archive that does not yet exist is
+/// noise, and noise is how advisory checks get ignored.
+fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+    let sealed_total: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM volumes v WHERE {}",
+            crate::policy::coverage::eligible("v")
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if sealed_total == 0 {
+        return Ok(Vec::new());
+    }
+
+    // `MAX()` over an empty set still returns one row holding NULL, so this
+    // is an `Option<String>` column read rather than an optional query.
+    let last_kit: Option<String> = conn.query_row(
+        "SELECT MAX(timestamp) FROM events WHERE action = 'escrow_kit_generated'",
+        [],
+        |r| r.get(0),
+    )?;
+
+    let Some(last_kit) = last_kit else {
+        return Ok(vec![AuditFinding {
+            unit: "archive".into(),
+            check: "escrow_kit_missing".into(),
+            message: format!(
+                "{sealed_total} sealed volume(s) exist but no heir kit has ever been \
+                 generated — nothing off-site can decrypt them"
+            ),
+            action: "tapectl key escrow-kit --out <dir>".to_string(),
+        }]);
+    };
+
+    // Sealed AFTER the last kit. `sealed_at` is not a column, so this uses the
+    // completion time of the write that sealed the volume — the moment the
+    // bytes the kit cannot reach came into existence.
+    //
+    // A NULL `completed_at` counts as STALE. `session.rs` sets it in the same
+    // statement that sets `status = 'completed'`, so production rows always
+    // have one; but a legacy or hand-edited row without a timestamp cannot be
+    // *proven* to predate the kit, and for a custody check the safe direction
+    // is to warn. Excluding it instead would make the one case nobody can
+    // verify also the one case nobody is told about.
+    let stale_count: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(DISTINCT v.id) FROM volumes v
+             JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+             WHERE {} AND (w.completed_at IS NULL OR w.completed_at > ?1)",
+            crate::policy::coverage::eligible("v")
+        ),
+        rusqlite::params![last_kit],
+        |r| r.get(0),
+    )?;
+
+    if stale_count > 0 {
+        return Ok(vec![AuditFinding {
+            unit: "archive".into(),
+            check: "escrow_kit_stale".into(),
+            message: format!(
+                "{stale_count} volume(s) were sealed after the last heir kit \
+                 ({last_kit}); the printed kit still opens older tapes and silently \
+                 misses these"
+            ),
+            action: "tapectl key escrow-kit --out <dir>".to_string(),
+        }]);
+    }
+    Ok(Vec::new())
 }
 
 /// A unit's current copy count for `audit`'s `copy_count` check.
@@ -786,6 +875,110 @@ mod tests {
             );
             assert_eq!(findings[0].unit, "volume:SEAL01");
             assert_eq!(findings[0].check, "compaction_candidate");
+        }
+
+        // --- Heir Kit staleness (ADR-0009 / issue #69) -------------------
+
+        /// A fresh install must say NOTHING about heir kits. An advisory
+        /// check that nags before there is anything to protect is a check
+        /// that gets tuned out — and then misses the case that matters.
+        #[test]
+        fn escrow_kit_check_is_silent_with_no_sealed_volumes() {
+            let (conn, _unit_id) = setup();
+            assert!(
+                escrow_kit_findings(&conn).unwrap().is_empty(),
+                "no sealed volumes means nothing to escrow yet"
+            );
+        }
+
+        /// Sealed tapes with no kit at all: nothing off-site can decrypt
+        /// them. This is the strongest form of the finding.
+        #[test]
+        fn escrow_kit_check_fires_when_tapes_exist_but_no_kit_was_ever_made() {
+            let (conn, unit_id) = setup();
+            seed_written_volume(&conn, unit_id, "SEALK1", "sealed", 1000, 900, 100);
+
+            let findings = escrow_kit_findings(&conn).unwrap();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].check, "escrow_kit_missing");
+            assert!(findings[0].action.contains("key escrow-kit"));
+        }
+
+        /// A kit generated AFTER the tapes were sealed covers them, so the
+        /// check must fall silent. Without this the check would fire
+        /// forever once any volume existed, which is the same as not
+        /// having it.
+        #[test]
+        fn escrow_kit_check_is_silent_when_the_kit_is_newer_than_the_tapes() {
+            let (conn, unit_id) = setup();
+            seed_written_volume(&conn, unit_id, "SEALK2", "sealed", 1000, 900, 100);
+            // The fixture leaves `completed_at` NULL, which now counts as
+            // stale by design; stamp a real completion so this test measures
+            // the timeline rather than the NULL rule.
+            conn.execute(
+                "UPDATE writes SET completed_at = datetime('now', '-2 day')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (entity_type, entity_id, action, timestamp)
+                 VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '+1 day'))",
+                [],
+            )
+            .unwrap();
+
+            assert!(
+                escrow_kit_findings(&conn).unwrap().is_empty(),
+                "a kit newer than every sealed volume is not stale"
+            );
+        }
+
+        /// The case ADR-0005 names in so many words: the paper still opens
+        /// the old tapes and silently misses the new ones.
+        #[test]
+        fn escrow_kit_check_fires_when_a_tape_was_sealed_after_the_kit() {
+            let (conn, unit_id) = setup();
+            conn.execute(
+                "INSERT INTO events (entity_type, entity_id, action, timestamp)
+                 VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '-1 day'))",
+                [],
+            )
+            .unwrap();
+            seed_written_volume(&conn, unit_id, "SEALK3", "sealed", 1000, 900, 100);
+            conn.execute("UPDATE writes SET completed_at = datetime('now')", [])
+                .unwrap();
+
+            let findings = escrow_kit_findings(&conn).unwrap();
+            assert_eq!(findings.len(), 1, "a tape sealed after the kit is stale");
+            assert_eq!(findings[0].check, "escrow_kit_stale");
+        }
+
+        /// A sealed volume whose write carries NO completion timestamp
+        /// cannot be proven to predate the kit, so it warns. `session.rs`
+        /// sets `completed_at` in the same statement as
+        /// `status = 'completed'`, so this is a legacy/hand-edited row —
+        /// exactly the case where silence would be worst, because it is the
+        /// one nobody can verify by other means.
+        #[test]
+        fn escrow_kit_check_treats_an_undated_write_as_stale_rather_than_covered() {
+            let (conn, unit_id) = setup();
+            conn.execute(
+                "INSERT INTO events (entity_type, entity_id, action, timestamp)
+                 VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '+1 day'))",
+                [],
+            )
+            .unwrap();
+            // Kit is dated in the FUTURE, so a dated write would be covered.
+            seed_written_volume(&conn, unit_id, "SEALK4", "sealed", 1000, 900, 100);
+            // seed leaves completed_at NULL — that is the condition under test.
+
+            let findings = escrow_kit_findings(&conn).unwrap();
+            assert_eq!(
+                findings.len(),
+                1,
+                "an undated completed write must warn, not be silently treated as covered"
+            );
+            assert_eq!(findings[0].check, "escrow_kit_stale");
         }
 
         /// A sealed volume above the threshold must NOT be flagged — proves

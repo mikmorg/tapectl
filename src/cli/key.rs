@@ -77,6 +77,25 @@ pub enum KeyCommands {
         #[arg(long)]
         escrow: bool,
     },
+
+    /// Generate the printed Heir Kit and the encrypted catalog bundle
+    /// (ADR-0005 / ADR-0009, issue #69).
+    ///
+    /// Writes three files: COVER.txt (the plain-text cover sheet — the
+    /// artifact with the decades-scale claim), escrow-kit.html (the same
+    /// content with an inline QR, for printing), and catalog.db.age (the
+    /// whole catalog encrypted to the escrow recipient).
+    ///
+    /// This command stops at the files. Printing them, sealing them into
+    /// tamper-evident envelopes and distributing them across at least two
+    /// independent failure domains is the operator's part, and the cover
+    /// sheet states those requirements. Re-run after each production write
+    /// session; `audit` warns when the kit has fallen behind the tapes.
+    EscrowKit {
+        /// Directory to write the kit into (created if absent, mode 0700)
+        #[arg(long)]
+        out: String,
+    },
 }
 
 #[derive(Tabled)]
@@ -308,6 +327,44 @@ pub fn run(
                 } else {
                     println!("key \"{full_alias}\" imported");
                 }
+            }
+        }
+
+        KeyCommands::EscrowKit { out } => {
+            let report = crate::crypto::escrow_kit::generate(
+                conn,
+                &paths.db_file,
+                std::path::Path::new(out),
+            )?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "out_dir": report.out_dir,
+                        "cover_txt": report.cover_txt,
+                        "html": report.html,
+                        "catalog_age": report.catalog_age,
+                        "catalog_bytes": report.catalog_bytes,
+                        "sealed_volumes": report.sealed_volumes,
+                        "escrow_public_key": report.escrow_public_key,
+                    })
+                );
+            } else {
+                println!("heir kit written to {}", report.out_dir.display());
+                println!("  COVER.txt        the printable cover sheet (print this)");
+                println!("  escrow-kit.html  same content with a QR, for a browser's print dialog");
+                println!(
+                    "  catalog.db.age   encrypted catalog, {} bytes, covering {} sealed volume(s)",
+                    report.catalog_bytes, report.sealed_volumes
+                );
+                println!();
+                // ADR-0005 puts the custody requirements on the printed sheet,
+                // but the operator is standing here now — and the kit has no
+                // value at all until these three things happen.
+                println!("still to do, and only you can do it:");
+                println!("  1. print COVER.txt (or the HTML page)");
+                println!("  2. seal it in a tamper-evident envelope");
+                println!("  3. store copies in at least TWO independent failure domains");
             }
         }
     }

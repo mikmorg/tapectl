@@ -33,6 +33,7 @@ indicatif = "0.17"
 rand = "0.9"
 tar = "0.4"
 tempfile = "3"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 clap_mangen = "0.2"
