@@ -17,14 +17,21 @@ fn setup() -> (TempDir, Connection, PathBuf) {
     std::fs::create_dir_all(&keys_dir).unwrap();
 
     // Write minimal config
+    // Staging lives INSIDE this test's TempDir (issue #111). It used to be a
+    // shared absolute `/tmp/tapectl-test-staging`, from a fixture that
+    // otherwise isolates itself properly — so two concurrent runs wrote to
+    // the same directory and could delete each other's slices.
+    let staging_dir = home.join("staging");
+    std::fs::create_dir_all(&staging_dir).unwrap();
     std::fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
 [dar]
 binary = "/usr/bin/dar"
 
 [staging]
-directory = "/tmp/tapectl-test-staging"
+directory = "{staging}"
 
 [defaults]
 slice_size = "100M"
@@ -38,6 +45,8 @@ preserve_fsa = true
 min_copies_for_tape_only = 2
 min_locations_for_tape_only = 2
 "#,
+            staging = staging_dir.display()
+        ),
     )
     .unwrap();
 
@@ -2121,6 +2130,10 @@ fn test_tracing_warning_goes_to_stderr_not_stdout() {
 
     let bogus_root = home.join("does-not-exist-watch-root");
     let bogus_root_str = bogus_root.to_string_lossy();
+    // Inside the TempDir, not a shared /tmp path (issue #111).
+    let staging_dir = home.join("staging");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let staging_str = staging_dir.display().to_string();
     assert!(
         !bogus_root.exists(),
         "test fixture bug: bogus watch root must not exist"
@@ -2134,7 +2147,7 @@ fn test_tracing_warning_goes_to_stderr_not_stdout() {
 binary = "/usr/bin/dar"
 
 [staging]
-directory = "/tmp/tapectl-test-staging"
+directory = "{staging_str}"
 
 [defaults]
 slice_size = "100M"

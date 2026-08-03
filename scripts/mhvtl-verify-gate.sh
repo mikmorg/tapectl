@@ -43,62 +43,16 @@ done
 exec 9>/tmp/tapectl-tape.lock
 flock -n 9 || die "another process holds the tape lock (/tmp/tapectl-tape.lock)"
 
-# ---------- device discovery (#67) ----------
-ST_BASE="$(basename "$TAPE_DEV")"; ST_BASE="${ST_BASE#n}"   # nst0 -> st0
-ROW="$(lsscsi -g | awk -v d="/dev/$ST_BASE" '$0 ~ d" " || $NF ~ d {print; exit}')"
-[ -n "$ROW" ] || ROW="$(lsscsi -g | grep -F "/dev/$ST_BASE " | head -1)"
-[ -n "$ROW" ] || die "cannot find $TAPE_DEV in lsscsi -g"
-HCTL="$(echo "$ROW" | sed -n 's/^\[\([0-9:]*\)\].*/\1/p')"
-DRIVE_MODEL="$(echo "$ROW" | awk '{print $4}')"
-DRIVE_SG="$(echo "$ROW" | awk '{print $NF}')"
-T_CHAN="$(echo "$HCTL" | cut -d: -f2)"; T_TGT="$(echo "$HCTL" | cut -d: -f3)"; T_LUN="$(echo "$HCTL" | cut -d: -f4)"
+# ---------- device discovery + generation-matched media (#67, #111) ----------
+# Delegated to scripts/mhvtl-device.sh, which is now the ONE implementation of
+# this chain (st node -> lsscsi -> device.conf -> DTE -> changer sg -> media
+# generation). It used to live inline here while tests/mhvtl_e2e.rs carried a
+# partial second copy with hardcoded device paths. Sets TAPE_DEV, DRIVE_MODEL,
+# DRIVE_SG, CHG_SG, DTE, GEN, LOADED_TAG.
+DISCOVERY="$("$(dirname "$0")/mhvtl-device.sh" --tape "$TAPE_DEV" --ensure-media)" \
+    || die "device discovery failed (see the message above)"
+eval "$DISCOVERY"
 
-# device.conf: match Drive by CHANNEL/TARGET/LUN -> queue; owning Library = last Library seen above it
-DRIVE_Q="" ; LIB_Q="" ; cur_lib=""
-while read -r kind q rest; do
-    case "$kind" in
-        Library:) cur_lib="$q" ;;
-        Drive:)
-            c=$(echo "$rest" | sed -n 's/.*CHANNEL: *\([0-9][0-9]*\).*/\1/p')
-            t=$(echo "$rest" | sed -n 's/.*TARGET: *\([0-9][0-9]*\).*/\1/p')
-            l=$(echo "$rest" | sed -n 's/.*LUN: *\([0-9][0-9]*\).*/\1/p')
-            if [ "$((10#${c:-99}))" -eq "$((10#$T_CHAN))" ] \
-               && [ "$((10#${t:-99}))" -eq "$((10#$T_TGT))" ] \
-               && [ "$((10#${l:-99}))" -eq "$((10#$T_LUN))" ]; then
-                DRIVE_Q="$q"; LIB_Q="$cur_lib"
-            fi ;;
-    esac
-done < <(grep -E '^(Library|Drive):' /etc/mhvtl/device.conf)
-[ -n "$DRIVE_Q" ] || die "no device.conf Drive matches $TAPE_DEV at $HCTL"
-DTE=$((DRIVE_Q - LIB_Q - 1))
-
-# changer sg node: the mediumx row whose C:T:L matches the Library's device.conf entry
-LIB_LINE="$(grep -E "^Library: $LIB_Q " /etc/mhvtl/device.conf)"
-L_TGT=$(echo "$LIB_LINE" | sed -n 's/.*TARGET: *\([0-9][0-9]*\).*/\1/p')
-T_HOST="$(echo "$HCTL" | cut -d: -f1)"
-CHG_SG="$(lsscsi -g | grep mediumx \
-    | grep -E "^\[$((10#$T_HOST)):$((10#$T_CHAN)):$((10#$L_TGT)):[0-9]+\]" \
-    | awk '{print $NF; exit}')"
-[ -n "$CHG_SG" ] || die "cannot locate changer sg node for library $LIB_Q"
-
-# media generation from drive model (ULT3580-TDn -> Ln)
-GEN="$(echo "$DRIVE_MODEL" | sed -n 's/.*TD\([0-9]\).*/L\1/p')"
-[ -n "$GEN" ] || die "cannot derive media generation from drive model '$DRIVE_MODEL'"
-
-STATUS="$(mtx -f "$CHG_SG" status)" || die "mtx status failed on $CHG_SG"
-LOADED_TAG="$(echo "$STATUS" | sed -n "s/.*Data Transfer Element $DTE:Full.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p")"
-if [ -n "$LOADED_TAG" ] && [ "${LOADED_TAG: -2}" != "$GEN" ]; then
-    ORIGIN="$(echo "$STATUS" | sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
-    mtx -f "$CHG_SG" unload "${ORIGIN:-1}" "$DTE" || die "cannot unload wrong-generation tape"
-    LOADED_TAG=""
-fi
-if [ -z "$LOADED_TAG" ]; then
-    SLOT="$(echo "$STATUS" | grep -E "Storage Element [0-9]+:Full" | grep "VolumeTag=[EF][0-9]*$GEN" | head -1 \
-            | sed -n 's/.*Storage Element \([0-9]*\):Full.*/\1/p')"
-    [ -n "$SLOT" ] || die "no $GEN data cartridge in library $LIB_Q"
-    mtx -f "$CHG_SG" load "$SLOT" "$DTE" || die "mtx load $SLOT $DTE failed"
-    LOADED_TAG="$(mtx -f "$CHG_SG" status | sed -n "s/.*Data Transfer Element $DTE:Full.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p")"
-fi
 echo "gate: drive=$TAPE_DEV ($DRIVE_MODEL, sg=$DRIVE_SG) changer=$CHG_SG dte=$DTE tape=$LOADED_TAG"
 
 # ---------- workspace + build ----------

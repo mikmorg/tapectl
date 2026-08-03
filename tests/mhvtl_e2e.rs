@@ -32,12 +32,68 @@ use tapectl::volume::layout::{
 use tapectl::volume::layout_model::{CapacityBudget, ContentSource, Layout, LayoutEntry, ZoneKind};
 use tapectl::{db, staging, tenant, unit, volume};
 
-const TAPE_DEV: &str = "/dev/nst0";
-const SG_DEV: &str = "/dev/sg1";
+/// Default tape device. Overridable via `TAPECTL_GATE_TAPE`, the same
+/// variable `scripts/mhvtl-verify-gate.sh` uses, so a machine with a
+/// different layout configures both harnesses once (issue #111).
+fn tape_dev() -> String {
+    std::env::var("TAPECTL_GATE_TAPE").unwrap_or_else(|_| "/dev/nst0".into())
+}
+
 const BLOCK_SIZE: usize = 512 * 1024;
 
+/// Everything `scripts/mhvtl-device.sh` resolves: the drive's sg node, the
+/// changer, the DTE index and the loaded cartridge.
+#[derive(Debug, Default)]
+struct MhvtlDevices {
+    drive_sg: String,
+    loaded_tag: String,
+}
+
+/// Resolve devices by SHELLING OUT to `scripts/mhvtl-device.sh` (issue #111).
+///
+/// This file used to hardcode `/dev/sg1` as the drive's sg node. SCSI
+/// enumeration shuffles across module reloads, so that is not a stable name
+/// for anything — it meant the gated suite could silently exercise the wrong
+/// device, or fail for a reason that looks like a tapectl defect. The script
+/// is the single implementation of that chain and the verify gate calls the
+/// same one; duplicating its device.conf/DTE/generation logic in Rust would
+/// make a third copy of the thing this issue exists to remove.
+fn discover_devices(ensure_media: bool) -> Option<MhvtlDevices> {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mhvtl-device.sh");
+    let mut cmd = Command::new(script);
+    cmd.arg("--tape").arg(tape_dev());
+    if ensure_media {
+        cmd.arg("--ensure-media");
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "mhvtl-device.sh failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut d = MhvtlDevices::default();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_matches('\'').to_string();
+        match k {
+            "DRIVE_SG" => d.drive_sg = v,
+            "LOADED_TAG" => d.loaded_tag = v,
+            _ => {}
+        }
+    }
+    if d.drive_sg.is_empty() {
+        return None;
+    }
+    Some(d)
+}
+
 fn mhvtl_enabled() -> bool {
-    std::env::var("TAPECTL_MHVTL").is_ok() && Path::new(TAPE_DEV).exists()
+    std::env::var("TAPECTL_MHVTL").is_ok() && Path::new(&tape_dev()).exists()
 }
 
 /// Global lock so parallel tests don't race on the single tape device. Poison
@@ -60,44 +116,20 @@ fn find_dar() -> String {
     "dar".into()
 }
 
-/// Discover the media changer instead of hardcoding it (issue #67).
+/// Ensure a GENERATION-MATCHED cartridge is loaded (issue #111).
 ///
-/// SCSI enumeration shuffles across mhvtl module reloads — `/dev/sg0` was the
-/// changer once and is the CD-ROM today, which silently broke every gated test
-/// (the `mtx` call is best-effort, so the failure only surfaced downstream as
-/// `volume_init` finding no media). Ask `lsscsi -g` for the `mediumx` devices
-/// and use the first that actually answers `mtx status`.
-fn discover_changer() -> Option<String> {
-    let out = Command::new("lsscsi").arg("-g").output().ok()?;
-    let listing = String::from_utf8_lossy(&out.stdout);
-    for line in listing.lines().filter(|l| l.contains("mediumx")) {
-        if let Some(sg) = line
-            .split_whitespace()
-            .rev()
-            .find(|f| f.starts_with("/dev/sg"))
-        {
-            let ok = Command::new("mtx")
-                .args(["-f", sg, "status"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if ok {
-                return Some(sg.to_string());
-            }
-        }
-    }
-    None
-}
-
-// "load 1" is a best-effort no-op on VMs where the drive is already loaded, and
-// volume_init rewinds anyway. The changer is discovered, never assumed.
+/// This used to issue a bare `mtx load 1` — whatever is in slot 1, which on a
+/// mixed library can be the wrong generation. An L8 tape in a TD6 drive fails
+/// in a way that reads like a tapectl bug, so the gate script had already
+/// learned to unload a mismatched tape and pick a matching slot; that logic
+/// now lives in `scripts/mhvtl-device.sh` and this calls it.
 fn mhvtl_load() {
-    if let Some(changer) = discover_changer() {
-        let _ = Command::new("mtx")
-            .args(["-f", &changer, "load", "1"])
-            .status();
+    if let Some(d) = discover_devices(true) {
+        if d.loaded_tag.is_empty() {
+            eprintln!("warning: no generation-matched cartridge could be loaded");
+        }
     } else {
-        eprintln!("warning: no responding media changer found via lsscsi -g");
+        eprintln!("warning: mhvtl device discovery failed");
     }
     // Bulk-erase the scratch cartridge — the test equivalent of the production
     // reuse procedure (#27: retire, bulk-erase, `cartridge mark-erased`). The
@@ -106,8 +138,12 @@ fn mhvtl_load() {
     // refuses to overwrite it (ADR-0003 — `--force` cannot and must not defeat
     // that). Erasing here means the fixtures exercise the DEFAULT no-force
     // path, which is the one production uses. Instant on mhvtl (~20ms).
-    let _ = Command::new("mt").args(["-f", TAPE_DEV, "rewind"]).status();
-    let _ = Command::new("mt").args(["-f", TAPE_DEV, "erase"]).status();
+    let _ = Command::new("mt")
+        .args(["-f", &tape_dev(), "rewind"])
+        .status();
+    let _ = Command::new("mt")
+        .args(["-f", &tape_dev(), "erase"])
+        .status();
 }
 
 /// sha256 hex digest. `src/store.rs` and `src/volume/write.rs` each have a
@@ -134,7 +170,13 @@ impl Harness {
 }
 
 fn setup_mhvtl(name: &str) -> Harness {
-    let scratch = PathBuf::from("/scratch/tapectl-mhvtl-test");
+    // Env-overridable with the previous literal as the default, mirroring
+    // the gate script's TAPECTL_GATE_SCRATCH (issue #111) — nothing changes
+    // for anyone who does not set it.
+    let scratch = PathBuf::from(
+        std::env::var("TAPECTL_E2E_SCRATCH")
+            .unwrap_or_else(|_| "/scratch/tapectl-mhvtl-test".into()),
+    );
     fs::create_dir_all(&scratch).unwrap();
     let root = tempfile::Builder::new()
         .prefix(&format!("{name}-"))
@@ -160,8 +202,14 @@ fn setup_mhvtl(name: &str) -> Harness {
     config.defaults.compression = "none".into();
     config.backends.lto.push(LtoBackendConfig {
         name: "mhvtl".into(),
-        device_tape: TAPE_DEV.into(),
-        device_sg: SG_DEV.into(),
+        device_tape: tape_dev(),
+        // Discovered, never hardcoded (issue #111). Falls back to the
+        // historical literal only so a machine without the discovery script
+        // still builds a config; every gated test calls mhvtl_load() first,
+        // which fails loudly when discovery does not work.
+        device_sg: discover_devices(false)
+            .map(|d| d.drive_sg)
+            .unwrap_or_else(|| "/dev/sg1".into()),
         media_type: "LTO-6".into(),
         nominal_capacity: "2400G".into(),
         usable_capacity_factor: 0.92,
@@ -314,9 +362,15 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
     // on this VM as of this writing per project notes, independent of this
     // change) — flagged for the coordinator to resolve before the next real
     // mhvtl run, most likely by erasing the scratch cartridge first.
-    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, false).unwrap();
+    volume::write::volume_init(&h.conn, &h.config, label, &tape_dev(), BLOCK_SIZE, false).unwrap();
     volume::write::volume_write(
-        &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
+        &h.conn,
+        &h.paths,
+        &h.config,
+        label,
+        &tape_dev(),
+        BLOCK_SIZE,
+        true,
     )
     .unwrap();
     h
@@ -331,7 +385,7 @@ fn restore_to(h: &Harness, unit_name: &str, label: &str, dest: &Path) {
         unit_name,
         label,
         &dest.to_string_lossy(),
-        TAPE_DEV,
+        &tape_dev(),
         BLOCK_SIZE,
         false,
     )
@@ -354,7 +408,7 @@ fn diff_recursive(a: &Path, b: &Path) -> bool {
 #[ignore]
 fn mhvtl_full_round_trip() {
     if !mhvtl_enabled() {
-        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        eprintln!("skip: TAPECTL_MHVTL not set or {} missing", tape_dev());
         return;
     }
     let _g = tape_lock();
@@ -372,7 +426,7 @@ fn mhvtl_full_round_trip() {
         &h.conn,
         &h.config,
         label,
-        TAPE_DEV,
+        &tape_dev(),
         BLOCK_SIZE,
         Tier::default(),
     )
@@ -399,7 +453,7 @@ fn mhvtl_full_round_trip() {
 #[ignore]
 fn mhvtl_v2_layout_positions_derived_from_front_index() {
     if !mhvtl_enabled() {
-        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        eprintln!("skip: TAPECTL_MHVTL not set or {} missing", tape_dev());
         return;
     }
     let _g = tape_lock();
@@ -410,7 +464,7 @@ fn mhvtl_v2_layout_positions_derived_from_front_index() {
         &[("dana", "dana-u", 2), ("erin", "erin-u", 2)],
     );
 
-    let parsed = read_front_index(TAPE_DEV, BLOCK_SIZE);
+    let parsed = read_front_index(&tape_dev(), BLOCK_SIZE);
     let violations = format::validate_consistency(&parsed);
     assert!(
         violations.is_empty(),
@@ -539,7 +593,7 @@ fn mhvtl_tenant_isolation() {
         "bob-u",
         label,
         &bob_via_op.to_string_lossy(),
-        TAPE_DEV,
+        &tape_dev(),
         BLOCK_SIZE,
         false,
     )
@@ -557,7 +611,7 @@ fn mhvtl_tenant_isolation() {
         "bob-u",
         label,
         &bob_dest.to_string_lossy(),
-        TAPE_DEV,
+        &tape_dev(),
         BLOCK_SIZE,
         false,
     );
@@ -577,7 +631,7 @@ fn mhvtl_volume_identify() {
     let label = "MHVTLC";
     let _h = write_volume("identify", label, &[("alice", "alice-u", 1)]);
 
-    let id = volume::write::volume_identify(TAPE_DEV, BLOCK_SIZE).unwrap();
+    let id = volume::write::volume_identify(&tape_dev(), BLOCK_SIZE).unwrap();
     assert!(id.contains(label), "id thunk missing label: {id}");
     assert!(id.contains("TAPECTL"), "id thunk missing header: {id}");
 }
@@ -652,7 +706,7 @@ fn slice_plaintext_hashes(conn: &Connection, unit_name: &str) -> Vec<String> {
 #[ignore]
 fn mhvtl_no_plaintext_tenant_metadata() {
     if !mhvtl_enabled() {
-        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        eprintln!("skip: TAPECTL_MHVTL not set or {} missing", tape_dev());
         return;
     }
     let _g = tape_lock();
@@ -716,9 +770,15 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     // on this VM as of this writing per project notes, independent of this
     // change) — flagged for the coordinator to resolve before the next real
     // mhvtl run, most likely by erasing the scratch cartridge first.
-    volume::write::volume_init(&h.conn, &h.config, label, TAPE_DEV, BLOCK_SIZE, false).unwrap();
+    volume::write::volume_init(&h.conn, &h.config, label, &tape_dev(), BLOCK_SIZE, false).unwrap();
     volume::write::volume_write(
-        &h.conn, &h.paths, &h.config, label, TAPE_DEV, BLOCK_SIZE, true,
+        &h.conn,
+        &h.paths,
+        &h.config,
+        label,
+        &tape_dev(),
+        BLOCK_SIZE,
+        true,
     )
     .unwrap();
 
@@ -728,7 +788,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     // `volume-format-v2.md` sec 1/sec 8) — the envelope/slice RANGE now comes
     // from the front index itself (File 3), never from ID-thunk position
     // fields.
-    let id_thunk = read_tape_file_at(TAPE_DEV, BLOCK_SIZE, 0);
+    let id_thunk = read_tape_file_at(&tape_dev(), BLOCK_SIZE, 0);
     let id_text = std::str::from_utf8(&id_thunk).expect("id thunk utf8");
     assert!(id_text.contains(label));
     assert!(
@@ -745,7 +805,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
 
     // The front index (File 3) itself — the only source of the v2
     // envelope/slice range now that the v1 ID-thunk position fields are gone.
-    let parsed = read_front_index(TAPE_DEV, BLOCK_SIZE);
+    let parsed = read_front_index(&tape_dev(), BLOCK_SIZE);
     let violations = format::validate_consistency(&parsed);
     assert!(
         violations.is_empty(),
@@ -764,7 +824,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     let plaintext_positions = [0i32, 1, 2, front_index_pos, seal_marker_pos];
 
     for pos in 0..total_files {
-        let data = read_tape_file_at(TAPE_DEV, BLOCK_SIZE, pos);
+        let data = read_tape_file_at(&tape_dev(), BLOCK_SIZE, pos);
         assert!(!data.is_empty(), "file {pos} empty");
 
         if plaintext_positions.contains(&pos) {
@@ -999,13 +1059,13 @@ fn extract_restore_sh(device: &str, block_size: usize, dest: &Path) -> String {
 
 /// Run the extracted RESTORE.sh with `--verify` against `device`, invoked via
 /// `bash <path>` (sidesteps chmod/noexec questions on the scratch tempdir —
-/// the shebang line is irrelevant either way) with `TAPE_DEVICE` set so the
+/// the shebang line is irrelevant either way) with `&tape_dev()ICE` set so the
 /// script targets the same tape this test just wrote/corrupted.
 fn run_restore_sh_verify(script_path: &Path, device: &str) -> std::process::Output {
     Command::new("bash")
         .arg(script_path)
         .arg("--verify")
-        .env("TAPE_DEVICE", device)
+        .env("&tape_dev()ICE", device)
         .output()
         .expect("failed to spawn RESTORE.sh --verify")
 }
@@ -1020,7 +1080,7 @@ fn run_restore_sh_verify(script_path: &Path, device: &str) -> std::process::Outp
 #[ignore]
 fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
     if !mhvtl_enabled() {
-        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        eprintln!("skip: TAPECTL_MHVTL not set or {} missing", tape_dev());
         return;
     }
     let _g = tape_lock();
@@ -1033,7 +1093,7 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
         &h.conn,
         &h.config,
         label,
-        TAPE_DEV,
+        &tape_dev(),
         BLOCK_SIZE,
         Tier::default(),
     )
@@ -1046,13 +1106,13 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
 
     // (b) consumer 3: RESTORE.sh's own bash chain walk.
     let script_path = h.root.path().join("RESTORE.sh");
-    let script_text = extract_restore_sh(TAPE_DEV, BLOCK_SIZE, &script_path);
+    let script_text = extract_restore_sh(&tape_dev(), BLOCK_SIZE, &script_path);
     assert!(
         script_text.contains("--verify"),
         "extracted File 2 does not look like RESTORE.sh v2 (no --verify mode found)"
     );
 
-    let output = run_restore_sh_verify(&script_path, TAPE_DEV);
+    let output = run_restore_sh_verify(&script_path, &tape_dev());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1245,7 +1305,7 @@ fn write_hand_corrupted_volume(device: &str, block_size: usize, label: &str) -> 
 #[ignore]
 fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
     if !mhvtl_enabled() {
-        eprintln!("skip: TAPECTL_MHVTL not set or {TAPE_DEV} missing");
+        eprintln!("skip: TAPECTL_MHVTL not set or {} missing", tape_dev());
         return;
     }
     let _g = tape_lock();
@@ -1261,13 +1321,13 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
         )
         .unwrap();
 
-    let corrupted_position = write_hand_corrupted_volume(TAPE_DEV, BLOCK_SIZE, label);
+    let corrupted_position = write_hand_corrupted_volume(&tape_dev(), BLOCK_SIZE, label);
 
     // (a) Rust: the SAME production `Store::confirm` chain walk must FAIL —
     // never an `Err` (fail-safe reporting via `Evidence.mismatches`,
     // `volume-format-v2.md` sec 5) — and implicate exactly
     // `corrupted_position`.
-    let evidence = tape_confirm_evidence(TAPE_DEV, BLOCK_SIZE, Tier::Integrity);
+    let evidence = tape_confirm_evidence(&tape_dev(), BLOCK_SIZE, Tier::Integrity);
     assert!(
         !evidence.mismatches.is_empty(),
         "rust chain walk must FAIL on the hand-corrupted tape"
@@ -1289,7 +1349,7 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
         &h.conn,
         &h.config,
         label,
-        TAPE_DEV,
+        &tape_dev(),
         BLOCK_SIZE,
         Tier::Integrity,
     )
@@ -1302,9 +1362,9 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
     // (b) bash: RESTORE.sh --verify must ALSO fail and print a FAIL line at
     // the SAME position.
     let script_path = h.root.path().join("RESTORE.sh");
-    extract_restore_sh(TAPE_DEV, BLOCK_SIZE, &script_path);
+    extract_restore_sh(&tape_dev(), BLOCK_SIZE, &script_path);
 
-    let output = run_restore_sh_verify(&script_path, TAPE_DEV);
+    let output = run_restore_sh_verify(&script_path, &tape_dev());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

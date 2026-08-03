@@ -49,7 +49,13 @@ struct PerfHarness {
 }
 
 fn setup(name: &str) -> PerfHarness {
-    let scratch = PathBuf::from("/scratch/tapectl-perf");
+    // Env-overridable with the previous literal as the default, mirroring
+    // the gate script's TAPECTL_GATE_SCRATCH (issue #111). Nothing changes
+    // for anyone who does not set it; a machine without /scratch can now run
+    // the suite without editing the harness.
+    let scratch = PathBuf::from(
+        std::env::var("TAPECTL_PERF_SCRATCH").unwrap_or_else(|_| "/scratch/tapectl-perf".into()),
+    );
     fs::create_dir_all(&scratch).unwrap();
     let root = tempfile::Builder::new()
         .prefix(&format!("{name}-"))
