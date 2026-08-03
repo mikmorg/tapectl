@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::db::queries;
@@ -311,7 +311,35 @@ fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
 /// evidence a different class — never re-verified, and it "dies weeks
 /// after payment stops". Folding it invisibly into one number would let an
 /// operator read "2 copies" as two cartridges.
-pub(crate) type FireRiskRow = (String, String, i64, i64, i64);
+/// Why a unit appears in `report fire-risk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FireRisk {
+    /// No copies at all.
+    NoCopies,
+    /// Fewer copies than this unit's own resolved `min_copies`.
+    BelowMinimum,
+    /// The unit's policy could not be resolved, so its threshold is unknown
+    /// (issue #106). It is LISTED rather than skipped: a unit whose policy
+    /// will not resolve cannot be shown as safe, and silently dropping it
+    /// reproduces the exact silent-pass class #59 removed from `audit`.
+    PolicyUnresolvable(String),
+}
+
+/// One at-risk unit. A struct rather than the old 5-tuple because #106 added
+/// the *resolved per-unit* threshold and a risk reason, and a 7-tuple of
+/// same-typed integers is a bug waiting to happen at the call site.
+#[derive(Debug, Clone)]
+pub(crate) struct FireRiskRow {
+    pub unit: String,
+    pub status: String,
+    pub copies: i64,
+    pub locations: i64,
+    pub deposits: i64,
+    /// This unit's own resolved `min_copies`, not the global default
+    /// (issue #106). `None` when the policy would not resolve.
+    pub min_copies: Option<i64>,
+    pub risk: FireRisk,
+}
 
 /// The parenthetical the human-readable copy/location surfaces append when
 /// some of a unit's copies are warehouse deposits (issue #73). Empty when
@@ -327,7 +355,7 @@ fn warehouse_note(deposits: i64) -> String {
     }
 }
 
-pub(crate) fn fire_risk_rows(conn: &Connection, min_copies: i64) -> Result<Vec<FireRiskRow>> {
+pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<FireRiskRow>> {
     // Units with fewer copies than min_copies. Copies and locations come
     // from the shared deposit-aware expressions (issue #73), correlated to
     // `u.id`: they re-qualify volume eligibility at use time per ADR-0004
@@ -341,67 +369,149 @@ pub(crate) fn fire_risk_rows(conn: &Connection, min_copies: i64) -> Result<Vec<F
     // The threshold filter has to sit in an OUTER query: with the joins
     // gone there is no GROUP BY, so a HAVING clause would be a
     // single-group aggregate filter, not a per-row one.
+    // Issue #106: the threshold is now resolved PER UNIT, so it cannot be a
+    // bound parameter in the SQL any more. The query returns every active
+    // unit with its counts and the comparison happens in Rust, against the
+    // same dotfile > archive_set > defaults chain `audit` uses.
+    //
+    // That matters because both commands answer one question — "is this unit
+    // under-covered?" — and before this they could DISAGREE: `audit` resolved
+    // per unit while fire-risk applied `defaults.min_copies_for_tape_only` to
+    // everything. The one an operator glances at was the wrong one.
+    //
+    // The old `OR copies = 0` is gone with it. Once the threshold is a real
+    // per-unit `min_copies`, zero is already below any positive minimum, so
+    // it read like a guard while guarding nothing.
     let scope = crate::policy::coverage::CoverageQuery::current_unit("u.id");
     let sql = format!(
-        "SELECT * FROM (
-            SELECT u.name, u.status,
-                   {} as copies,
-                   {} as locations,
-                   {} as deposits
-            FROM units u
-            WHERE u.status = 'active'
-         ) WHERE copies < ?1 OR copies = 0",
+        "SELECT u.id, u.name, u.status,
+                {} as copies,
+                {} as locations,
+                {} as deposits
+         FROM units u
+         WHERE u.status = 'active'",
         crate::policy::coverage::copy_count_expr(&scope),
         crate::policy::coverage::location_count_expr(&scope),
         crate::policy::coverage::deposit_count_expr(&scope),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let at_risk: Vec<FireRiskRow> = stmt
-        .query_map(params![min_copies], |row| {
+    let counts: std::collections::HashMap<i64, (String, String, i64, i64, i64)> = stmt
+        .query_map([], |row| {
             Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
+                row.get::<_, i64>(0)?,
+                (
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ),
             ))
         })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<_, _>>()?;
+
+    // Two queries total, indexed by id — not one query per unit. `resolve`
+    // needs a whole `Unit`, and `list_units` is the same call `audit` makes,
+    // which keeps the two commands reading the same unit set as well as the
+    // same threshold.
+    let mut at_risk = Vec::new();
+    for unit in crate::db::queries::list_units(conn, None, Some("active"))? {
+        let Some((name, status, copies, locations, deposits)) = counts.get(&unit.id).cloned()
+        else {
+            continue;
+        };
+        let (min_copies, risk) = match crate::policy::resolve(conn, config, &unit) {
+            Ok(p) => {
+                if copies == 0 {
+                    (Some(p.min_copies), FireRisk::NoCopies)
+                } else if copies < p.min_copies {
+                    (Some(p.min_copies), FireRisk::BelowMinimum)
+                } else {
+                    continue;
+                }
+            }
+            Err(e) => (None, FireRisk::PolicyUnresolvable(e.to_string())),
+        };
+        at_risk.push(FireRiskRow {
+            unit: name,
+            status,
+            copies,
+            locations,
+            deposits,
+            min_copies,
+            risk,
+        });
+    }
     Ok(at_risk)
 }
 
 fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    let min_copies = config.defaults.min_copies_for_tape_only as i64;
-    let mut risks: Vec<serde_json::Value> = Vec::new();
-    let at_risk = fire_risk_rows(conn, min_copies)?;
+    let at_risk = fire_risk_rows(conn, config)?;
 
-    for (name, status, copies, locations, deposits) in &at_risk {
-        risks.push(serde_json::json!({
-            "unit": name, "status": status, "copies": copies, "locations": locations,
-            "warehouse_deposits": deposits,
-            "risk": if *copies == 0 { "no_copies" } else { "below_minimum" },
-        }));
-    }
+    let risks: Vec<serde_json::Value> = at_risk
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "unit": r.unit, "status": r.status, "copies": r.copies,
+                "locations": r.locations, "warehouse_deposits": r.deposits,
+                // The threshold this unit was actually judged against, so a
+                // scripted consumer can tell a 2-copy unit failing a
+                // min_copies=3 archive set from one failing the default.
+                "min_copies": r.min_copies,
+                "risk": match &r.risk {
+                    FireRisk::NoCopies => "no_copies",
+                    FireRisk::BelowMinimum => "below_minimum",
+                    FireRisk::PolicyUnresolvable(_) => "policy_unresolvable",
+                },
+                "detail": match &r.risk {
+                    FireRisk::PolicyUnresolvable(e) => Some(e.clone()),
+                    _ => None,
+                },
+            })
+        })
+        .collect();
 
     if json_output {
         println!(
             "{}",
             serde_json::json!({"at_risk": risks.len(), "units": risks})
         );
-    } else if risks.is_empty() {
-        println!("fire-risk: all units meet minimum copy requirements");
+    } else if at_risk.is_empty() {
+        println!("fire-risk: all units meet their resolved minimum copy requirements");
     } else {
-        println!("FIRE RISK: {} unit(s) at risk", risks.len());
-        for (name, _status, copies, locations, deposits) in &at_risk {
-            let severity = if *copies == 0 {
-                "ZERO COPIES"
-            } else {
-                "below minimum"
-            };
-            println!(
-                "  {name}: {copies} copies{}, {locations} locations — {severity}",
-                warehouse_note(*deposits)
-            );
+        println!("FIRE RISK: {} unit(s) at risk", at_risk.len());
+        for r in &at_risk {
+            match &r.risk {
+                // Named separately from a copy shortfall because it is a
+                // different problem with a different fix: nothing is known
+                // to be wrong with this unit's coverage — the tool cannot
+                // tell either way, which is strictly worse.
+                FireRisk::PolicyUnresolvable(e) => println!(
+                    "  {}: {} copies{}, {} locations — POLICY UNRESOLVABLE, \
+                     coverage NOT checked ({e})",
+                    r.unit,
+                    r.copies,
+                    warehouse_note(r.deposits),
+                    r.locations,
+                ),
+                other => {
+                    let severity = if *other == FireRisk::NoCopies {
+                        "ZERO COPIES"
+                    } else {
+                        "below minimum"
+                    };
+                    println!(
+                        "  {}: {} copies{}, {} locations — {severity} (needs {})",
+                        r.unit,
+                        r.copies,
+                        warehouse_note(r.deposits),
+                        r.locations,
+                        r.min_copies
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1119,6 +1229,7 @@ mod tests {
     //! `_unit_filter`). These tests exercise the real classify()-backed
     //! scan and confirm the filter now actually narrows the result.
     use super::*;
+    use rusqlite::params;
     use tempfile::TempDir;
 
     /// Issue #73 / ADR-0006: the three advisory surfaces that print a
@@ -1145,22 +1256,127 @@ mod tests {
                 crate::policy::coverage::tests::setup_unit_with_deposit("active");
             // min_copies = 3 keeps the unit in the at-risk set either way,
             // so the assertion is about the COUNT, not about membership.
-            let rows = fire_risk_rows(&conn, 3).unwrap();
+            // The fixture unit has no dotfile and no archive set, so the
+            // resolved threshold IS the default (issue #106).
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 3;
+            let rows = fire_risk_rows(&conn, &config).unwrap();
             let row = rows
                 .iter()
-                .find(|r| r.0 == "photos")
+                .find(|r| r.unit == "photos")
                 .expect("photos listed");
-            assert_eq!(row.2, 2, "copies must include the warehouse deposit");
-            assert_eq!(row.3, 2, "locations must include the warehouse");
+            assert_eq!(row.copies, 2, "copies must include the warehouse deposit");
+            assert_eq!(row.locations, 2, "locations must include the warehouse");
+        }
+
+        /// Issue #106, the defect itself: an archive set demanding MORE
+        /// copies than the global default must put the unit at risk. Before
+        /// this, fire-risk applied `defaults.min_copies_for_tape_only` to
+        /// every unit while `audit` resolved per unit — so the two commands
+        /// answered the same question differently, and the one an operator
+        /// glances at was the wrong one.
+        #[test]
+        fn fire_risk_uses_the_units_archive_set_threshold_not_the_global_default() {
+            let (conn, unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            // The unit has 2 copies. Global default says 2 = fine; the
+            // archive set it belongs to demands 3.
+            conn.execute(
+                "INSERT INTO archive_sets (name, min_copies) VALUES ('strict', 3)",
+                [],
+            )
+            .unwrap();
+            let as_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE id = ?2",
+                params![as_id, unit_id],
+            )
+            .unwrap();
+
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 2;
+
+            let rows = fire_risk_rows(&conn, &config).unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.unit == "photos")
+                .expect("the archive set demands 3 copies and the unit has 2 — it is at risk");
+            assert_eq!(
+                row.min_copies,
+                Some(3),
+                "the reported threshold must be the RESOLVED one, not the global default"
+            );
+            assert_eq!(row.risk, FireRisk::BelowMinimum);
+        }
+
+        /// The other direction, so the test above cannot pass by simply
+        /// reporting everything: an archive set demanding FEWER copies than
+        /// the global default must take the unit OUT of the at-risk set.
+        #[test]
+        fn fire_risk_respects_an_archive_set_that_is_laxer_than_the_default() {
+            let (conn, unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            conn.execute(
+                "INSERT INTO archive_sets (name, min_copies) VALUES ('lax', 1)",
+                [],
+            )
+            .unwrap();
+            let as_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE id = ?2",
+                params![as_id, unit_id],
+            )
+            .unwrap();
+
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 5;
+
+            let rows = fire_risk_rows(&conn, &config).unwrap();
+            assert!(
+                !rows.iter().any(|r| r.unit == "photos"),
+                "a unit meeting its own archive set's min_copies=1 is not at risk, \
+                 whatever the global default says: {rows:?}"
+            );
+        }
+
+        /// A unit whose policy will not resolve must be LISTED, not skipped.
+        /// Skipping reproduces the silent-pass class #59 removed from
+        /// `audit`: the tool cannot tell whether the unit is covered, which
+        /// is strictly worse than knowing it is not.
+        #[test]
+        fn fire_risk_lists_a_unit_whose_policy_will_not_resolve() {
+            let (conn, unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            // A dangling archive_set_id makes `policy::resolve` fail (#105).
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "UPDATE units SET archive_set_id = 9999 WHERE id = ?1",
+                params![unit_id],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+            let rows = fire_risk_rows(&conn, &Config::default()).unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.unit == "photos")
+                .expect("an unresolvable unit must not vanish from the risk report");
+            assert!(matches!(row.risk, FireRisk::PolicyUnresolvable(_)));
+            assert_eq!(
+                row.min_copies, None,
+                "no threshold is known, and reporting one would be a guess"
+            );
         }
 
         #[test]
         fn fire_risk_drops_a_unit_whose_second_copy_is_a_deposit() {
             let (conn, _unit_id, _vol) =
                 crate::policy::coverage::tests::setup_unit_with_deposit("active");
-            let rows = fire_risk_rows(&conn, 2).unwrap();
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = 2;
+            let rows = fire_risk_rows(&conn, &config).unwrap();
             assert!(
-                !rows.iter().any(|r| r.0 == "photos"),
+                !rows.iter().any(|r| r.unit == "photos"),
                 "a unit with a tape copy AND a warehouse deposit meets min_copies=2: {rows:?}"
             );
         }
