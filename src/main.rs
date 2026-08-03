@@ -1,4 +1,4 @@
-use tapectl::{cli, config, db, error, policy, signal, staging, tenant, unit, volume};
+use tapectl::{cli, config, db, error, signal, tenant};
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -59,29 +59,6 @@ fn exit_if_nonzero(code: i32) {
         use std::io::Write;
         let _ = std::io::stdout().flush();
         std::process::exit(code);
-    }
-}
-
-/// Decide the process exit code for `db fsck` from its report (issue
-/// #45/H10). Mirrors the `audit` convention: 0=clean, 1=warning,
-/// 2=violation.
-///
-/// - The integrity check itself failing is a violation, full stop — no
-///   amount of orphan-row repair changes that.
-/// - Any other issue (e.g. orphaned rows) is a warning regardless of
-///   whether `--repair` fixed it: an unrepaired finding (fsck run without
-///   `--repair`) is still a finding nobody should see reported as a clean
-///   0 — that is exactly the "reports success while finding problems" bug
-///   this ticket exists to kill. It just isn't tape/DB corruption, so it's
-///   1, not 2.
-/// - No issues at all is genuinely clean.
-fn fsck_exit_code(report: &cli::operations::FsckReport) -> i32 {
-    if !report.integrity_ok {
-        error::EXIT_ERROR
-    } else if !report.issues.is_empty() {
-        error::EXIT_WARNING
-    } else {
-        error::EXIT_SUCCESS
     }
 }
 
@@ -226,33 +203,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref capacity,
             ref notes,
         } => {
-            let cap_bytes = crate::staging::parse_size_to_bytes(capacity)?;
-            // Resolve backend_name from configured backend of this type, else fall back
-            // to the type string so the row remains self-consistent.
-            let backend_name = match backend.as_str() {
-                "lto" => cfg
-                    .backends
-                    .lto
-                    .first()
-                    .map(|b| b.name.clone())
-                    .unwrap_or_else(|| backend.clone()),
-                _ => backend.clone(),
-            };
-            conn.execute(
-                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
-                rusqlite::params![label, backend, backend_name, media_type, cap_bytes, notes],
+            cli::operations::volume_import(
+                &conn,
+                &cfg,
+                label,
+                backend,
+                media_type,
+                capacity,
+                notes.as_deref(),
+                cli.json,
             )?;
-            let vol_id = conn.last_insert_rowid();
-            crate::db::events::log_created(&conn, "volume", vol_id, label, None)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"id": vol_id, "label": label, "status": "imported"})
-                );
-            } else {
-                println!("volume \"{label}\" imported (id={vol_id}, {media_type}, {capacity})");
-            }
         }
         Commands::QuickArchive {
             ref path,
@@ -261,336 +221,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref tag,
             ref device,
         } => {
-            // Step 1: init unit
-            let unit_id = crate::unit::init_unit(&conn, &paths, path, tenant, None, tag, None)?;
-            let unit_name: String = conn.query_row(
-                "SELECT name FROM units WHERE id = ?1",
-                rusqlite::params![unit_id],
-                |row| row.get(0),
+            cli::operations::quick_archive(
+                &conn, &paths, &cfg, path, tenant, volume, tag, device, cli.json,
             )?;
-            println!("unit \"{unit_name}\" initialized");
-            // Step 2: snapshot
-            let snap_id = crate::staging::snapshot_create(&conn, &unit_name, &cfg)?;
-            println!("snapshot created (id={snap_id})");
-            // Step 3: stage
-            let ss_id = crate::staging::stage_create(&conn, &paths, &cfg, snap_id)?;
-            println!("staged (stage_set={ss_id})");
-            // Step 4: write
-            // force=false: quick-archive writes to a caller-provided volume
-            // label with no override surface of its own (issue #27 scopes
-            // --force to `volume init`/`volume write` only).
-            crate::volume::write::volume_write(
-                &conn,
-                &paths,
-                &cfg,
-                volume,
-                device,
-                512 * 1024,
-                false,
-            )?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"})
-                );
-            } else {
-                println!("quick-archive complete: \"{unit_name}\" written to \"{volume}\"");
-            }
         }
-        Commands::Db { ref command } => match command {
-            cli::DbCommands::Backup { to, include_keys } => {
-                cli::operations::db_backup(&paths, to, *include_keys)?;
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"backup": to, "keys_included": include_keys})
-                    );
-                } else if *include_keys {
-                    println!("database and keys backed up to {to}");
-                } else {
-                    println!(
-                        "database backed up to {to} (private keys not included — pass --include-keys to copy them)"
-                    );
-                }
-            }
-            cli::DbCommands::Fsck { repair } => {
-                let report = cli::operations::db_fsck(&conn, *repair)?;
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"integrity_ok": report.integrity_ok, "issues": report.issues, "repaired": report.repaired})
-                    );
-                } else {
-                    println!(
-                        "fsck: integrity={}, issues={}, repaired={}",
-                        if report.integrity_ok { "ok" } else { "FAIL" },
-                        report.issues.len(),
-                        report.repaired,
-                    );
-                    for issue in &report.issues {
-                        println!("  {issue}");
-                    }
-                }
-                // issue #45/H10: fsck must not exit 0 when it found real
-                // problems — see `fsck_exit_code` for the exact rule.
-                exit_if_nonzero(fsck_exit_code(&report));
-            }
-            cli::DbCommands::Export => {
-                // Full streaming JSON dump of the database (issue #61):
-                // schema_version + every user table, enumerated from
-                // sqlite_master at runtime. `--json` is a no-op here since
-                // the output is unconditionally JSON. Nothing but the JSON
-                // document itself may go to stdout on this path.
-                let stdout = std::io::stdout();
-                let mut writer = std::io::BufWriter::new(stdout.lock());
-                db::export::export_json(&conn, &mut writer)?;
-            }
-            cli::DbCommands::Import { path: import_path } => {
-                cli::operations::db_import(&paths, import_path, cli.yes, cli.dry_run, cli.json)?;
-            }
-            cli::DbCommands::Stats => {
-                let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-                let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-                let db_size = page_count * page_size;
-                let table_count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"size_bytes": db_size, "tables": table_count, "pages": page_count})
-                    );
-                } else {
-                    println!(
-                        "database: {} KB, {table_count} tables, {page_count} pages",
-                        db_size / 1024
-                    );
-                }
-            }
-        },
-        Commands::Config { ref command } => match command {
-            cli::ConfigCommands::Show => {
-                let toml_str = std::fs::read_to_string(&paths.config_file)?;
-                if cli.json {
-                    let val: toml::Value = toml_str
-                        .parse()
-                        .unwrap_or(toml::Value::String(toml_str.clone()));
-                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
-                } else {
-                    print!("{toml_str}");
-                }
-            }
-            cli::ConfigCommands::Check => {
-                let toml_str = std::fs::read_to_string(&paths.config_file)?;
-
-                // Advisory scan for pre-existing dotfiles that still shadow
-                // an archive_set's policy fields (Recast of v4.0 §2.2,
-                // docs/design-errata.md, issue #92). Never affects the
-                // exit code and never rewrites anything — the operator
-                // owns these files.
-                let shadowing_hits = if paths.db_file.exists() {
-                    policy::shadowing::scan(&conn)
-                } else {
-                    Vec::new()
-                };
-
-                match toml_str.parse::<toml::Value>() {
-                    Ok(_) => {
-                        let loaded = config::Config::load(&paths.config_file)?;
-
-                        // Advisory scan for `preserve_acls = false`, which
-                        // cannot take effect: dar has no independent ACL
-                        // switch, so ACLs ride EAs (CTO decision
-                        // 2026-07-31, issue #50; docs/design-errata.md).
-                        // Same contract as the shadowing scan above —
-                        // advises, rewrites nothing, never changes the
-                        // exit code.
-                        let subsumed_hits = if paths.db_file.exists() {
-                            policy::subsumed::scan(&loaded, &conn)
-                        } else {
-                            policy::subsumed::scan(
-                                &loaded,
-                                &rusqlite::Connection::open_in_memory()?,
-                            )
-                        };
-                        // Decorative-key advisory (issue #62, #92/#50
-                        // precedent): keys that are parsed but have no
-                        // reader yet get surfaced, not deleted.
-                        let decorative_hits = policy::decorative::scan(&loaded);
-
-                        // Advisory scan (issue #97): a pre-existing
-                        // archive_sets row whose compression the local dar
-                        // cannot perform — validation only runs at write
-                        // time, so a row written before that guard (or
-                        // against a different dar build) can still be
-                        // sitting there. Never rewrites, never touches the
-                        // exit code.
-                        let unsupported_compression_hits = if paths.db_file.exists() {
-                            policy::compression_capability::scan(&conn, &loaded.dar.binary)
-                        } else {
-                            Vec::new()
-                        };
-
-                        // Depth checks (issue #62): does the config
-                        // actually work, not just parse? Warnings only —
-                        // never touches the exit code. Never opens a tape
-                        // device — existence checks only.
-                        let dar_check = policy::depth_check::check_dar(&loaded.dar.binary);
-                        let staging_check =
-                            policy::depth_check::check_staging(&loaded.staging.directory);
-                        let tape_device_checks = policy::depth_check::scan_tape_devices(&loaded);
-
-                        if cli.json {
-                            let shadowing_json: Vec<_> = shadowing_hits
-                                .iter()
-                                .map(|h| {
-                                    serde_json::json!({
-                                        "unit": h.unit_name,
-                                        "dotfile_path": h.dotfile_path.display().to_string(),
-                                        "checksum_mode_set": h.checksum_mode_set,
-                                        "compression_set": h.compression_set,
-                                    })
-                                })
-                                .collect();
-                            let subsumed_json: Vec<_> = subsumed_hits
-                                .iter()
-                                .map(|h| {
-                                    serde_json::json!({
-                                        "source": h.source,
-                                        "field": "preserve_acls",
-                                        "note": policy::subsumed::describe(h),
-                                    })
-                                })
-                                .collect();
-                            let decorative_json: Vec<_> = decorative_hits
-                                .iter()
-                                .map(|h| {
-                                    serde_json::json!({
-                                        "key": h.key,
-                                        "note": policy::decorative::describe(h),
-                                    })
-                                })
-                                .collect();
-                            let dar_json = match &dar_check {
-                                policy::depth_check::DarCheck::Missing { path } => {
-                                    serde_json::json!({"status": "missing", "path": path})
-                                }
-                                policy::depth_check::DarCheck::NotExecutable { path } => {
-                                    serde_json::json!({"status": "not_executable", "path": path})
-                                }
-                                policy::depth_check::DarCheck::Unreadable { path, detail } => {
-                                    serde_json::json!({"status": "unreadable", "path": path, "detail": detail})
-                                }
-                                policy::depth_check::DarCheck::TooOld {
-                                    path,
-                                    found,
-                                    minimum,
-                                } => {
-                                    serde_json::json!({"status": "too_old", "path": path, "found": found, "minimum": minimum})
-                                }
-                                policy::depth_check::DarCheck::Ok { path, version } => {
-                                    serde_json::json!({"status": "ok", "path": path, "version": version})
-                                }
-                            };
-                            let staging_json = match &staging_check {
-                                policy::depth_check::StagingCheck::Missing { path } => {
-                                    serde_json::json!({"status": "missing", "path": path})
-                                }
-                                policy::depth_check::StagingCheck::NotWritable { path, detail } => {
-                                    serde_json::json!({"status": "not_writable", "path": path, "detail": detail})
-                                }
-                                policy::depth_check::StagingCheck::Writable { path } => {
-                                    serde_json::json!({"status": "writable", "path": path})
-                                }
-                            };
-                            let tape_devices_json: Vec<_> = tape_device_checks
-                                .iter()
-                                .map(|c| {
-                                    serde_json::json!({
-                                        "backend": c.backend_name,
-                                        "device_tape": c.device_tape,
-                                        "device_tape_exists": c.device_tape_exists,
-                                        "device_sg": c.device_sg,
-                                        "device_sg_exists": c.device_sg_exists,
-                                    })
-                                })
-                                .collect();
-                            let unsupported_compression_json: Vec<_> = unsupported_compression_hits
-                                .iter()
-                                .map(|h| {
-                                    serde_json::json!({
-                                        "archive_set": h.archive_set_name,
-                                        "compression": h.compression,
-                                        "note": policy::compression_capability::describe(h),
-                                    })
-                                })
-                                .collect();
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "valid": true,
-                                    "shadowing_dotfiles": shadowing_json,
-                                    "subsumed_policy_fields": subsumed_json,
-                                    "decorative_keys": decorative_json,
-                                    "dar": dar_json,
-                                    "staging": staging_json,
-                                    "tape_devices": tape_devices_json,
-                                    "unsupported_compression": unsupported_compression_json,
-                                })
-                            );
-                        } else {
-                            println!("config: valid");
-                            for hit in &shadowing_hits {
-                                let mut fields = Vec::new();
-                                if hit.checksum_mode_set {
-                                    fields.push("checksum_mode");
-                                }
-                                if hit.compression_set {
-                                    fields.push("compression");
-                                }
-                                println!(
-                                    "warning: unit '{}' dotfile sets [policy] {} — this overrides its archive set ({})",
-                                    hit.unit_name,
-                                    fields.join(", "),
-                                    hit.dotfile_path.display()
-                                );
-                            }
-                            if !shadowing_hits.is_empty() {
-                                println!(
-                                    "  hint: remove the shadowing key(s) from each dotfile's [policy] table to defer to the archive set"
-                                );
-                            }
-                            for hit in &subsumed_hits {
-                                println!("{}", policy::subsumed::describe(hit));
-                            }
-                            println!("{}", policy::depth_check::describe_dar(&dar_check));
-                            println!("{}", policy::depth_check::describe_staging(&staging_check));
-                            for check in &tape_device_checks {
-                                println!("{}", policy::depth_check::describe_tape_device(check));
-                            }
-                            for hit in &decorative_hits {
-                                println!("{}", policy::decorative::describe(hit));
-                            }
-                            for hit in &unsupported_compression_hits {
-                                println!("{}", policy::compression_capability::describe(hit));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if cli.json {
-                            println!(
-                                "{}",
-                                serde_json::json!({"valid": false, "error": e.to_string()})
-                            );
-                        } else {
-                            println!("config: INVALID — {e}");
-                        }
-                    }
-                }
-            }
-        },
+        Commands::Db { ref command } => {
+            // Body lives in `cli::db` (issue #112). The exit CODE comes back
+            // here because acting on it — terminating the process — is the
+            // binary's job, not the library's.
+            let exit_code = cli::db::run(&conn, &paths, command, cli.json, cli.yes, cli.dry_run)?;
+            exit_if_nonzero(exit_code);
+        }
+        Commands::Config { ref command } => {
+            cli::config::run(&conn, &paths, command, cli.json)?;
+        }
         Commands::Init { .. } | Commands::Completions { .. } => {
             unreachable!()
         }
@@ -665,64 +309,4 @@ fn check_dar(dar_path: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cli::operations::FsckReport;
-
-    #[test]
-    fn fsck_exit_code_clean_is_success() {
-        let report = FsckReport {
-            integrity_ok: true,
-            issues: vec![],
-            repaired: 0,
-        };
-        assert_eq!(fsck_exit_code(&report), error::EXIT_SUCCESS);
-    }
-
-    #[test]
-    fn fsck_exit_code_broken_integrity_is_violation() {
-        let report = FsckReport {
-            integrity_ok: false,
-            issues: vec!["integrity_check: corrupted".to_string()],
-            repaired: 0,
-        };
-        assert_eq!(fsck_exit_code(&report), error::EXIT_ERROR);
-    }
-
-    #[test]
-    fn fsck_exit_code_broken_integrity_is_violation_even_if_other_things_repaired() {
-        // Integrity failure outranks repair count — repairing orphan rows
-        // does not paper over a corrupted database.
-        let report = FsckReport {
-            integrity_ok: false,
-            issues: vec!["integrity_check: corrupted".to_string(), "1 orphan".into()],
-            repaired: 1,
-        };
-        assert_eq!(fsck_exit_code(&report), error::EXIT_ERROR);
-    }
-
-    #[test]
-    fn fsck_exit_code_issues_found_and_repaired_is_warning() {
-        let report = FsckReport {
-            integrity_ok: true,
-            issues: vec!["3 orphaned write records".to_string()],
-            repaired: 1,
-        };
-        assert_eq!(fsck_exit_code(&report), error::EXIT_WARNING);
-    }
-
-    #[test]
-    fn fsck_exit_code_issues_found_but_not_repaired_is_still_warning() {
-        // Ran without --repair: nothing got fixed (repaired == 0), but the
-        // finding is real and must not be swallowed as a clean 0.
-        let report = FsckReport {
-            integrity_ok: true,
-            issues: vec!["3 orphaned write records".to_string()],
-            repaired: 0,
-        };
-        assert_eq!(fsck_exit_code(&report), error::EXIT_WARNING);
-    }
 }

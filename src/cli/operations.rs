@@ -1481,6 +1481,99 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+// ── Commands moved out of `main.rs` (issue #112) ──
+//
+// The crate is a dual lib+bin target with `main.rs` as a thin wrapper for a
+// reason: integration tests import `tapectl::` and CANNOT reach anything
+// defined in the binary. Logic inlined in `main.rs` was therefore logic no
+// integration test could exercise. These two were the last such command
+// bodies alongside `db` and `config`.
+
+/// `tapectl import`: register a pre-existing volume in the database.
+#[allow(clippy::too_many_arguments)]
+pub fn volume_import(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    backend: &str,
+    media_type: &str,
+    capacity: &str,
+    notes: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let cap_bytes = crate::staging::parse_size_to_bytes(capacity)?;
+    // Resolve backend_name from configured backend of this type, else fall back
+    // to the type string so the row remains self-consistent.
+    let backend_name = match backend {
+        "lto" => config
+            .backends
+            .lto
+            .first()
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| backend.to_string()),
+        _ => backend.to_string(),
+    };
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+        rusqlite::params![label, backend, backend_name, media_type, cap_bytes, notes],
+    )?;
+    let vol_id = conn.last_insert_rowid();
+    crate::db::events::log_created(conn, "volume", vol_id, label, None)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"id": vol_id, "label": label, "status": "imported"})
+        );
+    } else {
+        println!("volume \"{label}\" imported (id={vol_id}, {media_type}, {capacity})");
+    }
+    Ok(())
+}
+
+/// `tapectl quick-archive`: unit init -> snapshot -> stage -> write.
+#[allow(clippy::too_many_arguments)]
+pub fn quick_archive(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    path: &str,
+    tenant: &str,
+    volume: &str,
+    tag: &[String],
+    device: &str,
+    json_output: bool,
+) -> Result<()> {
+    // Step 1: init unit
+    let unit_id = crate::unit::init_unit(conn, paths, path, tenant, None, tag, None)?;
+    let unit_name: String = conn.query_row(
+        "SELECT name FROM units WHERE id = ?1",
+        rusqlite::params![unit_id],
+        |row| row.get(0),
+    )?;
+    println!("unit \"{unit_name}\" initialized");
+    // Step 2: snapshot
+    let snap_id = crate::staging::snapshot_create(conn, &unit_name, config)?;
+    println!("snapshot created (id={snap_id})");
+    // Step 3: stage
+    let ss_id = crate::staging::stage_create(conn, paths, config, snap_id)?;
+    println!("staged (stage_set={ss_id})");
+    // Step 4: write
+    // force=false: quick-archive writes to a caller-provided volume
+    // label with no override surface of its own (issue #27 scopes
+    // --force to `volume init`/`volume write` only).
+    crate::volume::write::volume_write(conn, paths, config, volume, device, 512 * 1024, false)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"})
+        );
+    } else {
+        println!("quick-archive complete: \"{unit_name}\" written to \"{volume}\"");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Issue #32/H6: `unit_check_integrity` was the last H9-class
