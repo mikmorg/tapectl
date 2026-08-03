@@ -896,7 +896,7 @@ fn report_verify_status(
 fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bool) -> Result<()> {
     let mut sql = String::from(
         "SELECT v.label, h.operation, h.logged_at, h.total_bytes,
-                h.total_corrected, h.total_uncorrected
+                h.total_corrected, h.total_uncorrected, h.tape_alerts
          FROM health_logs h
          JOIN volumes v ON v.id = h.volume_id
          WHERE 1=1",
@@ -918,6 +918,10 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
         Option<i64>,
         Option<i64>,
         Option<i64>,
+        // tape_alerts (issue #107). `Option` is the whole point: rows written
+        // before migration 009 genuinely do not know, and rendering that as 0
+        // would assert the drive reported no alerts when nothing was recorded.
+        Option<i64>,
     );
     let rows: Vec<Row> = stmt
         .query_map(params_ref.as_slice(), |row| {
@@ -928,25 +932,38 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(|(label, op, at, bytes, corrected, uncorrected)| {
-            serde_json::json!({"volume": label, "operation": op, "at": at, "bytes": bytes, "corrected": corrected, "uncorrected": uncorrected})
+        let json: Vec<serde_json::Value> = rows.iter().map(|(label, op, at, bytes, corrected, uncorrected, alerts)| {
+            serde_json::json!({"volume": label, "operation": op, "at": at, "bytes": bytes, "corrected": corrected, "uncorrected": uncorrected, "tape_alerts": alerts})
         }).collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         println!("no health logs recorded");
     } else {
-        for (label, op, at, _bytes, corrected, uncorrected) in &rows {
+        for (label, op, at, _bytes, corrected, uncorrected, alerts) in &rows {
+            // A raised tape alert is the drive saying the medium or the head
+            // is going bad. It is shouted rather than tucked in with the
+            // counters, because unlike them it is actionable without a
+            // baseline or a trend. "-" is not-recorded (pre-009 row); 0 is
+            // recorded-and-clean.
+            let alert_note = match alerts {
+                Some(n) if *n > 0 => format!("  ** {n} TAPE ALERT(S) — check the drive/medium **"),
+                Some(_) => String::new(),
+                None => String::new(),
+            };
             println!(
-                "  {label} {}: {} — corrected={} uncorrected={}",
+                "  {label} {}: {} — corrected={} uncorrected={} alerts={}{}",
                 op.as_deref().unwrap_or("?"),
                 at,
                 corrected.unwrap_or(0),
                 uncorrected.unwrap_or(0),
+                alerts.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+                alert_note,
             );
         }
     }

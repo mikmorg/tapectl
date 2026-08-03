@@ -113,10 +113,13 @@ pub fn record(
     raw_log: &str,
 ) -> Result<()> {
     conn.execute(
+        // `tape_alerts` added by migration 009 (issue #107). It had been
+        // parsed on every collection since this module was written and then
+        // dropped on the floor here, because there was no column for it.
         "INSERT INTO health_logs
             (volume_id, operation, total_bytes, total_uncorrected,
-             total_corrected, total_retries, total_rewritten, raw_log)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             total_corrected, total_retries, total_rewritten, tape_alerts, raw_log)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             volume_id,
             operation,
@@ -125,6 +128,7 @@ pub fn record(
             counters.total_corrected,
             counters.total_retries,
             counters.total_rewritten,
+            counters.tape_alerts,
             raw_log,
         ],
     )?;
@@ -288,5 +292,95 @@ Write error counter page [0x2]
         assert_eq!(uncorrected, 0);
         assert_eq!(corrected, 2);
         assert_eq!(raw, "raw log contents");
+    }
+
+    /// Issue #107: `tape_alerts` was parsed on every collection and then
+    /// discarded, because the INSERT wrote eight columns and this was not
+    /// one of them. Migration 009 adds the column; this proves the value
+    /// actually survives the round trip rather than being computed into a
+    /// local and dropped, which is exactly what it did before.
+    ///
+    /// A raised tape alert is the drive reporting that the medium or the
+    /// head is degrading — the most directly actionable signal a tape
+    /// system produces, and it was the one number being thrown away.
+    #[test]
+    fn record_persists_the_tape_alert_count() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-ALERT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+
+        let counters = HealthCounters {
+            total_bytes_processed: 1,
+            total_uncorrected: 0,
+            total_corrected: 0,
+            total_retries: 0,
+            total_rewritten: 0,
+            tape_alerts: 3,
+        };
+        record(&conn, vid, "verify", &counters, "raw").unwrap();
+
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT tape_alerts FROM health_logs WHERE volume_id = ?1",
+                params![vid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            Some(3),
+            "the parsed alert count must reach the database, not a local variable"
+        );
+    }
+
+    /// Zero alerts must store as 0, never NULL. The distinction is the whole
+    /// reason the column is nullable: NULL means "not recorded" (a row
+    /// written before migration 009), 0 means "recorded, and the drive
+    /// raised none". A reader that conflates them would report a clean drive
+    /// for a collection that never happened.
+    #[test]
+    fn zero_alerts_is_stored_as_zero_not_null() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-CLEAN', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+
+        record(
+            &conn,
+            vid,
+            "verify",
+            &HealthCounters {
+                total_bytes_processed: 1,
+                total_uncorrected: 0,
+                total_corrected: 0,
+                total_retries: 0,
+                total_rewritten: 0,
+                tape_alerts: 0,
+            },
+            "raw",
+        )
+        .unwrap();
+
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT tape_alerts FROM health_logs WHERE volume_id = ?1",
+                params![vid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            Some(0),
+            "recorded-and-clean must not read as unknown"
+        );
     }
 }

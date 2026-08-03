@@ -107,6 +107,11 @@ fn migrations() -> Migrations<'static> {
         // which means something different. A cartridge has a media_type, not a
         // storage class. See the migration header.
         M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+        // 009 adds health_logs.tape_alerts (issue #107): the value has always
+        // been parsed from log page 0x2e and then discarded for want of a
+        // column. Nullable with no default — NULL means "not recorded", 0
+        // means "recorded, none raised". See the migration header.
+        M::up(include_str!("migrations/009_health_tape_alerts.sql")),
     ])
 }
 

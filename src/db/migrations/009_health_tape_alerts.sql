@@ -1,0 +1,20 @@
+-- 009: store the tape-alert count that health collection already computes.
+--
+-- Issue #107. `src/tape/health.rs` has always parsed log page 0x2e (TapeAlert,
+-- SSC-3) and summed every raised flag into `HealthCounters.tape_alerts` — and
+-- then thrown the number away, because `health_logs` had no column to put it
+-- in. The INSERT wrote eight columns and this was not one of them.
+--
+-- Worth more than its `severity:low` label: a tape alert is the DRIVE telling
+-- you that the medium or the head is degrading. Unlike the error counters
+-- beside it, which need a baseline and a trend before they mean anything, a
+-- raised alert flag is actionable on its own — it is the most direct warning
+-- a tape system ever gets, and until now the only place it appeared was a
+-- local variable.
+--
+-- Nullable with no default, deliberately. Rows written before this migration
+-- genuinely do not know how many alerts were raised, and backfilling 0 would
+-- assert "the drive reported no alerts" about collections that never recorded
+-- one. NULL says "not recorded"; 0 says "recorded, and there were none". A
+-- reader must not conflate them, and `report health` renders NULL as "-".
+ALTER TABLE health_logs ADD COLUMN tape_alerts INTEGER;
