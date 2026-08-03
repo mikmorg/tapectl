@@ -100,8 +100,14 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!(rows
                         .iter()
+                        // `description` is included because the table shows it
+                        // and, since #72, it is where a warehouse's
+                        // `s3://bucket/prefix` lives -- there is deliberately no
+                        // separate URI column. Omitting it cost the JSON consumer
+                        // the one field that says where the bytes actually are.
                         .map(|r| serde_json::json!({"name": r.name, "kind": r.kind,
-                              "volumes": r.volumes, "deposits": r.deposits}))
+                              "volumes": r.volumes, "deposits": r.deposits,
+                              "description": r.description}))
                         .collect::<Vec<_>>()))
                     .unwrap()
                 );

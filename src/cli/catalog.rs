@@ -17,7 +17,11 @@ pub enum CatalogCommands {
 
     /// Search for files by pattern
     Search {
-        /// Search pattern (substring match)
+        /// Search pattern. Split on non-alphanumerics; each token is
+        /// PREFIX-matched and all must match (AND). So "foo bar" finds
+        /// paths containing a word starting with foo AND one starting
+        /// with bar -- it is not a substring match, and "ar" will not
+        /// find "bar".
         pattern: String,
         /// Limit results
         #[arg(long, default_value = "50")]
@@ -182,7 +186,7 @@ pub fn run(conn: &Connection, command: &CatalogCommands, json_output: bool) -> R
                         modified: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                         sha256: row
                             .get::<_, Option<String>>(3)?
-                            .map(|s| format!("{}...", &s[..12]))
+                            .map(|s| short_hash(&s))
                             .unwrap_or_else(|| "(unstaged)".into()),
                     })
                 })?
@@ -350,8 +354,54 @@ fn format_size(bytes: i64) -> String {
     }
 }
 
+/// First 12 characters of a hash, elided — or the whole thing when it is
+/// shorter than that.
+///
+/// Issue #110: this was `&s[..12]`, which PANICS on a string shorter than 12
+/// bytes (and, in general, on a byte index that falls mid-UTF-8). Hashes are
+/// hex so length is the live risk, and a truncated or hand-edited row should
+/// never crash a read-only listing.
+fn short_hash(s: &str) -> String {
+    match s.get(..12) {
+        Some(head) => format!("{head}..."),
+        None => s.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // --- issue #110 item 1: short-hash elision must not panic ---
+
+    #[test]
+    fn short_hash_elides_a_full_length_hash() {
+        let h = "0123456789abcdef0123456789abcdef";
+        assert_eq!(super::short_hash(h), "0123456789ab...");
+    }
+
+    /// The actual defect: `&s[..12]` panicked here. A read-only listing must
+    /// survive a truncated or hand-edited row.
+    #[test]
+    fn short_hash_returns_a_short_string_whole_instead_of_panicking() {
+        assert_eq!(super::short_hash("abc"), "abc");
+        assert_eq!(super::short_hash(""), "");
+    }
+
+    /// Exactly 12 is the boundary `..12` gets right and off-by-one gets wrong.
+    #[test]
+    fn short_hash_handles_the_exact_boundary() {
+        assert_eq!(super::short_hash("0123456789ab"), "0123456789ab...");
+    }
+
+    /// Byte-slicing also panics mid-UTF-8. Hashes are hex, but the function
+    /// is a general string helper and must not be a landmine for a future
+    /// caller.
+    #[test]
+    fn short_hash_does_not_panic_on_multibyte_characters() {
+        let s = "ααααααα"; // 7 chars, 14 bytes — byte 12 is mid-character
+        let out = super::short_hash(s);
+        assert!(!out.is_empty());
+    }
+
     use super::*;
     use crate::db;
 

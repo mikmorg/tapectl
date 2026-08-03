@@ -31,4 +31,4 @@ Path to config file
 Print help
 .TP
 <\fIPATTERN\fR>
-Search pattern (substring match)
+Search pattern. Split on non\-alphanumerics; each token is PREFIX\-matched and all must match (AND). So "foo bar" finds paths containing a word starting with foo AND one starting with bar \-\- it is not a substring match, and "ar" will not find "bar"

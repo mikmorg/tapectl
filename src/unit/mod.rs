@@ -5,6 +5,7 @@ pub mod nesting;
 use std::path::Path;
 
 use rusqlite::Connection;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::TapectlPaths;
@@ -116,7 +117,6 @@ pub fn init_bulk(
     parent_dir: &str,
     tenant_name: &str,
     tags: &[String],
-    _depth: usize,
 ) -> Result<Vec<(String, std::result::Result<i64, TapectlError>)>> {
     let parent = std::fs::canonicalize(parent_dir)
         .map_err(|_| TapectlError::UnitPathNotFound(parent_dir.to_string()))?;
@@ -174,13 +174,41 @@ pub fn rename_unit(conn: &Connection, current_name: &str, new_name: &str) -> Res
         Some(unit.tenant_id),
     )?;
 
-    // Update dotfile if path exists
+    // Update dotfile if path exists.
+    //
+    // Failures here are WARNED, not swallowed (issue #110). The rename has
+    // already been committed to the database, so a dotfile that does not get
+    // rewritten leaves the unit's on-disk identity stale -- and the operator
+    // has no other signal that it happened. It is deliberately not an error:
+    // the database is authoritative for the name, and failing the whole
+    // rename after it has been recorded would be worse than a stale dotfile.
+    // But silence was wrong; the two failure modes are named separately
+    // because they need different fixes (unreadable/corrupt file vs an
+    // unwritable one).
     if let Some(ref path) = unit.current_path {
         let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
         if dotfile_path.exists() {
-            if let Ok(mut df) = dotfile::read_dotfile(&dotfile_path) {
-                df.name = new_name.to_string();
-                let _ = dotfile::write_dotfile(&dotfile_path, &df);
+            match dotfile::read_dotfile(&dotfile_path) {
+                Ok(mut df) => {
+                    df.name = new_name.to_string();
+                    if let Err(e) = dotfile::write_dotfile(&dotfile_path, &df) {
+                        warn!(
+                            path = %dotfile_path.display(),
+                            error = %e,
+                            new_name,
+                            "unit renamed in the database, but its .tapectl-unit.toml \
+                             could not be rewritten — the dotfile still carries the old \
+                             name and must be corrected by hand"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    path = %dotfile_path.display(),
+                    error = %e,
+                    new_name,
+                    "unit renamed in the database, but its .tapectl-unit.toml could not \
+                     be read, so the name on disk is now stale"
+                ),
             }
         }
     }
@@ -371,5 +399,42 @@ mod tests {
         let resolved = crate::policy::resolve(&conn, &config, &unit).unwrap();
         assert_eq!(resolved.min_copies, 2);
         assert_eq!(resolved.compression, "none");
+    }
+
+    // --- issue #110 item 5: rename must not swallow dotfile failures ---
+
+    /// A rename whose dotfile cannot be rewritten still SUCCEEDS — the
+    /// database is authoritative for the name, and failing the rename after
+    /// it has already been committed would be worse than a stale dotfile.
+    /// What changed is that it no longer does so silently (`let _ = ...`);
+    /// it warns naming the path. The warning itself is a `tracing` event, so
+    /// what is pinned here is the contract around it: the DB rename lands,
+    /// and the operator is not left with a *failed* command.
+    #[test]
+    fn rename_with_an_unreadable_dotfile_still_renames_in_the_database() {
+        let (conn, tmp, paths) = harness();
+        let unit_dir = tmp.path().join("photos");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        init_unit(
+            &conn,
+            &paths,
+            unit_dir.to_str().unwrap(),
+            "alice",
+            Some("photos"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        // Corrupt the dotfile so `read_dotfile` fails.
+        std::fs::write(unit_dir.join(".tapectl-unit.toml"), "not [ valid toml = =").unwrap();
+
+        rename_unit(&conn, "photos", "pictures")
+            .expect("a bad dotfile must not fail a rename already committed to the DB");
+
+        let name: String = conn
+            .query_row("SELECT name FROM units WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "pictures", "the database rename must have landed");
     }
 }

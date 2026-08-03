@@ -88,39 +88,7 @@ pub fn run(
             }
         }
         CartridgeCommands::List { status } => {
-            let sql = if let Some(st) = status {
-                format!(
-                    "SELECT c.barcode, c.media_type, c.status, c.total_load_count,
-                            (SELECT v.label FROM cartridge_volumes cv
-                             JOIN volumes v ON v.id = cv.volume_id
-                             WHERE cv.cartridge_id = c.id AND cv.unmounted_at IS NULL
-                             LIMIT 1) as current_vol
-                     FROM cartridges c WHERE c.status = '{st}' ORDER BY c.barcode"
-                )
-            } else {
-                "SELECT c.barcode, c.media_type, c.status, c.total_load_count,
-                        (SELECT v.label FROM cartridge_volumes cv
-                         JOIN volumes v ON v.id = cv.volume_id
-                         WHERE cv.cartridge_id = c.id AND cv.unmounted_at IS NULL
-                         LIMIT 1) as current_vol
-                 FROM cartridges c ORDER BY c.barcode"
-                    .to_string()
-            };
-            let mut stmt = conn.prepare(&sql)?;
-            let rows: Vec<CartridgeRow> = stmt
-                .query_map([], |row| {
-                    Ok(CartridgeRow {
-                        barcode: row.get(0)?,
-                        media_type: row.get(1)?,
-                        status: row.get(2)?,
-                        loads: row
-                            .get::<_, Option<i64>>(3)?
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
-                        volume: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let rows = cartridge_rows(conn, status.as_deref())?;
             if json_output {
                 println!(
                     "{}",
@@ -200,4 +168,102 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// Cartridge listing rows, split out from the printing so they are assertable
+/// in tests without capturing stdout — the same pattern as `report`'s
+/// `dirty_rows` / `fire_risk_rows` / `copies_rows`.
+///
+/// Issue #110: the status filter used to be INTERPOLATED into the SQL
+/// (`WHERE c.status = '{st}'`). It arrives from a clap arg on a
+/// single-operator tool, so it was hygiene rather than a live exploit — but
+/// every other query in this file binds, and one interpolated string is how
+/// the habit erodes.
+fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<CartridgeRow>> {
+    const SELECT: &str = "SELECT c.barcode, c.media_type, c.status, c.total_load_count,
+                (SELECT v.label FROM cartridge_volumes cv
+                 JOIN volumes v ON v.id = cv.volume_id
+                 WHERE cv.cartridge_id = c.id AND cv.unmounted_at IS NULL
+                 LIMIT 1) as current_vol
+         FROM cartridges c";
+    let sql = match status {
+        Some(_) => format!("{SELECT} WHERE c.status = ?1 ORDER BY c.barcode"),
+        None => format!("{SELECT} ORDER BY c.barcode"),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let bound: Vec<&dyn rusqlite::types::ToSql> = match &status {
+        Some(st) => vec![st],
+        None => vec![],
+    };
+    let rows = stmt
+        .query_map(bound.as_slice(), |row| {
+            Ok(CartridgeRow {
+                barcode: row.get(0)?,
+                media_type: row.get(1)?,
+                status: row.get(2)?,
+                loads: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                volume: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed() -> Connection {
+        let conn = crate::db::open_memory().unwrap();
+        // Real statuses from the 001 CHECK constraint — an invented one is
+        // rejected outright, which is the schema doing its job.
+        for (bc, st) in [
+            ("A001L6", "available"),
+            ("A002L6", "retired_permanent"),
+            ("A003L6", "available"),
+        ] {
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, status, nominal_capacity)
+                 VALUES (?1, 'LTO-6', ?2, 2500000000000)",
+                rusqlite::params![bc, st],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Issue #110 item 2: the status filter is a bound parameter now. This
+    /// proves it still FILTERS — a binding mistake that silently returned
+    /// everything would look fine to a smoke test that only checked the
+    /// command exits 0.
+    #[test]
+    fn status_filter_is_applied_and_bound() {
+        let conn = seed();
+        let rows = cartridge_rows(&conn, Some("available")).unwrap();
+        assert_eq!(rows.len(), 2, "only the two available cartridges");
+        assert!(rows.iter().all(|r| r.status == "available"));
+    }
+
+    #[test]
+    fn no_filter_lists_everything() {
+        let conn = seed();
+        assert_eq!(cartridge_rows(&conn, None).unwrap().len(), 3);
+    }
+
+    /// A value containing a quote must be treated as data, not SQL. Under the
+    /// old interpolation this string would have produced a syntax error or
+    /// worse; bound, it simply matches nothing.
+    #[test]
+    fn a_quote_in_the_status_is_data_not_sql() {
+        let conn = seed();
+        let rows = cartridge_rows(&conn, Some("available' OR '1'='1")).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a quoted payload must match no rows, not inject (got {} rows)",
+            rows.len()
+        );
+    }
 }

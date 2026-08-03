@@ -150,7 +150,7 @@ pub fn run(
         }
 
         UnitCommands::InitBulk { path, tenant, tag } => {
-            let results = crate::unit::init_bulk(conn, paths, path, tenant, tag, 1)?;
+            let results = crate::unit::init_bulk(conn, paths, path, tenant, tag)?;
             let mut success = 0;
             let mut failed = 0;
             for (dir, result) in &results {
