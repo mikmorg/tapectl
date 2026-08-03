@@ -5,7 +5,7 @@ autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **four software issues remain agent work; the hardware
+The short version: **three software issues remain agent work; the hardware
 measurement harness is built (`scripts/lto6-measure.sh`). Three things are irreducibly yours** — the Heir Kit
 ceremony, the LTO-6 session on real media, and the first production write.
 
@@ -36,7 +36,7 @@ Taken in severity order. All that remain are lows.
 | ~~#114~~ | **DONE (`a9eb90b`).** `TapectlError::PolicyUnresolvable` carries a `PolicyLayer`; the action names the layer that actually broke. |
 | #112 | Move four inlined command bodies out of `main.rs` into `src/cli/`. |
 | #111 | Test-harness hygiene: hardcoded roots and devices. |
-| #110 | Grouped one-line correctness and honesty cleanups. |
+| ~~#110~~ | **DONE (`7ce61c4`).** Six fixes: catalog-ls panic, cartridge-list SQL binding, wrong search help, location JSON description, silent rename dotfile failures, vestigial `_depth`. |
 | #109 | Separate `--home` from `--config`. **Not gate-free** — the gate script depends on the current hijack, so the two change together. |
 | ~~#108~~ | **DONE (`a262f65`).** A failed unlink is now reported with its path and named as permanent; the false comment corrected. |
 | ~~#107~~ | **DONE (`c85a86c`, migration 009).** Tape alerts are stored and surfaced by `report health`. **Migration 010 is next.** |
