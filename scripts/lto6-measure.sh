@@ -333,7 +333,14 @@ fi
 say ""
 
 # ---------- close ----------
+# Leave the drive at the block size tapectl actually uses. This run may have
+# set 1 M partway through, and block size is DRIVER state that outlives the
+# process — leaving it there would make the next mhvtl gate run fail in a way
+# that looks like a code regression. Restored explicitly rather than relying
+# on the EOD probe having happened to set it back.
 mt -f "$TAPE_DEV" rewind >/dev/null 2>&1
+mt -f "$TAPE_DEV" setblk 524288 >/dev/null 2>&1 \
+    || note "> WARNING: could not restore the 512 K block size; run \`mt -f $TAPE_DEV setblk 524288\` before the next gate run."
 rm -f "$PAYLOAD"
 
 say "## Still manual — and still required"
