@@ -222,13 +222,37 @@ pub fn move_volume(conn: &Connection, volume_label: &str, location_name: &str) -
         )
         .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
 
-    let loc_id: i64 = conn
+    let (loc_id, loc_kind): (i64, String) = conn
         .query_row(
-            "SELECT id FROM locations WHERE name = ?1",
+            "SELECT id, kind FROM locations WHERE name = ?1",
             params![location_name],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| TapectlError::Other(format!("location \"{location_name}\" not found")))?;
+
+    // Issue #100 (fallout from #73). `volumes.location_id` answers exactly one
+    // question — "where do I go to fetch this cartridge" — and the answer can
+    // never be an S3 bucket. Recording a physical tape as sitting inside cold
+    // cloud storage is an incoherent record, not merely an odd one.
+    //
+    // A warehouse copy is a DEPOSIT of an already-sealed volume, which is why
+    // #73 gave it its own table rather than reusing this column: the two facts
+    // are asymmetric (a cartridge has one location; a volume can have many
+    // deposits, and a deposit never moves). See the header of
+    // 007_warehouse_locations.sql.
+    //
+    // `move_volume` is the only production writer of `volumes.location_id` —
+    // audited at the time of this change — so this one refusal closes the
+    // whole path.
+    if loc_kind == "warehouse" {
+        return Err(TapectlError::Other(format!(
+            "\"{location_name}\" is a warehouse location, and a physical cartridge cannot \
+             be moved into one — `volumes.location_id` records where to go to FETCH the \
+             tape. To record that a copy of this volume was uploaded to \
+             \"{location_name}\", use:\n    \
+             tapectl volume deposit add {volume_label} --to {location_name}"
+        )));
+    }
 
     let old_loc: Option<i64> = conn.query_row(
         "SELECT location_id FROM volumes WHERE id = ?1",
@@ -261,4 +285,92 @@ pub fn move_volume(conn: &Connection, volume_label: &str, location_name: &str) -
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seed one shelf location, one warehouse location, and a sealed volume.
+    fn setup() -> Connection {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Issue #100: `volumes.location_id` answers "where do I go to fetch this
+    /// cartridge", and the answer can never be an S3 bucket. Moving a tape
+    /// into a warehouse is an incoherent record, not merely an odd one.
+    #[test]
+    fn move_refuses_a_warehouse_destination() {
+        let conn = setup();
+        let err = move_volume(&conn, "L6-0001", "glacier")
+            .expect_err("a cartridge cannot be moved into cold cloud storage");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("volume deposit add"),
+            "the refusal must name the thing the operator probably meant; got: {msg}"
+        );
+
+        // And nothing was recorded — neither the location nor a movement.
+        let loc: Option<i64> = conn
+            .query_row(
+                "SELECT location_id FROM volumes WHERE label = 'L6-0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loc, None, "a refused move must not update location_id");
+        let movements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM volume_movements", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(movements, 0, "a refused move must not log a movement");
+    }
+
+    /// The other direction, so the refusal cannot be "reject everything":
+    /// a shelf destination still works exactly as before.
+    #[test]
+    fn move_to_a_shelf_still_succeeds_and_records_the_movement() {
+        let conn = setup();
+        move_volume(&conn, "L6-0001", "home").expect("a shelf is a valid destination");
+
+        let loc_name: String = conn
+            .query_row(
+                "SELECT l.name FROM volumes v JOIN locations l ON l.id = v.location_id
+                 WHERE v.label = 'L6-0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loc_name, "home");
+        let movements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM volume_movements", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(movements, 1);
+    }
+
+    /// An unknown location must still be a not-found error, not the new
+    /// warehouse refusal — the kind lookup must not swallow that case.
+    #[test]
+    fn move_to_an_unknown_location_still_reports_not_found() {
+        let conn = setup();
+        let err = move_volume(&conn, "L6-0001", "nowhere").expect_err("no such location");
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
 }

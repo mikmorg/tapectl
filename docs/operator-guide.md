@@ -734,6 +734,14 @@ tapectl volume move <label> --to <location>
 tapectl cartridge info <barcode>       # physical cartridge, tracked separately
 ```
 
+`--to` must be a **shelf** location. A warehouse destination is refused
+(issue #100): `volumes.location_id` records where to go to *fetch* the
+cartridge, and the answer can never be an S3 bucket. To record that a copy of
+a volume's bytes was uploaded to cold storage, use `volume deposit add`
+instead — a deposit is a separate fact in a separate table, because a
+cartridge has one location while a volume can carry several deposits and a
+deposit never moves.
+
 `volume retire` shows an impact analysis of which units lose copies, and — for
 every affected unit that still retains coverage after the retirement — which
 volume that remaining coverage rests on and how old its last passing
