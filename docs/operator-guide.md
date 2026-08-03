@@ -120,6 +120,25 @@ Validate with:
 tapectl config check
 ```
 
+### Working on a different archive
+
+Everything lives under `~/.tapectl` by default. To operate on a different one
+— a copy on an external disk, a restored catalog, a scratch archive for a
+drill — pass `--home` (or export `TAPECTL_HOME`):
+
+```bash
+tapectl --home /mnt/usb/archive report copies
+TAPECTL_HOME=/mnt/usb/archive tapectl audit
+```
+
+`--config` points at a config *file*. On its own it **also** relocates the
+whole home to that file's parent directory — database, keys, catalogs,
+receipts — which is surprising, and it warns when you do it. It still works,
+because scripts and test harnesses have long relied on it for isolation, and
+silently repointing them at the real archive would be worse than the
+surprise. Use `--home` to choose the archive and `--config` only to name a
+file inside it (issue #109).
+
 ## Day-to-Day Operations
 
 ### Register Units

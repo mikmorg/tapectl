@@ -65,7 +65,11 @@ BIN="${CARGO_TARGET_DIR:-target}/debug/tapectl"
 
 HOME_DIR="$RUN/home"; mkdir -p "$HOME_DIR"
 CFG="$HOME_DIR/config.toml"
-TCTL() { "$BIN" --config "$CFG" "$@"; }
+# --home, not --config (issue #109). `--config` alone still relocates the
+# whole home to the config file's parent — which is how this gate used to get
+# an isolated ~/.tapectl — but that is now the deprecated, warning path. The
+# gate says what it means: HOME_DIR is the archive, CFG is the file in it.
+TCTL() { "$BIN" --home "$HOME_DIR" --config "$CFG" "$@"; }
 
 # ---------- check harness ----------
 declare -A RESULT
@@ -370,7 +374,7 @@ interrupt_write_parked() { # interrupt_write_parked <label> [signal=INT]
     rm -f "$marker"
     start=$SECONDS
     TAPECTL_TEST_PAUSE_AFTER_PLAN="$marker" \
-        "$BIN" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+        "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
         [ -e "$marker" ] && break
@@ -388,7 +392,7 @@ interrupt_write_parked() { # interrupt_write_parked <label> [signal=INT]
 interrupt_write() { # interrupt_write <label> <sql-ready> <what> [signal=INT]
     local label="$1" ready_sql="$2" what="$3" sig="${4:-INT}" pid start waited
     start=$SECONDS
-    "$BIN" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+    "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
     pid=$!
     # Wait for the condition, but never past the process exiting or 120s.
     while kill -0 "$pid" 2>/dev/null; do

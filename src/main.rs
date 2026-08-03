@@ -86,14 +86,43 @@ fn fsck_exit_code(report: &cli::operations::FsckReport) -> i32 {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    // Resolve paths
-    let paths = if let Some(ref config_path) = cli.config {
-        // If --config is given, derive home from the config file's parent
+    // Resolve paths (issue #109).
+    //
+    // Three inputs, in precedence order: --home, TAPECTL_HOME, then the
+    // legacy "--config relocates everything" behaviour, then the default.
+    //
+    // The legacy behaviour is KEPT rather than removed. `--config` deriving
+    // the whole home from the config file's parent is genuinely surprising —
+    // point it at a config in an unexpected directory and you get an empty
+    // catalog instead of an error — but it is also exactly how every test
+    // harness obtains an isolated home. Removing it would mean a script that
+    // used `--config` for isolation silently starts operating on the REAL
+    // ~/.tapectl, which is far worse than the surprise being fixed. So it
+    // still works, and now says so; `--home` is the explicit way to mean it.
+    let paths = if let Some(home) = cli
+        .home
+        .clone()
+        .or_else(|| std::env::var("TAPECTL_HOME").ok())
+    {
+        let mut p = TapectlPaths::new(std::path::PathBuf::from(home));
+        if let Some(ref config_path) = cli.config {
+            // Both given: --home selects the archive, --config selects the
+            // file within it. No warning — this combination is unambiguous.
+            p.config_file = std::path::PathBuf::from(config_path);
+        }
+        p
+    } else if let Some(ref config_path) = cli.config {
         let config_file = std::path::Path::new(config_path);
         let home = config_file
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
+        tracing::warn!(
+            home = %home.display(),
+            "--config given without --home: the tapectl home (database, keys, \
+             catalogs, receipts) is being taken from the config file's parent \
+             directory. Pass --home to say that explicitly."
+        );
         TapectlPaths::new(home)
     } else {
         TapectlPaths::default_paths()

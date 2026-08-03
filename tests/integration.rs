@@ -2178,6 +2178,11 @@ watch_roots = ["{bogus_root_str}"]
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
+            // --home, not bare --config (issue #109): --config alone still
+            // relocates the whole home to the file's parent, but that is the
+            // deprecated warning path. Say what we mean.
+            "--home",
+            home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "--json",
@@ -2236,6 +2241,8 @@ fn test_db_backup_json_reports_whether_keys_were_included() {
 
     let run_backup = |dest: &std::path::Path, include_keys: bool| -> serde_json::Value {
         let mut args = vec![
+            "--home".to_string(),
+            home.to_str().unwrap().to_string(),
             "--config".to_string(),
             config_path.to_str().unwrap().to_string(),
             "--json".to_string(),
@@ -2478,6 +2485,11 @@ fn test_volume_retire_shows_coverage_evidence_age() {
     let config_path = home.join("config.toml");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
+            // --home, not bare --config (issue #109): --config alone still
+            // relocates the whole home to the file's parent, but that is the
+            // deprecated warning path. Say what we mean.
+            "--home",
+            home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "--json",
@@ -2669,6 +2681,11 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
     let config_path = home.join("config.toml");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
+            // --home, not bare --config (issue #109): --config alone still
+            // relocates the whole home to the file's parent, but that is the
+            // deprecated warning path. Say what we mean.
+            "--home",
+            home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "--json",
@@ -2716,6 +2733,11 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
     // the same evidence line alongside the existing summary line.
     let text_output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
+            // --home, not bare --config (issue #109): --config alone still
+            // relocates the whole home to the file's parent, but that is the
+            // deprecated warning path. Say what we mean.
+            "--home",
+            home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "unit",
@@ -2758,6 +2780,11 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
 
     let guard_output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
+            // --home, not bare --config (issue #109): --config alone still
+            // relocates the whole home to the file's parent, but that is the
+            // deprecated warning path. Say what we mean.
+            "--home",
+            home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "unit",
@@ -2883,6 +2910,11 @@ fn test_compact_finish_shows_coverage_evidence() {
     let config_path = home.join("config.toml");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
+            // --home, not bare --config (issue #109): --config alone still
+            // relocates the whole home to the file's parent, but that is the
+            // deprecated warning path. Say what we mean.
+            "--home",
+            home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "--json",

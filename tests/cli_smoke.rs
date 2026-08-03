@@ -665,3 +665,116 @@ fn staging_clean_json_is_pure_and_reports_session_and_lockfile_counters() {
     assert_eq!(parsed["session_dirs_reclaimed"], 0);
     assert_eq!(parsed["lockfiles_reclaimed"], 0);
 }
+
+// --- issue #109: --home vs --config ------------------------------------
+
+/// `--home` selects the archive. The database must land under it, not under
+/// `$HOME/.tapectl` — that is the whole point of the flag.
+#[test]
+fn home_flag_places_the_database_under_the_given_directory() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--home", archive.path().to_str().unwrap(), "init"])
+        .env("HOME", real_home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "init --home failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        archive.path().join("tapectl.db").exists(),
+        "--home must place the database in the named directory"
+    );
+    // And it must NOT have touched the real home — an exit-code-only
+    // assertion would pass just as happily if it had.
+    assert!(
+        !real_home.path().join(".tapectl/tapectl.db").exists(),
+        "--home must not fall back to $HOME/.tapectl"
+    );
+}
+
+/// `TAPECTL_HOME` does the same thing, so a shell can export it once.
+#[test]
+fn tapectl_home_env_var_is_honoured() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["init"])
+        .env("HOME", real_home.path())
+        .env("TAPECTL_HOME", archive.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    assert!(archive.path().join("tapectl.db").exists());
+    assert!(!real_home.path().join(".tapectl/tapectl.db").exists());
+}
+
+/// The compatibility guarantee. `--config` alone still relocates the whole
+/// home to the config file's parent — every harness relied on that, and
+/// breaking it would mean a script using `--config` for isolation silently
+/// starts writing to the operator's REAL archive. It warns now, but it works.
+#[test]
+fn config_alone_still_relocates_the_home_and_says_so() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+    let cfg = archive.path().join("config.toml");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--config", cfg.to_str().unwrap(), "init"])
+        .env("HOME", real_home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "the legacy --config behaviour must keep working: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        archive.path().join("tapectl.db").exists(),
+        "--config alone must still derive the home from the config's parent"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--home"),
+        "the surprising behaviour must announce itself and name the fix; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--home` plus `--config` is unambiguous, so it must NOT warn — otherwise
+/// the warning becomes noise on the very invocation that got it right.
+#[test]
+fn home_plus_config_does_not_warn() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args([
+            "--home",
+            archive.path().to_str().unwrap(),
+            "--config",
+            archive.path().join("config.toml").to_str().unwrap(),
+            "init",
+        ])
+        .env("HOME", real_home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("without --home"),
+        "an explicit --home must not trigger the deprecation warning; stderr={stderr}"
+    );
+}

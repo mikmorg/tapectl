@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-archive\-set\-create \- Create a new archive set policy
 .SH SYNOPSIS
-\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-checksum\-mode\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-\-slice\-size\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Create a new archive set policy
 .SH OPTIONS
@@ -47,7 +47,14 @@ Skip confirmation prompts
 Checksum mode
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, receipts, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
 .TP
 \fB\-\-slice\-size\fR \fI<SLICE_SIZE>\fR
 Slice size (e.g., "2400G")
@@ -62,7 +69,7 @@ Warehouse copies expected (ADR\-0006). Omitted leaves the field NULL, which mean
 Description
 .TP
 \fB\-h\fR, \fB\-\-help\fR
-Print help
+Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fINAME\fR>
 Archive set name
