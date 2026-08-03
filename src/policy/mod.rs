@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::config::Config;
 use crate::db::models::Unit;
-use crate::error::{Result, TapectlError};
+use crate::error::{PolicyLayer, Result, TapectlError};
 
 pub mod compression_capability;
 pub mod coverage;
@@ -72,7 +72,12 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         encrypt: defaults.encrypt,
         compression: defaults.compression.clone(),
         checksum_mode: defaults.checksum_mode.clone(),
-        slice_size: crate::staging::parse_size_to_bytes(&defaults.slice_size)?,
+        slice_size: crate::staging::parse_size_to_bytes(&defaults.slice_size).map_err(|e| {
+            TapectlError::PolicyUnresolvable {
+                layer: PolicyLayer::Defaults,
+                detail: format!("config.toml [defaults] slice_size is invalid: {e}"),
+            }
+        })?,
         verify_interval_days: None,
         preserve_xattrs: defaults.preserve_xattrs,
         preserve_acls: defaults.preserve_acls,
@@ -116,12 +121,14 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 },
             )
             .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => TapectlError::Other(format!(
-                    "unit \"{}\" references archive_set_id {} but no such archive set \
-                     exists — the catalog is inconsistent; re-point the unit with \
-                     `tapectl unit init --archive-set <name>` or restore the archive set",
-                    unit.name, as_id
-                )),
+                rusqlite::Error::QueryReturnedNoRows => TapectlError::PolicyUnresolvable {
+                    layer: PolicyLayer::ArchiveSet,
+                    detail: format!(
+                        "unit \"{}\" references archive_set_id {} but no such archive set \
+                         exists — the catalog is inconsistent",
+                        unit.name, as_id
+                    ),
+                },
                 other => TapectlError::Database(other),
             })?;
 
@@ -153,10 +160,13 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             // issue #105; same class, same function.)
             policy.required_locations =
                 serde_json::from_str::<Vec<String>>(&locs).map_err(|e| {
-                    TapectlError::Other(format!(
-                        "archive set {as_id} has an unparseable required_locations value \
-                         ({e}); expected a JSON array of location names, found: {locs}"
-                    ))
+                    TapectlError::PolicyUnresolvable {
+                        layer: PolicyLayer::ArchiveSet,
+                        detail: format!(
+                            "archive set {as_id} has an unparseable required_locations value \
+                             ({e}); expected a JSON array of location names, found: {locs}"
+                        ),
+                    }
                 })?;
         }
         if let Some(v) = encrypt {
@@ -203,19 +213,26 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         // must not be quietly folded back into "absent".
         if dotfile_path.exists() {
             let contents = std::fs::read_to_string(&dotfile_path).map_err(|e| {
-                TapectlError::Other(format!(
-                    "unit \"{}\" has a .tapectl-unit.toml at {} that cannot be read ({e})",
-                    unit.name,
-                    dotfile_path.display()
-                ))
+                TapectlError::PolicyUnresolvable {
+                    layer: PolicyLayer::Dotfile,
+                    detail: format!(
+                        "unit \"{}\" has a .tapectl-unit.toml at {} that cannot be read ({e})",
+                        unit.name,
+                        dotfile_path.display()
+                    ),
+                }
             })?;
-            let toml = contents.parse::<toml::Table>().map_err(|e| {
-                TapectlError::Other(format!(
-                    "unit \"{}\" has a malformed .tapectl-unit.toml at {} ({e})",
-                    unit.name,
-                    dotfile_path.display()
-                ))
-            })?;
+            let toml =
+                contents
+                    .parse::<toml::Table>()
+                    .map_err(|e| TapectlError::PolicyUnresolvable {
+                        layer: PolicyLayer::Dotfile,
+                        detail: format!(
+                            "unit \"{}\" has a malformed .tapectl-unit.toml at {} ({e})",
+                            unit.name,
+                            dotfile_path.display()
+                        ),
+                    })?;
             if let Some(pol) = toml.get("policy").and_then(|v| v.as_table()) {
                 if let Some(v) = pol.get("checksum_mode").and_then(|v| v.as_str()) {
                     policy.checksum_mode = v.to_string();
@@ -224,7 +241,16 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                     policy.compression = v.to_string();
                 }
                 if let Some(v) = pol.get("slice_size").and_then(|v| v.as_str()) {
-                    policy.slice_size = crate::staging::parse_size_to_bytes(v)?;
+                    policy.slice_size = crate::staging::parse_size_to_bytes(v).map_err(|e| {
+                        TapectlError::PolicyUnresolvable {
+                            layer: PolicyLayer::Dotfile,
+                            detail: format!(
+                                "unit \"{}\" has an invalid [policy] slice_size in {} ({e})",
+                                unit.name,
+                                dotfile_path.display()
+                            ),
+                        }
+                    })?;
                 }
                 // ADR-0006 / issue #73. Read straight off the TOML
                 // table, like every other dotfile knob here: absent

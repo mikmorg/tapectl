@@ -156,10 +156,24 @@ fn collect_findings(
                         "policy could not be resolved ({e}); copy_count/location_presence/\
                          verify_age/encryption checks were SKIPPED for this unit"
                     ),
-                    action: format!(
-                        "fix the [policy] section in {}/.tapectl-unit.toml",
-                        unit.current_path.as_deref().unwrap_or("<unit path>")
-                    ),
+                    // Issue #114: the action is derived from WHICH layer
+                    // failed, not assumed to be the dotfile. It used to say
+                    // "fix the [policy] section in <unit>/.tapectl-unit.toml"
+                    // unconditionally — advice that sends the operator to
+                    // edit a file that is not the problem when the real
+                    // fault is a dangling archive_set_id or a bad value in
+                    // config.toml's [defaults]. Anything that is not a
+                    // PolicyUnresolvable keeps the old wording, since the
+                    // dotfile remains the likeliest culprit for an
+                    // unclassified failure.
+                    action: match &e {
+                        crate::error::TapectlError::PolicyUnresolvable { layer, .. } => {
+                            layer.remedy(unit.current_path.as_deref())
+                        }
+                        _ => {
+                            crate::error::PolicyLayer::Dotfile.remedy(unit.current_path.as_deref())
+                        }
+                    },
                 });
                 continue;
             }
@@ -875,6 +889,89 @@ mod tests {
             );
             assert_eq!(findings[0].unit, "volume:SEAL01");
             assert_eq!(findings[0].check, "compaction_candidate");
+        }
+
+        // --- policy_unresolvable action text (issue #114) -----------------
+
+        /// Issue #114: the action must name the layer that actually broke.
+        /// A dangling `archive_set_id` is a CATALOG fault — telling the
+        /// operator to edit the unit's dotfile sends them to a file that is
+        /// not the problem, and they can edit it all day without fixing
+        /// anything.
+        #[test]
+        fn unresolvable_via_archive_set_points_at_the_archive_set_not_the_dotfile() {
+            let (conn, unit_id) = setup();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "UPDATE units SET archive_set_id = 9999 WHERE id = ?1",
+                params![unit_id],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+            let (violations, _warnings) =
+                collect_findings(&conn, &Config::default(), None).unwrap();
+            let f = violations
+                .iter()
+                .find(|f| f.check == "policy_unresolvable")
+                .expect("a dangling archive_set_id must be reported");
+            assert!(
+                f.action.contains("archive-set"),
+                "the action must send the operator to the archive set; got: {}",
+                f.action
+            );
+            assert!(
+                !f.action.contains(".tapectl-unit.toml"),
+                "the action must NOT blame the dotfile for a catalog fault; got: {}",
+                f.action
+            );
+        }
+
+        /// A bad `[defaults]` value affects every unit, so the action must
+        /// say so rather than pointing at one unit's dotfile.
+        #[test]
+        fn unresolvable_via_defaults_points_at_config_toml() {
+            let (conn, _unit_id) = setup();
+            let mut config = Config::default();
+            config.defaults.slice_size = "not-a-size".into();
+
+            let (violations, _warnings) = collect_findings(&conn, &config, None).unwrap();
+            let f = violations
+                .iter()
+                .find(|f| f.check == "policy_unresolvable")
+                .expect("an unparseable defaults.slice_size must be reported");
+            assert!(f.action.contains("config.toml"), "got: {}", f.action);
+            assert!(
+                !f.action.contains(".tapectl-unit.toml"),
+                "got: {}",
+                f.action
+            );
+        }
+
+        /// And the dotfile case still points at the dotfile — otherwise the
+        /// two tests above could pass by never mentioning it at all.
+        #[test]
+        fn unresolvable_via_dotfile_still_points_at_the_dotfile() {
+            let (conn, unit_id) = setup();
+            let tmp = tempfile::TempDir::new().unwrap();
+            std::fs::write(
+                tmp.path().join(".tapectl-unit.toml"),
+                "[policy\nnot valid toml = = =\n",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE units SET current_path = ?1 WHERE id = ?2",
+                params![tmp.path().to_str().unwrap(), unit_id],
+            )
+            .unwrap();
+
+            let (violations, _warnings) =
+                collect_findings(&conn, &Config::default(), None).unwrap();
+            let f = violations
+                .iter()
+                .find(|f| f.check == "policy_unresolvable")
+                .expect("a malformed dotfile must be reported");
+            assert!(f.action.contains(".tapectl-unit.toml"), "got: {}", f.action);
         }
 
         // --- Heir Kit staleness (ADR-0009 / issue #69) -------------------

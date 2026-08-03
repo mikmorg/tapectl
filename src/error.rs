@@ -92,8 +92,59 @@ pub enum TapectlError {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
+    /// A layer of the 3-level policy chain could not be resolved (issue
+    /// #114). Carries WHICH layer, because the remedy differs completely —
+    /// editing a dotfile does not fix a dangling `archive_set_id` — and the
+    /// error text alone cannot be branched on.
+    #[error("{detail}")]
+    PolicyUnresolvable { layer: PolicyLayer, detail: String },
+
     #[error("{0}")]
     Other(String),
+}
+
+/// Which layer of `policy::resolve`'s dotfile > archive_set > defaults chain
+/// failed (issue #114).
+///
+/// Exists so a caller can give the operator an action that is actually
+/// correct. `audit` previously told them to "fix the [policy] section in
+/// <unit>/.tapectl-unit.toml" no matter which layer broke — advice that
+/// sends someone to edit a file that is not the problem when the real fault
+/// is in the catalog or in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyLayer {
+    /// `config.toml`'s `[defaults]` — a bad value there affects every unit.
+    Defaults,
+    /// The unit's `archive_sets` row: missing, or holding unparseable data.
+    ArchiveSet,
+    /// The unit's own `.tapectl-unit.toml`.
+    Dotfile,
+}
+
+impl PolicyLayer {
+    /// The concrete thing an operator should go and fix.
+    ///
+    /// Takes the unit path because only the dotfile remedy is unit-scoped;
+    /// the other two point at shared state, which is itself worth conveying —
+    /// a `[defaults]` fault is not one unit's problem.
+    pub fn remedy(&self, unit_path: Option<&str>) -> String {
+        match self {
+            PolicyLayer::Defaults => {
+                "fix the [defaults] section in ~/.tapectl/config.toml (it affects every unit)"
+                    .to_string()
+            }
+            PolicyLayer::ArchiveSet => {
+                "fix the unit's archive set — `tapectl archive-set list` to find it, \
+                 `tapectl archive-set edit <name>` to correct it, or re-point the unit \
+                 with `tapectl unit init --archive-set <name>`"
+                    .to_string()
+            }
+            PolicyLayer::Dotfile => format!(
+                "fix {}/.tapectl-unit.toml",
+                unit_path.unwrap_or("<unit path>")
+            ),
+        }
+    }
 }
 
 /// Convenience type alias for collection results.
