@@ -5,7 +5,7 @@ autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **three software issues remain agent work; the hardware
+The short version: **two software issues remain agent work; the hardware
 measurement harness is built (`scripts/lto6-measure.sh`). Three things are irreducibly yours** — the Heir Kit
 ceremony, the LTO-6 session on real media, and the first production write.
 
@@ -35,7 +35,7 @@ Taken in severity order. All that remain are lows.
 | ~~#69~~ | **DONE (`d0c8503`).** `key escrow-kit` ships; `audit` reports kit staleness. Only the ceremony remains, under Tier C. |
 | ~~#114~~ | **DONE (`a9eb90b`).** `TapectlError::PolicyUnresolvable` carries a `PolicyLayer`; the action names the layer that actually broke. |
 | #112 | Move four inlined command bodies out of `main.rs` into `src/cli/`. |
-| #111 | Test-harness hygiene: hardcoded roots and devices. |
+| ~~#111~~ | **DONE (`552e44a`).** Device discovery extracted to `scripts/mhvtl-device.sh` — one implementation, gate + e2e both call it. Scratch roots env-overridable; fixtures stay in their TempDir. |
 | ~~#110~~ | **DONE (`7ce61c4`).** Six fixes: catalog-ls panic, cartridge-list SQL binding, wrong search help, location JSON description, silent rename dotfile failures, vestigial `_depth`. |
 | #109 | Separate `--home` from `--config`. **Not gate-free** — the gate script depends on the current hijack, so the two change together. |
 | ~~#108~~ | **DONE (`a262f65`).** A failed unlink is now reported with its path and named as permanent; the false comment corrected. |
