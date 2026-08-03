@@ -5,7 +5,7 @@ autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **five software issues remain agent work; the hardware
+The short version: **four software issues remain agent work; the hardware
 measurement harness is built (`scripts/lto6-measure.sh`). Three things are irreducibly yours** — the Heir Kit
 ceremony, the LTO-6 session on real media, and the first production write.
 
@@ -33,7 +33,7 @@ Taken in severity order. All that remain are lows.
 | Issue | What it is |
 |---|---|
 | ~~#69~~ | **DONE (`d0c8503`).** `key escrow-kit` ships; `audit` reports kit staleness. Only the ceremony remains, under Tier C. |
-| #114 | `audit`'s `policy_unresolvable` action line always blames the dotfile; now often wrong. Needs a policy-source discriminant on the error. |
+| ~~#114~~ | **DONE (`a9eb90b`).** `TapectlError::PolicyUnresolvable` carries a `PolicyLayer`; the action names the layer that actually broke. |
 | #112 | Move four inlined command bodies out of `main.rs` into `src/cli/`. |
 | #111 | Test-harness hygiene: hardcoded roots and devices. |
 | #110 | Grouped one-line correctness and honesty cleanups. |
