@@ -52,9 +52,34 @@ use crate::error::Result;
 /// on a staged `.age` file, so every DB change (nulling `staging_path`,
 /// marking the stage_set `'cleaned'`) is collected and committed BEFORE any
 /// file is unlinked. Unlinking first would strand a live snapshot pointing
-/// at nothing if the process died between the unlink and the DB update —
-/// worse than leaving an orphaned file behind for a later `staging clean`
-/// to pick up.
+/// at nothing if the process died between the unlink and the DB update.
+/// Do NOT invert this.
+///
+/// **The cost of that ordering, stated honestly (issue #108).** An earlier
+/// version of this comment justified the ordering as "better than leaving an
+/// orphaned file behind for a later `staging clean` to pick up". That was
+/// false, and the falsehood mattered: a later clean **cannot** pick it up.
+/// `.age` discovery is strictly `staging_path IS NOT NULL`, which is the
+/// column this function has just nulled, and `find_plaintext_orphans` runs
+/// only for `'failed'` sets and only matches `.dar`/`.sha512`. So a file
+/// whose unlink fails is invisible to every future cleanup path, **forever**,
+/// and only a human can remove it.
+///
+/// The ordering is still right — a row pointing at a file that is gone is
+/// worse than a file no row points at — so the fix is not to reorder but to
+/// make the stranding *visible at the moment it happens*. Every failed unlink
+/// is recorded in [`CleanReport::stranded`] with its path, and the CLI prints
+/// those paths and says plainly that they are permanent. A bare error count
+/// (what this used to report) tells an operator that something is wrong but
+/// not which file, which for a one-shot, never-repeated notice is the same as
+/// telling them nothing.
+///
+/// A filesystem sweep to rediscover such files was considered and rejected as
+/// disproportionate: #95 established that an orphan with no referencing row
+/// cannot be deleted without `--force` anyway (a live `build()` is
+/// indistinguishable from crash garbage), so a sweep would produce a report
+/// rather than a cleanup — which is what naming the path here already does,
+/// without a new scan that could race a writer.
 pub fn clean_staging(conn: &Connection, config: &Config, force: bool) -> Result<CleanReport> {
     let mut report = CleanReport::default();
 
@@ -180,8 +205,18 @@ fn remove_and_account(path: &Path, report: &mut CleanReport) {
             report.bytes_freed += file_size;
         }
         Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to remove staged file");
+            // Issue #108: record the PATH, not just a tally. `staging_path`
+            // has already been nulled by the time this runs, so nothing will
+            // ever rediscover this file — this notice is the operator's only
+            // chance to learn it exists.
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to remove staged file — it is now stranded permanently \
+                 and must be removed by hand"
+            );
             report.errors += 1;
+            report.stranded.push(path.to_path_buf());
         }
     }
 }
@@ -265,6 +300,12 @@ pub struct CleanReport {
     pub files_removed: usize,
     pub bytes_freed: i64,
     pub errors: usize,
+    /// Files whose unlink failed (issue #108). Their `staging_path` rows are
+    /// already nulled, so no future `staging clean` can rediscover them —
+    /// these paths are the operator's ONLY notice that the files exist, and
+    /// removing them is a manual job. Always a subset of `errors`; carried
+    /// separately because a count alone does not say *which* file.
+    pub stranded: Vec<std::path::PathBuf>,
     /// `sessions/*` directories removed because every `writes` row
     /// referencing them reached a terminal state (`completed`, `failed`,
     /// `aborted`) — see `reclaim_session_dirs`.
@@ -716,6 +757,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "cleaned");
+    }
+
+    /// Issue #108: when an unlink FAILS, the file is stranded permanently —
+    /// `staging_path` was nulled before the unlink, and `.age` discovery is
+    /// strictly `staging_path IS NOT NULL`, so no later `staging clean` can
+    /// ever find it. The report must therefore carry the PATH, not just bump
+    /// an error counter: this is the operator's one and only notice.
+    ///
+    /// The failure is induced by making the file's parent directory
+    /// read-only, which is the realistic shape (a read-only mount, an ACL, a
+    /// permissions mistake) and needs no fault injection in the code itself.
+    #[test]
+    fn a_failed_unlink_is_reported_with_its_path_not_just_an_error_count() {
+        let (conn, _stage_set_id, path, dir) = seed_stage_set_with_status("failed");
+
+        // Move the .age into a subdirectory we can seal, so the rest of the
+        // staging dir stays writable (session-dir reclamation walks it).
+        let locked = dir.path().join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let moved = locked.join(path.file_name().unwrap());
+        fs::rename(&path, &moved).unwrap();
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = ?1",
+            params![moved.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        // Verify the seal actually blocks US before asserting on it. Root
+        // ignores directory write permission, and so do some filesystems, so
+        // without this probe the test would silently assert nothing on those
+        // hosts. Probing the real precondition beats guessing at it from a
+        // uid — and it needs no new dependency.
+        if fs::write(locked.join(".probe"), b"x").is_ok() {
+            let _ = fs::remove_file(locked.join(".probe"));
+            let mut p = fs::metadata(&locked).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o700);
+            fs::set_permissions(&locked, p).unwrap();
+            eprintln!(
+                "SKIPPED: a read-only directory does not block writes here \
+                 (running as root, or a filesystem that ignores the mode), so \
+                 an unlink failure cannot be induced"
+            );
+            return;
+        }
+
+        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+
+        // Restore write permission first, so the TempDir can clean up even
+        // if an assertion below fails.
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        assert_eq!(report.errors, 1, "the unlink must have failed");
+        assert_eq!(
+            report.stranded.len(),
+            1,
+            "a failed unlink must be recorded with its path — nothing will \
+             ever rediscover this file, so a bare count tells the operator \
+             that something is wrong but not which file"
+        );
+        assert_eq!(report.stranded[0], moved);
+        assert!(moved.exists(), "the file really is still there");
+
+        // And the row is already nulled, which is exactly why no later clean
+        // can find it — the property that makes naming the path essential.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_slices WHERE staging_path IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "staging_path is nulled before the unlink, so re-running clean \
+             finds nothing — this is the permanence #108 is about"
+        );
+    }
+
+    /// The happy path must not report anything as stranded, or the notice
+    /// above becomes noise that gets ignored.
+    #[test]
+    fn a_successful_clean_strands_nothing() {
+        let (conn, _id, path, dir) = seed_stage_set_with_status("failed");
+        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+        assert!(!path.exists());
+        assert_eq!(report.errors, 0);
+        assert!(report.stranded.is_empty());
     }
 
     /// The common crash shape: a `'failed'` stage_set with zero

@@ -109,6 +109,9 @@ pub fn run(
                         "session_dirs_retained": report.session_dirs_retained,
                         "session_dirs_orphaned": report.session_dirs_orphaned,
                         "lockfiles_reclaimed": report.lockfiles_reclaimed,
+                        // Issue #108: nothing will ever rediscover these,
+                        // so a scripted consumer needs the paths, not a count.
+                        "stranded": report.stranded,
                     })
                 );
             } else {
@@ -127,6 +130,21 @@ pub fn run(
                 );
                 if report.errors > 0 {
                     println!("  {} errors", report.errors);
+                }
+                // Issue #108: `staging clean` nulls `staging_path` before it
+                // unlinks, so a file whose unlink failed can never be found
+                // by a later clean. This printout is the operator's only
+                // notice, which is why it names every path rather than
+                // reporting a count.
+                if !report.stranded.is_empty() {
+                    println!(
+                        "  {} file(s) could NOT be removed and are now stranded permanently —",
+                        report.stranded.len()
+                    );
+                    println!("  no future `staging clean` can find them. Remove by hand:");
+                    for p in &report.stranded {
+                        println!("    {}", p.display());
+                    }
                 }
             }
         }
