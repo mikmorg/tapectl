@@ -1,13 +1,17 @@
 # Handoff: what autopilot finishes, and what only you can do
 
-Written 2026-08-01; updated 2026-08-02, master at `d0c8503`. This document exists so that the
+Written 2026-08-01; updated 2026-08-03, master at `3bd65fc`. This document exists so that the
 autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **one software issue remains agent work; the hardware
-measurement harness is built (`scripts/lto6-measure.sh`). Three things are irreducibly yours** — the Heir Kit
-ceremony, the LTO-6 session on real media, and the first production write.
+**THE AGENT QUEUE IS EMPTY (2026-08-03).** Every issue of every severity is
+closed except the wayfinder map (#1), and the LTO-6 measurement harness is
+built (`scripts/lto6-measure.sh`).
+
+**Three things are irreducibly yours**, and they are all that is left: the
+Heir Kit ceremony, the LTO-6 session on real media, and the first production
+write. None of them is blocked on a decision — each needs your hands.
 
 ## Where the project actually stands
 
@@ -16,7 +20,7 @@ ceremony, the LTO-6 session on real media, and the first production write.
   zero slack, so any gate failure is a hard stop rather than a known-defect
   pin. Verified across five consecutive runs on 2026-08-01 when the last
   nondeterminism (#113) was removed.
-- 729 ungated tests; CI green; `cargo fmt`/`clippy -D warnings` clean.
+- 766 ungated tests; CI green; `cargo fmt`/`clippy -D warnings` clean.
 - **Every issue of every severity above `low` is now closed** (#69, the last
   `severity:high`, landed 2026-08-02). What remains is nine `severity:low`
   issues and the wayfinder map.
@@ -26,15 +30,15 @@ One correction to `CLAUDE.md`, which is stale on this point:
 lines, dry-run annotated against mhvtl, and already records the ENOSPC
 fidelity gap. Read it before the hardware session; it is usable as-is.
 
-## Tier A — pure software, no human needed
+## Tier A — pure software, no human needed — **ALL DONE**
 
-Taken in severity order. All that remain are lows.
+Taken in severity order; every row below is closed.
 
 | Issue | What it is |
 |---|---|
 | ~~#69~~ | **DONE (`d0c8503`).** `key escrow-kit` ships; `audit` reports kit staleness. Only the ceremony remains, under Tier C. |
 | ~~#114~~ | **DONE (`a9eb90b`).** `TapectlError::PolicyUnresolvable` carries a `PolicyLayer`; the action names the layer that actually broke. |
-| #112 | Move four inlined command bodies out of `main.rs` into `src/cli/`. |
+| ~~#112~~ | **DONE (`3bd65fc`).** `main.rs` 728 → 312 lines; all command bodies now live in `src/cli/` where integration tests can reach them. |
 | ~~#111~~ | **DONE (`552e44a`).** Device discovery extracted to `scripts/mhvtl-device.sh` — one implementation, gate + e2e both call it. Scratch roots env-overridable; fixtures stay in their TempDir. |
 | ~~#110~~ | **DONE (`7ce61c4`).** Six fixes: catalog-ls panic, cartridge-list SQL binding, wrong search help, location JSON description, silent rename dotfile failures, vestigial `_depth`. |
 | ~~#109~~ | **DONE (`2902658`).** `--home`/`TAPECTL_HOME` added; `--config`'s relocate behaviour kept but warned; all ten callers migrated. |
@@ -132,8 +136,11 @@ Recorded in `docs/adr/0009-heir-kit-contents-and-staleness.md` and the
 5. QR encoder: **`qrcode` 0.14.1, `default-features = false`, `features =
    ["svg"]`** — verified to pull no image stack, which was the open risk.
 
-## When this is done
+## Done
 
-Every remaining item will be Tier C. At that point autopilot stops rather
-than idling, and the outstanding work is exactly the three things above —
-each of which needs your hands, not a decision.
+Reached 2026-08-03 at `3bd65fc`. Autopilot stopped rather than idling.
+
+One thing surfaced rather than decided: **the wayfinder map (#1) is now
+complete-but-unclosed** — every child issue is closed and the renovation
+stage it charts is finished. Closing a map is not autopilot's call (the same
+rule that applied to epic #20), so it is left open for you.
