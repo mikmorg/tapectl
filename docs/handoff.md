@@ -5,8 +5,8 @@ autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **nine software issues and one hardware measurement harness
-remain agent work. Three things are irreducibly yours** — the Heir Kit
+The short version: **eight software issues remain agent work; the hardware
+measurement harness is built (`scripts/lto6-measure.sh`). Three things are irreducibly yours** — the Heir Kit
 ceremony, the LTO-6 session on real media, and the first production write.
 
 ## Where the project actually stands
@@ -40,7 +40,7 @@ Taken in severity order. All that remain are lows.
 | #109 | Separate `--home` from `--config`. **Not gate-free** — the gate script depends on the current hijack, so the two change together. |
 | #108 | `staging clean` can strand a slice permanently, and `clean.rs`'s own comment claims otherwise. |
 | #107 | `sg_logs` tape alerts are parsed then discarded — no column to store them. **Migration 009** (008 is taken by #101). |
-| #106 | `report fire-risk` uses the global copy threshold instead of each unit's resolved policy. |
+| ~~#106~~ | **DONE (`5908a2c`).** fire-risk now resolves `min_copies` per unit, so it can no longer disagree with `audit`. |
 | #100 | `volume move` accepts a warehouse destination, producing an incoherent record. |
 
 ## Tier B — agent-built, but only valuable if you then run it
