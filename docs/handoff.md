@@ -45,7 +45,14 @@ Taken in severity order. All that remain are lows.
 
 ## Tier B — agent-built, but only valuable if you then run it
 
-**The LTO-6 measurement harness.** `docs/design/v2-open-questions.md` §5 lists
+**The LTO-6 measurement harness — BUILT (`scripts/lto6-measure.sh`).** Run it
+first in the hardware session:
+
+```bash
+./scripts/lto6-measure.sh --erase-cartridge <BARCODE>
+```
+
+`docs/design/v2-open-questions.md` §5 lists
 six questions that mhvtl structurally cannot answer, because mhvtl gives a
 *false pass* on the most important one: at end-of-tape it accepted every write
 without returning ENOSPC and silently produced unreadable slices.
@@ -61,8 +68,13 @@ read the output". It will answer:
   returning stale data (§3.2's physics assumption);
 - v1-tape disposal confirmation.
 
-It writes a recording file for diffing against
-`docs/mhvtl-baseline-recordings.txt`.
+It writes every raw command output to a recording directory.
+
+**Dry-run finding (mhvtl, 2026-08-02):** 1 MiB blocks were refused with
+`EBUSY` by the host `st` driver even though the drive advertised a 2 MiB
+maximum. That is a host buffer limit, not a drive property — so the
+512 K-vs-1 M question may not be answerable on a stock Linux host without
+tuning `st` first. Worth knowing before you spend a hardware session on it.
 
 **It erases cartridges.** It is therefore gated behind an explicit
 barcode-naming confirmation, following ADR-0008's consent tiers rather than

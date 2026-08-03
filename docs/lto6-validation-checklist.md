@@ -35,6 +35,39 @@ pages 0x02/0x0c, and the EOT-drill result).
 - The MAM/sg_logs commands work against mhvtl (recorded), so the *plumbing*
   is validated; only the values differ on real media.
 
+## Run the measurement harness first
+
+`scripts/lto6-measure.sh` automates the measurable half of this session —
+block-size acceptance and throughput, compression as-found state, LBP
+capability, the MAM over-report bound, and the EOD-semantics probe — and
+writes every raw command output to a recording directory.
+
+```bash
+./scripts/lto6-measure.sh --erase-cartridge <BARCODE>
+```
+
+It **erases the loaded cartridge**, so it refuses to start unless you name
+that cartridge and the name matches the barcode in MAM (ADR-0008's consent
+shape: name the thing you are destroying, rather than answer a y/n prompt).
+
+It deliberately does **not** perform the ENOSPC drill or the raw-recovery
+drill — those stay manual, below. It also does not attempt an LBP MODE
+SELECT: enabling LBP changes the block format the drive expects for every
+subsequent command, and a half-applied change on a cartridge you are about
+to write real data to is worse than not knowing.
+
+**Finding from the mhvtl dry-run (2026-08-02):** the harness ran clean
+against mhvtl, and turned up something worth knowing before the hardware
+session. **1 MiB blocks were refused with `EBUSY` by the host's `st`
+driver even though the drive advertised a 2 MiB maximum** via READ BLOCK
+LIMITS. That is a host-side buffer limit, not a drive or medium property,
+and it is invisible from tapectl. So the §5 "512 K vs 1 M" question may not
+be answerable on a stock Linux host at all without tuning `st` first —
+check the harness's block-limits line against its write result before
+concluding anything about the medium. The EOD probe passed on mhvtl (a read
+past EOD returned no data), but that is exactly the check whose mhvtl result
+proves least; §3.2's assumption still needs the real drive.
+
 ## Pre-flight
 
 - [ ] Drive visible: `lsscsi -g | grep -i lto` shows both `/dev/nst*`
