@@ -5,7 +5,7 @@ autonomous run and the operator have the same picture of what is left. It is
 the answer to one question: **which remaining work needs a person, and which
 does not?**
 
-The short version: **two software issues remain agent work; the hardware
+The short version: **one software issue remains agent work; the hardware
 measurement harness is built (`scripts/lto6-measure.sh`). Three things are irreducibly yours** — the Heir Kit
 ceremony, the LTO-6 session on real media, and the first production write.
 
@@ -37,7 +37,7 @@ Taken in severity order. All that remain are lows.
 | #112 | Move four inlined command bodies out of `main.rs` into `src/cli/`. |
 | ~~#111~~ | **DONE (`552e44a`).** Device discovery extracted to `scripts/mhvtl-device.sh` — one implementation, gate + e2e both call it. Scratch roots env-overridable; fixtures stay in their TempDir. |
 | ~~#110~~ | **DONE (`7ce61c4`).** Six fixes: catalog-ls panic, cartridge-list SQL binding, wrong search help, location JSON description, silent rename dotfile failures, vestigial `_depth`. |
-| #109 | Separate `--home` from `--config`. **Not gate-free** — the gate script depends on the current hijack, so the two change together. |
+| ~~#109~~ | **DONE (`2902658`).** `--home`/`TAPECTL_HOME` added; `--config`'s relocate behaviour kept but warned; all ten callers migrated. |
 | ~~#108~~ | **DONE (`a262f65`).** A failed unlink is now reported with its path and named as permanent; the false comment corrected. |
 | ~~#107~~ | **DONE (`c85a86c`, migration 009).** Tape alerts are stored and surfaced by `report health`. **Migration 010 is next.** |
 | ~~#106~~ | **DONE (`5908a2c`).** fire-risk now resolves `min_copies` per unit, so it can no longer disagree with `audit`. |
