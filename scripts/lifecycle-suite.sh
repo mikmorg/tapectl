@@ -906,15 +906,19 @@ print($2)
 " "$1" 2>/dev/null
 }
 
-# bootstrap_archive_v1 — the "after first-year" state several scenarios
-# need (evolving-source, key-rotation, tenant-reassign, tape-only-and-
-# reclaim, retire-and-reuse, db-loss): two tenants, three units (photos/
-# alice, docs/bob, big/alice), escrow before staging, snapshot+stage v1,
-# VOL-A written and moved to vault, cartridge registered. Runs as ONE
-# `check` (the caller names it) rather than first-year's own per-step
-# checks, so scenarios that build on it don't re-report first-year's
-# checks under a different scenario's report section.
+# bootstrap_archive_v1 [label=VOL-A] — the "after first-year" state several
+# scenarios need (evolving-source, key-rotation, tenant-reassign, tape-
+# only-and-reclaim, compaction, retire-and-reuse, db-loss): two tenants,
+# three units (photos/alice, docs/bob, big/alice), escrow before staging,
+# snapshot+stage v1, one volume written and moved to vault, cartridge
+# registered. The label is parameterized so compaction can call it as
+# "VOL-E" per the task spec's naming. Runs as ONE `check` (the caller names
+# it) rather than first-year's own per-step checks, so scenarios that build
+# on it don't re-report first-year's checks under a different scenario's
+# report section.
+# shellcheck disable=SC2120  # called with an explicit label via `check cp.setup bootstrap_archive_v1 VOL-E`
 bootstrap_archive_v1() {
+    local label="${1:-VOL-A}"
     bootstrap_config || return 1
     TCTL location add vault --description "Home vault" || return 1
     TCTL location add offsite --description "Offsite shelf" || return 1
@@ -938,10 +942,10 @@ bootstrap_archive_v1() {
     TCTL stage create photos || return 1
     TCTL stage create docs || return 1
     TCTL stage create big || return 1
-    next_tape VOL-A || return 1
-    TCTL volume init VOL-A --device "$TAPE_DEV" || return 1
-    TCTL volume write VOL-A --device "$TAPE_DEV" || return 1
-    TCTL volume move VOL-A --to vault || return 1
+    next_tape "$label" || return 1
+    TCTL volume init "$label" --device "$TAPE_DEV" || return 1
+    TCTL volume write "$label" --device "$TAPE_DEV" || return 1
+    TCTL volume move "$label" --to vault || return 1
     if [ "$DRY_RUN" != 1 ]; then
         TCTL cartridge register --barcode "$LOADED_TAG" --media-type LTO-6 || return 1
     fi
@@ -1478,8 +1482,235 @@ scenario_tape_only_and_reclaim() {
     check tor.report_copies                tor_report_copies
     check tor.restore_latest               tor_restore_latest
 }
-scenario_compaction() { echo "PLAN: [compaction] not yet implemented"; }
-scenario_retire_and_reuse() { echo "PLAN: [retire-and-reuse] not yet implemented"; }
+# ============================================================
+# Scenario: compaction (mhvtl-only)
+# ============================================================
+# Needs THREE simultaneously-distinct volumes (VOL-E, VOL-F, VOL-G) to mean
+# anything — impossible under --single-cartridge, which destroys each
+# previous volume's cartridge on next_tape (see tape-only-and-reclaim's
+# next_tape fix). The whole scenario SKIPs there, visibly, rather than
+# faking a single-cartridge shape that wouldn't test compaction at all.
+#
+# Sequence: VOL-E starts with photos/docs/big v1. photos v2 goes to VOL-F,
+# which makes photos v1 on VOL-E supersedable; mark it reclaimable and
+# purge it, leaving docs v1 and big v1 as VOL-E's only live content — under
+# bootstrap_config's utilization_threshold=0.95 that is enough for
+# `report compaction-candidates` to flag VOL-E. compact-read pulls those
+# live slices to staging; compact-finish is asserted to REFUSE before
+# compact-write has given docs/big a copy anywhere else, then to SUCCEED
+# once VOL-G holds one.
+cp_skip_single_cartridge() {
+    skip "cp.scenario" "compaction needs 3 simultaneously-distinct volumes (VOL-E/F/G) — impossible under --single-cartridge"
+    return $?
+}
+
+cp_write_photos_v2_on_volf() {
+    mutate_source "$SRC/photos" "$SEED" modify || return 1
+    TCTL snapshot create photos || return 1
+    TCTL stage create photos || return 1
+    next_tape VOL-F || return 1
+    TCTL volume init VOL-F --device "$TAPE_DEV" && TCTL volume write VOL-F --device "$TAPE_DEV"
+}
+
+cp_reclaim_v1_photos() {
+    TCTL snapshot mark-reclaimable --version 1 photos && TCTL snapshot purge --version 1 photos
+}
+
+cp_compaction_candidates_lists_vole() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report compaction-candidates --json (assert VOL-E listed)"; return 0; }
+    local logf="$RUN/log-cp.candidates.json"
+    TCTL report compaction-candidates --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "VOL-E" "$logf" || { echo "VOL-E not listed as a compaction candidate:"; cat "$logf"; return 1; }
+}
+
+cp_compact_read_vole() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape VOL-E; tapectl volume compact-read VOL-E --device \$TAPE_DEV"
+        return 0
+    fi
+    load_volume_tape VOL-E || return 1
+    TCTL volume compact-read VOL-E --device "$TAPE_DEV"
+}
+
+# Read the refusal text from src/volume/write.rs's compact_finish: "cannot
+# retire \"<label>\": <N> live slice(s) have no copy on another volume
+# (...)" — fires here because docs/big's only completed write is still
+# VOL-E itself; nothing has been written to VOL-G yet.
+cp_compact_finish_refused_first() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume compact-finish VOL-E (expect refusal: 'have no copy on another volume' — docs/big have no copy yet)"; return 0; }
+    local out rc
+    out="$(TCTL volume compact-finish VOL-E 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "compact-finish VOL-E unexpectedly succeeded before VOL-G existed: $out"; return 1; }
+    echo "$out" | grep -qi "have no copy on another volume" || { echo "unexpected refusal text: $out"; return 1; }
+}
+
+cp_write_volg() {
+    next_tape VOL-G || return 1
+    TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV"
+}
+
+cp_compact_finish_succeeds() { TCTL volume compact-finish VOL-E; }
+
+scenario_compaction() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        check cp.scenario cp_skip_single_cartridge
+        return 0
+    fi
+
+    check cp.setup                     bootstrap_archive_v1 VOL-E
+    check cp.write_photos_v2_on_volf   cp_write_photos_v2_on_volf
+    check cp.reclaim_v1_photos         cp_reclaim_v1_photos
+    check cp.compaction_candidates     cp_compaction_candidates_lists_vole
+    check cp.compact_read_vole         cp_compact_read_vole
+    check cp.compact_finish_refused    cp_compact_finish_refused_first
+    check cp.write_volg                cp_write_volg
+    check cp.compact_finish_succeeds   cp_compact_finish_succeeds
+
+    restore_matrix VOL-G docs bob   "$SRC/docs" cp-docs-volg alice
+    restore_matrix VOL-G big  alice "$SRC/big"  cp-big-volg  bob
+}
+# ============================================================
+# Scenario: retire-and-reuse
+# ============================================================
+# After first-year: retire VOL-A while it is the sole copy (refused, then
+# driven with --yes... actually driven properly by first giving every unit
+# a second copy so the SAME retire call succeeds without needing consent —
+# ADR-0008 Tier 2 only fires on a zero-copy unit); then the documented
+# cartridge-reuse procedure (docs/operator-guide.md: register -> retire ->
+# physically erase -> `cartridge mark-erased` -> reuse); and the ADR-0003
+# negative — a still-sealed VOL-A cartridge refuses `volume init` for a
+# DIFFERENT label both with and without --force.
+#
+# Decided from src/cli/operations.rs:540 (`cartridge mark-erased`'s
+# precondition is the cartridge's DB status == 'pending_erase', which
+# `volume retire` sets — not whether the tape was physically erased, which
+# the DB cannot observe): mark-erased attempted BEFORE `volume retire` (the
+# cartridge is still 'active') hits the ADR-0008 Tier-2 consent gate and is
+# refused without --yes/--force; attempted AFTER retire (pending_erase) it
+# needs no consent at all, physical erase or not. This scenario tests the
+# refusal in that true position (before retire), not "before the physical
+# erase" as a separate gate — there isn't one.
+rr_mark_erased_before_retire_refused() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge mark-erased \$barcode (cartridge still 'active', not 'pending_erase' -> Tier-2 refusal without --yes)"; return 0; }
+    [ -n "${RR_VOLA_BARCODE:-}" ] || { echo "no barcode captured for VOL-A's cartridge"; return 1; }
+    local out rc
+    out="$(TCTL cartridge mark-erased "$RR_VOLA_BARCODE" 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "cartridge mark-erased unexpectedly succeeded before any retirement: $out"; return 1; }
+}
+
+rr_retire_refused_sole_copy() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A (no --yes; sole copy -> refused, impact analysis names a ZERO-copy unit)"; return 0; }
+    local out rc
+    out="$(TCTL volume retire VOL-A 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "volume retire VOL-A unexpectedly succeeded without consent while it is the sole copy: $out"; return 1; }
+    echo "$out" | grep -qi "ZERO copies remaining" || { echo "impact analysis did not name a zero-copy unit ('ZERO copies remaining'): $out"; return 1; }
+}
+
+# A second COPY of the same v1 content (re-stage the same version, write
+# again) — not a new version, and not `volume read-slices` (which MOVES
+# slices into staging for a follow-on write, self-describing invariant
+# preserved, rather than duplicating them).
+rr_write_second_copy_volb() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.write_second_copy_volb" "single-cartridge mode cannot hold a second, independent copy of VOL-A's content"
+        return $?
+    fi
+    TCTL stage create photos --version 1 || return 1
+    TCTL stage create docs --version 1 || return 1
+    TCTL stage create big --version 1 || return 1
+    next_tape VOL-B || return 1
+    TCTL volume init VOL-B --device "$TAPE_DEV" && TCTL volume write VOL-B --device "$TAPE_DEV"
+}
+
+rr_retire_vola_succeeds_with_coverage() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.retire_vola_succeeds_with_coverage" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A (now safe: every unit has a second copy on VOL-B, so no consent is needed)"; return 0; }
+    TCTL volume retire VOL-A
+}
+
+# ADR-0003 negative, run BEFORE the physical erase: VOL-A's cartridge is
+# still loaded and still physically sealed even though the DB now says
+# "retired" — File 0 and the seal marker are exactly as `volume write`
+# left them. `volume init VOL-X` must refuse on THIS tape both with and
+# without --force (src/volume/write.rs's check_fresh_write_contact_
+# foreign_sealed_tape_refuses_even_with_force test; every AlreadySealed
+# refusal cites "ADR-0003" in its message).
+rr_volinit_volx_refused_no_force() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.volinit_volx_refused_no_force" "single-cartridge mode: VOL-A's cartridge was already reused by an earlier next_tape in this run"
+        return $?
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape VOL-A; tapectl volume init VOL-X --device \$TAPE_DEV (no --force; expect refused, message cites ADR-0003)"
+        return 0
+    fi
+    load_volume_tape VOL-A || return 1
+    local out rc
+    out="$(TCTL volume init VOL-X --device "$TAPE_DEV" 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "volume init VOL-X unexpectedly succeeded on a cartridge still sealed as VOL-A: $out"; return 1; }
+    echo "$out" | grep -q "ADR-0003" || { echo "refusal did not cite ADR-0003: $out"; return 1; }
+}
+
+rr_volinit_volx_refused_with_force() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.volinit_volx_refused_with_force" "single-cartridge mode: VOL-A's cartridge was already reused by an earlier next_tape in this run"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume init VOL-X --device \$TAPE_DEV --force (ADR-0003: force never overrides a sealed tape; expect STILL refused, ADR-0003 cited)"; return 0; }
+    local out rc
+    out="$(TCTL volume init VOL-X --device "$TAPE_DEV" --force 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "volume init VOL-X --force unexpectedly succeeded over a sealed cartridge (violates ADR-0003): $out"; return 1; }
+    echo "$out" | grep -q "ADR-0003" || { echo "refusal did not cite ADR-0003: $out"; return 1; }
+}
+
+# Now the documented reuse procedure for real: physically erase, THEN
+# `cartridge mark-erased` (needs no consent now — status is 'pending_erase'
+# since the retire above), THEN `volume init` on the reused cartridge
+# succeeds WITHOUT --force (the tape is genuinely blank now).
+rr_physical_erase() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.physical_erase" "single-cartridge mode: VOL-A's cartridge was already reused by an earlier next_tape in this run"
+        return $?
+    fi
+    erase_tape
+}
+
+rr_mark_erased_after_retire_succeeds() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.mark_erased_after_retire_succeeds" "depends on rr.physical_erase, itself SKIP under --single-cartridge"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge mark-erased \$barcode (pending_erase since the retire above -> succeeds, no consent needed)"; return 0; }
+    [ -n "${RR_VOLA_BARCODE:-}" ] || { echo "no barcode captured for VOL-A's cartridge"; return 1; }
+    TCTL cartridge mark-erased "$RR_VOLA_BARCODE"
+}
+
+rr_volinit_volh_on_reused_cartridge_succeeds() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.volinit_volh_on_reused_cartridge_succeeds" "depends on rr.physical_erase, itself SKIP under --single-cartridge"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume init VOL-H --device \$TAPE_DEV (no --force; blank tape now -> succeeds)"; return 0; }
+    TCTL volume init VOL-H --device "$TAPE_DEV"
+}
+
+scenario_retire_and_reuse() {
+    check rr.setup bootstrap_archive_v1 VOL-A
+    RR_VOLA_BARCODE="$LOADED_TAG"
+
+    check rr.mark_erased_before_retire_refused rr_mark_erased_before_retire_refused
+    check rr.retire_refused_sole_copy          rr_retire_refused_sole_copy
+    check rr.write_second_copy_volb            rr_write_second_copy_volb
+    check rr.retire_vola_succeeds_with_coverage rr_retire_vola_succeeds_with_coverage
+    check rr.volinit_volx_refused_no_force     rr_volinit_volx_refused_no_force
+    check rr.volinit_volx_refused_with_force   rr_volinit_volx_refused_with_force
+    check rr.physical_erase                    rr_physical_erase
+    check rr.mark_erased_after_retire_succeeds rr_mark_erased_after_retire_succeeds
+    check rr.volinit_volh_on_reused_cartridge_succeeds rr_volinit_volh_on_reused_cartridge_succeeds
+}
 scenario_db_loss() { echo "PLAN: [db-loss] not yet implemented"; }
 # ============================================================
 # Scenario: escrow-ordering (issue #115 regression)
