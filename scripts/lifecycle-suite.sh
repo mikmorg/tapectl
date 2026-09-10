@@ -300,6 +300,18 @@ check() { # check <name> <fn> [args...]
     echo "  [$name] ${RESULT[$name]}"
 }
 
+# ---------- vinit: happy-path volume init that tolerates a reused cartridge ----------
+# In single-cartridge reuse, erase_tape (weof at BOT) unseals and truncates the
+# cartridge but leaves an unparseable File 0 that `volume init` refuses without
+# --force (verified on a real HP LTO-6, 2026-09-10). The reuse consent
+# (--single-cartridge, and on a real drive --i-will-lose-the-cartridge)
+# authorizes that override. Scenarios that WRITE a volume go through vinit; the
+# retire-and-reuse negative checks call `volume init` directly (they test the
+# refusal itself and the ADR-0003 sealed-tape rule), so they must not use this.
+REUSE_FORCE=""
+[ "$SINGLE_CARTRIDGE" = 1 ] && REUSE_FORCE="--force"
+vinit() { TCTL volume init "$1" --device "$TAPE_DEV" $REUSE_FORCE; }
+
 # ---------- erase_tape: the ONE place scenarios reuse a tape ----------
 erase_tape() {
     case "$ERASE_MODE" in
@@ -956,7 +968,7 @@ bootstrap_archive_v1() {
     TCTL stage create docs || return 1
     TCTL stage create big || return 1
     next_tape "$label" || return 1
-    TCTL volume init "$label" --device "$TAPE_DEV" || return 1
+    vinit "$label" || return 1
     TCTL volume write "$label" --device "$TAPE_DEV" || return 1
     TCTL volume move "$label" --to vault || return 1
     if [ "$DRY_RUN" != 1 ]; then
@@ -980,7 +992,7 @@ bootstrap_two_volumes() {
     TCTL stage create docs || return 1
     TCTL stage create big || return 1
     next_tape VOL-B || return 1
-    TCTL volume init VOL-B --device "$TAPE_DEV" || return 1
+    vinit VOL-B || return 1
     TCTL volume write VOL-B --device "$TAPE_DEV" || return 1
     TCTL volume move VOL-B --to offsite || return 1
 }
@@ -1019,7 +1031,7 @@ fy_pending_is_three() {
 fy_plan()      { TCTL volume plan; }
 fy_write() {
     next_tape VOL-A || return 1
-    TCTL volume init VOL-A --device "$TAPE_DEV" \
+    vinit VOL-A \
     && TCTL volume write VOL-A --device "$TAPE_DEV"
 }
 fy_move()      { TCTL volume move VOL-A --to vault; }
@@ -1117,7 +1129,7 @@ ev_stage_v2() { TCTL stage create photos && TCTL stage create docs && TCTL stage
 
 ev_write_volb() {
     next_tape VOL-B || return 1
-    TCTL volume init VOL-B --device "$TAPE_DEV" && TCTL volume write VOL-B --device "$TAPE_DEV"
+    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV"
 }
 
 ev_restore_v1_from_vola() {
@@ -1197,7 +1209,7 @@ kr_mutate_and_stage_v2() {
 
 kr_write_volc() {
     next_tape VOL-C || return 1
-    TCTL volume init VOL-C --device "$TAPE_DEV" && TCTL volume write VOL-C --device "$TAPE_DEV"
+    vinit VOL-C && TCTL volume write VOL-C --device "$TAPE_DEV"
 }
 
 # --- VOL-C checks (new key), run while VOL-C is still the loaded tape ---
@@ -1345,7 +1357,7 @@ tr_write_photos_v2() {
     TCTL snapshot create photos || return 1
     TCTL stage create photos || return 1
     next_tape VOL-D || return 1
-    TCTL volume init VOL-D --device "$TAPE_DEV" && TCTL volume write VOL-D --device "$TAPE_DEV"
+    vinit VOL-D && TCTL volume write VOL-D --device "$TAPE_DEV"
 }
 
 tr_restore_vola_via_tctl() {
@@ -1426,7 +1438,7 @@ tor_solo_unit() {
     TCTL snapshot create solo || return 1
     TCTL stage create solo || return 1
     next_tape VOL-SOLO || return 1
-    TCTL volume init VOL-SOLO --device "$TAPE_DEV" && TCTL volume write VOL-SOLO --device "$TAPE_DEV"
+    vinit VOL-SOLO && TCTL volume write VOL-SOLO --device "$TAPE_DEV"
 }
 
 tor_mark_tape_only_photos_passes() {
@@ -1522,7 +1534,7 @@ cp_write_photos_v2_on_volf() {
     TCTL snapshot create photos || return 1
     TCTL stage create photos || return 1
     next_tape VOL-F || return 1
-    TCTL volume init VOL-F --device "$TAPE_DEV" && TCTL volume write VOL-F --device "$TAPE_DEV"
+    vinit VOL-F && TCTL volume write VOL-F --device "$TAPE_DEV"
 }
 
 cp_reclaim_v1_photos() {
@@ -1632,7 +1644,7 @@ rr_write_second_copy_volb() {
     TCTL stage create docs --version 1 || return 1
     TCTL stage create big --version 1 || return 1
     next_tape VOL-B || return 1
-    TCTL volume init VOL-B --device "$TAPE_DEV" && TCTL volume write VOL-B --device "$TAPE_DEV"
+    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV"
 }
 
 rr_retire_vola_succeeds_with_coverage() {
@@ -1898,7 +1910,7 @@ eo_escrow()       { TCTL key generate --escrow; }
 eo_stage()        { TCTL stage create unitA && TCTL stage create unitB; }
 eo_write() {
     next_tape VOL-EO || return 1
-    TCTL volume init VOL-EO --device "$TAPE_DEV" && TCTL volume write VOL-EO --device "$TAPE_DEV"
+    vinit VOL-EO && TCTL volume write VOL-EO --device "$TAPE_DEV"
 }
 
 scenario_escrow_ordering() {
@@ -2118,7 +2130,7 @@ col_plan()   { TCTL collection plan; }
 
 col_run_batch() {
     next_tape VOL-COL1 || return 1
-    TCTL volume init VOL-COL1 --device "$TAPE_DEV" || return 1
+    vinit VOL-COL1 || return 1
     TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV"
 }
 
@@ -2231,7 +2243,7 @@ pm_op_write_next_volume() {
     PM_VOL_SEQ=$((PM_VOL_SEQ + 1))
     local label="VOL-PM$PM_VOL_SEQ" sd; sd="$(dirname "$HOME_DIR")"
     next_tape "$label" || return 1
-    TCTL volume init "$label" --device "$TAPE_DEV" || return 1
+    vinit "$label" || return 1
     TCTL volume write "$label" --device "$TAPE_DEV" || return 1
     cp -a "$SRC" "$sd/pm-snapshot-$label"
     PM_WRITTEN+=("$label")

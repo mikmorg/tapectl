@@ -831,6 +831,17 @@ do_find_envelope() {
 
 # ---- --restore ----
 
+# Does an envelope MANIFEST.toml list a given unit under [[units]]? Exit 0 if
+# so. Used by --restore to pick the right envelope for a universal key (#127).
+manifest_has_unit() { # <manifest_path> <unit_name>
+  awk -v u="$2" '
+    /^\[\[units\]\]/ { in_u = 1; next }
+    in_u && /^name = / { gsub(/"/, "", $3); if ($3 == u) found = 1; in_u = 0 }
+    /^\[/             { in_u = 0 }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
+}
+
 do_restore() {
   local keyfile=$1 destdir=$2 target_unit=$3
 
@@ -838,7 +849,15 @@ do_restore() {
 
   establish_files
 
-  # Step 1: find and decrypt envelope (same candidates as --find-envelope)
+  # Step 1: find and decrypt the envelope that holds the target unit.
+  #
+  # A per-tenant key opens exactly one envelope, so the first decryptable one
+  # is the right one. But the escrow recipient (ADR-0005) is on EVERY envelope,
+  # so a universal key decrypts all of them and the first on tape may belong to
+  # a different tenant than --unit. When a unit was named, keep searching until
+  # an envelope whose manifest actually lists it is found (the operator
+  # envelope always does); otherwise the first decryptable envelope wins, as
+  # before. (issue #127)
   local found=0 pos
   while IFS= read -r pos; do
     require_uint envelope_position "$pos"
@@ -852,12 +871,22 @@ do_restore() {
     rm -rf "$WORK/env" && mkdir -p "$WORK/env"
     if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
       tar xf - -C "$WORK/env/" 2>/dev/null; then
+      if [ -n "$target_unit" ] && [ -f "$WORK/env/MANIFEST.toml" ] &&
+        ! manifest_has_unit "$WORK/env/MANIFEST.toml" "$target_unit"; then
+        info "Envelope at file $pos decrypts but does not list '$target_unit'; continuing..."
+        continue
+      fi
       found=1
       info "Decrypted envelope at file $pos"
       break
     fi
   done < <(envelope_positions "$FILES_TXT")
-  [ "$found" -eq 1 ] || die "no envelope matched the provided key"
+  if [ "$found" -ne 1 ]; then
+    if [ -n "$target_unit" ]; then
+      die "no envelope for unit '$target_unit' matched the provided key"
+    fi
+    die "no envelope matched the provided key"
+  fi
   [ -f "$WORK/env/MANIFEST.toml" ] || die "envelope missing MANIFEST.toml"
 
   local manifest="$WORK/env/MANIFEST.toml"
