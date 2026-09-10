@@ -8,6 +8,20 @@
 //! The parser is deliberately forgiving: it greps known key phrases and
 //! ignores anything it does not understand. Unknown format = zeroed counters,
 //! not a crash.
+//!
+//! Different vendors populate different parameters on pages 0x02/0x03
+//! (issue #120). `Total errors corrected` is the parameter this module has
+//! always read, but a real HP LTO-6 leaves it at 0 and reports its ECC
+//! activity under `Errors corrected without substantial delay` and
+//! `Total times correction algorithm processed` instead — the two
+//! parameters that actually trend upward as a drive or medium degrades.
+//! `total_corrected` stays exactly what it was (the persisted `health_logs`
+//! column, faithful to `Total errors corrected`, and what older rows already
+//! depend on); the trending pair is parsed alongside it into
+//! `HealthCounters` and — since neither is a stored column — can also be
+//! re-derived from a row's `raw_log` on demand via `from_raw_log`. `report
+//! health` surfaces and labels both so a summary never claims a cleaner
+//! picture than the drive is reporting.
 
 use std::process::Command;
 
