@@ -350,6 +350,29 @@ next_tape() { # next_tape <intended-label>
     erase_tape
 }
 
+# load_volume_tape <label> — reload a PREVIOUSLY WRITTEN cartridge (recorded
+# earlier by next_tape in $SLOT_LABEL_MAP) WITHOUT erasing it, so a
+# scenario can read back an older volume after moving on to a newer one.
+# Multi-tape mhvtl only; single-cartridge mode cannot do this (the older
+# volume's cartridge was erased to become the newer one) — callers SKIP.
+load_volume_tape() {
+    local label="$1" slot status origin
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape $label -> mtx unload current, load the slot recorded for $label"
+        return 0
+    fi
+    [ "$SINGLE_CARTRIDGE" = 1 ] && { echo "load_volume_tape: single-cartridge mode cannot reload a superseded volume"; return 1; }
+    [ "$MHVTL_DISCOVERY" = 1 ] || { echo "load_volume_tape: not an mhvtl drive"; return 1; }
+    slot="$(awk -F'\t' -v l="$label" '$2==l {print $1}' "$SLOT_LABEL_MAP" | tail -1)"
+    [ -n "$slot" ] || { echo "load_volume_tape: no recorded slot for \"$label\" in $SLOT_LABEL_MAP"; return 1; }
+    status="$(mtx -f "$CHG_SG" status)" || { echo "load_volume_tape: mtx status failed"; return 1; }
+    origin="$(echo "$status" | sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
+    if [ -n "$origin" ]; then
+        devcmd mtx -f "$CHG_SG" unload "$origin" "$DTE" || { echo "load_volume_tape: unload failed"; return 1; }
+    fi
+    devcmd mtx -f "$CHG_SG" load "$slot" "$DTE" || { echo "load_volume_tape: load $slot $DTE failed"; return 1; }
+}
+
 # ---------- leak-scan media path (mhvtl only; real drive -> caller SKIPs) ----------
 mhvtl_media_dir() {
     [ "$MHVTL_DISCOVERY" = 1 ] || return 1
@@ -518,22 +541,59 @@ assert_identical() {
 # ============================================================
 # Restore matrix
 # ============================================================
-# ensure_heir_restore_sh — dd RESTORE.sh off the currently loaded tape into
-# $RM_WORK/heir, once. Later matrix steps reuse it; self-healing if an
-# earlier step failed to extract it.
+
+# active_key_path <tenant> <key_type: primary|backup> — resolves the
+# CURRENTLY ACTIVE key file for a tenant via `key list --json`, not a
+# hardcoded "<tenant>-primary.age.key" guess. Matters because `key rotate`
+# (src/cli/key.rs) never reuses that filename — it mints
+# "<tenant>-rotated-primary-<seq>.age.key" and leaves the old file on disk,
+# now inactive. Falls back to the conventional "<tenant>-<key_type>"
+# filename if `key list` can't be read (e.g. tenant renamed/reassigned
+# mid-scenario and the lookup needs a retry the caller controls).
+active_key_path() {
+    local tenant="$1" ktype="$2" alias
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "$HOME_DIR/keys/$tenant-$ktype.age.key"
+        return 0
+    fi
+    alias="$(TCTL key list --tenant "$tenant" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = []
+for k in d:
+    if k.get('key_type') == '$ktype' and k.get('is_active') and not k.get('is_escrow'):
+        print(k.get('alias'))
+        break
+" 2>/dev/null)"
+    if [ -n "$alias" ] && [ -f "$HOME_DIR/keys/$alias.age.key" ]; then
+        echo "$HOME_DIR/keys/$alias.age.key"
+    else
+        echo "$HOME_DIR/keys/$tenant-$ktype.age.key"
+    fi
+}
+
+# ensure_heir_restore_sh [workdir] — dd RESTORE.sh off the CURRENTLY LOADED
+# tape into <workdir>/heir, once (self-healing if an earlier step failed to
+# extract it). Defaults to $RM_WORK so restore_matrix's steps can keep
+# calling it with no argument; scenarios that need the heir script for a
+# tape outside a restore_matrix call (e.g. key-rotation reloading VOL-A)
+# pass their own workdir explicitly.
 ensure_heir_restore_sh() {
+    local work="${1:-$RM_WORK}"
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: mt rewind; setblk 524288; fsf 2; dd if=$TAPE_DEV bs=512k | tr -d '\\0' > RESTORE.sh; chmod +x; bash -n"
         return 0
     fi
-    [ -f "$RM_WORK/heir/RESTORE.sh" ] && return 0
-    mkdir -p "$RM_WORK/heir"
+    [ -f "$work/heir/RESTORE.sh" ] && return 0
+    mkdir -p "$work/heir"
     devcmd mt -f "$TAPE_DEV" rewind || return 1
     devcmd mt -f "$TAPE_DEV" setblk 524288 || return 1
     devcmd mt -f "$TAPE_DEV" fsf 2 || return 1
-    dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' > "$RM_WORK/heir/RESTORE.sh"
-    chmod +x "$RM_WORK/heir/RESTORE.sh"
-    bash -n "$RM_WORK/heir/RESTORE.sh"
+    dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' > "$work/heir/RESTORE.sh"
+    chmod +x "$work/heir/RESTORE.sh"
+    bash -n "$work/heir/RESTORE.sh"
 }
 
 rm_step_unit() {
@@ -575,7 +635,8 @@ rm_step_restore_sh_dd() {
 
 rm_step_restore_sh_primary() {
     ensure_heir_restore_sh || return 1
-    local key="$HOME_DIR/keys/$RM_TENANT-primary.age.key" to="$RM_WORK/primary"
+    local key to="$RM_WORK/primary"
+    key="$(active_key_path "$RM_TENANT" primary)"
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key $key --to $to"
         return 0
@@ -587,7 +648,8 @@ rm_step_restore_sh_primary() {
 
 rm_step_restore_sh_backup() {
     ensure_heir_restore_sh || return 1
-    local key="$HOME_DIR/keys/$RM_TENANT-backup.age.key" to="$RM_WORK/backup"
+    local key to="$RM_WORK/backup"
+    key="$(active_key_path "$RM_TENANT" backup)"
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key $key --to $to (proves the backup key is a real recipient)"
         return 0
@@ -606,7 +668,8 @@ rm_step_restore_sh_backup() {
 # more than one unit. Not a refusal-by-design case.
 rm_step_operator_envelope() {
     ensure_heir_restore_sh || return 1
-    local opkey="$HOME_DIR/keys/${OPERATOR}-primary.age.key" to="$RM_WORK/operator"
+    local opkey to="$RM_WORK/operator"
+    opkey="$(active_key_path "$OPERATOR" primary)"
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: ./RESTORE.sh --find-envelope --key $opkey; ./RESTORE.sh --restore --unit $RM_UNIT --key $opkey --to $to"
         return 0
@@ -658,7 +721,7 @@ rm_step_isolation() {
         skip "$RM_TAG.isolation" "no other tenant registered on this archive besides $RM_TENANT/$OPERATOR — nothing to cross-test"
         return $?
     fi
-    local otherkey="$HOME_DIR/keys/$other-primary.age.key"
+    local otherkey; otherkey="$(active_key_path "$other" primary)"
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: resolve a $RM_UNIT slice via the catalog; age -d -i $otherkey <slice> (must fail)"
         return 0
@@ -830,6 +893,47 @@ print($2)
 " "$1" 2>/dev/null
 }
 
+# bootstrap_archive_v1 — the "after first-year" state several scenarios
+# need (evolving-source, key-rotation, tenant-reassign, tape-only-and-
+# reclaim, retire-and-reuse, db-loss): two tenants, three units (photos/
+# alice, docs/bob, big/alice), escrow before staging, snapshot+stage v1,
+# VOL-A written and moved to vault, cartridge registered. Runs as ONE
+# `check` (the caller names it) rather than first-year's own per-step
+# checks, so scenarios that build on it don't re-report first-year's
+# checks under a different scenario's report section.
+bootstrap_archive_v1() {
+    bootstrap_config || return 1
+    TCTL location add vault --description "Home vault" || return 1
+    TCTL location add offsite --description "Offsite shelf" || return 1
+    TCTL tenant add alice || return 1
+    TCTL tenant add bob || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL key generate --escrow
+    else
+        TCTL key generate --escrow >"$RUN/log-_bootstrap_escrow.txt" 2>&1 || return 1
+        capture_escrow_secret _bootstrap_escrow
+    fi
+    make_source "$SRC/photos" "plain+links" "$CANARY" || return 1
+    make_source "$SRC/docs" "unicode+deep" || return 1
+    make_source "$SRC/big" "big" || return 1
+    TCTL unit init "$SRC/photos" --tenant alice --name photos || return 1
+    TCTL unit init "$SRC/docs" --tenant bob --name docs || return 1
+    TCTL unit init "$SRC/big" --tenant alice --name big || return 1
+    TCTL snapshot create photos || return 1
+    TCTL snapshot create docs || return 1
+    TCTL snapshot create big || return 1
+    TCTL stage create photos || return 1
+    TCTL stage create docs || return 1
+    TCTL stage create big || return 1
+    next_tape VOL-A || return 1
+    TCTL volume init VOL-A --device "$TAPE_DEV" || return 1
+    TCTL volume write VOL-A --device "$TAPE_DEV" || return 1
+    TCTL volume move VOL-A --to vault || return 1
+    if [ "$DRY_RUN" != 1 ]; then
+        TCTL cartridge register --barcode "$LOADED_TAG" --media-type LTO-6 || return 1
+    fi
+}
+
 # ---------- scenario stubs ----------
 # Each is replaced with a real implementation in a later commit. Kept as
 # real (if minimal) functions from the start so --list/--dry-run/--all can
@@ -905,8 +1009,252 @@ scenario_first_year() {
     check fy.fsck       fy_fsck
     check fy.summary    fy_summary
 }
-scenario_evolving_source() { echo "PLAN: [evolving-source] not yet implemented"; }
-scenario_key_rotation() { echo "PLAN: [key-rotation] not yet implemented"; }
+# ============================================================
+# Scenario: evolving-source
+# ============================================================
+# After first-year's state: mutate every unit's source, prove the dirty
+# detector and snapshot diff see it, write v2 to a second volume, and prove
+# BOTH versions remain restorable — v2 from the new volume, v1 still from
+# the old one (multi-tape only).
+ev_save_pristine() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: cp -a photos/docs/big to pristine-v1-* before mutating"; return 0; }
+    local sd; sd="$(dirname "$HOME_DIR")"
+    cp -a "$SRC/photos" "$sd/pristine-v1-photos" || return 1
+    cp -a "$SRC/docs" "$sd/pristine-v1-docs" || return 1
+    cp -a "$SRC/big" "$sd/pristine-v1-big" || return 1
+}
+
+# One mutation per unit, deterministic from --seed. `big` gets touch-only
+# deliberately: under the default checksum_mode (mtime_size, config.rs
+# default_checksum_mode), mtime_size compares mtime AND size, so a
+# same-content/new-mtime edit DOES register dirty — src/collection/
+# fingerprint.rs's own test names the ONE edit mtime_size is blind to as
+# "same size, same mtime, different bytes", which touch-only is not. So
+# the expectation here (documented, not assumed) is dirty=true for all
+# three units, including the touched-only one.
+ev_mutate() {
+    mutate_source "$SRC/photos" "$SEED" modify || return 1
+    mutate_source "$SRC/docs" "$SEED" add || return 1
+    mutate_source "$SRC/big" "$SEED" touch-only || return 1
+}
+
+ev_dirty_lists_mutated() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report dirty --json (assert photos, docs, big all listed, including the touch-only unit)"; return 0; }
+    local logf="$RUN/log-ev.dirty.json"
+    TCTL report dirty --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+names = {r.get("unit") for r in d} if isinstance(d, list) else set()
+missing = {"photos", "docs", "big"} - names
+assert not missing, f"expected photos/docs/big all dirty (touch-only counts under mtime_size), missing: {missing}, got: {names}"
+' "$logf"
+}
+
+ev_snapshot_v2() { TCTL snapshot create photos && TCTL snapshot create docs && TCTL snapshot create big; }
+
+ev_diff() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl snapshot diff --v1 1 --v2 2 photos/docs/big (assert non-empty, changed paths named)"; return 0; }
+    local u
+    for u in photos docs big; do
+        TCTL snapshot diff --v1 1 --v2 2 "$u" >"$RUN/log-ev.diff.$u.txt" 2>&1 || { cat "$RUN/log-ev.diff.$u.txt"; return 1; }
+        [ -s "$RUN/log-ev.diff.$u.txt" ] || { echo "snapshot diff v1..v2 for $u produced no output"; return 1; }
+    done
+}
+
+ev_stage_v2() { TCTL stage create photos && TCTL stage create docs && TCTL stage create big; }
+
+ev_write_volb() {
+    next_tape VOL-B || return 1
+    TCTL volume init VOL-B --device "$TAPE_DEV" && TCTL volume write VOL-B --device "$TAPE_DEV"
+}
+
+ev_restore_v1_from_vola() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "ev.restore_v1_from_vola" "single-cartridge mode: VOL-A's cartridge was erased to become VOL-B — v1 is no longer on any tape this run controls"
+        return $?
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape VOL-A; tapectl restore unit --unit photos --from VOL-A --to DIR; assert identical to the pristine v1 copy"
+        return 0
+    fi
+    load_volume_tape VOL-A || return 1
+    local sd to; sd="$(dirname "$HOME_DIR")"; to="$sd/restore-v1-photos"
+    TCTL restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
+    assert_identical "$sd/pristine-v1-photos" "$to"
+}
+
+ev_supersedable() { TCTL report supersedable; }
+ev_age()          { TCTL report age; }
+
+scenario_evolving_source() {
+    check ev.setup         bootstrap_archive_v1
+    check ev.save_pristine ev_save_pristine
+    check ev.mutate        ev_mutate
+    check ev.dirty         ev_dirty_lists_mutated
+    check ev.snapshot_v2   ev_snapshot_v2
+    check ev.diff          ev_diff
+    check ev.stage_v2      ev_stage_v2
+    check ev.write_volb    ev_write_volb
+
+    restore_matrix VOL-B photos alice "$SRC/photos" ev-photos-v2 bob
+    restore_matrix VOL-B docs   bob   "$SRC/docs"   ev-docs-v2   alice
+    restore_matrix VOL-B big    alice "$SRC/big"    ev-big-v2    bob
+
+    check ev.restore_v1_from_vola ev_restore_v1_from_vola
+    check ev.supersedable         ev_supersedable
+    check ev.age                  ev_age
+}
+# ============================================================
+# Scenario: key-rotation
+# ============================================================
+# After first-year: rotate alice's key mid-archive and prove OLD (now
+# inactive), NEW, and ESCROW keys all still restore — the old key's
+# volume (VOL-A) as well as the new key's volume (VOL-C). VOL-C's checks
+# run FIRST, while it is still the loaded tape from `next_tape`; VOL-A's
+# checks reload it via `load_volume_tape` afterward. `key rotate` refusing
+# without an escrow recipient is pre-existing behaviour covered in
+# escrow-ordering, not re-tested here.
+kr_rotate() { TCTL key rotate --tenant alice; }
+
+kr_keylist_shows_rotation() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl key list --tenant alice --json (assert 1 active + >=1 inactive primary key)"; return 0; }
+    local logf="$RUN/log-kr.keylist.json"
+    TCTL key list --tenant alice --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+primaries = [k for k in d if k.get("key_type") == "primary" and not k.get("is_escrow")]
+active = [k for k in primaries if k.get("is_active")]
+inactive = [k for k in primaries if not k.get("is_active")]
+assert len(active) == 1, f"expected exactly 1 active primary key after rotation, got {len(active)}: {active}"
+assert len(inactive) >= 1, f"expected >=1 deactivated (pre-rotation) primary key, got {inactive}"
+' "$logf"
+}
+
+kr_save_pristine() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: cp -a photos to pristine-v1-photos before mutating"; return 0; }
+    local sd; sd="$(dirname "$HOME_DIR")"
+    cp -a "$SRC/photos" "$sd/pristine-v1-photos"
+}
+
+kr_mutate_and_stage_v2() {
+    mutate_source "$SRC/photos" "$SEED" modify || return 1
+    TCTL snapshot create photos || return 1
+    TCTL stage create photos
+}
+
+kr_write_volc() {
+    next_tape VOL-C || return 1
+    TCTL volume init VOL-C --device "$TAPE_DEV" && TCTL volume write VOL-C --device "$TAPE_DEV"
+}
+
+# --- VOL-C checks (new key), run while VOL-C is still the loaded tape ---
+kr_restore_volc_new_key() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl restore unit --unit photos --from VOL-C --to DIR (new key)"; return 0; }
+    local sd to; sd="$(dirname "$HOME_DIR")"; to="$sd/restore-volc-photos"
+    TCTL restore unit --unit photos --from VOL-C --to "$to" --device "$TAPE_DEV" || return 1
+    assert_identical "$SRC/photos" "$to"
+}
+
+kr_restore_sh_new_key_volc() {
+    local sd work newkey to
+    sd="$(dirname "$HOME_DIR")"; work="$sd/heir-volc"; to="$sd/restore-sh-volc-photos"
+    ensure_heir_restore_sh "$work" || return 1
+    newkey="$(active_key_path alice primary)"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit photos --key $newkey --to $to (VOL-C, the NEW rotated key)"
+        return 0
+    fi
+    (cd "$work/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit photos --key "$newkey" --to "$to") \
+        >"$RUN/log-kr.restore_sh_new_volc.txt" 2>&1 || { cat "$RUN/log-kr.restore_sh_new_volc.txt"; return 1; }
+    assert_identical "$SRC/photos" "$to"
+}
+
+kr_escrow_restores_volc() {
+    local sd work to
+    sd="$(dirname "$HOME_DIR")"; work="$sd/heir-volc"; to="$sd/escrow-volc-photos"
+    ensure_heir_restore_sh "$work" || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit photos --key \$ESCROW_KEY_PATH --to $to (VOL-C)"
+        return 0
+    fi
+    [ -f "$ESCROW_KEY_PATH" ] || { echo "no escrow key captured for this scenario"; return 1; }
+    (cd "$work/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit photos --key "$ESCROW_KEY_PATH" --to "$to") \
+        >"$RUN/log-kr.escrow_volc.txt" 2>&1 || { cat "$RUN/log-kr.escrow_volc.txt"; return 1; }
+    assert_identical "$SRC/photos" "$to"
+}
+
+# --- VOL-A checks (old, now-inactive key), reloaded via load_volume_tape ---
+kr_restore_vola_old_key() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "kr.restore_vola_old_key" "single-cartridge mode: VOL-A's cartridge was erased to become VOL-C"
+        return $?
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape VOL-A; tapectl restore unit --unit photos --from VOL-A --to DIR (old, now-inactive key — restore trial-decrypts every key)"
+        return 0
+    fi
+    load_volume_tape VOL-A || return 1
+    local sd to; sd="$(dirname "$HOME_DIR")"; to="$sd/restore-vola-photos"
+    TCTL restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
+    assert_identical "$sd/pristine-v1-photos" "$to"
+}
+
+kr_restore_sh_old_key_vola() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "kr.restore_sh_old_key_vola" "single-cartridge mode: VOL-A's cartridge was erased to become VOL-C"
+        return $?
+    fi
+    local sd work oldkey to
+    sd="$(dirname "$HOME_DIR")"; work="$sd/heir-vola"; oldkey="$HOME_DIR/keys/alice-primary.age.key"; to="$sd/restore-sh-vola-photos"
+    if [ "$DRY_RUN" != 1 ]; then load_volume_tape VOL-A || return 1; fi
+    ensure_heir_restore_sh "$work" || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit photos --key $oldkey --to $to (VOL-A, the OLD deactivated key — its file never moves on rotation)"
+        return 0
+    fi
+    (cd "$work/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit photos --key "$oldkey" --to "$to") \
+        >"$RUN/log-kr.restore_sh_old_vola.txt" 2>&1 || { cat "$RUN/log-kr.restore_sh_old_vola.txt"; return 1; }
+    local sd2; sd2="$(dirname "$HOME_DIR")"
+    assert_identical "$sd2/pristine-v1-photos" "$to"
+}
+
+kr_escrow_restores_vola() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "kr.escrow_restores_vola" "single-cartridge mode: VOL-A's cartridge was erased to become VOL-C"
+        return $?
+    fi
+    local sd work to
+    sd="$(dirname "$HOME_DIR")"; work="$sd/heir-vola"; to="$sd/escrow-vola-photos"
+    if [ "$DRY_RUN" != 1 ]; then load_volume_tape VOL-A || return 1; fi
+    ensure_heir_restore_sh "$work" || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit photos --key \$ESCROW_KEY_PATH --to $to (VOL-A)"
+        return 0
+    fi
+    [ -f "$ESCROW_KEY_PATH" ] || { echo "no escrow key captured for this scenario"; return 1; }
+    (cd "$work/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit photos --key "$ESCROW_KEY_PATH" --to "$to") \
+        >"$RUN/log-kr.escrow_vola.txt" 2>&1 || { cat "$RUN/log-kr.escrow_vola.txt"; return 1; }
+    assert_identical "$sd/pristine-v1-photos" "$to"
+}
+
+scenario_key_rotation() {
+    check kr.setup                    bootstrap_archive_v1
+    check kr.rotate                   kr_rotate
+    check kr.keylist                  kr_keylist_shows_rotation
+    check kr.save_pristine            kr_save_pristine
+    check kr.mutate_and_stage_v2      kr_mutate_and_stage_v2
+    check kr.write_volc               kr_write_volc
+
+    check kr.restore_volc_new_key     kr_restore_volc_new_key
+    check kr.restore_sh_new_key_volc  kr_restore_sh_new_key_volc
+    check kr.escrow_restores_volc     kr_escrow_restores_volc
+
+    check kr.restore_vola_old_key     kr_restore_vola_old_key
+    check kr.restore_sh_old_key_vola  kr_restore_sh_old_key_vola
+    check kr.escrow_restores_vola     kr_escrow_restores_vola
+}
 scenario_tenant_reassign() { echo "PLAN: [tenant-reassign] not yet implemented"; }
 scenario_tape_only_and_reclaim() { echo "PLAN: [tape-only-and-reclaim] not yet implemented"; }
 scenario_compaction() { echo "PLAN: [compaction] not yet implemented"; }
