@@ -2528,6 +2528,124 @@ mod tests {
         );
     }
 
+    /// Issue #115, the `--force` question. `force` is a parameter of exactly
+    /// one thing — [`check_fresh_write_contact`], the File-0 identity check
+    /// at contact — and `volume_write` runs `built.validate(&keys)` BEFORE
+    /// `TapeStore::open` ever touches a device. So a stage set lacking the
+    /// escrow recipient is refused with `force = true` just as loudly as
+    /// without it, and no drive is contacted on the way to the refusal.
+    ///
+    /// This drives the real `volume_write` (not a validate-level stand-in)
+    /// precisely to pin that ordering: a bogus device path is reached only
+    /// if the refusal fails to fire, in which case the error names the
+    /// device instead of the stage set.
+    #[test]
+    fn force_does_not_bypass_the_escrow_check_and_never_reaches_the_device() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+
+        // Staged before the escrow existed: 1 unrelated recipient recorded.
+        let other = crate::crypto::keys::generate_keypair();
+        set_key_fingerprints(
+            &conn,
+            stage_set_id,
+            Some(&serde_json::to_string(&vec![other.public_key]).unwrap()),
+        );
+        register_escrow(&conn);
+
+        // A real staged slice on disk, so `validate`'s tri-layer L1 has
+        // something valid to check and cannot be what fails.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slices_dir = tmp.path().join("slices");
+        fs::create_dir_all(&slices_dir).unwrap();
+        let content = b"encrypted slice bytes for the force test".repeat(8);
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted)
+             VALUES (?1, 1, ?2, ?2, ?3, ?4)",
+            params![
+                stage_set_id,
+                content.len() as i64,
+                direct_hash(b"plaintext hash is not exercised here"),
+                direct_hash(&content),
+            ],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+        let slice_path = slices_dir.join(format!("slice_{slice_id}.age"));
+        fs::write(&slice_path, &content).unwrap();
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+            params![slice_path.to_string_lossy(), slice_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('FORCETEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let mut config = Config::default();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+        // Device paths that cannot exist: reaching either one is the failure
+        // this test is looking for.
+        config.backends.lto.push(crate::config::LtoBackendConfig {
+            name: "no-such-drive".into(),
+            device_tape: "/nonexistent/tapectl-force-test-nst".into(),
+            device_sg: "/nonexistent/tapectl-force-test-sg".into(),
+            media_type: "LTO-6".into(),
+            nominal_capacity: "2400G".into(),
+            usable_capacity_factor: 0.92,
+            enospc_buffer: "50M".into(),
+            block_size: "512K".into(),
+            hardware_compression: false,
+        });
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &config,
+            "FORCETEST",
+            "/nonexistent/tapectl-force-test-nst",
+            512 * 1024,
+            true, // --force
+        )
+        .expect_err("force must not bypass pre-write validation");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("failed pre-write validation"),
+            "expected the pre-flight refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("stage set {stage_set_id}")) && msg.contains("photos"),
+            "the refusal must name the offending stage set and its unit: {msg}"
+        );
+        assert!(
+            msg.contains("escrow recipient absent from recorded list") && msg.contains("ADR-0005"),
+            "the refusal must give the reason and the ADR: {msg}"
+        );
+        assert!(
+            !msg.contains("tapectl-force-test-nst"),
+            "validation must refuse BEFORE the tape device is opened: {msg}"
+        );
+
+        // Nothing was planned: no `writes` rows, so the operator is not left
+        // with a phantom session to resume or abort.
+        let writes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes, 0, "a refused write must plan nothing");
+    }
+
     #[test]
     fn record_write_bookkeeping_sums_only_padded_slice_entries() {
         let conn = crate::db::open_memory().unwrap();
