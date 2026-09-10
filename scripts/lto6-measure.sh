@@ -257,22 +257,44 @@ say ""
 # ---------- D. MAM over-report bound ----------
 say "## D. MAM remaining-capacity over-report"
 if command -v sg_read_attr >/dev/null; then
+    # weof at BOT truncates EOD back to BOT, which is what makes mam-before a
+    # clean baseline (docs/lto6-session-journal-2026-09-10.md, Phase 6). Do
+    # not simplify this sequence away.
     mt -f "$TAPE_DEV" rewind >/dev/null 2>&1
     mt -f "$TAPE_DEV" weof 1 >/dev/null 2>&1
     raw mam-before sg_read_attr "$DRIVE_SG" || true
-    dd if="$PAYLOAD" of="$TAPE_DEV" bs=524288 status=none 2>/dev/null || true
-    mt -f "$TAPE_DEV" weof 1 >/dev/null 2>&1
-    raw mam-after sg_read_attr "$DRIVE_SG" || true
-    say "Captured MAM before and after writing ${PAYLOAD_MB} MiB"
-    say "(\`mam-before.txt\` / \`mam-after.txt\`)."
-    say ""
-    say "**To size the ENOSPC buffer:** diff the remaining-capacity attribute"
-    say "across those two files. Remaining should fall by ~${PAYLOAD_MB} MiB. The"
-    say "shortfall — how much MORE the drive claims it still has than it really"
-    say "does — is the over-report, and the buffer must exceed it. This is"
-    say "reported rather than computed because the attribute's name and units"
-    say "differ by vendor, and a mis-parsed capacity would silently produce a"
-    say "buffer that is too small."
+    # Section A's last measure_blocksize call may have left the st driver in
+    # 1 M fixed-block mode. This probe writes fixed 512 K blocks and must not
+    # inherit that state independently of section A (issue #116): writing
+    # 512 K blocks to a driver set for 1 M is EINVAL, and the old code threw
+    # both the dd exit status and stderr away, sampling mam-after after a
+    # zero-byte write and reporting a confident, wrong "no change". Kept
+    # independent of measure_blocksize's own setblk on purpose — a future
+    # reordering of the sections must not silently reintroduce this.
+    if ! mt -f "$TAPE_DEV" setblk 524288 >"$RUN/setblk-mam.txt" 2>&1; then
+        say "**NOT MEASURED — could not set block size** (see \`setblk-mam.txt\`)."
+    elif dd if="$PAYLOAD" of="$TAPE_DEV" bs=524288 status=none 2>"$RUN/dd-mam.txt"; then
+        mt -f "$TAPE_DEV" weof 1 >/dev/null 2>&1
+        raw mam-after sg_read_attr "$DRIVE_SG" || true
+        say "Captured MAM before and after writing ${PAYLOAD_MB} MiB"
+        say "(\`mam-before.txt\` / \`mam-after.txt\`)."
+        say ""
+        BEFORE_LINE="$(grep -F 'Remaining capacity in partition' "$RUN/mam-before.txt" 2>/dev/null | head -1)"
+        AFTER_LINE="$(grep -F 'Remaining capacity in partition' "$RUN/mam-after.txt" 2>/dev/null | head -1)"
+        say "- before: \`${BEFORE_LINE:-not found in mam-before.txt}\`"
+        say "- after:  \`${AFTER_LINE:-not found in mam-after.txt}\`"
+        say ""
+        say "**To size the ENOSPC buffer:** diff the remaining-capacity attribute"
+        say "across those two files. Remaining should fall by ~${PAYLOAD_MB} MiB. The"
+        say "shortfall — how much MORE the drive claims it still has than it really"
+        say "does — is the over-report, and the buffer must exceed it. This is"
+        say "reported rather than computed because the attribute's name and units"
+        say "differ by vendor, and a mis-parsed capacity would silently produce a"
+        say "buffer that is too small."
+    else
+        say "**NOT MEASURED — the capacity write FAILED (see dd-mam.txt); the"
+        say "before/after MAM pair below is meaningless.**"
+    fi
 else
     say "\`sg_read_attr\` not installed — skipped."
 fi
