@@ -375,6 +375,18 @@ require_uint() {
   esac
 }
 
+# Make a string read from an unauthenticated plaintext tape zone safe to ECHO.
+# Same trust tier as require_uint's callers: anyone holding the tape can write
+# these bytes. This one is never used in arithmetic — the danger is terminal
+# control sequences (a crafted label could hide or forge output). Keep only
+# printable ASCII, cap the length, and mark it if anything was dropped.
+safe_str() {
+  local raw=$1 clean
+  clean=$(printf '%s' "$raw" | LC_ALL=C tr -cd '[:alnum:] ._:@/+-' | cut -c1-64)
+  [ "$clean" = "$raw" ] || clean="$clean (sanitized)"
+  printf '%s' "$clean"
+}
+
 # Non-fatal cousin of require_uint: true/false, never exits. Used in soft
 # parse/consistency checks where a bad value should degrade the reader to the
 # next rung of the ladder (or to an UNSEALED/DAMAGED verdict) instead of
@@ -532,6 +544,42 @@ bootstrap_thunk() {
   require_uint front_index "$FRONT_INDEX"
   require_uint seal_marker "$SEAL_MARKER"
   require_uint total_files "$TOTAL_FILES"
+
+  # Which volume is ACTUALLY in the drive. $LABEL is baked into this script at
+  # write time; it says which tape the script was made for, and is printed even
+  # when a different tape is loaded. Only the thunk says what is really there.
+  TAPE_LABEL=$(safe_str "$(toml_val "$WORK/thunk.toml" label)")
+  check_tape_identity
+}
+
+# Always say which device was read and what was found there. A silent default
+# device is how a wrong-tape read disguises itself as a key or data problem:
+# with the wrong cartridge loaded, --info happily describes it while
+# --find-envelope reports "no envelope matched the provided key", which reads
+# as "your key is wrong" or "your archive is gone" when it means neither.
+#
+# This WARNS and continues rather than exiting. Everything here except $LABEL is
+# generic, so running this script against a sibling tape is legitimate recovery
+# — and a damaged thunk (the case where an heir needs this script most) must
+# never be turned into a hard stop.
+check_tape_identity() {
+  info "Tape device:      $DEVICE${TAPE_DEVICE:+ (from TAPE_DEVICE)}"
+  info "Tape identifies as: ${TAPE_LABEL:-<unreadable>}"
+  if [ -n "$TAPE_LABEL" ] && [ "$TAPE_LABEL" != "$LABEL" ]; then
+    echo "" >&2
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+    echo "  WRONG TAPE? This script was written for volume '$LABEL'," >&2
+    echo "  but the tape in $DEVICE identifies itself as '$TAPE_LABEL'." >&2
+    echo "" >&2
+    echo "  Reading continues, but keys and units from '$LABEL' will NOT" >&2
+    echo "  be found on this tape. If that is not what you intended:" >&2
+    echo "    - load the '$LABEL' cartridge, or" >&2
+    echo "    - point this script at the right drive:" >&2
+    echo "        TAPE_DEVICE=/dev/nstN $0 ..." >&2
+    echo "  Drives on this machine: ls -l /dev/tape/by-id/" >&2
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+    echo "" >&2
+  fi
 }
 
 # ---- rung 1: the front index (File 3) ----
@@ -661,7 +709,9 @@ do_info() {
   fi
 
   echo ""
-  echo "=== tapectl volume: $LABEL ==="
+  # The tape's own label, not this script's — the map below describes what is
+  # actually loaded. Identical in the normal case; honest in the wrong-tape one.
+  echo "=== tapectl volume: ${TAPE_LABEL:-$LABEL} ==="
   echo ""
   echo "Verdict: $verdict"
   case "$verdict" in
@@ -823,7 +873,10 @@ do_find_envelope() {
     fi
   done < <(envelope_positions "$FILES_TXT")
 
-  [ "$found" -eq 1 ] || die "no envelope matched the provided key"
+  [ "$found" -eq 1 ] || die "no envelope matched the provided key
+       Tape in $DEVICE identifies as '\''${TAPE_LABEL:-<unreadable>}'\''; this script is for '\''$LABEL'\''.
+       If those differ, you have the wrong cartridge or the wrong drive
+       (set TAPE_DEVICE=/dev/nstN) — not necessarily the wrong key."
   echo ""
   echo "To restore, run:"
   echo "  $0 --restore --key $keyfile --to /your/destination"
@@ -885,7 +938,10 @@ do_restore() {
     if [ -n "$target_unit" ]; then
       die "no envelope for unit '$target_unit' matched the provided key"
     fi
-    die "no envelope matched the provided key"
+    die "no envelope matched the provided key
+       Tape in $DEVICE identifies as '\''${TAPE_LABEL:-<unreadable>}'\''; this script is for '\''$LABEL'\''.
+       If those differ, you have the wrong cartridge or the wrong drive
+       (set TAPE_DEVICE=/dev/nstN) — not necessarily the wrong key."
   fi
   [ -f "$WORK/env/MANIFEST.toml" ] || die "envelope missing MANIFEST.toml"
 
