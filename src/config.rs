@@ -149,7 +149,14 @@ fn default_enospc_buffer() -> String {
     "50M".to_string()
 }
 fn default_block_size() -> String {
-    "1M".to_string()
+    // Issue #121: the write path's block size is a format constant that
+    // never scales (docs/design/v2-open-questions.md:442,
+    // volume-format-v2.md §1/D7) -- this default was "1M", silently
+    // contradicting it. The field is still inert today
+    // (cli::volume::DEFAULT_BLOCK_SIZE is what the write path actually
+    // uses), so this default is currently only misleading, not dangerous,
+    // but it should read as what the format actually fixes.
+    "512K".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

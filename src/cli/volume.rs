@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::store::Tier;
 use crate::volume::write;
 
-const DEFAULT_BLOCK_SIZE: usize = 512 * 1024; // 512 KB
+pub(crate) const DEFAULT_BLOCK_SIZE: usize = 512 * 1024; // 512 KB
 
 #[derive(Subcommand, Debug)]
 pub enum VolumeCommands {

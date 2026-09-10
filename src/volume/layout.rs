@@ -1830,4 +1830,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn on_tape_recovery_text_uses_the_write_paths_block_size() {
+        // Issue #121: the recovery text an heir reads off the tape must stay
+        // in lockstep with the write path's actual block size
+        // (`cli::volume::DEFAULT_BLOCK_SIZE`), not a hand-typed literal that
+        // could silently drift if the write path's block size ever changes
+        // without re-templating these generators. This doesn't replace the
+        // literal-asserting tests above (`restore_script_v2_has_all_modes_
+        // and_rung2_fallback`'s `BLOCK=524288`, `tenant_recovery_md_has_
+        // working_dar_recipe`'s `setblk 524288`) -- it adds the tripwire: if
+        // DEFAULT_BLOCK_SIZE ever changes without this text changing too,
+        // this test is what catches it.
+        let guide = generate_system_guide_v2("LOCK01", 20);
+        let script = generate_restore_script_v2("LOCK01", 20);
+        assert!(guide.contains(&format!(
+            "setblk {}",
+            crate::cli::volume::DEFAULT_BLOCK_SIZE
+        )));
+        assert!(script.contains(&format!("BLOCK={}", crate::cli::volume::DEFAULT_BLOCK_SIZE)));
+    }
 }
