@@ -290,8 +290,14 @@ step_heir_extract() {
     && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' > "$HEIR/RESTORE.sh" \
     && chmod +x "$HEIR/RESTORE.sh" && bash -n "$HEIR/RESTORE.sh"
 }
-step_heir_info() { (cd "$HEIR" && ./RESTORE.sh --info); }
-step_heir_find() { (cd "$HEIR" && ./RESTORE.sh --find-envelope --key "$HOME_DIR/keys/alice-primary.age.key"); }
+# RESTORE.sh defaults to `${TAPE_DEVICE:-/dev/nst0}` — the tape an HEIR would
+# reach for, NOT necessarily this gate's drive. Every invocation below therefore
+# pins TAPE_DEVICE="$TAPE_DEV". Without it the heir leg silently reads /dev/nst0:
+# harmless while nst0 happened to be the mhvtl drive, but on a host where nst0 is
+# a DIFFERENT (e.g. real) drive it reads the wrong tape entirely — heir_info still
+# "passes" against any valid volume there while heir_find/restore fail on keys.
+step_heir_info() { (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info); }
+step_heir_find() { (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find-envelope --key "$HOME_DIR/keys/alice-primary.age.key"); }
 step_heir_restore() {
     # RESTORE.sh extracts the unit's contents directly into --to (dar restores
     # the unit's own tree), so compare that tree to the source directly — same
@@ -304,14 +310,14 @@ step_heir_restore() {
     # the tape and RESTORE.sh correctly refuses to guess ("FATAL: multiple
     # units found"). Naming the unit restores the intended assertion — this
     # leg diffs against $SRC/unitA, so it must ask for unitA.
-    (cd "$HEIR" && ./RESTORE.sh --restore --unit unitA --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered") \
+    (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered") \
     && diff -r "$SRC/unitA" "$HEIR/recovered"
 }
 # The heir path is the reason this project exists, so symlink survival is
 # checked there too, not only through tapectl. See step_restore_C for why
 # --no-dereference is mandatory here.
 step_heir_restore_symlinks() {
-    (cd "$HEIR" && ./RESTORE.sh --restore --unit unitC --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-C") \
+    (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitC --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-C") \
     && diff -r --no-dereference "$SRC/unitC" "$HEIR/recovered-C"
 }
 echo "gate: leg 2 — heir leg (RESTORE.sh, no tapectl)"
