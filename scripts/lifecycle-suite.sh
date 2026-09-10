@@ -882,6 +882,19 @@ capture_escrow_secret() {
     chmod 600 "$log" 2>/dev/null || true
 }
 
+# NEWHOME_TCTL <home> [args...] — like TCTL, but for a SECOND, throwaway
+# home a scenario stands up alongside its own $HOME_DIR (db-loss's three
+# "what if the database/home is gone" arms). Never touches $HOME_DIR/$CFG.
+NEWHOME_TCTL() {
+    local home="$1"; shift
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl --home $home --config $home/config.toml $*"
+        return 0
+    fi
+    echo "+ tapectl --home $home --config $home/config.toml $*" >>"$COMMANDS_LOG"
+    "$BIN" --home "$home" --config "$home/config.toml" "$@" </dev/null
+}
+
 # pending_count — number of pending (staged, unwritten) stage sets, via
 # `report pending --json` (a plain JSON array — src/cli/report.rs
 # report_pending) rather than sqlite3 directly (guardrail: no direct DB
@@ -1711,7 +1724,117 @@ scenario_retire_and_reuse() {
     check rr.mark_erased_after_retire_succeeds rr_mark_erased_after_retire_succeeds
     check rr.volinit_volh_on_reused_cartridge_succeeds rr_volinit_volh_on_reused_cartridge_succeeds
 }
-scenario_db_loss() { echo "PLAN: [db-loss] not yet implemented"; }
+# ============================================================
+# Scenario: db-loss
+# ============================================================
+# After first-year: three "what if $HOME_DIR is gone" arms, none of which
+# ever touch $HOME_DIR again once bootstrapped. VOL-A stays loaded
+# throughout (no next_tape call happens after bootstrap), so this scenario
+# needs no --single-cartridge guards at all.
+#
+# Decided from src/main.rs:118-120: EVERY command except `init` and
+# `completions` requires `paths.is_initialized()`, so even `restore
+# raw-volume` — which touches nothing in the DB — needs a bare `tapectl
+# init` on the new home first. Recorded here rather than assumed.
+dl_backup() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl db backup --to \$sd/backup.db --include-keys"; return 0; }
+    local sd; sd="$(dirname "$HOME_DIR")"
+    TCTL db backup --to "$sd/backup.db" --include-keys
+}
+
+# (a) NEW empty home + `db import`: restores the FULL catalog (units,
+# snapshots, writes — everything `restore unit` needs), so this arm is
+# expected to work end-to-end.
+dl_scenario_a_db_import() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: new home; tapectl init; tapectl db import \$sd/backup.db; copy keys; tapectl catalog locate photos (assert VOL-A named); tapectl restore unit --unit photos --from VOL-A --to DIR (assert identical)"
+        return 0
+    fi
+    local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-a"
+    mkdir -p "$newhome"
+    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" >"$sd/dl.a.init.txt" 2>&1 || { cat "$sd/dl.a.init.txt"; return 1; }
+    NEWHOME_TCTL "$newhome" db import "$sd/backup.db" --yes >"$sd/dl.a.import.txt" 2>&1 || { cat "$sd/dl.a.import.txt"; return 1; }
+    mkdir -p "$newhome/keys"
+    cp -a "$sd/backup.keys/." "$newhome/keys/" 2>/dev/null || { echo "could not copy backup.keys into the new home"; return 1; }
+    local logf="$sd/dl.a.locate.json"
+    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos:"; cat "$logf"; return 1; }
+    local to="$sd/dl.a.restore-photos"
+    NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
+        >"$sd/dl.a.restore.txt" 2>&1 || { cat "$sd/dl.a.restore.txt"; return 1; }
+    assert_identical "$SRC/photos" "$to"
+}
+
+# (b) NEW empty home, NO backup at all: `restore raw-volume` is DB-less by
+# design and must verify every file from the tape's own front index alone.
+# Then top-level `tapectl import` (src/cli/operations.rs:1494 volume_import)
+# — decided by reading it: it inserts ONLY a bare `volumes` row (label,
+# backend, media type, capacity; status 'active') with NO units, snapshots,
+# stage_sets or writes. `restore unit --unit photos` resolves the unit by
+# name FIRST, so it has nothing to find. This arm is EXPECTED TO FAIL until
+# `import` is taught to reconstruct catalog rows from the tape's own front
+# index — a real gap this suite surfaces, not a mistake in the check.
+dl_scenario_b_raw_and_import() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: new home (init only); tapectl restore raw-volume --to DIR --json (assert all_verified, DB-less); tapectl import --label VOL-A; tapectl restore unit --unit photos --from VOL-A (documented gap: import creates no unit/write rows, so this is expected to fail today)"
+        return 0
+    fi
+    local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-b"
+    mkdir -p "$newhome"
+    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" >"$sd/dl.b.init.txt" 2>&1 || { cat "$sd/dl.b.init.txt"; return 1; }
+
+    local rawto="$sd/dl.b.raw" rawlog="$sd/dl.b.raw.json"
+    NEWHOME_TCTL "$newhome" restore raw-volume --to "$rawto" --device "$TAPE_DEV" --json >"$rawlog" 2>&1
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
+' "$rawlog" || { echo "raw-volume did not verify cleanly:"; cat "$rawlog"; return 1; }
+
+    NEWHOME_TCTL "$newhome" import --label VOL-A --media-type LTO-6 >"$sd/dl.b.import.txt" 2>&1 \
+        || { echo "top-level 'tapectl import' itself failed:"; cat "$sd/dl.b.import.txt"; return 1; }
+    local to="$sd/dl.b.restore-photos"
+    if ! NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
+        >"$sd/dl.b.restore.txt" 2>&1; then
+        echo "NOTE (expected, documented finding — src/cli/operations.rs:1494):"
+        echo "  'tapectl import' inserts only a bare volumes row (no units/snapshots/"
+        echo "  writes), so 'restore unit --unit photos' has no unit row to resolve"
+        echo "  against. See docs/lifecycle-suite.md for the full writeup."
+        cat "$sd/dl.b.restore.txt"
+        return 1
+    fi
+    assert_identical "$SRC/photos" "$to"
+}
+
+# (c) The pure heir path: a directory holding ONLY RESTORE.sh and the
+# tenant's key file, HOME pointed at an empty directory so nothing of
+# tapectl's own state (~/.tapectl, $HOME_DIR, keys elsewhere) is reachable.
+dl_scenario_c_pure_heir() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: dd RESTORE.sh + copy alice's key into an EMPTY dir; HOME=<empty> ./RESTORE.sh --restore --unit photos --key ./alice-primary.age.key --to DIR"
+        return 0
+    fi
+    local sd heir emptyhome to
+    sd="$(dirname "$HOME_DIR")"; heir="$sd/pure-heir"; emptyhome="$sd/pure-heir-emptyhome"; to="$sd/dl.c.restore-photos"
+    mkdir -p "$heir" "$emptyhome"
+    devcmd mt -f "$TAPE_DEV" rewind || return 1
+    devcmd mt -f "$TAPE_DEV" setblk 524288 || return 1
+    devcmd mt -f "$TAPE_DEV" fsf 2 || return 1
+    dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$heir/RESTORE.sh"
+    chmod +x "$heir/RESTORE.sh"
+    cp "$HOME_DIR/keys/alice-primary.age.key" "$heir/alice-primary.age.key" || return 1
+    (cd "$heir" && HOME="$emptyhome" TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit photos --key ./alice-primary.age.key --to "$to") \
+        >"$sd/dl.c.restore.txt" 2>&1 || { cat "$sd/dl.c.restore.txt"; return 1; }
+    assert_identical "$SRC/photos" "$to"
+}
+
+scenario_db_loss() {
+    check dl.setup     bootstrap_archive_v1 VOL-A
+    check dl.backup    dl_backup
+    check dl.scenario_a dl_scenario_a_db_import
+    check dl.scenario_b dl_scenario_b_raw_and_import
+    check dl.scenario_c dl_scenario_c_pure_heir
+}
 # ============================================================
 # Scenario: escrow-ordering (issue #115 regression)
 # ============================================================
@@ -1793,7 +1916,114 @@ scenario_escrow_ordering() {
     restore_matrix VOL-EO unitA alice "$SRC/unitA" eo-unitA bob
     restore_matrix VOL-EO unitB bob   "$SRC/unitB" eo-unitB alice
 }
-scenario_restore_file_and_catalog() { echo "PLAN: [restore-file-and-catalog] not yet implemented"; }
+# ============================================================
+# Scenario: restore-file-and-catalog
+# ============================================================
+# After first-year: catalog browsing cross-checked against `find` on the
+# real source, single-file restore for the awkward cases (nested unicode,
+# 0-byte, symlink), and `unit check-integrity` clean vs. after a mutation.
+#
+# `catalog ls --json` bakes a literal "d " prefix onto directory paths
+# before .trim() (src/cli/catalog.rs: `format!("{}{}", if is_dir {"d "}
+# else {"  "}, path)` — trim only strips the two-space file prefix, not
+# the letter 'd'), so file/link entries are exactly the ones NOT starting
+# with "d ".
+rfc_catalog_ls_matches_find() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog ls photos --json; compare non-directory entry count to find \$SRC/photos -type f -o -type l"; return 0; }
+    local logf="$RUN/log-rfc.catalog_ls.json"
+    TCTL catalog ls photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    local expect actual
+    expect="$(find "$SRC/photos" \( -type f -o -type l \) | wc -l)"
+    actual="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(sum(1 for r in d if not r.get("path", "").startswith("d ")))
+' "$logf")"
+    [ "$expect" = "$actual" ] || { echo "catalog ls photos: expected $expect file/link entries (find), got $actual (catalog)"; cat "$logf"; return 1; }
+}
+
+rfc_catalog_search() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog search target --json (assert target.txt found)"; return 0; }
+    local logf="$RUN/log-rfc.search.json"
+    TCTL catalog search target --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "target" "$logf" || { echo "catalog search 'target' found nothing:"; cat "$logf"; return 1; }
+}
+
+rfc_catalog_locate() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog locate photos --json (assert VOL-A named)"; return 0; }
+    local logf="$RUN/log-rfc.locate.json"
+    TCTL catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos:"; cat "$logf"; return 1; }
+}
+
+# Deliberately not cross-checked against `find` (catalog stats is
+# whole-database, not per-unit — an exact cross-check would need to sum
+# every unit's file count and would be more fragile than informative).
+rfc_catalog_stats() { TCTL catalog stats; }
+
+rfc_restore_file_nested_unicode() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl restore file --file nested/déjà-vu.txt --unit photos --from VOL-A --to DIR; assert sha256 match"; return 0; }
+    local to="$RUN/rfc-file-nested"
+    TCTL restore file --file "nested/déjà-vu.txt" --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
+    local expect actual
+    expect="$(sha256sum "$SRC/photos/nested/déjà-vu.txt" | awk '{print $1}')"
+    actual="$(sha256sum "$to/déjà-vu.txt" 2>/dev/null | awk '{print $1}')"
+    [ -n "$actual" ] && [ "$expect" = "$actual" ] || { echo "nested unicode file mismatch or missing at $to/déjà-vu.txt"; return 1; }
+}
+
+rfc_restore_file_empty() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl restore file --file empty.bin --unit photos --from VOL-A --to DIR; assert present and 0 bytes"; return 0; }
+    local to="$RUN/rfc-file-empty"
+    TCTL restore file --file empty.bin --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
+    [ -f "$to/empty.bin" ] || { echo "empty.bin missing after restore file"; return 1; }
+    [ ! -s "$to/empty.bin" ] || { echo "empty.bin is not empty after restore"; return 1; }
+}
+
+# Decided from src/volume/restore.rs:369 (`restore_file`'s single-file path
+# copies via `fs::copy(&source_file, &dest)` after a full temp-dir unit
+# restore) — `fs::copy` opens the source path and copies bytes; on a
+# symlink source that FOLLOWS the link, so the destination is always a
+# plain file, never a symlink. This check is therefore expected to FAIL
+# today — a real gap this suite surfaces (parallel to raw-volume's `import`
+# gap in db-loss), not a mistake in the assertion.
+rfc_restore_file_symlink() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl restore file --file link-ok --unit photos --from VOL-A --to DIR; assert restored AS A SYMLINK (documented gap: fs::copy dereferences, expected to fail today)"; return 0; }
+    local to="$RUN/rfc-file-link"
+    TCTL restore file --file link-ok --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
+    [ -L "$to/link-ok" ] || {
+        echo "NOTE (expected, documented finding — src/volume/restore.rs:369): restore file's"
+        echo "  fs::copy dereferences a symlink source, so link-ok was restored as a plain"
+        echo "  file instead of a symlink. See docs/lifecycle-suite.md."
+        return 1
+    }
+}
+
+rfc_check_integrity_clean() { TCTL unit check-integrity photos; }
+
+rfc_check_integrity_after_modify() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: mutate photos (modify); tapectl unit check-integrity photos --json (assert bitrot+size_mismatch > 0, naming the changed file)"; return 0; }
+    mutate_source "$SRC/photos" "$SEED" modify || return 1
+    local logf="$RUN/log-rfc.integrity_modify.json"
+    TCTL unit check-integrity photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert (d.get("bitrot", 0) + d.get("size_mismatch", 0)) > 0, d
+' "$logf" || { cat "$logf"; return 1; }
+}
+
+scenario_restore_file_and_catalog() {
+    check rfc.setup                        bootstrap_archive_v1 VOL-A
+    check rfc.catalog_ls_matches_find      rfc_catalog_ls_matches_find
+    check rfc.catalog_search               rfc_catalog_search
+    check rfc.catalog_locate               rfc_catalog_locate
+    check rfc.catalog_stats                rfc_catalog_stats
+    check rfc.restore_file_nested_unicode  rfc_restore_file_nested_unicode
+    check rfc.restore_file_empty           rfc_restore_file_empty
+    check rfc.restore_file_symlink         rfc_restore_file_symlink
+    check rfc.check_integrity_clean        rfc_check_integrity_clean
+    check rfc.check_integrity_after_modify rfc_check_integrity_after_modify
+}
 scenario_quick_archive() { echo "PLAN: [quick-archive] not yet implemented"; }
 scenario_collection() { echo "PLAN: [collection] not yet implemented"; }
 scenario_permute() { echo "PLAN: [permute] seed=$SEED steps=$STEPS not yet implemented"; }
