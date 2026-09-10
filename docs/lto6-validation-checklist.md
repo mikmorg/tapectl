@@ -107,7 +107,8 @@ proves least; §3.2's assumption still needs the real drive.
 - [ ] `tapectl volume verify LTO6-0001 --device /dev/nst0` — per-slice
       sha256 must all pass; failed count must be zero.
 - [ ] `tapectl restore unit <name> LTO6-0001 --device /dev/nst0` for
-      each tenant. `diff -r` against the source must be clean.
+      each tenant. `diff -r --no-dereference` against the source must be clean (see the
+      note in the raw-recovery drill on why the flag matters).
 - [ ] `tapectl report health` — drive error counters from sg_logs
       should show write_ok >> write_corrected; no unrecovered errors.
 
@@ -135,7 +136,10 @@ mhvtl. `fsf 2` assumes the layout order ID-thunk(0)/guide(1)/RESTORE.sh(2)
 - [ ] `./RESTORE.sh --restore --key <tenant-key>.age.key --to /tmp/recovered`
       — full restore succeeds: all slice checksums pass, age decryption works,
       dar extraction completes.
-- [ ] `diff -r <original-source-dir> /tmp/recovered` — byte-identical.
+- [ ] `diff -r --no-dereference <original-source-dir> /tmp/recovered` — byte-identical.
+      (`--no-dereference` is load-bearing: plain `diff -r` follows symlinks and
+      false-fails on any source tree with a dangling link — `/usr/share/doc`
+      has them. tapectl preserves such links correctly; see #122.)
 
 ## ENOSPC drill — REAL HARDWARE ONLY (mhvtl gives a false pass)
 
