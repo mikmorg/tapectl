@@ -215,9 +215,6 @@ if command -v sg_read_block_limits >/dev/null; then
         say ""
     fi
 fi
-say "| block size | setblk | throughput |"
-say "|---|---|---|"
-
 # Payload lives in tmpfs when there's room, so every throughput run below
 # reads from RAM rather than the source disk (issue #117): the original
 # harness generated one payload file on $OUT_DIR (a disk) and read it once
@@ -260,6 +257,13 @@ else
     say "Source read rate: NOT MEASURED — the timing read failed (see \`dd-source-read.txt\`)."
 fi
 say ""
+
+# The table header goes immediately before the first row-emitting call, not
+# up near the READ BLOCK LIMITS text above: anything `say`'d between a
+# Markdown table's header and its first row (the payload-location and
+# source-read-rate lines above) breaks the table.
+say "| block size | setblk | throughput |"
+say "|---|---|---|"
 
 measure_blocksize() { # measure_blocksize <bytes> <label>
     local bs="$1" label="$2" t0 t1 secs rate
@@ -335,7 +339,18 @@ if command -v sg_read_attr >/dev/null; then
     # reordering of the sections must not silently reintroduce this.
     if ! mt -f "$TAPE_DEV" setblk 524288 >"$RUN/setblk-mam.txt" 2>&1; then
         say "**NOT MEASURED — could not set block size** (see \`setblk-mam.txt\`)."
-    elif dd if="$PAYLOAD" of="$TAPE_DEV" bs=524288 status=none 2>"$RUN/dd-mam.txt"; then
+    else
+        DD_MAM_OK=1
+        if ! dd if="$PAYLOAD" of="$TAPE_DEV" bs=524288 status=none 2>"$RUN/dd-mam.txt"; then
+            DD_MAM_OK=0
+            say "**NOT MEASURED — the capacity write FAILED (see dd-mam.txt); the"
+            say "before/after MAM pair below is meaningless.**"
+        fi
+        # Captured either way — even on a failed write the journal's own
+        # methodology note is that this before/after pair is still worth
+        # having on file: it is what exposed the original bug in the first
+        # place (Phase 6). Only the sizing guidance below is withheld on
+        # failure, not the capture.
         mt -f "$TAPE_DEV" weof 1 >/dev/null 2>&1
         raw mam-after sg_read_attr "$DRIVE_SG" || true
         say "Captured MAM before and after writing ${PAYLOAD_MB} MiB"
@@ -346,16 +361,15 @@ if command -v sg_read_attr >/dev/null; then
         say "- before: \`${BEFORE_LINE:-not found in mam-before.txt}\`"
         say "- after:  \`${AFTER_LINE:-not found in mam-after.txt}\`"
         say ""
-        say "**To size the ENOSPC buffer:** diff the remaining-capacity attribute"
-        say "across those two files. Remaining should fall by ~${PAYLOAD_MB} MiB. The"
-        say "shortfall — how much MORE the drive claims it still has than it really"
-        say "does — is the over-report, and the buffer must exceed it. This is"
-        say "reported rather than computed because the attribute's name and units"
-        say "differ by vendor, and a mis-parsed capacity would silently produce a"
-        say "buffer that is too small."
-    else
-        say "**NOT MEASURED — the capacity write FAILED (see dd-mam.txt); the"
-        say "before/after MAM pair below is meaningless.**"
+        if [ "$DD_MAM_OK" -eq 1 ]; then
+            say "**To size the ENOSPC buffer:** diff the remaining-capacity attribute"
+            say "across those two files. Remaining should fall by ~${PAYLOAD_MB} MiB. The"
+            say "shortfall — how much MORE the drive claims it still has than it really"
+            say "does — is the over-report, and the buffer must exceed it. This is"
+            say "reported rather than computed because the attribute's name and units"
+            say "differ by vendor, and a mis-parsed capacity would silently produce a"
+            say "buffer that is too small."
+        fi
     fi
 else
     say "\`sg_read_attr\` not installed — skipped."
@@ -386,13 +400,10 @@ for i in 1 2 3; do
     mt -f "$TAPE_DEV" weof 1 >/dev/null 2>&1
 done
 mt -f "$TAPE_DEV" rewind >/dev/null 2>&1
-# Skip past all three files, then past EOD. Left silent deliberately: making
-# this positioning step report its own failure would change what a FAIL below
-# means (a mispositioned fsf could make the probe read real file 1 data and
-# misreport it as "stale data past EOD"), and that is EOD-probe interpretation
-# logic, not a write-failure report — out of scope for this change (issues
-# #116/#117 are about writes and the block-size table, not this probe's
-# positioning). Flagged as a residual, not fixed here.
+# Skip past all three files, then past EOD. Left silent deliberately: a
+# failed fsf here could leave the head short of EOD, so the read below would
+# return real file-1 data and get misreported as "stale data past EOD" — a
+# known gap in this probe, not a write failure, so it is not handled here.
 mt -f "$TAPE_DEV" fsf 3 >/dev/null 2>&1
 EOD_OUT="$RUN/eod-read.txt"
 if dd if="$TAPE_DEV" of=/dev/null bs=524288 count=1 >"$EOD_OUT" 2>&1; then
