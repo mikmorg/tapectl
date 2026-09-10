@@ -200,6 +200,34 @@ pub struct KeyAvailability {
     /// `write::assemble_session_keys`) pass `Some(..)`, as should any new one
     /// (ADR-0005).
     pub escrow_recipient_present: Option<bool>,
+    /// Per-stage-set escrow verdicts for the stage sets this write is about
+    /// to put on tape: `(stage_set_id, unit_name, reason)`, one entry per
+    /// stage set whose **recorded** recipient list (`stage_sets.key_
+    /// fingerprints`) does not contain the currently registered escrow
+    /// public key (issue #115).
+    ///
+    /// This is a strictly different question from
+    /// [`Self::escrow_recipient_present`], which only asks "is an escrow
+    /// registered *now*". Slices are encrypted at `stage create` time and
+    /// envelopes at `volume write` time, so registering the escrow between
+    /// those two steps — the natural order for a new archive, since `volume
+    /// write` is the first command that mentions escrow at all — produced a
+    /// tape that sealed and verified clean while the escrow key could open
+    /// the envelopes and not the data. The recorded recipient list is the
+    /// only evidence of who a staged slice was actually encrypted to (an
+    /// age X25519 stanza carries an ephemeral share, not a recipient
+    /// identity), so it is what this field is computed from.
+    ///
+    /// Semantics mirror `escrow_recipient_present`: `None` means the caller
+    /// did not compute it and the check is skipped entirely — meant for a
+    /// caller with no stage-set context, not a routine choice. Production
+    /// orchestrators MUST pass `Some(..)`, and always do: the one place this
+    /// is computed is `write::assemble_session_keys`, shared by
+    /// `write::volume_write` and `write::volume_resume`. `Some(vec![])` —
+    /// the pass verdict — is also what a not-yet-registered escrow yields,
+    /// since `escrow_recipient_present: Some(false)` already reports that
+    /// case and the two must not double-report.
+    pub stage_sets_lacking_escrow: Option<Vec<(i64, String, String)>>,
 }
 
 /// A validation failure. `validate` collects all failures rather than
@@ -230,6 +258,24 @@ pub enum LayoutError {
     OperatorKeyMissing,
     #[error("escrow recipient missing (ADR-0005)")]
     EscrowRecipientMissing,
+    /// A stage set about to be written was encrypted to a recipient list
+    /// that does not include the *current* escrow public key (issue #115).
+    /// Deliberately NOT [`Self::EscrowRecipientMissing`]: that one means "no
+    /// escrow is registered at all" and is fixed by registering one, while
+    /// this one means "an escrow exists but these particular slices predate
+    /// it (or predate a deliberate escrow swap, ADR-0005)" and is fixed only
+    /// by re-staging — the slices cannot be repaired in place, and must not
+    /// be.
+    #[error(
+        "stage set {stage_set_id} for unit '{unit}' was encrypted without the current escrow \
+         recipient ({reason}) — its slices cannot be recovered with the escrow key; re-stage \
+         it: tapectl stage create {unit} (ADR-0005)"
+    )]
+    StageSetLacksEscrow {
+        stage_set_id: i64,
+        unit: String,
+        reason: String,
+    },
     #[error("i/o hashing {path}: {message}")]
     Io { path: PathBuf, message: String },
     #[error("materialized zone at position {position} missing from disk: {path}")]
@@ -450,6 +496,20 @@ impl Layout {
         if keys.escrow_recipient_present == Some(false) {
             errs.push(LayoutError::EscrowRecipientMissing);
         }
+        // Issue #115. Same `None` = opted-out semantics as above; one error
+        // per offending stage set, because the remedy (re-stage) is
+        // per-stage-set and the operator needs to know which ones. The
+        // caller guarantees this list is empty when no escrow is registered
+        // at all, so this never doubles up with `EscrowRecipientMissing`.
+        if let Some(lacking) = &keys.stage_sets_lacking_escrow {
+            for (stage_set_id, unit, reason) in lacking {
+                errs.push(LayoutError::StageSetLacksEscrow {
+                    stage_set_id: *stage_set_id,
+                    unit: unit.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
     }
 }
 
@@ -489,6 +549,7 @@ mod tests {
             tenants_with_active_key: tenants.iter().copied().collect(),
             operator_key_present: true,
             escrow_recipient_present: None,
+            stage_sets_lacking_escrow: None,
         }
     }
 
@@ -650,6 +711,7 @@ mod tests {
             tenants_with_active_key: [7].into_iter().collect(),
             operator_key_present: false,
             escrow_recipient_present: None,
+            stage_sets_lacking_escrow: None,
         };
         let errs = l.validate(&keys).unwrap_err();
         assert!(errs.contains(&LayoutError::TenantHasNoActiveKey(8)));
@@ -675,6 +737,67 @@ mod tests {
         assert!(l.validate(&k).is_ok());
     }
 
+    /// Issue #115: an escrow can be registered (so `escrow_recipient_present`
+    /// is `Some(true)` and `EscrowRecipientMissing` never fires) while a
+    /// stage set about to be written was encrypted BEFORE that registration
+    /// — the envelopes would carry the escrow recipient and the slices would
+    /// not. `validate` must refuse, naming the offending stage set, its
+    /// unit, and why.
+    #[test]
+    fn stage_set_lacking_escrow_fails_validation_per_stage_set() {
+        let l = layout_with(vec![gen_entry(0, ZoneKind::IdThunk, 10)], 10 * BS, 0);
+        let mut k = keys_ok(&[]);
+        k.escrow_recipient_present = Some(true);
+
+        // The pass verdict: an escrow exists and every stage set records it.
+        k.stage_sets_lacking_escrow = Some(vec![]);
+        assert!(
+            l.validate(&k).is_ok(),
+            "an empty verdict list is the PASS case and must not error"
+        );
+
+        // One lacking stage set → exactly one StageSetLacksEscrow for it.
+        k.stage_sets_lacking_escrow = Some(vec![(
+            42,
+            "photos".to_string(),
+            "escrow recipient absent from recorded list".to_string(),
+        )]);
+        let errs = l.validate(&k).unwrap_err();
+        let lacking: Vec<&LayoutError> = errs
+            .iter()
+            .filter(|e| matches!(e, LayoutError::StageSetLacksEscrow { .. }))
+            .collect();
+        assert_eq!(
+            lacking.len(),
+            1,
+            "expected exactly one StageSetLacksEscrow, got: {errs:?}"
+        );
+        assert_eq!(
+            *lacking[0],
+            LayoutError::StageSetLacksEscrow {
+                stage_set_id: 42,
+                unit: "photos".to_string(),
+                reason: "escrow recipient absent from recorded list".to_string(),
+            }
+        );
+        // It is NOT the "no escrow registered at all" error — the two have
+        // different remedies (register one vs. re-stage) and must stay apart.
+        assert!(
+            !errs.contains(&LayoutError::EscrowRecipientMissing),
+            "must not double-report as EscrowRecipientMissing: {errs:?}"
+        );
+        // The rendered message must name the remedy the operator has to run.
+        let msg = lacking[0].to_string();
+        assert!(
+            msg.contains("tapectl stage create photos") && msg.contains("ADR-0005"),
+            "message must name the re-stage remedy and the ADR: {msg}"
+        );
+
+        // `None` = the caller did not compute the field: check skipped.
+        k.stage_sets_lacking_escrow = None;
+        assert!(l.validate(&k).is_ok());
+    }
+
     #[test]
     fn validate_collects_all_failures() {
         // Over capacity AND a keyless tenant AND a missing slice, all at once.
@@ -694,6 +817,7 @@ mod tests {
             tenants_with_active_key: HashSet::new(),
             operator_key_present: true,
             escrow_recipient_present: None,
+            stage_sets_lacking_escrow: None,
         };
         let errs = l.validate(&keys).unwrap_err();
         assert!(errs

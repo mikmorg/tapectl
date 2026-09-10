@@ -276,12 +276,20 @@ pub fn volume_write(
     let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
     distinct_tenant_ids.sort_unstable();
     distinct_tenant_ids.dedup();
+    // The stage sets this write will put on tape, taken straight from
+    // `find_staged_data`'s single selection above — the one place the write
+    // path decides what it writes. Used twice below (the escrow-recorded-
+    // recipient check inside `assemble_session_keys`, issue #115, and the
+    // filtered catalog snapshot, issue #83); deriving it once is deliberate,
+    // because two selections that can drift is exactly how issue #96
+    // happened.
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let SessionKeys {
         keys,
         tenants,
         operator_public_keys,
         escrow_public_key,
-    } = assemble_session_keys(conn, &distinct_tenant_ids)?;
+    } = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
 
     // MAM (best-effort, informational; never gates the write — the pre-flight
     // capacity gate below reads the configured nominal capacity, which is
@@ -324,7 +332,6 @@ pub fn volume_write(
     // write). `build()` appends it to the OPERATOR envelope only.
     fs::create_dir_all(&session_dir)?;
     let catalog_db_path = session_dir.join("catalog_snapshot.db");
-    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     crate::db::catalog_snapshot::build_catalog_snapshot(conn, &stage_set_ids, &catalog_db_path)?;
 
     let inputs = BuildInputs {
@@ -489,7 +496,15 @@ pub fn volume_resume(
         ids.dedup();
         ids
     };
-    let SessionKeys { keys, .. } = assemble_session_keys(conn, &tenant_ids)?;
+    // The stage sets this session is writing, recovered from the rehydrated
+    // Layout's own slice entries rather than from a fresh
+    // `WHERE status = 'staged'` query (issue #115). `plan` already moved
+    // those stage sets out of `'staged'`, so a second selection would return
+    // the wrong set — and a second selection is what issue #96 was. The
+    // Layout IS the frozen record of the one `find_staged_data` selection
+    // this session was planned from.
+    let stage_set_ids = stage_set_ids_for_layout(conn, &layout_snapshot)?;
+    let SessionKeys { keys, .. } = assemble_session_keys(conn, &tenant_ids, &stage_set_ids)?;
 
     let backend = config
         .backends
@@ -712,7 +727,123 @@ struct SessionKeys {
     escrow_public_key: Option<String>,
 }
 
-fn assemble_session_keys(conn: &Connection, tenant_ids: &[i64]) -> Result<SessionKeys> {
+/// The stage sets a rehydrated Layout is writing, recovered by mapping its
+/// `ZoneKind::Slice` entries back through `stage_slices.stage_set_id`
+/// (issue #115).
+///
+/// This is a lookup **by id**, never a second selection: `find_staged_data`
+/// remains the one place the write path decides *which* stage sets it
+/// writes, and by resume time its answer is frozen into the Layout (`plan`
+/// has already moved those rows out of `status = 'staged'`, so re-running
+/// that query would return something else entirely). Two selections that can
+/// drift is how issue #96 happened.
+///
+/// A slice id with no surviving row is skipped rather than erroring: the
+/// escrow check downstream fails closed on the stage sets it *can* see, and
+/// a missing `stage_slices` row is a separate integrity problem that
+/// `validate`'s staged-slice checks already report.
+fn stage_set_ids_for_layout(conn: &Connection, layout: &Layout) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT stage_set_id FROM stage_slices WHERE id = ?1")?;
+    let mut ids = Vec::new();
+    for entry in &layout.entries {
+        let ZoneKind::Slice { stage_slice_id } = entry.kind else {
+            continue;
+        };
+        let found: Option<i64> = stmt
+            .query_row(params![stage_slice_id], |r| r.get(0))
+            .optional()?;
+        if let Some(stage_set_id) = found {
+            ids.push(stage_set_id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Which of `stage_set_ids` were encrypted WITHOUT `escrow_public_key`
+/// (issue #115), as `(stage_set_id, unit_name, reason)` — the payload of
+/// [`KeyAvailability::stage_sets_lacking_escrow`].
+///
+/// The evidence is `stage_sets.key_fingerprints`, the recipient list
+/// `stage_create` recorded for the slices it wrote (`fingerprint ==
+/// public_key` by construction throughout this system, so the column holds
+/// public keys verbatim). It is the ONLY evidence available: an age X25519
+/// stanza carries a per-encryption ephemeral share, not the recipient's
+/// identity, so the ciphertext itself cannot be asked who it was encrypted
+/// to without a private key — and the escrow private key is deliberately
+/// absent from any machine that runs this code (ADR-0005).
+///
+/// **Fails closed.** A stage set whose recipient list is missing,
+/// unparseable, or contradicted by `encrypted = 0` is reported, not skipped:
+/// on write-once media "we could not tell" must not read as "it is fine".
+/// Each case gets its own `reason` so the operator can tell a pre-escrow
+/// stage set apart from a corrupt row.
+///
+/// This is a lookup by id over the ids the caller already selected — never
+/// its own `WHERE status = 'staged'` query. `find_staged_data` stays the one
+/// place the write path decides what it writes (issue #96).
+fn stage_sets_lacking_escrow(
+    conn: &Connection,
+    stage_set_ids: &[i64],
+    escrow_public_key: &str,
+) -> Result<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.name, ss.key_fingerprints, ss.encrypted
+         FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE ss.id = ?1",
+    )?;
+    let mut lacking = Vec::new();
+    for &stage_set_id in stage_set_ids {
+        let row: Option<(String, Option<String>, i64)> = stmt
+            .query_row(params![stage_set_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        // No row at all (or no unit behind it) is as unprovable as a NULL
+        // list — same fail-closed answer, same wording.
+        let Some((unit_name, fingerprints, encrypted)) = row else {
+            lacking.push((
+                stage_set_id,
+                format!("<unknown unit for stage set {stage_set_id}>"),
+                "no recorded recipient list".to_string(),
+            ));
+            continue;
+        };
+        let reason = if encrypted == 0 {
+            // Checked first: whatever the recipient column claims, a stage
+            // set marked unencrypted has no age recipients on its slices at
+            // all, so the column cannot be describing them.
+            "staged with encrypted=0"
+        } else {
+            match fingerprints.as_deref() {
+                None => "no recorded recipient list",
+                Some(json) => match serde_json::from_str::<Vec<String>>(json) {
+                    Err(_) => "recipient list unparseable",
+                    Ok(list) => {
+                        if list.iter().any(|k| k == escrow_public_key) {
+                            continue;
+                        }
+                        // The normal case, and also what a deliberate escrow
+                        // swap looks like (ADR-0005: it orphans pre-swap
+                        // material, so pre-swap stage sets must be re-staged).
+                        "escrow recipient absent from recorded list"
+                    }
+                },
+            }
+        };
+        lacking.push((stage_set_id, unit_name, reason.to_string()));
+    }
+    Ok(lacking)
+}
+
+fn assemble_session_keys(
+    conn: &Connection,
+    tenant_ids: &[i64],
+    stage_set_ids: &[i64],
+) -> Result<SessionKeys> {
     let mut tenants = Vec::with_capacity(tenant_ids.len());
     let mut tenants_with_active_key = HashSet::new();
     for &tenant_id in tenant_ids {
@@ -747,12 +878,30 @@ fn assemble_session_keys(conn: &Connection, tenant_ids: &[i64]) -> Result<Sessio
     // `key rotate` refuses without one.
     let escrow_public_key = queries::escrow_public_key(conn)?;
 
+    // Issue #115: "an escrow is registered" and "the slices about to be
+    // written were encrypted to it" are different questions, and only the
+    // second one is about the bytes that end up on tape. Computed here, in
+    // the one place `volume_write` and `volume_resume` both route through,
+    // so the two can never drift on it — the same reason this function
+    // exists at all.
+    let lacking = match &escrow_public_key {
+        Some(pk) => stage_sets_lacking_escrow(conn, stage_set_ids, pk)?,
+        // No escrow registered at all: `escrow_recipient_present:
+        // Some(false)` already fails validation with the right remedy
+        // ("register one"), so listing every stage set here would bury it
+        // under N copies of the wrong remedy ("re-stage"). Still computed —
+        // an empty list, not `None`, which is reserved for callers that have
+        // no stage-set context.
+        None => Vec::new(),
+    };
+
     Ok(SessionKeys {
         keys: KeyAvailability {
             tenant_ids: tenant_ids.to_vec(),
             tenants_with_active_key,
             operator_key_present: true,
             escrow_recipient_present: Some(escrow_public_key.is_some()),
+            stage_sets_lacking_escrow: Some(lacking),
         },
         tenants,
         operator_public_keys,
@@ -2080,6 +2229,302 @@ mod tests {
         assert!(
             units.is_empty(),
             "a stage_set with no on-disk slices must not surface as staged data"
+        );
+    }
+
+    // --- issue #115: recorded recipients vs the CURRENT escrow ------------
+    //
+    // The defect these pin: `stage create` encrypts the slices, `volume
+    // write` encrypts the envelopes, and the escrow recipient could be
+    // registered between the two. Pre-write validation only asked "is an
+    // escrow registered", so the tape sealed and verified clean with
+    // 5-recipient envelopes over 4-recipient slices — the escrow key opens
+    // the envelope and not the data, which is the exact failure ADR-0005
+    // exists to prevent. `stage_sets.key_fingerprints` is the ONLY evidence
+    // of who a staged slice was really encrypted to (an age X25519 stanza
+    // carries an ephemeral share, not a recipient identity), so it is what
+    // gets compared.
+
+    /// A DB with an operator tenant (+ active key), one content tenant
+    /// (+ active key), one unit/snapshot/stage_set, and no escrow yet.
+    /// Returns `(conn, tenant_id, stage_set_id)`.
+    fn escrow_check_fixture() -> (Connection, i64, i64) {
+        let conn = crate::db::open_memory().unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let operator_id = conn.last_insert_rowid();
+        let op_key = crate::crypto::keys::generate_keypair();
+        conn.execute(
+            "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+             VALUES (?1, 'operator-key', ?2, ?3, 'primary', 1)",
+            params![operator_id, op_key.fingerprint, op_key.public_key],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('alpha', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let tenant_key = crate::crypto::keys::generate_keypair();
+        conn.execute(
+            "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+             VALUES (?1, 'alpha-key', ?2, ?3, 'primary', 1)",
+            params![tenant_id, tenant_key.fingerprint, tenant_key.public_key],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-photos', 'photos', ?1, 'mtime_size', 1, 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp/photos', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snapshot_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+
+        (conn, tenant_id, stage_set_id)
+    }
+
+    /// Register the permanent escrow recipient (ADR-0005) on its own holder
+    /// tenant, exactly as production does — public key only, the secret half
+    /// never touching the DB. Mirrors `tests/mhvtl_e2e.rs`'s harness.
+    /// Returns the escrow public key.
+    fn register_escrow(conn: &Connection) -> String {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let holder_id = conn.last_insert_rowid();
+        let kp = crate::crypto::keys::generate_keypair();
+        queries::insert_escrow_key(
+            conn,
+            holder_id,
+            "test-escrow",
+            &kp.fingerprint,
+            &kp.public_key,
+            Some("test escrow recipient (ADR-0005)"),
+        )
+        .unwrap();
+        kp.public_key
+    }
+
+    fn set_key_fingerprints(conn: &Connection, stage_set_id: i64, json: Option<&str>) {
+        conn.execute(
+            "UPDATE stage_sets SET key_fingerprints = ?1 WHERE id = ?2",
+            params![json, stage_set_id],
+        )
+        .unwrap();
+    }
+
+    /// The verdict list `assemble_session_keys` hands `validate`, for the
+    /// stage sets `find_staged_data` selected.
+    fn verdicts(
+        conn: &Connection,
+        tenant_id: i64,
+        stage_set_id: i64,
+    ) -> Vec<(i64, String, String)> {
+        let session = assemble_session_keys(conn, &[tenant_id], &[stage_set_id]).unwrap();
+        session
+            .keys
+            .stage_sets_lacking_escrow
+            .expect("production assembly must always COMPUTE this field, never leave it None")
+    }
+
+    #[test]
+    fn stage_set_staged_before_escrow_registration_is_named_by_the_assembly_path() {
+        // The exact real-world ordering from the 2026-09-10 LTO-6 session:
+        // stage first (4 recipients), register escrow second, write third.
+        let (conn, tenant_id, stage_set_id) = escrow_check_fixture();
+        let other = crate::crypto::keys::generate_keypair();
+        set_key_fingerprints(
+            &conn,
+            stage_set_id,
+            Some(&serde_json::to_string(&vec![other.public_key]).unwrap()),
+        );
+        register_escrow(&conn);
+
+        let v = verdicts(&conn, tenant_id, stage_set_id);
+        assert_eq!(v.len(), 1, "expected exactly one lacking stage set: {v:?}");
+        assert_eq!(v[0].0, stage_set_id);
+        assert_eq!(v[0].1, "photos", "the verdict must name the unit");
+        assert_eq!(v[0].2, "escrow recipient absent from recorded list");
+    }
+
+    #[test]
+    fn stage_set_recording_the_escrow_recipient_passes() {
+        let (conn, tenant_id, stage_set_id) = escrow_check_fixture();
+        let escrow_pk = register_escrow(&conn);
+        let other = crate::crypto::keys::generate_keypair();
+        set_key_fingerprints(
+            &conn,
+            stage_set_id,
+            Some(&serde_json::to_string(&vec![other.public_key, escrow_pk]).unwrap()),
+        );
+
+        assert!(
+            verdicts(&conn, tenant_id, stage_set_id).is_empty(),
+            "a recorded list containing the escrow key is the PASS case"
+        );
+
+        // ...and the Layout-level predicate agrees.
+        let session = assemble_session_keys(&conn, &[tenant_id], &[stage_set_id]).unwrap();
+        let layout = Layout {
+            label: "ESCTEST".into(),
+            volume_uuid: "u".into(),
+            media_type: "LTO-6".into(),
+            block_size: 512 * 1024,
+            budget: CapacityBudget {
+                available_bytes: 1_000_000_000,
+                reserve_bytes: 0,
+            },
+            entries: vec![],
+        };
+        assert!(layout.validate(&session.keys).is_ok());
+    }
+
+    #[test]
+    fn escrow_check_fails_closed_on_null_unparseable_and_unencrypted() {
+        // Every one of these is a stage set whose recipient list cannot be
+        // proven to contain the escrow key. None of them may be skipped:
+        // "we could not tell" and "it is fine" are different answers, and
+        // only one of them is safe on write-once media.
+        let (conn, tenant_id, stage_set_id) = escrow_check_fixture();
+        let escrow_pk = register_escrow(&conn);
+
+        // NULL — never finalized, or a pre-#115 row.
+        set_key_fingerprints(&conn, stage_set_id, None);
+        let v = verdicts(&conn, tenant_id, stage_set_id);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].2, "no recorded recipient list");
+
+        // Not JSON at all.
+        set_key_fingerprints(&conn, stage_set_id, Some("{not json"));
+        let v = verdicts(&conn, tenant_id, stage_set_id);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].2, "recipient list unparseable");
+
+        // Valid JSON, but not a list of recipients.
+        set_key_fingerprints(&conn, stage_set_id, Some("{\"escrow\": true}"));
+        let v = verdicts(&conn, tenant_id, stage_set_id);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].2, "recipient list unparseable");
+
+        // encrypted = 0. The recorded list deliberately DOES contain the
+        // escrow key here, so only the `encrypted` column can produce a
+        // verdict — proving that column is really consulted.
+        set_key_fingerprints(
+            &conn,
+            stage_set_id,
+            Some(&serde_json::to_string(&vec![escrow_pk]).unwrap()),
+        );
+        conn.execute(
+            "UPDATE stage_sets SET encrypted = 0 WHERE id = ?1",
+            params![stage_set_id],
+        )
+        .unwrap();
+        let v = verdicts(&conn, tenant_id, stage_set_id);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].2, "staged with encrypted=0");
+    }
+
+    #[test]
+    fn no_registered_escrow_reports_only_escrow_recipient_missing_not_every_stage_set() {
+        // With no escrow at all the remedy is "register one", and
+        // `EscrowRecipientMissing` says exactly that. Repeating it per stage
+        // set would bury it under N copies of the WRONG remedy (re-stage).
+        let (conn, tenant_id, stage_set_id) = escrow_check_fixture();
+        set_key_fingerprints(&conn, stage_set_id, None);
+
+        let session = assemble_session_keys(&conn, &[tenant_id], &[stage_set_id]).unwrap();
+        assert_eq!(session.keys.escrow_recipient_present, Some(false));
+        assert_eq!(
+            session.keys.stage_sets_lacking_escrow,
+            Some(vec![]),
+            "computed (Some), but empty — the missing-escrow error covers this case"
+        );
+    }
+
+    #[test]
+    fn stage_set_ids_for_layout_maps_slice_entries_back_to_their_stage_sets() {
+        // `volume_resume`'s half of the plumbing: by resume time `plan` has
+        // already moved these rows out of status='staged', so the Layout —
+        // not a re-run of `find_staged_data` — is what says which stage sets
+        // this session writes.
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let mut slice_ids = Vec::new();
+        for n in 1..=2 {
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, ?2, 10, 10, 'a', 'b', '/tmp/x')",
+                params![stage_set_id, n],
+            )
+            .unwrap();
+            slice_ids.push(conn.last_insert_rowid());
+        }
+
+        let layout = Layout {
+            label: "RESTEST".into(),
+            volume_uuid: "u".into(),
+            media_type: "LTO-6".into(),
+            block_size: 512 * 1024,
+            budget: CapacityBudget {
+                available_bytes: 1_000_000_000,
+                reserve_bytes: 0,
+            },
+            entries: vec![
+                LayoutEntry {
+                    position: 0,
+                    kind: ZoneKind::IdThunk,
+                    size_bytes: Some(10),
+                    sha256: None,
+                    source: ContentSource::Generated,
+                },
+                LayoutEntry {
+                    position: 4,
+                    kind: ZoneKind::Slice {
+                        stage_slice_id: slice_ids[0],
+                    },
+                    size_bytes: Some(10),
+                    sha256: Some("b".into()),
+                    source: ContentSource::Generated,
+                },
+                LayoutEntry {
+                    position: 5,
+                    kind: ZoneKind::Slice {
+                        stage_slice_id: slice_ids[1],
+                    },
+                    size_bytes: Some(10),
+                    sha256: Some("b".into()),
+                    source: ContentSource::Generated,
+                },
+            ],
+        };
+
+        assert_eq!(
+            stage_set_ids_for_layout(&conn, &layout).unwrap(),
+            vec![stage_set_id],
+            "two slices of one stage set must dedup to one id, and non-slice \
+             entries must contribute nothing"
         );
     }
 

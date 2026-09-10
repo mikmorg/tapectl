@@ -1133,6 +1133,7 @@ mod tests {
             tenants_with_active_key: tenant_ids.into_iter().collect(),
             operator_key_present: true,
             escrow_recipient_present: None,
+            stage_sets_lacking_escrow: None,
         }
     }
 

@@ -301,6 +301,7 @@ fn rebuild_keys(conn: &Connection, tenant_ids: Vec<i64>) -> KeyAvailability {
         tenants_with_active_key: with_key,
         operator_key_present: true,
         escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
     }
 }
 

@@ -309,6 +309,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
         tenants_with_active_key: tenants.iter().map(|t| t.tenant_id).collect(),
         operator_key_present: true,
         escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
     };
 
     let mut store = MemStore::new(BS as usize);
