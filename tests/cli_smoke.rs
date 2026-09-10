@@ -200,13 +200,26 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
         Some(&serde_json::json!([])),
         "config check --json missing/non-empty 'unsupported_compression' field on a fresh db: {parsed}"
     );
-    // Fresh init's default dar.binary (/opt/dar/bin/dar) does not exist on
-    // this machine — the headline case this ticket exists for. It must be
-    // reported, not silently absent, and it must not fail the command.
+    // Fresh init's default dar.binary is now the bare, PATH-resolved "dar"
+    // (issue #124 — the old shipped default /opt/dar/bin/dar existed on no
+    // mainstream distro). `dar` is a hard runtime dependency guaranteed on
+    // PATH for this whole suite (CLAUDE.md; enforced by
+    // tests/test_dependencies.rs), and `config check` now resolves a bare
+    // name via PATH the same way the runtime does (issue #119), so a fresh
+    // init's dar status must come back "ok", not "missing" — the field
+    // still must be present and reported either way, and must not fail the
+    // command. Coverage for the "reported, not silently absent, when
+    // actually missing" case moved to depth_check.rs's own unit tests.
     assert_eq!(
         parsed["dar"]["status"],
-        serde_json::json!("missing"),
-        "expected the default dar.binary to be reported missing: {parsed}"
+        serde_json::json!("ok"),
+        "expected a fresh init's default dar.binary ('dar') to resolve via PATH: {parsed}"
+    );
+    assert!(
+        parsed["dar"]["path"]
+            .as_str()
+            .is_some_and(|p| p.starts_with('/')),
+        "expected config check to report the PATH-resolved absolute path, not the bare name: {parsed}"
     );
 
     // 4. db fsck — a clean fresh db must exit 0. (#45 fixed fsck so it
@@ -339,9 +352,10 @@ fn prepare_home_for_staging(
         String::from_utf8_lossy(&init_out.stderr)
     );
 
-    // Repoint staging.directory at our own TempDir before anything stages,
-    // and dar.binary at wherever this box actually has dar installed —
-    // `Config::default`'s `/opt/dar/bin/dar` is very unlikely to exist.
+    // Repoint staging.directory at our own TempDir before anything stages.
+    // `Config::default`'s dar.binary is the bare, PATH-resolved "dar"
+    // (issue #124), which already works on this box; TAPECTL_TEST_DAR_BIN
+    // lets a caller override it to an explicit path instead.
     let config_path = home.join(".tapectl").join("config.toml");
     let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
     cfg.staging.directory = staging_dir.to_string_lossy().to_string();
