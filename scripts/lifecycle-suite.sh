@@ -2024,8 +2024,142 @@ scenario_restore_file_and_catalog() {
     check rfc.check_integrity_clean        rfc_check_integrity_clean
     check rfc.check_integrity_after_modify rfc_check_integrity_after_modify
 }
-scenario_quick_archive() { echo "PLAN: [quick-archive] not yet implemented"; }
-scenario_collection() { echo "PLAN: [collection] not yet implemented"; }
+# ============================================================
+# Scenario: quick-archive
+# ============================================================
+# The one-shot create+stage+write flow (src/cli/operations.rs:1536
+# quick_archive: unit init -> snapshot -> stage -> write). `quick-archive`
+# has no `--name` override, so the unit name is whatever
+# `unit::auto_name_from_path` derives — every Normal path component
+# joined with "/" (src/unit/mod.rs:221), which for a path under $RUN is
+# the whole absolute path minus the leading "/". Captured from the run's
+# own log rather than guessed, so this scenario works regardless of where
+# $OUT_DIR happens to be.
+qa_tenants() { TCTL tenant add alice && TCTL tenant add bob; }
+
+qa_escrow() { TCTL key generate --escrow; }
+
+qa_run() {
+    make_source "$SRC/qa-unit" "plain+links" "$CANARY" || return 1
+    next_tape VOL-Q || return 1
+    TCTL quick-archive --tenant alice --volume VOL-Q "$SRC/qa-unit" --device "$TAPE_DEV"
+}
+
+scenario_quick_archive() {
+    check qa.init    bootstrap_config
+    check qa.tenants qa_tenants
+    check qa.escrow  qa_escrow
+    capture_escrow_secret qa.escrow
+    check qa.run     qa_run
+
+    local qa_unit_name
+    if [ "$DRY_RUN" = 1 ]; then
+        qa_unit_name="<auto-named-from-path>"
+    else
+        qa_unit_name="$(grep -oE 'unit "[^"]+" initialized' "$RUN/log-qa.run.txt" 2>/dev/null \
+            | head -1 | sed -E 's/unit "([^"]+)".*/\1/')"
+        [ -n "$qa_unit_name" ] || { echo "qa.unit_name: could not capture the auto-named unit from qa.run's log"; qa_unit_name="qa-unit"; }
+    fi
+
+    restore_matrix VOL-Q "$qa_unit_name" alice "$SRC/qa-unit" qa-unit bob
+}
+# ============================================================
+# Scenario: collection
+# ============================================================
+# A folder-per-unit collection: 4 pre-existing folders, `collection sync`
+# registers them, `collection run` writes one batch, then a 5th folder
+# appears and a 3rd is renamed — `collection sync` must resolve the rename
+# by dotfile uuid (unit count goes to 5, not 6).
+#
+# Config keys read from src/config.rs's CollectionConfig (`[[collections]]`
+# name/root/tenant/unit_depth/exclude/archive_set/dotfiles): unit names are
+# "{collection-name}/{relative_path}" (the struct's own doc comment), so
+# with name="media" and unit_depth=1 the four folders become
+# "media/alpha", "media/bravo", "media/charlie", "media/delta" —
+# deterministic, no log-scraping needed (unlike quick-archive's
+# path-derived name).
+col_setup() {
+    bootstrap_config || return 1
+    TCTL tenant add alice || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: create 4 folders under \$SRC/col-root; append [[collections]] (name=media, root=\$SRC/col-root, tenant=alice, unit_depth=1) to \$CFG"
+        return 0
+    fi
+    mkdir -p "$SRC/col-root"
+    make_source "$SRC/col-root/alpha" "plain" || return 1
+    make_source "$SRC/col-root/bravo" "unicode" || return 1
+    make_source "$SRC/col-root/charlie" "deep" || return 1
+    make_source "$SRC/col-root/delta" "links" || return 1
+    python3 - "$CFG" "$SRC/col-root" <<'PY'
+import sys
+cfg, root = sys.argv[1:3]
+with open(cfg, "a") as f:
+    f.write(f'''
+[[collections]]
+name = "media"
+root = "{root}"
+tenant = "alice"
+unit_depth = 1
+''')
+PY
+}
+
+col_sync_registers_four() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl collection sync --json; tapectl unit list --tenant alice --json (assert 4 units)"; return 0; }
+    local logf="$RUN/log-col.sync.json"
+    TCTL collection sync --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    local n
+    n="$(TCTL unit list --tenant alice --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+    [ "$n" = 4 ] || { echo "expected 4 units after collection sync, got $n:"; cat "$logf"; return 1; }
+}
+
+col_status() { TCTL collection status; }
+col_plan()   { TCTL collection plan; }
+
+col_run_batch() {
+    next_tape VOL-COL1 || return 1
+    TCTL volume init VOL-COL1 --device "$TAPE_DEV" || return 1
+    TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV"
+}
+
+# Rename-by-uuid: add a 5th folder AND rename the 3rd, in one sync. If the
+# rename were resolved as delete+add instead, the count would be 6 (4
+# original minus 1 vanished... no: 4 existing + 1 stray "new" for the
+# renamed path + 1 genuinely new = 6); resolved correctly by dotfile uuid,
+# the renamed folder keeps its unit identity and the count is 5.
+col_add_and_rename() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: make_source \$SRC/col-root/echo; mv charlie -> charlie-renamed; tapectl collection sync (assert unit count is 5, not 6)"
+        return 0
+    fi
+    make_source "$SRC/col-root/echo" "plain" || return 1
+    mv "$SRC/col-root/charlie" "$SRC/col-root/charlie-renamed" || return 1
+    TCTL collection sync || return 1
+    local n
+    n="$(TCTL unit list --tenant alice --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+    [ "$n" = 5 ] || { echo "expected 5 units after adding a folder + renaming another (rename resolved by dotfile uuid), got $n"; return 1; }
+}
+
+col_status_shows_new_pending() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl collection status --json (assert media/echo shown pending)"; return 0; }
+    local logf="$RUN/log-col.status2.json"
+    TCTL collection status --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "echo" "$logf" || { echo "media/echo not shown as pending in collection status:"; cat "$logf"; return 1; }
+}
+
+scenario_collection() {
+    check col.setup                 col_setup
+    check col.sync_registers_four   col_sync_registers_four
+    check col.status                col_status
+    check col.plan                  col_plan
+    check col.run_batch             col_run_batch
+
+    restore_matrix VOL-COL1 media/alpha alice "$SRC/col-root/alpha" col-alpha
+    restore_matrix VOL-COL1 media/bravo alice "$SRC/col-root/bravo" col-bravo
+
+    check col.add_and_rename        col_add_and_rename
+    check col.status_shows_new_pending col_status_shows_new_pending
+}
 scenario_permute() { echo "PLAN: [permute] seed=$SEED steps=$STEPS not yet implemented"; }
 
 # ---------- REPORT.md ----------
