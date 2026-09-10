@@ -73,6 +73,30 @@ fn setup(name: &str) -> PerfHarness {
     paths.ensure_dirs().unwrap();
     let conn = db::open(&paths.db_file).unwrap();
 
+    // Issue #115 / ADR-0005: `stage_create` refuses without a registered
+    // escrow recipient. Registered here, in `setup`, so it is in place
+    // before ANY scenario's first `stage_create` by construction — every
+    // scenario starts by calling this function, and none of them stages
+    // before it returns. Public key only, exactly as production does; the
+    // holder is its own tenant, independent of the "op" operator tenant the
+    // scenarios add afterwards. Mirrors `tests/mhvtl_e2e.rs`'s harness.
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let escrow_holder_id = conn.last_insert_rowid();
+    let escrow_kp = tapectl::crypto::keys::generate_keypair();
+    tapectl::db::queries::insert_escrow_key(
+        &conn,
+        escrow_holder_id,
+        "perf-escrow",
+        &escrow_kp.fingerprint,
+        &escrow_kp.public_key,
+        Some("test escrow recipient (ADR-0005)"),
+    )
+    .unwrap();
+
     let mut config = Config::default();
     config.dar.binary = find_dar();
     config.staging = StagingConfig {

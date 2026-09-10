@@ -205,6 +205,30 @@ fn stage_create_inner(
     stage_set_id_holder: &std::cell::Cell<Option<i64>>,
     lock_holder: &std::cell::Cell<Option<lock::StageLock>>,
 ) -> Result<i64> {
+    // ADR-0005 / issue #115. First thing, before the `stage_sets` INSERT and
+    // long before dar: without a registered escrow recipient,
+    // `recipient_list_with_escrow` below is a silent no-op and every slice
+    // this run produces is encrypted to tenant + operator only. Those slices
+    // are exactly what the escrow line exists to be able to open, and
+    // `volume write`'s pre-flight now refuses them
+    // (`LayoutError::StageSetLacksEscrow`) — so staging them at all would
+    // spend hours of dar + age on material that cannot be written and cannot
+    // be repaired in place. Fail here, cheaply, with the remedy.
+    //
+    // The check belongs to this caller, not to `recipient_list_with_escrow`:
+    // that helper is also how `volume write` builds its ENVELOPE recipient
+    // lists, and must keep working as a no-op for callers that are not
+    // minting new ciphertext (issue #115's scope fence).
+    if queries::escrow_public_key(conn)?.is_none() {
+        return Err(TapectlError::Other(
+            "no escrow recipient is registered — staged slices would be unrecoverable \
+             with the escrow key and volume write would refuse them (ADR-0005). \
+             Register one first: `tapectl key generate --escrow`, or adopt an existing \
+             public key with `tapectl key import --escrow <age1...>`"
+                .into(),
+        ));
+    }
+
     let snapshot = get_snapshot(conn, snapshot_id)?;
     let unit = get_unit_for_snapshot(conn, &snapshot)?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
@@ -1467,6 +1491,31 @@ mod tests {
         format!("{:x}", h.finalize())
     }
 
+    /// Register the permanent escrow recipient (ADR-0005) on a throwaway
+    /// holder tenant. `stage_create` refuses without one (issue #115), so
+    /// this is not fixture decoration — it is the state every real staging
+    /// run requires. Public key only, exactly as production does: the secret
+    /// half never touches the database. Mirrors `tests/mhvtl_e2e.rs`'s
+    /// harness.
+    fn register_test_escrow(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let holder_id = conn.last_insert_rowid();
+        let kp = crate::crypto::keys::generate_keypair();
+        queries::insert_escrow_key(
+            conn,
+            holder_id,
+            "test-escrow",
+            &kp.fingerprint,
+            &kp.public_key,
+            Some("test escrow recipient (ADR-0005)"),
+        )
+        .unwrap();
+    }
+
     /// Real age decryption of a file on disk, mirroring the pattern used by
     /// `tests/failure_modes.rs`'s `decrypt_with` — this is what fails if a
     /// `StreamWriter` is ever left un-`finish()`ed (a truncated STREAM with
@@ -1895,6 +1944,8 @@ mod tests {
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        // Issue #115: `stage_create` refuses without a registered escrow.
+        register_test_escrow(&conn);
 
         // Archive set overriding both slice_size and compression away from
         // config.defaults' "100M"/"none" above.
@@ -1982,6 +2033,8 @@ mod tests {
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        // Issue #115: `stage_create` refuses without a registered escrow.
+        register_test_escrow(&conn);
 
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
@@ -2060,6 +2113,8 @@ mod tests {
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         let alice_id = crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        // Issue #115: `stage_create` refuses without a registered escrow.
+        register_test_escrow(&conn);
 
         // Strip alice's active keys so stage_create's "no active keys"
         // refusal fires after dar has already produced plaintext slices.
@@ -2272,7 +2327,73 @@ mod tests {
             crate::unit::dotfile::write_dotfile(&dotfile_path, &df).unwrap();
         }
 
+        // Issue #115: `stage_create` refuses without one.
+        register_test_escrow(&conn);
+
         (conn, paths, config, src)
+    }
+
+    /// Issue #115 / ADR-0005. Staging without a registered escrow recipient
+    /// silently produces slices the escrow key can never open — the whole
+    /// point of the escrow line — and `volume write` now refuses to put them
+    /// on tape. So the refusal belongs here, before dar and age burn hours
+    /// on material that cannot be written, not at the drive afterwards.
+    ///
+    /// The two halves that matter are both about *when*: no `stage_sets` row
+    /// may be left behind, and dar must never start. `dar.binary` is pointed
+    /// at a path that cannot exist, so reaching dar at all would produce a
+    /// visibly different error.
+    #[test]
+    fn stage_create_refuses_when_no_escrow_recipient_is_registered() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // The shared fixture registers an escrow, because that is now the
+        // precondition every other staging test needs. This is the one test
+        // that must run without one.
+        conn.execute("DELETE FROM encryption_keys WHERE is_escrow = 1", [])
+            .unwrap();
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+
+        fs::write(src.join("f.txt"), b"content that must never reach dar").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+
+        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no escrow recipient is registered"),
+            "expected the escrow refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains("key generate --escrow") && msg.contains("key import --escrow"),
+            "the refusal must name both ways to register one: {msg}"
+        );
+        assert!(
+            !msg.contains("dar-must-never-run"),
+            "the refusal must precede the dar run, not follow it: {msg}"
+        );
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "the refusal must precede the stage_sets INSERT — no orphan row \
+             for the startup sweep to find and mark 'failed'"
+        );
+
+        let left_in_staging: Vec<String> = fs::read_dir(&config.staging.directory)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left_in_staging.is_empty(),
+            "nothing may reach the staging directory before the refusal: {left_in_staging:?}"
+        );
     }
 
     /// Issue #52 change 2 — the self-match trap. `snapshot_create` for an

@@ -372,6 +372,20 @@ fn prepare_home_for_staging(
         String::from_utf8_lossy(&tenant_out.stderr)
     );
 
+    // Issue #115 / ADR-0005: `stage create` now refuses without a registered
+    // escrow recipient, because slices staged before one exists are exactly
+    // the material the escrow line is supposed to be able to open — and
+    // `volume write` refuses them too. Not fixture decoration: this is the
+    // state every real staging run requires. `init` above created the
+    // operator tenant this key hangs off, and `--escrow` prints the secret
+    // once to stdout (a throwaway HOME here) rather than storing it.
+    let escrow_out = run_tapectl(home, &["key", "generate", "--escrow"]);
+    assert!(
+        escrow_out.status.success(),
+        "key generate --escrow failed: {}",
+        String::from_utf8_lossy(&escrow_out.stderr)
+    );
+
     let unit_name = "unit1";
     let unit_out = run_tapectl(
         home,

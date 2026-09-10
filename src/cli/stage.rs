@@ -366,6 +366,26 @@ mod tests {
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        // Issue #115 / ADR-0005: `stage_create` refuses without a registered
+        // escrow recipient. Public key only, exactly as production does.
+        {
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let holder_id = conn.last_insert_rowid();
+            let kp = crate::crypto::keys::generate_keypair();
+            crate::db::queries::insert_escrow_key(
+                &conn,
+                holder_id,
+                "test-escrow",
+                &kp.fingerprint,
+                &kp.public_key,
+                Some("test escrow recipient (ADR-0005)"),
+            )
+            .unwrap();
+        }
 
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
