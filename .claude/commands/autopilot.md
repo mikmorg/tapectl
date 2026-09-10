@@ -16,6 +16,30 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
+- **RUN 2026-09-10 (real-LTO-6 follow-through) — IN PROGRESS.** Triggered
+  after the hardware validation session (`docs/lto6-session-journal-2026-09-10.md`,
+  `docs/lto6-drive-passthrough.md`). Scope from the CTO: land #115–#124,
+  commit automatically, keep validating on the real drive, build a lifecycle/
+  permutation suite. Baseline 756 ungated tests. **mhvtl is NOT broken on
+  this VM** — `/dev/nst0` is the mhvtl TD6; the real HP LTO-6 is `/dev/nst3`
+  (`/dev/tape/by-id/scsi-HUJ808A5L4-nst`) via libvirt SCSI passthrough, and
+  `mhvtl-device.sh` cannot resolve it (not in device.conf), so the gate can
+  never land on it. Cartridge `EW7VWMVKF6` is expendable; use `--erase short`
+  (`rewind; weof 1; rewind`) on the real drive — `mt erase` is hours there.
+  Landed so far: session docs `a76b917`; #122 `22c26bb`; errata §2.29
+  correction `8424187` (MTCOMPRESSION 0 already landed in `TapeStore::open`;
+  #28 is closed); harness #116/#117 `4b2962c..f968cde` incl. a third defect
+  (§E pipe writes without `iflag=fullblock`). In flight (worktrees, separate
+  target dirs): pm-115 (escrow — needs the mhvtl gate), pm-119 (#118/#119/
+  #121/#124a), pm-120 (#120), pm-123 (mam.rs half; the `write.rs` fill is a
+  coordinator 2-liner after pm-115), pm-lifecycle (`scripts/lifecycle-suite.sh`).
+  Filed #125 (audit: volumes whose stage sets lack the escrow). CTO decisions
+  queued, not yet asked: `init` creating the escrow identity (ADR-0005
+  ceremony change); a `backend add` command vs hand-edited `[[backends.lto]]`.
+  Lesson already banked: **two of the three most serious hardware findings
+  were in the measuring instrument** (page-cache artifact; a `|| true`-swallowed
+  EINVAL) — both exited 0 with plausible numbers. Any harness number that
+  argues for a design change gets a controlled re-measurement first.
 - **CTO BATCH ANSWERED 2026-08-01 (five decisions, recorded in ADR-0009,
   commit 9ee0658). #69 IS UNBLOCKED AND IS NEXT — it is the only open
   `severity:high`.** The deferral covers the **ceremony** (printing,
