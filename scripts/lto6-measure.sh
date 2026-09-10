@@ -387,12 +387,16 @@ if ! mt -f "$TAPE_DEV" setblk 524288 >"$RUN/setblk-eod.txt" 2>&1; then
     say "**NOT MEASURED — could not set block size for the EOD probe**"
     say "(see \`setblk-eod.txt\`); the writes below are expected to fail too."
 fi
+# iflag=fullblock is required: dd reads from a PIPE here, pipe reads return
+# short (~64K), and without fullblock dd writes each short read as its own
+# block -- EINVAL in 512K fixed-block mode, i.e. the same silent-failure
+# class as issue #116. Found in review of the #116/#117 fix, 2026-09-10.
 # These three writes are load-bearing: the EOD probe below is meaningless if
 # fewer than three real files ended up on the tape, so a failure here is
 # reported loudly instead of silently producing a probe result that looks
 # like a real PASS or FAIL but isn't (issue #116's bug class).
 for i in 1 2 3; do
-    if ! head -c 524288 /dev/urandom | dd of="$TAPE_DEV" bs=524288 status=none 2>"$RUN/dd-eod-$i.txt"; then
+    if ! head -c 524288 /dev/urandom | dd of="$TAPE_DEV" bs=524288 iflag=fullblock status=none 2>"$RUN/dd-eod-$i.txt"; then
         say "**NOT MEASURED reliably — EOD probe write $i FAILED**"
         say "(see \`dd-eod-$i.txt\`); the EOD read below may not reflect three"
         say "real files on the tape."
