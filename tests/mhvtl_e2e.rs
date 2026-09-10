@@ -1061,13 +1061,20 @@ fn extract_restore_sh(device: &str, block_size: usize, dest: &Path) -> String {
 
 /// Run the extracted RESTORE.sh with `--verify` against `device`, invoked via
 /// `bash <path>` (sidesteps chmod/noexec questions on the scratch tempdir —
-/// the shebang line is irrelevant either way) with `&tape_dev()ICE` set so the
+/// the shebang line is irrelevant either way) with `TAPE_DEVICE` set so the
 /// script targets the same tape this test just wrote/corrupted.
+///
+/// The env key MUST be the literal `TAPE_DEVICE`: RESTORE.sh falls back to
+/// `${TAPE_DEVICE:-/dev/nst0}`, so a misspelled key silently redirects the
+/// whole test to whatever tape is in /dev/nst0. This line previously read
+/// `.env("&tape_dev()ICE", device)` — a `TAPE_DEV` -> `&tape_dev()` rename that
+/// ate the string literal too — and the corrupted-tape assertion consequently
+/// verified an unrelated real cartridge and saw it PASS.
 fn run_restore_sh_verify(script_path: &Path, device: &str) -> std::process::Output {
     Command::new("bash")
         .arg(script_path)
         .arg("--verify")
-        .env("&tape_dev()ICE", device)
+        .env("TAPE_DEVICE", device)
         .output()
         .expect("failed to spawn RESTORE.sh --verify")
 }
