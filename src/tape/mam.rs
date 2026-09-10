@@ -19,6 +19,8 @@ pub struct MamInfo {
     pub remaining_bytes: Option<i64>,
     pub serial: Option<String>,
     pub load_count: Option<i64>,
+    pub manufacturer: Option<String>,
+    pub length_meters: Option<i64>,
 }
 
 /// Read MAM attributes from the drive's sg device.
@@ -55,6 +57,12 @@ pub fn parse_mam(raw: &str) -> MamInfo {
             }
         } else if label.eq_ignore_ascii_case("Load count") {
             m.load_count = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Medium manufacturer") {
+            if !value.is_empty() {
+                m.manufacturer = Some(value.to_string());
+            }
+        } else if label.eq_ignore_ascii_case("Medium length [m]") {
+            m.length_meters = value.parse::<i64>().ok();
         }
     }
     m
@@ -86,5 +94,71 @@ mod tests {
     fn missing_fields_are_none_not_error() {
         let m = parse_mam("Attribute values:\n  TapeAlert flags: 0\n");
         assert_eq!(m, MamInfo::default());
+    }
+
+    // Captured verbatim from a real HP LTO-6 drive's sg_read_attr output
+    // (/scratch/tapectl-lto6-session/recordings/preflight-mam.txt, 2026-09-10
+    // preflight session, issue #123). Includes trailing-space padding on
+    // some values, as sg_read_attr actually emits — exercises value.trim().
+    const LTO6_SAMPLE: &str = "Attribute values:
+  Remaining capacity in partition [MiB]: 2499053
+  Maximum capacity in partition [MiB]: 2499053
+  TapeAlert flags: 0
+  Load count: 1
+  MAM space remaining [B]: 3062
+  Assigning organization: LTO-CVE 
+  Format density code: 0x5a
+  Initialization count: 0
+  Volume identifier: 
+  Volume change reference: 0x0
+  Density vendor/serial number at last load: HP      HUJ808A5L4                      
+  Density vendor/serial number at load-1: HP      
+  Density vendor/serial number at load-2: HP      
+  Density vendor/serial number at load-3: HP      
+  Total MiB written in medium life: 0
+  Total MiB read in medium life: 0
+  Total MiB written in current/last load: 0
+  Total MiB read in current/last load: 0
+  Logical position of first encrypted block: <unknown> [ff]
+  Logical position of first unencrypted block -
+      after first encrypted block: <unknown> [ff]
+  Medium manufacturer: FUJIFILM
+  Medium serial number: EW7VWMVKF6                      
+  Medium length [m]: 846
+  Medium width [0.1 mm]: 127
+  Assigning organization: LTO-CVE 
+  Medium density code: 0x5a
+  Medium manufacture date: 20170824
+  MAM capacity [B]: 16384
+  Medium type: 0x0
+  Medium type information: 0x0
+  Vendor specific medium attribute 0x1000: 
+ 00     02 73 1d 28 47 36 41 43  56 32 58 31 46 55 4a 49    .s.(G6ACV2X1FUJI
+ 10     46 49 4c 4d 00 06 0f e1  00 20 00 00                FILM..... ..
+  Vendor specific medium attribute 0x1001: 
+ 00     02 73 1d 28 47 36 41 43  56 32 58 31 45 57 37 56    .s.(G6ACV2X1EW7V
+ 10     57 4d 56 4b 46 36 00 20                             WMVKF6. 
+";
+
+    #[test]
+    fn parses_manufacturer_and_length_from_real_lto6_output() {
+        let m = parse_mam(LTO6_SAMPLE);
+        assert_eq!(m.manufacturer.as_deref(), Some("FUJIFILM"));
+        assert_eq!(m.length_meters, Some(846));
+        assert_eq!(m.serial.as_deref(), Some("EW7VWMVKF6"));
+        assert_eq!(m.load_count, Some(1));
+        assert_eq!(m.max_capacity_bytes, Some(2499053 * MIB));
+    }
+
+    #[test]
+    fn mhvtl_sample_has_no_manufacturer_or_length() {
+        let m = parse_mam(SAMPLE);
+        assert_eq!(m.manufacturer, None);
+        assert_eq!(m.length_meters, None);
+        // Existing assertions still hold.
+        assert_eq!(m.max_capacity_bytes, Some(500 * MIB));
+        assert_eq!(m.remaining_bytes, Some(476 * MIB));
+        assert_eq!(m.serial.as_deref(), Some("F01030L6_1775794349"));
+        assert_eq!(m.load_count, Some(4));
     }
 }
