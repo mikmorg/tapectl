@@ -946,3 +946,47 @@ dry-run's `EBUSY` was an mhvtl/host artifact.
   was never touched.
 - **Throwaway escrow key:** `/scratch/tapectl-lto6-session/keys/` (mode 600,
   outside the repo). Not a Heir Kit; delete with the rest.
+---
+
+# Re-validation, 2026-09-10 (autopilot run)
+
+After the findings above were fixed (#115–#124, #127) and landed, everything
+was re-validated on the same real HP LTO-6 (`/dev/nst3`, cartridge
+`EW7VWMVKF6`). The mhvtl gate is unusable on this VM (dead `lload` IPC — the
+library moves media but the tape daemon never sees it), so per CTO decision a
+real-hardware round-trip substitutes; re-run the mhvtl gate after a VM reboot.
+
+**`scripts/lto6-measure.sh`, fixed (#116/#117), re-run — all three defects gone:**
+
+- §A block size: `512K 108.1 | 1M 108.7 | 1M 108.7 | 512K 108.4` MiB/s across
+  alternating passes — a wash, correctly reported (the fake 3.1× is gone). The
+  source-read-rate line (758.8 MiB/s) is printed, so the disk-sourced-payload
+  fallback is self-evident.
+- §D MAM: the capacity write now happens — remaining fell 2,499,053 → 2,497,003
+  (2,050 MiB for a 2,048 MiB write). Over-report **+2 MiB** — MAM is accurate,
+  matching the corrected Phase 6 finding. (Was "never moves" — a swallowed
+  EINVAL.)
+- §E EOD: PASS.
+
+**pm-115 (escrow fix + `--allow-missing-escrow`) + #127 (RESTORE.sh `--unit`
+envelope search), validated via `scripts/lifecycle-suite.sh escrow-ordering` on
+real media — 29/29 checks GREEN, 0 skips:**
+
+- `stage create` before escrow → refused; `stage list` empty. (The exact
+  2026-09-10 hole, now closed.)
+- `key rotate` before escrow → refused.
+- write with escrow'd slices → `volume verify` 11/11.
+- The full restore matrix for BOTH tenants: `restore unit`, `restore file`,
+  RESTORE.sh dd/`--verify`/primary-key/backup-key, operator envelope, **escrow
+  key**, `restore raw-volume`, cross-tenant isolation.
+- The escrow key decrypts a slice's ciphertext directly (`age -d`, 702 KB
+  plaintext) — the core #115 fix, which the pre-fix tape could not do.
+- `eo-unitA.escrow` passes even though unitA is not in the first-decrypted
+  envelope — the #127 fix (RESTORE.sh keeps searching for the unit's envelope).
+
+**Still deferred (own iterations):** `init` creating the escrow identity (CTO
+Q3), the `[[backends.lto]]` first-run ergonomics (#124b/#126), the audit check
+for already-written pre-escrow volumes (#125), and a full `--all` lifecycle run
+across every scenario. The retire-and-reuse and compaction scenarios encode
+real-erase reuse semantics that a short-erased single cartridge cannot fully
+satisfy — they SKIP or need `--erase long` / a second cartridge.
