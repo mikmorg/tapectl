@@ -102,6 +102,14 @@ REPORT="$RUN/REPORT.md"
 # Every raw command output is kept. The checklist's closing instruction is
 # "don't paper over it" — a summary without the raw capture cannot be
 # re-examined once the tape is unloaded.
+#
+# Every `raw ... || true` call site in this script (mam-preflight,
+# mt-status-$label, mam-before, mam-after) is deliberate: the caller never
+# branches on raw()'s own return value, it inspects the OUTPUT FILE
+# afterward instead (grepping it for a barcode, a block-size confirmation, a
+# MAM attribute). `|| true` there only stops a probe that is allowed to come
+# back empty from tripping `set -uo pipefail`; it does not hide a failure
+# that matters, because the file it wrote is always there to go check.
 raw() { # raw <name> <command...>
     local name="$1"; shift
     echo "\$ $*" > "$RUN/$name.txt"
@@ -352,13 +360,30 @@ say "## E. EOD semantics (§3.2's untested physics assumption)"
 # read as complete — which is the one failure mode the front index and seal
 # marker cannot detect, because both would look internally consistent.
 mt -f "$TAPE_DEV" rewind >/dev/null 2>&1
-mt -f "$TAPE_DEV" setblk 524288 >/dev/null 2>&1
+if ! mt -f "$TAPE_DEV" setblk 524288 >"$RUN/setblk-eod.txt" 2>&1; then
+    say "**NOT MEASURED — could not set block size for the EOD probe**"
+    say "(see \`setblk-eod.txt\`); the writes below are expected to fail too."
+fi
+# These three writes are load-bearing: the EOD probe below is meaningless if
+# fewer than three real files ended up on the tape, so a failure here is
+# reported loudly instead of silently producing a probe result that looks
+# like a real PASS or FAIL but isn't (issue #116's bug class).
 for i in 1 2 3; do
-    head -c 524288 /dev/urandom | dd of="$TAPE_DEV" bs=524288 status=none 2>/dev/null
+    if ! head -c 524288 /dev/urandom | dd of="$TAPE_DEV" bs=524288 status=none 2>"$RUN/dd-eod-$i.txt"; then
+        say "**NOT MEASURED reliably — EOD probe write $i FAILED**"
+        say "(see \`dd-eod-$i.txt\`); the EOD read below may not reflect three"
+        say "real files on the tape."
+    fi
     mt -f "$TAPE_DEV" weof 1 >/dev/null 2>&1
 done
 mt -f "$TAPE_DEV" rewind >/dev/null 2>&1
-# Skip past all three files, then past EOD.
+# Skip past all three files, then past EOD. Left silent deliberately: making
+# this positioning step report its own failure would change what a FAIL below
+# means (a mispositioned fsf could make the probe read real file 1 data and
+# misreport it as "stale data past EOD"), and that is EOD-probe interpretation
+# logic, not a write-failure report — out of scope for this change (issues
+# #116/#117 are about writes and the block-size table, not this probe's
+# positioning). Flagged as a residual, not fixed here.
 mt -f "$TAPE_DEV" fsf 3 >/dev/null 2>&1
 EOD_OUT="$RUN/eod-read.txt"
 if dd if="$TAPE_DEV" of=/dev/null bs=524288 count=1 >"$EOD_OUT" 2>&1; then
