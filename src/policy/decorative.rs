@@ -10,9 +10,13 @@
 //!   `docs/design/v2-open-questions.md` §5 lists 512K-vs-1M as a deferred
 //!   **hardware** question (LTO-6 validation), and epic #20 child work may
 //!   consume this field once that's answered.
-//! - `backends.lto[].hardware_compression` — `docs/design-errata.md` §2.29
-//!   records that `MTCOMPRESSION 0` lands with #28; nothing calls
-//!   `MTCOMPRESSION` today.
+//! - `backends.lto[].hardware_compression` — the *knob* is inert (nothing
+//!   reads its value in either direction), but `MTCOMPRESSION` itself is
+//!   NOT inert: `TapeStore::open` (`src/store.rs`) calls
+//!   `dev.disable_compression()` unconditionally on every write-path open,
+//!   confirmed landing on real LTO-6 hardware (`DCE` 1→0) in
+//!   `docs/lto6-session-journal-2026-09-10.md`. So a `true` value here is
+//!   silently ignored, not merely "not yet implemented".
 //! - `packing.min_free_for_append` — append is rejected outright (ADR-0003);
 //!   there is no append path for this knob to gate.
 //!
@@ -70,8 +74,9 @@ pub fn describe(hit: &DecorativeHit) -> String {
         )
     } else if hit.key.ends_with(".hardware_compression") {
         format!(
-            "note: {} is parsed but not consumed — nothing issues MTCOMPRESSION today. \
-             docs/design-errata.md §2.29 tracks `MTCOMPRESSION 0` landing with issue #28.",
+            "note: {} is parsed but not consumed — the write path disables drive compression \
+             unconditionally on every open (TapeStore::open → MTCOMPRESSION 0), so this knob \
+             cannot re-enable it. Set it to false or omit it; a true value is ignored.",
             hit.key
         )
     } else if hit.key == "packing.min_free_for_append" {
@@ -140,13 +145,20 @@ mod tests {
     }
 
     #[test]
-    fn describe_hardware_compression_cites_28_and_errata() {
+    fn describe_hardware_compression_states_the_write_path_disables_it_unconditionally() {
+        // Issue #118: the previous wording claimed that nothing calls
+        // MTCOMPRESSION at all, which real LTO-6 hardware disproved
+        // (TapeStore::open does, on every write). The note must now
+        // describe what is actually true: the knob can't be used to
+        // re-enable compression.
         let hit = DecorativeHit {
             key: "backends.lto[\"lto1\"].hardware_compression".to_string(),
         };
         let line = describe(&hit);
-        assert!(line.contains("#28"));
         assert!(line.contains("MTCOMPRESSION"));
+        assert!(line.contains("TapeStore::open"));
+        assert!(line.contains("unconditionally"));
+        assert!(line.contains("is ignored"));
     }
 
     #[test]
