@@ -201,12 +201,48 @@ fi
 say "| block size | setblk | throughput |"
 say "|---|---|---|"
 
-PAYLOAD="$RUN/payload.bin"
+# Payload lives in tmpfs when there's room, so every throughput run below
+# reads from RAM rather than the source disk (issue #117): the original
+# harness generated one payload file on $OUT_DIR (a disk) and read it once
+# per block size, so the first run read it cold and later runs read it warm
+# from page cache — it measured the source disk, not the tape. Falls back to
+# $RUN (still on disk) when /dev/shm is missing or too small; the source
+# read rate measured below makes a disk-bound fallback self-evident either way.
+NEED_MB=$((PAYLOAD_MB + 64))
+SHM_FREE_MB=""
+if [ -d /dev/shm ]; then
+    SHM_FREE_MB="$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')"
+fi
+if [ -n "$SHM_FREE_MB" ] && [ "$SHM_FREE_MB" -ge "$NEED_MB" ] 2>/dev/null; then
+    PAYLOAD="/dev/shm/tapectl-lto6-payload-$STAMP.bin"
+    say "Payload location: \`/dev/shm\` (tmpfs) — needs ${NEED_MB} MiB, ${SHM_FREE_MB} MiB free."
+else
+    PAYLOAD="$RUN/payload.bin"
+    say "Payload location: \`$RUN\` (disk) — /dev/shm is missing or has less than"
+    say "${NEED_MB} MiB free (has: ${SHM_FREE_MB:-n/a} MiB). Throughput numbers"
+    say "below may be source-disk-bound rather than tape-bound; the source read"
+    say "rate line below is how to tell."
+fi
+say ""
+
 # Incompressible on purpose: tapectl writes age ciphertext, so a compressible
 # payload would measure the drive's compressor rather than the medium and
 # report a throughput the real write path can never reach.
 dd if=/dev/urandom of="$PAYLOAD" bs=1M count="$PAYLOAD_MB" status=none 2>/dev/null \
-    || die "could not generate a ${PAYLOAD_MB} MiB payload in $RUN"
+    || die "could not generate a ${PAYLOAD_MB} MiB payload at $PAYLOAD"
+
+# Source read rate, reported so a source-bound measurement below is
+# self-evident rather than mistaken for a tape/block-size effect (issue #117).
+SRC_T0=$(date +%s.%N)
+if dd if="$PAYLOAD" of=/dev/null bs=1M status=none 2>"$RUN/dd-source-read.txt"; then
+    SRC_T1=$(date +%s.%N)
+    SRC_SECS=$(python3 -c "print(max(1e-6, $SRC_T1 - $SRC_T0))")
+    SRC_RATE=$(python3 -c "print(f'{$PAYLOAD_MB / $SRC_SECS:.1f}')")
+    say "Source read rate: ${SRC_RATE} MiB/s (\`$PAYLOAD\` -> /dev/null, ${PAYLOAD_MB} MiB)."
+else
+    say "Source read rate: NOT MEASURED — the timing read failed (see \`dd-source-read.txt\`)."
+fi
+say ""
 
 measure_blocksize() { # measure_blocksize <bytes> <label>
     local bs="$1" label="$2" t0 t1 secs rate
@@ -247,11 +283,20 @@ measure_blocksize() { # measure_blocksize <bytes> <label>
     echo "$label $rate" >> "$RUN/throughput.txt"
 }
 
-measure_blocksize 524288 "512K"
-measure_blocksize 1048576 "1M"
+# Two passes in alternating order (issue #117): a real block-size effect
+# looks the same regardless of order; a page-cache/warm-up artifact shows up
+# as a trend across the passes instead of disorder. This is what exposed the
+# original "1 M is 3x faster" artifact — it was the source disk warming up,
+# not the tape.
+measure_blocksize 524288 "512K (pass 1)"
+measure_blocksize 1048576 "1M (pass 1)"
+measure_blocksize 1048576 "1M (pass 2)"
+measure_blocksize 524288 "512K (pass 2)"
 say ""
 say "The v2 write path uses fixed 512 K blocks. A 1 M advantage large enough to"
-say "matter is the input to reopening that choice; a wash means leave it alone."
+say "matter, consistent across both pass orders, is the input to reopening that"
+say "choice; a wash — or a number that only shows up in one order — means leave"
+say "it alone."
 say ""
 
 # ---------- D. MAM over-report bound ----------
