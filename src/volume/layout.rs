@@ -1936,4 +1936,61 @@ mod tests {
         )));
         assert!(script.contains(&format!("BLOCK={}", crate::cli::volume::DEFAULT_BLOCK_SIZE)));
     }
+
+    /// RESTORE.sh sanitizes the tape's label before echoing it (the ID thunk is
+    /// unauthenticated), and then compares it against the label baked into the
+    /// script. Those two things are only safe together while `safe_str`'s
+    /// allowlist is a SUPERSET of what `validate_volume_label` accepts: if a
+    /// legitimate label were altered by sanitizing, it could never equal
+    /// `$LABEL`, and every correct tape would raise a permanent "WRONG TAPE"
+    /// warning — and now also fail the gate's heir_info assertion.
+    ///
+    /// This runs the real `safe_str` out of the real generated script, so
+    /// widening `validate_segment` without widening the allowlist fails here.
+    #[test]
+    fn safe_str_never_alters_a_label_that_tapectl_would_accept() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // The widest label validate_volume_label accepts: every permitted
+        // character class, at exactly the maximum length, and not starting with
+        // a dash or dot.
+        let mut label = String::from("Az9");
+        while label.len() < 64 {
+            label.push_str("._-Az9");
+        }
+        label.truncate(64);
+        crate::naming::validate_volume_label(&label)
+            .expect("test fixture must itself be a valid volume label");
+
+        let script = generate_restore_script_v2("PROBE1", 20);
+        let body = script
+            .split_once("safe_str() {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(b, _)| b)
+            .expect("generated RESTORE.sh must define safe_str()");
+
+        let mut child = Command::new("bash")
+            .args(["-s", "--", &label])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn bash");
+        write!(
+            child.stdin.as_mut().unwrap(),
+            "safe_str() {{{body}\n}}\nsafe_str \"$1\"\n"
+        )
+        .unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().expect("bash ran");
+        let got = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            got,
+            label,
+            "safe_str altered a legitimate {}-char label — every correct tape \
+             would now warn WRONG TAPE. Widen the tr allowlist in RESTORE.sh to \
+             cover validate_segment, or narrow validate_segment.",
+            label.len()
+        );
+    }
 }

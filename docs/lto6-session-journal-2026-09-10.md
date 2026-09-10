@@ -1046,11 +1046,45 @@ The gate wrote to `nst1` and its heir leg read the real drive's tape. See
 up the passthrough, but scoped the trigger too narrowly ("if mhvtl fails to
 load"). A plain reboot re-racing the SCSI hosts was enough.
 
-**Commands issued against the real drive `/dev/nst0` during the three RED runs**
-(via RESTORE.sh, per run): `mt -f /dev/nst0 setblk 524288`, `mt -f /dev/nst0
-rewind`, `mt -f /dev/nst0 fsf N`, `dd if=/dev/nst0 bs=524288`. **All read-only.**
-The cartridge was repositioned; nothing was written to it, and its volume still
-verifies. No `mt erase`, no `dd of=`.
+**Every command issued against the real drive `/dev/nst0` this phase.**
+
+During the three RED runs, via RESTORE.sh, per run:
+
+```
+mt -f /dev/nst0 setblk 524288
+mt -f /dev/nst0 rewind
+mt -f /dev/nst0 fsf N
+dd if=/dev/nst0 bs=524288
+```
+
+Then deliberately, while diagnosing and while proving the fix:
+
+```
+sudo sg_inq /dev/nst0                                  # identify the drive
+TAPE_DEVICE=/dev/nst0 ./RESTORE.sh --info              # wrong-tape negative test
+TAPE_DEVICE=/dev/nst0 ./RESTORE.sh --verify            # integrity check, keyless
+```
+
+**All read-only.** The cartridge was repositioned; nothing was written to it. No
+`mt erase`, no `dd of=`, no tapectl write path — `tapectl` itself was never
+pointed at nst0.
+
+The tape holds lifecycle volume **`VOL-A`** (from the key-rotation scenario) —
+which is exactly the volume the RED runs' `heir_info` had been describing under
+the label `MHVTLG`. It is undamaged; checked rather than assumed:
+
+```console
+$ TAPE_DEVICE=/dev/nst0 ./RESTORE.sh --verify
+>>> Tape identifies as: VOL-A
+  WRONG TAPE? This script was written for volume 'MHVTLG', ...
+PASS  file   4  tenant_envelope
+...
+PASS  file  21  data_slice
+VERIFY: PASS — every file matches the front index.
+```
+
+That run doubles as proof of the warn-don't-die design: a mismatched label
+warned loudly and the keyless integrity walk still completed.
 
 ### Why the symptom was so misleading
 
