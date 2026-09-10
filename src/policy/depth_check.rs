@@ -8,7 +8,8 @@
 //! and `--json` arms of `config check` can never drift, and so the wording
 //! is unit-testable without touching a filesystem.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::dar::version;
@@ -33,15 +34,72 @@ pub enum DarCheck {
     Ok { path: String, version: String },
 }
 
+/// Walk `path_var` (a `PATH`-style, `:`-separated list of directories) for
+/// the first entry where `<dir>/<binary>` exists and is executable — the
+/// same question `Command::new(binary)` answers internally via `execvp`,
+/// pulled out as a pure function so it is testable with an explicit `PATH`
+/// string rather than mutating the process environment (issue #119: the
+/// crate's unit tests run in parallel in one process, so `set_var` would be
+/// a footgun here).
+///
+/// An empty `PATH` segment (e.g. a leading/trailing/doubled `:`) traditionally
+/// means "search the current directory" in POSIX `PATH` semantics, but that
+/// makes resolution depend on the caller's cwd — surprising for a config
+/// checker — so empty segments are skipped here rather than honored.
+pub fn resolve_on_path(binary: &str, path_var: &OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(binary);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = std::fs::metadata(&candidate)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if !executable {
+                continue;
+            }
+        }
+        return Some(candidate);
+    }
+    None
+}
+
 /// Probe `binary`: existence, executable bit, then `dar --version` via the
 /// existing runner in `dar::version` (never a second implementation of it).
+///
+/// If `binary` contains no path separator (a bare name like `"dar"`), it is
+/// first resolved against `PATH` via [`resolve_on_path`] — mirroring what
+/// the runtime actually does (`Command::new` in `dar::version::check`
+/// resolves bare names via `PATH`/`execvp`). Before this, `check_dar` used
+/// `Path::exists` directly on the bare name, which is never true, so a
+/// perfectly working `binary = "dar"` was reported `Missing` (issue #119).
+/// An absolute or relative path containing `/` is used as-is, unchanged
+/// from before.
 pub fn check_dar(binary: &str) -> DarCheck {
-    let path = Path::new(binary);
+    let resolved: PathBuf = if binary.contains('/') {
+        PathBuf::from(binary)
+    } else {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        match resolve_on_path(binary, &path_var) {
+            Some(p) => p,
+            None => {
+                return DarCheck::Missing {
+                    path: binary.to_string(),
+                };
+            }
+        }
+    };
+    let path = resolved.as_path();
+    let path_str = resolved.to_string_lossy().to_string();
 
     if !path.exists() {
-        return DarCheck::Missing {
-            path: binary.to_string(),
-        };
+        return DarCheck::Missing { path: path_str };
     }
 
     #[cfg(unix)]
@@ -51,24 +109,22 @@ pub fn check_dar(binary: &str) -> DarCheck {
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false);
         if !executable {
-            return DarCheck::NotExecutable {
-                path: binary.to_string(),
-            };
+            return DarCheck::NotExecutable { path: path_str };
         }
     }
 
-    match version::check(binary) {
+    match version::check(&path_str) {
         Ok(v) => DarCheck::Ok {
-            path: binary.to_string(),
+            path: path_str,
             version: v.full_string,
         },
         Err(crate::error::TapectlError::DarVersionTooOld { found, minimum }) => DarCheck::TooOld {
-            path: binary.to_string(),
+            path: path_str,
             found,
             minimum,
         },
         Err(e) => DarCheck::Unreadable {
-            path: binary.to_string(),
+            path: path_str,
             detail: e.to_string(),
         },
     }
@@ -301,6 +357,94 @@ mod tests {
     fn check_dar_missing_path_reports_missing() {
         let check = check_dar("/nonexistent/path/to/dar-that-does-not-exist");
         assert!(matches!(check, DarCheck::Missing { .. }));
+    }
+
+    // -- resolve_on_path: pure, exercised with an explicit PATH string so no
+    // test mutates the real process environment (issue #119) -- the crate's
+    // unit tests run in parallel in one binary, so `set_var` would race.
+
+    #[test]
+    fn resolve_on_path_finds_an_executable_bare_name_shim() {
+        let tmp = TempDir::new().unwrap();
+        let shim_name = format!("fakedar-{}", std::process::id());
+        let shim_path = tmp.path().join(&shim_name);
+        // Mirror the shape `dar::version::check` parses ("dar version
+        // X.Y.Z, ..."), so this also doubles as proof the resolved path is
+        // actually usable end to end, not merely present on disk.
+        std::fs::write(
+            &shim_path,
+            "#!/bin/sh\necho 'dar version 2.7.13, Copyright (C) 2002-2023 Denis Corbin'\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let path_var = std::ffi::OsString::from(tmp.path());
+        let resolved = resolve_on_path(&shim_name, &path_var);
+        assert_eq!(resolved, Some(shim_path.clone()));
+
+        let version = crate::dar::version::check(shim_path.to_str().unwrap())
+            .expect("shim should parse as a valid dar version");
+        assert_eq!(version.full_string, "2.7.13");
+    }
+
+    #[test]
+    fn resolve_on_path_skips_a_non_executable_match_and_keeps_looking() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let name = format!("fakedar-noexec-{}", std::process::id());
+
+        // A same-named, non-executable file earlier on PATH must not shadow
+        // a real executable later on PATH -- matches `execvp`'s behavior.
+        let dud = tmp1.path().join(&name);
+        std::fs::write(&dud, "not executable").unwrap();
+
+        let real = tmp2.path().join(&name);
+        std::fs::write(&real, "#!/bin/sh\necho hi\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let path_var = std::env::join_paths([tmp1.path(), tmp2.path()]).unwrap();
+        let resolved = resolve_on_path(&name, &path_var);
+        assert_eq!(resolved, Some(real));
+    }
+
+    #[test]
+    fn resolve_on_path_returns_none_for_a_name_absent_everywhere_on_path() {
+        let path_var = std::ffi::OsString::from("/nonexistent-dir-a:/nonexistent-dir-b");
+        let resolved = resolve_on_path("definitely-not-here-xyz", &path_var);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn check_dar_bare_name_absent_from_path_reports_missing() {
+        // Doesn't touch the real PATH -- just asserts against a name that
+        // (overwhelmingly likely) isn't installed anywhere on it.
+        let check = check_dar("definitely-not-here-xyz-tapectl-test");
+        assert!(matches!(check, DarCheck::Missing { .. }));
+    }
+
+    #[test]
+    fn check_dar_bare_name_present_on_path_resolves_like_the_runtime_does() {
+        // `dar` is a hard runtime dependency and guaranteed on PATH for this
+        // whole test suite (CLAUDE.md; enforced by `tests/test_dependencies.rs`),
+        // so this exercises check_dar's PATH-resolution branch end to end
+        // against the real environment, complementing the explicit-PATH
+        // `resolve_on_path` tests above.
+        let check = check_dar("dar");
+        match check {
+            DarCheck::Ok { path, .. } => {
+                assert!(
+                    path.contains('/'),
+                    "expected a resolved absolute path, got {path}"
+                )
+            }
+            other => panic!("expected 'dar' on PATH to resolve to Ok, got {other:?}"),
+        }
     }
 
     #[test]
