@@ -361,6 +361,374 @@ mhvtl_media_dir() {
     return 1
 }
 
+# ---------- globals shared by fixtures / restore matrix ----------
+# CANARY: embedded in one file per unit (like the gate) for the leak scan.
+# OPERATOR: the operator tenant name every scenario's `init --operator`
+# uses, so the restore-matrix's operator-envelope step knows which key to
+# reach for without threading it through every call.
+# shellcheck disable=SC2034  # consumed by make_source calls in scenario functions (next commit)
+CANARY="CANARY_tapectl_lifecycle_${STAMP}_$$"
+OPERATOR="lc-op"
+
+# ============================================================
+# Fixtures
+# ============================================================
+
+# make_source <dir> <profiles> [canary]
+# `profiles` is one or more of plain/big/links/unicode/deep, joined with
+# "+" (e.g. "plain+links"). Deterministic content only where content
+# matters for a check (canary, unicode name/content) — bulk filler is
+# /dev/urandom, which is fine since size/slicing is what those profiles
+# exist to exercise, not reproducibility of the bytes themselves.
+make_source() {
+    local dir="$1" profiles="$2" canary="${3:-}"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: make_source $dir ($profiles)${canary:+, canary embedded}"
+        return 0
+    fi
+    mkdir -p "$dir"
+    local IFS_OLD="$IFS" p
+    IFS='+'
+    for p in $profiles; do
+        case "$p" in
+            plain)
+                echo "plain content" > "$dir/plain.txt"
+                head -c 700000 /dev/urandom > "$dir/big-block.bin"
+                : > "$dir/empty.bin"
+                mkdir -p "$dir/nested"
+                echo "nested" > "$dir/nested/déjà-vu.txt"
+                ;;
+            big)
+                head -c 12000000 /dev/urandom > "$dir/twelve-meg.bin"
+                ;;
+            links)
+                echo "target" > "$dir/target.txt"
+                ln -sf target.txt "$dir/link-ok"
+                ln -sf /nonexistent-lifecycle-path "$dir/link-broken"
+                ;;
+            unicode)
+                printf '\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e content\n' > "$dir/ünïcödé 日本語.txt"
+                ;;
+            deep)
+                mkdir -p "$dir/d1/d2/d3/d4/d5/d6/d7"
+                echo "deep leaf" > "$dir/d1/d2/d3/d4/d5/d6/d7/leaf.txt"
+                ;;
+            *)
+                echo "make_source: unknown profile \"$p\"" >&2
+                IFS="$IFS_OLD"
+                return 1
+                ;;
+        esac
+    done
+    IFS="$IFS_OLD"
+    [ -n "$canary" ] && echo "$canary payload" > "$dir/${canary}.txt"
+    return 0
+}
+
+# mutate_source <dir> <seed> <kind>
+# kind: add | modify | delete | rename | touch-only. Deterministic from
+# <seed> via python's random.Random so a `permute` failure is reproducible.
+mutate_source() {
+    local dir="$1" seed="$2" kind="$3"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: mutate_source $dir seed=$seed kind=$kind"
+        return 0
+    fi
+    python3 - "$dir" "$seed" "$kind" <<'PY'
+import sys, os, random, pathlib
+
+d, seed, kind = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+rng = random.Random(seed)
+root = pathlib.Path(d)
+files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+
+if kind == "add":
+    name = f"added-{seed}-{rng.randint(0, 999999)}.txt"
+    (root / name).write_text("added by mutate_source seed=%d\n" % seed + "x" * rng.randint(10, 200))
+    sys.exit(0)
+
+if not files:
+    print("mutate_source: no eligible regular file to mutate in %s" % d, file=sys.stderr)
+    sys.exit(1)
+
+target = rng.choice(files)
+if kind == "modify":
+    data = bytearray(target.read_bytes()) or bytearray(b"x")
+    data[0] = (data[0] + 1) % 256
+    target.write_bytes(bytes(data))
+elif kind == "delete":
+    target.unlink()
+elif kind == "rename":
+    target.rename(target.with_name(target.name + ".renamed"))
+elif kind == "touch-only":
+    st = target.stat()
+    new_mtime = st.st_mtime + 3600
+    os.utime(target, (new_mtime, new_mtime))
+else:
+    print("mutate_source: unknown kind %r" % kind, file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
+# ============================================================
+# Comparison helpers
+# ============================================================
+
+# tree_checksum <dir> — content+symlink-target checksum, journal Phase 4's
+# shape: sorted file list, per-entry sha256 (files) or readlink (symlinks),
+# then sha256 of that list.
+tree_checksum() {
+    local dir="$1"
+    (
+        cd "$dir" || exit 1
+        find . \( -type f -o -type l \) | LC_ALL=C sort | while IFS= read -r p; do
+            if [ -L "$p" ]; then
+                printf 'LINK\t%s\t%s\n' "$p" "$(readlink "$p")"
+            else
+                printf 'FILE\t%s\t%s\n' "$p" "$(sha256sum "$p" | awk '{print $1}')"
+            fi
+        done | sha256sum | awk '{print $1}'
+    )
+}
+
+# assert_identical <src> <restored> — plain `diff -r` FOLLOWS symlinks and
+# false-fails (or false-passes) on a dangling one; --no-dereference is
+# load-bearing (docs/lto6-session-journal-2026-09-10.md's methodology
+# note). Both the diff AND the tree checksum must agree.
+assert_identical() {
+    local src="$1" restored="$2"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: diff -r --no-dereference $src $restored && tree_checksum comparison"
+        return 0
+    fi
+    if ! diff -r --no-dereference "$src" "$restored"; then
+        echo "assert_identical: diff -r --no-dereference disagreed"
+        return 1
+    fi
+    local h1 h2
+    h1="$(tree_checksum "$src")"
+    h2="$(tree_checksum "$restored")"
+    if [ "$h1" != "$h2" ]; then
+        echo "assert_identical: tree checksum mismatch: $h1 (src) != $h2 (restored)"
+        return 1
+    fi
+    echo "identical: $src == $restored (tree checksum $h1)"
+}
+
+# ============================================================
+# Restore matrix
+# ============================================================
+# ensure_heir_restore_sh — dd RESTORE.sh off the currently loaded tape into
+# $RM_WORK/heir, once. Later matrix steps reuse it; self-healing if an
+# earlier step failed to extract it.
+ensure_heir_restore_sh() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: mt rewind; setblk 524288; fsf 2; dd if=$TAPE_DEV bs=512k | tr -d '\\0' > RESTORE.sh; chmod +x; bash -n"
+        return 0
+    fi
+    [ -f "$RM_WORK/heir/RESTORE.sh" ] && return 0
+    mkdir -p "$RM_WORK/heir"
+    devcmd mt -f "$TAPE_DEV" rewind || return 1
+    devcmd mt -f "$TAPE_DEV" setblk 524288 || return 1
+    devcmd mt -f "$TAPE_DEV" fsf 2 || return 1
+    dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' > "$RM_WORK/heir/RESTORE.sh"
+    chmod +x "$RM_WORK/heir/RESTORE.sh"
+    bash -n "$RM_WORK/heir/RESTORE.sh"
+}
+
+rm_step_unit() {
+    local to="$RM_WORK/unit"
+    TCTL restore unit --unit "$RM_UNIT" --from "$RM_LABEL" --to "$to" --device "$TAPE_DEV" || return 1
+    [ "$DRY_RUN" = 1 ] && return 0
+    assert_identical "$RM_SRC" "$to"
+}
+
+rm_step_file() {
+    local to="$RM_WORK/file" relpath
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL restore file --file "<nested-file-in-$RM_UNIT>" --unit "$RM_UNIT" --from "$RM_LABEL" --to "$to" --device "$TAPE_DEV"
+        return 0
+    fi
+    relpath="$(cd "$RM_SRC" && find . -type f | LC_ALL=C sort | tail -1 | sed 's#^\./##')"
+    [ -n "$relpath" ] || { echo "no regular file found under $RM_SRC"; return 1; }
+    TCTL restore file --file "$relpath" --unit "$RM_UNIT" --from "$RM_LABEL" --to "$to" --device "$TAPE_DEV" || return 1
+    local base expect actual
+    base="$(basename "$relpath")"
+    expect="$(sha256sum "$RM_SRC/$relpath" | awk '{print $1}')"
+    actual="$(sha256sum "$to/$base" 2>/dev/null | awk '{print $1}')"
+    [ -n "$actual" ] && [ "$expect" = "$actual" ] || {
+        echo "restore file: sha256 mismatch or missing ($to/$base)"; return 1;
+    }
+}
+
+rm_step_restore_sh_dd() {
+    ensure_heir_restore_sh || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --info (expect 'Verdict: SEALED'); ./RESTORE.sh --verify (expect 'VERIFY: PASS')"
+        return 0
+    fi
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info) >"$RM_WORK/info.txt" 2>&1
+    grep -q "Verdict: SEALED" "$RM_WORK/info.txt" || { cat "$RM_WORK/info.txt"; echo "expected Verdict: SEALED"; return 1; }
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --verify) >"$RM_WORK/verify_sh.txt" 2>&1
+    grep -q "VERIFY: PASS" "$RM_WORK/verify_sh.txt" || { cat "$RM_WORK/verify_sh.txt"; echo "expected VERIFY: PASS"; return 1; }
+}
+
+rm_step_restore_sh_primary() {
+    ensure_heir_restore_sh || return 1
+    local key="$HOME_DIR/keys/$RM_TENANT-primary.age.key" to="$RM_WORK/primary"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key $key --to $to"
+        return 0
+    fi
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$key" --to "$to") \
+        >"$RM_WORK/restore_primary.txt" 2>&1 || { cat "$RM_WORK/restore_primary.txt"; return 1; }
+    assert_identical "$RM_SRC" "$to"
+}
+
+rm_step_restore_sh_backup() {
+    ensure_heir_restore_sh || return 1
+    local key="$HOME_DIR/keys/$RM_TENANT-backup.age.key" to="$RM_WORK/backup"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key $key --to $to (proves the backup key is a real recipient)"
+        return 0
+    fi
+    [ -f "$key" ] || { echo "tenant backup key missing: $key"; return 1; }
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$key" --to "$to") \
+        >"$RM_WORK/restore_backup.txt" 2>&1 || { cat "$RM_WORK/restore_backup.txt"; return 1; }
+    assert_identical "$RM_SRC" "$to"
+}
+
+# Decided from src/volume/layout.rs:516 (envelope_positions lists
+# tenant_envelope, operator_envelope AND operator_envelope_backup as equal
+# trial-decrypt candidates) and :883 ("multiple units found" only fires when
+# a single envelope covers >1 unit) — the operator envelope IS a normal
+# restore path, requiring --unit exactly like a tenant envelope covering
+# more than one unit. Not a refusal-by-design case.
+rm_step_operator_envelope() {
+    ensure_heir_restore_sh || return 1
+    local opkey="$HOME_DIR/keys/${OPERATOR}-primary.age.key" to="$RM_WORK/operator"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --find-envelope --key $opkey; ./RESTORE.sh --restore --unit $RM_UNIT --key $opkey --to $to"
+        return 0
+    fi
+    [ -f "$opkey" ] || { echo "operator key missing: $opkey"; return 1; }
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find-envelope --key "$opkey") \
+        >"$RM_WORK/find_operator.txt" 2>&1 || { cat "$RM_WORK/find_operator.txt"; return 1; }
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$opkey" --to "$to") \
+        >"$RM_WORK/restore_operator.txt" 2>&1 || { cat "$RM_WORK/restore_operator.txt"; return 1; }
+    assert_identical "$RM_SRC" "$to"
+}
+
+rm_step_escrow() {
+    ensure_heir_restore_sh || return 1
+    local to="$RM_WORK/escrow"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key \$RUN/escrow.key --to $to"
+        return 0
+    fi
+    [ -f "$RUN/escrow.key" ] || { echo "no escrow.key captured for this run — was key generate --escrow run?"; return 1; }
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$RUN/escrow.key" --to "$to") \
+        >"$RM_WORK/restore_escrow.txt" 2>&1 || { cat "$RM_WORK/restore_escrow.txt"; return 1; }
+    assert_identical "$RM_SRC" "$to"
+}
+
+rm_step_raw_volume() {
+    local to="$RM_WORK/raw"
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL restore raw-volume --to "$to" --device "$TAPE_DEV" --json
+        echo "PLAN: assert mismatched_count == 0 and all_verified from the JSON above"
+        return 0
+    fi
+    TCTL restore raw-volume --to "$to" --device "$TAPE_DEV" --json >"$RM_WORK/raw.json" 2>&1
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
+' "$RM_WORK/raw.json" || { cat "$RM_WORK/raw.json"; return 1; }
+}
+
+# Cross-tenant negative. Primary evidence (mirrors mhvtl-verify-gate.sh's
+# step_crosskey): the other tenant's key must NOT age-decrypt a slice
+# belonging to RM_UNIT, resolved via the catalog. RM_OTHER is set by
+# restore_matrix's caller (or auto-detected); no other tenant on this
+# volume is a legitimate SKIP, not a failure.
+rm_step_isolation() {
+    local other="$RM_OTHER"
+    if [ -z "$other" ]; then
+        skip "$RM_TAG.isolation" "no other tenant registered on this archive besides $RM_TENANT/$OPERATOR — nothing to cross-test"
+        return $?
+    fi
+    local otherkey="$HOME_DIR/keys/$other-primary.age.key"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: resolve a $RM_UNIT slice via the catalog; age -d -i $otherkey <slice> (must fail)"
+        return 0
+    fi
+    [ -f "$otherkey" ] || { echo "other tenant key missing: $otherkey"; return 1; }
+    local slice
+    slice="$(python3 - "$HOME_DIR/tapectl.db" "$RM_UNIT" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    """SELECT sl.staging_path FROM stage_slices sl
+       JOIN stage_sets ss ON ss.id = sl.stage_set_id
+       JOIN snapshots s ON s.id = ss.snapshot_id
+       JOIN units u ON u.id = s.unit_id
+       WHERE u.name = ? AND sl.staging_path IS NOT NULL
+       ORDER BY sl.slice_number LIMIT 1""",
+    (sys.argv[2],),
+).fetchone()
+print(row[0] if row else "")
+PY
+)"
+    if [ -z "$slice" ] || [ ! -f "$slice" ]; then
+        skip "$RM_TAG.isolation" "no live staged slice for $RM_UNIT (already released by staging clean) — crypto isolation already proved by other tags in this run"
+        return $?
+    fi
+    if age -d -i "$otherkey" "$slice" >/dev/null 2>&1; then
+        echo "$other's key decrypted $RM_TENANT's ($RM_UNIT) slice — isolation broken"
+        return 1
+    fi
+}
+
+rm_step_verify() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl volume verify $RM_LABEL --full/--quick --device $TAPE_DEV --json; tapectl report verify-status --json (assert $RM_LABEL listed)"
+        return 0
+    fi
+    TCTL volume verify "$RM_LABEL" --full --device "$TAPE_DEV" --json >"$RM_WORK/verify_full.json" 2>&1 || { cat "$RM_WORK/verify_full.json"; return 1; }
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RM_WORK/verify_full.json" || return 1
+    TCTL volume verify "$RM_LABEL" --quick --device "$TAPE_DEV" --json >"$RM_WORK/verify_quick.json" 2>&1 || { cat "$RM_WORK/verify_quick.json"; return 1; }
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0, d' "$RM_WORK/verify_quick.json" || return 1
+    TCTL report verify-status --json >"$RM_WORK/verify_status.json" 2>&1 || return 1
+    grep -q "\"$RM_LABEL\"" "$RM_WORK/verify_status.json" || { echo "volume $RM_LABEL not listed in report verify-status"; return 1; }
+}
+
+# restore_matrix <label> <unit> <tenant> <expected_src_dir> <tag> [other_tenant]
+# Runs all 10 methods as separate `check`s named "<tag>.<method>". Call
+# after a volume is sealed and while its cartridge is (or can be) reloaded.
+restore_matrix() {
+    RM_LABEL="$1"; RM_UNIT="$2"; RM_TENANT="$3"; RM_SRC="$4"; RM_TAG="$5"; RM_OTHER="${6:-}"
+    if [ "$DRY_RUN" != 1 ]; then
+        RM_WORK="$RUN/matrix-$RM_TAG"; mkdir -p "$RM_WORK"
+        if [ -z "$RM_OTHER" ] && [ -d "$HOME_DIR/keys" ]; then
+            RM_OTHER="$(find "$HOME_DIR/keys" -maxdepth 1 -name '*-primary.age.key' -printf '%f\n' 2>/dev/null \
+                | sed 's/-primary\.age\.key$//' | grep -vx "$RM_TENANT" | grep -vx "$OPERATOR" | head -1 || true)"
+        fi
+    else
+        RM_WORK="$RUN/matrix-$RM_TAG"
+    fi
+
+    check "$RM_TAG.unit"               rm_step_unit
+    check "$RM_TAG.file"               rm_step_file
+    check "$RM_TAG.restore_sh_dd"      rm_step_restore_sh_dd
+    check "$RM_TAG.restore_sh_primary" rm_step_restore_sh_primary
+    check "$RM_TAG.restore_sh_backup"  rm_step_restore_sh_backup
+    check "$RM_TAG.operator_envelope"  rm_step_operator_envelope
+    check "$RM_TAG.escrow"             rm_step_escrow
+    check "$RM_TAG.raw_volume"         rm_step_raw_volume
+    check "$RM_TAG.isolation"          rm_step_isolation
+    check "$RM_TAG.verify"             rm_step_verify
+}
+
 # ---------- scenario stubs ----------
 # Each is replaced with a real implementation in a later commit. Kept as
 # real (if minimal) functions from the start so --list/--dry-run/--all can
