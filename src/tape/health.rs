@@ -25,6 +25,16 @@ pub struct HealthCounters {
     pub total_retries: i64,
     pub total_rewritten: i64,
     pub tape_alerts: i64,
+    /// "Errors corrected without substantial delay" (0x02/0x03). On drives
+    /// that leave `total_corrected` (`Total errors corrected`) at 0, this is
+    /// where ECC activity actually shows up — see the module doc.
+    pub corrected_no_delay: i64,
+    /// "Errors corrected with possible delays" (0x02/0x03) — sibling of
+    /// `corrected_no_delay`, the costlier ECC bucket.
+    pub corrected_with_delay: i64,
+    /// "Total times correction algorithm processed" (0x02/0x03) — the other
+    /// parameter that trends upward as a drive or medium degrades.
+    pub correction_algorithm_invocations: i64,
 }
 
 /// Parse a single sg_logs page output into partial counters.
@@ -43,6 +53,18 @@ pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
                     c.total_uncorrected += v;
                 } else if let Some(v) = extract_counter(line, "Total errors corrected") {
                     c.total_corrected += v;
+                } else if let Some(v) =
+                    extract_counter(line, "Errors corrected without substantial delay")
+                {
+                    c.corrected_no_delay += v;
+                } else if let Some(v) =
+                    extract_counter(line, "Errors corrected with possible delays")
+                {
+                    c.corrected_with_delay += v;
+                } else if let Some(v) =
+                    extract_counter(line, "Total times correction algorithm processed")
+                {
+                    c.correction_algorithm_invocations += v;
                 } else if let Some(v) = extract_counter(line, "Total rewrites or rereads") {
                     // Page 0x02 calls this "rewrites", page 0x03 "rereads". Same line text.
                     if page == 0x02 {
@@ -74,6 +96,52 @@ pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
     }
 
     c
+}
+
+impl HealthCounters {
+    /// Re-derive `HealthCounters` from a stored `raw_log` blob — the
+    /// concatenated per-page text `collect()` writes, delimited by
+    /// `=== page 0xNN ===` markers. Lets a caller recompute counters,
+    /// including the two "trending" fields that are not persisted as their
+    /// own columns (see the module doc), from an already-stored row without
+    /// a second sg_logs collection.
+    ///
+    /// As forgiving as `parse_sg_logs_page`: text before the first marker is
+    /// ignored, an empty or markerless string yields `HealthCounters::default()`,
+    /// and an unrecognized page number contributes nothing (same as
+    /// `parse_sg_logs_page`'s `_ => {}` arm).
+    pub fn from_raw_log(raw: &str) -> HealthCounters {
+        let mut totals = HealthCounters::default();
+        let mut current_page: Option<u8> = None;
+        let mut current_text = String::new();
+
+        for line in raw.lines() {
+            if let Some(page) = parse_page_marker(line) {
+                if let Some(p) = current_page {
+                    merge(&mut totals, parse_sg_logs_page(p, &current_text));
+                }
+                current_page = Some(page);
+                current_text.clear();
+            } else {
+                current_text.push_str(line);
+                current_text.push('\n');
+            }
+        }
+        if let Some(p) = current_page {
+            merge(&mut totals, parse_sg_logs_page(p, &current_text));
+        }
+
+        totals
+    }
+}
+
+/// Parse a `=== page 0xNN ===` separator line (the format `collect()`
+/// writes) into the page number. Returns `None` for anything else, so
+/// ordinary log text never gets mistaken for a marker.
+fn parse_page_marker(line: &str) -> Option<u8> {
+    let line = line.trim();
+    let hex = line.strip_prefix("=== page 0x")?.strip_suffix(" ===")?;
+    u8::from_str_radix(hex, 16).ok()
 }
 
 /// Shell out to sg_logs and collect counters from all three pages.
@@ -156,6 +224,9 @@ fn merge(into: &mut HealthCounters, from: HealthCounters) {
     into.total_retries += from.total_retries;
     into.total_rewritten += from.total_rewritten;
     into.tape_alerts += from.tape_alerts;
+    into.corrected_no_delay += from.corrected_no_delay;
+    into.corrected_with_delay += from.corrected_with_delay;
+    into.correction_algorithm_invocations += from.correction_algorithm_invocations;
     if from.total_bytes_processed > into.total_bytes_processed {
         into.total_bytes_processed = from.total_bytes_processed;
     }
@@ -255,6 +326,144 @@ Write error counter page [0x2]
         assert_eq!(c.total_corrected, 42);
     }
 
+    // ── Issue #120: this drive's ECC activity trends under different
+    // parameters than the one the summary reads ──────────────────────────
+    //
+    // Measured on a real HP LTO-6 during the 2026-09-10 session
+    // (`docs/lto6-session-journal-2026-09-10.md`): `Total errors corrected`
+    // sits at 0 on this drive while `Errors corrected without substantial
+    // delay` (875) and `Total times correction algorithm processed`
+    // (305,674) carry its actual ECC activity.
+
+    // Real HP LTO-6 (Ultrium 6-SCSI) sg_logs output, pages 0x02/0x03,
+    // captured verbatim during that session (recordings under
+    // /scratch/tapectl-lto6-session/recordings/measure/run-20260910-012953/)
+    // — the pre-write/idle state, every counter at 0. This proves the parser
+    // extracts fields correctly against the REAL device's banner and field
+    // text, not only mhvtl's IBM emulation shape used by PAGE_02/PAGE_03
+    // above.
+    const HP_LTO6_PAGE_02: &str =
+        include_str!("../../tests/fixtures/sg_logs/hp_lto6_page_0x02.txt");
+    const HP_LTO6_PAGE_03: &str =
+        include_str!("../../tests/fixtures/sg_logs/hp_lto6_page_0x03.txt");
+
+    #[test]
+    fn parse_real_hp_lto6_page_02_zero_state() {
+        let c = parse_sg_logs_page(0x02, HP_LTO6_PAGE_02);
+        assert_eq!(c.total_uncorrected, 0);
+        assert_eq!(c.total_corrected, 0);
+        assert_eq!(c.corrected_no_delay, 0);
+        assert_eq!(c.corrected_with_delay, 0);
+        assert_eq!(c.correction_algorithm_invocations, 0);
+    }
+
+    #[test]
+    fn parse_real_hp_lto6_page_03_zero_state() {
+        let c = parse_sg_logs_page(0x03, HP_LTO6_PAGE_03);
+        assert_eq!(c.total_uncorrected, 0);
+        assert_eq!(c.corrected_no_delay, 0);
+        assert_eq!(c.correction_algorithm_invocations, 0);
+    }
+
+    /// Quoted VERBATIM from the journal's "⚠ `report health` reports
+    /// `corrected=0` while the drive reports 875" subsection (issue #120) —
+    /// the busy-page excerpt the bug report is actually about. This is a
+    /// DIFFERENT capture than `HP_LTO6_PAGE_02` above: that file is the
+    /// pre-write preflight/measure snapshot (all zero) still on disk; this
+    /// text is what the same drive reported after the write. The post-write
+    /// raw sg_logs output was never itself saved to a file anywhere in this
+    /// session's recordings (confirmed by grepping the whole
+    /// `/scratch/tapectl-lto6-session` tree for "875" and "305674" — no
+    /// hits outside the journal) — only this quoted excerpt survives, so it
+    /// is reproduced here exactly rather than treated as a full page dump.
+    const HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT: &str = "\
+Write error counter page [0x2]
+  Errors corrected without substantial delay   = 875
+  Total errors corrected                       = 0
+  Total times correction algorithm processed   = 305674
+  Total uncorrected errors                     = 0
+";
+
+    #[test]
+    fn parse_real_hp_lto6_busy_page_02_from_journal() {
+        let c = parse_sg_logs_page(0x02, HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT);
+        assert_eq!(c.total_corrected, 0, "faithful to Total errors corrected");
+        assert_eq!(c.total_uncorrected, 0);
+        assert_eq!(c.corrected_no_delay, 875);
+        assert_eq!(c.correction_algorithm_invocations, 305_674);
+    }
+
+    /// No real page-0x03 capture at a non-zero state exists anywhere in the
+    /// session recordings, and the journal doesn't quote one either — only
+    /// page 0x02 is discussed there. This page is therefore SYNTHETIC: the
+    /// real HP field shape (banner + field order taken from `HP_LTO6_PAGE_03`
+    /// above) with small values substituted, purely to prove `from_raw_log`
+    /// sums page 0x02 *and* 0x03 rather than only reading one of them. It is
+    /// not presented as a real capture anywhere outside this comment.
+    const SYNTHETIC_HP_LTO6_PAGE_03: &str = "\
+    HP        Ultrium 6-SCSI    35GD
+Read error counter page  [0x3]
+  Errors corrected without substantial delay = 2
+  Errors corrected with possible delays = 0
+  Total rewrites or rereads = 0
+  Total errors corrected = 0
+  Total times correction algorithm processed = 2
+  Total bytes processed = 0
+  Total uncorrected errors = 0
+";
+
+    #[test]
+    fn parse_synthetic_hp_lto6_page_03() {
+        let c = parse_sg_logs_page(0x03, SYNTHETIC_HP_LTO6_PAGE_03);
+        assert_eq!(c.corrected_no_delay, 2);
+        assert_eq!(c.correction_algorithm_invocations, 2);
+    }
+
+    #[test]
+    fn from_raw_log_sums_the_trending_fields_across_pages_02_and_03() {
+        let raw = format!(
+            "=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n"
+        );
+        let c = HealthCounters::from_raw_log(&raw);
+        assert_eq!(c.corrected_no_delay, 875 + 2);
+        assert_eq!(c.correction_algorithm_invocations, 305_674 + 2);
+        assert_eq!(c.total_corrected, 0);
+        assert_eq!(c.total_uncorrected, 0);
+    }
+
+    /// `from_raw_log` must carry `tape_alerts` through the re-derive too —
+    /// not just the two new trending fields — so a three-page concatenation
+    /// (0x02 + 0x03 + 0x2e) is exercised here, not only the two pages issue
+    /// #120 is about.
+    #[test]
+    fn from_raw_log_three_pages_includes_tape_alerts() {
+        let raw = format!(
+            "=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n=== page 0x2e ===\n{PAGE_2E}\n"
+        );
+        let c = HealthCounters::from_raw_log(&raw);
+        assert_eq!(c.corrected_no_delay, 875 + 2);
+        assert_eq!(c.tape_alerts, 0); // PAGE_2E fixture has no raised flags
+    }
+
+    /// Text before the first `=== page 0xNN ===` marker (a stray blank line,
+    /// or output the parser doesn't recognize) must be ignored rather than
+    /// mis-attributed to page 0 — consistent with the "deliberately
+    /// forgiving" parser design (module doc): unknown input yields zeroed
+    /// counters, never an error.
+    #[test]
+    fn from_raw_log_ignores_text_before_first_marker() {
+        let raw = format!(
+            "some stray preamble\nnot a page marker\n=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n"
+        );
+        let c = HealthCounters::from_raw_log(&raw);
+        assert_eq!(c.corrected_no_delay, 875);
+    }
+
+    #[test]
+    fn from_raw_log_of_empty_string_is_zero() {
+        assert_eq!(HealthCounters::from_raw_log(""), HealthCounters::default());
+    }
+
     #[test]
     fn record_inserts_row() {
         // Full ordered migration chain (issue #44) — was a hand-applied
@@ -277,6 +486,9 @@ Write error counter page [0x2]
             total_retries: 1,
             total_rewritten: 3,
             tape_alerts: 0,
+            corrected_no_delay: 0,
+            corrected_with_delay: 0,
+            correction_algorithm_invocations: 0,
         };
         record(&conn, vid, "write", &counters, "raw log contents").unwrap();
 
@@ -321,6 +533,9 @@ Write error counter page [0x2]
             total_retries: 0,
             total_rewritten: 0,
             tape_alerts: 3,
+            corrected_no_delay: 0,
+            corrected_with_delay: 0,
+            correction_algorithm_invocations: 0,
         };
         record(&conn, vid, "verify", &counters, "raw").unwrap();
 
@@ -365,6 +580,9 @@ Write error counter page [0x2]
                 total_retries: 0,
                 total_rewritten: 0,
                 tape_alerts: 0,
+                corrected_no_delay: 0,
+                corrected_with_delay: 0,
+                correction_algorithm_invocations: 0,
             },
             "raw",
         )
