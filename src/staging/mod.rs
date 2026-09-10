@@ -1496,8 +1496,8 @@ mod tests {
     /// this is not fixture decoration — it is the state every real staging
     /// run requires. Public key only, exactly as production does: the secret
     /// half never touches the database. Mirrors `tests/mhvtl_e2e.rs`'s
-    /// harness.
-    fn register_test_escrow(conn: &Connection) {
+    /// harness. Returns the escrow public key.
+    fn register_test_escrow(conn: &Connection) -> String {
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
             [],
@@ -1514,6 +1514,7 @@ mod tests {
             Some("test escrow recipient (ADR-0005)"),
         )
         .unwrap();
+        kp.public_key
     }
 
     /// Real age decryption of a file on disk, mirroring the pattern used by
@@ -2328,7 +2329,7 @@ mod tests {
         }
 
         // Issue #115: `stage_create` refuses without one.
-        register_test_escrow(&conn);
+        let _escrow_pk = register_test_escrow(&conn);
 
         (conn, paths, config, src)
     }
@@ -2393,6 +2394,75 @@ mod tests {
         assert!(
             left_in_staging.is_empty(),
             "nothing may reach the staging directory before the refusal: {left_in_staging:?}"
+        );
+    }
+
+    /// The complement of the refusal above, and the ordering story issue
+    /// #115 turns on. Two claims:
+    ///
+    /// 1. `policy.encrypt = false` is still never honored and never fatal —
+    ///    it warns and encrypts anyway (the coordinator decision recorded in
+    ///    `stage_create_inner`). The new escrow precondition must not have
+    ///    quietly turned that warning into a refusal.
+    /// 2. The recipient list `stage_create` RECORDS on the stage set
+    ///    contains the escrow public key. That column is the sole evidence
+    ///    `volume write`'s pre-flight has (an age X25519 stanza names no
+    ///    recipient), so if it were ever wrong, the check built on it would
+    ///    be too.
+    #[test]
+    fn encrypt_false_still_warns_encrypts_and_records_the_escrow_recipient() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let escrow_pk: String = conn
+            .query_row(
+                "SELECT public_key FROM encryption_keys WHERE is_escrow = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        config.defaults.encrypt = false;
+
+        fs::write(
+            src.join("f.txt"),
+            b"content staged under policy.encrypt = false",
+        )
+        .unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id)
+            .expect("encrypt=false must warn, not refuse (ADR-0005 makes it un-honorable)");
+
+        let (encrypted, fingerprints): (i64, String) = conn
+            .query_row(
+                "SELECT encrypted, key_fingerprints FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(encrypted, 1, "encryption cannot be disabled (ADR-0005)");
+
+        let recipients: Vec<String> = serde_json::from_str(&fingerprints).unwrap();
+        assert!(
+            recipients.contains(&escrow_pk),
+            "the recorded recipient list must contain the escrow public key — it is \
+             what `volume write` checks the slices against (issue #115): {recipients:?}"
+        );
+
+        // And the bytes on disk really are age ciphertext, not plaintext dar.
+        let slice_path: String = conn
+            .query_row(
+                "SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            slice_path.ends_with(".age"),
+            "slice must be the encrypted artifact: {slice_path}"
+        );
+        let head = fs::read(&slice_path).unwrap();
+        assert!(
+            head.starts_with(b"age-encryption.org/v1"),
+            "slice must carry a real age header despite policy.encrypt = false"
         );
     }
 
