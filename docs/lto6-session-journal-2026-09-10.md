@@ -990,3 +990,115 @@ for already-written pre-escrow volumes (#125), and a full `--all` lifecycle run
 across every scenario. The retire-and-reuse and compaction scenarios encode
 real-erase reuse semantics that a short-erased single cartridge cannot fully
 satisfy — they SKIP or need `--erase long` / a second cartridge.
+
+---
+
+## Phase 7 — post-reboot: the mhvtl gate, and a wrong-tape read
+
+The reboot was the human step needed to fix mhvtl's dead `lload` IPC (CTO Q1
+deferred the gate re-run until after it). mhvtl came back healthy. The gate then
+failed RED three times in a row, on exactly three checks:
+
+```
+heir_find_envelope: FAIL  << UNEXPECTED — regression
+heir_restore: FAIL  << UNEXPECTED — regression
+heir_restore_symlink_unit: FAIL  << UNEXPECTED — regression
+```
+```
+>>> Trying envelope at file 4...  5...  6...  7...
+FATAL: no envelope matched the provided key
+```
+
+### What made this hard
+
+Everything passed in isolation. Ruled out, in order: `do_find_envelope` is
+byte-identical between the gate's extracted RESTORE.sh and a known-good copy;
+alice-primary secret ↔ DB ↔ `.pub` all match; `volume verify` passes (it hashes
+every envelope); `tapectl restore` passes; tape reads are byte-consistent across
+repeats; and four progressively more faithful replicas — up to an exact gate
+replica with 1 M slices and the full fixture set — ALL PASS. Running the gate's
+own heir sequence by hand on the preserved tape also passed.
+
+I then chased a red herring for a while. An in-gate probe running a RESTORE.sh
+patched *only* to drop `2>/dev/null` from the age command SUCCEEDED where the
+unpatched one failed, which looked like a `set -uo pipefail` / SIGPIPE
+interaction in the envelope loop. It was not: RESTORE.sh runs as a subprocess
+with its own `set -euo pipefail`, so the gate's shell options never reach it.
+The probe passed because it also pinned `TAPE_DEVICE=/dev/nst1` — the one
+variable that actually mattered. Recorded because the wrong lead was
+superficially compelling and cost real time.
+
+### Root cause
+
+`RESTORE.sh` defaults to `${TAPE_DEVICE:-/dev/nst0}` (`src/volume/layout.rs`).
+The gate's four heir steps invoked it with no `TAPE_DEVICE`, so they read
+`/dev/nst0` regardless of `TAPECTL_GATE_TAPE`. That was harmless for as long as
+`/dev/nst0` *was* the mhvtl drive. After the reboot it was not:
+
+```console
+$ ls -l /dev/tape/by-id/ | grep -E 'nst[0-9]$'
+scsi-HUJ808A5L4-nst -> ../../nst0     ← the REAL HP LTO-6
+scsi-XYZZY_A1-nst   -> ../../nst1     ← mhvtl
+```
+
+The gate wrote to `nst1` and its heir leg read the real drive's tape. See
+`docs/lto6-drive-passthrough.md` — I predicted this exact collision when setting
+up the passthrough, but scoped the trigger too narrowly ("if mhvtl fails to
+load"). A plain reboot re-racing the SCSI hosts was enough.
+
+**Commands issued against the real drive `/dev/nst0` during the three RED runs**
+(via RESTORE.sh, per run): `mt -f /dev/nst0 setblk 524288`, `mt -f /dev/nst0
+rewind`, `mt -f /dev/nst0 fsf N`, `dd if=/dev/nst0 bs=524288`. **All read-only.**
+The cartridge was repositioned; nothing was written to it, and its volume still
+verifies. No `mt erase`, no `dd of=`.
+
+### Why the symptom was so misleading
+
+`heir_info` **PASSED** while reading the wrong tape, because nothing checked
+*which* volume it read — the real drive happened to hold a valid sealed volume
+from the lifecycle runs. The file maps make it unmistakable:
+
+| | RED run (read `/dev/nst0`) | GREEN run (read `/dev/nst1`) |
+|---|---|---|
+| tenant envelopes | 7886 / 17089 | 10910 / 14046 |
+| operator envelope | 47539 | 46600 |
+| first data slice | 1049474 | 703525 |
+| **printed label** | **`MHVTLG`** | `MHVTLG` |
+
+Both printed the same label — `$LABEL` is baked into the script at write time
+and was never compared with the tape. So the heir leg reported the expected
+volume name while describing a completely different tape, and the only visible
+failure was "no envelope matched the provided key": to an heir, "your key is
+wrong" or "your archive is gone", when it meant neither.
+
+### Fixes
+
+- **`0dbfda7`** — gate pins `TAPE_DEVICE="$TAPE_DEV"` on all four heir steps.
+  Gate **GREEN 26/26** against an empty EXPECTED_FAIL manifest, closing the
+  deferred CTO Q1 re-run.
+- **`3b5d287`** — RESTORE.sh now parses `label` from the ID thunk, announces the
+  device and the tape's real label, warns prominently on mismatch, and names
+  both labels in the "no envelope matched" message. Warns rather than exits: the
+  script is generic apart from `$LABEL`, so a sibling tape is legitimate
+  recovery, and an unreadable thunk must not become a hard stop. Labels are
+  echoed through a new `safe_str()` because the ID thunk is unauthenticated.
+
+Verified read-only against a genuinely mismatched tape:
+
+```console
+$ TAPE_DEVICE=/dev/nst1 ./RESTORE.sh --info      # script built for CHECK1
+>>> Tape device:      /dev/nst1 (from TAPE_DEVICE)
+>>> Tape identifies as: MHVTLR3
+  WRONG TAPE? This script was written for volume 'CHECK1',
+  but the tape in /dev/nst1 identifies itself as 'MHVTLR3'.
+```
+
+### Standing hazard
+
+The write path was never at risk: `scripts/mhvtl-device.sh` is the single entry
+point for every writing harness and refuses a device with no `device.conf` Drive
+stanza (`no device.conf Drive matches /dev/nst0 at 0:0:0:0`, exit 2), which the
+gate treats as fatal — verified. But **`/dev/nstN` numbering is not stable across
+reboots on this VM.** Always address the real drive as
+`/dev/tape/by-id/scsi-HUJ808A5L4-nst`, and re-check the mapping after any reboot
+before trusting a bare device number in any doc, including this one.

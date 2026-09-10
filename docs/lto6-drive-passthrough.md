@@ -151,6 +151,27 @@ hardcoded default in `tests/mhvtl_e2e.rs`, `scripts/mhvtl-verify-gate.sh`
 and `scripts/mhvtl-device.sh`. A routine `TAPECTL_MHVTL=1 cargo test` would
 then write a synthetic test volume onto a real cartridge.
 
+### THIS HAPPENED (2026-09-10, after the VM reboot)
+
+The enumeration flipped — not because mhvtl failed to load, but simply because
+a reboot re-raced the two SCSI hosts. mhvtl came up fine; the real drive just
+won `nst0`:
+
+```
+/dev/tape/by-id/scsi-HUJ808A5L4-nst -> ../../nst0   ← REAL DRIVE, now nst0
+/dev/tape/by-id/scsi-XYZZY_A1-nst   -> ../../nst1   ← mhvtl
+```
+
+So "if mhvtl fails to load" was too narrow a trigger. **Assume every reboot
+reshuffles these names.** Only the `by-id` serial names are stable.
+
+What it cost: three RED `mhvtl-verify-gate.sh` runs. The write path was never
+at risk (see below), but the gate's heir leg invoked `RESTORE.sh` without
+`TAPE_DEVICE`, and RESTORE.sh's own default is `/dev/nst0` — so it read the
+real drive while the gate wrote mhvtl. Reads only (`setblk`, `rewind`, `fsf`,
+`dd if=`); the real cartridge was repositioned, never written. Fixed in
+`0dbfda7`; the confusing symptom it produced is fixed in `3b5d287`.
+
 **Always address the real drive by its stable serial name:**
 
 ```bash
@@ -159,9 +180,29 @@ export TAPECTL_GATE_TAPE=/dev/tape/by-id/scsi-HUJ808A5L4-nst   # real LTO-6
 
 Both the test suite and the gate scripts honour `TAPECTL_GATE_TAPE`.
 
-Follow-up worth doing: have the gate script INQUIRY-check for vendor ≠ `HP`
-before writing, so a misidentified device fails closed rather than eating a
-cartridge.
+### Write-path guard: already closed (verified)
+
+The follow-up suggested here — INQUIRY-check the vendor before writing — turns
+out to be unnecessary for the write path, because `scripts/mhvtl-device.sh` is
+the single entry point for every writing harness (issue #111) and it resolves
+the drive through `/etc/mhvtl/device.conf`. A device that is not an mhvtl drive
+matches no Drive stanza, so it fails closed. Verified directly:
+
+```console
+$ bash scripts/mhvtl-device.sh --tape /dev/nst0
+mhvtl-device.sh: no device.conf Drive matches /dev/nst0 at 0:0:0:0
+$ echo $?
+2
+```
+
+The gate treats that exit as fatal. So `TAPECTL_MHVTL=1` with an unset
+`TAPECTL_GATE_TAPE` now *aborts* rather than eating the real cartridge.
+
+The gap was never the write path — it was the **read** path, where RESTORE.sh
+is deliberately standalone and cannot consult device.conf. That is addressed at
+the level an heir actually experiences it: RESTORE.sh now announces its device,
+reads the loaded tape's own label from the ID thunk, and warns loudly when it
+does not match the volume the script was written for (`3b5d287`).
 
 ## Open / unmeasured
 

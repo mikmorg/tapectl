@@ -296,7 +296,24 @@ step_heir_extract() {
 # harmless while nst0 happened to be the mhvtl drive, but on a host where nst0 is
 # a DIFFERENT (e.g. real) drive it reads the wrong tape entirely — heir_info still
 # "passes" against any valid volume there while heir_find/restore fail on keys.
-step_heir_info() { (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info); }
+# Assert the tape read is the tape this gate WROTE, not merely some valid
+# volume. Without this, heir_info passes against any sealed tape in any drive —
+# which is exactly how the wrong-device read above stayed hidden for three runs
+# while three later checks failed on "no envelope matched the provided key".
+step_heir_info() {
+    local out
+    out=$( (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info) ) || return 1
+    printf '%s\n' "$out"
+    grep -q "Tape identifies as: $LABEL\$" <<<"$out" ||
+        {
+            echo "heir_info: tape in $TAPE_DEV is not volume $LABEL — wrong drive or wrong cartridge" >&2
+            return 1
+        }
+    grep -q "Verdict: SEALED" <<<"$out" || {
+        echo "heir_info: volume $LABEL is not SEALED" >&2
+        return 1
+    }
+}
 step_heir_find() { (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find-envelope --key "$HOME_DIR/keys/alice-primary.age.key"); }
 step_heir_restore() {
     # RESTORE.sh extracts the unit's contents directly into --to (dar restores

@@ -73,16 +73,18 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
 - **Verified:** 270 ungated tests; `tests/format_v2.rs` is a keyless synthetic-heir
   acceptance suite (proves the byte layout from recorded bytes alone); mhvtl e2e 9/9
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
-  corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN with exactly the two ticketed
-  EXPECTED_FAIL entries (H7 #33, H8 #34 — both phase-2).
+  corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **26/26 against an empty
+  EXPECTED_FAIL manifest** (2026-09-10 — H7 #33 / H8 #34 are fixed and removed).
 
 **Next:** issues #22–#28 describe the *pre-v2* design and must be read against the
-normative set above, not implemented literally. Phase 2 next (#33/#34 would empty
-the gate manifest). Real LTO-6 hardware validation stays deferred by choice — an
-LTO-6 drive is owned, but development is mhvtl-first; the open hardware questions
-(block size 512K vs 1M, LBP acceptance, MAM over-report bounds) are recorded in
-`docs/design/v2-open-questions.md` §5 and the procedure is in
-`docs/lto6-validation-checklist.md`.
+normative set above, not implemented literally.
+
+**Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
+LTO-6 is passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
+for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
+open hardware questions are answered there — block size 512 K vs 1 M is a wash, MAM
+over-report is +2 MiB. `scripts/lifecycle-suite.sh` (13 scenarios x a 10-method
+restore matrix) is the permutation suite built from it.
 
 ## Build Commands
 
@@ -131,9 +133,16 @@ cargo test test_volume_write_positions  # a single test by name (substring match
 Two suites are gated (they skip at runtime unless the env var is set):
 
 ```bash
-# mhvtl end-to-end round-trip + on-tape tenant isolation. Needs /dev/nst0 backed by
-# mhvtl. Tests are also #[ignore], so pass --ignored.
-TAPECTL_MHVTL=1 cargo test --test mhvtl_e2e -- --ignored --nocapture
+# mhvtl end-to-end round-trip + on-tape tenant isolation. Tests are #[ignore], so
+# pass --ignored.
+#
+# DEVICE NUMBERING IS NOT STABLE: this VM also has a real LTO-6 passed through, and
+# a reboot can hand it /dev/nst0. Always set TAPECTL_GATE_TAPE. Discovery fails
+# closed on a non-mhvtl device, so an unset value aborts rather than writing to the
+# real drive — but do not rely on that. Check `ls -l /dev/tape/by-id/` after a boot:
+# scsi-HUJ808A5L4-nst is the REAL drive; scsi-XYZZY_A* are mhvtl.
+TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 \
+    cargo test --test mhvtl_e2e -- --ignored --nocapture
 
 # Performance scenarios (thousands of files, large archives); ~2 min. This is the one
 # case a release build is expected.
