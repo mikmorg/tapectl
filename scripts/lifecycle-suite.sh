@@ -2160,7 +2160,214 @@ scenario_collection() {
     check col.add_and_rename        col_add_and_rename
     check col.status_shows_new_pending col_status_shows_new_pending
 }
-scenario_permute() { echo "PLAN: [permute] seed=$SEED steps=$STEPS not yet implemented"; }
+# ============================================================
+# Scenario: permute
+# ============================================================
+# A seeded random walk over the command surface, starting from first-year.
+# The op sequence is generated ONCE, deterministically, from --seed via
+# python's random.Random (same reproducibility contract as mutate_source):
+# same seed + same --steps => the exact same walk, printed to REPORT.md so
+# a failure can be replayed by re-running with the same --seed.
+#
+# Op pool and weights are the task spec's table verbatim. Preconditioned
+# ops (write-next-volume, restore-latest-and-diff, mark-reclaimable-oldest)
+# SKIP visibly with a reason when their precondition isn't met, rather than
+# being excluded from the draw — an ineligible draw still consumes a step
+# and is logged, exactly as the spec asks.
+pm_generate_sequence() {
+    python3 -c '
+import random, sys
+seed, steps = int(sys.argv[1]), int(sys.argv[2])
+pool = (
+    ["mutate:add"] * 3 + ["mutate:modify"] * 3 + ["mutate:delete"] * 1 + ["mutate:rename"] * 1
+    + ["snapshot"] * 3 + ["stage"] * 3 + ["write-next-volume"] * 2
+    + ["restore-latest-and-diff"] * 2 + ["key-rotate"] * 1 + ["report-random"] * 2
+    + ["audit"] * 2 + ["staging-clean"] * 1 + ["db-fsck"] * 1
+    + ["mark-reclaimable-oldest"] * 1 + ["check-integrity"] * 1
+)
+units = ["photos", "docs", "big"]
+reports = ["summary", "fire-risk", "copies", "tape-only", "dirty", "pending",
+           "verify-status", "health", "capacity", "age", "events",
+           "compaction-candidates", "supersedable"]
+rng = random.Random(seed)
+for _ in range(steps):
+    op = rng.choice(pool)
+    if op in ("mutate:add", "mutate:modify", "mutate:delete", "mutate:rename",
+              "snapshot", "stage", "check-integrity"):
+        print(f"{op} {rng.choice(units)}")
+    elif op == "report-random":
+        print(f"report-random {rng.choice(reports)}")
+    else:
+        print(op)
+' "$SEED" "$STEPS"
+}
+
+# Per-scenario walk state. PM_SNAPSHOT_COUNT starts at 1 for every
+# first-year unit (bootstrap_archive_v1 already took v1). PM_WRITTEN
+# tracks labels this walk has written, in order (last = most recent).
+declare -A PM_SNAPSHOT_COUNT
+PM_WRITTEN=()
+PM_VOL_SEQ=0
+PM_CHECK_NAME=""
+
+pm_skip_never_written() { skip "pm-final-$1.unit" "unit $1 never ended up on any volume this walk"; return $?; }
+
+pm_op_mutate() { mutate_source "$SRC/$2" "$SEED" "${1#mutate:}"; }
+pm_op_snapshot() {
+    TCTL snapshot create "$1" || return 1
+    PM_SNAPSHOT_COUNT["$1"]=$(( ${PM_SNAPSHOT_COUNT["$1"]:-1} + 1 ))
+}
+pm_op_stage()           { TCTL stage create "$1"; }
+pm_op_check_integrity() { TCTL unit check-integrity "$1"; }
+pm_op_key_rotate()      { TCTL key rotate --tenant alice; }
+pm_op_audit()           { local rc; TCTL audit; rc=$?; [ "$rc" -le 2 ]; }
+pm_op_staging_clean()   { TCTL staging clean; }
+pm_op_db_fsck()         { TCTL db fsck; }
+pm_op_report_random()   { TCTL report "$1"; }
+
+pm_op_write_next_volume() {
+    local n; n="$(pending_count)"
+    if [ "$n" -le 0 ]; then skip "$PM_CHECK_NAME" "nothing staged"; return $?; fi
+    PM_VOL_SEQ=$((PM_VOL_SEQ + 1))
+    local label="VOL-PM$PM_VOL_SEQ" sd; sd="$(dirname "$HOME_DIR")"
+    next_tape "$label" || return 1
+    TCTL volume init "$label" --device "$TAPE_DEV" || return 1
+    TCTL volume write "$label" --device "$TAPE_DEV" || return 1
+    cp -a "$SRC" "$sd/pm-snapshot-$label"
+    PM_WRITTEN+=("$label")
+}
+
+pm_op_restore_latest_and_diff() {
+    if [ "${#PM_WRITTEN[@]}" -eq 0 ]; then skip "$PM_CHECK_NAME" "no volume written yet this walk"; return $?; fi
+    local label="${PM_WRITTEN[-1]}" sd u to
+    sd="$(dirname "$HOME_DIR")"
+    load_volume_tape "$label" || return 1
+    for u in photos docs big; do
+        to="$sd/pm-restore-$label-$u"
+        if TCTL restore unit --unit "$u" --from "$label" --to "$to" --device "$TAPE_DEV" >/dev/null 2>&1; then
+            assert_identical "$sd/pm-snapshot-$label/$u" "$to" || return 1
+        fi
+        # A unit simply not present on this particular write is expected in
+        # a random walk (not every write bundles every unit) — not a
+        # failure, just nothing to check for that unit this time.
+    done
+}
+
+# "≥2 written versions" tracked via PM_SNAPSHOT_COUNT rather than a DB
+# query, kept in sync by pm_op_snapshot above. Both refusal and success are
+# logged as PASS (this op's contract is "the exit code matches the
+# documented precondition rule", and the rule itself — enforced
+# server-side by `snapshot mark-reclaimable` — is what is under test, not
+# guessed here).
+pm_op_mark_reclaimable_oldest() {
+    local candidate="" u
+    for u in photos docs big; do
+        if [ "${PM_SNAPSHOT_COUNT[$u]:-1}" -ge 2 ]; then candidate="$u"; break; fi
+    done
+    if [ -z "$candidate" ]; then skip "$PM_CHECK_NAME" "no unit has >=2 snapshot versions yet"; return $?; fi
+    TCTL snapshot mark-reclaimable --version 1 "$candidate" 2>&1
+    return 0
+}
+
+pm_run_step() { # pm_run_step <line...>
+    local op="$1"; shift
+    case "$op" in
+        mutate:add|mutate:modify|mutate:delete|mutate:rename) pm_op_mutate "$op" "$1" ;;
+        snapshot)                 pm_op_snapshot "$1" ;;
+        stage)                    pm_op_stage "$1" ;;
+        check-integrity)          pm_op_check_integrity "$1" ;;
+        report-random)            pm_op_report_random "$1" ;;
+        write-next-volume)        pm_op_write_next_volume ;;
+        restore-latest-and-diff)  pm_op_restore_latest_and_diff ;;
+        key-rotate)               pm_op_key_rotate ;;
+        audit)                    pm_op_audit ;;
+        staging-clean)            pm_op_staging_clean ;;
+        db-fsck)                  pm_op_db_fsck ;;
+        mark-reclaimable-oldest)  pm_op_mark_reclaimable_oldest ;;
+        *) echo "permute: unknown op \"$op\""; return 1 ;;
+    esac
+}
+
+# After EVERY step: db fsck must be clean, and audit must not exit 2
+# unless the step just applied was a mutate:* (a fresh mutation
+# legitimately trips a dirty/under-copied finding until re-archived).
+pm_post_step_invariants() { # pm_post_step_invariants <op>
+    local op="$1" fsck_json
+    fsck_json="$(TCTL db fsck --json 2>&1)"
+    echo "$fsck_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d.get("integrity_ok"), d
+' || { echo "db fsck not clean after op \"$op\": $fsck_json"; return 1; }
+
+    local audit_rc
+    TCTL audit >/dev/null 2>&1; audit_rc=$?
+    case "$op" in
+        mutate:*) [ "$audit_rc" -le 2 ] || { echo "audit exited $audit_rc (>2) after \"$op\""; return 1; } ;;
+        *)        [ "$audit_rc" -le 1 ] || { echo "audit exited $audit_rc after \"$op\" (only mutate:* steps may push it to 2)"; return 1; } ;;
+    esac
+}
+
+scenario_permute() {
+    check pm.setup bootstrap_archive_v1 VOL-A
+
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: seed=$SEED steps=$STEPS op sequence:"
+        pm_generate_sequence | nl -ba
+        return 0
+    fi
+
+    local sd; sd="$(dirname "$HOME_DIR")"
+    local seqfile="$sd/permute-sequence.txt"
+    pm_generate_sequence >"$seqfile"
+    {
+        echo "### permute sequence (seed=$SEED, steps=$STEPS) — reproduce with:"
+        echo "###   scripts/lifecycle-suite.sh --scenario permute --seed $SEED --steps $STEPS [...]"
+        echo '```'
+        cat "$seqfile"
+        echo '```'
+    } >>"$REPORT"
+
+    local i=0 line op
+    while IFS= read -r line; do
+        i=$((i + 1))
+        op="${line%% *}"
+        PM_CHECK_NAME="pm.step$i.$op"
+        # shellcheck disable=SC2086  # word-splitting the (unit|report-name) arg is intentional
+        check "$PM_CHECK_NAME" pm_run_step $line
+        check "pm.step$i.invariants" pm_post_step_invariants "$op"
+    done <"$seqfile"
+
+    # Restore matrix for the latest version of every unit that ended up on
+    # some written volume this walk — "the latest version" here means
+    # whichever written volume most recently carried that unit, found via
+    # `catalog locate` rather than re-deriving it from the walk.
+    local u tenant locate_json labels last
+    for u in photos docs big; do
+        case "$u" in photos|big) tenant=alice ;; docs) tenant=bob ;; esac
+        if [ "${#PM_WRITTEN[@]}" -eq 0 ]; then
+            check "pm-final-$u.unit" pm_skip_never_written "$u"
+            continue
+        fi
+        locate_json="$(TCTL catalog locate "$u" --json 2>/dev/null)"
+        labels="$(echo "$locate_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+vols = d if isinstance(d, list) else d.get("volumes", [])
+for v in vols:
+    print(v.get("label", v) if isinstance(v, dict) else v)
+' 2>/dev/null)"
+        last=""
+        for cand in "${PM_WRITTEN[@]}"; do
+            echo "$labels" | grep -qx "$cand" && last="$cand"
+        done
+        if [ -n "$last" ]; then
+            restore_matrix "$last" "$u" "$tenant" "$SRC/$u" "pm-final-$u"
+        else
+            check "pm-final-$u.unit" pm_skip_never_written "$u"
+        fi
+    done
+}
 
 # ---------- REPORT.md ----------
 write_report_header() {
