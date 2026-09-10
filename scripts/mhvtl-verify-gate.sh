@@ -113,7 +113,7 @@ ln -s /nonexistent-gate-path "$SRC/unitC/link-broken"
 
 # ---------- leg 1: tapectl round trip ----------
 step_init() {
-    TCTL init --operator gate-op
+    TCTL init --operator gate-op --no-escrow
     python3 - "$CFG" "$RUN" "$TAPE_DEV" "$DRIVE_SG" <<'PY'
 import sys, re
 cfg, run, tape, sg = sys.argv[1:5]

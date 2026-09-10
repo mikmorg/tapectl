@@ -106,8 +106,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     // Init is special — it creates everything from scratch
-    if let Commands::Init { ref operator } = cli.command {
-        return cmd_init(&paths, operator.as_deref(), cli.json);
+    if let Commands::Init {
+        ref operator,
+        no_escrow,
+    } = cli.command
+    {
+        return cmd_init(&paths, operator.as_deref(), no_escrow, cli.json);
     }
 
     // Completions don't need DB
@@ -247,6 +251,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 fn cmd_init(
     paths: &TapectlPaths,
     operator_name: Option<&str>,
+    no_escrow: bool,
     json_output: bool,
 ) -> anyhow::Result<()> {
     if paths.is_initialized() {
@@ -271,6 +276,26 @@ fn cmd_init(
     // Create operator tenant with keypairs
     let tenant_id = tenant::add_tenant(&conn, paths, &op_name, Some("System operator"), true)?;
 
+    // Create the permanent escrow recipient (ADR-0005) as part of first-run
+    // setup (CTO decision 2026-09-10): `stage create` and `volume write` refuse
+    // to run without one (issue #115), and `volume write` is otherwise the
+    // first command that even mentions escrow — which is exactly how a tape
+    // was once sealed unrecoverable-by-escrow. Doing it here closes that
+    // window at the source. `--no-escrow` opts out (adopt an existing identity
+    // with `key import --escrow` instead). The SECRET is printed once to
+    // STDERR and stored nowhere.
+    let escrow_public_key: Option<String> = if no_escrow {
+        None
+    } else {
+        let created = tapectl::cli::key::create_escrow_recipient(&conn, paths, None)
+            .context("failed to create the escrow recipient")?;
+        tapectl::cli::key::print_escrow_secret_warning(
+            &created.keypair.public_key,
+            &created.keypair.secret_key,
+        );
+        Some(created.keypair.public_key)
+    };
+
     // Validate dar availability (non-fatal warning)
     let dar_path = &cfg.dar.binary;
     let dar_ok = check_dar(dar_path);
@@ -283,6 +308,7 @@ fn cmd_init(
                 "operator": op_name,
                 "operator_id": tenant_id,
                 "dar_available": dar_ok,
+                "escrow_public_key": escrow_public_key,
             })
         );
     } else {
@@ -290,6 +316,17 @@ fn cmd_init(
         println!("  operator: {op_name}");
         println!("  database: {}", paths.db_file.display());
         println!("  config:   {}", paths.config_file.display());
+        match &escrow_public_key {
+            Some(pk) => {
+                println!("  escrow:   {pk}");
+                println!(
+                    "            (the SECRET was printed above — transcribe it now onto paper; ADR-0005)"
+                );
+            }
+            None => println!(
+                "  escrow:   not created (--no-escrow) — register one with `key generate --escrow` or `key import --escrow` before staging"
+            ),
+        }
         if dar_ok {
             // Issue #119/#124: use the same PATH-resolution helper `config
             // check` uses, so a bare, PATH-resolved dar.binary (the default

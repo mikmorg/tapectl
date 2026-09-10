@@ -834,7 +834,7 @@ restore_matrix() {
 # what `tape-only-and-reclaim` needs — no override required (verified via
 # `tapectl init` in an isolated home).
 bootstrap_config() {
-    TCTL init --operator "$OPERATOR" || return 1
+    TCTL init --operator "$OPERATOR" --no-escrow || return 1
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: python3 rewrites $CFG (dar binary=dar, slice_size=1M, staging dir, backends.lto entry for $TAPE_DEV, compaction.utilization_threshold=0.95)"
         return 0
@@ -1764,7 +1764,7 @@ dl_scenario_a_db_import() {
     fi
     local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-a"
     mkdir -p "$newhome"
-    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" >"$sd/dl.a.init.txt" 2>&1 || { cat "$sd/dl.a.init.txt"; return 1; }
+    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" --no-escrow >"$sd/dl.a.init.txt" 2>&1 || { cat "$sd/dl.a.init.txt"; return 1; }
     NEWHOME_TCTL "$newhome" db import "$sd/backup.db" --yes >"$sd/dl.a.import.txt" 2>&1 || { cat "$sd/dl.a.import.txt"; return 1; }
     mkdir -p "$newhome/keys"
     cp -a "$sd/backup.keys/." "$newhome/keys/" 2>/dev/null || { echo "could not copy backup.keys into the new home"; return 1; }
@@ -1793,7 +1793,7 @@ dl_scenario_b_raw_and_import() {
     fi
     local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-b"
     mkdir -p "$newhome"
-    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" >"$sd/dl.b.init.txt" 2>&1 || { cat "$sd/dl.b.init.txt"; return 1; }
+    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" --no-escrow >"$sd/dl.b.init.txt" 2>&1 || { cat "$sd/dl.b.init.txt"; return 1; }
 
     local rawto="$sd/dl.b.raw" rawlog="$sd/dl.b.raw.json"
     NEWHOME_TCTL "$newhome" restore raw-volume --to "$rawto" --device "$TAPE_DEV" --json >"$rawlog" 2>&1

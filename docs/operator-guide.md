@@ -156,10 +156,14 @@ tapectl unit discover
 
 ### Archive to Tape
 
-Register the permanent escrow recipient (`tapectl key generate --escrow`, ADR-0005)
-**before the first `stage create`** — slices are encrypted at stage time, so an escrow
-registered afterwards cannot open them, and `stage create` now refuses without one
-(issue #115).
+`tapectl init` creates the permanent escrow recipient (ADR-0005) for you and prints
+its secret once — **transcribe that secret onto paper then, and store it in two
+independent places** (it is stored nowhere on disk). The escrow recipient must exist
+**before the first `stage create`**, because slices are encrypted at stage time and an
+escrow registered afterwards cannot open them; `stage create` and `volume write` both
+refuse without one (issue #115). If you initialized with `--no-escrow` (to adopt an
+existing identity), register it now with `tapectl key generate --escrow` or
+`tapectl key import --escrow <age1...>` before staging.
 
 ```bash
 # Step 1: Snapshot (fast directory walk)

@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH tapectl-init 1  "tapectl-init " 
 .SH NAME
-tapectl\-init \- Initialize tapectl (DB, config, operator tenant, keys)
+tapectl\-init \- Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it)
 .SH SYNOPSIS
-\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-\-no\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Initialize tapectl (DB, config, operator tenant, keys)
+Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it)
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -17,6 +17,9 @@ Operator name (defaults to system username)
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
+.TP
+\fB\-\-no\-escrow\fR
+Do NOT create the permanent escrow recipient (ADR\-0005) at init. By default `init` generates it and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import \-\-escrow` instead, or in tests/tooling that register escrow separately
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

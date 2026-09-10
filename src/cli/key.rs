@@ -378,12 +378,26 @@ pub fn run(
 /// disk, or a log/trace call. Only the public half is persisted: a DB row
 /// (`is_escrow=1`, `is_active=1`) and a `.age.pub` file, for parity with how
 /// ordinary keys are stored (the public key is not sensitive).
-fn generate_escrow_key(
+/// A freshly created escrow recipient (ADR-0005): the generated identity plus
+/// the alias it was registered under. The SECRET half lives only in
+/// `keypair.secret_key` and is stored NOWHERE on disk — the caller must hand it
+/// to the operator via [`print_escrow_secret_warning`] and then drop it.
+pub struct CreatedEscrow {
+    pub keypair: keys::GeneratedKeypair,
+    pub alias: String,
+}
+
+/// Generate and register the permanent escrow recipient (ADR-0005): a new
+/// keypair whose PUBLIC half is saved to the database and `keys/`, and whose
+/// SECRET half is returned to the caller and never written to disk. Refuses if
+/// one is already registered (there is only ever one). Shared by
+/// `key generate --escrow` and `tapectl init` (issue #115 / CTO 2026-09-10) so
+/// the two cannot drift in what they store.
+pub fn create_escrow_recipient(
     conn: &Connection,
     paths: &TapectlPaths,
     description: Option<&str>,
-    json_output: bool,
-) -> Result<()> {
+) -> Result<CreatedEscrow> {
     if queries::escrow_key_exists(conn)? {
         return Err(escrow_already_registered_error());
     }
@@ -419,15 +433,29 @@ fn generate_escrow_key(
     let pub_path = paths.keys_dir.join(format!("{full_alias}.age.pub"));
     keys::save_public_key(&pub_path, &kp.public_key)?;
 
-    print_escrow_secret_warning(&kp.public_key, &kp.secret_key);
+    Ok(CreatedEscrow {
+        keypair: kp,
+        alias: full_alias,
+    })
+}
+
+fn generate_escrow_key(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    description: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let created = create_escrow_recipient(conn, paths, description)?;
+
+    print_escrow_secret_warning(&created.keypair.public_key, &created.keypair.secret_key);
 
     if json_output {
         println!(
             "{}",
             serde_json::json!({
-                "alias": full_alias,
+                "alias": created.alias,
                 "escrow": true,
-                "public_key": kp.public_key,
+                "public_key": created.keypair.public_key,
             })
         );
     }
@@ -521,31 +549,35 @@ fn escrow_already_registered_error() -> TapectlError {
 /// skimmed past. Per ADR-0005 this is the ONLY time the secret is ever
 /// shown: tapectl never persists it anywhere (not the database, not a
 /// config file, not a key file on disk, not a log or trace line).
-fn print_escrow_secret_warning(public_key: &str, secret_key: &str) {
-    println!();
-    println!("================================================================================");
-    println!("  ESCROW IDENTITY GENERATED -- THIS SECRET IS SHOWN EXACTLY ONCE, RIGHT NOW");
-    println!("================================================================================");
-    println!();
-    println!("  tapectl does NOT store this secret anywhere: not in the database, not in");
-    println!("  a config file, not in any file on this machine. Close this terminal without");
-    println!("  transcribing it and it is gone forever -- the escrow recipient becomes");
-    println!("  useless for every future encryption it was meant to protect.");
-    println!();
-    println!("  Per ADR-0005: copy the secret below onto paper NOW. Store that paper in at");
-    println!("  least two independent physical locations. Verify the transcription");
-    println!("  character-by-character before doing anything else.");
-    println!();
-    println!("  SECRET -- transcribe this line:");
-    println!();
-    println!("    {secret_key}");
-    println!();
-    println!("  Public key (already saved to disk and the database -- safe to keep there):");
-    println!();
-    println!("    {public_key}");
-    println!();
-    println!("================================================================================");
-    println!();
+/// Print the once-only escrow-secret transcription ceremony (ADR-0005) to
+/// STDERR — it is a human safety warning, never machine data, so `--json`
+/// callers (`key generate --escrow --json`, `tapectl init --json`) keep a
+/// clean, parseable stdout.
+pub fn print_escrow_secret_warning(public_key: &str, secret_key: &str) {
+    eprintln!();
+    eprintln!("================================================================================");
+    eprintln!("  ESCROW IDENTITY GENERATED -- THIS SECRET IS SHOWN EXACTLY ONCE, RIGHT NOW");
+    eprintln!("================================================================================");
+    eprintln!();
+    eprintln!("  tapectl does NOT store this secret anywhere: not in the database, not in");
+    eprintln!("  a config file, not in any file on this machine. Close this terminal without");
+    eprintln!("  transcribing it and it is gone forever -- the escrow recipient becomes");
+    eprintln!("  useless for every future encryption it was meant to protect.");
+    eprintln!();
+    eprintln!("  Per ADR-0005: copy the secret below onto paper NOW. Store that paper in at");
+    eprintln!("  least two independent physical locations. Verify the transcription");
+    eprintln!("  character-by-character before doing anything else.");
+    eprintln!();
+    eprintln!("  SECRET -- transcribe this line:");
+    eprintln!();
+    eprintln!("    {secret_key}");
+    eprintln!();
+    eprintln!("  Public key (already saved to disk and the database -- safe to keep there):");
+    eprintln!();
+    eprintln!("    {public_key}");
+    eprintln!();
+    eprintln!("================================================================================");
+    eprintln!();
 }
 
 fn truncate_fingerprint(fp: &str) -> String {

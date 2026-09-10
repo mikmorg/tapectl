@@ -65,11 +65,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize tapectl (DB, config, operator tenant, keys)
+    /// Initialize tapectl (DB, config, operator tenant, keys, and the
+    /// permanent escrow recipient — ADR-0005; use --no-escrow to skip it)
     Init {
         /// Operator name (defaults to system username)
         #[arg(long)]
         operator: Option<String>,
+        /// Do NOT create the permanent escrow recipient (ADR-0005) at init.
+        /// By default `init` generates it and prints its secret once. Use this
+        /// only when you will adopt an existing escrow identity with
+        /// `key import --escrow` instead, or in tests/tooling that register
+        /// escrow separately.
+        #[arg(long)]
+        no_escrow: bool,
     },
 
     /// Manage tenants

@@ -37,11 +37,56 @@ fn parses_init_with_operator() {
     let cli = Cli::try_parse_from(["tapectl", "init", "--operator", "alice"])
         .expect("init --operator should parse");
     match cli.command {
-        tapectl::cli::Commands::Init { operator } => {
+        tapectl::cli::Commands::Init { operator, .. } => {
             assert_eq!(operator.as_deref(), Some("alice"));
         }
         _ => panic!("expected Init"),
     }
+}
+
+#[test]
+fn init_creates_the_escrow_recipient_and_prints_its_secret_to_stderr() {
+    // Q3 (CTO 2026-09-10): `init` creates the permanent escrow recipient so the
+    // stage-before-escrow window (issue #115) never opens. The once-only secret
+    // is a human ceremony warning — stderr, never stdout — so `init --json`
+    // stays parseable.
+    let home = TempDir::new().unwrap();
+    let out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY"),
+        "the escrow secret must NOT be on stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("AGE-SECRET-KEY"),
+        "the escrow secret must be printed to stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("escrow:"),
+        "init stdout should name the escrow public key:\n{stdout}"
+    );
+
+    // A second `key generate --escrow` must refuse — init already made one.
+    let again = run_tapectl(home.path(), &["key", "generate", "--escrow"]);
+    assert!(
+        !again.status.success(),
+        "escrow should already be registered by init; a second generate must refuse"
+    );
+
+    // `--no-escrow` opts out entirely (no secret, no registration).
+    let home2 = TempDir::new().unwrap();
+    let out2 = run_tapectl(home2.path(), &["init", "--no-escrow"]);
+    assert!(out2.status.success());
+    assert!(
+        !String::from_utf8_lossy(&out2.stderr).contains("AGE-SECRET-KEY"),
+        "--no-escrow must not generate an escrow secret"
+    );
 }
 
 #[test]
@@ -345,7 +390,10 @@ fn prepare_home_for_staging(
         "`dar` not on PATH — see tests/test_dependencies.rs for what this costs"
     );
 
-    let init_out = run_tapectl(home, &["init"]);
+    // `init --no-escrow`: this flow registers the escrow recipient explicitly
+    // below (to exercise `key generate --escrow`), so opt out of init's default
+    // creation (issue #115 / CTO 2026-09-10) to avoid a double-registration.
+    let init_out = run_tapectl(home, &["init", "--no-escrow"]);
     assert!(
         init_out.status.success(),
         "init failed: {}",
