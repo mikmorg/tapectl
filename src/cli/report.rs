@@ -896,7 +896,7 @@ fn report_verify_status(
 fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bool) -> Result<()> {
     let mut sql = String::from(
         "SELECT v.label, h.operation, h.logged_at, h.total_bytes,
-                h.total_corrected, h.total_uncorrected, h.tape_alerts
+                h.total_corrected, h.total_uncorrected, h.tape_alerts, h.raw_log
          FROM health_logs h
          JOIN volumes v ON v.id = h.volume_id
          WHERE 1=1",
@@ -922,6 +922,12 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
         // before migration 009 genuinely do not know, and rendering that as 0
         // would assert the drive reported no alerts when nothing was recorded.
         Option<i64>,
+        // raw_log (issue #120): re-parsed on read via
+        // `HealthCounters::from_raw_log` to surface the ECC parameters that
+        // `total_corrected` alone can miss on some drives (see
+        // `src/tape/health.rs` module doc). `None`/empty means an older row
+        // or a partial collection — the derived fields render as "n/a".
+        Option<String>,
     );
     let rows: Vec<Row> = stmt
         .query_map(params_ref.as_slice(), |row| {
@@ -933,41 +939,108 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(|(label, op, at, bytes, corrected, uncorrected, alerts)| {
-            serde_json::json!({"volume": label, "operation": op, "at": at, "bytes": bytes, "corrected": corrected, "uncorrected": uncorrected, "tape_alerts": alerts})
+        let json: Vec<serde_json::Value> = rows.iter().map(|(label, op, at, bytes, corrected, uncorrected, alerts, raw_log)| {
+            let derived = derive_trending_counters(raw_log.as_deref());
+            serde_json::json!({
+                "volume": label,
+                "operation": op,
+                "at": at,
+                "bytes": bytes,
+                "corrected": corrected,
+                "uncorrected": uncorrected,
+                "tape_alerts": alerts,
+                // New (issue #120), additive: the existing "corrected" key is
+                // untouched (still `total_corrected`, in case anything parses
+                // it) — these two are `null` when raw_log is absent/empty,
+                // same convention as "tape_alerts" above.
+                "corrected_no_delay": derived.as_ref().map(|h| h.corrected_no_delay),
+                "ecc_invocations": derived.as_ref().map(|h| h.correction_algorithm_invocations),
+            })
         }).collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         println!("no health logs recorded");
     } else {
-        for (label, op, at, _bytes, corrected, uncorrected, alerts) in &rows {
-            // A raised tape alert is the drive saying the medium or the head
-            // is going bad. It is shouted rather than tucked in with the
-            // counters, because unlike them it is actionable without a
-            // baseline or a trend. "-" is not-recorded (pre-009 row); 0 is
-            // recorded-and-clean.
-            let alert_note = match alerts {
-                Some(n) if *n > 0 => format!("  ** {n} TAPE ALERT(S) — check the drive/medium **"),
-                Some(_) => String::new(),
-                None => String::new(),
-            };
+        for (label, op, at, _bytes, corrected, uncorrected, alerts, raw_log) in &rows {
             println!(
-                "  {label} {}: {} — corrected={} uncorrected={} alerts={}{}",
-                op.as_deref().unwrap_or("?"),
-                at,
-                corrected.unwrap_or(0),
-                uncorrected.unwrap_or(0),
-                alerts.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-                alert_note,
+                "{}",
+                health_line(
+                    label,
+                    op.as_deref(),
+                    at,
+                    *corrected,
+                    *uncorrected,
+                    *alerts,
+                    raw_log.as_deref(),
+                )
             );
         }
     }
     Ok(())
+}
+
+/// Re-derive the trending counters (issue #120) from a stored `raw_log`,
+/// treating `None` and an all-whitespace/empty string the same way — both
+/// mean "nothing to derive from" (an older row, or a partial collection).
+fn derive_trending_counters(raw_log: Option<&str>) -> Option<crate::tape::health::HealthCounters> {
+    raw_log
+        .filter(|s| !s.trim().is_empty())
+        .map(crate::tape::health::HealthCounters::from_raw_log)
+}
+
+/// Render one `report health` line. Pulled out of `report_health`'s loop so
+/// it can be exercised directly in tests (issue #120) without a database.
+///
+/// `corrected`/`uncorrected` are `total_corrected`/`total_uncorrected` as
+/// stored; `corrected_no_delay`/`ecc_invocations` are derived from
+/// `raw_log` on the fly and print as `n/a` when it is NULL/empty — see the
+/// module doc on `src/tape/health.rs` for why a single "corrected" number
+/// isn't the whole story on every drive.
+fn health_line(
+    label: &str,
+    operation: Option<&str>,
+    logged_at: &str,
+    corrected: Option<i64>,
+    uncorrected: Option<i64>,
+    tape_alerts: Option<i64>,
+    raw_log: Option<&str>,
+) -> String {
+    let derived = derive_trending_counters(raw_log);
+    let corrected_no_delay = derived
+        .as_ref()
+        .map(|h| h.corrected_no_delay.to_string())
+        .unwrap_or_else(|| "n/a".into());
+    let ecc_invocations = derived
+        .as_ref()
+        .map(|h| h.correction_algorithm_invocations.to_string())
+        .unwrap_or_else(|| "n/a".into());
+
+    // A raised tape alert is the drive saying the medium or the head is
+    // going bad. It is shouted rather than tucked in with the counters,
+    // because unlike them it is actionable without a baseline or a trend.
+    // "-" is not-recorded (pre-009 row); 0 is recorded-and-clean.
+    let alert_note = match tape_alerts {
+        Some(n) if n > 0 => format!("  ** {n} TAPE ALERT(S) — check the drive/medium **"),
+        _ => String::new(),
+    };
+
+    format!(
+        "  {label} {}: {} — uncorrected={} corrected_total={} corrected_no_delay={} ecc_invocations={} alerts={}{}",
+        operation.unwrap_or("?"),
+        logged_at,
+        uncorrected.unwrap_or(0),
+        corrected.unwrap_or(0),
+        corrected_no_delay,
+        ecc_invocations,
+        tape_alerts.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        alert_note,
+    )
 }
 
 /// Per-volume capacity rows: `(label, capacity_bytes, bytes_written, status)`.
@@ -1921,6 +1994,99 @@ mod tests {
                 .map(|(l, _, _, _)| l)
                 .collect();
             assert_eq!(labels, vec!["FULL03", "INIT01", "SEAL04"]);
+        }
+    }
+
+    /// Issue #120: `report health` used to read only `total_corrected`,
+    /// which some drives (a real HP LTO-6, see
+    /// `docs/lto6-session-journal-2026-09-10.md`) leave at 0 while their ECC
+    /// activity trends under `raw_log`'s other parameters instead. These
+    /// exercise the rendered line directly, without a database.
+    mod health_line_rendering {
+        use super::*;
+
+        /// Verbatim from the journal's "report health reports corrected=0
+        /// while the drive reports 875" excerpt — same text used in
+        /// `src/tape/health.rs`'s own fixture for the same bug.
+        const BUSY_PAGE_02: &str = "\
+=== page 0x02 ===
+Write error counter page [0x2]
+  Errors corrected without substantial delay   = 875
+  Total errors corrected                       = 0
+  Total times correction algorithm processed   = 305674
+  Total uncorrected errors                     = 0
+";
+
+        #[test]
+        fn shows_derived_fields_against_the_real_hp_lto6_fixture() {
+            let line = health_line(
+                "LTO6-0001",
+                Some("write"),
+                "2026-09-10 01:00:00",
+                Some(0), // total_corrected: faithful to "Total errors corrected" = 0
+                Some(0),
+                Some(0),
+                Some(BUSY_PAGE_02),
+            );
+            assert_eq!(
+                line,
+                "  LTO6-0001 write: 2026-09-10 01:00:00 — uncorrected=0 corrected_total=0 \
+                 corrected_no_delay=875 ecc_invocations=305674 alerts=0"
+            );
+        }
+
+        /// Pre-#120 row: `raw_log` is `NULL` (older schema state) and
+        /// `tape_alerts` is `NULL` (pre-#107 row) — both render as
+        /// not-recorded, `n/a` and `-` respectively, never as a fabricated 0.
+        #[test]
+        fn renders_na_and_dash_when_nothing_to_derive_from() {
+            let line = health_line(
+                "LTO6-0001",
+                Some("verify"),
+                "2026-01-01 00:00:00",
+                Some(2),
+                Some(0),
+                None,
+                None,
+            );
+            assert_eq!(
+                line,
+                "  LTO6-0001 verify: 2026-01-01 00:00:00 — uncorrected=0 corrected_total=2 \
+                 corrected_no_delay=n/a ecc_invocations=n/a alerts=-"
+            );
+        }
+
+        /// An empty (but non-NULL) `raw_log` — e.g. a collection that failed
+        /// every page — is treated the same as `NULL`, not as a page with no
+        /// markers that happens to parse to zero.
+        #[test]
+        fn empty_raw_log_string_is_also_na() {
+            let line = health_line(
+                "LTO6-0001",
+                Some("write"),
+                "2026-01-01 00:00:00",
+                Some(0),
+                Some(0),
+                Some(0),
+                Some("   \n"),
+            );
+            assert!(line.contains("corrected_no_delay=n/a"));
+            assert!(line.contains("ecc_invocations=n/a"));
+        }
+
+        #[test]
+        fn tape_alert_note_is_still_appended() {
+            let line = health_line(
+                "LTO6-0001",
+                Some("verify"),
+                "2026-09-10 02:00:00",
+                Some(0),
+                Some(0),
+                Some(2),
+                None,
+            );
+            assert!(line.contains("alerts=2"));
+            assert!(line.contains("TAPE ALERT"));
         }
     }
 }
