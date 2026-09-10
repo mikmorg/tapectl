@@ -843,12 +843,17 @@ bootstrap_config() {
     scenario_dir="$(dirname "$HOME_DIR")"
     staging_dir="$scenario_dir/staging"
     mkdir -p "$staging_dir"
-    python3 - "$CFG" "$staging_dir" "$TAPE_DEV" "$DRIVE_SG" <<'PY'
+    python3 - "$CFG" "$staging_dir" "$TAPE_DEV" "$DRIVE_SG" "$SINGLE_CARTRIDGE" <<'PY'
 import re
 import sys
 
-cfg, staging, tape, sg = sys.argv[1:5]
+cfg, staging, tape, sg, single = sys.argv[1:6]
 t = open(cfg).read()
+if single == "1":
+    # One cartridge cannot hold two copies, so the default min_copies=2 makes
+    # `audit` report every unit under-copied (a real violation, exit 2) on an
+    # otherwise-clean archive. Match the policy to the medium under test.
+    t = re.sub(r'(?m)^(\[defaults\]\s*)$', r'\1\nmin_copies = 1', t, count=1)
 t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{staging}"', t, count=1)
@@ -2103,16 +2108,22 @@ col_setup() {
     make_source "$SRC/col-root/charlie" "deep" || return 1
     make_source "$SRC/col-root/delta" "links" || return 1
     python3 - "$CFG" "$SRC/col-root" <<'PY'
+import re
 import sys
 cfg, root = sys.argv[1:3]
-with open(cfg, "a") as f:
-    f.write(f'''
+t = open(cfg).read()
+# `Config::default` serializes an empty `collections = []` at the document
+# root; TOML forbids that alongside a `[[collections]]` array-of-tables, so
+# strip the empty key first (mirrors how the backend block is added).
+t = re.sub(r'(?m)^collections *= *\[\] *\n', "", t)
+t += f'''
 [[collections]]
 name = "media"
 root = "{root}"
 tenant = "alice"
 unit_depth = 1
-''')
+'''
+open(cfg, "w").write(t)
 PY
 }
 
