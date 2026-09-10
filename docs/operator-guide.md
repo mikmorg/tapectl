@@ -156,6 +156,11 @@ tapectl unit discover
 
 ### Archive to Tape
 
+Register the permanent escrow recipient (`tapectl key generate --escrow`, ADR-0005)
+**before the first `stage create`** — slices are encrypted at stage time, so an escrow
+registered afterwards cannot open them, and `stage create` now refuses without one
+(issue #115).
+
 ```bash
 # Step 1: Snapshot (fast directory walk)
 tapectl snapshot create tv/breaking-bad/s01
