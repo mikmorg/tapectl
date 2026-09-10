@@ -1562,7 +1562,16 @@ pub fn quick_archive(
     // force=false: quick-archive writes to a caller-provided volume
     // label with no override surface of its own (issue #27 scopes
     // --force to `volume init`/`volume write` only).
-    crate::volume::write::volume_write(conn, paths, config, volume, device, 512 * 1024, false)?;
+    crate::volume::write::volume_write(
+        conn,
+        paths,
+        config,
+        volume,
+        device,
+        512 * 1024,
+        false,
+        false,
+    )?;
     if json_output {
         println!(
             "{}",

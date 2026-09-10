@@ -371,6 +371,7 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
         &tape_dev(),
         BLOCK_SIZE,
         true,
+        false,
     )
     .unwrap();
     h
@@ -779,6 +780,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
         &tape_dev(),
         BLOCK_SIZE,
         true,
+        false,
     )
     .unwrap();
 

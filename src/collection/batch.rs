@@ -97,7 +97,9 @@ pub fn execute_batch(
     // cartridge got loaded for this batch, which must hard-refuse, not
     // silently override (issue #27).
     for label in copy_labels {
-        crate::volume::write::volume_write(conn, paths, config, label, device, block_size, false)?;
+        crate::volume::write::volume_write(
+            conn, paths, config, label, device, block_size, false, false,
+        )?;
     }
 
     // Release staging: only reachable once every copy above sealed.

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-write \- Write staged data to volume
 .SH SYNOPSIS
-\fBtapectl volume write\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume write\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Write staged data to volume
 .SH OPTIONS
@@ -20,6 +20,9 @@ Show what would be done without making changes
 .TP
 \fB\-\-force\fR
 See `volume init \-\-force` — same override, same limits
+.TP
+\fB\-\-allow\-missing\-escrow\fR
+Seal slices that were staged before the escrow recipient existed (ADR\-0005). Only reachable for tapes copied forward via `read\-slices`/`compact\-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre\-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

@@ -37,6 +37,13 @@ pub enum VolumeCommands {
         /// See `volume init --force` — same override, same limits.
         #[arg(long)]
         force: bool,
+        /// Seal slices that were staged before the escrow recipient existed
+        /// (ADR-0005). Only reachable for tapes copied forward via
+        /// `read-slices`/`compact-read`, since `stage create` refuses to
+        /// stage without escrow; use it to migrate a dying pre-escrow
+        /// cartridge, knowing the copy stays unrecoverable by the escrow key.
+        #[arg(long)]
+        allow_missing_escrow: bool,
     },
 
     /// Resume an interrupted write session (issue #25). Reload the SAME
@@ -148,6 +155,10 @@ pub enum VolumeCommands {
         /// Tape device path
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
+        /// See `volume write --allow-missing-escrow`. A compaction whose
+        /// source volume predates the escrow recipient needs this to proceed.
+        #[arg(long)]
+        allow_missing_escrow: bool,
     },
 
     /// Show bin-packing plan for pending staged data
@@ -170,6 +181,9 @@ pub enum VolumeCommands {
         /// Tape device path
         #[arg(long, default_value = "/dev/nst0")]
         device: String,
+        /// See `volume write --allow-missing-escrow`.
+        #[arg(long)]
+        allow_missing_escrow: bool,
     },
 
     /// Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006).
@@ -267,6 +281,7 @@ pub fn run(
             label,
             device,
             force,
+            allow_missing_escrow,
         } => {
             write::volume_write(
                 conn,
@@ -276,6 +291,7 @@ pub fn run(
                 device,
                 DEFAULT_BLOCK_SIZE,
                 *force,
+                *allow_missing_escrow,
             )?;
             if json_output {
                 println!(
@@ -480,8 +496,17 @@ pub fn run(
         VolumeCommands::CompactWrite {
             destination,
             device,
+            allow_missing_escrow,
         } => {
-            write::compact_write(conn, paths, config, destination, device, DEFAULT_BLOCK_SIZE)?;
+            write::compact_write(
+                conn,
+                paths,
+                config,
+                destination,
+                device,
+                DEFAULT_BLOCK_SIZE,
+                *allow_missing_escrow,
+            )?;
             if json_output {
                 println!(
                     "{}",
@@ -509,7 +534,11 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Compact { label, device } => {
+        VolumeCommands::Compact {
+            label,
+            device,
+            allow_missing_escrow,
+        } => {
             // Interactive: run all 3 steps
             println!("=== Step 1: Reading live slices from \"{label}\" ===");
             let report = write::compact_read(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
@@ -531,7 +560,15 @@ pub fn run(
             }
 
             println!("=== Step 2: Writing compaction slices to \"{dest_label}\" ===");
-            write::compact_write(conn, paths, config, dest_label, device, DEFAULT_BLOCK_SIZE)?;
+            write::compact_write(
+                conn,
+                paths,
+                config,
+                dest_label,
+                device,
+                DEFAULT_BLOCK_SIZE,
+                *allow_missing_escrow,
+            )?;
             println!("  Write completed");
 
             println!("=== Step 3: Retiring source volume \"{label}\" ===");

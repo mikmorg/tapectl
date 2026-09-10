@@ -1875,6 +1875,7 @@ fn test_volume_write_refuses_over_capacity() {
         "/dev/null",
         512 * 1024,
         false,
+        false,
     )
     .unwrap_err();
     let msg = format!("{err}");
@@ -1967,6 +1968,7 @@ fn test_volume_write_refuses_when_an_unresolved_write_session_already_exists() {
         "L6-BUSY",
         "/dev/null",
         512 * 1024,
+        false,
         false,
     )
     .unwrap_err();
@@ -2071,6 +2073,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         "L6-NOKEY",
         "/dev/null",
         512 * 1024,
+        false,
         false,
     )
     .unwrap_err();

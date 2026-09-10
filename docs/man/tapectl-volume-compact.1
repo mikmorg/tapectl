@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-compact \- Interactive compaction: read + write + finish in one flow
 .SH SYNOPSIS
-\fBtapectl volume compact\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume compact\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Interactive compaction: read + write + finish in one flow
 .SH OPTIONS
@@ -14,6 +14,9 @@ Tape device path
 .TP
 \fB\-\-json\fR
 Output in JSON format
+.TP
+\fB\-\-allow\-missing\-escrow\fR
+See `volume write \-\-allow\-missing\-escrow`
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes

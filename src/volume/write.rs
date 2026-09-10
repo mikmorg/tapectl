@@ -211,6 +211,37 @@ pub fn volume_init(
 /// reads File 0 and the seal-marker position and refuses on a wrong-tape or
 /// already-sealed finding — the same check `session::InterruptedSession::resume_checking`
 /// runs, applied to the fresh (non-resumed) path this function drives.
+/// Split pre-write validation failures for the `--allow-missing-escrow`
+/// override (CTO 2026-09-10, `docs/design-errata.md` §2.16). Returns
+/// `(blocking, waived)`: `waived` is empty unless `allow_missing_escrow` is
+/// set, in which case it holds the `StageSetLacksEscrow` failures the caller
+/// downgrades to warnings; every OTHER failure — capacity, a corrupt staged
+/// slice, and `EscrowRecipientMissing` (no escrow registered at all) — always
+/// stays in `blocking`. Pure: no DB, no device, so it is unit-tested directly.
+///
+/// The override is safe to expose because `stage_create` refuses to stage
+/// without an escrow recipient, so a `StageSetLacksEscrow` can ONLY originate
+/// from `read-slices`/`compact-read` reactivating an already-sealed
+/// pre-escrow stage set — never from fresh staging. It therefore cannot seal
+/// a fresh un-escrowed tape.
+fn blocking_validation_errors(
+    errs: Vec<crate::volume::layout_model::LayoutError>,
+    allow_missing_escrow: bool,
+) -> (
+    Vec<crate::volume::layout_model::LayoutError>,
+    Vec<crate::volume::layout_model::LayoutError>,
+) {
+    use crate::volume::layout_model::LayoutError;
+    if !allow_missing_escrow {
+        return (errs, Vec::new());
+    }
+    // partition: `true` bucket (blocking) is everything that is NOT a waivable
+    // per-stage-set escrow gap.
+    errs.into_iter()
+        .partition(|e| !matches!(e, LayoutError::StageSetLacksEscrow { .. }))
+}
+
+#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow
 pub fn volume_write(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -219,6 +250,7 @@ pub fn volume_write(
     device: &str,
     block_size: usize,
     force: bool,
+    allow_missing_escrow: bool,
 ) -> Result<()> {
     let volume_id: i64 = conn
         .query_row(
@@ -371,13 +403,23 @@ pub fn volume_write(
     // capacity gates"). Sacred invariant 2 (full-hash staged slices from
     // disk) runs here, not a size-only shortcut.
     if let Err(errs) = built.validate(&keys) {
-        return Err(TapectlError::Other(format!(
-            "volume \"{label}\" failed pre-write validation: {}",
-            errs.iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        )));
+        let (blocking, waived) = blocking_validation_errors(errs, allow_missing_escrow);
+        for e in &waived {
+            tracing::warn!(
+                "sealing a slice the escrow key cannot open, per --allow-missing-escrow \
+                 (ADR-0005): {e}"
+            );
+        }
+        if !blocking.is_empty() {
+            return Err(TapectlError::Other(format!(
+                "volume \"{label}\" failed pre-write validation: {}",
+                blocking
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
     }
 
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
@@ -1720,13 +1762,23 @@ pub fn compact_write(
     dest_label: &str,
     device: &str,
     block_size: usize,
+    allow_missing_escrow: bool,
 ) -> Result<()> {
     // The normal volume_write picks up all staged data. `force` is not
     // exposed here (out of scope for #27, which is narrowly about
     // `VolumeCommands::Init`/`Write`) — a compaction destination that fails
     // contact discipline hard-refuses, same as `quick-archive`/`collection
     // run` below.
-    volume_write(conn, paths, config, dest_label, device, block_size, false)
+    volume_write(
+        conn,
+        paths,
+        config,
+        dest_label,
+        device,
+        block_size,
+        false,
+        allow_missing_escrow,
+    )
 }
 
 /// One unit affected by `compact_finish`'s retirement, together with the
@@ -2539,6 +2591,49 @@ mod tests {
     /// precisely to pin that ordering: a bogus device path is reached only
     /// if the refusal fails to fire, in which case the error names the
     /// device instead of the stage set.
+    fn sle(id: i64) -> crate::volume::layout_model::LayoutError {
+        crate::volume::layout_model::LayoutError::StageSetLacksEscrow {
+            stage_set_id: id,
+            unit: "photos".into(),
+            reason: "escrow recipient absent from recorded list".into(),
+        }
+    }
+
+    #[test]
+    fn allow_missing_escrow_waives_only_stage_set_escrow_gaps() {
+        use crate::volume::layout_model::LayoutError;
+        // Without the flag, an escrow gap blocks.
+        let (blocking, waived) = blocking_validation_errors(vec![sle(1)], false);
+        assert_eq!(blocking.len(), 1);
+        assert!(waived.is_empty());
+
+        // With the flag, an escrow gap is waived and nothing blocks.
+        let (blocking, waived) = blocking_validation_errors(vec![sle(1), sle(2)], true);
+        assert!(
+            blocking.is_empty(),
+            "escrow gaps must be waived: {blocking:?}"
+        );
+        assert_eq!(waived.len(), 2, "both gaps must be reported as warnings");
+
+        // The flag NEVER waives a hard failure sitting alongside a gap.
+        let cap = LayoutError::CapacityExceeded {
+            needed: 100,
+            reserve: 10,
+            available: 50,
+        };
+        let (blocking, waived) = blocking_validation_errors(vec![sle(1), cap], true);
+        assert_eq!(blocking.len(), 1, "capacity must still block");
+        assert!(matches!(blocking[0], LayoutError::CapacityExceeded { .. }));
+        assert_eq!(waived.len(), 1);
+
+        // The flag NEVER waives "no escrow registered at all" — that is a
+        // different failure (EscrowRecipientMissing), not a per-set gap.
+        let (blocking, waived) =
+            blocking_validation_errors(vec![LayoutError::EscrowRecipientMissing], true);
+        assert_eq!(blocking.len(), 1, "a total escrow absence must still block");
+        assert!(waived.is_empty());
+    }
+
     #[test]
     fn force_does_not_bypass_the_escrow_check_and_never_reaches_the_device() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
@@ -2616,7 +2711,8 @@ mod tests {
             "FORCETEST",
             "/nonexistent/tapectl-force-test-nst",
             512 * 1024,
-            true, // --force
+            true,  // --force
+            false, // --allow-missing-escrow
         )
         .expect_err("force must not bypass pre-write validation");
         let msg = err.to_string();
