@@ -291,9 +291,27 @@ fn cmd_init(
         println!("  database: {}", paths.db_file.display());
         println!("  config:   {}", paths.config_file.display());
         if dar_ok {
-            println!("  dar:      {dar_path} (ok)");
-        } else {
+            // Issue #119/#124: use the same PATH-resolution helper `config
+            // check` uses, so a bare, PATH-resolved dar.binary (the default
+            // as of issue #124) shows the operator where it actually
+            // resolved to, not just the bare name they configured.
+            let found_at = if dar_path.contains('/') {
+                None
+            } else {
+                std::env::var_os("PATH")
+                    .and_then(|path_var| {
+                        tapectl::policy::depth_check::resolve_on_path(dar_path, &path_var)
+                    })
+                    .map(|p| p.display().to_string())
+            };
+            match found_at {
+                Some(found) => println!("  dar:      {dar_path} (found at {found})"),
+                None => println!("  dar:      {dar_path} (ok)"),
+            }
+        } else if dar_path.contains('/') {
             println!("  dar:      {dar_path} (NOT FOUND — install before staging)");
+        } else {
+            println!("  dar:      {dar_path} (NOT FOUND on PATH — install before staging)");
         }
     }
 

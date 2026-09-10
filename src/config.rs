@@ -104,7 +104,11 @@ pub struct DarConfig {
 }
 
 fn default_dar_binary() -> String {
-    "/opt/dar/bin/dar".to_string()
+    // Bare and PATH-resolved (issue #124) -- portable across distros that
+    // install dar to /usr/bin, /usr/local/bin, or elsewhere, and honored by
+    // `config check` (issue #119) exactly like the runtime honors it via
+    // `Command::new`.
+    "dar".to_string()
 }
 
 impl Default for DarConfig {

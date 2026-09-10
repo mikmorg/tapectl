@@ -136,8 +136,8 @@ pub fn describe_dar(check: &DarCheck) -> String {
     match check {
         DarCheck::Missing { path } => format!(
             "warning: dar binary not found at '{path}' — config.dar.binary points nowhere; \
-             archiving will fail until this is corrected (the shipped default, \
-             /opt/dar/bin/dar, does not exist on most systems)"
+             archiving will fail until this is corrected (install dar, or set [dar] binary \
+             to an absolute path if it is not on PATH)"
         ),
         DarCheck::NotExecutable { path } => {
             format!("warning: dar binary at '{path}' exists but is not executable")
@@ -274,10 +274,15 @@ mod tests {
     #[test]
     fn describe_dar_missing_names_the_path() {
         let line = describe_dar(&DarCheck::Missing {
-            path: "/opt/dar/bin/dar".to_string(),
+            path: "/usr/local/bin/dar".to_string(),
         });
-        assert!(line.contains("/opt/dar/bin/dar"));
+        assert!(line.contains("/usr/local/bin/dar"));
         assert!(line.contains("not found"));
+        // Issue #124: the old hint named the shipped default
+        // (/opt/dar/bin/dar) as though that were still the story; now that
+        // the default is a bare, PATH-resolved "dar", the hint should point
+        // at what an operator can actually do instead.
+        assert!(line.contains("install dar"));
     }
 
     #[test]
