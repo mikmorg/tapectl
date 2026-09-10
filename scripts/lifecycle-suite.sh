@@ -623,11 +623,11 @@ rm_step_escrow() {
     ensure_heir_restore_sh || return 1
     local to="$RM_WORK/escrow"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key \$RUN/escrow.key --to $to"
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key \$ESCROW_KEY_PATH --to $to"
         return 0
     fi
-    [ -f "$RUN/escrow.key" ] || { echo "no escrow.key captured for this run — was key generate --escrow run?"; return 1; }
-    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$RUN/escrow.key" --to "$to") \
+    [ -f "$ESCROW_KEY_PATH" ] || { echo "no escrow key captured for this scenario ($ESCROW_KEY_PATH) — was key generate --escrow run?"; return 1; }
+    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$ESCROW_KEY_PATH" --to "$to") \
         >"$RM_WORK/restore_escrow.txt" 2>&1 || { cat "$RM_WORK/restore_escrow.txt"; return 1; }
     assert_identical "$RM_SRC" "$to"
 }
@@ -729,11 +729,182 @@ restore_matrix() {
     check "$RM_TAG.verify"             rm_step_verify
 }
 
+# ============================================================
+# Shared scenario helpers
+# ============================================================
+
+# bootstrap_config — `tapectl init` plus the same config.toml hand-edits
+# every scenario needs: dar resolved via PATH (never hardcode a path —
+# CLAUDE.md), a staging directory under this scenario's own tree, the
+# discovered/consented device wired into a [[backends.lto]] entry, and
+# `slice_size = "1M"` so the `big` fixture profile (12 MB) naturally spans
+# multiple slices without a separate archive-set. `compaction.
+# utilization_threshold` is raised for every scenario (harmless — only the
+# `compaction` scenario ever calls `volume compact*`) so that scenario
+# doesn't need its own config pass. `min_copies_for_tape_only` /
+# `min_locations_for_tape_only` are already 2/2 in a fresh `init`, matching
+# what `tape-only-and-reclaim` needs — no override required (verified via
+# `tapectl init` in an isolated home).
+bootstrap_config() {
+    TCTL init --operator "$OPERATOR" || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: python3 rewrites $CFG (dar binary=dar, slice_size=1M, staging dir, backends.lto entry for $TAPE_DEV, compaction.utilization_threshold=0.95)"
+        return 0
+    fi
+    local scenario_dir staging_dir
+    scenario_dir="$(dirname "$HOME_DIR")"
+    staging_dir="$scenario_dir/staging"
+    mkdir -p "$staging_dir"
+    python3 - "$CFG" "$staging_dir" "$TAPE_DEV" "$DRIVE_SG" <<'PY'
+import re
+import sys
+
+cfg, staging, tape, sg = sys.argv[1:5]
+t = open(cfg).read()
+t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
+t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
+t = re.sub(r'(?m)^directory *=.*$', f'directory = "{staging}"', t, count=1)
+t = re.sub(r'(?m)^utilization_threshold *=.*$', 'utilization_threshold = 0.95', t, count=1)
+if "[[backends.lto]]" not in t:
+    t = re.sub(r'(?m)^lto *= *\[\] *\n', "", t)
+    t += f'''
+[[backends.lto]]
+name = "lifecycle"
+device_tape = "{tape}"
+device_sg = "{sg}"
+media_type = "LTO-6"
+nominal_capacity = "2.5T"
+usable_capacity_factor = 0.95
+manifest_reserve = "1G"
+enospc_buffer = "2G"
+block_size = "512K"
+hardware_compression = false
+'''
+open(cfg, "w").write(t)
+PY
+}
+
+# capture_escrow_secret <check-name> — pulls the AGE-SECRET-KEY-1... line
+# `key generate --escrow` printed into that check's log (never re-printed;
+# ADR-0005 shows it exactly once) into $ESCROW_KEY_PATH (mode 600), and
+# locks the log down to 600 too so the secret doesn't sit world-readable —
+# it must never reach REPORT.md, only the public key does.
+capture_escrow_secret() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: parse AGE-SECRET-KEY-1... from log-$1.txt into \$ESCROW_KEY_PATH (mode 600); record only the public key"
+        return 0
+    fi
+    local log="$RUN/log-$1.txt" secret pub
+    [ -f "$log" ] || return 0
+    secret="$(grep -oE 'AGE-SECRET-KEY-1[A-Z0-9]+' "$log" | head -1)"
+    pub="$(grep -oE 'age1[a-z0-9]+' "$log" | head -1)"
+    if [ -n "$secret" ]; then
+        printf '%s\n' "$secret" >"$ESCROW_KEY_PATH"
+        chmod 600 "$ESCROW_KEY_PATH"
+        [ -n "$pub" ] && echo "$pub" >"$(dirname "$ESCROW_KEY_PATH")/escrow.pub"
+    fi
+    chmod 600 "$log" 2>/dev/null || true
+}
+
+# pending_count — number of pending (staged, unwritten) stage sets, via
+# `report pending --json` (a plain JSON array — src/cli/report.rs
+# report_pending) rather than sqlite3 directly (guardrail: no direct DB
+# access except the one documented read-only exception this isn't).
+pending_count() {
+    if [ "$DRY_RUN" = 1 ]; then echo 0; return 0; fi
+    TCTL report pending --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(len(d) if isinstance(d, list) else 0)
+' 2>/dev/null || echo 0
+}
+
+# json_field <json-file> <python-expr-on-d> — small helper so scenario
+# checks don't hand-roll a python3 heredoc for every single field read.
+# <python-expr-on-d> is evaluated with `d` bound to the parsed JSON.
+json_field() {
+    python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+print($2)
+" "$1" 2>/dev/null
+}
+
 # ---------- scenario stubs ----------
 # Each is replaced with a real implementation in a later commit. Kept as
 # real (if minimal) functions from the start so --list/--dry-run/--all can
 # already enumerate and plan every scenario name.
-scenario_first_year() { echo "PLAN: [first-year] not yet implemented"; }
+# ============================================================
+# Scenario: first-year
+# ============================================================
+# Baseline every later scenario builds on: escrow BEFORE any staging (the
+# correct order — issue #115's escrow-ordering scenario tests what happens
+# when it's violated), three units across two tenants, one volume, moved to
+# a shelf location, cartridge registered, full restore matrix on all three
+# units.
+fy_init()      { bootstrap_config; }
+fy_locations() { TCTL location add vault --description "Home vault" && TCTL location add offsite --description "Offsite shelf"; }
+fy_tenants()   { TCTL tenant add alice && TCTL tenant add bob; }
+fy_escrow()    { TCTL key generate --escrow; }
+fy_units() {
+    make_source "$SRC/photos" "plain+links" "$CANARY" || return 1
+    make_source "$SRC/docs" "unicode+deep" || return 1
+    make_source "$SRC/big" "big" || return 1
+    TCTL unit init "$SRC/photos" --tenant alice --name photos \
+    && TCTL unit init "$SRC/docs" --tenant bob --name docs \
+    && TCTL unit init "$SRC/big" --tenant alice --name big
+}
+fy_snapshots() { TCTL snapshot create photos && TCTL snapshot create docs && TCTL snapshot create big; }
+fy_stage()     { TCTL stage create photos && TCTL stage create docs && TCTL stage create big; }
+fy_pending_is_three() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report pending --json (assert 3 entries)"; return 0; }
+    local n; n="$(pending_count)"
+    [ "$n" = 3 ] || { echo "expected 3 pending stage sets, got $n"; return 1; }
+}
+fy_plan()      { TCTL volume plan; }
+fy_write() {
+    next_tape VOL-A || return 1
+    TCTL volume init VOL-A --device "$TAPE_DEV" \
+    && TCTL volume write VOL-A --device "$TAPE_DEV"
+}
+fy_move()      { TCTL volume move VOL-A --to vault; }
+fy_cartridge() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge register --barcode \$LOADED_TAG --media-type LTO-6"; return 0; }
+    TCTL cartridge register --barcode "$LOADED_TAG" --media-type LTO-6
+}
+fy_audit() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl audit --json (record exit code; 0 or 1 both PASS)"; return 0; }
+    TCTL audit --json >"$RUN/log-fy.audit.txt" 2>&1
+    local rc=$?
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || { echo "audit exited $rc (expected 0 or 1)"; return 1; }
+    return 0
+}
+fy_fsck()      { TCTL db fsck; }
+fy_summary()   { TCTL report summary; }
+
+scenario_first_year() {
+    check fy.init       fy_init
+    check fy.locations  fy_locations
+    check fy.tenants    fy_tenants
+    check fy.escrow     fy_escrow
+    capture_escrow_secret fy.escrow
+    check fy.units      fy_units
+    check fy.snapshots  fy_snapshots
+    check fy.stage      fy_stage
+    check fy.pending    fy_pending_is_three
+    check fy.plan       fy_plan
+    check fy.write      fy_write
+    check fy.move       fy_move
+    check fy.cartridge  fy_cartridge
+
+    restore_matrix VOL-A photos alice "$SRC/photos" fy-photos bob
+    restore_matrix VOL-A docs   bob   "$SRC/docs"   fy-docs   alice
+    restore_matrix VOL-A big    alice "$SRC/big"    fy-big    bob
+
+    check fy.audit      fy_audit
+    check fy.fsck       fy_fsck
+    check fy.summary    fy_summary
+}
 scenario_evolving_source() { echo "PLAN: [evolving-source] not yet implemented"; }
 scenario_key_rotation() { echo "PLAN: [key-rotation] not yet implemented"; }
 scenario_tenant_reassign() { echo "PLAN: [tenant-reassign] not yet implemented"; }
@@ -741,7 +912,87 @@ scenario_tape_only_and_reclaim() { echo "PLAN: [tape-only-and-reclaim] not yet i
 scenario_compaction() { echo "PLAN: [compaction] not yet implemented"; }
 scenario_retire_and_reuse() { echo "PLAN: [retire-and-reuse] not yet implemented"; }
 scenario_db_loss() { echo "PLAN: [db-loss] not yet implemented"; }
-scenario_escrow_ordering() { echo "PLAN: [escrow-ordering] not yet implemented"; }
+# ============================================================
+# Scenario: escrow-ordering (issue #115 regression)
+# ============================================================
+# The exact defect docs/lto6-session-journal-2026-09-10.md's Phase 4/5
+# found on real hardware: staging BEFORE an escrow recipient is registered
+# produces slices the escrow key can never decrypt, and pre-write
+# validation only checked the REGISTRY, not the slices. The fix (issue
+# #115, landing in a parallel branch) is to refuse `stage create` itself
+# when no escrow recipient exists yet. This scenario asserts the
+# POST-FIX behavior; until #115 lands, eo.stage_before_escrow_refused is
+# expected to FAIL (stage create currently succeeds) — that is not a bug
+# in this suite, see docs/lifecycle-suite.md.
+eo_init()      { bootstrap_config; }
+eo_tenants()   { TCTL tenant add alice && TCTL tenant add bob; }
+eo_units() {
+    make_source "$SRC/unitA" "plain" "$CANARY" || return 1
+    make_source "$SRC/unitB" "unicode" || return 1
+    TCTL unit init "$SRC/unitA" --tenant alice --name unitA \
+    && TCTL unit init "$SRC/unitB" --tenant bob --name unitB
+}
+eo_snapshots() { TCTL snapshot create unitA && TCTL snapshot create unitB; }
+
+eo_stage_before_escrow_refused() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl stage create unitA (expect refusal containing 'no escrow recipient is registered'); tapectl stage list --json (expect [])"
+        return 0
+    fi
+    local out rc
+    out="$(TCTL stage create unitA 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "stage create unexpectedly SUCCEEDED with no escrow recipient registered (issue #115 not yet fixed on this branch):"
+        echo "$out"
+        return 1
+    fi
+    if ! echo "$out" | grep -qi "no escrow recipient is registered"; then
+        echo "refused, but not with the expected message ('no escrow recipient is registered'):"
+        echo "$out"
+        return 1
+    fi
+    local listing
+    listing="$(TCTL stage list --json 2>&1)"
+    echo "$listing" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert isinstance(d, list) and len(d) == 0, d
+' || { echo "stage list not empty after a refused stage create: $listing"; return 1; }
+}
+
+# Pre-existing behaviour (not part of #115): key rotate already refuses
+# without an escrow recipient (src/cli/key.rs "key rotate refuses: no
+# escrow recipient is registered").
+eo_rotate_before_escrow_refused() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl key rotate --tenant alice (expect refusal: 'no escrow recipient is registered')"; return 0; }
+    local out rc
+    out="$(TCTL key rotate --tenant alice 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "key rotate unexpectedly succeeded with no escrow recipient: $out"; return 1; }
+    echo "$out" | grep -qi "no escrow recipient is registered" || { echo "unexpected refusal text: $out"; return 1; }
+}
+
+eo_escrow()       { TCTL key generate --escrow; }
+eo_stage()        { TCTL stage create unitA && TCTL stage create unitB; }
+eo_write() {
+    next_tape VOL-EO || return 1
+    TCTL volume init VOL-EO --device "$TAPE_DEV" && TCTL volume write VOL-EO --device "$TAPE_DEV"
+}
+
+scenario_escrow_ordering() {
+    check eo.init                          eo_init
+    check eo.tenants                       eo_tenants
+    check eo.units                         eo_units
+    check eo.snapshots                     eo_snapshots
+    check eo.stage_before_escrow_refused   eo_stage_before_escrow_refused
+    check eo.rotate_before_escrow_refused  eo_rotate_before_escrow_refused
+    check eo.escrow                        eo_escrow
+    capture_escrow_secret eo.escrow
+    check eo.stage                         eo_stage
+    check eo.write                         eo_write
+
+    restore_matrix VOL-EO unitA alice "$SRC/unitA" eo-unitA bob
+    restore_matrix VOL-EO unitB bob   "$SRC/unitB" eo-unitB alice
+}
 scenario_restore_file_and_catalog() { echo "PLAN: [restore-file-and-catalog] not yet implemented"; }
 scenario_quick_archive() { echo "PLAN: [quick-archive] not yet implemented"; }
 scenario_collection() { echo "PLAN: [collection] not yet implemented"; }
@@ -799,9 +1050,24 @@ write_report_footer() {
 }
 
 # ---------- dispatch ----------
+# Each scenario gets its OWN home/config/source tree and its own tape-slot
+# tracking (spec: "a fresh HOME_DIR unless stated"; "slot tracking is
+# per-scenario") — required for --all to run every scenario in one
+# invocation without one scenario's state leaking into the next. Check
+# names and restore-matrix tags are scenario-prefixed by convention, so the
+# shared $CHECKS/$RESULT arrays and $RUN/log-<name>.txt paths stay unique
+# without needing a second layer of namespacing.
 run_scenario() { # run_scenario <name>
-    local fn="scenario_${1//-/_}"
-    echo "=== ${DRY_RUN:+PLAN: }scenario $1 ==="
+    local name="$1" fn="scenario_${1//-/_}"
+    HOME_DIR="$RUN/$name/home"
+    CFG="$HOME_DIR/config.toml"
+    SRC="$RUN/$name/src"
+    ESCROW_KEY_PATH="$RUN/$name/escrow.key"
+    USED_SLOTS=""
+    if [ "$DRY_RUN" != 1 ]; then
+        mkdir -p "$HOME_DIR" "$SRC"
+    fi
+    echo "=== ${DRY_RUN:+PLAN: }scenario $name ==="
     "$fn"
 }
 
