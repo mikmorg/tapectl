@@ -340,13 +340,70 @@ fail-safe-truncation test (§4.1) as the software-side stand-in.
 
 ---
 
-## 5. Deferred to LTO-6 hardware validation (unchanged from round 1, +1)
+## 5. Deferred to LTO-6 hardware validation — PARTLY ANSWERED 2026-09-10
 
-Block size 512 K vs 1 M throughput; LBP MODE SELECT acceptance + `st` readback;
-MAM over-report bounds (sizes the ENOSPC buffer); real ENOSPC behavior (the
-clean-abort trigger); v1-tape disposal confirmation; **and (new) EOD semantics
-on the real drive** — confirm forward ops past EOD error rather than reading
-stale data (§3.2's physics assumption).
+The original deferred set: block size 512 K vs 1 M throughput; LBP MODE SELECT
+acceptance + `st` readback; MAM over-report bounds (sizes the ENOSPC buffer);
+real ENOSPC behavior (the clean-abort trigger); v1-tape disposal confirmation;
+**and (new) EOD semantics on the real drive** — confirm forward ops past EOD
+error rather than reading stale data (§3.2's physics assumption).
+
+A hardware session on 2026-09-10 answered four of these against a real HP
+Ultrium 6-SCSI (fw 35GD) with FUJIFILM LTO-6 media, reached over libvirt SCSI
+passthrough. Full record and raw output:
+`docs/lto6-session-journal-2026-09-10.md`; passthrough setup:
+`docs/lto6-drive-passthrough.md`.
+
+### 5.1 Answered
+
+- **Block size 512 K vs 1 M — SETTLED: no difference. Keep 512 K.**
+  114.0 / 114.4 / 114.7 / 113.9 / 114.5 / 114.6 MiB/s across 512 K, 1 M, 2 M and
+  4 M, alternating order, payload served from RAM — under 1% spread. There is no
+  throughput argument for touching the format constant. Note the drive
+  advertises a **16 MB** maximum block size (not the 2 MiB mhvtl reports), and
+  1 M blocks *are* accepted on real hardware — the 2026-08-02 dry-run's `EBUSY`
+  was an mhvtl/host artifact.
+  *(The harness's own §A run reported a 3.1× win for 1 M. That was a page-cache
+  artifact, not a result — issue #117.)*
+
+- **EOD semantics — SETTLED: §3.2's assumption holds.** A forward read past EOD
+  returned no data rather than stale data. The one failure mode the front index
+  and seal marker cannot detect does not occur on this drive.
+
+- **MAM over-report — SETTLED at the scale tested: there is none worth budgeting
+  for.** Remaining capacity tracks the end-of-data position and is accurate to
+  ~2 MiB against bytes written, erring slightly conservative. The configured
+  `enospc_buffer = "50M"` is not contradicted.
+  *(Measure this by differencing against independently-established blank-tape
+  capacity. The harness's §D never wrote anything and reported the no-op as
+  "no change" — issue #116.)*
+
+- **Hardware compression — resolved in passing.** The drive ships with
+  compression **on** (`DCE=1`); `TapeStore::open` issues `MTCOMPRESSION 0`
+  unconditionally and it lands (`DCE` 1→0 measured across a write). The
+  `hardware_compression` config knob is inert in both directions — see #118.
+
+### 5.2 Still open
+
+- **LBP — half answered.** The drive **supports** logical block protection: the
+  changeable mode-page mask is `4a f0 00 04 ff 3f c0 00`, so `LBP_METHOD`, the
+  information length, and the `LBP_W`/`LBP_R` bits are all writable. It is
+  currently disabled (`LBP_METHOD = 0`). **MODE SELECT was deliberately not
+  attempted** — enabling LBP changes the block format the drive expects for
+  every subsequent command, and a half-applied change is worse than not knowing.
+  Enabling it remains a considered change with its own ticket.
+
+- **Real ENOSPC behavior — NOT tested.** Still the single most important check,
+  and still the one mhvtl actively lies about (it accepts writes past capacity
+  and silently corrupts them). Filling 2.44 TiB at ~114 MiB/s is roughly six
+  hours of continuous writing, so it needs a dedicated session with the operator
+  watching.
+
+- **MAM accuracy near a full cartridge — NOT tested.** It held to ~2 MiB at the
+  2 GiB scale; the regime the ENOSPC buffer actually guards is the last few GiB
+  of a full tape, and that is untested. Same cartridge-hours constraint.
+
+- **v1-tape disposal confirmation — NOT addressed** this session.
 
 ---
 

@@ -12,6 +12,12 @@ everything mhvtl has been simulating works: fixed-block I/O, MAM
 queries, sg_logs error counters, ENOSPC behavior at end-of-tape, and
 the full write → verify → restore round-trip.
 
+The drive is not local to this VM: it lives on `home2` and reaches vm-desk1 by
+libvirt SCSI LUN passthrough. See `docs/lto6-drive-passthrough.md` for how that
+is wired, and — importantly — for the device-name collision with mhvtl. Address
+the real drive as `/dev/tape/by-id/scsi-HUJ808A5L4-nst` via `TAPECTL_GATE_TAPE`,
+never as `/dev/nst0`.
+
 ## Dry-run findings (mhvtl, 2026-07-20) — read before the hardware session
 
 Baseline recordings for later diffing are in
