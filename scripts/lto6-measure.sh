@@ -30,6 +30,15 @@
 #
 # Devices are DISCOVERED, never hardcoded (issue #67): SCSI enumeration
 # shuffles between reloads and reboots.
+#
+# This harness ran on real hardware on 2026-09-10 and confidently reported
+# two wrong numbers, both fixed 2026-09-10 (issues #116/#117; see
+# docs/lto6-session-journal-2026-09-10.md): §D sampled its before/after MAM
+# pair around a write that silently failed with EINVAL (a stale block-size
+# mode left by §A), so "remaining capacity never moved" was really "nothing
+# was written"; and §A's block-size table was reading a warming page cache on
+# the source disk, not the tape, reporting a 3.1x 1M-vs-512K win that a
+# controlled re-run showed was actually a <1% wash.
 set -uo pipefail
 
 TAPE_DEV="${TAPECTL_MEASURE_TAPE:-/dev/nst0}"
