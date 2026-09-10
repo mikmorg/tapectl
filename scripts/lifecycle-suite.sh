@@ -317,14 +317,26 @@ if [ "$DRY_RUN" = 1 ]; then SLOT_LABEL_MAP="/dev/null"; else SLOT_LABEL_MAP="$RU
 next_tape() { # next_tape <intended-label>
     local label="${1:-}"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: next_tape \"$label\" -> $([ "$SINGLE_CARTRIDGE" = 1 ] && echo "reuse loaded cartridge (single-cartridge mode)" || echo "unload current, load next unused $GEN slot")"
+        echo "PLAN: next_tape \"$label\" -> $([ "$SINGLE_CARTRIDGE" = 1 ] && echo "retire \$PREV_LABEL in the DB (physical truth catch-up), then reuse loaded cartridge" || echo "unload current, load next unused $GEN slot")"
         erase_tape
+        PREV_LABEL="$label"
         return 0
     fi
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        # The DB has no other way to learn the previous volume's cartridge is
+        # gone: `volumes.status` stays 'sealed' forever unless something
+        # retires it, and ADR-0004's copy derivation is DB-status-only. Retire
+        # it here so copy-count/mark-tape-only/audit see the truth a real
+        # single-cartridge operator lives with, instead of crediting a
+        # cartridge that no longer physically exists.
+        if [ -n "${PREV_LABEL:-}" ]; then
+            TCTL volume retire "$PREV_LABEL" --yes \
+                || echo "next_tape: warning — could not retire \"$PREV_LABEL\" before reusing its cartridge (continuing; single-cartridge copy counts may over-credit it)" >&2
+        fi
         echo "next_tape: single-cartridge mode — erasing $LOADED_TAG in place for \"$label\""
         erase_tape
         echo "$LOADED_TAG	$label	SAME_CARTRIDGE" >>"$SLOT_LABEL_MAP"
+        PREV_LABEL="$label"
         return 0
     fi
     [ "$MHVTL_DISCOVERY" = 1 ] || { echo "next_tape: not an mhvtl drive and not --single-cartridge — nothing this script can safely swap" >&2; return 1; }
@@ -348,6 +360,7 @@ next_tape() { # next_tape <intended-label>
     LOADED_TAG="$(mtx -f "$CHG_SG" status | sed -n "s/.*Data Transfer Element $DTE:Full.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p")"
     echo "$slot	$label	$LOADED_TAG" >>"$SLOT_LABEL_MAP"
     erase_tape
+    PREV_LABEL="$label"
 }
 
 # load_volume_tape <label> — reload a PREVIOUSLY WRITTEN cartridge (recorded
@@ -934,6 +947,27 @@ bootstrap_archive_v1() {
     fi
 }
 
+# bootstrap_two_volumes — bootstrap_archive_v1 plus a second, mutated
+# version of every unit written to VOL-B and moved to offsite. Gives every
+# unit 2 sealed copies in 2 distinct locations (vault, offsite) — what
+# tape-only-and-reclaim and compaction both need as a starting point.
+bootstrap_two_volumes() {
+    bootstrap_archive_v1 || return 1
+    mutate_source "$SRC/photos" "$SEED" modify || return 1
+    mutate_source "$SRC/docs" "$SEED" add || return 1
+    mutate_source "$SRC/big" "$SEED" touch-only || return 1
+    TCTL snapshot create photos || return 1
+    TCTL snapshot create docs || return 1
+    TCTL snapshot create big || return 1
+    TCTL stage create photos || return 1
+    TCTL stage create docs || return 1
+    TCTL stage create big || return 1
+    next_tape VOL-B || return 1
+    TCTL volume init VOL-B --device "$TAPE_DEV" || return 1
+    TCTL volume write VOL-B --device "$TAPE_DEV" || return 1
+    TCTL volume move VOL-B --to offsite || return 1
+}
+
 # ---------- scenario stubs ----------
 # Each is replaced with a real implementation in a later commit. Kept as
 # real (if minimal) functions from the start so --list/--dry-run/--all can
@@ -1255,8 +1289,195 @@ scenario_key_rotation() {
     check kr.restore_sh_old_key_vola  kr_restore_sh_old_key_vola
     check kr.escrow_restores_vola     kr_escrow_restores_vola
 }
-scenario_tenant_reassign() { echo "PLAN: [tenant-reassign] not yet implemented"; }
-scenario_tape_only_and_reclaim() { echo "PLAN: [tape-only-and-reclaim] not yet implemented"; }
+# ============================================================
+# Scenario: tenant-reassign
+# ============================================================
+# After first-year: move alice's units to bob, prove ownership actually
+# moved, write a new version under bob, and prove alice's OLD volume
+# (VOL-A) is still restorable both ways — reassignment changes DB
+# ownership, not which key a slice was encrypted to.
+tr_reassign() { TCTL tenant reassign --to bob alice; }
+
+# `unit list --json` (src/db/queries.rs list_units) returns `tenant_id`,
+# not a tenant name, so the move is checked via the `--tenant NAME` filter
+# both ways rather than reading tenant_id numbers out of the JSON.
+tr_unit_list_shows_move() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit list --tenant bob --json (assert photos,big present); --tenant alice --json (assert absent)"; return 0; }
+    local bobf="$RUN/log-tr.unitlist.bob.json" alicef="$RUN/log-tr.unitlist.alice.json"
+    TCTL unit list --tenant bob --json >"$bobf" 2>&1 || { cat "$bobf"; return 1; }
+    TCTL unit list --tenant alice --json >"$alicef" 2>&1 || { cat "$alicef"; return 1; }
+    python3 -c '
+import json, sys
+bob = {u.get("name") for u in json.load(open(sys.argv[1]))}
+alice = {u.get("name") for u in json.load(open(sys.argv[2]))}
+missing = {"photos", "big"} - bob
+assert not missing, f"expected photos+big under bob after reassignment, missing: {missing} (bob has {bob})"
+leftover = {"photos", "big"} & alice
+assert not leftover, f"photos/big still listed under alice after reassignment: {leftover}"
+' "$bobf" "$alicef"
+}
+
+tr_save_pristine() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: cp -a photos to pristine-v1-photos before mutating"; return 0; }
+    local sd; sd="$(dirname "$HOME_DIR")"
+    cp -a "$SRC/photos" "$sd/pristine-v1-photos"
+}
+
+tr_write_photos_v2() {
+    mutate_source "$SRC/photos" "$SEED" modify || return 1
+    TCTL snapshot create photos || return 1
+    TCTL stage create photos || return 1
+    next_tape VOL-D || return 1
+    TCTL volume init VOL-D --device "$TAPE_DEV" && TCTL volume write VOL-D --device "$TAPE_DEV"
+}
+
+tr_restore_vola_via_tctl() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "tr.restore_vola_via_tctl" "single-cartridge mode: VOL-A's cartridge was erased to become VOL-D"
+        return $?
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape VOL-A; tapectl restore unit --unit photos --from VOL-A --to DIR (alice's key still exists even though the DB now says bob owns photos)"
+        return 0
+    fi
+    load_volume_tape VOL-A || return 1
+    local sd to; sd="$(dirname "$HOME_DIR")"; to="$sd/restore-vola-photos"
+    TCTL restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
+    assert_identical "$sd/pristine-v1-photos" "$to"
+}
+
+tr_restore_sh_vola_alice_key() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "tr.restore_sh_vola_alice_key" "single-cartridge mode: VOL-A's cartridge was erased to become VOL-D"
+        return $?
+    fi
+    local sd work alicekey to
+    sd="$(dirname "$HOME_DIR")"; work="$sd/heir-vola"; alicekey="$HOME_DIR/keys/alice-primary.age.key"; to="$sd/restore-sh-vola-photos"
+    if [ "$DRY_RUN" != 1 ]; then load_volume_tape VOL-A || return 1; fi
+    ensure_heir_restore_sh "$work" || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: ./RESTORE.sh --restore --unit photos --key $alicekey --to $to (VOL-A, alice's key — RESTORE.sh has no DB and knows nothing of the reassignment)"
+        return 0
+    fi
+    (cd "$work/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit photos --key "$alicekey" --to "$to") \
+        >"$RUN/log-tr.restore_sh_vola.txt" 2>&1 || { cat "$RUN/log-tr.restore_sh_vola.txt"; return 1; }
+    local sd2; sd2="$(dirname "$HOME_DIR")"
+    assert_identical "$sd2/pristine-v1-photos" "$to"
+}
+
+tr_catalog_locate() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog locate photos --json (assert both VOL-A and VOL-D named)"; return 0; }
+    local logf="$RUN/log-tr.locate.json"
+    TCTL catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos:"; cat "$logf"; return 1; }
+    grep -q "VOL-D" "$logf" || { echo "VOL-D not named in catalog locate photos:"; cat "$logf"; return 1; }
+}
+
+scenario_tenant_reassign() {
+    check tr.setup                    bootstrap_archive_v1
+    check tr.reassign                 tr_reassign
+    check tr.unit_list_shows_move     tr_unit_list_shows_move
+    check tr.save_pristine            tr_save_pristine
+    check tr.write_photos_v2          tr_write_photos_v2
+
+    restore_matrix VOL-D photos bob "$SRC/photos" tr-photos-bob alice
+
+    check tr.restore_vola_via_tctl    tr_restore_vola_via_tctl
+    check tr.restore_sh_vola_alice_key tr_restore_sh_vola_alice_key
+    check tr.catalog_locate           tr_catalog_locate
+}
+# ============================================================
+# Scenario: tape-only-and-reclaim
+# ============================================================
+# After bootstrap_two_volumes (VOL-A/vault v1, VOL-B/offsite v2): every
+# first-year unit has 2 sealed copies in 2 locations, so mark-tape-only
+# must PASS for them; a freshly-written "solo" unit with only 1 copy must
+# be REFUSED, naming the shortfall. Then reclaim v1 (mark-reclaimable ->
+# purge), staging clean, and prove the LATEST version is still restorable.
+#
+# --single-cartridge note: next_tape's single-cartridge branch now retires
+# the previous label in the DB before reusing its cartridge (added this
+# commit — ADR-0004's copy count is DB-status-only, so without this a
+# reused cartridge would go on being credited as a live copy it no longer
+# physically is). That makes "2 copies in 2 locations" genuinely
+# unreachable under --single-cartridge: VOL-A is retired the moment VOL-B
+# is created. So only the one-copy REFUSAL is meaningful there; everything
+# that assumes 2 real copies is SKIP, visibly, not a failure.
+tor_solo_unit() {
+    make_source "$SRC/solo" "plain" || return 1
+    TCTL unit init "$SRC/solo" --tenant alice --name solo || return 1
+    TCTL snapshot create solo || return 1
+    TCTL stage create solo || return 1
+    next_tape VOL-SOLO || return 1
+    TCTL volume init VOL-SOLO --device "$TAPE_DEV" && TCTL volume write VOL-SOLO --device "$TAPE_DEV"
+}
+
+tor_mark_tape_only_photos_passes() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "tor.mark_tape_only_photos_passes" "single-cartridge mode: VOL-A was retired when VOL-B/VOL-SOLO reused its cartridge, so photos genuinely has <2 live copies here"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit mark-tape-only photos (>=2 copies in >=2 locations -> PASS)"; return 0; }
+    TCTL unit mark-tape-only photos
+}
+
+tor_mark_tape_only_solo_refused() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit mark-tape-only solo (1 copy -> REFUSED, message names the shortfall)"; return 0; }
+    local out rc
+    out="$(TCTL unit mark-tape-only solo 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "mark-tape-only solo unexpectedly succeeded with only 1 copy: $out"; return 1; }
+    echo "$out" | grep -qi "insufficient copies" || { echo "refusal did not name the shortfall ('insufficient copies'): $out"; return 1; }
+}
+
+tor_report_tape_only() { TCTL report tape-only; }
+
+tor_mark_reclaimable_v1_photos() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "tor.mark_reclaimable_v1_photos" "single-cartridge mode: VOL-A (v1's only copy) was retired, not merely superseded"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl snapshot mark-reclaimable --version 1 photos (v2 exists and is written)"; return 0; }
+    TCTL snapshot mark-reclaimable --version 1 photos
+}
+
+tor_purge_v1_photos() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "tor.purge_v1_photos" "depends on tor.mark_reclaimable_v1_photos, itself SKIP under --single-cartridge"
+        return $?
+    fi
+    TCTL snapshot purge --version 1 photos
+}
+
+tor_staging_clean() { TCTL staging clean; }
+tor_report_copies() { TCTL report copies; }
+
+tor_restore_latest() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "tor.restore_latest" "single-cartridge mode: VOL-B's cartridge was reused for VOL-SOLO"
+        return $?
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: load_volume_tape VOL-B; tapectl restore unit --unit photos --from VOL-B --to DIR; assert identical to the latest (mutated) source"
+        return 0
+    fi
+    load_volume_tape VOL-B || return 1
+    local sd to; sd="$(dirname "$HOME_DIR")"; to="$sd/restore-latest-photos"
+    TCTL restore unit --unit photos --from VOL-B --to "$to" --device "$TAPE_DEV" || return 1
+    assert_identical "$SRC/photos" "$to"
+}
+
+scenario_tape_only_and_reclaim() {
+    check tor.setup                        bootstrap_two_volumes
+    check tor.solo_unit                    tor_solo_unit
+    check tor.mark_tape_only_photos_passes tor_mark_tape_only_photos_passes
+    check tor.mark_tape_only_solo_refused  tor_mark_tape_only_solo_refused
+    check tor.report_tape_only             tor_report_tape_only
+    check tor.mark_reclaimable_v1_photos   tor_mark_reclaimable_v1_photos
+    check tor.purge_v1_photos              tor_purge_v1_photos
+    check tor.staging_clean                tor_staging_clean
+    check tor.report_copies                tor_report_copies
+    check tor.restore_latest               tor_restore_latest
+}
 scenario_compaction() { echo "PLAN: [compaction] not yet implemented"; }
 scenario_retire_and_reuse() { echo "PLAN: [retire-and-reuse] not yet implemented"; }
 scenario_db_loss() { echo "PLAN: [db-loss] not yet implemented"; }
@@ -1412,6 +1633,7 @@ run_scenario() { # run_scenario <name>
     SRC="$RUN/$name/src"
     ESCROW_KEY_PATH="$RUN/$name/escrow.key"
     USED_SLOTS=""
+    PREV_LABEL=""
     if [ "$DRY_RUN" != 1 ]; then
         mkdir -p "$HOME_DIR" "$SRC"
     fi
