@@ -300,6 +300,32 @@ check() { # check <name> <fn> [args...]
     echo "  [$name] ${RESULT[$name]}"
 }
 
+# ---------- audit_passes: an audit exit code the scenario tolerates ----------
+# `audit` exit 0/1 is always fine (clean / advisory warnings). Exit 2 is a
+# VIOLATION and normally a failure — EXCEPT in --single-cartridge mode, where
+# every unit is legitimately under-copied ("1 copy, needs 2": policy min_copies
+# is coupled to min_copies_for_tape_only=2, and one cartridge cannot hold two
+# copies). There, exit 2 is acceptable ONLY when every violation is copy_count;
+# any other violation still fails. Reads the audit --json the caller captured.
+# $1 = audit exit code, $2 = path to the captured audit --json.
+audit_passes() {
+    local rc="$1" jf="$2"
+    { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && return 0
+    [ "$rc" -eq 2 ] || return 1
+    [ "$SINGLE_CARTRIDGE" = 1 ] || return 1
+    # exit 2 in single-cartridge mode: pass iff the ONLY violations are copy_count.
+    python3 - "$jf" <<'PY2'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+findings = d.get("findings") or d.get("results") or []
+viols = [f for f in findings if f.get("severity") == "violation"]
+sys.exit(0 if viols and all(f.get("check") == "copy_count" for f in viols) else 1)
+PY2
+}
+
 # ---------- vinit: happy-path volume init that tolerates a reused cartridge ----------
 # In single-cartridge reuse, erase_tape (weof at BOT) unseals and truncates the
 # cartridge but leaves an unparseable File 0 that `volume init` refuses without
@@ -848,12 +874,8 @@ import re
 import sys
 
 cfg, staging, tape, sg, single = sys.argv[1:6]
+_ = single  # kept for signature stability; copy policy is handled in audit_passes()
 t = open(cfg).read()
-if single == "1":
-    # One cartridge cannot hold two copies, so the default min_copies=2 makes
-    # `audit` report every unit under-copied (a real violation, exit 2) on an
-    # otherwise-clean archive. Match the policy to the medium under test.
-    t = re.sub(r'(?m)^(\[defaults\]\s*)$', r'\1\nmin_copies = 1', t, count=1)
 t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{staging}"', t, count=1)
@@ -1046,9 +1068,11 @@ fy_cartridge() {
 }
 fy_audit() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl audit --json (record exit code; 0 or 1 both PASS)"; return 0; }
-    TCTL audit --json >"$RUN/log-fy.audit.txt" 2>&1
+    local fy_audit_json="$RUN/fy.audit.json"
+    TCTL audit --json >"$fy_audit_json" 2>&1
     local rc=$?
-    [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || { echo "audit exited $rc (expected 0 or 1)"; return 1; }
+    audit_passes "$rc" "$fy_audit_json" || {
+        echo "audit exited $rc with non-copy_count violations:"; cat "$fy_audit_json"; return 1; }
     return 0
 }
 fy_fsck()      { TCTL db fsck; }
@@ -2323,11 +2347,11 @@ d = json.load(sys.stdin)
 assert d.get("integrity_ok"), d
 ' || { echo "db fsck not clean after op \"$op\": $fsck_json"; return 1; }
 
-    local audit_rc
-    TCTL audit >/dev/null 2>&1; audit_rc=$?
+    local audit_rc pm_audit_json="$RUN/log-pm.audit.json"
+    TCTL audit --json >"$pm_audit_json" 2>&1; audit_rc=$?
     case "$op" in
-        mutate:*) [ "$audit_rc" -le 2 ] || { echo "audit exited $audit_rc (>2) after \"$op\""; return 1; } ;;
-        *)        [ "$audit_rc" -le 1 ] || { echo "audit exited $audit_rc after \"$op\" (only mutate:* steps may push it to 2)"; return 1; } ;;
+        mutate:*) audit_passes "$audit_rc" "$pm_audit_json" || [ "$audit_rc" -le 2 ] || { echo "audit exited $audit_rc (>2) after \"$op\""; return 1; } ;;
+        *)        audit_passes "$audit_rc" "$pm_audit_json" || { echo "audit exited $audit_rc after \"$op\" with non-copy_count violations"; return 1; } ;;
     esac
 }
 
