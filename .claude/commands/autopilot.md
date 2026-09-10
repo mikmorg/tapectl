@@ -40,6 +40,7 @@ the normative design set named in the Policy block below.
   were in the measuring instrument** (page-cache artifact; a `|| true`-swallowed
   EINVAL) — both exited 0 with plausible numbers. Any harness number that
   argues for a design change gets a controlled re-measurement first.
+  **CTO batch answered 2026-09-10:** (Q1) the **mhvtl gate is unusable on this VM** — the library moves media but the tape daemon never receives the `lload` over the SysV queue, and the kernel module will not reload while in use (needs a VM reboot, a human step). **Real-LTO-6 validation substitutes** for the mhvtl gate on restore-path branches this run (a real write→verify→restore→heir round-trip on /dev/nst3 via the lifecycle suite is a strict superset of what the gate checks; mhvtl also gives false ENOSPC/MAM passes). Hold a note to **re-run the mhvtl gate after the VM is rebooted**, before these are considered fully closed. Not a gate weakening — real hardware is stricter. (Q2) pre-escrow-tape copy → `--allow-missing-escrow` override, default refuse. (Q3) `init` creates the escrow identity. (Q4) backend error+example now, `backend add` is a follow-up. All four recorded in design-errata §2.16/§7.
 - **CTO BATCH ANSWERED 2026-08-01 (five decisions, recorded in ADR-0009,
   commit 9ee0658). #69 IS UNBLOCKED AND IS NEXT — it is the only open
   `severity:high`.** The deferral covers the **ceremony** (printing,
