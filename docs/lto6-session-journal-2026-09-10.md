@@ -1136,3 +1136,36 @@ gate treats as fatal — verified. But **`/dev/nstN` numbering is not stable acr
 reboots on this VM.** Always address the real drive as
 `/dev/tape/by-id/scsi-HUJ808A5L4-nst`, and re-check the mapping after any reboot
 before trusting a bare device number in any doc, including this one.
+
+### Third site, found by the new warning
+
+Running the gated `mhvtl_e2e` suite afterwards, the wrong-tape warning paid for
+itself immediately. `mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position`
+FAILED with:
+
+```
+>>> Tape device:      /dev/nst0          <- note: no "(from TAPE_DEVICE)"
+>>> Tape identifies as: VOL-A
+=== keyless integrity walk: MHVTLM ===
+VERIFY: PASS — every file matches the front index.
+```
+
+`tests/mhvtl_e2e.rs` had the same defect in a third form: `run_restore_sh_verify`
+set an env var literally named `&tape_dev()ICE`, the residue of a `TAPE_DEV` ->
+`&tape_dev()` rename that rewrote the string literal and the doc comment along
+with the Rust identifiers. So RESTORE.sh fell back to `/dev/nst0` and both
+parity tests read the real drive instead of the tape they had just written.
+
+The good-tape test had been passing *for the wrong reason* — it verified an
+unrelated intact cartridge, and PASS was the expected answer either way. Only
+the corrupted-tape test could expose it, and only once nst0 stopped being mhvtl.
+
+What used to be a three-run mystery was a one-look diagnosis: the output named
+the device and said the tape was VOL-A, not MHVTLM. Fixed in `73aa72c`;
+`mhvtl_e2e` is 9/9.
+
+**Tally for this class of bug: three sites** — the gate's heir leg (`0dbfda7`),
+the on-tape recovery instructions (#130, unfixed, frozen bytes), and this test
+harness (`73aa72c`). All three shared one shape: a `/dev/nst0` default that was
+correct only by coincidence of enumeration order.
+
