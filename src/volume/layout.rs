@@ -75,6 +75,14 @@ an open-source archival storage tool.
 >>> COMPLETE INSTRUCTIONS ARE IN THE NEXT FILE ON THIS TAPE. <<<
 >>> THE FULL MAP OF THIS TAPE IS FILE 3 (the front index).   <<<
 
+Your drive may not be /dev/nst0. That is an example, not a fact
+about this tape. List the tape drives on the machine you are
+using and substitute the right one everywhere below:
+
+    ls -l /dev/tape/by-id/
+
+A wrong device reads a DIFFERENT tape, or fails outright.
+
 To read the next file (the full recovery guide):
 
     mt -f /dev/nst0 setblk 524288
@@ -163,6 +171,20 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
 - `dar` (dar.linux.free.fr) — archive extraction
 - `sha256sum` (coreutils) — integrity verification
 - `head`, `truncate` (coreutils) — trimming block padding to exact sizes
+
+## Which device?
+
+Every command in this guide says `/dev/nst0`. That is an example, not a
+fact about this tape — drive numbering belongs to the machine you are
+sitting at, and it changes when hardware is added or the machine reboots.
+List the tape drives and substitute the right one throughout:
+
+    ls -l /dev/tape/by-id/
+
+A wrong device does not always fail loudly: if another tape is loaded in
+it, the commands below will succeed and recover the WRONG volume. File 0
+names the volume this tape carries; RESTORE.sh checks that for you and
+warns (it takes `TAPE_DEVICE=/dev/nstN` to point it at another drive).
 
 ## Automated Recovery (recommended)
 
@@ -1413,7 +1435,9 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
             "## {}\n\n\
              UUID: `{}`  ·  snapshot v{}\n\n\
              Put the drive in fixed 512KB block mode, then read, trim, verify and\n\
-             decrypt each slice:\n\n\
+             decrypt each slice. `/dev/nst0` below is an example — run\n\
+             `ls -l /dev/tape/by-id/` and substitute your own drive, or you may\n\
+             read a different tape:\n\n\
              ```bash\n\
              mt -f /dev/nst0 setblk 524288\n\n",
             unit.name, unit.uuid, unit.snapshot_version,
@@ -1728,6 +1752,77 @@ mod tests {
         assert!(!s.contains("slice_1.dar"), "old slice_N naming leaked");
         assert!(!s.contains("ARCHIVE_BASE"), "placeholder leaked");
         assert!(!s.contains("bs=64k"));
+    }
+
+    /// #130: every heir-facing document hands out literal `mt -f /dev/nst0`
+    /// commands, and `/dev/nst0` is a guess about the heir's machine rather
+    /// than a fact about the tape. It was wrong on this very dev VM after a
+    /// routine reboot, where a real LTO-6 and mhvtl swapped node numbers —
+    /// and a wrong device is not reliably loud: with another tape loaded, the
+    /// commands succeed and recover the WRONG volume.
+    ///
+    /// These are frozen plaintext zones that cannot check anything at read
+    /// time the way RESTORE.sh now does, so the caveat is all they get. The
+    /// issue named two documents; RECOVERY.md is a third with the same defect.
+    #[test]
+    fn every_heir_document_says_the_device_may_not_be_nst0() {
+        let params = IdThunkV2Params {
+            label: "DEV130",
+            uuid: "11111111-2222-3333-4444-555555555555",
+            media_type: "LTO-6",
+            tapectl_version: "0.2.0",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 27,
+            mam_manufacturer: "IBM",
+            mam_serial: "SERIAL1",
+            mam_length: 846,
+            mam_loads: 5,
+            created_at: "2026-07-22T20:09:00Z",
+        };
+        let units = vec![ManifestUnit {
+            name: "alpha".into(),
+            uuid: "uuid-a".into(),
+            snapshot_version: 2,
+            stage_set_id: 7,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: 4,
+                size_bytes: 1_048_576,
+                encrypted_bytes: 1_049_000,
+                sha256_plain: "abc".into(),
+                sha256_encrypted: "def456".into(),
+            }],
+        }];
+
+        for (what, doc) in [
+            ("ID thunk (File 0)", generate_id_thunk_v2(&params)),
+            (
+                "system guide (File 1)",
+                generate_system_guide_v2("DEV130", 27),
+            ),
+            (
+                "RECOVERY.md",
+                generate_recovery_md("DEV130", "alice", &units),
+            ),
+        ] {
+            // The runnable example stays — an heir needs something to type.
+            assert!(
+                doc.contains("/dev/nst0"),
+                "{what} should keep a concrete example device"
+            );
+            // But it must say the example may be wrong, and how to find out.
+            assert!(
+                doc.contains("ls -l /dev/tape/by-id/"),
+                "{what} must tell the heir how to list the real drives"
+            );
+            assert!(
+                doc.contains("example"),
+                "{what} must mark /dev/nst0 as an example, not a fact"
+            );
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ killed. Consequences for this run:
 | # | Item | State |
 |---|---|---|
 | 1 | #133 — RESTORE.sh heir findings (4 defects + the missing test) | **landed** |
-| 2 | #130 — ID thunk and system guide hardcode `mt -f /dev/nst0` | queued |
+| 2 | #130 — ID thunk and system guide hardcode `mt -f /dev/nst0` | **landed** (3 sites, not the 2 named) |
 | 3 | `dl.scenario_b` — bare `import` rebuilds only a volumes row | queued |
 | 4 | `rfc.restore_file_symlink` — `restore file` dereferences symlinks | queued |
 | 5 | #132 — `quick-archive --volume` says only "volume not found" | queued |
@@ -60,6 +60,7 @@ unless it is a regression this run caused, or it blocks a queued item.
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 07:48 | #130 | landed. Caveat added to all THREE heir documents — the issue named two; RECOVERY.md had the same defect. 705 lib tests (+1), gate GREEN 26/26. Settled, not deferred: correcting wrong instructions is not a design fork. Owes the same real-drive pass as #133. |
 | 09-11 07:35 | #133 | landed. 704 lib tests (+2), clippy/fmt clean, gate GREEN 26/26 on `/dev/nst1`. All 3 negative controls confirmed failing pre-fix at distinct assertion lines. **Owes a real-drive confirmation pass** — it changes File 2's bytes; batched to end of queue. |
 
 ## Discoveries
