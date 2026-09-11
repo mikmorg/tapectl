@@ -268,15 +268,6 @@ devcmd() {
     "$@"
 }
 
-# The reason string for work a single reused cartridge cannot support, or the
-# empty string when running with a real library. Passed as restore_matrix's 7th
-# argument so the whole matrix SKIPs rather than failing on a premise the run
-# cannot meet.
-single_cartridge_skip() { # single_cartridge_skip <reason>
-    [ "$SINGLE_CARTRIDGE" = 1 ] && printf 'single-cartridge mode: %s' "$1"
-    return 0
-}
-
 skip() { # skip <check-name> <reason...>
     local name="$1"; shift
     echo "$name: SKIP — $*" | tee -a "$SKIPPED_FILE"
@@ -847,23 +838,16 @@ rm_step_verify() {
 # restore_matrix <label> <unit> <tenant> <expected_src_dir> <tag> [other_tenant]
 # Runs all 10 methods as separate `check`s named "<tag>.<method>". Call
 # after a volume is sealed and while its cartridge is (or can be) reloaded.
-# restore_matrix <label> <unit> <tenant> <src> <tag> [other-tenant] [skip-reason]
+# restore_matrix <label> <unit> <tenant> <src> <tag> [other-tenant]
 #
-# With a 7th argument every check in the matrix becomes a visible SKIP carrying
-# that reason, instead of running and failing. Used for matrices whose premise a
-# single cartridge cannot satisfy (the volume they read was erased to make a
-# later one). A SKIP must never look like a PASS — see SKIPPED.txt.
+# Deliberately has NO "skip this whole matrix" escape hatch. One was added while
+# closing #128, on the premise that quick-archive, collection, tenant-reassign
+# and key-rotation had matrices a single cartridge could not satisfy. Every one
+# of those turned out to be a real bug — a missing escrow step, a missing
+# `volume init`, and #131 — so the hatch was removed. If a matrix fails here,
+# find out why before deciding the media is at fault.
 restore_matrix() {
     RM_LABEL="$1"; RM_UNIT="$2"; RM_TENANT="$3"; RM_SRC="$4"; RM_TAG="$5"; RM_OTHER="${6:-}"
-    local rm_skip="${7:-}"
-    if [ -n "$rm_skip" ]; then
-        local s
-        for s in unit file restore_sh_dd restore_sh_primary restore_sh_backup \
-            operator_envelope escrow raw_volume isolation verify; do
-            check "$RM_TAG.$s" skip "$RM_TAG.$s" "$rm_skip"
-        done
-        return 0
-    fi
     if [ "$DRY_RUN" != 1 ]; then
         RM_WORK="$RUN/matrix-$RM_TAG"; mkdir -p "$RM_WORK"
         if [ -z "$RM_OTHER" ] && [ -d "$HOME_DIR/keys" ]; then
@@ -2127,14 +2111,14 @@ qa_tenants() { TCTL tenant add alice && TCTL tenant add bob; }
 qa_escrow() { TCTL key generate --escrow; }
 
 qa_run() {
-    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
-        # NB: `skip` returns 77, which is falsy — it can never be chained with
-        # `&&`, or the body runs anyway and the check FAILs instead of SKIPping.
-        skip qa.run 'quick-archive runs its own "volume init" with no --force, so it cannot reuse a non-blank cartridge (--erase short leaves unparseable leftover). Passes on mhvtl with --erase long.'
-        return 77
-    fi
     make_source "$SRC/qa-unit" "plain+links" "$CANARY" || return 1
     next_tape VOL-Q || return 1
+    # `quick-archive --volume L` writes to an EXISTING volume; it does not
+    # initialize one. Without this the whole scenario died with "volume not
+    # found: VOL-Q" on every drive, single- or multi-cartridge — which #128 read
+    # as a cartridge-reuse limitation. vinit supplies --force when a cartridge
+    # is being reused.
+    vinit VOL-Q || return 1
     TCTL quick-archive --tenant alice --volume VOL-Q "$SRC/qa-unit" --device "$TAPE_DEV"
 }
 
@@ -2154,8 +2138,7 @@ scenario_quick_archive() {
         [ -n "$qa_unit_name" ] || { echo "qa.unit_name: could not capture the auto-named unit from qa.run's log"; qa_unit_name="qa-unit"; }
     fi
 
-    restore_matrix VOL-Q "$qa_unit_name" alice "$SRC/qa-unit" qa-unit bob \
-        "$(single_cartridge_skip "qa.run was skipped, so VOL-Q was never written")"
+    restore_matrix VOL-Q "$qa_unit_name" alice "$SRC/qa-unit" qa-unit bob
 }
 # ============================================================
 # Scenario: collection
@@ -2175,6 +2158,17 @@ scenario_quick_archive() {
 col_setup() {
     bootstrap_config || return 1
     TCTL tenant add alice || return 1
+    # ADR-0005: staging refuses without an escrow recipient, so this is a
+    # precondition of `collection run`, not optional setup. quick-archive has
+    # always had this step; collection did not, and col.run_batch failed with
+    # "no escrow recipient is registered" on ANY drive — which a
+    # single-cartridge SKIP would have hidden as a media limitation.
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL key generate --escrow
+    else
+        TCTL key generate --escrow >"$RUN/log-col_escrow.txt" 2>&1 || return 1
+        capture_escrow_secret col_escrow
+    fi
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: create 4 folders under \$SRC/col-root; append [[collections]] (name=media, root=\$SRC/col-root, tenant=alice, unit_depth=1) to \$CFG"
         return 0
@@ -2217,10 +2211,6 @@ col_status() { TCTL collection status; }
 col_plan()   { TCTL collection plan; }
 
 col_run_batch() {
-    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
-        skip col.run_batch '"collection run" does its own "volume init" with no --force, so it cannot reuse a non-blank cartridge. Passes on mhvtl with --erase long.'
-        return 77
-    fi
     next_tape VOL-COL1 || return 1
     vinit VOL-COL1 || return 1
     TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV"
@@ -2244,11 +2234,33 @@ col_add_and_rename() {
     [ "$n" = 5 ] || { echo "expected 5 units after adding a folder + renaming another (rename resolved by dotfile uuid), got $n"; return 1; }
 }
 
+# The 5th folder added by col_add_and_rename must be registered AND counted as
+# pending.
+#
+# This used to grep `collection status --json` for "echo". That output carries
+# only aggregate per-collection counts — it has never contained a unit name in
+# either the json or the text form — so the check could not pass whatever the
+# tool did. Assert each half against a command that actually reports it:
+# `unit list` for registration, the pending count for state.
 col_status_shows_new_pending() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl collection status --json (assert media/echo shown pending)"; return 0; }
-    local logf="$RUN/log-col.status2.json"
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: unit list names media/echo; collection status --json reports 5 pending"; return 0; }
+    local logf="$RUN/log-col.status2.json" units="$RUN/log-col.status2.units.txt"
+    TCTL unit list >"$units" 2>&1 || { cat "$units"; return 1; }
+    grep -q 'media/echo' "$units" || {
+        echo "media/echo was not registered by collection sync:"; cat "$units"; return 1; }
+    local n; n="$(grep -cE 'media/[a-z]+' "$units")"
+    [ "$n" -eq 5 ] || { echo "expected 5 units in collection media after add+rename, got $n:"; cat "$units"; return 1; }
     TCTL collection status --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
-    grep -q "echo" "$logf" || { echo "media/echo not shown as pending in collection status:"; cat "$logf"; return 1; }
+    # `pending` moves as units get staged/written, so assert the collection is
+    # tracked and still short of full coverage rather than pinning a count that
+    # legitimately varies between a single- and multi-cartridge run.
+    python3 - "$logf" <<'PY2' || { echo "collection status did not report media as under-copied:"; cat "$logf"; return 1; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+media = next((c for c in d if c.get("collection") == "media"), None)
+assert media is not None, d
+assert media.get("under_copied", 0) >= 1, media
+PY2
 }
 
 scenario_collection() {
@@ -2258,10 +2270,8 @@ scenario_collection() {
     check col.plan                  col_plan
     check col.run_batch             col_run_batch
 
-    restore_matrix VOL-COL1 media/alpha alice "$SRC/col-root/alpha" col-alpha "" \
-        "$(single_cartridge_skip "col.run_batch was skipped, so VOL-COL1 was never written")"
-    restore_matrix VOL-COL1 media/bravo alice "$SRC/col-root/bravo" col-bravo "" \
-        "$(single_cartridge_skip "col.run_batch was skipped, so VOL-COL1 was never written")"
+    restore_matrix VOL-COL1 media/alpha alice "$SRC/col-root/alpha" col-alpha
+    restore_matrix VOL-COL1 media/bravo alice "$SRC/col-root/bravo" col-bravo
 
     check col.add_and_rename        col_add_and_rename
     check col.status_shows_new_pending col_status_shows_new_pending

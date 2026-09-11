@@ -1169,3 +1169,112 @@ the on-tape recovery instructions (#130, unfixed, frozen bytes), and this test
 harness (`73aa72c`). All three shared one shape: a `/dev/nst0` default that was
 correct only by coincidence of enumeration order.
 
+
+---
+
+## Phase 8 — mhvtl as a single-cartridge testbed, and what it found
+
+With mhvtl healthy again, single-cartridge semantics can be reproduced there
+instead of on the real cartridge: `--single-cartridge --erase short` on
+`/dev/nst1`. Fast, repeatable, and no physical media at risk. That became the
+loop for closing out #128/#129 and for finding #131.
+
+### Run-to-run
+
+| run | passed | failed | skipped | note |
+|---|---|---|---|---|
+| real LTO-6, 2026-09-10 | 213 | 67 | 26 | the original `--all` |
+| mhvtl single-cartridge #1 | 115 | 136 | 55 | worse — a regression I had just introduced |
+| mhvtl single-cartridge #2 | 224 | 26 | 56 | after the config-guard fix |
+| mhvtl single-cartridge #3 | 246 | 3 | 57 | after the permute fixes |
+
+### A regression I introduced and the suite caught
+
+`init` writing a commented `[[backends.lto]]` example (#124b) broke both the
+lifecycle suite and the gate. Each decided whether to append its own backend
+with a plain substring test — `if '[[backends.lto]]' not in t` — which the
+commented example satisfies. Neither appended a real backend, so every tape
+operation died with `no LTO backend configured`. That is the 136-failure run.
+
+Both now match an uncommented table header with an anchored regex (`283c15a`).
+Worth recording as a general hazard: **a commented example in a config file is a
+trap for any consumer that greps instead of parsing.** Those two were the only
+such consumers in the tree; I checked.
+
+### The permute scenario was blaming tapectl for its own damage
+
+19 of the 26 remaining failures were permute invariants reporting `audit exited
+2 ... with non-copy_count violations`. None were tapectl defects:
+
+- `mutate_source` was mutating `.tapectl-unit.toml` — tapectl's own control
+  file, not user content. `modify` flips byte 0, turning `[unit]` into `\unit]`.
+  Audit then correctly reported `policy_unresolvable` for that unit for the rest
+  of the walk, and only the mutating step tolerated it, so every later step
+  failed on damage the walk itself had caused.
+- The permute audit json was written to one path, overwritten each step, with
+  `2>&1` folding stderr in — so the only surviving evidence was the last step's,
+  and any stray stderr line would make it unparseable, which the helper reports
+  as a policy violation. Now per-step, stderr separate, and the failure dumps
+  the actual json rather than asserting a cause.
+- `restore-latest-and-diff` compared the tape against a source copy taken at
+  **write** time, but a volume is written from a stage set built earlier — so
+  any mutation in between produced a false mismatch. The baseline is now
+  captured at **stage** time. This check could not pass in single-cartridge mode
+  before; it now runs and passes.
+
+Permute went 59/19/6 → 77/0/7 (`6f513cc`).
+
+### #131 — the real defect underneath #128
+
+#128 assumed the remaining `tenant-reassign` and `key-rotation` failures needed
+a second cartridge. Running those scenarios **multi-cartridge** (`--erase long`,
+no `--single-cartridge`) reproduced them exactly, which disproves that — and
+converting them to SKIP, as #128 proposed, would have buried a real bug.
+
+The failure signature pointed elsewhere: `.unit` PASS (DB-driven restore),
+`.escrow` PASS, `.restore_sh_dd` PASS — but bob's keys failed via RESTORE.sh.
+That is a recipient problem on the *current* volume, not a missing tape.
+
+VOL-D carries `photos` twice: staged once before `tenant reassign alice -> bob`
+and once after, so with different recipients.
+
+| stage set | unit | owner now | encrypted to |
+|---|---|---|---|
+| 1 | photos | bob | alice |
+| 4 | photos | bob | bob |
+
+`RESTORE.sh --unit photos` collected the slices of **every** `[[units]]` block
+named `photos` and handed the concatenation to dar:
+
+```
+>>> Decrypted envelope at file 4
+>>> Parsing slices for unit: photos
+>>> 2 slice(s) to read          <- both versions
+>>> Slice 1/2 — tape file 20    <- the ALICE-era slice
+age: error: no identity matched any of the recipients
+FATAL: cannot decrypt slice 1 — wrong key?
+```
+
+Bob's key was right; the slice was the wrong one. **Heir-path only** — `tapectl
+restore unit` passes on the same tape because it trial-decrypts with every key
+in the DB. So it surfaces precisely in the emergency the heir kit exists for,
+and it is not reassignment-specific: any volume holding two versions of a unit
+hits it, where the slices are all decryptable and dar is simply handed two
+archives spliced together.
+
+Fixed in `9fca382`: the manifest already carried `snapshot_version` per entry,
+so no format change — RESTORE.sh now restores one version (newest by default,
+`--version N` to choose) and announces which, because silently picking among
+several is how an heir recovers stale data believing it is current.
+
+  tenant-reassign  15/3 → **18/18**
+  key-rotation     11/1 → **12/12**
+  gate             GREEN 26/26 throughout
+
+The suite's isolation check had the same version-blindness — it took the first
+slice by `slice_number` across all stage sets, so it could test a slice staged
+under a *previous* owner, which that owner's key legitimately still opens:
+sealed media cannot be retroactively re-encrypted. It now tests the current
+version. Whether a former tenant retaining access to pre-reassignment slices is
+acceptable is a real question, left open in #131 rather than decided by accident
+in a test helper.
