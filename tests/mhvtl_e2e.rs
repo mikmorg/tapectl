@@ -632,7 +632,8 @@ fn mhvtl_volume_identify() {
     let label = "MHVTLC";
     let _h = write_volume("identify", label, &[("alice", "alice-u", 1)]);
 
-    let id = volume::write::volume_identify(&tape_dev(), BLOCK_SIZE).unwrap();
+    let mut store = TapeStore::open_read(&tape_dev(), BLOCK_SIZE).unwrap();
+    let id = volume::write::volume_identify(&mut store).unwrap();
     assert!(id.contains(label), "id thunk missing label: {id}");
     assert!(id.contains("TAPECTL"), "id thunk missing header: {id}");
 }
