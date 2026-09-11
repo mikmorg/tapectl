@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::db::events;
@@ -45,30 +46,27 @@ pub enum CartridgeCommands {
     },
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct CartridgeRow {
     #[tabled(rename = "Barcode")]
     barcode: String,
     #[tabled(rename = "Type")]
+    #[serde(skip)]
     media_type: String,
     #[tabled(rename = "Status")]
     status: String,
     #[tabled(rename = "Loads")]
+    #[serde(skip)]
     loads: String,
     #[tabled(rename = "Volume")]
+    #[serde(skip)]
     volume: String,
 }
 
-/// `cartridge list --json` shape, extracted verbatim from the inline closure
-/// so it is a single seam pinned by a unit test (issue: C2 row-listing
-/// drift). `media_type`/`loads`/`volume` have no JSON counterpart today and
-/// none is added here.
+/// `cartridge list --json` shape. `media_type`/`loads`/`volume` have no
+/// JSON counterpart today and none is added here.
 fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| serde_json::json!({"barcode": r.barcode, "status": r.status}))
-            .collect(),
-    )
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(

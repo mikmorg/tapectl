@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
@@ -70,7 +71,7 @@ pub enum SnapshotCommands {
     },
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct SnapshotRow {
     #[tabled(rename = "ID")]
     id: i64,
@@ -81,25 +82,20 @@ struct SnapshotRow {
     #[tabled(rename = "Status")]
     status: String,
     #[tabled(rename = "Files")]
+    #[serde(skip)]
     files: String,
     #[tabled(rename = "Size")]
+    #[serde(skip)]
     size: String,
     #[tabled(rename = "Created")]
+    #[serde(skip)]
     created: String,
 }
 
-/// `snapshot list --json` shape, extracted verbatim from the inline closure
-/// so it is a single seam pinned by a unit test (issue: C2 row-listing
-/// drift). `files`/`size`/`created` have no JSON counterpart today and none
-/// is added here.
+/// `snapshot list --json` shape. `files`/`size`/`created` have no JSON
+/// counterpart today and none is added here.
 fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| {
-                serde_json::json!({"id": r.id, "unit": r.unit, "version": r.version, "status": r.status})
-            })
-            .collect(),
-    )
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(

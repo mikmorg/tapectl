@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::db::events;
@@ -38,7 +39,7 @@ pub enum LocationCommands {
     },
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct LocationRow {
     #[tabled(rename = "Name")]
     name: String,
@@ -54,19 +55,10 @@ struct LocationRow {
     description: String,
 }
 
-/// `location list --json` shape, extracted verbatim from the inline closure
-/// so it is a single seam pinned by a unit test (issue: C2 row-listing
-/// drift). Every table column already has a JSON counterpart here.
+/// `location list --json` shape. Every table column already has a JSON
+/// counterpart here.
 fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| {
-                serde_json::json!({"name": r.name, "kind": r.kind,
-                      "volumes": r.volumes, "deposits": r.deposits,
-                      "description": r.description})
-            })
-            .collect(),
-    )
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> Result<()> {

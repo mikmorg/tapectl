@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::Config;
@@ -141,32 +142,27 @@ pub enum ArchiveSetCommands {
     Sync,
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct ArchiveSetRow {
     #[tabled(rename = "Name")]
     name: String,
     #[tabled(rename = "Copies")]
     min_copies: String,
     #[tabled(rename = "Locations")]
+    #[serde(skip)]
     locations: String,
     #[tabled(rename = "Verify Days")]
+    #[serde(skip)]
     verify_days: String,
     #[tabled(rename = "Units")]
+    #[serde(rename = "units")]
     unit_count: i64,
 }
 
-/// `archive-set list --json` shape, extracted verbatim from the inline
-/// closure so it is a single seam pinned by a unit test (issue: C2
-/// row-listing drift). `locations`/`verify_days` have no JSON counterpart
-/// today and none is added here.
+/// `archive-set list --json` shape. `locations`/`verify_days` have no JSON
+/// counterpart today and none is added here.
 fn archive_set_rows_to_json(rows: &[ArchiveSetRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| {
-                serde_json::json!({"name": r.name, "min_copies": r.min_copies, "units": r.unit_count})
-            })
-            .collect(),
-    )
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(

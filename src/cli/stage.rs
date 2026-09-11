@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
@@ -40,7 +41,7 @@ pub enum StageCommands {
     },
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct StageRow {
     #[tabled(rename = "ID")]
     id: i64,
@@ -53,26 +54,17 @@ struct StageRow {
     #[tabled(rename = "Slices")]
     slices: String,
     #[tabled(rename = "Encrypted")]
+    #[serde(skip)]
     encrypted_size: String,
     #[tabled(rename = "Staged At")]
+    #[serde(skip)]
     staged_at: String,
 }
 
-/// `stage list --json` shape, extracted verbatim from the inline closure so
-/// it is a single seam pinned by a unit test (issue: C2 row-listing drift).
-/// `encrypted_size`/`staged_at` have no JSON counterpart today and none is
-/// added here.
+/// `stage list --json` shape. `encrypted_size`/`staged_at` have no JSON
+/// counterpart today and none is added here.
 fn stage_rows_to_json(rows: &[StageRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.id, "unit": r.unit, "version": r.version,
-                    "status": r.status, "slices": r.slices,
-                })
-            })
-            .collect(),
-    )
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(
