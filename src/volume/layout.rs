@@ -2325,12 +2325,33 @@ snapshot_version = 1
     /// argument loop both sit ahead of it — so this needs no device.
     #[test]
     fn restore_sh_reports_bad_invocations_instead_of_exiting_quietly() {
+        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let dir = std::env::temp_dir().join(format!("tapectl-argv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sh = dir.join("RESTORE.sh");
         std::fs::write(&sh, generate_restore_script_v2("ARGV1", 20)).unwrap();
+
+        // The script's prerequisite loop refuses to run without mt/age/dar, and
+        // CI has none of them — it died with "missing required tool: age"
+        // before reaching the dispatch under test. Stub every required tool on
+        // PATH instead of installing tape software into CI: argv handling has
+        // nothing to do with those binaries, and none of the paths exercised
+        // here ever runs one. `command -v` only checks for an executable file,
+        // so the stubs are never executed either.
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["mt", "dd", "age", "dar", "sha256sum", "head", "truncate"] {
+            let stub = bin.join(tool);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
 
         // Invoked as `bash RESTORE.sh`, not exec'd. A script written moments
         // earlier and then exec'd hits ETXTBSY whenever a sibling test thread
@@ -2340,6 +2361,7 @@ snapshot_version = 1
             let o = Command::new("bash")
                 .arg(&sh)
                 .args(args)
+                .env("PATH", &path)
                 .output()
                 .expect("spawn script");
             let mut text = String::from_utf8_lossy(&o.stdout).to_string();
