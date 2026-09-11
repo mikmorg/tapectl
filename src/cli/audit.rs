@@ -5,6 +5,11 @@ use crate::error::Result;
 use crate::policy;
 
 /// Run policy compliance audit. Returns exit code: 0=clean, 1=warnings, 2=violations.
+/// Unit statuses whose coverage, encryption, verification-age and escrow
+/// checks `audit` runs (issue #138). The dirty scan scopes itself to
+/// `active` inside `report::dirty_rows` and is not governed by this list.
+const AUDITED_STATUSES: &[&str] = &["active", "tape_only", "missing"];
+
 pub fn run(
     conn: &Connection,
     config: &Config,
@@ -121,13 +126,40 @@ fn collect_findings(
     // caught earlier, at stage time (#115).
     let escrow_pubkey = crate::db::queries::escrow_public_key(conn)?;
 
-    // Get units to audit
+    // Get units to audit.
+    //
+    // Scope is PER CHECK, not per command (issue #138). From Milestone 6
+    // until then this selected `status = 'active'` only, which made every
+    // `tape_only` unit invisible to every check below — measured: the same
+    // three one-copy units reported 3 `copy_count` violations as `active`
+    // and 0 as `tape_only`. `tape_only` means "the source is deleted; the
+    // tape is all there is", which is the moment copy count matters most,
+    // and `mark-tape-only` enforces `min_copies_for_tape_only` exactly
+    // once, at marking. The knob named for tape-only units was applied to
+    // every unit except tape-only ones.
+    //
+    // | check                         | active | tape_only | missing | retired |
+    // |-------------------------------|--------|-----------|---------|---------|
+    // | dirty scan (walks the source) | yes    | no        | no      | no      |
+    // | copy count / locations / whs  | yes    | yes       | yes     | no      |
+    // | encryption compliance         | yes    | yes       | yes     | no      |
+    // | verification age              | yes    | yes       | yes     | no      |
+    // | escrow coverage               | yes    | yes       | yes     | no      |
+    //
+    // The dirty scan needs no gate here: `report::dirty_rows` derives its
+    // own unit set from `list_units(.., Some("active"))`, so a tape-only or
+    // missing unit is simply absent from `dirty_rows` and the lookup below
+    // finds nothing. `missing` ("source path gone, not yet declared
+    // tape-only") is the same situation with less paperwork. `retired` is
+    // out: it is the operator saying the unit no longer matters.
     let units = if let Some(name) = unit_filter {
         let unit = crate::db::queries::get_unit_by_name(conn, name)?
             .ok_or_else(|| crate::error::TapectlError::UnitNotFound(name.to_string()))?;
         vec![unit]
     } else {
-        crate::db::queries::list_units(conn, None, Some("active"))?
+        let mut all = crate::db::queries::list_units(conn, None, None)?;
+        all.retain(|u| AUDITED_STATUSES.contains(&u.status.as_str()));
+        all
     };
 
     // Dirty scan (design §2.20): computed once for all units (or the one
@@ -751,6 +783,56 @@ mod tests {
         .unwrap();
 
         (conn, unit_id)
+    }
+
+    /// Issue #138 — the measurement that found it, verbatim. The same
+    /// one-copy unit MUST keep reporting `copy_count` after it is marked
+    /// `tape_only` (the source is deleted; the tape is all there is) or
+    /// `missing`. From Milestone 6 until #138 it silently stopped.
+    #[test]
+    fn a_tape_only_unit_is_still_audited_for_copy_count() {
+        for status in ["tape_only", "missing"] {
+            // Second volume `retired`, so exactly one copy counts.
+            let (conn, unit_id) = setup_unit_with_two_volumes(&format!("u-{status}"), "retired");
+            let before = collect_findings(&conn, &Config::default(), None).unwrap();
+            assert!(
+                before.0.iter().any(|f| f.check == "copy_count"),
+                "precondition: an active one-copy unit violates min_copies=2"
+            );
+
+            conn.execute(
+                "UPDATE units SET status = ?1 WHERE id = ?2",
+                params![status, unit_id],
+            )
+            .unwrap();
+            let after = collect_findings(&conn, &Config::default(), None).unwrap();
+            assert!(
+                after.0.iter().any(|f| f.check == "copy_count"),
+                "a `{status}` unit with one copy fell out of the copy_count check: \
+                 violations={:?}",
+                after.0.iter().map(|f| &f.check).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// `retired` is the operator saying the unit no longer matters; it is
+    /// the one status the coverage checks leave alone.
+    #[test]
+    fn a_retired_unit_is_not_audited() {
+        let (conn, unit_id) = setup_unit_with_two_volumes("u-retired", "retired");
+        conn.execute(
+            "UPDATE units SET status = 'retired' WHERE id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        assert!(
+            violations
+                .iter()
+                .chain(warnings.iter())
+                .all(|f| f.unit != "u-retired"),
+            "a retired unit produced findings"
+        );
     }
 
     /// Issue #73 / ADR-0006: a recorded warehouse deposit is a copy and a
