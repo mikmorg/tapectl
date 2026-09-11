@@ -1,15 +1,11 @@
 use rusqlite::{params, Connection};
 
 use crate::config::Config;
+use crate::db::models::Unit;
 use crate::error::Result;
-use crate::policy;
+use crate::policy::{self, ResolvedPolicy};
 
 /// Run policy compliance audit. Returns exit code: 0=clean, 1=warnings, 2=violations.
-/// Unit statuses whose coverage, encryption, verification-age and escrow
-/// checks `audit` runs (issue #138). The dirty scan scopes itself to
-/// `active` inside `report::dirty_rows` and is not governed by this list.
-const AUDITED_STATUSES: &[&str] = &["active", "tape_only", "missing"];
-
 pub fn run(
     conn: &Connection,
     config: &Config,
@@ -107,6 +103,177 @@ fn render(
     out
 }
 
+/// Every per-unit check's `statuses` except `dirty` (issue #138): `active`,
+/// `tape_only` and `missing` are audited; `retired` never is. `tape_only`
+/// means "the source is deleted; the tape is all there is", which is the
+/// moment coverage/encryption/verify-age/escrow matter most, and `missing`
+/// ("source path gone, not yet declared tape-only") is the same situation
+/// with less paperwork.
+const ACTIVE_TAPE_ONLY_MISSING: &[&str] = &["active", "tape_only", "missing"];
+
+/// Everything a check function reads, gathered once per [`collect_findings`]
+/// call so no check needs its own `conn.prepare` boilerplate for context
+/// that is identical across every check.
+struct Ctx<'a> {
+    conn: &'a Connection,
+    config: &'a Config,
+    /// The registered escrow public key (ADR-0005), if any.
+    escrow: Option<&'a str>,
+    /// `report::dirty_rows`'s scan, computed once for all units.
+    dirty_rows: &'a [crate::cli::report::DirtyRow],
+    unit_filter: Option<&'a str>,
+}
+
+/// One check's contribution to the audit's finding lists.
+#[derive(Default)]
+struct Findings {
+    violations: Vec<AuditFinding>,
+    warnings: Vec<AuditFinding>,
+}
+
+impl Findings {
+    fn extend_into(self, violations: &mut Vec<AuditFinding>, warnings: &mut Vec<AuditFinding>) {
+        violations.extend(self.violations);
+        warnings.extend(self.warnings);
+    }
+}
+
+type PerUnitFn = fn(&Ctx<'_>, &Unit, Option<&ResolvedPolicy>) -> Result<Findings>;
+type ArchiveFn = fn(&Ctx<'_>) -> Result<Findings>;
+
+/// The two shapes a check comes in (issue #138 / C4 architecture review):
+/// most checks read one unit (and usually its resolved policy); three read
+/// the whole archive and run once regardless of how many units exist.
+enum Scope {
+    PerUnit {
+        /// Unit statuses this check runs for.
+        statuses: &'static [&'static str],
+        /// Whether the runner passes `Some(&resolved)` (true) or `None`
+        /// (false) as the third argument — a check that never reads policy
+        /// gets `None`, so its own signature honestly shows it does not
+        /// depend on any particular resolved value.
+        needs_policy: bool,
+        run: PerUnitFn,
+    },
+    Archive {
+        run: ArchiveFn,
+    },
+}
+
+struct Check {
+    // Read by `#[cfg(test)]` code (the table-shape tests below) and kept
+    // for self-documentation and a future `--only <check>` filter (out of
+    // scope here) — never by the production runner itself, so the plain
+    // `--lib`/`--bins` build sees it as unread.
+    #[allow(dead_code)]
+    name: &'static str,
+    scope: Scope,
+}
+
+/// The checks `audit` runs and their scope, as data. Before this table
+/// existed, real per-check scope lived only in a comment here (issue #138:
+/// the code instead selected units with one command-wide filter, which is
+/// how every `tape_only` unit went invisible to every check for a whole
+/// milestone) while [`collect_findings`] ran every check inline in one
+/// per-unit loop. Now the table below IS the scope, and the loop in
+/// [`collect_findings`] just reads it. `policy_unresolvable` is not a row:
+/// it is what the runner itself emits when `policy::resolve` fails, in
+/// place of running any row in this table for that unit — see
+/// [`collect_findings`].
+const CHECKS: &[Check] = &[
+    Check {
+        name: "copy_count",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: true,
+            run: check_copy_count,
+        },
+    },
+    Check {
+        name: "warehouse_copies",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: true,
+            run: check_warehouse_copies,
+        },
+    },
+    Check {
+        name: "location_presence",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: true,
+            run: check_location_presence,
+        },
+    },
+    Check {
+        name: "verify_age",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: true,
+            run: check_verify_age,
+        },
+    },
+    Check {
+        name: "escrow_coverage",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: false,
+            run: check_escrow_coverage,
+        },
+    },
+    Check {
+        name: "no_archive",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: false,
+            run: check_no_archive,
+        },
+    },
+    Check {
+        name: "dirty",
+        scope: Scope::PerUnit {
+            // `report::dirty_rows` derives its own unit set from
+            // `list_units(.., Some("active"))`, so this was already the
+            // effective scope (a tape-only/missing unit was simply absent
+            // from `dirty_rows` and the lookup found nothing) — now it is
+            // the enforced one too.
+            statuses: &["active"],
+            needs_policy: false,
+            run: check_dirty,
+        },
+    },
+    Check {
+        name: "encryption",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: true,
+            run: check_encryption,
+        },
+    },
+    Check {
+        name: "compaction_candidate",
+        scope: Scope::Archive {
+            run: check_compaction_candidate,
+        },
+    },
+    Check {
+        // Umbrella name for a single check whose one function
+        // (`escrow_kit_findings`) emits one of two mutually exclusive
+        // finding names, `escrow_kit_missing` or `escrow_kit_stale`,
+        // depending which condition it finds (see that function).
+        name: "escrow_kit",
+        scope: Scope::Archive {
+            run: check_escrow_kit,
+        },
+    },
+    Check {
+        name: "escrow_identity_mismatch",
+        scope: Scope::Archive {
+            run: check_escrow_identity_mismatch,
+        },
+    },
+];
+
 /// Collect every audit finding for `unit_filter` (or all active units),
 /// split into (violations, warnings). Extracted from [`run`] so tests can
 /// assert on the actual finding set — `check` names, counts, which unit —
@@ -126,39 +293,28 @@ fn collect_findings(
     // caught earlier, at stage time (#115).
     let escrow_pubkey = crate::db::queries::escrow_public_key(conn)?;
 
-    // Get units to audit.
-    //
-    // Scope is PER CHECK, not per command (issue #138). From Milestone 6
-    // until then this selected `status = 'active'` only, which made every
-    // `tape_only` unit invisible to every check below — measured: the same
-    // three one-copy units reported 3 `copy_count` violations as `active`
-    // and 0 as `tape_only`. `tape_only` means "the source is deleted; the
-    // tape is all there is", which is the moment copy count matters most,
-    // and `mark-tape-only` enforces `min_copies_for_tape_only` exactly
-    // once, at marking. The knob named for tape-only units was applied to
-    // every unit except tape-only ones.
-    //
-    // | check                         | active | tape_only | missing | retired |
-    // |-------------------------------|--------|-----------|---------|---------|
-    // | dirty scan (walks the source) | yes    | no        | no      | no      |
-    // | copy count / locations / whs  | yes    | yes       | yes     | no      |
-    // | encryption compliance         | yes    | yes       | yes     | no      |
-    // | verification age              | yes    | yes       | yes     | no      |
-    // | escrow coverage               | yes    | yes       | yes     | no      |
-    //
-    // The dirty scan needs no gate here: `report::dirty_rows` derives its
-    // own unit set from `list_units(.., Some("active"))`, so a tape-only or
-    // missing unit is simply absent from `dirty_rows` and the lookup below
-    // finds nothing. `missing` ("source path gone, not yet declared
-    // tape-only") is the same situation with less paperwork. `retired` is
-    // out: it is the operator saying the unit no longer matters.
+    // Get units to audit. Scope is PER CHECK (issue #138) — see `CHECKS`
+    // above. With no single unit named, the candidate set is the union of
+    // every `PerUnit` check's `statuses`, so a unit invisible to every
+    // check never even has its policy resolved. An explicitly named unit
+    // (`--unit`) bypasses this filter entirely, as before: naming a unit
+    // always resolves its policy, even if its status then matches none of
+    // today's checks.
     let units = if let Some(name) = unit_filter {
         let unit = crate::db::queries::get_unit_by_name(conn, name)?
             .ok_or_else(|| crate::error::TapectlError::UnitNotFound(name.to_string()))?;
         vec![unit]
     } else {
+        let audited: std::collections::BTreeSet<&str> = CHECKS
+            .iter()
+            .filter_map(|c| match &c.scope {
+                Scope::PerUnit { statuses, .. } => Some(statuses.iter().copied()),
+                Scope::Archive { .. } => None,
+            })
+            .flatten()
+            .collect();
         let mut all = crate::db::queries::list_units(conn, None, None)?;
-        all.retain(|u| AUDITED_STATUSES.contains(&u.status.as_str()));
+        all.retain(|u| audited.contains(u.status.as_str()));
         all
     };
 
@@ -169,6 +325,14 @@ fn collect_findings(
     // discipline: one predicate, one place).
     let dirty_rows =
         crate::cli::report::dirty_rows(conn, unit_filter, &config.defaults.global_excludes)?;
+
+    let ctx = Ctx {
+        conn,
+        config,
+        escrow: escrow_pubkey.as_deref(),
+        dirty_rows: &dirty_rows,
+        unit_filter,
+    };
 
     for unit in &units {
         // `audit` is advisory, never blocking (design: exit 0=clean,
@@ -183,7 +347,11 @@ fn collect_findings(
         // location_presence, verify_age, encryption) is skipped for this
         // unit — and that gap is itself reported as a VIOLATION (an
         // unreadable policy is strictly worse than a known-noncompliant
-        // unit, because the tool cannot even tell).
+        // unit, because the tool cannot even tell). This skips every OTHER
+        // per-unit check for the unit too, not only the policy-dependent
+        // ones — that was already true before this change (a `continue`
+        // out of the whole per-unit loop body) and stays true now: no
+        // `CHECKS` row runs for this unit at all.
         let resolved = match policy::resolve(conn, config, unit) {
             Ok(r) => r,
             Err(e) => {
@@ -217,273 +385,355 @@ fn collect_findings(
             }
         };
 
-        // Check copy count. Routes through the same ADR-0004 eligibility
-        // predicate (issue #89) the gates use, so `audit` and `unit
-        // mark-tape-only`/`snapshot mark-reclaimable` can never disagree
-        // about how many copies a unit has.
-        let copy_count = copy_count_for_unit(conn, unit.id)?;
+        for check in CHECKS {
+            if let Scope::PerUnit {
+                statuses,
+                needs_policy,
+                run,
+            } = &check.scope
+            {
+                if statuses.contains(&unit.status.as_str()) {
+                    let policy_arg = if *needs_policy { Some(&resolved) } else { None };
+                    run(&ctx, unit, policy_arg)?.extend_into(&mut violations, &mut warnings);
+                }
+            }
+        }
+    }
 
-        if copy_count < resolved.min_copies as i64 {
-            violations.push(AuditFinding {
+    // Archive-wide checks (volume-level or archive-level, not per-unit): run
+    // once, in table order, and only when auditing the whole archive — an
+    // explicitly named unit (`--unit`) must not also report on every other
+    // unit's volumes (unchanged from before this table existed).
+    if ctx.unit_filter.is_none() {
+        for check in CHECKS {
+            if let Scope::Archive { run } = &check.scope {
+                run(&ctx)?.extend_into(&mut violations, &mut warnings);
+            }
+        }
+    }
+
+    Ok((violations, warnings))
+}
+
+// Check copy count. Routes through the same ADR-0004 eligibility predicate
+// (issue #89) the gates use, so `audit` and `unit
+// mark-tape-only`/`snapshot mark-reclaimable` can never disagree about how
+// many copies a unit has.
+fn check_copy_count(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let resolved = policy.expect("copy_count is a needs_policy check");
+    let mut f = Findings::default();
+    let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
+
+    if copy_count < resolved.min_copies {
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "copy_count".into(),
+            message: format!("has {copy_count} copies, needs {}", resolved.min_copies),
+            action: format!(
+                "tapectl stage create {} && tapectl volume write <LABEL>",
+                unit.name
+            ),
+        });
+    }
+    Ok(f)
+}
+
+// Check warehouse copies (ADR-0006, issue #73). VIOLATION, not warning, and
+// for the same reason the copy-count shortfall above is one: it is the
+// identical failure -- fewer durable copies than policy demands -- and it
+// can only fire when an operator has explicitly set `warehouse_copies > 0`
+// somewhere in the chain (the default is 0, so an all-tape fleet never sees
+// this check). ADR-0004 is not weakened: `audit` remains advisory, exit
+// code 2 as before, nothing is gated or refused.
+fn check_warehouse_copies(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let resolved = policy.expect("warehouse_copies is a needs_policy check");
+    let mut f = Findings::default();
+    if resolved.warehouse_copies > 0 {
+        let deposits = deposit_count_for_unit(ctx.conn, unit.id)?;
+        if deposits < resolved.warehouse_copies {
+            f.violations.push(AuditFinding {
                 unit: unit.name.clone(),
-                check: "copy_count".into(),
-                message: format!("has {copy_count} copies, needs {}", resolved.min_copies),
-                action: format!(
-                    "tapectl stage create {} && tapectl volume write <LABEL>",
-                    unit.name
+                check: "warehouse_copies".into(),
+                message: format!(
+                    "has {deposits} warehouse deposit(s), needs {}",
+                    resolved.warehouse_copies
                 ),
+                action: "copy the volume's bytes out by the documented external procedure, then: tapectl volume deposit add <LABEL> --to <warehouse-location>"
+                    .to_string(),
             });
         }
+    }
+    Ok(f)
+}
 
-        // Check warehouse copies (ADR-0006, issue #73). VIOLATION, not
-        // warning, and for the same reason the copy-count shortfall above
-        // is one: it is the identical failure -- fewer durable copies than
-        // policy demands -- and it can only fire when an operator has
-        // explicitly set `warehouse_copies > 0` somewhere in the chain
-        // (the default is 0, so an all-tape fleet never sees this check).
-        // ADR-0004 is not weakened: `audit` remains advisory, exit code 2
-        // as before, nothing is gated or refused.
-        if resolved.warehouse_copies > 0 {
-            let deposits = deposit_count_for_unit(conn, unit.id)?;
-            if deposits < resolved.warehouse_copies {
-                violations.push(AuditFinding {
-                    unit: unit.name.clone(),
-                    check: "warehouse_copies".into(),
-                    message: format!(
-                        "has {deposits} warehouse deposit(s), needs {}",
-                        resolved.warehouse_copies
-                    ),
-                    action: "copy the volume's bytes out by the documented external procedure, then: tapectl volume deposit add <LABEL> --to <warehouse-location>"
-                        .to_string(),
-                });
-            }
+// Check location presence.
+fn check_location_presence(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let resolved = policy.expect("location_presence is a needs_policy check");
+    let mut f = Findings::default();
+    let location_count = location_count_for_unit(ctx.conn, unit.id)?;
+
+    if !resolved.required_locations.is_empty() {
+        let needed = resolved.required_locations.len() as i64;
+        if location_count < needed {
+            f.violations.push(AuditFinding {
+                unit: unit.name.clone(),
+                check: "location_presence".into(),
+                message: format!(
+                    "in {location_count} locations, needs {needed} ({:?})",
+                    resolved.required_locations
+                ),
+                action: "tapectl volume write <LABEL> (at missing location)".to_string(),
+            });
         }
+    }
+    Ok(f)
+}
 
-        // Check location presence
-        let location_count = location_count_for_unit(conn, unit.id)?;
-
-        if !resolved.required_locations.is_empty() {
-            let needed = resolved.required_locations.len() as i64;
-            if location_count < needed {
-                violations.push(AuditFinding {
-                    unit: unit.name.clone(),
-                    check: "location_presence".into(),
-                    message: format!(
-                        "in {location_count} locations, needs {needed} ({:?})",
-                        resolved.required_locations
-                    ),
-                    action: "tapectl volume write <LABEL> (at missing location)".to_string(),
-                });
-            }
-        }
-
-        // Check verification age
-        if let Some(verify_days) = resolved.verify_interval_days {
-            let last_verify: Option<String> = conn
-                .query_row(
-                    "SELECT MAX(vs.completed_at)
-                     FROM verification_sessions vs
-                     JOIN writes w ON w.volume_id = vs.volume_id
-                     JOIN stage_sets ss ON ss.id = w.stage_set_id
-                     JOIN snapshots s ON s.id = ss.snapshot_id
-                     WHERE s.unit_id = ?1 AND vs.outcome = 'passed'",
-                    params![unit.id],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-
-            let overdue = if let Some(ref last) = last_verify {
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
-                    let age = chrono::Utc::now().naive_utc() - dt;
-                    age.num_days() > verify_days
-                } else {
-                    true
-                }
-            } else {
-                copy_count > 0 // only warn if there are copies to verify
-            };
-
-            if overdue {
-                warnings.push(AuditFinding {
-                    unit: unit.name.clone(),
-                    check: "verify_age".into(),
-                    message: format!(
-                        "not verified within {verify_days} days (last: {})",
-                        last_verify.as_deref().unwrap_or("never")
-                    ),
-                    action: "tapectl volume verify <LABEL>".to_string(),
-                });
-            }
-        }
-
-        // ESCROW COVERAGE (#125, follow-up to #115).
-        //
-        // #115 stops new writes from sealing slices the escrow key cannot open.
-        // It cannot help volumes already written — and ADR-0005 explicitly
-        // permits swapping in a fresh escrow recipient, which by design orphans
-        // every volume written to the old one. Nothing otherwise tells the
-        // operator which volumes those are, and the failure stays silent until
-        // the escrow key is the only key left.
-        //
-        // The evidence is already recorded: stage_sets.key_fingerprints is the
-        // exact recipient list each stage set was encrypted to (fingerprint ==
-        // public_key by construction, src/staging/mod.rs). No tape access and
-        // no key material needed.
-        //
-        // WARNING, never a violation (ADR-0004): the remedy is operational —
-        // re-stage and rewrite, or accept the orphaning the swap intended — so
-        // audit reports it and does not block.
-        if let Some(ref escrow) = escrow_pubkey {
-            // The query (which stage sets, on which volumes, with what
-            // recorded recipient list) lives in `policy::escrow` so this
-            // check, `catalog locate`, `report copies` and the write
-            // pre-flight cannot disagree. A rebuilt row (#137) gets the
-            // same verdict with a different explanation.
-            let rows = crate::policy::escrow::stage_set_coverage(
-                conn,
-                crate::policy::escrow::Scope::Unit(unit.id),
-                escrow,
-            )?;
-
-            for row in rows {
-                let stage_set_id = row.stage_set_id;
-                let label = row.volume_label.as_deref().unwrap_or("?");
-                let reason = match row.coverage {
-                    crate::policy::escrow::Coverage::Covered => None,
-                    crate::policy::escrow::Coverage::Unknown => {
-                        Some(crate::policy::escrow::UNKNOWN_REASON.to_string())
-                    }
-                    crate::policy::escrow::Coverage::Gap(reason) => Some(reason),
-                };
-
-                if let Some(reason) = reason {
-                    warnings.push(AuditFinding {
-                        unit: unit.name.clone(),
-                        check: "escrow_coverage".into(),
-                        message: format!(
-                            "volume {label} (stage set {stage_set_id}): {reason} \
-                             — the current escrow key cannot recover it"
-                        ),
-                        action: format!(
-                            "re-stage and rewrite this unit to a new volume, or accept \
-                             that {label} is recoverable only by its original recipients: \
-                             tapectl stage create {} && tapectl volume write <LABEL>",
-                            unit.name
-                        ),
-                    });
-                }
-            }
-        }
-
-        // Check if current snapshot exists
-        let has_current: bool = conn
+// Check verification age.
+fn check_verify_age(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let resolved = policy.expect("verify_age is a needs_policy check");
+    let mut f = Findings::default();
+    if let Some(verify_days) = resolved.verify_interval_days {
+        let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
+        let last_verify: Option<String> = ctx
+            .conn
             .query_row(
-                "SELECT COUNT(*) FROM snapshots WHERE unit_id = ?1 AND status = 'current'",
+                "SELECT MAX(vs.completed_at)
+                 FROM verification_sessions vs
+                 JOIN writes w ON w.volume_id = vs.volume_id
+                 JOIN stage_sets ss ON ss.id = w.stage_set_id
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 WHERE s.unit_id = ?1 AND vs.outcome = 'passed'",
                 params![unit.id],
-                |row| row.get::<_, i64>(0),
+                |row| row.get(0),
             )
-            .map(|c| c > 0)?;
+            .ok()
+            .flatten();
 
-        if !has_current && copy_count == 0 {
-            warnings.push(AuditFinding {
+        let overdue = if let Some(ref last) = last_verify {
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
+                let age = chrono::Utc::now().naive_utc() - dt;
+                age.num_days() > verify_days
+            } else {
+                true
+            }
+        } else {
+            copy_count > 0 // only warn if there are copies to verify
+        };
+
+        if overdue {
+            f.warnings.push(AuditFinding {
                 unit: unit.name.clone(),
-                check: "no_archive".into(),
-                message: "no current snapshot or tape copies".into(),
-                action: format!(
-                    "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
-                    unit.name, unit.name
+                check: "verify_age".into(),
+                message: format!(
+                    "not verified within {verify_days} days (last: {})",
+                    last_verify.as_deref().unwrap_or("never")
                 ),
+                action: "tapectl volume verify <LABEL>".to_string(),
             });
         }
+    }
+    Ok(f)
+}
 
-        // Check dirty status (design §2.20). MUST NOT fire for
-        // `PendingReason::New` — a never-archived unit is already reported
-        // by `no_archive` above, and firing both would double-report the
-        // same condition (`dirty_rows`'s "new" state, distinct from
-        // "dirty", exists for exactly this reason).
-        if let Some(row) = dirty_rows.iter().find(|r| r.name == unit.name) {
-            if row.state == "dirty" {
-                warnings.push(AuditFinding {
-                    unit: unit.name.clone(),
-                    check: "dirty".into(),
-                    message: format!(
-                        "source has drifted since last archive ({} added, {} removed, {} modified)",
-                        row.added.len(),
-                        row.removed.len(),
-                        row.modified.len(),
-                    ),
-                    action: format!(
-                        "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
-                        unit.name, unit.name
-                    ),
-                });
-            }
-        }
+// ESCROW COVERAGE (#125, follow-up to #115).
+//
+// #115 stops new writes from sealing slices the escrow key cannot open.
+// It cannot help volumes already written — and ADR-0005 explicitly
+// permits swapping in a fresh escrow recipient, which by design orphans
+// every volume written to the old one. Nothing otherwise tells the
+// operator which volumes those are, and the failure stays silent until
+// the escrow key is the only key left.
+//
+// The evidence is already recorded: stage_sets.key_fingerprints is the
+// exact recipient list each stage set was encrypted to (fingerprint ==
+// public_key by construction, src/staging/mod.rs). No tape access and
+// no key material needed.
+//
+// WARNING, never a violation (ADR-0004): the remedy is operational —
+// re-stage and rewrite, or accept the orphaning the swap intended — so
+// audit reports it and does not block.
+fn check_escrow_coverage(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    _policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let mut f = Findings::default();
+    if let Some(escrow) = ctx.escrow {
+        // The query (which stage sets, on which volumes, with what
+        // recorded recipient list) lives in `policy::escrow` so this
+        // check, `catalog locate`, `report copies` and the write
+        // pre-flight cannot disagree. A rebuilt row (#137) gets the
+        // same verdict with a different explanation.
+        let rows = crate::policy::escrow::stage_set_coverage(
+            ctx.conn,
+            crate::policy::escrow::Scope::Unit(unit.id),
+            escrow,
+        )?;
 
-        // Check encryption compliance (design §2.20). Fires when policy
-        // requires encryption but at least one `stage_sets` row written to
-        // an in-service volume for the unit's current snapshot is
-        // unencrypted. The join mirrors `copy_count_for_unit` exactly
-        // (writes -> stage_sets -> snapshots, `s.status = 'current'`,
-        // `w.status = 'completed'`), scoped the same way every other
-        // per-unit check in this file is.
-        //
-        // Known and accepted gap: a plaintext stage_set written under a
-        // now-superseded (non-`current`) snapshot is still plaintext on a
-        // tape but will not be reported here, because this check scopes to
-        // the current snapshot like its neighbours. Widening that is
-        // deliberately out of scope for this task.
-        //
-        // Uses `policy::coverage::in_service`, not `eligible`: this is an
-        // inventory question ("is unencrypted data sitting on media we
-        // still account for?"), not a durability/copy-count claim, so the
-        // wider in-service set (active/full/sealed) is correct here — see
-        // `in_service`'s doc comment. Routing through the shared predicate
-        // rather than inlining a status list is the discipline issue #96
-        // established.
-        if resolved.encrypt {
-            let unencrypted_count: i64 = {
-                let sql = format!(
-                    "SELECT COUNT(*)
-                     FROM writes w
-                     JOIN stage_sets ss ON ss.id = w.stage_set_id
-                     JOIN snapshots s ON s.id = ss.snapshot_id
-                     JOIN volumes v ON v.id = w.volume_id
-                     WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
-                       AND ss.encrypted = 0 AND {}",
-                    policy::coverage::in_service("v")
-                );
-                conn.query_row(&sql, params![unit.id], |row| row.get(0))?
+        for row in rows {
+            let stage_set_id = row.stage_set_id;
+            let label = row.volume_label.as_deref().unwrap_or("?");
+            let reason = match row.coverage {
+                crate::policy::escrow::Coverage::Covered => None,
+                crate::policy::escrow::Coverage::Unknown => {
+                    Some(crate::policy::escrow::UNKNOWN_REASON.to_string())
+                }
+                crate::policy::escrow::Coverage::Gap(reason) => Some(reason),
             };
 
-            if unencrypted_count > 0 {
-                violations.push(AuditFinding {
+            if let Some(reason) = reason {
+                f.warnings.push(AuditFinding {
                     unit: unit.name.clone(),
-                    check: "encryption".into(),
+                    check: "escrow_coverage".into(),
                     message: format!(
-                        "{unencrypted_count} unencrypted stage set(s) on tape, policy requires encryption"
+                        "volume {label} (stage set {stage_set_id}): {reason} \
+                         — the current escrow key cannot recover it"
                     ),
                     action: format!(
-                        "tapectl stage create {} && tapectl volume write <LABEL>",
+                        "re-stage and rewrite this unit to a new volume, or accept \
+                         that {label} is recoverable only by its original recipients: \
+                         tapectl stage create {} && tapectl volume write <LABEL>",
                         unit.name
                     ),
                 });
             }
         }
     }
+    Ok(f)
+}
 
-    // Check compaction candidates (volume-level, not per-unit)
-    if unit_filter.is_none() {
-        warnings.extend(compaction_findings(
-            conn,
-            config.compaction.utilization_threshold,
-        )?);
-        warnings.extend(escrow_kit_findings(conn)?);
-        warnings.extend(escrow_identity_findings(conn, escrow_pubkey.as_deref())?);
+// Check if current snapshot exists.
+fn check_no_archive(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    _policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let mut f = Findings::default();
+    let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
+    let has_current: bool = ctx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE unit_id = ?1 AND status = 'current'",
+            params![unit.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)?;
+
+    if !has_current && copy_count == 0 {
+        f.warnings.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "no_archive".into(),
+            message: "no current snapshot or tape copies".into(),
+            action: format!(
+                "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
+                unit.name, unit.name
+            ),
+        });
     }
+    Ok(f)
+}
 
-    Ok((violations, warnings))
+// Check dirty status (design §2.20). MUST NOT fire for `PendingReason::New`
+// — a never-archived unit is already reported by `no_archive` above, and
+// firing both would double-report the same condition (`dirty_rows`'s "new"
+// state, distinct from "dirty", exists for exactly this reason).
+fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> Result<Findings> {
+    let mut f = Findings::default();
+    if let Some(row) = ctx.dirty_rows.iter().find(|r| r.name == unit.name) {
+        if row.state == "dirty" {
+            f.warnings.push(AuditFinding {
+                unit: unit.name.clone(),
+                check: "dirty".into(),
+                message: format!(
+                    "source has drifted since last archive ({} added, {} removed, {} modified)",
+                    row.added.len(),
+                    row.removed.len(),
+                    row.modified.len(),
+                ),
+                action: format!(
+                    "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
+                    unit.name, unit.name
+                ),
+            });
+        }
+    }
+    Ok(f)
+}
+
+// Check encryption compliance (design §2.20). Fires when policy requires
+// encryption but at least one `stage_sets` row written to an in-service
+// volume for the unit's current snapshot is unencrypted. The join mirrors
+// `copy_count_for_unit` exactly (writes -> stage_sets -> snapshots,
+// `s.status = 'current'`, `w.status = 'completed'`), scoped the same way
+// every other per-unit check in this file is.
+//
+// Known and accepted gap: a plaintext stage_set written under a
+// now-superseded (non-`current`) snapshot is still plaintext on a tape but
+// will not be reported here, because this check scopes to the current
+// snapshot like its neighbours. Widening that is deliberately out of scope
+// for this task.
+//
+// Uses `policy::coverage::in_service`, not `eligible`: this is an inventory
+// question ("is unencrypted data sitting on media we still account for?"),
+// not a durability/copy-count claim, so the wider in-service set
+// (active/full/sealed) is correct here — see `in_service`'s doc comment.
+// Routing through the shared predicate rather than inlining a status list
+// is the discipline issue #96 established.
+fn check_encryption(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let resolved = policy.expect("encryption is a needs_policy check");
+    let mut f = Findings::default();
+    if resolved.encrypt {
+        let unencrypted_count: i64 = {
+            let sql = format!(
+                "SELECT COUNT(*)
+                 FROM writes w
+                 JOIN stage_sets ss ON ss.id = w.stage_set_id
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN volumes v ON v.id = w.volume_id
+                 WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+                   AND ss.encrypted = 0 AND {}",
+                policy::coverage::in_service("v")
+            );
+            ctx.conn
+                .query_row(&sql, params![unit.id], |row| row.get(0))?
+        };
+
+        if unencrypted_count > 0 {
+            f.violations.push(AuditFinding {
+                unit: unit.name.clone(),
+                check: "encryption".into(),
+                message: format!(
+                    "{unencrypted_count} unencrypted stage set(s) on tape, policy requires encryption"
+                ),
+                action: format!(
+                    "tapectl stage create {} && tapectl volume write <LABEL>",
+                    unit.name
+                ),
+            });
+        }
+    }
+    Ok(f)
 }
 
 /// Heir Kit staleness (ADR-0009, issue #69) — archive-wide, so the caller
@@ -723,6 +973,33 @@ fn compaction_findings(conn: &Connection, threshold: f64) -> Result<Vec<AuditFin
         }
     }
     Ok(findings)
+}
+
+// `Scope::Archive` adapters for the three archive-wide functions above: same
+// bodies, same call signatures (existing tests call
+// `escrow_identity_findings`/`escrow_kit_findings`/`compaction_findings`
+// directly), just wrapped to the `ArchiveFn` shape `CHECKS` needs. All three
+// only ever produce warnings (ADR-0004: none of these are violations).
+
+fn check_compaction_candidate(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: compaction_findings(ctx.conn, ctx.config.compaction.utilization_threshold)?,
+    })
+}
+
+fn check_escrow_kit(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: escrow_kit_findings(ctx.conn)?,
+    })
+}
+
+fn check_escrow_identity_mismatch(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: escrow_identity_findings(ctx.conn, ctx.escrow)?,
+    })
 }
 
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
@@ -2075,6 +2352,404 @@ mod tests {
         fn no_registered_escrow_is_silent() {
             let conn = setup("age1new", &[r#"["age1old"]"#], &[]);
             assert!(escrow_identity_findings(&conn, None).unwrap().is_empty());
+        }
+    }
+
+    /// Issue #138 / C4 architecture review: `CHECKS` is now the scope table
+    /// that used to be a comment above `collect_findings`. These tests pin
+    /// the table's shape and the runner's use of it, independent of any
+    /// single check's own fixtures above.
+    mod checks_table {
+        use super::*;
+
+        /// The 13 distinct `check` name literals this file's findings can
+        /// carry (grep-verified against every `check: "..."` / `check ==
+        /// "..."` in this file, non-test code). Every `CHECKS` row name
+        /// must be one of these, and every one of these must be covered by
+        /// exactly one row, with two documented exceptions.
+        const KNOWN_CHECK_NAMES: &[&str] = &[
+            "policy_unresolvable",
+            "copy_count",
+            "warehouse_copies",
+            "location_presence",
+            "verify_age",
+            "escrow_coverage",
+            "no_archive",
+            "dirty",
+            "encryption",
+            "compaction_candidate",
+            "escrow_kit_missing",
+            "escrow_kit_stale",
+            "escrow_identity_mismatch",
+        ];
+
+        #[test]
+        fn every_check_name_in_the_file_is_a_table_row_exactly_once() {
+            let names: Vec<&str> = CHECKS.iter().map(|c| c.name).collect();
+
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                names.len(),
+                "duplicate name in CHECKS: {names:?}"
+            );
+
+            // 8 per-unit checks + 3 archive-wide checks. `policy_unresolvable`
+            // is not one of them (see below), and `escrow_kit_missing`/
+            // `escrow_kit_stale` share one row.
+            assert_eq!(
+                names.len(),
+                11,
+                "expected 8 per-unit + 3 archive-wide CHECKS rows, got: {names:?}"
+            );
+
+            for &known in KNOWN_CHECK_NAMES {
+                let canonical = match known {
+                    // Emitted by the runner itself when `policy::resolve`
+                    // fails, in place of running any `CHECKS` row for that
+                    // unit (see `collect_findings`) — never a row.
+                    "policy_unresolvable" => continue,
+                    // Two mutually exclusive outcomes of the single
+                    // `escrow_kit` archive row: one function,
+                    // `escrow_kit_findings`, returns whichever finding
+                    // applies (or none) — never both.
+                    "escrow_kit_missing" | "escrow_kit_stale" => "escrow_kit",
+                    other => other,
+                };
+                assert!(
+                    names.contains(&canonical),
+                    "known check `{known}` (row `{canonical}`) is missing from CHECKS: {names:?}"
+                );
+            }
+        }
+
+        /// The #138 property, now enforced as data instead of documented as
+        /// prose: every per-unit check except `dirty` covers `tape_only`
+        /// and `missing` alongside `active`; `dirty` covers only `active`;
+        /// and nothing ever covers `retired`.
+        #[test]
+        fn per_unit_scope_is_data_not_prose() {
+            let mut saw_per_unit = 0;
+            for check in CHECKS {
+                if let Scope::PerUnit { statuses, .. } = &check.scope {
+                    saw_per_unit += 1;
+                    assert!(
+                        !statuses.contains(&"retired"),
+                        "`{}` must never audit retired units: {statuses:?}",
+                        check.name
+                    );
+                    if check.name == "dirty" {
+                        assert_eq!(
+                            *statuses,
+                            &["active"],
+                            "`dirty` must be scoped to exactly `[\"active\"]`"
+                        );
+                    } else {
+                        assert!(
+                            statuses.contains(&"tape_only") && statuses.contains(&"missing"),
+                            "`{}` must audit tape_only and missing units (issue #138): {statuses:?}",
+                            check.name
+                        );
+                    }
+                }
+            }
+            assert_eq!(saw_per_unit, 8, "expected 8 PerUnit rows in CHECKS");
+        }
+
+        /// Issue #105 / ADR-behaviour: a unit whose policy will not resolve
+        /// gets exactly one finding (`policy_unresolvable`) and no others —
+        /// every other per-unit check is skipped for it, not merely the
+        /// policy-dependent ones. Unlike the `unresolvable_via_dotfile_*`
+        /// fixtures above, this unit also carries a sealed, unencrypted
+        /// stage set that WOULD trigger `copy_count` (1 volume < default
+        /// min_copies 2) and `encryption` if policy resolved — so this is a
+        /// real negative control, not a fixture with nothing else to find.
+        #[test]
+        fn the_runner_skips_a_unit_whose_policy_will_not_resolve() {
+            let root = tempfile::TempDir::new().unwrap();
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+
+            let dir = root.path().join("bad_policy_multi");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".tapectl-unit.toml"),
+                "[policy\nnot valid toml = = =\n",
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES ('u-bad-multi', 'bad-policy-multi', ?1, ?2, 'mtime_size', 1, 'active')",
+                params![tid, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
+                 VALUES (?1, 'staged', 524288, 0)",
+                params![snap_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('BADMULTI-VOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol_id],
+            )
+            .unwrap();
+
+            let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+
+            assert_eq!(
+                violations.len(),
+                1,
+                "this fixture has exactly one unit, so exactly one finding \
+                 (policy_unresolvable) is expected total: {violations:?}"
+            );
+            assert_eq!(violations[0].unit, "bad-policy-multi");
+            assert_eq!(violations[0].check, "policy_unresolvable");
+
+            assert!(
+                warnings.iter().all(|f| f.unit != "bad-policy-multi"),
+                "no warning may be attributed to a unit whose policy did not resolve: {warnings:?}"
+            );
+        }
+
+        /// The runner's execution order — outer loop over units in
+        /// selection order, inner loop over `CHECKS` in table order, then
+        /// archive-wide checks in table order — must be exactly what
+        /// `CHECKS`'s own order says. This fixture puts every firing
+        /// per-unit check on a SINGLE unit (mixing units would make the
+        /// global order unit-major-then-check-minor, not pure table order)
+        /// plus one archive-wide check tied to a second, `retired` unit
+        /// (excluded from the per-unit loop entirely, so its volume
+        /// contributes only to the archive-wide query and nothing else).
+        #[test]
+        fn findings_order_is_table_order() {
+            const ESCROW_KEY: &str = "age1escrowescrowescrow";
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            crate::db::queries::insert_escrow_key(
+                &conn, tid, "escrow", ESCROW_KEY, ESCROW_KEY, None,
+            )
+            .unwrap();
+
+            // Unit under test: one sealed, UNENCRYPTED volume with a
+            // recipient list that does not include the escrow key.
+            // Triggers copy_count (V, 1 < default min_copies 2) and
+            // encryption (V, unencrypted on an in-service volume): both
+            // scope to the CURRENT snapshot only.
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('uuid-order', 'order-test', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
+                 VALUES (?1, 'staged', 524288, 0)",
+                params![snap_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('ORDVOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol_id],
+            )
+            .unwrap();
+
+            // A second, SUPERSEDED snapshot for the SAME unit, encrypted,
+            // with a recipient list that does not include the escrow key.
+            // `escrow_coverage`'s underlying query
+            // (`policy::escrow::stage_set_coverage`) has no snapshot-status
+            // filter, so this fires escrow_coverage (W) without adding a
+            // second CURRENT-snapshot volume that would push copy_count to
+            // 2 and silence that violation, and without being encrypted=0
+            // itself — `Volumes::InService` already excludes `encrypted =
+            // 0` stage sets from escrow coverage (the `encryption`
+            // violation above already owns that fact).
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 2, 'full', 'superseded', '/src-old')",
+                params![unit_id],
+            )
+            .unwrap();
+            let old_snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+                 VALUES (?1, 'staged', 524288, 1, ?2)",
+                params![old_snap_id, r#"["age1alice","age1operator"]"#],
+            )
+            .unwrap();
+            let old_stage_set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('ORDVOL-ESCROW', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let old_vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![old_stage_set_id, old_snap_id, old_vol_id],
+            )
+            .unwrap();
+
+            // A second unit, `retired` (excluded from the per-unit loop
+            // entirely — see `a_retired_unit_is_not_audited` above), whose
+            // sealed volume at 10% utilization exists solely to trigger the
+            // archive-wide `compaction_candidate` check without adding a
+            // second eligible volume to `order-test` (which would push its
+            // copy_count to 2 and silence that violation).
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('uuid-order2', 'order-test-2', ?1, 'mtime_size', 1, 'retired')",
+                params![tid],
+            )
+            .unwrap();
+            let unit2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, bytes_written, status)
+                 VALUES ('ORDVOL-COMPACT', 'lto', 'lto0', 'LTO-6', 1000000, 1000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src2')",
+                params![unit2_id],
+            )
+            .unwrap();
+            let snap2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap2_id],
+            )
+            .unwrap();
+            let stage_set2_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (?1, 0, 100, 100, 'p', 'e')",
+                params![stage_set2_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set2_id, snap2_id, vol2_id],
+            )
+            .unwrap();
+
+            let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+
+            let index_of = |name: &str| -> usize {
+                let canonical = match name {
+                    "escrow_kit_missing" | "escrow_kit_stale" => "escrow_kit",
+                    other => other,
+                };
+                CHECKS
+                    .iter()
+                    .position(|c| c.name == canonical)
+                    .unwrap_or_else(|| panic!("finding `{name}` has no CHECKS row"))
+            };
+
+            // Fixture guards: every check this test is actually about must
+            // have really fired, or the ordering assertions below prove
+            // nothing.
+            assert!(
+                violations
+                    .iter()
+                    .any(|f| f.check == "copy_count" && f.unit == "order-test"),
+                "fixture guard (copy_count): {violations:?}"
+            );
+            assert!(
+                violations
+                    .iter()
+                    .any(|f| f.check == "encryption" && f.unit == "order-test"),
+                "fixture guard (encryption): {violations:?}"
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|f| f.check == "escrow_coverage" && f.unit == "order-test"),
+                "fixture guard (escrow_coverage): {warnings:?}"
+            );
+            assert!(
+                warnings.iter().any(|f| f.check == "compaction_candidate"),
+                "fixture guard (compaction_candidate): {warnings:?}"
+            );
+
+            let violation_indices: Vec<usize> =
+                violations.iter().map(|f| index_of(&f.check)).collect();
+            assert!(
+                violation_indices.windows(2).all(|w| w[0] <= w[1]),
+                "violations are not in CHECKS order: {violations:?} -> {violation_indices:?}"
+            );
+
+            let warning_indices: Vec<usize> = warnings.iter().map(|f| index_of(&f.check)).collect();
+            assert!(
+                warning_indices.windows(2).all(|w| w[0] <= w[1]),
+                "warnings are not in CHECKS order: {warnings:?} -> {warning_indices:?}"
+            );
+
+            let per_unit_max = CHECKS
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c.scope, Scope::PerUnit { .. }))
+                .map(|(i, _)| i)
+                .max()
+                .expect("at least one PerUnit row exists");
+            assert!(
+                warning_indices.iter().any(|&i| i > per_unit_max),
+                "the archive-wide compaction_candidate warning must come after every \
+                 per-unit warning: {warning_indices:?}"
+            );
         }
     }
 }
