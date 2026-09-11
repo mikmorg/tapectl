@@ -27,6 +27,26 @@
 //! `units` (`snapshots.unit_id`); `stage_slices` via `stage_slices.stage_set_id`;
 //! `files` via `files.snapshot_id`.
 //!
+//! # What it is for (settled 2026-09-11, review finding 2)
+//!
+//! A **complete rebuild source** for `catalog rebuild` (#136): everything the
+//! operator's catalog knows about this write *at staging time* rides here —
+//! including, since that decision, the `tenants` that own the units, each
+//! stage set's recorded recipient list (`key_fingerprints`, the escrow
+//! receipt #137 could not otherwise recover), and each slice's
+//! `sha256_plain`. Tape positions are NOT here and cannot be: this file is
+//! generated before `build()` assigns them, so the envelope `MANIFEST.toml`
+//! stays authoritative for the slice map. Unit and snapshot *statuses* are
+//! copied for the heir's reading only; a rebuild applies its own rules.
+//!
+//! All of it is inside an age envelope encrypted to operator + escrow. The
+//! isolation invariant governs plaintext files; nothing here is plaintext.
+//!
+//! A `catalog.db` written before this change lacks `tenants`,
+//! `key_fingerprints` and `sha256_plain`. `catalog rebuild` probes for them
+//! (`PRAGMA table_info`) rather than trusting a number, and falls back to
+//! the tenant envelopes and the manifest for what is missing.
+//!
 //! # Isolation
 //!
 //! The output covers every tenant's units on this write — it is appended to
@@ -44,6 +64,10 @@ use crate::error::Result;
 /// `tapectl.db` — see `RECOVERY.md`'s "Querying `catalog.db`" section for
 /// the schema as documented to the operator.
 const SCHEMA: &str = "
+CREATE TABLE tenants (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL
+);
 CREATE TABLE units (
     id          INTEGER PRIMARY KEY,
     uuid        TEXT NOT NULL,
@@ -66,7 +90,8 @@ CREATE TABLE stage_sets (
     slice_size           INTEGER,
     num_slices           INTEGER,
     total_dar_size       INTEGER,
-    total_encrypted_size INTEGER
+    total_encrypted_size INTEGER,
+    key_fingerprints     TEXT
 );
 CREATE TABLE stage_slices (
     id               INTEGER PRIMARY KEY,
@@ -74,6 +99,7 @@ CREATE TABLE stage_slices (
     slice_number     INTEGER NOT NULL,
     size_bytes       INTEGER,
     encrypted_bytes  INTEGER,
+    sha256_plain     TEXT,
     sha256_encrypted TEXT
 );
 CREATE TABLE files (
@@ -125,7 +151,8 @@ pub fn build_catalog_snapshot(
     // stage_sets: the given ids, verbatim.
     {
         let sql = format!(
-            "SELECT id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size
+            "SELECT id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size,
+                    key_fingerprints
              FROM stage_sets WHERE id IN ({})",
             ph()
         );
@@ -138,15 +165,23 @@ pub fn build_catalog_snapshot(
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         for r in rows {
-            let (id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size) =
-                r?;
+            let (
+                id,
+                snapshot_id,
+                slice_size,
+                num_slices,
+                total_dar_size,
+                total_encrypted_size,
+                key_fingerprints,
+            ) = r?;
             out.execute(
-                "INSERT INTO stage_sets (id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size],
+                "INSERT INTO stage_sets (id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size, key_fingerprints)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size, key_fingerprints],
             )?;
         }
     }
@@ -210,10 +245,37 @@ pub fn build_catalog_snapshot(
         }
     }
 
+    // tenants owning those units — name only. A `tenants` row carries no key
+    // material (keys live on `encryption_keys` and, privately, under
+    // `keys/`), so this is ownership, not secrets. Without it a rebuild has
+    // to decrypt every tenant envelope just to learn who owns what.
+    {
+        let sql = format!(
+            "SELECT DISTINCT t.id, t.name
+             FROM tenants t
+             JOIN units u ON u.tenant_id = t.id
+             JOIN snapshots s ON s.unit_id = u.id
+             JOIN stage_sets ss ON ss.snapshot_id = s.id
+             WHERE ss.id IN ({})",
+            ph()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (id, name) = r?;
+            out.execute(
+                "INSERT INTO tenants (id, name) VALUES (?1, ?2)",
+                rusqlite::params![id, name],
+            )?;
+        }
+    }
+
     // stage_slices for those stage_sets.
     {
         let sql = format!(
-            "SELECT id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_encrypted
+            "SELECT id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted
              FROM stage_slices WHERE stage_set_id IN ({})",
             ph()
         );
@@ -226,15 +288,23 @@ pub fn build_catalog_snapshot(
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         for r in rows {
-            let (id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_encrypted) =
-                r?;
+            let (
+                id,
+                stage_set_id,
+                slice_number,
+                size_bytes,
+                encrypted_bytes,
+                sha256_plain,
+                sha256_encrypted,
+            ) = r?;
             out.execute(
-                "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_encrypted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_encrypted],
+                "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted],
             )?;
         }
     }
@@ -358,6 +428,53 @@ mod tests {
             .unwrap();
         assert_eq!(ss_ids, vec![ss_a]);
         assert!(!ss_ids.contains(&ss_b));
+    }
+
+    /// Review finding 2 (2026-09-11): the three facts a rebuild could not
+    /// get from the old subset — who owns the unit, the escrow receipt, and
+    /// the plaintext hash — ride along now.
+    #[test]
+    fn snapshot_carries_tenants_receipts_and_plain_hashes() {
+        let conn = crate::db::open_memory().unwrap();
+        let (unit_id, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        conn.execute(
+            "UPDATE stage_sets SET key_fingerprints = ?1 WHERE id = ?2",
+            rusqlite::params![r#"["age1alice","age1escrow"]"#, ss_id],
+        )
+        .unwrap();
+        let owner: String = conn
+            .query_row(
+                "SELECT t.name FROM tenants t JOIN units u ON u.tenant_id = t.id WHERE u.id = ?1",
+                rusqlite::params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("catalog.db");
+        build_catalog_snapshot(&conn, &[ss_id], &out_path).unwrap();
+        let out = Connection::open(&out_path).unwrap();
+
+        let (tenant_name, tenant_count): (String, i64) = out
+            .query_row(
+                "SELECT (SELECT t.name FROM tenants t JOIN units u ON u.tenant_id = t.id LIMIT 1),
+                        (SELECT COUNT(*) FROM tenants)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tenant_name, owner);
+        assert_eq!(tenant_count, 1);
+
+        let receipt: Option<String> = out
+            .query_row("SELECT key_fingerprints FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipt.as_deref(), Some(r#"["age1alice","age1escrow"]"#));
+
+        let plain: String = out
+            .query_row("SELECT sha256_plain FROM stage_slices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(plain, "plainhash");
     }
 
     #[test]

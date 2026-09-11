@@ -50,10 +50,24 @@ const UNITS: &[(&str, &str, &[u8])] = &[
     ("ledgers/fy24", "bravo", b"bravo ledger payload"),
 ];
 
+/// Which `catalog.db` the operator envelope carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CatalogDb {
+    /// None at all — a tape written before #83.
+    None,
+    /// The pre-2026-09-11 shape: no `tenants`, no `key_fingerprints`, no
+    /// `sha256_plain`. Derived from the REAL generator's output by dropping
+    /// those, not hand-rolled, so it cannot drift from what old tapes hold.
+    Old,
+    /// What `build_catalog_snapshot` writes today.
+    New,
+}
+
 struct SealedVolume {
     store: MemStore,
     operator_secret: String,
     escrow_secret: String,
+    escrow_public: String,
     tenant_secret: String,
     /// Unit name -> the tape positions its slices landed on, in slice order.
     expected_positions: Vec<(String, Vec<i64>)>,
@@ -87,6 +101,14 @@ fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> 
 /// sealed result. `with_catalog_db` selects whether the operator envelope
 /// carries #83's `catalog.db` — false stands in for a tape written before it.
 fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
+    build_sealed_volume_with(if with_catalog_db {
+        CatalogDb::New
+    } else {
+        CatalogDb::None
+    })
+}
+
+fn build_sealed_volume_with(catalog_db: CatalogDb) -> SealedVolume {
     let db_dir = tempfile::tempdir().unwrap();
     let conn = db::open(&db_dir.path().join("src.db")).unwrap();
 
@@ -101,6 +123,11 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     )
     .unwrap();
     let volume_id = conn.last_insert_rowid();
+
+    // ADR-0005's permanent escrow recipient — a recipient of every SLICE
+    // and every envelope, so attestation (trial-decrypting a slice header
+    // with the escrow key) has something true to find.
+    let escrow = generate_keypair();
 
     let slices_dir = tempfile::tempdir().unwrap();
     let mut build_units = Vec::new();
@@ -153,6 +180,19 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
         .unwrap();
         let stage_set_id = conn.last_insert_rowid();
         stage_set_ids.push(stage_set_id);
+        conn.execute(
+            "UPDATE stage_sets SET key_fingerprints = ?1 WHERE id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&[
+                    tenant.public_key.as_str(),
+                    operator.public_key.as_str(),
+                    escrow.public_key.as_str(),
+                ])
+                .unwrap(),
+                stage_set_id
+            ],
+        )
+        .unwrap();
 
         // Two slices per unit, so "slice number is not tape position" is a
         // claim the fixture can actually falsify.
@@ -160,7 +200,11 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
         for slice_number in 1..=2i64 {
             let mut plaintext = content.to_vec();
             plaintext.extend_from_slice(format!("-slice{slice_number}").as_bytes());
-            let recipients = vec![tenant.public_key.clone(), operator.public_key.clone()];
+            let recipients = vec![
+                tenant.public_key.clone(),
+                operator.public_key.clone(),
+                escrow.public_key.clone(),
+            ];
             let encrypted = staging::encrypt_data(&plaintext, &recipients).unwrap();
             let sha_plain = sha256_hex(&plaintext);
             let sha_enc = sha256_hex(&encrypted);
@@ -217,19 +261,23 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     }
 
     let catalog_dir = tempfile::tempdir().unwrap();
-    let catalog_db_path = if with_catalog_db {
-        let p = catalog_dir.path().join("catalog.db");
-        db::catalog_snapshot::build_catalog_snapshot(&conn, &stage_set_ids, &p).unwrap();
-        Some(p)
-    } else {
-        None
+    let catalog_db_path = match catalog_db {
+        CatalogDb::None => None,
+        CatalogDb::New | CatalogDb::Old => {
+            let p = catalog_dir.path().join("catalog.db");
+            db::catalog_snapshot::build_catalog_snapshot(&conn, &stage_set_ids, &p).unwrap();
+            if catalog_db == CatalogDb::Old {
+                let c = rusqlite::Connection::open(&p).unwrap();
+                c.execute_batch(
+                    "DROP TABLE tenants;
+                     ALTER TABLE stage_sets DROP COLUMN key_fingerprints;
+                     ALTER TABLE stage_slices DROP COLUMN sha256_plain;",
+                )
+                .unwrap();
+            }
+            Some(p)
+        }
     };
-
-    // ADR-0005's permanent escrow recipient. `with_escrow` adds it to EVERY
-    // envelope's recipient list, so the escrow key is the other half of the
-    // ratified "operator or escrow key" rule — untested until this fixture
-    // carried one.
-    let escrow = generate_keypair();
 
     let tenants = [alpha, bravo];
     let inputs = BuildInputs {
@@ -319,6 +367,7 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
         store,
         operator_secret: operator.secret_key,
         escrow_secret: escrow.secret_key,
+        escrow_public: escrow.public_key,
         tenant_secret: tenants[0].secret_key.clone(),
         expected_positions,
         expected_plain_hashes,
@@ -793,7 +842,9 @@ fn the_escrow_key_rebuilds_as_well_as_the_operator_key() {
 /// recipient list" — the same verdict, a different explanation.
 #[test]
 fn rebuilt_stage_sets_are_marked_as_such() {
-    let mut vol = build_sealed_volume(true);
+    // Old shape on purpose: a NEW-shape tape carries the receipt, and then the
+    // predicate answers "yes", not "?" — see `receipts_ride_the_tape...`.
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     let scratch = tempfile::tempdir().unwrap();
@@ -821,6 +872,100 @@ fn rebuilt_stage_sets_are_marked_as_such() {
             fp.as_deref(),
             tapectl::policy::escrow::Origin::Rebuilt,
             Some("age1anything"),
+        ),
+        "?"
+    );
+}
+
+/// Review finding 2, option (a): the escrow receipt rides the tape in
+/// `catalog.db`, so a rebuild of a new-shape tape records coverage rather
+/// than reporting it unknown. This is #137 closed for every tape written
+/// after 2026-09-11 — and it is proven through the same predicate `audit`
+/// and `catalog locate` use.
+#[test]
+fn receipts_ride_the_tape_so_a_rebuilt_new_tape_is_escrow_covered() {
+    let mut vol = build_sealed_volume_with(CatalogDb::New);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert!(report.tenants_from_catalog_db);
+    assert_eq!(report.receipts_from_tape, UNITS.len());
+
+    let mut stmt = conn
+        .prepare("SELECT key_fingerprints, origin FROM stage_sets")
+        .unwrap();
+    let rows: Vec<(Option<String>, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows.len(), UNITS.len());
+    for (fp, origin) in &rows {
+        assert_eq!(origin, "rebuilt");
+        assert_eq!(
+            tapectl::policy::escrow::marker(
+                fp.as_deref(),
+                tapectl::policy::escrow::Origin::Rebuilt,
+                Some(&vol.escrow_public),
+            ),
+            "yes",
+            "a rebuilt stage set with its receipt on the tape is covered, not unknown"
+        );
+    }
+}
+
+/// A tape written before 2026-09-11 carries the old `catalog.db` shape.
+/// Ownership must still come back — from the tenant envelopes — and the
+/// receipt honestly cannot: those rows are `unknown`, attestable later.
+#[test]
+fn an_old_shape_catalog_db_still_rebuilds_through_the_envelopes() {
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert!(report.had_catalog_db);
+    assert!(!report.tenants_from_catalog_db);
+    assert_eq!(report.receipts_from_tape, 0);
+    assert_eq!(
+        report.files,
+        UNITS.len() * 2,
+        "the file index still comes from catalog.db"
+    );
+
+    for (unit_name, tenant_name, _) in UNITS {
+        let got: String = conn
+            .query_row(
+                "SELECT t.name FROM units u JOIN tenants t ON t.id = u.tenant_id WHERE u.name = ?1",
+                rusqlite::params![unit_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(&got, tenant_name, "ownership from the tenant envelopes");
+    }
+    for (unit_name, expected) in &vol.expected_positions {
+        let rows = restore_resolution_query(&conn, unit_name);
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|(_, pos, _)| pos.parse().unwrap())
+            .collect();
+        assert_eq!(&got, expected, "unit {unit_name}");
+    }
+    let fp: Option<String> = conn
+        .query_row("SELECT key_fingerprints FROM stage_sets LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        tapectl::policy::escrow::marker(
+            fp.as_deref(),
+            tapectl::policy::escrow::Origin::Rebuilt,
+            Some(&vol.escrow_public),
         ),
         "?"
     );

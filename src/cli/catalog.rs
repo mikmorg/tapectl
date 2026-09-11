@@ -408,6 +408,8 @@ pub fn run(
                         "positions": report.positions,
                         "files": report.files,
                         "had_catalog_db": report.had_catalog_db,
+                        "tenants_from_catalog_db": report.tenants_from_catalog_db,
+                        "receipts_from_tape": report.receipts_from_tape,
                         "units_without_tenant_envelope": report.units_without_tenant_envelope,
                         "no_changes": report.is_noop(),
                     })
@@ -457,10 +459,19 @@ pub fn run(
                      `tapectl volume verify --label {}` to check them",
                     report.label
                 );
-                println!(
-                    "  escrow coverage cannot be rebuilt: no tape records a recipient list, \
-                     so these units report `escrow: NO` (issue #137)"
-                );
+                if report.stage_sets > 0 && report.receipts_from_tape == report.stage_sets {
+                    println!(
+                        "  escrow receipts: all {} stage set(s) carried theirs on the tape",
+                        report.receipts_from_tape
+                    );
+                } else if report.stage_sets > 0 {
+                    println!(
+                        "  escrow receipts: {} of {} stage set(s) carried one on the tape; the \
+                         rest report `escrow: ?` (unknown) until attested with \
+                         `catalog rebuild --key <escrow key>` (issue #137)",
+                        report.receipts_from_tape, report.stage_sets
+                    );
+                }
             }
         }
 

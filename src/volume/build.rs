@@ -321,9 +321,13 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
              This envelope also carries `catalog.db`, a small standalone SQLite \
              database (no tapectl or the source `tapectl.db` needed) covering every \
              unit written to THIS volume, across all tenants — operator-only, never \
-             in a tenant envelope. Tables: `units`, `snapshots`, `stage_sets`, \
-             `stage_slices`, `files`. `PRAGMA user_version` on this file mirrors the \
-             schema level of the `tapectl.db` it was generated from. Example:\n\n\
+             in a tenant envelope. Tables: `tenants`, `units`, `snapshots`, \
+             `stage_sets` (with each set's recorded recipient list, `key_fingerprints`), \
+             `stage_slices` (with `sha256_plain`), `files`. Tape positions are NOT here; \
+             MANIFEST.toml beside this file has them. `PRAGMA user_version` on this \
+             file mirrors the schema level of the `tapectl.db` it was generated from. \
+             With the operator or escrow key, `tapectl catalog rebuild --from-volume` \
+             reconstructs the catalog from this envelope. Example:\n\n\
              ```bash\n\
              sqlite3 catalog.db 'SELECT u.name, s.version, count(f.id) \
              FROM units u JOIN snapshots s ON s.unit_id = u.id \

@@ -37,11 +37,12 @@
 //!
 //! # Escrow coverage
 //!
-//! Rebuilt stage sets carry no `key_fingerprints`: the recipient list is on
-//! neither the tape nor the on-tape `catalog.db`, so `policy::escrow::gap`
-//! fail-closes and every rebuilt unit reports `escrow: NO` forever. That is
-//! honest — unknown is not covered — but it is permanent and un-clearable,
-//! and it is raised with the CTO as issue #137.
+//! For tapes written after 2026-09-11 the recorded recipient list rides in
+//! `catalog.db` and is copied into `stage_sets.key_fingerprints`, so coverage
+//! is recorded, not guessed. For older tapes it is NULL: `origin = 'rebuilt'`
+//! (migration 010) lets `policy::escrow` report that as **unknown** — still
+//! not covered, every gate still refuses — with the attest path named
+//! (#137). Attestation is `catalog rebuild --key <escrow>`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -75,6 +76,14 @@ pub struct RebuildReport {
     /// what is lost is the per-file index (`catalog ls`/`search`) and each
     /// snapshot's original `source_path`.
     pub had_catalog_db: bool,
+    /// True when `catalog.db` carried a `tenants` table (written after the
+    /// 2026-09-11 decision), so ownership came from one file rather than from
+    /// decrypting every tenant envelope.
+    pub tenants_from_catalog_db: bool,
+    /// Stage sets whose escrow receipt (`key_fingerprints`) rode the tape in
+    /// `catalog.db`. For those, #137 does not arise: coverage is recorded,
+    /// not unknown.
+    pub receipts_from_tape: usize,
     /// Units whose tenant could not be read from any tenant envelope on this
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
@@ -182,8 +191,6 @@ pub fn rebuild_from_store(
             )
         })?;
 
-    let tenant_of = tenant_index(&opened);
-
     let mut report = RebuildReport {
         label: ident.label.clone(),
         uuid: ident.uuid.clone(),
@@ -196,6 +203,8 @@ pub fn rebuild_from_store(
         Some(path) => Supplement::load(path)?,
         None => Supplement::default(),
     };
+    let tenant_of = tenant_index(&opened, &supplement);
+    report.tenants_from_catalog_db = supplement.has_tenants;
 
     // `unchecked_transaction` matches the codebase's convention (session,
     // write, key, operations): the CLI holds a shared `Connection`, and
@@ -300,17 +309,23 @@ fn open_all_envelopes(
     Ok(out)
 }
 
-/// Map each unit name to the tenant that owns it, read from the tenant
-/// envelopes. The operator envelope files every unit under the placeholder
-/// tenant `"operator"` and so cannot answer this.
-fn tenant_index(opened: &[OpenedEnvelope]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+/// Map each unit name to the tenant that owns it.
+///
+/// From `catalog.db` when it carries `tenants` (tapes written after
+/// 2026-09-11), else from the tenant envelopes — the operator envelope files
+/// every unit under the placeholder tenant `"operator"` and so cannot answer
+/// this. On a new-shape tape the envelopes are still opened (they are how a
+/// tenant key would be refused, and they are cheap), but ownership is taken
+/// from the one file that states it.
+fn tenant_index(opened: &[OpenedEnvelope], supplement: &Supplement) -> HashMap<String, String> {
+    let mut map = supplement.tenant_of.clone();
     for env in opened {
         if env.manifest.is_operator() {
             continue;
         }
         for unit in &env.manifest.units {
-            map.insert(unit.name.clone(), env.manifest.manifest.tenant.clone());
+            map.entry(unit.name.clone())
+                .or_insert_with(|| env.manifest.manifest.tenant.clone());
         }
     }
     map
@@ -326,6 +341,14 @@ struct Supplement {
     slice_size: HashMap<String, i64>,
     /// (unit name, version) -> the file rows of that snapshot.
     files: HashMap<(String, i64), Vec<FileRow>>,
+    /// unit name -> owning tenant name, when `catalog.db` carries `tenants`.
+    tenant_of: HashMap<String, String>,
+    /// unit name -> recorded recipient list JSON, when `catalog.db` carries
+    /// `stage_sets.key_fingerprints`.
+    key_fingerprints: HashMap<String, String>,
+    /// Whether the `tenants` table was present at all — distinguishes "no
+    /// tenants on this write" from "an older catalog.db".
+    has_tenants: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +434,47 @@ impl Supplement {
             for row in rows {
                 let (name, version, file) = row?;
                 out.files.entry((name, version)).or_default().push(file);
+            }
+        }
+
+        // Written after 2026-09-11? Probe the shape rather than trust a
+        // version number: a `tenants` table and a `key_fingerprints` column.
+        let has_tenants: bool = db.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tenants'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        let has_receipts: bool = db
+            .prepare("PRAGMA table_info(stage_sets)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|c| c == "key_fingerprints");
+        out.has_tenants = has_tenants;
+
+        if has_tenants {
+            let mut stmt = db.prepare(
+                "SELECT u.name, t.name FROM units u JOIN tenants t ON t.id = u.tenant_id",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (unit, tenant) = row?;
+                out.tenant_of.insert(unit, tenant);
+            }
+        }
+        if has_receipts {
+            let mut stmt = db.prepare(
+                "SELECT u.name, ss.key_fingerprints
+                 FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE ss.key_fingerprints IS NOT NULL",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (unit, json) = row?;
+                out.key_fingerprints.insert(unit, json);
             }
         }
 
@@ -653,14 +717,19 @@ fn ensure_stage_set(
         .copied()
         .or_else(|| unit.slices.iter().map(|s| s.size_bytes).max())
         .unwrap_or(0);
-    // `key_fingerprints` stays NULL and there is nowhere to get it from: the
-    // recipient list is on neither the tape nor `catalog.db`. `escrow::gap`
-    // fail-closes on that, so every rebuilt unit reports `escrow: NO` — see
-    // the module header and issue #137.
+    // The escrow receipt rides the tape in `catalog.db` for volumes written
+    // after 2026-09-11 (review finding 2); for older tapes it is NULL and
+    // `origin = 'rebuilt'` lets `policy::escrow` say "unknown — attest it"
+    // rather than "no recorded recipient list" (#137).
+    let receipt = supplement.key_fingerprints.get(&unit.name).cloned();
+    if receipt.is_some() {
+        report.receipts_from_tape += 1;
+    }
     tx.execute(
         "INSERT INTO stage_sets (snapshot_id, status, origin, dar_version, dar_command, slice_size,
-                                 num_slices, total_dar_size, total_encrypted_size, staged_at, notes)
-         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8)",
+                                 num_slices, total_dar_size, total_encrypted_size, staged_at, notes,
+                                 key_fingerprints)
+         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9)",
         params![
             snapshot_id,
             unit.dar_version,
@@ -670,6 +739,7 @@ fn ensure_stage_set(
             unit.slices.iter().map(|s| s.size_bytes).sum::<i64>(),
             unit.slices.iter().map(|s| s.encrypted_bytes).sum::<i64>(),
             "rebuilt from the volume's envelope manifest; slices live on tape only",
+            receipt,
         ],
     )?;
     report.stage_sets += 1;
@@ -815,7 +885,7 @@ fn record_event(
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); catalog.db {}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape; catalog.db {}",
         report.label,
         report.uuid,
         device,
@@ -828,6 +898,7 @@ fn record_event(
         report.writes,
         report.positions,
         report.files,
+        report.receipts_from_tape,
         if report.had_catalog_db {
             "present"
         } else {
