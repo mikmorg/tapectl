@@ -266,6 +266,21 @@ Round 3's lessons:
   chains were OOM-killed mid-`clippy`; nothing was lost because git steps
   were ordered before cargo steps. Keep it that way.
 
+**Round 4 — the architecture review's seven deepenings, attended, via
+`/autopilot do all`.** Report: `/tmp/architecture-review-20260911-180729.html`
+(and the 📼 artifact). Each candidate went to a sonnet worker in its own
+worktree; the coordinator reviewed, cherry-picked, gated and pushed. Byte pins
+for MANIFEST.toml and RESTORE.sh (`fcad514`) landed before anything could
+move them. Order landed: C3 `..ed14c92` → C1 `..7b26f57` → C6 `..6551b46` →
+C5 `..e6d800c` → C2 `..d13de21` → C4+C7 `..ae2c4ee`. 745 lib tests at the
+start, **784** at the end (902 total). Gate GREEN 26/26 after every tape-path
+landing; CI read after every push. CTO batch answered: no catalog.db stamp;
+add the twelve table-only `--json` columns (C2b, in flight); keep
+`in_service` for escrow findings. Two lessons: `git stash` is shared across
+worktrees (a worker popped another's entry, noticed, restored — now banned in
+the template); and a review that measures four things beats one that reads
+forty files. Details per item in `.claude/commands/autopilot.md`.
+
 One process note, twice over: `Closes #NNN` in a commit message auto-closes
 the issue **on push, before CI finishes**. It went green both times, but the
 #133 rule stands — do not treat an issue as closed until CI is read.
