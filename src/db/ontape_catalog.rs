@@ -27,9 +27,10 @@
 //!
 //! # Two generations exist on shipped tape
 //!
-//! A `catalog.db` written before 2026-07 (#83's original landing) carries
-//! `units`, `snapshots`, `stage_sets`, `stage_slices` and `files` only. One
-//! written after the 2026-09-11 decision (review finding 2) additionally
+//! A `catalog.db` written between #83's original landing (2026-07) and the
+//! 2026-09-11 decision carries `units`, `snapshots`, `stage_sets`,
+//! `stage_slices` and `files` only. One written after the 2026-09-11
+//! decision (review finding 2) additionally
 //! carries `tenants` (unit ownership), `stage_sets.key_fingerprints` (the
 //! escrow receipt #137 could not otherwise recover) and
 //! `stage_slices.sha256_plain`. `PRAGMA user_version` cannot tell them apart
