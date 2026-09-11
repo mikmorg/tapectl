@@ -115,6 +115,12 @@ fn collect_findings(
     let mut warnings: Vec<AuditFinding> = Vec::new();
     let mut violations: Vec<AuditFinding> = Vec::new();
 
+    // The escrow recipient every *new* encryption gets (ADR-0005). `None` means
+    // none is registered, in which case escrow_coverage below has nothing to
+    // compare against and is skipped — the missing-escrow condition itself is
+    // caught earlier, at stage time (#115).
+    let escrow_pubkey = crate::db::queries::escrow_public_key(conn)?;
+
     // Get units to audit
     let units = if let Some(name) = unit_filter {
         let unit = crate::db::queries::get_unit_by_name(conn, name)?
@@ -276,6 +282,82 @@ fn collect_findings(
                     ),
                     action: "tapectl volume verify <LABEL>".to_string(),
                 });
+            }
+        }
+
+        // ESCROW COVERAGE (#125, follow-up to #115).
+        //
+        // #115 stops new writes from sealing slices the escrow key cannot open.
+        // It cannot help volumes already written — and ADR-0005 explicitly
+        // permits swapping in a fresh escrow recipient, which by design orphans
+        // every volume written to the old one. Nothing otherwise tells the
+        // operator which volumes those are, and the failure stays silent until
+        // the escrow key is the only key left.
+        //
+        // The evidence is already recorded: stage_sets.key_fingerprints is the
+        // exact recipient list each stage set was encrypted to (fingerprint ==
+        // public_key by construction, src/staging/mod.rs). No tape access and
+        // no key material needed.
+        //
+        // WARNING, never a violation (ADR-0004): the remedy is operational —
+        // re-stage and rewrite, or accept the orphaning the swap intended — so
+        // audit reports it and does not block.
+        if let Some(ref escrow) = escrow_pubkey {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT v.label, ss.id, ss.key_fingerprints
+                 FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 JOIN stage_sets ss ON ss.id = w.stage_set_id
+                 JOIN snapshots s ON s.id = w.snapshot_id
+                 WHERE s.unit_id = ?1
+                   AND w.status = 'completed'
+                   AND ss.encrypted = 1
+                   -- Exclude dead media rather than listing live statuses: a
+                   -- status added later (003 added 'sealed' and 'quarantined')
+                   -- then defaults to being REPORTED rather than silently
+                   -- skipped. An allowlist here would have missed every
+                   -- 'sealed' volume — i.e. exactly the ones this check is for.
+                   AND v.status NOT IN ('retired', 'erased', 'missing', 'blank')
+                 ORDER BY v.label",
+            )?;
+            let rows = stmt.query_map(params![unit.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (label, stage_set_id, fingerprints) = row?;
+                // Fail closed: an absent or unparseable recipient list is
+                // reported, not assumed covered. A stage set that recorded no
+                // list cannot be shown to be escrow-recoverable.
+                let reason = match fingerprints.as_deref() {
+                    None => Some("no recorded recipient list".to_string()),
+                    Some(json) => match serde_json::from_str::<Vec<String>>(json) {
+                        Ok(keys) if keys.iter().any(|k| k == escrow) => None,
+                        Ok(_) => Some("encrypted without the current escrow recipient".to_string()),
+                        Err(_) => Some("recipient list is unreadable".to_string()),
+                    },
+                };
+
+                if let Some(reason) = reason {
+                    warnings.push(AuditFinding {
+                        unit: unit.name.clone(),
+                        check: "escrow_coverage".into(),
+                        message: format!(
+                            "volume {label} (stage set {stage_set_id}): {reason} \
+                             — the current escrow key cannot recover it"
+                        ),
+                        action: format!(
+                            "re-stage and rewrite this unit to a new volume, or accept \
+                             that {label} is recoverable only by its original recipients: \
+                             tapectl stage create {} && tapectl volume write <LABEL>",
+                            unit.name
+                        ),
+                    });
+                }
             }
         }
 
@@ -1560,5 +1642,126 @@ mod tests {
     fn human_output_says_clean_when_there_are_no_findings() {
         let out = render(&[], &[], 0, false, false);
         assert!(out.contains("audit: clean"), "got: {out}");
+    }
+
+    /// #125: escrow_coverage fixtures. A unit with one completed write to a
+    /// sealed volume, whose stage set recorded `fingerprints` as its recipient
+    /// list, plus a registered escrow recipient `ESCROW_KEY`.
+    fn setup_escrow_coverage(fingerprints: Option<&str>, escrow_registered: bool) -> Connection {
+        const ESCROW_KEY: &str = "age1escrowescrowescrow";
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        if escrow_registered {
+            // Via the production inserter, so this fixture cannot drift from
+            // how a real escrow row is actually shaped.
+            crate::db::queries::insert_escrow_key(
+                &conn, tid, "escrow", ESCROW_KEY, ESCROW_KEY, None,
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('uuid-esc', 'escunit', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+             VALUES (?1, 'staged', 524288, 1, ?2)",
+            params![snap_id, fingerprints],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('ESCVOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let vol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, vol_id],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn escrow_findings(conn: &Connection) -> Vec<AuditFinding> {
+        let (violations, warnings) =
+            collect_findings(conn, &crate::config::Config::default(), None).unwrap();
+        assert!(
+            !violations.iter().any(|f| f.check == "escrow_coverage"),
+            "escrow_coverage is advisory (ADR-0004) and must never be a violation"
+        );
+        warnings
+            .into_iter()
+            .filter(|f| f.check == "escrow_coverage")
+            .collect()
+    }
+
+    /// The #125 case: a volume written before the escrow existed, or before a
+    /// documented ADR-0005 escrow swap. The escrow key cannot open it, and
+    /// nothing else in the tool says so.
+    #[test]
+    fn escrow_coverage_flags_a_volume_encrypted_without_the_current_escrow() {
+        let conn = setup_escrow_coverage(Some(r#"["age1alice","age1operator"]"#), true);
+        let found = escrow_findings(&conn);
+        assert_eq!(found.len(), 1, "expected one finding, got {found:?}");
+        assert!(found[0].message.contains("ESCVOL"), "{}", found[0].message);
+        assert!(
+            found[0].message.contains("without the current escrow"),
+            "{}",
+            found[0].message
+        );
+    }
+
+    #[test]
+    fn escrow_coverage_is_silent_when_the_escrow_is_a_recipient() {
+        let conn = setup_escrow_coverage(Some(r#"["age1alice","age1escrowescrowescrow"]"#), true);
+        assert!(escrow_findings(&conn).is_empty());
+    }
+
+    /// Fail closed: a stage set with no recorded recipient list cannot be
+    /// SHOWN to be escrow-recoverable, so it is reported rather than assumed
+    /// fine. Same for a list that does not parse.
+    #[test]
+    fn escrow_coverage_fails_closed_on_missing_or_unreadable_recipient_lists() {
+        for (fixture, expected) in [
+            (None, "no recorded recipient list"),
+            (Some("not json at all"), "unreadable"),
+        ] {
+            let conn = setup_escrow_coverage(fixture, true);
+            let found = escrow_findings(&conn);
+            assert_eq!(found.len(), 1, "fixture {fixture:?} produced {found:?}");
+            assert!(
+                found[0].message.contains(expected),
+                "fixture {fixture:?}: {}",
+                found[0].message
+            );
+        }
+    }
+
+    /// With no escrow registered there is nothing to compare against, and the
+    /// missing-escrow condition is already caught at stage time (#115). This
+    /// check must stay quiet rather than flag every volume in the catalog.
+    #[test]
+    fn escrow_coverage_is_skipped_when_no_escrow_is_registered() {
+        let conn = setup_escrow_coverage(Some(r#"["age1alice"]"#), false);
+        assert!(escrow_findings(&conn).is_empty());
     }
 }
