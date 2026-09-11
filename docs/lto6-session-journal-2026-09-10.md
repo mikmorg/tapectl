@@ -1278,3 +1278,29 @@ sealed media cannot be retroactively re-encrypted. It now tests the current
 version. Whether a former tenant retaining access to pre-reassignment slices is
 acceptable is a real question, left open in #131 rather than decided by accident
 in a test helper.
+
+### Phase 8 closeout — every "media limitation" was a bug
+
+#128 catalogued the residual `--all` failures as things a single reused
+cartridge cannot do, to be converted to SKIP. Investigated one at a time,
+**none** of them were:
+
+| item | actual cause |
+|---|---|
+| quick-archive | the scenario never ran `volume init`; `quick-archive --volume L` writes to an EXISTING volume, so it died with `volume not found` on any drive (#132) |
+| collection | the scenario never registered an escrow recipient, an ADR-0005 staging precondition; failed on any drive |
+| tenant-reassign, key-rotation | #131, a genuine heir-path defect |
+| col.status_shows_new_pending | asserted on a unit name in `collection status --json`, which only ever emits aggregate counts |
+
+So the skip mechanism added for #128 was **removed** again — `restore_matrix`
+no longer takes a skip-reason and `single_cartridge_skip` is gone. The
+generalisable lesson, recorded because it nearly cost a real defect: *"the test
+environment can't do this"* is a hypothesis, not a diagnosis. The cheap way to
+test it here was running the same scenario multi-cartridge; when it failed
+identically, the media explanation was dead and #131 was underneath.
+
+Final: **306 checks — 277 passed, 2 failed, 27 skipped** (from 213/67/26). Both
+remaining failures are the pre-documented findings (`dl.scenario_b` bare-import,
+`rfc.restore_file_symlink`). Gate GREEN 26/26; 702 unit tests, clippy and fmt
+clean.
+

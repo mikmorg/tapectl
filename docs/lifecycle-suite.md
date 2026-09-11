@@ -81,6 +81,35 @@ Comparison is always `diff -r --no-dereference` **plus** a content+symlink-
 target tree checksum (`tree_checksum` — journal Phase 4's method); plain
 `diff -r` false-passes when a symlink is flattened to a regular file.
 
+`isolation` targets the unit's **newest** stage set. Ordering by slice number
+alone could pick a slice staged under a previous owner (before a `tenant
+reassign`), which that owner's key legitimately still decrypts — sealed media
+cannot be retroactively re-encrypted. Isolation here means *the current owner's
+data is not readable by another tenant*; what a former tenant should retain
+across a reassignment is open in #131.
+
+There is deliberately **no** way to skip a whole matrix. One existed briefly
+while closing #128, on the premise that some matrices need more than one
+cartridge; every such case turned out to be a real bug (a missing escrow step, a
+missing `volume init`, and #131). If a matrix fails, diagnose it — do not
+attribute it to the media. The cheap discriminator is to re-run the scenario
+multi-cartridge (`--erase long`, no `--single-cartridge`): if it still fails,
+the media is not the cause.
+
+## The `permute` restore baseline
+
+`restore-latest-and-diff` compares the tape against a copy of the source taken
+when a unit is **staged**, not when the volume is written. A volume is written
+from a stage set built earlier, so a mutation landing in between would otherwise
+make the "pristine" copy disagree with the tape and fail the check on content
+the tape was never meant to hold. The tape holds what was staged, so that is the
+instant the baseline must capture.
+
+`mutate_source` never touches `.tapectl-unit.toml`. It is tapectl's own control
+file, not user content — mutating it does not model source drift, it corrupts
+metadata, and `audit` then correctly reports `policy_unresolvable` for that unit
+for the rest of the walk.
+
 ## Reproducing a `permute` failure
 
 The op sequence is generated once from `--seed` via Python's
