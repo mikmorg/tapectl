@@ -825,68 +825,35 @@ fn stage_set_ids_for_layout(conn: &Connection, layout: &Layout) -> Result<Vec<i6
 /// This is a lookup by id over the ids the caller already selected — never
 /// its own `WHERE status = 'staged'` query. `find_staged_data` stays the one
 /// place the write path decides what it writes (issue #96).
+///
+/// The query and the classification both live in `policy::escrow` now
+/// (`Scope::StageSets` — by id, no `writes`/`volumes` join, since a stage
+/// set about to be written has no completed write yet); this is a thin
+/// mapping from its verdicts to the `(stage_set_id, unit_name, reason)`
+/// shape `KeyAvailability::stage_sets_lacking_escrow` expects.
 fn stage_sets_lacking_escrow(
     conn: &Connection,
     stage_set_ids: &[i64],
     escrow_public_key: &str,
 ) -> Result<Vec<(i64, String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT u.name, ss.key_fingerprints, ss.encrypted, ss.origin
-         FROM stage_sets ss
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         JOIN units u ON u.id = s.unit_id
-         WHERE ss.id = ?1",
+    let rows = crate::policy::escrow::stage_set_coverage(
+        conn,
+        crate::policy::escrow::Scope::StageSets(stage_set_ids),
+        escrow_public_key,
     )?;
-    let mut lacking = Vec::new();
-    for &stage_set_id in stage_set_ids {
-        let row: Option<(String, Option<String>, i64, String)> = stmt
-            .query_row(params![stage_set_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .optional()?;
-        // No row at all (or no unit behind it) is as unprovable as a NULL
-        // list — same fail-closed answer, same wording.
-        let Some((unit_name, fingerprints, encrypted, origin)) = row else {
-            lacking.push((
-                stage_set_id,
-                format!("<unknown unit for stage set {stage_set_id}>"),
-                "no recorded recipient list".to_string(),
-            ));
-            continue;
-        };
-        let reason = if encrypted == 0 {
-            // Checked first: whatever the recipient column claims, a stage
-            // set marked unencrypted has no age recipients on its slices at
-            // all, so the column cannot be describing them.
-            "staged with encrypted=0"
-        } else {
-            match fingerprints.as_deref() {
-                // A rebuilt row (#137, CTO Q8): still refused — fail-closed
-                // is the verdict — but the reason names the attest path, and
-                // `--allow-missing-escrow` remains the sanctioned override.
-                None if crate::policy::escrow::Origin::parse(&origin)
-                    == crate::policy::escrow::Origin::Rebuilt =>
-                {
-                    crate::policy::escrow::UNKNOWN_REASON
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let reason = match row.coverage {
+                crate::policy::escrow::Coverage::Covered => return None,
+                crate::policy::escrow::Coverage::Unknown => {
+                    crate::policy::escrow::UNKNOWN_REASON.to_string()
                 }
-                None => "no recorded recipient list",
-                Some(json) => match serde_json::from_str::<Vec<String>>(json) {
-                    Err(_) => "recipient list unparseable",
-                    Ok(list) => {
-                        if list.iter().any(|k| k == escrow_public_key) {
-                            continue;
-                        }
-                        // The normal case, and also what a deliberate escrow
-                        // swap looks like (ADR-0005: it orphans pre-swap
-                        // material, so pre-swap stage sets must be re-staged).
-                        "escrow recipient absent from recorded list"
-                    }
-                },
-            }
-        };
-        lacking.push((stage_set_id, unit_name, reason.to_string()));
-    }
-    Ok(lacking)
+                crate::policy::escrow::Coverage::Gap(reason) => reason,
+            };
+            Some((row.stage_set_id, row.unit_name, reason))
+        })
+        .collect())
 }
 
 fn assemble_session_keys(
@@ -2426,7 +2393,7 @@ mod tests {
         assert_eq!(v.len(), 1, "expected exactly one lacking stage set: {v:?}");
         assert_eq!(v[0].0, stage_set_id);
         assert_eq!(v[0].1, "photos", "the verdict must name the unit");
-        assert_eq!(v[0].2, "escrow recipient absent from recorded list");
+        assert_eq!(v[0].2, "encrypted without the current escrow recipient");
     }
 
     #[test]
@@ -2480,13 +2447,13 @@ mod tests {
         set_key_fingerprints(&conn, stage_set_id, Some("{not json"));
         let v = verdicts(&conn, tenant_id, stage_set_id);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].2, "recipient list unparseable");
+        assert_eq!(v[0].2, "recipient list is unreadable");
 
         // Valid JSON, but not a list of recipients.
         set_key_fingerprints(&conn, stage_set_id, Some("{\"escrow\": true}"));
         let v = verdicts(&conn, tenant_id, stage_set_id);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].2, "recipient list unparseable");
+        assert_eq!(v[0].2, "recipient list is unreadable");
 
         // encrypted = 0. The recorded list deliberately DOES contain the
         // escrow key here, so only the `encrypted` column can produce a
@@ -2734,7 +2701,8 @@ mod tests {
             "the refusal must name the offending stage set and its unit: {msg}"
         );
         assert!(
-            msg.contains("escrow recipient absent from recorded list") && msg.contains("ADR-0005"),
+            msg.contains("encrypted without the current escrow recipient")
+                && msg.contains("ADR-0005"),
             "the refusal must give the reason and the ADR: {msg}"
         );
         assert!(
