@@ -190,7 +190,12 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     Ok(rows)
 }
 
-pub fn run(conn: &Connection, command: &CatalogCommands, json_output: bool) -> Result<()> {
+pub fn run(
+    conn: &Connection,
+    config: &crate::config::Config,
+    command: &CatalogCommands,
+    json_output: bool,
+) -> Result<()> {
     match command {
         CatalogCommands::Ls { unit, version } => {
             let unit_row = crate::db::queries::get_unit_by_name(conn, unit)?
@@ -374,6 +379,7 @@ pub fn run(conn: &Connection, command: &CatalogCommands, json_output: bool) -> R
                 key,
                 label.as_deref(),
                 tenant,
+                config.backends.lto.first().map(|b| b.name.as_str()),
                 &scratch,
             );
             // The scratch dir holds decrypted MANIFEST/catalog.db copies —

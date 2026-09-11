@@ -1898,7 +1898,7 @@ assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
 # works.
 dl_scenario_d_catalog_rebuild() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: new home (init only); copy operator key; tapectl catalog rebuild --from-volume --key OPKEY --label VOL-A --json (assert units>0); tapectl catalog locate photos (assert VOL-A); tapectl restore unit --unit photos --from VOL-A (assert identical); rebuild AGAIN (assert no_changes)"
+        echo "PLAN: new home (init only); copy operator key; tapectl catalog rebuild --from-volume --key OPKEY --label VOL-A --json (assert units>0); tapectl catalog locate photos (assert VOL-A); tapectl restore unit --unit photos --from VOL-A (assert identical); tapectl volume verify VOL-A --full; rebuild AGAIN (assert no_changes)"
         return 0
     fi
     local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-d"
@@ -1933,6 +1933,15 @@ assert d["units_without_tenant_envelope"] == [], d
     NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
         >"$sd/dl.d.restore.txt" 2>&1 || { cat "$sd/dl.d.restore.txt"; return 1; }
     assert_identical "$SRC/photos" "$to"
+
+    # The command `catalog rebuild` itself tells the operator to run next.
+    # It was never exercised until now: the rebuilt rows must be good enough
+    # for a full integrity chain walk, and `volumes.backend_name` must name a
+    # backend that resolves rather than an invented one.
+    NEWHOME_TCTL "$newhome" volume verify VOL-A --device "$TAPE_DEV" --full \
+        >"$sd/dl.d.verify.txt" 2>&1 || {
+        echo "'volume verify' — which the rebuild's own output tells the operator to run — failed:"
+        cat "$sd/dl.d.verify.txt"; return 1; }
 
     # Idempotence, against a real tape rather than a MemStore: the second
     # pass must change nothing. This is what makes it safe to walk a shelf.

@@ -102,6 +102,7 @@ impl RebuildReport {
 /// cannot open the operator envelope (its recipients are operator + escrow
 /// only) and is refused with a pointer at `RESTORE.sh`, which is the heir
 /// path and does not need a catalog at all.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_from_volume(
     conn: &Connection,
     device: &str,
@@ -109,6 +110,7 @@ pub fn rebuild_from_volume(
     key_path: &Path,
     expect_label: Option<&str>,
     fallback_tenant: &str,
+    backend_name: Option<&str>,
     scratch: &Path,
 ) -> Result<RebuildReport> {
     let secret = crate::crypto::keys::read_secret_key(key_path)?;
@@ -122,6 +124,7 @@ pub fn rebuild_from_volume(
         &[identity],
         expect_label,
         fallback_tenant,
+        backend_name,
         scratch,
         device,
     )
@@ -134,12 +137,16 @@ pub fn rebuild_from_volume(
 /// implementation, so a test that drives this drives the real logic. A test
 /// harness that instead re-implemented the walk would be a fixture simpler
 /// than the artifact — it would pass while the shipped path was broken.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_from_store(
     conn: &Connection,
     store: &mut dyn Store,
     identities: &[age::x25519::Identity],
     expect_label: Option<&str>,
     fallback_tenant: &str,
+    // The configured LTO backend's name; `None` falls back to the backend
+    // type, matching `volume_import`.
+    backend_name: Option<&str>,
     scratch: &Path,
     device_label: &str,
 ) -> Result<RebuildReport> {
@@ -202,6 +209,7 @@ pub fn rebuild_from_store(
         &operator.manifest,
         &tenant_of,
         fallback_tenant,
+        backend_name,
         &supplement,
         &mut report,
     )?;
@@ -422,10 +430,14 @@ fn insert_all(
     operator: &EnvelopeManifest,
     tenant_of: &HashMap<String, String>,
     fallback_tenant: &str,
+    backend_name: Option<&str>,
     supplement: &Supplement,
     report: &mut RebuildReport,
 ) -> Result<i64> {
-    let backend_name = "rebuilt";
+    // Resolved the same way `cli::operations::volume_import` does, falling
+    // back to the type string — never an invented name like "rebuilt", which
+    // would put a backend in the catalog that no config declares.
+    let backend_name = backend_name.unwrap_or("lto");
     let volume_id = match existing_id(
         tx,
         "SELECT id FROM volumes WHERE label = ?1",
@@ -545,8 +557,26 @@ fn insert_unit(
     // `current_path` stays NULL: the tape says where the data CAME from, not
     // where it lives now, and a rebuilt unit pointing at a path that may no
     // longer exist would invite `snapshot create` to archive the wrong thing.
+    //
+    // Status is `active`, NOT `tape_only`, for two independent reasons.
+    //
+    // On the merits: `tape_only` is a POLICY state that `unit mark-tape-only`
+    // sets deliberately after checking enforced preconditions (min_copies,
+    // min_locations) and it asserts "the source is deleted, the tape is all
+    // there is". A rebuild knows nothing of the sort — it has read a tape,
+    // not looked at anyone's disk.
+    //
+    // And in effect: `audit` scopes its per-unit checks to `status = 'active'`
+    // (`cli::audit`'s `list_units(conn, None, Some("active"))`). A rebuilt
+    // unit marked `tape_only` is invisible to every one of them, so a catalog
+    // rebuilt after a disaster reported ZERO violations where the catalog it
+    // replaced reported three `copy_count` violations for the same units on
+    // the same single tape. Under-reporting risk to an operator who has just
+    // lost their database is the worst possible direction for this to fail
+    // in — the #105 lesson, in a new place: a silent downgrade is strictly
+    // worse than a known violation, because the tool cannot tell.
     tx.execute(
-        "INSERT INTO units (uuid, name, tenant_id, status) VALUES (?1, ?2, ?3, 'tape_only')",
+        "INSERT INTO units (uuid, name, tenant_id, status) VALUES (?1, ?2, ?3, 'active')",
         params![unit.uuid, unit.name, tenant_id],
     )?;
     report.units += 1;

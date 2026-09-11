@@ -142,6 +142,7 @@ value` instead of dying silently, and `--info` announces
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 14:45 | #136 | **follow-up: a rebuilt catalog was QUIETER than the truth.** Rebuilt units were inserted `tape_only`; `audit` scopes every per-unit check to `status = 'active'`, so the rebuilt catalog reported 0 violations where the one it replaced reported 3 `copy_count` violations for the same units on the same tape. Fixed to `active` — which is also the honest value, since `tape_only` is a policy state `mark-tape-only` sets after checking preconditions. Negative control confirmed red. Also: `volumes.backend_name` was the invented literal `"rebuilt"`; now resolved from config like `volume_import`. And `volume verify --full`, which the command's own output tells the operator to run next, was never exercised — it is now arm (d)'s last step, 23/23. 839 tests (+3), gate GREEN 26/26, db-loss 6/6. |
 | 09-11 14:20 | #134/#135 | real-drive pass **BLOCKED AGAIN**. The auto-mode classifier refused `--i-will-lose-the-cartridge` as irreversible deletion; the grant the CTO made at 12:40 was session-scoped and did not persist as a rule in `.claude/settings.local.json`. Not retried in variant forms. Everything the pass would confirm is already green on mhvtl (gate 26/26, including `heir_restore` and `heir_find_envelope` against the new File 2); what is outstanding is narrowly "the same bytes land on real LTO-6 hardware". |
 | 09-11 14:12 | #136 | landed `edef129`, closing the issue. Gate GREEN 26/26. **db-loss 6/6 — green for the first time**: arm (b) was this suite's last expected failure, and arm (d) rebuilt 3 units / 2 tenants / 14 slices / 22 file rows off mhvtl tape, restored `photos` byte-identical through the rebuilt rows, then rebuilt again to all zeros. 730 lib tests (+7), 836 total. |
 | 09-11 14:05 | #136 | implemented. New `volume::envelope` (the first Rust code that reads an envelope BACK — the write path packed them and only bash ever unpacked them) and `volume::rebuild`. 9 integration tests drive the **real** write session into a `MemStore` and rebuild from those exact bytes; the load-bearing assertion runs `restore_unit`'s verbatim resolution join. Two negative controls confirmed red at distinct assertions. |
@@ -171,6 +172,35 @@ value` instead of dying silently, and `--info` announces
 
 **Round 1 — queue: 8 items — 6 landed, 1 deferred, 1 documented. One
 obligation blocked.** Round 2 reopened the queue above with #134/#135/#136.
+
+**Round 2 — queue: 3 items, all landed.** #134 and #135 in `64d3f91`; #136 in
+`edef129` + `85ca9f2`. 723 lib tests at the start of round 2, **733** at the
+end; 839 total. Gate GREEN 26/26 on every tape-path commit, CI green on every
+push, and `db-loss` reached 6/6 — the first time that scenario has been fully
+green, because its arm (b) was the suite's last standing expected failure.
+
+Deferred to the CTO: **#137** (a rebuilt catalog can never prove escrow
+coverage). Blocked: the **second real-drive confirmation pass**, on a
+permission rule rather than on anything technical — see the section above.
+
+Round 2's lessons, both of which cost a real correction:
+
+- **Measure the thing you are about to tell someone to rely on.** Two of the
+  three defects found after the first commit — the silent `audit` downgrade
+  and the never-run `volume verify` — were invisible to 9 passing tests and
+  a green gate, and fell out of running `audit` once against the catalog the
+  command had just built. This is the round-1 fixture lesson at one more
+  remove: not only must the fixture match the artifact, the artifact must be
+  used the way the docs say to use it.
+- **A status is a claim.** `tape_only` looked like a neutral description of a
+  unit whose data is on tape. It is a policy state with enforced
+  preconditions and an audit consequence, and inferring it from a data fact
+  silenced every check that mattered. The same shape as #105: the downgrade
+  was silent, so the tool could not tell.
+
+One process note, twice over: `Closes #NNN` in a commit message auto-closes
+the issue **on push, before CI finishes**. It went green both times, but the
+#133 rule stands — do not treat an issue as closed until CI is read.
 
 | Commit | What |
 |---|---|

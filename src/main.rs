@@ -174,7 +174,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::restore::run(&conn, &paths, &cfg, command, cli.json)?;
         }
         Commands::Catalog { ref command } => {
-            cli::catalog::run(&conn, command, cli.json)?;
+            cli::catalog::run(&conn, &cfg, command, cli.json)?;
         }
         Commands::Location { ref command } => {
             cli::location::run(&conn, command, cli.json)?;

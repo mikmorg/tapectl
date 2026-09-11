@@ -53,6 +53,7 @@ const UNITS: &[(&str, &str, &[u8])] = &[
 struct SealedVolume {
     store: MemStore,
     operator_secret: String,
+    escrow_secret: String,
     tenant_secret: String,
     /// Unit name -> the tape positions its slices landed on, in slice order.
     expected_positions: Vec<(String, Vec<i64>)>,
@@ -224,6 +225,12 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
         None
     };
 
+    // ADR-0005's permanent escrow recipient. `with_escrow` adds it to EVERY
+    // envelope's recipient list, so the escrow key is the other half of the
+    // ratified "operator or escrow key" rule — untested until this fixture
+    // carried one.
+    let escrow = generate_keypair();
+
     let tenants = [alpha, bravo];
     let inputs = BuildInputs {
         label: LABEL.to_string(),
@@ -250,7 +257,7 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
             })
             .collect(),
         operator_public_keys: vec![operator.public_key.clone()],
-        escrow_public_key: None,
+        escrow_public_key: Some(escrow.public_key.clone()),
         catalog_db_path,
     };
 
@@ -311,6 +318,7 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     SealedVolume {
         store,
         operator_secret: operator.secret_key,
+        escrow_secret: escrow.secret_key,
         tenant_secret: tenants[0].secret_key.clone(),
         expected_positions,
         expected_plain_hashes,
@@ -381,6 +389,7 @@ fn rebuild(
         &[identity],
         Some(LABEL),
         "recovered",
+        Some("lto0"),
         scratch,
         "memstore",
     )
@@ -685,4 +694,96 @@ fn the_rebuild_records_its_provenance_as_an_event() {
     assert!(details.contains(LABEL), "{details}");
     assert!(details.contains(VOL_UUID), "{details}");
     assert!(details.contains("catalog.db present"), "{details}");
+}
+
+/// The defect this test exists for: `audit` scopes every per-unit check to
+/// `status = 'active'` (`cli::audit`'s `list_units(conn, None, Some("active"))`).
+/// Rebuilt units were first written as `tape_only`, which made a catalog
+/// rebuilt after a disaster report ZERO violations where the catalog it
+/// replaced reported three `copy_count` violations for the same units on the
+/// same single tape. Under-reporting risk to someone who has just lost their
+/// database is the worst direction for this to fail in.
+///
+/// Pinned through the exact call `audit` makes, not through a status string,
+/// so it keeps testing the real scoping if that scoping ever moves.
+#[test]
+fn rebuilt_units_are_visible_to_the_scope_audit_checks() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let audited = tapectl::db::queries::list_units(&conn, None, Some("active")).unwrap();
+    let mut names: Vec<&str> = audited.iter().map(|u| u.name.as_str()).collect();
+    names.sort_unstable();
+    let mut expected: Vec<&str> = UNITS.iter().map(|(n, _, _)| *n).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        names, expected,
+        "every rebuilt unit must fall inside the scope audit checks, or a \
+         rebuilt catalog silently reports fewer violations than the truth"
+    );
+
+    // `tape_only` is a policy state `unit mark-tape-only` sets deliberately
+    // after checking enforced preconditions. A rebuild has read a tape, not
+    // looked at anyone's disk, and must not claim it.
+    let tape_only: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE status = 'tape_only'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tape_only, 0);
+}
+
+/// The `volumes` row must name a backend the config actually declares — an
+/// invented name would put a backend in the catalog that nothing can resolve.
+#[test]
+fn the_rebuilt_volume_names_the_configured_backend() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let (btype, bname): (String, String) = conn
+        .query_row(
+            "SELECT backend_type, backend_name FROM volumes WHERE label = ?1",
+            rusqlite::params![LABEL],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(btype, "lto");
+    assert_eq!(bname, "lto0", "the caller's configured backend name");
+}
+
+/// The other half of the ratified access rule. `with_escrow` puts the escrow
+/// recipient on every envelope (ADR-0005), so the escrow key must rebuild
+/// exactly as the operator key does — this is the key an heir actually holds,
+/// printed on the kit `key escrow-kit` generates.
+#[test]
+fn the_escrow_key_rebuilds_as_well_as_the_operator_key() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.escrow_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("the escrow key must open the operator envelope");
+    assert_eq!(report.units, UNITS.len());
+    assert!(report.had_catalog_db);
+
+    for (unit_name, expected) in &vol.expected_positions {
+        let rows = restore_resolution_query(&conn, unit_name);
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|(_, pos, _)| pos.parse().unwrap())
+            .collect();
+        assert_eq!(&got, expected, "unit {unit_name}");
+    }
 }

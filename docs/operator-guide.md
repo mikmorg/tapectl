@@ -886,6 +886,15 @@ What comes back, and from where:
 | tenant ownership | the tenant envelopes |
 | the per-file index and original source paths | the operator envelope's `catalog.db` |
 
+Rebuilt units come back as `active`, so `audit` sees them. Expect it to start
+reporting the truth immediately — a single cartridge is one copy, and if your
+policy asks for two, that is a violation it should be telling you about:
+
+```bash
+tapectl audit                       # exit 2 on a one-copy rebuild is correct
+tapectl volume verify --label VOL0001 --device /dev/nst0 --full
+```
+
 Three things it deliberately does not do:
 
 - **It does not verify the tape.** The hashes it records are the tape's own
