@@ -16,13 +16,46 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **RUN 2026-09-11 (unattended, through Sunday 2026-09-13) — IN PROGRESS.**
-  The CTO is away. **Read `.claude/skills/unattended-run/SKILL.md` before the
-  first pick** — it governs scope, the settle/defer/halt tiers, tape access,
-  what "done" requires, and the red lines. The queue, the wall-clock bound and
-  the progress log live in `docs/runs/2026-09-11-unattended.md`; that file is
-  the cold-start entry point after a dropped session. Deferred questions go to
-  `docs/decisions-pending.md` **and** an issue labelled `needs:cto`.
+- **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — IN PROGRESS.**
+  The CTO asked for an architecture review and then `/autopilot do all`. The
+  queue is the seven candidates in `docs/audits/2026-09-11-deepening-review`
+  (report: `/tmp/architecture-review-20260911-180729.html`, artifact
+  https://claude.ai/code/artifact/5625257c-2dcb-43ee-aaf5-6c679cb5c3f1).
+  Take in this order — dependency and blast radius, not preference:
+  1. **C1** escrow coverage: `policy::escrow` grows the query half (mirror
+     `policy::coverage::CoverageQuery`); the four callers (audit, locate,
+     report copies, write pre-flight) call it; the write pre-flight's private
+     JSON parse and reason strings are deleted. Volume filter: **`in_service`**
+     (coordinator decision, recorded in the commit; the CTO can flip it).
+  2. **C3** MANIFEST.toml: one `format::Manifest` type, `to_toml`/`from_toml`.
+     **Bytes on tape must be identical** — a golden test pins the writer's
+     output before and after; `to_toml` keeps the hand format.
+  3. **C6** RESTORE.sh: named awk fragments assembled into the script;
+     **generated script byte-identical**, pinned by a golden hash test; the
+     awk tests take their MANIFEST from `Manifest::to_toml`.
+  4. **C7** Store: `TapeStore::open_read` moves to the CLI; `volume_identify`,
+     `read_slices`, `compact_read`, `restore_raw`, `rebuild` take
+     `&mut dyn Store`.
+  5. **C5** catalog.db: schema const + row types + shape probe in one module
+     both sides import. A generation STAMP would be bytes on tape → CTO
+     question, queued; the consolidation itself is not.
+  6. **C2** row structs derive `Serialize`; JSON arm = `to_string_pretty`.
+     **Existing JSON key names are a contract** — `#[serde(rename)]` keeps
+     every key exactly as shipped; `cli_smoke.rs` assertions must not change.
+  7. **C4** audit check table + one runner; findings order and text identical.
+  Rules for this queue: one worktree sub-agent per item (sonnet), coordinator
+  reviews and cherry-picks, full gate after each, mhvtl gate for anything under
+  src/volume, src/tape, src/store.rs or generated RESTORE.sh, push, READ CI.
+  Golden tests for C3/C6 are written by the coordinator FIRST and must pass
+  before dispatch, so a worker cannot move bytes and re-pin.
+- **RUN 2026-09-11 (unattended, then attended) — CLOSED 2026-09-11 evening.**
+  Three rounds: #125/#126/#130/#132/#133 + symlink restore; #134/#135/#136
+  (`catalog rebuild`); the design review's six items (#138, third escrow
+  state, catalog.db as rebuild source, attestation, DR docs, lifecycle arm d).
+  Real-drive passes #1–#3 all 45/45 with bytes read back off the cartridge.
+  Full account in `docs/runs/2026-09-11-unattended.md`; rules that outlived
+  the run are in `.claude/skills/unattended-run/SKILL.md`. Open follow-up:
+  #139 (`init --escrow-public-key`).
 - **DEVICES MOVED — the 2026-09-10 entry below is superseded on this point.**
   The VM reboot happened. The **mhvtl gate is GREEN 26/26** against an empty
   `EXPECTED_FAIL` manifest and is fully usable again; real-LTO-6 validation no
