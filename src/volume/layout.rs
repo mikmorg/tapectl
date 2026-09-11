@@ -1011,12 +1011,23 @@ do_restore() {
       }
       in_s = 0; num = ""; tpos = ""; eb = ""; sha = ""
     }
-    /^\[\[units\]\]/ { flush(); blk++; hit[blk] = 0; ver[blk] = -1; in_u = 0; next }
-    /^name = / {
+    # in_head tracks POSITION (are we in the key/value region directly under
+    # [[units]]?); in_u tracks IDENTITY (is this block the unit we want?).
+    # Separate on purpose: name and snapshot_version belong to the block head,
+    # so honouring them anywhere else — a name key added to [[units.slices]],
+    # or to some future table — would silently retarget the selector and drop
+    # the remaining slices. A wrong answer with no error is the worst failure
+    # this script can produce (#135).
+    #
+    # No apostrophes in these comments: the whole program is single-quoted in
+    # the shell, so one would end it mid-awk and break the generated script.
+    /^\[\[units\]\]/ { flush(); blk++; hit[blk] = 0; ver[blk] = -1; in_u = 0; in_head = 1; next }
+    /^\[/ { in_head = 0 }
+    in_head && /^name = / {
       gsub(/"/, "", $3)
       if ($3 == unit) { in_u = 1; hit[blk] = 1 } else { in_u = 0 }
     }
-    in_u && /^snapshot_version = / { ver[blk] = $3 + 0 }
+    in_u && in_head && /^snapshot_version = / { ver[blk] = $3 + 0 }
     in_u && /^\[\[units\.slices\]\]/ { flush(); in_s = 1; next }
     in_s && /^number = /           { num = $3 }
     in_s && /^tape_position = /    { tpos = $3 }
@@ -1368,7 +1379,6 @@ pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestU
 volume = "{label}"
 tenant = "{tenant_name}"
 created_at = "{now}"
-layout_version = 1
 
 "#
     );
@@ -1823,6 +1833,29 @@ mod tests {
                 "{what} must mark /dev/nst0 as an example, not a fact"
             );
         }
+    }
+
+    /// #134: the envelope manifest used to carry `layout_version = 1` on a v2
+    /// tape. It was a v1-era constant the format flip never touched — nothing
+    /// has ever read it, and it contradicted the ID thunk, the front index and
+    /// the seal marker, all of which say 2. An heir comparing the two would
+    /// conclude the tape was inconsistent when it is not.
+    ///
+    /// Deleted rather than bumped: a field no reader consults cannot be kept
+    /// honest, which is the same trap as `meta.schema_version` (#61). This
+    /// test exists so it cannot drift back in.
+    #[test]
+    fn the_envelope_manifest_carries_no_layout_version() {
+        let s = generate_manifest_toml("LAB01", "alice", &[]);
+        assert!(
+            !s.contains("layout_version"),
+            "the envelope manifest must not claim a layout version — the tape's \
+             own zones are authoritative:\n{s}"
+        );
+        let parsed: toml::Value = s.parse().expect("manifest must still be valid TOML");
+        let m = parsed.get("manifest").expect("[manifest] table survives");
+        assert_eq!(m.get("volume").unwrap().as_str(), Some("LAB01"));
+        assert_eq!(m.get("tenant").unwrap().as_str(), Some("alice"));
     }
 
     #[test]
@@ -2315,6 +2348,108 @@ snapshot_version = 1
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #135: a `name` key outside the `[[units]]` head must not retarget the
+    /// version selector. Nothing emits one today — `naming.rs` also bans the
+    /// characters that would break the field split — so this guards the
+    /// direction of travel, not a live defect. The failure it prevents is the
+    /// worst kind: the selector silently switches units mid-block and the
+    /// restore succeeds with part of the data.
+    #[test]
+    fn a_name_key_outside_the_units_head_does_not_retarget_the_selector() {
+        use std::process::{Command, Stdio};
+
+        let script = generate_restore_script_v2("GUARD1", 20);
+        let start = script
+            .find("awk -v unit=\"$target_unit\"")
+            .expect("version-selecting awk must be present");
+        let body = &script[start..];
+        let open = body.find('\'').expect("awk program opens");
+        let close = body[open + 1..].find('\'').expect("awk program closes");
+        let program = &body[open + 1..open + 1 + close];
+
+        // A slice table carrying its own `name`, as some future field might.
+        let manifest = "\
+[[units]]
+name = \"photos\"
+snapshot_version = 1
+
+[[units.slices]]
+number = 1
+name = \"decoy\"
+tape_position = 20
+encrypted_bytes = 111
+sha256_encrypted = \"aaa\"
+
+[[units.slices]]
+number = 2
+tape_position = 21
+encrypted_bytes = 222
+sha256_encrypted = \"bbb\"
+";
+        let dir = std::env::temp_dir().join(format!("tapectl-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let man = dir.join("MANIFEST.toml");
+        std::fs::write(&man, manifest).unwrap();
+        let prog = dir.join("sel.awk");
+        std::fs::write(&prog, program).unwrap();
+
+        let out = Command::new("awk")
+            .args([
+                "-v",
+                "unit=photos",
+                "-v",
+                "want=",
+                "-f",
+                prog.to_str().unwrap(),
+                man.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("spawn awk");
+        let got = String::from_utf8_lossy(&out.stdout).to_string();
+
+        assert_eq!(
+            got.lines().count(),
+            2,
+            "both slices must survive a decoy name key:\n{got}"
+        );
+        assert!(got.contains("|20|") && got.contains("|21|"), "{got}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generated script must be syntactically valid bash. Cheap, and it
+    /// catches the trap this file keeps setting: the awk programs are
+    /// single-quoted in the shell, so one apostrophe anywhere inside one —
+    /// including in a comment — ends the program early and breaks the script
+    /// that gets frozen onto tape. `bash -n` parses without executing.
+    #[test]
+    fn the_generated_script_parses_as_bash() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let script = generate_restore_script_v2("SYNTAX1", 20);
+        let mut child = Command::new("bash")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bash -n");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "generated RESTORE.sh is not valid bash:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// #133 defects 2 and 4, at the process boundary: how the script answers
