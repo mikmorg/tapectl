@@ -15,7 +15,12 @@
 //! | envelope positions | front index (File 3) | the plaintext map |
 //! | unit name/uuid, version, slice map, `sha256_plain` | envelope `MANIFEST.toml` | the front index may carry none of it (sacred invariant), and the on-tape `catalog.db` omits `sha256_plain` |
 //! | tenant name per unit | each tenant envelope's manifest | the operator manifest files every unit under the placeholder tenant `"operator"` |
-//! | per-file index, `source_path`, sizes | operator envelope's `catalog.db` (#83) | no manifest carries files |
+//! | per-file index, `source_path`, sizes | operator envelope's `catalog.db` (#83), via `db::ontape_catalog` | no manifest carries files |
+//!
+//! `db::ontape_catalog::Generation` is how an old tape's `catalog.db` (no
+//! `tenants`, no `key_fingerprints`, no `sha256_plain`) is told apart from a
+//! current one — probed from the file's actual shape, never from a version
+//! number (see that module's doc for why).
 //!
 //! # What it deliberately does not do
 //!
@@ -50,6 +55,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::db::ontape_catalog::{self, Generation};
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
 use crate::volume::envelope::{self, EnvelopeManifest, OpenError, OpenedEnvelope};
@@ -490,112 +496,94 @@ struct FileRow {
 }
 
 impl Supplement {
+    /// Read every table via `ontape_catalog::read`, then derive exactly the
+    /// maps `insert_all`/`tenant_index`/`ensure_*` already consume, keyed by
+    /// unit name (and version, where a fact is per-snapshot) the way the
+    /// hand-written joins used to key them.
     fn load(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
+        let cat = ontape_catalog::read(path)?;
         let mut out = Supplement::default();
 
-        {
-            let mut stmt = db.prepare(
-                "SELECT u.name, s.version, s.source_path, s.snapshot_type, s.total_size, s.file_count
-                 FROM snapshots s JOIN units u ON u.id = s.unit_id",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    SnapshotFacts {
-                        source_path: r.get(2)?,
-                        snapshot_type: r.get(3)?,
-                        total_size: r.get(4)?,
-                        file_count: r.get(5)?,
-                    },
+        let unit_name: HashMap<i64, String> =
+            cat.units.iter().map(|u| (u.id, u.name.clone())).collect();
+        let tenant_name: HashMap<i64, String> =
+            cat.tenants.iter().map(|t| (t.id, t.name.clone())).collect();
+        // snapshot id -> (owning unit's name, version), the stable key every
+        // consumer below joins on.
+        let snapshot_key: HashMap<i64, (String, i64)> = cat
+            .snapshots
+            .iter()
+            .filter_map(|s| {
+                unit_name
+                    .get(&s.unit_id)
+                    .map(|n| (s.id, (n.clone(), s.version)))
+            })
+            .collect();
+
+        for s in &cat.snapshots {
+            let Some(key) = snapshot_key.get(&s.id) else {
+                continue;
+            };
+            let snapshot_type = s.snapshot_type.clone().ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "catalog.db snapshots row {} has NULL snapshot_type",
+                    s.id
                 ))
             })?;
-            for row in rows {
-                let (name, version, facts) = row?;
-                out.snapshots.insert((name, version), facts);
-            }
+            out.snapshots.insert(
+                key.clone(),
+                SnapshotFacts {
+                    source_path: s.source_path.clone(),
+                    snapshot_type,
+                    total_size: s.total_size,
+                    file_count: s.file_count,
+                },
+            );
         }
 
-        {
-            let mut stmt = db.prepare(
-                "SELECT u.name, ss.slice_size
-                 FROM stage_sets ss
-                 JOIN snapshots s ON s.id = ss.snapshot_id
-                 JOIN units u ON u.id = s.unit_id",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in rows {
-                let (name, size) = row?;
-                out.slice_size.insert(name, size);
-            }
-        }
-
-        {
-            let mut stmt = db.prepare(
-                "SELECT u.name, s.version, f.path, f.size_bytes, f.sha256, f.modified_at,
-                        f.is_directory
-                 FROM files f
-                 JOIN snapshots s ON s.id = f.snapshot_id
-                 JOIN units u ON u.id = s.unit_id",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    FileRow {
-                        path: r.get(2)?,
-                        size_bytes: r.get(3)?,
-                        sha256: r.get(4)?,
-                        modified_at: r.get(5)?,
-                        is_directory: r.get(6)?,
-                    },
+        for ss in &cat.stage_sets {
+            let Some((name, _version)) = snapshot_key.get(&ss.snapshot_id) else {
+                continue;
+            };
+            let slice_size = ss.slice_size.ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "catalog.db stage_sets row {} has NULL slice_size",
+                    ss.id
                 ))
             })?;
-            for row in rows {
-                let (name, version, file) = row?;
-                out.files.entry((name, version)).or_default().push(file);
+            out.slice_size.insert(name.clone(), slice_size);
+            if let Some(fp) = &ss.key_fingerprints {
+                out.key_fingerprints.insert(name.clone(), fp.clone());
             }
         }
 
-        // Written after 2026-09-11? Probe the shape rather than trust a
-        // version number: a `tenants` table and a `key_fingerprints` column.
-        let has_tenants: bool = db.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tenants'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? > 0;
-        let has_receipts: bool = db
-            .prepare("PRAGMA table_info(stage_sets)")?
-            .query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
-            .any(|c| c == "key_fingerprints");
-        out.has_tenants = has_tenants;
-
-        if has_tenants {
-            let mut stmt = db.prepare(
-                "SELECT u.name, t.name FROM units u JOIN tenants t ON t.id = u.tenant_id",
-            )?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (unit, tenant) = row?;
-                out.tenant_of.insert(unit, tenant);
-            }
+        for f in &cat.files {
+            let Some(key) = snapshot_key.get(&f.snapshot_id) else {
+                continue;
+            };
+            let size_bytes = f.size_bytes.ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "catalog.db files row {} ({:?}) has NULL size_bytes",
+                    f.id, f.path
+                ))
+            })?;
+            out.files.entry(key.clone()).or_default().push(FileRow {
+                path: f.path.clone(),
+                size_bytes,
+                sha256: f.sha256.clone(),
+                modified_at: f.modified_at.clone(),
+                is_directory: f.is_directory,
+            });
         }
-        if has_receipts {
-            let mut stmt = db.prepare(
-                "SELECT u.name, ss.key_fingerprints
-                 FROM stage_sets ss
-                 JOIN snapshots s ON s.id = ss.snapshot_id
-                 JOIN units u ON u.id = s.unit_id
-                 WHERE ss.key_fingerprints IS NOT NULL",
-            )?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (unit, json) = row?;
-                out.key_fingerprints.insert(unit, json);
+
+        out.has_tenants = cat.generation == Generation::WithOwnershipAndReceipts;
+        if out.has_tenants {
+            for u in &cat.units {
+                if let (Some(uname), Some(tname)) =
+                    (unit_name.get(&u.id), tenant_name.get(&u.tenant_id))
+                {
+                    out.tenant_of.insert(uname.clone(), tname.clone());
+                }
             }
         }
 
