@@ -153,6 +153,50 @@ pub trait Store {
     /// trimming to the true size is the caller's job).
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64>;
 
+    /// The first `max_bytes` of the file at `position`, or the whole file if
+    /// it is shorter. Returns the byte count delivered.
+    ///
+    /// The default reads the whole file through a bounded sink — correct on
+    /// any store, and what `MemStore` uses. A tape overrides it to stop
+    /// reading after the first block(s): `catalog rebuild --key <escrow>`
+    /// attests escrow coverage by trial-decrypting one slice *header* per
+    /// stage set (#137), and a slice can be tens of gigabytes.
+    fn read_file_head(
+        &mut self,
+        position: u32,
+        max_bytes: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64> {
+        struct Head<'a> {
+            inner: &'a mut dyn Write,
+            remaining: u64,
+            written: u64,
+        }
+        impl Write for Head<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let take = (buf.len() as u64).min(self.remaining) as usize;
+                if take > 0 {
+                    self.inner.write_all(&buf[..take])?;
+                    self.remaining -= take as u64;
+                    self.written += take as u64;
+                }
+                // Report the whole buffer consumed so the producer keeps
+                // going to the file mark; we simply stop forwarding.
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        let mut head = Head {
+            inner: sink,
+            remaining: max_bytes,
+            written: 0,
+        };
+        self.read_file(position, &mut head)?;
+        Ok(head.written)
+    }
+
     /// Position the store for a resumed write session immediately before
     /// tape file `file_index` (0-indexed): the next `execute()` call becomes
     /// that file. Anything previously recorded at or after `file_index` is
@@ -541,6 +585,21 @@ impl Store for TapeStore {
         self.dev.read_file_streaming(sink)
     }
 
+    /// Overrides the default so a tape stops after the first block(s)
+    /// instead of streaming a whole slice to a sink that discards it.
+    fn read_file_head(
+        &mut self,
+        position: u32,
+        max_bytes: u64,
+        sink: &mut dyn Write,
+    ) -> Result<u64> {
+        self.dev.rewind()?;
+        if position > 0 {
+            self.dev.forward_space_file(position as i32)?;
+        }
+        self.dev.read_file_head(max_bytes, sink)
+    }
+
     fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
         self.dev.rewind()?;
         if file_index > 0 {
@@ -732,6 +791,27 @@ mod tests {
         assert_eq!(n, 4096);
         assert_eq!(sink.len(), 4096);
         assert_eq!(&sink[..5], b"hello");
+    }
+
+    /// The default `read_file_head`: exactly `max_bytes` of the padded file,
+    /// and the whole file when it is shorter than asked.
+    #[test]
+    fn read_file_head_delivers_a_bounded_prefix() {
+        let mut store = MemStore::new(16);
+        let payload: Vec<u8> = (0u8..40).collect(); // pads to 48
+        store
+            .execute(&mut &payload[..], payload.len() as u64, true)
+            .unwrap();
+
+        let mut head = Vec::new();
+        let n = store.read_file_head(0, 10, &mut head).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(head, (0u8..10).collect::<Vec<_>>());
+
+        let mut all = Vec::new();
+        let n = store.read_file_head(0, 1_000_000, &mut all).unwrap();
+        assert_eq!(n, 48, "shorter than asked: the whole padded file");
+        assert_eq!(&all[..40], &payload[..]);
     }
 
     // --- reposition_for_resume (T6) -------------------------------------

@@ -970,3 +970,123 @@ fn an_old_shape_catalog_db_still_rebuilds_through_the_envelopes() {
         "?"
     );
 }
+
+/// Register `public_key` as this catalog's escrow recipient — what
+/// `key import --escrow <original>` does, and step one of the DR procedure.
+fn register_escrow(conn: &rusqlite::Connection, public_key: &str) {
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    tapectl::db::queries::insert_escrow_key(conn, tid, "escrow", public_key, public_key, None)
+        .unwrap();
+}
+
+fn markers(conn: &rusqlite::Connection, escrow_pub: &str) -> Vec<&'static str> {
+    let mut stmt = conn
+        .prepare("SELECT key_fingerprints, origin FROM stage_sets ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+    })
+    .unwrap()
+    .map(|r| {
+        let (fp, origin) = r.unwrap();
+        tapectl::policy::escrow::marker(
+            fp.as_deref(),
+            tapectl::policy::escrow::Origin::parse(&origin),
+            Some(escrow_pub),
+        )
+    })
+    .collect()
+}
+
+/// #137, grilling Q2: with the REGISTERED escrow key in hand, a rebuild of
+/// an old-shape tape proves coverage by decrypting a slice header, and
+/// records it. Proof, not a receipt.
+#[test]
+fn the_registered_escrow_key_attests_coverage_on_an_old_tape() {
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    register_escrow(&conn, &vol.escrow_public);
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.escrow_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(report.key_is_escrow);
+    assert_eq!(
+        report.receipts_from_tape, 0,
+        "an old tape carries no receipt"
+    );
+    assert_eq!(report.attested, UNITS.len());
+    assert_eq!(report.unknown_remaining, 0);
+    assert!(markers(&conn, &vol.escrow_public)
+        .iter()
+        .all(|m| *m == "yes"));
+}
+
+/// The operator key opens every slice too — and that proves operator
+/// coverage, which is not the claim. It must not attest.
+#[test]
+fn the_operator_key_does_not_attest() {
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    register_escrow(&conn, &vol.escrow_public);
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(!report.key_is_escrow);
+    assert_eq!(report.attested, 0);
+    assert_eq!(report.unknown_remaining, UNITS.len() as i64);
+    assert!(markers(&conn, &vol.escrow_public).iter().all(|m| *m == "?"));
+}
+
+/// Review finding 4 made load-bearing: the escrow key attests only when it
+/// is the escrow recipient this catalog has REGISTERED. A post-disaster
+/// `init` mints a replacement identity; until the original is imported,
+/// nothing attests — and the report says the key was not recognised.
+#[test]
+fn an_unregistered_escrow_key_does_not_attest() {
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path()); // nothing registered
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.escrow_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(!report.key_is_escrow);
+    assert_eq!(report.attested, 0);
+    assert_eq!(report.unknown_remaining, UNITS.len() as i64);
+}
+
+/// Q10: attestation lives in `catalog rebuild`, so a second run with the
+/// escrow key fills in what the first (operator-key) run left unknown —
+/// "insert what is missing", applied to a column — and a third run is a
+/// no-op again.
+#[test]
+fn a_second_run_with_the_escrow_key_fills_what_the_first_left_unknown() {
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    register_escrow(&conn, &vol.escrow_public);
+    let scratch = tempfile::tempdir().unwrap();
+
+    let op = vol.operator_secret.clone();
+    let first = rebuild(&conn, &mut vol, &op, scratch.path()).unwrap();
+    assert_eq!(first.unknown_remaining, UNITS.len() as i64);
+
+    let esc = vol.escrow_secret.clone();
+    let second = rebuild(&conn, &mut vol, &esc, scratch.path()).unwrap();
+    assert_eq!(second.units, 0, "nothing new to insert");
+    assert_eq!(second.attested, UNITS.len());
+    assert!(!second.is_noop(), "attesting is a change worth reporting");
+    assert_eq!(second.unknown_remaining, 0);
+
+    let third = rebuild(&conn, &mut vol, &esc, scratch.path()).unwrap();
+    assert!(third.is_noop(), "{third:?}");
+}

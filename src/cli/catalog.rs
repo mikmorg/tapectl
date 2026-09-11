@@ -410,6 +410,9 @@ pub fn run(
                         "had_catalog_db": report.had_catalog_db,
                         "tenants_from_catalog_db": report.tenants_from_catalog_db,
                         "receipts_from_tape": report.receipts_from_tape,
+                        "attested": report.attested,
+                        "key_is_escrow": report.key_is_escrow,
+                        "unknown_remaining": report.unknown_remaining,
                         "units_without_tenant_envelope": report.units_without_tenant_envelope,
                         "no_changes": report.is_noop(),
                     })
@@ -459,17 +462,28 @@ pub fn run(
                      `tapectl volume verify --label {}` to check them",
                     report.label
                 );
-                if report.stage_sets > 0 && report.receipts_from_tape == report.stage_sets {
+                if report.attested > 0 {
                     println!(
-                        "  escrow receipts: all {} stage set(s) carried theirs on the tape",
+                        "  attested: {} stage set(s) — the escrow key decrypted a slice header",
+                        report.attested
+                    );
+                }
+                if report.receipts_from_tape > 0 {
+                    println!(
+                        "  escrow receipts: {} stage set(s) carried theirs on the tape",
                         report.receipts_from_tape
                     );
-                } else if report.stage_sets > 0 {
+                }
+                if report.unknown_remaining > 0 {
                     println!(
-                        "  escrow receipts: {} of {} stage set(s) carried one on the tape; the \
-                         rest report `escrow: ?` (unknown) until attested with \
-                         `catalog rebuild --key <escrow key>` (issue #137)",
-                        report.receipts_from_tape, report.stage_sets
+                        "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown){}",
+                        report.unknown_remaining,
+                        if report.key_is_escrow {
+                            " — the escrow key is not a recipient of their slices"
+                        } else {
+                            " — attest them with `catalog rebuild --key <the REGISTERED escrow key>` \
+                             (import the original with `key import --escrow` first), or re-stage"
+                        }
                     );
                 }
             }

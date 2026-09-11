@@ -45,6 +45,7 @@
 //! (#137). Attestation is `catalog rebuild --key <escrow>`.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -84,6 +85,17 @@ pub struct RebuildReport {
     /// `catalog.db`. For those, #137 does not arise: coverage is recorded,
     /// not unknown.
     pub receipts_from_tape: usize,
+    /// Stage sets whose coverage was DEMONSTRATED this run: the supplied key
+    /// is the registered escrow key and it decrypted a slice header. Proof,
+    /// not a receipt (CTO grilling Q2/Q10).
+    pub attested: usize,
+    /// True when the supplied key's public half is the escrow recipient this
+    /// catalog has registered. Attestation happens only then — an operator
+    /// key opening a slice proves operator coverage, which is not the claim.
+    pub key_is_escrow: bool,
+    /// Rebuilt stage sets on this volume still without a receipt after this
+    /// run — the ones that read `escrow: ?` until attested.
+    pub unknown_remaining: i64,
     /// Units whose tenant could not be read from any tenant envelope on this
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
@@ -102,6 +114,7 @@ impl RebuildReport {
             && self.writes == 0
             && self.positions == 0
             && self.files == 0
+            && self.attested == 0
     }
 }
 
@@ -222,10 +235,118 @@ pub fn rebuild_from_store(
         &supplement,
         &mut report,
     )?;
+    attest_escrow(&tx, store, identities, &operator.manifest, &mut report)?;
+    report.unknown_remaining = tx.query_row(
+        "SELECT COUNT(*) FROM stage_sets ss
+         JOIN writes w ON w.stage_set_id = ss.id
+         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
     record_event(&tx, &report, volume_id, device_label)?;
     tx.commit()?;
 
     Ok(report)
+}
+
+/// How much of a slice to read for attestation. An age header is a few
+/// hundred bytes per recipient plus a MAC line; one tape block (512 KiB) is
+/// far more than enough, and `MemStore` pads to its block size anyway.
+const ATTEST_HEAD_BYTES: u64 = 64 * 1024;
+
+/// Attest escrow coverage by demonstration (#137, CTO grilling Q2/Q10).
+///
+/// A recorded recipient list is a claim tapectl wrote down. Stronger proof
+/// exists when the escrow key is in hand: if it decrypts the slice, the slice
+/// is escrow-covered. age puts the recipient stanzas in the header and
+/// unwraps the file key before touching payload, so this reads one slice
+/// *header* per stage set — `Store::read_file_head` — never the slice.
+///
+/// Applies only when the supplied key's public half is the escrow recipient
+/// this catalog has REGISTERED. That is what makes "import the original
+/// escrow key first" (the DR procedure's step one) load-bearing rather than
+/// advisory: with a replacement identity registered, nothing attests. An
+/// operator key is never used here — it opening a slice proves operator
+/// coverage, which is not the claim being recorded.
+///
+/// It must be a SLICE, not the envelope: #115 showed the two can differ
+/// (staged before the escrow key was registered, envelope written after).
+///
+/// Records `[<escrow public key>]` — only the key that was demonstrated; the
+/// other recipients are unknown and are not invented. `origin` stays
+/// `rebuilt`. Any failure other than "not a recipient" is logged and skipped:
+/// attestation is an add-on, and a rebuild must not fail because of it.
+fn attest_escrow(
+    tx: &Connection,
+    store: &mut dyn Store,
+    identities: &[age::x25519::Identity],
+    manifest: &EnvelopeManifest,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let Some(registered) = crate::db::queries::escrow_public_key(tx)? else {
+        return Ok(());
+    };
+    let Some(escrow_id) = identities
+        .iter()
+        .find(|id| id.to_public().to_string() == registered)
+    else {
+        return Ok(());
+    };
+    report.key_is_escrow = true;
+    let receipt = serde_json::to_string(&[registered.as_str()])
+        .map_err(|e| TapectlError::Other(format!("receipt json: {e}")))?;
+
+    for unit in &manifest.units {
+        let Some(first) = unit.slices.iter().min_by_key(|s| s.number) else {
+            continue;
+        };
+        let stage_set_id: Option<i64> = tx
+            .query_row(
+                "SELECT ss.id FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE u.name = ?1 AND s.version = ?2
+                   AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL
+                 LIMIT 1",
+                params![unit.name, unit.snapshot_version],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(stage_set_id) = stage_set_id else {
+            continue; // already has a receipt (from the tape, or an earlier attestation)
+        };
+
+        let mut head = Vec::new();
+        if let Err(e) =
+            store.read_file_head(first.tape_position as u32, ATTEST_HEAD_BYTES, &mut head)
+        {
+            tracing::warn!(unit = %unit.name, position = first.tape_position, error = %e,
+                "attest: could not read the slice header; leaving coverage unknown");
+            continue;
+        }
+        let opened = age::Decryptor::new(Cursor::new(head))
+            .and_then(|d| d.decrypt(std::iter::once(escrow_id as &dyn age::Identity)));
+        match opened {
+            Ok(_) => {
+                tx.execute(
+                    "UPDATE stage_sets SET key_fingerprints = ?1
+                     WHERE id = ?2 AND key_fingerprints IS NULL",
+                    params![receipt, stage_set_id],
+                )?;
+                report.attested += 1;
+            }
+            Err(age::DecryptError::NoMatchingKeys) => {
+                tracing::warn!(unit = %unit.name, position = first.tape_position,
+                    "attest: the escrow key is not a recipient of this slice — the #115 shape; \
+                     coverage stays unknown");
+            }
+            Err(e) => {
+                tracing::warn!(unit = %unit.name, position = first.tape_position, error = %e,
+                    "attest: slice header did not parse; leaving coverage unknown");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Open every envelope the front index names, skipping the ones this key is
@@ -885,7 +1006,7 @@ fn record_event(
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape; catalog.db {}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}",
         report.label,
         report.uuid,
         device,
@@ -899,6 +1020,7 @@ fn record_event(
         report.positions,
         report.files,
         report.receipts_from_tape,
+        report.attested,
         if report.had_catalog_db {
             "present"
         } else {
@@ -918,4 +1040,43 @@ fn record_event(
         None,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The assumption attestation rests on: age unwraps the file key from
+    /// the header alone, so a bounded prefix of a large ciphertext is enough
+    /// to tell "this identity is a recipient" from "it is not". If a future
+    /// age release read payload before deciding, this is the test that
+    /// would say so.
+    #[test]
+    fn an_age_header_prefix_is_enough_to_test_a_recipient() {
+        let right = crate::crypto::keys::generate_keypair();
+        let wrong = crate::crypto::keys::generate_keypair();
+        let plaintext = vec![7u8; 1024 * 1024];
+        let ct = crate::staging::encrypt_data(&plaintext, std::slice::from_ref(&right.public_key))
+            .unwrap();
+        assert!(ct.len() > 4096);
+        let head = ct[..4096].to_vec();
+
+        let right_id: age::x25519::Identity = right.secret_key.parse().unwrap();
+        let wrong_id: age::x25519::Identity = wrong.secret_key.parse().unwrap();
+
+        let ok = age::Decryptor::new(Cursor::new(head.clone()))
+            .and_then(|d| d.decrypt(std::iter::once(&right_id as &dyn age::Identity)));
+        assert!(
+            ok.is_ok(),
+            "the right identity must unwrap from the header alone"
+        );
+
+        let no = age::Decryptor::new(Cursor::new(head))
+            .and_then(|d| d.decrypt(std::iter::once(&wrong_id as &dyn age::Identity)));
+        assert!(
+            matches!(no, Err(age::DecryptError::NoMatchingKeys)),
+            "the wrong identity must be refused at the header: {:?}",
+            no.as_ref().err()
+        );
+    }
 }

@@ -292,4 +292,37 @@ impl TapeDevice {
         }
         Ok(total)
     }
+
+    /// Read at most `max_bytes` from the start of the current file, then
+    /// stop — without reading to the file mark.
+    ///
+    /// For attesting escrow coverage (#137): an age header is a few hundred
+    /// bytes, and a data slice can be tens of gigabytes. Reading one block
+    /// and stopping is the difference between "attest a shelf of tapes over
+    /// lunch" and "over a week". Leaves the head mid-file; every
+    /// `Store::read_file` rewinds before positioning, so no caller depends
+    /// on where this left the tape.
+    pub fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<u64> {
+        let mut total = 0u64;
+        let read_size = if self.block_size > 0 {
+            self.block_size
+        } else {
+            1024 * 1024
+        };
+        let mut buf = vec![0u8; read_size];
+        while total < max_bytes {
+            match self.file.read(&mut buf) {
+                Ok(0) => break, // file mark: the file is shorter than asked
+                Ok(n) => {
+                    let take = (n as u64).min(max_bytes - total) as usize;
+                    sink.write_all(&buf[..take])
+                        .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
+                    total += take as u64;
+                }
+                Err(e) if e.raw_os_error() == Some(28) => break, // ENOSPC
+                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
+            }
+        }
+        Ok(total)
+    }
 }
