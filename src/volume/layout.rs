@@ -1420,6 +1420,10 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::volume::restore_script::{
+        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_PARSE_FILE_LIST,
+        AWK_SELECT_VERSION, AWK_UNIT_LIST,
+    };
 
     #[test]
     fn front_index_lists_every_file_with_hashes() {
@@ -2097,14 +2101,7 @@ mod tests {
     fn restore_sh_picks_one_version_of_a_unit_present_twice() {
         use std::process::{Command, Stdio};
 
-        let script = generate_restore_script_v2("MULTI1", 20);
-        let start = script
-            .find("awk -v unit=\"$target_unit\"")
-            .expect("version-selecting awk must be present");
-        let body = &script[start..];
-        let open = body.find('\'').expect("awk program opens");
-        let close = body[open + 1..].find('\'').expect("awk program closes");
-        let program = &body[open + 1..open + 1 + close];
+        let program = AWK_SELECT_VERSION;
 
         // Built through the real writer, not hand-typed: a hand-typed sample
         // would keep parsing after the writer's shape changed underneath it.
@@ -2201,14 +2198,7 @@ mod tests {
     fn restore_sh_lists_a_unit_stored_twice_only_once() {
         use std::process::{Command, Stdio};
 
-        let script = generate_restore_script_v2("MULTI2", 20);
-        let start = script
-            .find("done < <(awk '")
-            .expect("unit-name collection awk must be present");
-        let body = &script[start..];
-        let open = body.find('\'').expect("awk program opens");
-        let close = body[open + 1..].find('\'').expect("awk program closes");
-        let program = &body[open + 1..open + 1 + close];
+        let program = AWK_UNIT_LIST;
 
         // Built through the real writer, not hand-typed (see the sibling
         // #131 test above for why).
@@ -2263,14 +2253,7 @@ mod tests {
     fn a_name_key_outside_the_units_head_does_not_retarget_the_selector() {
         use std::process::{Command, Stdio};
 
-        let script = generate_restore_script_v2("GUARD1", 20);
-        let start = script
-            .find("awk -v unit=\"$target_unit\"")
-            .expect("version-selecting awk must be present");
-        let body = &script[start..];
-        let open = body.find('\'').expect("awk program opens");
-        let close = body[open + 1..].find('\'').expect("awk program closes");
-        let program = &body[open + 1..open + 1 + close];
+        let program = AWK_SELECT_VERSION;
 
         // A slice table carrying its own `name`, as some future field might.
         let manifest = "\
@@ -2353,6 +2336,60 @@ sha256_encrypted = \"bbb\"
             "generated RESTORE.sh is not valid bash:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Architecture review 2026-09-11 (candidate C6): every named `awk`
+    /// fragment must reassemble into the generated script byte-for-byte —
+    /// if a placeholder's boundaries or a const's content were ever off by
+    /// one character, this fails here instead of only as an opaque
+    /// `on_tape_golden` hash mismatch.
+    #[test]
+    fn every_named_awk_fragment_is_present_verbatim_in_the_assembled_script() {
+        let script = generate_restore_script_v2("FRAG01", 20);
+        for (name, fragment) in [
+            ("AWK_PARSE_FILE_LIST", AWK_PARSE_FILE_LIST),
+            ("AWK_CHECK_FILE_LIST", AWK_CHECK_FILE_LIST),
+            ("AWK_FIND_ENVELOPE", AWK_FIND_ENVELOPE),
+            ("AWK_MANIFEST_HAS_UNIT", AWK_MANIFEST_HAS_UNIT),
+            ("AWK_UNIT_LIST", AWK_UNIT_LIST),
+            ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
+        ] {
+            assert!(
+                script.contains(fragment),
+                "{name} is not a verbatim substring of the assembled script"
+            );
+        }
+    }
+
+    /// The template substitutes each `__AWK_*__` placeholder for its named
+    /// const before `__LABEL__`/`__TOTAL_FILES__`; a stray one surviving
+    /// would mean a placeholder and a const's name drifted apart, and would
+    /// ship an inert token straight onto tape.
+    #[test]
+    fn no_awk_placeholder_survives_assembly() {
+        let script = generate_restore_script_v2("FRAG02", 20);
+        assert!(
+            !script.contains("__AWK_"),
+            "an __AWK_*__ placeholder was not substituted"
+        );
+    }
+
+    /// #135's near-miss: every named fragment is single-quoted in the
+    /// generated shell script, so a `'` anywhere inside one — including
+    /// inside an awk comment — would end the quoting early and corrupt
+    /// every RESTORE.sh built from it.
+    #[test]
+    fn no_named_fragment_contains_an_apostrophe() {
+        for (name, fragment) in [
+            ("AWK_PARSE_FILE_LIST", AWK_PARSE_FILE_LIST),
+            ("AWK_CHECK_FILE_LIST", AWK_CHECK_FILE_LIST),
+            ("AWK_FIND_ENVELOPE", AWK_FIND_ENVELOPE),
+            ("AWK_MANIFEST_HAS_UNIT", AWK_MANIFEST_HAS_UNIT),
+            ("AWK_UNIT_LIST", AWK_UNIT_LIST),
+            ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
+        ] {
+            assert!(!fragment.contains('\''), "{name} contains an apostrophe");
+        }
     }
 
     /// #133 defects 2 and 4, at the process boundary: how the script answers
