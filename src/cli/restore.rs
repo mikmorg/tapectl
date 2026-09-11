@@ -3,6 +3,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
+use crate::store::TapeStore;
 use crate::volume;
 
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
@@ -145,8 +146,8 @@ pub fn run(
 
         RestoreCommands::RawVolume { device, to, from } => {
             let dest = std::path::Path::new(to);
-            let report =
-                volume::raw::restore_raw(device, DEFAULT_BLOCK_SIZE, dest, from.as_deref())?;
+            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let report = volume::raw::restore_raw(&mut store, dest, from.as_deref())?;
 
             if json_output {
                 let files: Vec<_> = report

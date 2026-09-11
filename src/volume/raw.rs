@@ -21,7 +21,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TapectlError};
-use crate::store::{Store, TapeStore};
+use crate::store::Store;
 use crate::util::{HashingWriter, TruncatingWriter};
 use crate::volume::format;
 
@@ -72,14 +72,16 @@ impl RawRestoreReport {
 /// `TruncatingWriter<HashingWriter<BufWriter<File>>>` — never buffers a whole
 /// slice in memory (the H9 whole-object OOM class, issues #32/#35/#87). Peak
 /// memory tracks the block size, not the file size.
+///
+/// Takes an already-open `store` (ADR-0006) rather than a device path — the
+/// caller opens `TapeStore::open_read` (or, in tests, hands in a `MemStore`
+/// built by [`tests::build_synthetic_tape`]), so this function's own logic is
+/// the test surface directly, with no private twin re-implementing the walk.
 pub fn restore_raw(
-    device: &str,
-    block_size: usize,
+    store: &mut dyn Store,
     dest: &Path,
     expect_label: Option<&str>,
 ) -> Result<RawRestoreReport> {
-    let mut store = TapeStore::open_read(device, block_size)?;
-
     // File 0: the ID thunk. Small and bounded (plain TOML text), so buffering
     // it into a Vec here (like `volume_identify` does) is fine — only the
     // per-content-file loop below needs to stream.
@@ -304,102 +306,13 @@ mod tests {
         store
     }
 
-    /// A store-injectable version of `restore_raw`, so the tests can drive
-    /// the real logic against `MemStore` (which shares `TapeStore`'s chain-
-    /// walk / read-file implementation) without touching real tape hardware.
-    fn restore_raw_from_store(
-        store: &mut dyn Store,
-        dest: &Path,
-        expect_label: Option<&str>,
-    ) -> Result<RawRestoreReport> {
-        let mut thunk_bytes = Vec::new();
-        store.read_file(0, &mut thunk_bytes)?;
-        let thunk_text = String::from_utf8_lossy(&thunk_bytes).to_string();
-        let identity = format::parse_id_thunk_identity(&thunk_text)?;
-        let pointers = format::parse_id_thunk_layout_pointers(&thunk_text)?;
-
-        if let Some(expected) = expect_label {
-            if expected != identity.label {
-                return Err(TapectlError::Other(format!(
-                    "wrong tape: expected label \"{expected}\", found \"{}\" (uuid {})",
-                    identity.label, identity.uuid
-                )));
-            }
-        }
-
-        let mut fi_bytes = Vec::new();
-        store.read_file(pointers.front_index as u32, &mut fi_bytes)?;
-        let fi_text = String::from_utf8_lossy(&fi_bytes).to_string();
-        let entries = format::parse_front_index(&fi_text)?;
-
-        fs::create_dir_all(dest)?;
-
-        let mut files = Vec::with_capacity(entries.len());
-        let mut bytes_written_total: u64 = 0;
-        let mut verified_count = 0usize;
-        let mut mismatched_count = 0usize;
-        let mut unverifiable_count = 0usize;
-
-        for entry in &entries {
-            let filename = format!("{:04}_{}.bin", entry.position, entry.type_label);
-            let path = dest.join(&filename);
-            let out = BufWriter::new(File::create(&path)?);
-            let mut hashing = HashingWriter::new(out);
-
-            let bytes_written = if let Some(true_len) = entry.size_bytes {
-                let mut bounded = TruncatingWriter::new(hashing, true_len);
-                store.read_file(entry.position as u32, &mut bounded)?;
-                hashing = bounded.into_inner();
-                hashing.bytes_written()
-            } else {
-                store.read_file(entry.position as u32, &mut hashing)?;
-                hashing.bytes_written()
-            };
-            hashing.flush()?;
-            let actual_hash = hashing.finalize_hex();
-
-            let verified = entry.sha256_encrypted.as_deref().map(|expected| {
-                let ok = expected == actual_hash;
-                if ok {
-                    verified_count += 1;
-                } else {
-                    mismatched_count += 1;
-                }
-                ok
-            });
-            if verified.is_none() {
-                unverifiable_count += 1;
-            }
-
-            bytes_written_total += bytes_written;
-            files.push(RawFileResult {
-                position: entry.position,
-                type_label: entry.type_label.clone(),
-                path,
-                bytes_written,
-                verified,
-            });
-        }
-
-        Ok(RawRestoreReport {
-            label: identity.label,
-            uuid: identity.uuid,
-            files_dumped: files.len(),
-            bytes_written: bytes_written_total,
-            verified_count,
-            mismatched_count,
-            unverifiable_count,
-            files,
-        })
-    }
-
     #[test]
     fn dumps_every_file_byte_identical_with_position_type_names() {
         let data = b"hello world, this is the plaintext of a synthetic data slice".to_vec();
         let mut store = build_synthetic_tape("RAW01", &data);
         let tmp = TempDir::new().unwrap();
 
-        let report = restore_raw_from_store(&mut store, tmp.path(), None).unwrap();
+        let report = restore_raw(&mut store, tmp.path(), None).unwrap();
 
         assert_eq!(report.label, "RAW01");
         assert_eq!(report.files_dumped, 6);
@@ -426,7 +339,7 @@ mod tests {
         store.files[4] = b"corrupted!! bytes replacing the original slice content".to_vec();
         let tmp = TempDir::new().unwrap();
 
-        let report = restore_raw_from_store(&mut store, tmp.path(), None).unwrap();
+        let report = restore_raw(&mut store, tmp.path(), None).unwrap();
 
         assert!(!report.all_verified());
         assert_eq!(report.mismatched_count, 1);
@@ -446,7 +359,7 @@ mod tests {
         let mut store = build_synthetic_tape("REAL-LABEL", &data);
         let tmp = TempDir::new().unwrap();
 
-        let err = restore_raw_from_store(&mut store, tmp.path(), Some("WRONG-LABEL"))
+        let err = restore_raw(&mut store, tmp.path(), Some("WRONG-LABEL"))
             .expect_err("must refuse on label mismatch");
         let msg = err.to_string();
         assert!(
@@ -471,12 +384,11 @@ mod tests {
         // future edit added one, this line would fail to compile, not just
         // fail a test.
         fn _assert_signature(
-            device: &str,
-            block_size: usize,
+            store: &mut dyn Store,
             dest: &Path,
             expect_label: Option<&str>,
         ) -> Result<RawRestoreReport> {
-            restore_raw(device, block_size, dest, expect_label)
+            restore_raw(store, dest, expect_label)
         }
     }
 }
