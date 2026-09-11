@@ -12,6 +12,7 @@ pub mod evidence;
 pub mod reclaimable;
 pub mod shadowing;
 pub mod subsumed;
+pub mod unknown_keys;
 
 /// Resolved policy for a unit after 3-level resolution:
 /// unit dotfile [policy] > archive_set > system [defaults].

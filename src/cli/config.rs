@@ -70,6 +70,15 @@ pub fn run(
                     // reader yet get surfaced, not deleted.
                     let decorative_hits = crate::policy::decorative::scan(&loaded);
 
+                    // Unknown-key advisory (issue #129). Serde silently drops
+                    // fields no struct declares, so a plausible setting can sit
+                    // in a config for years doing nothing while `config check`
+                    // says "valid". Needs the raw text — after parsing, the
+                    // evidence is gone.
+                    let unknown_key_hits = std::fs::read_to_string(&paths.config_file)
+                        .map(|t| crate::policy::unknown_keys::scan(&t))
+                        .unwrap_or_default();
+
                     // Advisory scan (issue #97): a pre-existing
                     // archive_sets row whose compression the local dar
                     // cannot perform — validation only runs at write
@@ -111,6 +120,15 @@ pub fn run(
                                     "source": h.source,
                                     "field": "preserve_acls",
                                     "note": crate::policy::subsumed::describe(h),
+                                })
+                            })
+                            .collect();
+                        let unknown_key_json: Vec<_> = unknown_key_hits
+                            .iter()
+                            .map(|h| {
+                                serde_json::json!({
+                                    "key": h.key,
+                                    "note": crate::policy::unknown_keys::describe(h),
                                 })
                             })
                             .collect();
@@ -187,6 +205,7 @@ pub fn run(
                                 "shadowing_dotfiles": shadowing_json,
                                 "subsumed_policy_fields": subsumed_json,
                                 "decorative_keys": decorative_json,
+                                "unknown_keys": unknown_key_json,
                                 "dar": dar_json,
                                 "staging": staging_json,
                                 "tape_devices": tape_devices_json,
@@ -228,6 +247,9 @@ pub fn run(
                                 "{}",
                                 crate::policy::depth_check::describe_tape_device(check)
                             );
+                        }
+                        for hit in &unknown_key_hits {
+                            println!("{}", crate::policy::unknown_keys::describe(hit));
                         }
                         for hit in &decorative_hits {
                             println!("{}", crate::policy::decorative::describe(hit));
