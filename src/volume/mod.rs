@@ -3,6 +3,7 @@ pub mod envelope;
 pub mod format;
 pub mod layout;
 pub mod layout_model;
+pub mod manifest;
 pub mod raw;
 pub mod rebuild;
 pub mod restore;
