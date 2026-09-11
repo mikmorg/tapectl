@@ -52,9 +52,16 @@ the normative design set named in the Policy block below.
      passed unchanged; three new tests pin fragment presence, no surviving
      placeholder, and no apostrophe in any fragment. Tests reference the
      #131/#133/#135 rules by name now. 763 lib / 881 total, gate GREEN.
-  4. **C7** Store: `TapeStore::open_read` moves to the CLI; `volume_identify`,
-     `read_slices`, `compact_read`, `restore_raw`, `rebuild` take
-     `&mut dyn Store`.
+  4. ~~**C7**~~ — **LANDED `..ae2c4ee`** (sonnet worker, 4 commits).
+     `volume_identify`, `read_slices`, `compact_read` and `restore_raw` take
+     `&mut dyn Store`; the CLI opens `TapeStore::open_read` once (the
+     `Compact` arm scopes its read store so the fd closes before
+     `compact_write` reopens the device); `restore_raw`'s private test twin is
+     gone — it had silently dropped the mismatch `tracing::error!`, which is
+     what a twin is for. `rebuild_from_volume` already sat over
+     `rebuild_from_store` and was left alone. One line in `tests/mhvtl_e2e.rs`
+     changed for the new signature (standalone commit). Write sessions'
+     `TapeStore::open` (the capacity seam) untouched. 769 lib / 887 total.
   5. ~~**C5**~~ — **LANDED `..e6d800c`** (sonnet worker, 5 commits).
      `db::ontape_catalog` owns SCHEMA, `Generation::{Original,
      WithOwnershipAndReceipts}`, `detect_generation` (probes `tenants` +
@@ -76,7 +83,24 @@ the normative design set named in the Policy block below.
      twelve table-only columns have no `--json` counterpart (e.g.
      `FileRow.modified`, `SnapshotRow.{files,size,created}`); adding keys is
      a contract change. 777 lib / 895 total; no tape path, no gate owed.
-  7. **C4** audit check table + one runner; findings order and text identical.
+  7. ~~**C4**~~ — **LANDED `..308b664`** (sonnet worker, 2 commits).
+     `cli::audit::CHECKS` — 11 rows (8 per-unit with their statuses, 3
+     archive-wide), one runner; `policy_unresolvable` is what the runner
+     emits when `resolve` fails, not a row. Findings text and order
+     identical; 45 tests unchanged + 4 (the #138 scope table is now a
+     property test). One edge made real: `audit --unit <retired-unit>` now
+     runs no checks — the #138 table always said `retired: no`; the old code
+     only honoured that for the bulk path. 767 lib.
+  **All seven landed.** CTO batch answered 2026-09-11 evening: (Q1) **no
+  generation stamp** in catalog.db — the shape probe is the reader;
+  (Q2) **add the twelve table-only columns to `--json`** — additive, pins
+  updated deliberately (follow-up **C2b**, dispatched); (Q3) **keep
+  `in_service`** for escrow findings — quarantined volumes excluded, per
+  Copy's definition.
+  **Lesson (C4 caught it in the act): `git stash` is shared across every
+  worktree of one `.git`.** A worker popped another worker's entry. No loss —
+  it noticed and restored — but the template now bans `stash`; baselines run
+  in a detached worktree or from a patch file.
   Rules for this queue: one worktree sub-agent per item (sonnet), coordinator
   reviews and cherry-picks, full gate after each, mhvtl gate for anything under
   src/volume, src/tape, src/store.rs or generated RESTORE.sh, push, READ CI.

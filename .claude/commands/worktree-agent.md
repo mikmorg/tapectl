@@ -66,6 +66,14 @@ shared target dir serializes builds on cargo's lock.
    under the verification step; the work happened to hold up, which is luck,
    not process. Closing is the coordinator's decision, made after the gate.
 5. No new dependencies without coordinator approval.
+6. **Never `git stash` / `git stash pop` — in any form.** `refs/stash` is
+   shared across every worktree of this repository, so a `pop` can hand you
+   ANOTHER worker's uncommitted changes and lose your own (2026-09-11: the C4
+   worker popped the C7 worker's entry; it noticed, nothing was lost, luck
+   not process). To take a baseline measurement before editing, run it FIRST
+   and do not touch files until it finishes; if you must set edits aside,
+   `git diff > /tmp/<branch>.patch && git checkout -- .` and `git apply` it
+   back, or make a temporary WIP commit and `git reset --soft HEAD~1` later.
 
 **SCOPE FENCE.** You own exactly these files: {{LIST}}. Other agents are
 concurrently editing {{LIST}} — do NOT edit those, even trivially. You may
