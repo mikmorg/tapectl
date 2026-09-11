@@ -953,7 +953,11 @@ do_restore() {
     unit_names+=("$uname")
   done < <(awk '
     /^\[\[units\]\]/ { in_u = 1; next }
-    in_u && /^name = / { gsub(/"/, "", $3); print $3; in_u = 0 }
+    # !seen[] — a volume can carry the SAME unit in several snapshot versions,
+    # one [[units]] block each. Listing it once per block made a single unit
+    # look like several and pushed the plain --restore (no --unit) form into
+    # the "multiple units" branch, printing the same name twice (#133).
+    in_u && /^name = / { gsub(/"/, "", $3); if (!seen[$3]++) print $3; in_u = 0 }
     /^\[/              { in_u = 0 }
   ' "$manifest")
 
@@ -1016,7 +1020,9 @@ do_restore() {
   picked=$(tr -d ' \n' <"$WORK/picked_version.txt" 2>/dev/null)
   if [ "$nslices" -eq 0 ]; then
     if [ -n "${want_version:-}" ]; then
-      die "unit '$target_unit' has no version $want_version on this volume — run --info, or omit --version for the newest"
+      die "unit '$target_unit' has no version $want_version on this volume
+       --find-envelope --key KEYFILE lists the versions here; --info is
+       keyless and cannot see them. Omit --version for the newest."
     fi
     die "no slices found for unit '$target_unit'"
   fi
@@ -1099,22 +1105,22 @@ case "${1:-}" in
 --restore)
   shift
   key="" dest="" unit="" want=""
+  # Every flag here takes a value. `shift 2` on a TRAILING bare flag fails
+  # because $# is 1, `set -e` fires, and the script exits 1 having printed
+  # nothing at all — the usage check below is never reached. Check the arity
+  # first and say which flag was short (#133).
   while [ $# -gt 0 ]; do
     case "$1" in
-    --key)
-      key="${2:-}"
-      shift 2
-      ;;
-    --to)
-      dest="${2:-}"
-      shift 2
-      ;;
-    --unit)
-      unit="${2:-}"
-      shift 2
-      ;;
-    --version)
-      want="${2:-}"
+    --key | --to | --unit | --version)
+      [ $# -ge 2 ] || die "$1 needs a value
+
+       usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+      case "$1" in
+      --key) key=$2 ;;
+      --to) dest=$2 ;;
+      --unit) unit=$2 ;;
+      --version) want=$2 ;;
+      esac
       shift 2
       ;;
     *) die "unknown option: $1" ;;
@@ -1135,16 +1141,26 @@ case "${1:-}" in
   echo "  $0 --find-envelope --key KEYFILE                Decrypt your envelope"
   echo "  $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
   echo "      Full restore. Without --version the NEWEST version of the unit on"
-  echo "      this volume is restored; --info lists what is here."
+  echo "      this volume is restored. To see which versions this tape holds,"
+  echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
+  echo "      encrypted envelope manifest, so --info cannot report it."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
   echo ""
   echo "Requirements: mt, dd, age, dar, sha256sum, head, truncate"
   ;;
-*)
+"")
   echo "RESTORE.sh for tapectl volume $LABEL"
   echo "Run '$0 --help' for usage."
+  ;;
+*)
+  # Exit 2, not 0. A typo'd mode used to print this and report success, so a
+  # wrapper or cron job around the heir path read "restore worked" (#133).
+  echo "RESTORE.sh for tapectl volume $LABEL" >&2
+  echo "Unknown mode: $1" >&2
+  echo "Run '$0 --help' for usage." >&2
+  exit 2
   ;;
 esac
 "#
@@ -2135,6 +2151,133 @@ sha256_encrypted = \"ccc\"
         // nothing (the caller turns that into a clear error).
         assert!(run("docs", "").contains("|21|"));
         assert!(run("photos", "9").trim().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #133: the sibling the #131 fix did not cover. `--restore` without
+    /// `--unit` collects the unit names from the manifest and auto-selects
+    /// when there is exactly one. A unit stored in two snapshot versions has
+    /// two `[[units]]` blocks, so it was listed twice and took the "multiple
+    /// units" branch — telling the heir to disambiguate between a name and
+    /// itself. `do_find_envelope` suggests exactly that no-`--unit` form, so
+    /// the script's own advice walked into it.
+    ///
+    /// The #131 test runs the version-selecting awk standalone with an
+    /// explicit `unit=`, which is precisely why it never saw this.
+    #[test]
+    fn restore_sh_lists_a_unit_stored_twice_only_once() {
+        use std::process::{Command, Stdio};
+
+        let script = generate_restore_script_v2("MULTI2", 20);
+        let start = script
+            .find("done < <(awk '")
+            .expect("unit-name collection awk must be present");
+        let body = &script[start..];
+        let open = body.find('\'').expect("awk program opens");
+        let close = body[open + 1..].find('\'').expect("awk program closes");
+        let program = &body[open + 1..open + 1 + close];
+
+        let manifest = "\
+[manifest]
+volume = \"MULTI2\"
+tenant = \"alice\"
+
+[[units]]
+name = \"photos\"
+snapshot_version = 1
+
+[[units]]
+name = \"photos\"
+snapshot_version = 2
+
+[[units]]
+name = \"docs\"
+snapshot_version = 1
+";
+        let dir = std::env::temp_dir().join(format!("tapectl-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let man = dir.join("MANIFEST.toml");
+        std::fs::write(&man, manifest).unwrap();
+        let prog = dir.join("names.awk");
+        std::fs::write(&prog, program).unwrap();
+
+        let out = Command::new("awk")
+            .args(["-f", prog.to_str().unwrap(), man.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("spawn awk");
+        let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["photos".to_string(), "docs".to_string()],
+            "a unit stored in two versions must be named once, in first-seen order"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #133 defects 2 and 4, at the process boundary: how the script answers
+    /// argv. Both are silent-success failures, which no assertion on the
+    /// script's *text* would catch, so this runs the real thing.
+    ///
+    /// Every path here returns before any tape I/O — the mode dispatch and the
+    /// argument loop both sit ahead of it — so this needs no device.
+    #[test]
+    fn restore_sh_reports_bad_invocations_instead_of_exiting_quietly() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("tapectl-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = dir.join("RESTORE.sh");
+        std::fs::write(&sh, generate_restore_script_v2("ARGV1", 20)).unwrap();
+
+        // Invoked as `bash RESTORE.sh`, not exec'd. A script written moments
+        // earlier and then exec'd hits ETXTBSY whenever a sibling test thread
+        // forks while this file's write fd is still open in the parent — the
+        // classic fork/exec race, and nothing to do with what is being tested.
+        let run = |args: &[&str]| -> (i32, String) {
+            let o = Command::new("bash")
+                .arg(&sh)
+                .args(args)
+                .output()
+                .expect("spawn script");
+            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.code().unwrap_or(-1), text)
+        };
+
+        // Bare invocation is a friendly no-op and stays successful.
+        let (code, text) = run(&[]);
+        assert_eq!(code, 0, "bare invocation should succeed:\n{text}");
+        assert!(text.contains("--help"), "should point at --help:\n{text}");
+
+        // A typo'd mode must NOT look like a completed restore to a wrapper.
+        let (code, text) = run(&["--resore"]);
+        assert_eq!(code, 2, "an unknown mode must exit 2:\n{text}");
+        assert!(text.contains("Unknown mode"), "should say so:\n{text}");
+
+        // A trailing bare flag used to fail `shift 2` under `set -e` and exit
+        // 1 having printed NOTHING. The message is the whole point.
+        let (code, text) = run(&["--restore", "--key"]);
+        assert_ne!(code, 0, "a flag with no value must fail:\n{text}");
+        assert!(
+            text.contains("--key needs a value"),
+            "a short flag must name itself, not exit silently:\n{text:?}"
+        );
+
+        // --info is keyless and cannot see snapshot_version; --help must send
+        // the heir to the command that can (#133 defect 3).
+        let (_, help) = run(&["--help"]);
+        assert!(
+            help.contains("run --find-envelope --key KEYFILE"),
+            "--help must point version discovery at --find-envelope:\n{help}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

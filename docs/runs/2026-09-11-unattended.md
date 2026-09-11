@@ -30,7 +30,7 @@ Resolve by serial, never by number — they move across reboots.
 
 | # | Item | State |
 |---|---|---|
-| 1 | #133 — RESTORE.sh heir findings (4 defects + the missing test) | queued |
+| 1 | #133 — RESTORE.sh heir findings (4 defects + the missing test) | **landed** |
 | 2 | #130 — ID thunk and system guide hardcode `mt -f /dev/nst0` | queued |
 | 3 | `dl.scenario_b` — bare `import` rebuilds only a volumes row | queued |
 | 4 | `rfc.restore_file_symlink` — `restore file` dereferences symlinks | queued |
@@ -47,6 +47,7 @@ unless it is a regression this run caused, or it blocks a queued item.
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 07:35 | #133 | landed. 704 lib tests (+2), clippy/fmt clean, gate GREEN 26/26 on `/dev/nst1`. All 3 negative controls confirmed failing pre-fix at distinct assertion lines. **Owes a real-drive confirmation pass** — it changes File 2's bytes; batched to end of queue. |
 
 ## Discoveries
 
