@@ -268,6 +268,15 @@ devcmd() {
     "$@"
 }
 
+# The reason string for work a single reused cartridge cannot support, or the
+# empty string when running with a real library. Passed as restore_matrix's 7th
+# argument so the whole matrix SKIPs rather than failing on a premise the run
+# cannot meet.
+single_cartridge_skip() { # single_cartridge_skip <reason>
+    [ "$SINGLE_CARTRIDGE" = 1 ] && printf 'single-cartridge mode: %s' "$1"
+    return 0
+}
+
 skip() { # skip <check-name> <reason...>
     local name="$1"; shift
     echo "$name: SKIP — $*" | tee -a "$SKIPPED_FILE"
@@ -819,8 +828,23 @@ rm_step_verify() {
 # restore_matrix <label> <unit> <tenant> <expected_src_dir> <tag> [other_tenant]
 # Runs all 10 methods as separate `check`s named "<tag>.<method>". Call
 # after a volume is sealed and while its cartridge is (or can be) reloaded.
+# restore_matrix <label> <unit> <tenant> <src> <tag> [other-tenant] [skip-reason]
+#
+# With a 7th argument every check in the matrix becomes a visible SKIP carrying
+# that reason, instead of running and failing. Used for matrices whose premise a
+# single cartridge cannot satisfy (the volume they read was erased to make a
+# later one). A SKIP must never look like a PASS — see SKIPPED.txt.
 restore_matrix() {
     RM_LABEL="$1"; RM_UNIT="$2"; RM_TENANT="$3"; RM_SRC="$4"; RM_TAG="$5"; RM_OTHER="${6:-}"
+    local rm_skip="${7:-}"
+    if [ -n "$rm_skip" ]; then
+        local s
+        for s in unit file restore_sh_dd restore_sh_primary restore_sh_backup \
+            operator_envelope escrow raw_volume isolation verify; do
+            check "$RM_TAG.$s" skip "$RM_TAG.$s" "$rm_skip"
+        done
+        return 0
+    fi
     if [ "$DRY_RUN" != 1 ]; then
         RM_WORK="$RUN/matrix-$RM_TAG"; mkdir -p "$RM_WORK"
         if [ -z "$RM_OTHER" ] && [ -d "$HOME_DIR/keys" ]; then
@@ -880,7 +904,10 @@ t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{staging}"', t, count=1)
 t = re.sub(r'(?m)^utilization_threshold *=.*$', 'utilization_threshold = 0.95', t, count=1)
-if "[[backends.lto]]" not in t:
+# Must match an UNCOMMENTED table header: `tapectl init` now writes a
+# commented-out [[backends.lto]] example (#124b), and a plain substring test
+# sees that and concludes a backend is already configured.
+if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
     t = re.sub(r'(?m)^lto *= *\[\] *\n', "", t)
     t += f'''
 [[backends.lto]]
@@ -2081,6 +2108,12 @@ qa_tenants() { TCTL tenant add alice && TCTL tenant add bob; }
 qa_escrow() { TCTL key generate --escrow; }
 
 qa_run() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        # NB: `skip` returns 77, which is falsy — it can never be chained with
+        # `&&`, or the body runs anyway and the check FAILs instead of SKIPping.
+        skip qa.run 'quick-archive runs its own "volume init" with no --force, so it cannot reuse a non-blank cartridge (--erase short leaves unparseable leftover). Passes on mhvtl with --erase long.'
+        return 77
+    fi
     make_source "$SRC/qa-unit" "plain+links" "$CANARY" || return 1
     next_tape VOL-Q || return 1
     TCTL quick-archive --tenant alice --volume VOL-Q "$SRC/qa-unit" --device "$TAPE_DEV"
@@ -2102,7 +2135,8 @@ scenario_quick_archive() {
         [ -n "$qa_unit_name" ] || { echo "qa.unit_name: could not capture the auto-named unit from qa.run's log"; qa_unit_name="qa-unit"; }
     fi
 
-    restore_matrix VOL-Q "$qa_unit_name" alice "$SRC/qa-unit" qa-unit bob
+    restore_matrix VOL-Q "$qa_unit_name" alice "$SRC/qa-unit" qa-unit bob \
+        "$(single_cartridge_skip "qa.run was skipped, so VOL-Q was never written")"
 }
 # ============================================================
 # Scenario: collection
@@ -2164,6 +2198,10 @@ col_status() { TCTL collection status; }
 col_plan()   { TCTL collection plan; }
 
 col_run_batch() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip col.run_batch '"collection run" does its own "volume init" with no --force, so it cannot reuse a non-blank cartridge. Passes on mhvtl with --erase long.'
+        return 77
+    fi
     next_tape VOL-COL1 || return 1
     vinit VOL-COL1 || return 1
     TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV"
@@ -2201,8 +2239,10 @@ scenario_collection() {
     check col.plan                  col_plan
     check col.run_batch             col_run_batch
 
-    restore_matrix VOL-COL1 media/alpha alice "$SRC/col-root/alpha" col-alpha
-    restore_matrix VOL-COL1 media/bravo alice "$SRC/col-root/bravo" col-bravo
+    restore_matrix VOL-COL1 media/alpha alice "$SRC/col-root/alpha" col-alpha "" \
+        "$(single_cartridge_skip "col.run_batch was skipped, so VOL-COL1 was never written")"
+    restore_matrix VOL-COL1 media/bravo alice "$SRC/col-root/bravo" col-bravo "" \
+        "$(single_cartridge_skip "col.run_batch was skipped, so VOL-COL1 was never written")"
 
     check col.add_and_rename        col_add_and_rename
     check col.status_shows_new_pending col_status_shows_new_pending

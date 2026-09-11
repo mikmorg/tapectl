@@ -123,7 +123,10 @@ t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{run}/staging"', t, count=1)
 t = re.sub(r'(?m)^device_tape *=.*$', f'device_tape = "{tape}"', t)
 t = re.sub(r'(?m)^device_sg *=.*$', f'device_sg = "{sg}"', t)
-if '[[backends.lto]]' not in t:
+# Must match an UNCOMMENTED table header: `tapectl init` writes a commented
+# [[backends.lto]] example (#124b), and a substring test sees that and wrongly
+# concludes a backend is already configured — leaving the gate with no drive.
+if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
     # `init` writes an empty backends.lto (audit shell-MED); the gate supplies one.
     t = re.sub(r'(?m)^lto *= *\[\] *\n', '', t)  # drop the inline empty array first
     t += f'''
