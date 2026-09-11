@@ -16,31 +16,37 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **RUN 2026-09-10 (real-LTO-6 follow-through) — IN PROGRESS.** Triggered
-  after the hardware validation session (`docs/lto6-session-journal-2026-09-10.md`,
-  `docs/lto6-drive-passthrough.md`). Scope from the CTO: land #115–#124,
-  commit automatically, keep validating on the real drive, build a lifecycle/
-  permutation suite. Baseline 756 ungated tests. **mhvtl is NOT broken on
-  this VM** — `/dev/nst0` is the mhvtl TD6; the real HP LTO-6 is `/dev/nst3`
-  (`/dev/tape/by-id/scsi-HUJ808A5L4-nst`) via libvirt SCSI passthrough, and
-  `mhvtl-device.sh` cannot resolve it (not in device.conf), so the gate can
-  never land on it. Cartridge `EW7VWMVKF6` is expendable; use `--erase short`
-  (`rewind; weof 1; rewind`) on the real drive — `mt erase` is hours there.
-  Landed so far: session docs `a76b917`; #122 `22c26bb`; errata §2.29
-  correction `8424187` (MTCOMPRESSION 0 already landed in `TapeStore::open`;
-  #28 is closed); harness #116/#117 `4b2962c..f968cde` incl. a third defect
-  (§E pipe writes without `iflag=fullblock`). In flight (worktrees, separate
-  target dirs): pm-115 (escrow — needs the mhvtl gate), pm-119 (#118/#119/
-  #121/#124a), pm-120 (#120), pm-123 (mam.rs half; the `write.rs` fill is a
-  coordinator 2-liner after pm-115), pm-lifecycle (`scripts/lifecycle-suite.sh`).
-  Filed #125 (audit: volumes whose stage sets lack the escrow). CTO decisions
-  queued, not yet asked: `init` creating the escrow identity (ADR-0005
-  ceremony change); a `backend add` command vs hand-edited `[[backends.lto]]`.
-  Lesson already banked: **two of the three most serious hardware findings
-  were in the measuring instrument** (page-cache artifact; a `|| true`-swallowed
-  EINVAL) — both exited 0 with plausible numbers. Any harness number that
-  argues for a design change gets a controlled re-measurement first.
-  **CTO batch answered 2026-09-10:** (Q1) the **mhvtl gate is unusable on this VM** — the library moves media but the tape daemon never receives the `lload` over the SysV queue, and the kernel module will not reload while in use (needs a VM reboot, a human step). **Real-LTO-6 validation substitutes** for the mhvtl gate on restore-path branches this run (a real write→verify→restore→heir round-trip on /dev/nst3 via the lifecycle suite is a strict superset of what the gate checks; mhvtl also gives false ENOSPC/MAM passes). Hold a note to **re-run the mhvtl gate after the VM is rebooted**, before these are considered fully closed. Not a gate weakening — real hardware is stricter. (Q2) pre-escrow-tape copy → `--allow-missing-escrow` override, default refuse. (Q3) `init` creates the escrow identity. (Q4) backend error+example now, `backend add` is a follow-up. All four recorded in design-errata §2.16/§7.
+- **RUN 2026-09-11 (unattended, through Sunday 2026-09-13) — IN PROGRESS.**
+  The CTO is away. **Read `.claude/skills/unattended-run/SKILL.md` before the
+  first pick** — it governs scope, the settle/defer/halt tiers, tape access,
+  what "done" requires, and the red lines. The queue, the wall-clock bound and
+  the progress log live in `docs/runs/2026-09-11-unattended.md`; that file is
+  the cold-start entry point after a dropped session. Deferred questions go to
+  `docs/decisions-pending.md` **and** an issue labelled `needs:cto`.
+- **DEVICES MOVED — the 2026-09-10 entry below is superseded on this point.**
+  The VM reboot happened. The **mhvtl gate is GREEN 26/26** against an empty
+  `EXPECTED_FAIL` manifest and is fully usable again; real-LTO-6 validation no
+  longer substitutes for it. Resolve drives by serial through
+  `/dev/tape/by-id/`: `scsi-HUJ808A5L4-nst` is the **real HP LTO-6**
+  (now `/dev/nst0`, cartridge `EW7VWMVKF6`, expendable), `scsi-XYZZY_A1..A4`
+  are **mhvtl** (now `/dev/nst1`-`nst4`, changer `/dev/sg4`, 43 slots loaded).
+  The numbers swapped across the reboot and will swap again — a gate leg that
+  defaulted to `/dev/nst0` read the real drive for three runs and passed
+  against the wrong tape. Always set `TAPECTL_GATE_TAPE`.
+- **RUN 2026-09-10 (real-LTO-6 follow-through) — CLOSED 2026-09-11.** Landed
+  #115-#124, #127-#129 and #131; lifecycle suite 277/2/27; mhvtl gate GREEN
+  26/26; CI green at `7150132`. Full account in
+  `docs/lto6-session-journal-2026-09-10.md`. Its device and gate claims are
+  superseded by the entry above; its **lessons stand**, chiefly: two of the
+  three most serious hardware findings were in the *measuring instrument*, and
+  every failure #128 blamed on single-cartridge media was a real bug. Any
+  harness number arguing for a design change gets a controlled re-measurement
+  first, and "the test environment can't do this" is a hypothesis, not a
+  diagnosis — the cheap discriminator is re-running multi-cartridge on mhvtl.
+  CTO batch answered 2026-09-10: (Q2) pre-escrow-tape copy →
+  `--allow-missing-escrow` override, default refuse. (Q3) `init` creates the
+  escrow identity. (Q4) backend error+example now, `backend add` is #126.
+  Recorded in design-errata §2.16/§7.
 - **CTO BATCH ANSWERED 2026-08-01 (five decisions, recorded in ADR-0009,
   commit 9ee0658). #69 IS UNBLOCKED AND IS NEXT — it is the only open
   `severity:high`.** The deferral covers the **ceremony** (printing,
