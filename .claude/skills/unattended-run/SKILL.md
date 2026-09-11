@@ -73,6 +73,11 @@ What "done" requires scales with what the change touches:
 | the suite or lifecycle | `scripts/lifecycle-suite.sh` multi-cartridge on mhvtl |
 | bytes written to tape | a real-drive confirmation pass, batched to the end |
 
+Run the real thing once before calling any of it done. A fixture simpler than
+the real artifact tests something that does not exist — both of this run's
+escaped defects passed their unit tests and failed the moment a real config or
+a real CI `PATH` met them.
+
 ## Stopping
 
 The run ends on whichever fires first: the queue empties, **two consecutive

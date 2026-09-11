@@ -1842,12 +1842,18 @@ dl_scenario_a_db_import() {
 # — decided by reading it: it inserts ONLY a bare `volumes` row (label,
 # backend, media type, capacity; status 'active') with NO units, snapshots,
 # stage_sets or writes. `restore unit --unit photos` resolves the unit by
-# name FIRST, so it has nothing to find. This arm is EXPECTED TO FAIL until
-# `import` is taught to reconstruct catalog rows from the tape's own front
-# index — a real gap this suite surfaces, not a mistake in the check.
+# name FIRST, so it has nothing to find.
+#
+# This arm USED TO BE an expected failure. The CTO settled #136 the other
+# way: `import` registers a cartridge and that is all it was ever for, and
+# rebuilding the catalog is its own command (`catalog rebuild`, arm (d)).
+# So this now asserts the correct behaviour POSITIVELY — import succeeds,
+# restore refuses, and the refusal names the unit — rather than logging a
+# failure. An arm that merely fails cannot tell "still broken" from "broken
+# in a new way".
 dl_scenario_b_raw_and_import() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: new home (init only); tapectl restore raw-volume --to DIR --json (assert all_verified, DB-less); tapectl import --label VOL-A; tapectl restore unit --unit photos --from VOL-A (documented gap: import creates no unit/write rows, so this is expected to fail today)"
+        echo "PLAN: new home (init only); tapectl restore raw-volume --to DIR --json (assert all_verified, DB-less); tapectl import --label VOL-A; assert restore unit --unit photos REFUSES and names the unit (import registers a cartridge, it does not rebuild a catalog — that is arm (d))"
         return 0
     fi
     local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-b"
@@ -1865,16 +1871,79 @@ assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
     NEWHOME_TCTL "$newhome" import --label VOL-A --media-type LTO-6 >"$sd/dl.b.import.txt" 2>&1 \
         || { echo "top-level 'tapectl import' itself failed:"; cat "$sd/dl.b.import.txt"; return 1; }
     local to="$sd/dl.b.restore-photos"
-    if ! NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
+    if NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
         >"$sd/dl.b.restore.txt" 2>&1; then
-        echo "NOTE (expected, documented finding — src/cli/operations.rs:1494):"
-        echo "  'tapectl import' inserts only a bare volumes row (no units/snapshots/"
-        echo "  writes), so 'restore unit --unit photos' has no unit row to resolve"
-        echo "  against. See docs/lifecycle-suite.md for the full writeup."
+        echo "'restore unit' SUCCEEDED after a bare 'import'. That means import is now"
+        echo "doing more than registering a cartridge — which is the job #136 gave to"
+        echo "'catalog rebuild' instead. Reconcile the two before relaxing this check."
         cat "$sd/dl.b.restore.txt"
         return 1
     fi
+    grep -qi "photos" "$sd/dl.b.restore.txt" || {
+        echo "restore refused, but without naming the unit it could not resolve:"
+        cat "$sd/dl.b.restore.txt"
+        return 1
+    }
+}
+
+# (d) NEW empty home, NO backup, and the OPERATOR key: `catalog rebuild`
+# reads the tape's envelopes and inserts the rows arm (b) proved `import`
+# does not. This is the arm #136 exists for, and it is the one that proves
+# the whole chain — envelope decrypt, manifest parse, row synthesis, and a
+# real `restore unit` off real tape through the rebuilt catalog.
+#
+# The key copied in is the OPERATOR's, not alice's: the operator envelope's
+# recipients are operator + escrow only, so a tenant key cannot open it.
+# That refusal has its own unit test; what this arm proves is the path that
+# works.
+dl_scenario_d_catalog_rebuild() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: new home (init only); copy operator key; tapectl catalog rebuild --from-volume --key OPKEY --label VOL-A --json (assert units>0); tapectl catalog locate photos (assert VOL-A); tapectl restore unit --unit photos --from VOL-A (assert identical); rebuild AGAIN (assert no_changes)"
+        return 0
+    fi
+    local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-d"
+    mkdir -p "$newhome"
+    NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" --no-escrow >"$sd/dl.d.init.txt" 2>&1 || { cat "$sd/dl.d.init.txt"; return 1; }
+
+    local opkey="$sd/dl.d.operator.age.key"
+    cp "$HOME_DIR/keys/$OPERATOR-primary.age.key" "$opkey" || {
+        echo "no operator key at $HOME_DIR/keys/$OPERATOR-primary.age.key"; ls -1 "$HOME_DIR/keys"; return 1; }
+
+    local rlog="$sd/dl.d.rebuild.json"
+    NEWHOME_TCTL "$newhome" catalog rebuild --from-volume --device "$TAPE_DEV" \
+        --key "$opkey" --label VOL-A --json >"$rlog" 2>&1 || { cat "$rlog"; return 1; }
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["label"] == "VOL-A", d
+assert d["volume_inserted"], d
+assert d["units"] > 0, d
+assert d["positions"] > 0, d
+assert not d["no_changes"], d
+assert d["units_without_tenant_envelope"] == [], d
+' "$rlog" || { echo "catalog rebuild did not report a real rebuild:"; cat "$rlog"; return 1; }
+
+    local logf="$sd/dl.d.locate.json"
+    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos after rebuild:"; cat "$logf"; return 1; }
+
+    mkdir -p "$newhome/keys"
+    cp -a "$HOME_DIR/keys/." "$newhome/keys/" || { echo "could not copy keys into the new home"; return 1; }
+    local to="$sd/dl.d.restore-photos"
+    NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
+        >"$sd/dl.d.restore.txt" 2>&1 || { cat "$sd/dl.d.restore.txt"; return 1; }
     assert_identical "$SRC/photos" "$to"
+
+    # Idempotence, against a real tape rather than a MemStore: the second
+    # pass must change nothing. This is what makes it safe to walk a shelf.
+    local rlog2="$sd/dl.d.rebuild2.json"
+    NEWHOME_TCTL "$newhome" catalog rebuild --from-volume --device "$TAPE_DEV" \
+        --key "$opkey" --label VOL-A --json >"$rlog2" 2>&1 || { cat "$rlog2"; return 1; }
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["no_changes"], d
+' "$rlog2" || { echo "a second catalog rebuild was not a no-op:"; cat "$rlog2"; return 1; }
 }
 
 # (c) The pure heir path: a directory holding ONLY RESTORE.sh and the
@@ -1905,6 +1974,7 @@ scenario_db_loss() {
     check dl.scenario_a dl_scenario_a_db_import
     check dl.scenario_b dl_scenario_b_raw_and_import
     check dl.scenario_c dl_scenario_c_pure_heir
+    check dl.scenario_d dl_scenario_d_catalog_rebuild
 }
 # ============================================================
 # Scenario: escrow-ordering (issue #115 regression)

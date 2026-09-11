@@ -1,4 +1,9 @@
+use std::path::PathBuf;
+
 use clap::Subcommand;
+
+/// Fixed tape block size, matching every other tape-reading command here.
+const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 use rusqlite::{params, Connection};
 use tabled::{Table, Tabled};
 
@@ -36,6 +41,36 @@ pub enum CatalogCommands {
 
     /// Show catalog statistics
     Stats,
+
+    /// Reconstruct catalog rows by reading a sealed volume — the path back
+    /// when the database is gone and there is no backup
+    Rebuild {
+        /// Rebuild from a sealed tape volume. The only source today; named
+        /// rather than implied so a later `--from-export` is additive.
+        #[arg(long = "from-volume")]
+        from_volume: bool,
+        /// Tape device. Deliberately has NO default: `/dev/nstN` numbering
+        /// is not stable across reboots on a host with more than one drive,
+        /// and unlike a read-only dump this command writes what it reads
+        /// into the catalog — a silent wrong-device default would file one
+        /// tape's contents under another's. Resolve by serial through
+        /// `/dev/tape/by-id/`.
+        #[arg(long)]
+        device: String,
+        /// Operator or escrow secret key file. A tenant key cannot open the
+        /// operator envelope and is refused with a pointer at RESTORE.sh.
+        #[arg(long)]
+        key: PathBuf,
+        /// Refuse unless the tape's own reported label matches — a
+        /// wrong-tape guard, not a database lookup
+        #[arg(long)]
+        label: Option<String>,
+        /// Tenant to file units under when no tenant envelope on this
+        /// cartridge names their owner (only reachable with a damaged or
+        /// partial tape)
+        #[arg(long, default_value = "recovered")]
+        tenant: String,
+    },
 }
 
 #[derive(Tabled)]
@@ -313,6 +348,110 @@ pub fn run(conn: &Connection, command: &CatalogCommands, json_output: bool) -> R
                         unserviceable.join(", ")
                     );
                 }
+            }
+        }
+
+        CatalogCommands::Rebuild {
+            from_volume,
+            device,
+            key,
+            label,
+            tenant,
+        } => {
+            if !from_volume {
+                return Err(TapectlError::Other(
+                    "catalog rebuild needs a source: pass --from-volume to rebuild \
+                     from a sealed tape"
+                        .to_string(),
+                ));
+            }
+            let scratch =
+                std::env::temp_dir().join(format!("tapectl-rebuild-{}", std::process::id()));
+            let report = crate::volume::rebuild::rebuild_from_volume(
+                conn,
+                device,
+                DEFAULT_BLOCK_SIZE,
+                key,
+                label.as_deref(),
+                tenant,
+                &scratch,
+            );
+            // The scratch dir holds decrypted MANIFEST/catalog.db copies —
+            // remove it on every path out, success or failure, exactly as
+            // `RestoreScratch` does for decrypted slices (#102).
+            let _ = std::fs::remove_dir_all(&scratch);
+            let report = report?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "label": report.label,
+                        "uuid": report.uuid,
+                        "envelopes_opened": report.envelopes_opened,
+                        "volume_inserted": report.volume_inserted,
+                        "tenants": report.tenants,
+                        "units": report.units,
+                        "snapshots": report.snapshots,
+                        "stage_sets": report.stage_sets,
+                        "slices": report.slices,
+                        "writes": report.writes,
+                        "positions": report.positions,
+                        "files": report.files,
+                        "had_catalog_db": report.had_catalog_db,
+                        "units_without_tenant_envelope": report.units_without_tenant_envelope,
+                        "no_changes": report.is_noop(),
+                    })
+                );
+            } else {
+                println!(
+                    "rebuilt from volume \"{}\" (uuid {}), {} envelope(s) opened",
+                    report.label, report.uuid, report.envelopes_opened
+                );
+                if report.is_noop() {
+                    println!("  no changes — the catalog already knew this volume");
+                } else {
+                    println!(
+                        "  inserted: {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s),",
+                        report.tenants, report.units, report.snapshots, report.stage_sets
+                    );
+                    println!(
+                        "            {} slice(s), {} write(s), {} position(s), {} file row(s){}",
+                        report.slices,
+                        report.writes,
+                        report.positions,
+                        report.files,
+                        if report.volume_inserted {
+                            ", 1 volume"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                if !report.had_catalog_db {
+                    println!(
+                        "  note: this tape carries no catalog.db (written before issue #83) — \
+                         the restore path is complete, but there is no per-file index and \
+                         each snapshot's original source path is unknown"
+                    );
+                }
+                if !report.units_without_tenant_envelope.is_empty() {
+                    println!(
+                        "  note: no tenant envelope on this cartridge names the owner of {} — \
+                         filed under tenant \"{}\"",
+                        report.units_without_tenant_envelope.join(", "),
+                        tenant
+                    );
+                }
+                println!(
+                    "  the slice hashes recorded are the tape's own claim; run \
+                     `tapectl volume verify --label {}` to check them",
+                    report.label
+                );
+                println!(
+                    "  escrow coverage cannot be rebuilt: no tape records a recipient list, \
+                     so these units report `escrow: NO` (issue #137)"
+                );
             }
         }
 

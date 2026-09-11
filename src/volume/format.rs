@@ -238,6 +238,50 @@ pub fn parse_id_thunk_layout_pointers(raw: &str) -> Result<IdThunkLayoutPointers
     })
 }
 
+/// The ID thunk (File 0)'s `[volume]` media and capacity facts — everything a
+/// `volumes` row needs that is not the label or the uuid.
+///
+/// A third parser over the same table rather than fields bolted onto
+/// [`IdThunkIdentity`], which documents at length that it carries only what
+/// resume needs. `catalog rebuild` (#136) is the only consumer: it
+/// reconstructs a `volumes` row from the tape's own claim about itself
+/// rather than from the local config, so a rebuild on a differently
+/// configured machine records the capacity the tape was actually written
+/// against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdThunkVolumeMeta {
+    pub media_type: String,
+    pub nominal_capacity_bytes: i64,
+    pub mam_capacity_bytes: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeMetaToml {
+    media_type: String,
+    nominal_capacity_bytes: i64,
+    mam_capacity_bytes: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdThunkVolumeMetaDoc {
+    volume: VolumeMetaToml,
+}
+
+/// Parse the ID thunk (File 0)'s `[volume]` media and capacity fields. Same
+/// fail-safe convention as its siblings: absent or malformed input is a
+/// normal `Err`, never a panic.
+pub fn parse_id_thunk_volume_meta(raw: &str) -> Result<IdThunkVolumeMeta> {
+    let body = toml_body(raw, "[volume]", "id thunk volume meta")?;
+    let doc: IdThunkVolumeMetaDoc = toml::from_str(body).map_err(|e| {
+        TapectlError::Other(format!("id thunk volume meta: TOML parse failed: {e}"))
+    })?;
+    Ok(IdThunkVolumeMeta {
+        media_type: doc.volume.media_type,
+        nominal_capacity_bytes: doc.volume.nominal_capacity_bytes,
+        mam_capacity_bytes: doc.volume.mam_capacity_bytes,
+    })
+}
+
 /// A violation of the §2.5 front-index self-consistency rules. Cheap checks
 /// that turn "subtly wrong map" into a loud, structured report rather than a
 /// silent bad read — every violation present is returned, not just the
@@ -558,6 +602,36 @@ mod tests {
 
         let parsed = parse_id_thunk_identity(&padded_str).expect("parses despite NUL padding");
         assert_eq!(parsed.label, "RT03");
+    }
+
+    // --- id thunk volume meta (the `volumes` row a rebuild reconstructs, #136) --
+
+    #[test]
+    fn id_thunk_volume_meta_round_trips_through_the_parser() {
+        let params = sample_id_thunk_params("RT06", "22222222-3333-4444-5555-666666666666");
+        let generated = generate_id_thunk_v2(&params);
+
+        let parsed = parse_id_thunk_volume_meta(&generated).expect("parses");
+        assert_eq!(parsed.media_type, "LTO-6");
+        assert_eq!(parsed.nominal_capacity_bytes, 2_500_000_000_000);
+        assert_eq!(parsed.mam_capacity_bytes, 2_400_000_000_000);
+    }
+
+    #[test]
+    fn id_thunk_volume_meta_parser_is_tolerant_of_trailing_block_padding_nuls() {
+        let params = sample_id_thunk_params("RT07", "33333333-4444-5555-6666-777777777777");
+        let generated = generate_id_thunk_v2(&params);
+        let mut padded = generated.into_bytes();
+        padded.resize(4096, 0);
+        let padded_str = String::from_utf8(padded).unwrap();
+
+        let parsed = parse_id_thunk_volume_meta(&padded_str).expect("parses despite NUL padding");
+        assert_eq!(parsed.media_type, "LTO-6");
+    }
+
+    #[test]
+    fn id_thunk_volume_meta_missing_marker_is_an_err_not_a_panic() {
+        assert!(parse_id_thunk_volume_meta("no toml here at all").is_err());
     }
 
     // --- id thunk layout pointers (the foreign-tape seal-position check, #27) --

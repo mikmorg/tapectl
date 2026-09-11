@@ -58,7 +58,7 @@ the journal of everything done).
 | `tape-only-and-reclaim` | mark-tape-only preconditions (copies/locations), reclaim a superseded snapshot |
 | `compaction` | mhvtl-only. compact-finish's copy-elsewhere refusal, then success once satisfied |
 | `retire-and-reuse` | Retire (refused sole-copy, then safe), cartridge reuse, ADR-0003 sealed-tape refusal |
-| `db-loss` | db backup/import, DB-less raw-volume + `import`, the pure heir path |
+| `db-loss` | db backup/import, DB-less raw-volume + `import`, the pure heir path, `catalog rebuild` from tape |
 | `escrow-ordering` | issue #115 regression: stage-before-escrow refusal, then a working escrow restore |
 | `restore-file-and-catalog` | catalog vs. `find`, single-file restore (unicode/empty/symlink), integrity checks |
 | `quick-archive` | The one-shot create+stage+write flow |
@@ -128,16 +128,18 @@ and therefore the failure, is identical.
 - **`cartridge mark-erased`'s gate is the cartridge's DB status**
   (`pending_erase`, set by `volume retire`), not whether a physical erase
   happened — the DB has no way to observe that.
-- One check is **expected to fail today, on purpose**: `db-loss`'s scenario
-  (b). Top-level `import` inserts only a bare `volumes` row — no units, no
-  writes — so a follow-on `restore unit` has nothing to resolve against.
-  Whether that is a defect in `import` or a missing recovery command is a
-  design question, deferred on
-  [#136](https://github.com/mikmorg/tapectl/issues/136); the constraint that
-  decides it is that the plaintext zones carry no unit names by invariant, so
-  any rebuild-from-tape must decrypt an envelope. Logged as a failure, not
-  silently softened.
-- Two former expected failures are now fixed:
+- **Every check is expected to pass.** `db-loss`'s scenario (b) used to be a
+  deliberate failure — top-level `import` inserts only a bare `volumes` row,
+  so a follow-on `restore unit` had nothing to resolve against. The CTO
+  settled [#136](https://github.com/mikmorg/tapectl/issues/136) the other
+  way: `import` registers a cartridge and that is all it was for, and
+  rebuilding the catalog is its own command. Arm (b) now asserts that
+  refusal positively, and the new arm **(d)** drives
+  `catalog rebuild --from-volume` end to end: rebuild from the tape's
+  envelopes on an empty home, `catalog locate`, a real `restore unit` off
+  tape through the rebuilt rows, then a second rebuild that must change
+  nothing.
+- Three former expected failures are now fixed:
   `restore-file-and-catalog`'s symlink case (`restore file` dereferenced via
   `fs::copy` while `restore unit` preserved the link — the two commands
   disagreed about the same archive entry) and `escrow-ordering`'s

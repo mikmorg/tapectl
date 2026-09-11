@@ -1,0 +1,50 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-catalog-rebuild 1  "tapectl-catalog-rebuild " 
+.SH NAME
+tapectl\-catalog\-rebuild \- Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
+.SH SYNOPSIS
+\fBtapectl catalog rebuild\fR [\fB\-\-from\-volume\fR] [\fB\-\-json\fR] <\fB\-\-device\fR> [\fB\-\-dry\-run\fR] <\fB\-\-key\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-label\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-tenant\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
+.SH OPTIONS
+.TP
+\fB\-\-from\-volume\fR
+Rebuild from a sealed tape volume. The only source today; named rather than implied so a later `\-\-from\-export` is additive
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device. Deliberately has NO default: `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read\-only dump this command writes what it reads into the catalog — a silent wrong\-device default would file one tape\*(Aqs contents under another\*(Aqs. Resolve by serial through `/dev/tape/by\-id/`
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-key\fR \fI<KEY>\fR
+Operator or escrow secret key file. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-label\fR \fI<LABEL>\fR
+Refuse unless the tape\*(Aqs own reported label matches — a wrong\-tape guard, not a database lookup
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+.TP
+\fB\-\-tenant\fR \fI<TENANT>\fR [default: recovered]
+Tenant to file units under when no tenant envelope on this cartridge names their owner (only reachable with a damaged or partial tape)
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, receipts, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

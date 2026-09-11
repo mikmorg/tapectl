@@ -55,6 +55,27 @@ killed. Consequences for this run:
 Discovered work is filed as an issue and listed under Discoveries, not worked —
 unless it is a regression this run caused, or it blocks a queued item.
 
+## Queue — REOPENED 2026-09-11 (CTO grilling on open decisions, ratified)
+
+The CTO was grilled on the four items round 1 left open and ratified every
+answer. #134 and #135 are no longer deferred; #136 is authorized to build.
+Same rules as round 1 (`.claude/skills/unattended-run/SKILL.md`).
+
+| # | Item | State |
+|---|---|---|
+| 9 | #134 — drop the stale `layout_version = 1` from the envelope manifest | **landed** `64d3f91` |
+| 10 | #135 — scope the heir version selector to the `[[units]]` head | **landed** `64d3f91` |
+| 11 | #136 — `catalog rebuild --from-volume --key K` | in progress |
+
+Ratified #136 design: operator/escrow key only (a tenant key is refused and
+pointed at `RESTORE.sh`); an `events` row for provenance, **no new column**;
+insert-missing-only and idempotent across cartridges; slice positions read from
+the age-authenticated envelope manifest, never the plaintext front index; does
+not bundle verification — `volume verify` already exists.
+
+A real-drive confirmation pass is owed at the end of this round for the
+#134/#135 heir-path byte changes; it is batched, not per-commit.
+
 ## Real-drive confirmation pass — DONE 2026-09-11 12:45 UTC
 
 #133 and #130 changed frozen on-tape bytes (File 0, File 1, File 2 and the
@@ -89,6 +110,10 @@ value` instead of dying silently, and `--info` announces
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 14:05 | #136 | implemented. New `volume::envelope` (the first Rust code that reads an envelope BACK — the write path packed them and only bash ever unpacked them) and `volume::rebuild`. 9 integration tests drive the **real** write session into a `MemStore` and rebuild from those exact bytes; the load-bearing assertion runs `restore_unit`'s verbatim resolution join. Two negative controls confirmed red at distinct assertions. |
+| 09-11 13:40 | #136 | **two of the three design questions collapsed on evidence, one deferred.** `tenants` has no `public_key` (it is on `encryption_keys`) and `restore` loads identities from `keys/` on disk — so a rebuilt tenant row is structurally complete, not a stub. Manifest-authoritative is forced, not chosen: `catalog.db` carries neither `sha256_plain` nor `tape_position`. The third — rebuilt sets can never show escrow coverage — went to the CTO as #137. |
+| 09-11 13:20 | — | queue reopened after the CTO ratified all three grilling rounds. #134/#135 landed `64d3f91`; #136 authorized to build. |
+| 09-11 13:15 | #135 | closing comment posted correcting the issue's own miscount: ONE unguarded matcher, not three. |
 | 09-11 08:52 | — | **RUN CLOSED: the queue is empty.** One of the three ratified stop conditions. Closeout below. |
 | 09-11 08:50 | #1 | status refresh posted. The map's destination was met long ago; recommended closing it, did not close it (maps and epics are surfaced, never closed unilaterally — the #27 rule). |
 | 09-11 08:40 | #126 | landed. `tapectl backend add`, appended as text so comments survive. **The end-to-end run found a bug no unit test could**: `init` serialized `lto = []`, which TOML rejects alongside a later `[[backends.lto]]` table — the command could not append to the file `init` had just written. Fixed both ends. Verified against the real LTO-6 by-id path: add exit 0, `config check` exit 0, duplicate name rejected. 720 lib tests (+6). |
@@ -110,7 +135,8 @@ value` instead of dying silently, and `--info` announces
 
 ## Closeout
 
-**Queue: 8 items — 6 landed, 1 deferred, 1 documented. One obligation blocked.**
+**Round 1 — queue: 8 items — 6 landed, 1 deferred, 1 documented. One
+obligation blocked.** Round 2 reopened the queue above with #134/#135/#136.
 
 | Commit | What |
 |---|---|

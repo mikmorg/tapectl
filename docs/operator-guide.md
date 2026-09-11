@@ -834,7 +834,18 @@ tapectl db export  # JSON row counts
 
 ## Disaster Recovery
 
-Every tape is self-describing. If the database is lost:
+Every tape is self-describing, so the database being gone costs you convenience,
+not data. There are two ways back, and which one you take depends on what you
+hold — not on how bad the loss is.
+
+> **Every `--device` below is an example.** `/dev/nstN` numbering is not stable
+> across reboots on a host with more than one drive. Resolve the drive by serial
+> through `/dev/tape/by-id/` and pass what you find.
+
+### If you hold a tenant key: restore directly, no catalog needed
+
+This is the heir path. It needs `mt`, `dd`, `age`, `dar` and `sha256sum` — and
+notably not `tapectl`.
 
 1. Read the ID thunk: `tapectl volume identify --device /dev/nst0`
 2. Extract RESTORE.sh from the tape (file position 2):
@@ -843,13 +854,53 @@ Every tape is self-describing. If the database is lost:
    dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
    chmod +x RESTORE.sh
    ```
-3. Use RESTORE.sh for guided recovery (requires mt, dd, age, dar, sha256sum):
+3. Use RESTORE.sh for guided recovery:
    ```bash
-   ./RESTORE.sh --info                                    # see tape layout
-   ./RESTORE.sh --find-envelope --key your.age.key        # find your data
-   ./RESTORE.sh --restore --key your.age.key --to /dest   # full restore
+   ./RESTORE.sh --info                                          # see tape layout
+   ./RESTORE.sh --find-envelope --key your.age.key              # find your data
+   ./RESTORE.sh --restore --unit UNIT --key your.age.key --to /dest
    ```
-4. Operator envelope contains a full catalog across all tenants
+
+### If you hold the operator or escrow key: rebuild the catalog
+
+`catalog rebuild` reads a sealed tape and inserts whatever catalog rows are
+missing, so `restore`, `catalog ls` and `report` work again:
+
+```bash
+tapectl catalog rebuild --from-volume \
+    --device /dev/nst0 \
+    --key ~/.tapectl/keys/operator-primary.age.key \
+    --label VOL0001            # optional wrong-tape guard
+```
+
+Run it once per cartridge, in any order. It only ever **inserts what is
+missing** and never edits a row it finds, so running it twice — or over a
+catalog that is damaged rather than absent — is safe.
+
+What comes back, and from where:
+
+| | source |
+|---|---|
+| volume identity, media, capacity | the ID thunk (tape file 0) |
+| units, snapshots, slice map, plaintext hashes | each envelope's `MANIFEST.toml` |
+| tenant ownership | the tenant envelopes |
+| the per-file index and original source paths | the operator envelope's `catalog.db` |
+
+Three things it deliberately does not do:
+
+- **It does not verify the tape.** The hashes it records are the tape's own
+  claim about itself. Run `tapectl volume verify --label VOL0001` afterwards to
+  turn that into a checked claim.
+- **It cannot rebuild escrow coverage.** No tape records a recipient list, so
+  rebuilt units report `escrow: NO` and `audit` will flag them. Unknown is not
+  the same as covered — see issue #137.
+- **It refuses a tenant key**, because a tenant key cannot open the operator
+  envelope. That is not a restriction on the tenant: they do not need a catalog
+  at all, and the refusal points them at RESTORE.sh above.
+
+A tape written before issue #83 carries no `catalog.db`. The restore path still
+comes back whole; what you lose is `catalog ls`/`catalog search` and each
+snapshot's original source path, and the command says so when it happens.
 
 ## Multi-Tenant Setup
 
