@@ -523,7 +523,20 @@ import sys, os, random, pathlib
 d, seed, kind = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 rng = random.Random(seed)
 root = pathlib.Path(d)
-files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+# `.tapectl-unit.toml` is tapectl's own control file, not user content.
+# Mutating it does not simulate source drift — `modify` flips byte 0, turning
+# `[unit]` into `\unit]`, and audit then (correctly) reports
+# policy_unresolvable as a VIOLATION for that unit for the rest of the run.
+# Only the mutating step tolerated it, so every later permute step failed on
+# damage the walk itself caused: 19 of 26 failures in the 2026-09-11
+# single-cartridge run. Corrupting the dotfile is a real scenario, but a
+# deliberate one (issue #59 covers it) — not a side effect of "a file changed".
+CONTROL_FILE = ".tapectl-unit.toml"
+files = sorted(
+    p
+    for p in root.rglob("*")
+    if p.is_file() and not p.is_symlink() and p.name != CONTROL_FILE
+)
 
 if kind == "add":
     name = f"added-{seed}-{rng.randint(0, 999999)}.txt"
@@ -2304,7 +2317,52 @@ pm_op_snapshot() {
     TCTL snapshot create "$1" || return 1
     PM_SNAPSHOT_COUNT["$1"]=$(( ${PM_SNAPSHOT_COUNT["$1"]:-1} + 1 ))
 }
-pm_op_stage()           { TCTL stage create "$1"; }
+# `stage create` requires an unstaged snapshot. The walk picks ops at random
+# and can land on `stage` for a unit whose snapshot is already staged, where
+# tapectl correctly refuses. That is a precondition the walk failed to meet, not
+# a defect — SKIP it, the way mark-reclaimable-oldest already does.
+pm_op_stage() {
+    local out rc
+    out="$(TCTL stage create "$1" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    # Match the refusal itself rather than pre-checking snapshot state: a
+    # pre-check that silently stopped matching would skip EVERY stage step and
+    # quietly delete this op's coverage. This way an unexpected failure still
+    # FAILs, and only the documented precondition becomes a SKIP.
+    if [ "$rc" -ne 0 ] && grep -q 'no unstaged snapshot for unit' <<<"$out"; then
+        skip "$PM_CHECK_NAME" "unit \"$1\" has no unstaged snapshot — the walk picked stage with its precondition unmet"
+        return $?
+    fi
+    # The source drifted after the snapshot was taken (a mutate:rename/delete
+    # landed in between), so the manifest names a file that is gone and staging
+    # refuses — correct behaviour (design 2.13), and a precondition the random
+    # walk failed to meet. Do what a real operator does: re-snapshot and stage
+    # again. Retried ONCE, and a second failure still FAILs, so this cannot
+    # paper over a genuine staging defect.
+    if [ "$rc" -ne 0 ] && grep -q 'source file missing' <<<"$out"; then
+        echo "pm_op_stage: snapshot went stale (source drifted) — re-running snapshot create and retrying"
+        TCTL snapshot create "$1" || return 1
+        out="$(TCTL stage create "$1" 2>&1)"; rc=$?
+        printf '%s\n' "$out"
+    fi
+    [ "$rc" -eq 0 ] && pm_capture_staged "$1"
+    return "$rc"
+}
+
+# The restore baseline, captured when a unit is STAGED.
+#
+# It used to be `cp -a "$SRC"` at write time, which is the wrong instant: a
+# volume is written from a stage set built earlier, so any mutation landing
+# between stage and write made the "pristine" copy disagree with the tape and
+# restore-latest-and-diff failed on content the tape was never supposed to have.
+# The tape holds what was staged, so the baseline must be the source as it was
+# when staged.
+pm_capture_staged() { # pm_capture_staged <unit>
+    local sd; sd="$(dirname "$HOME_DIR")"
+    mkdir -p "$sd/pm-staged"
+    rm -rf "${sd:?}/pm-staged/${1:?}"
+    cp -a "$SRC/$1" "$sd/pm-staged/$1"
+}
 pm_op_check_integrity() { TCTL unit check-integrity "$1"; }
 pm_op_key_rotate()      { TCTL key rotate --tenant alice; }
 pm_op_audit()           { local rc; TCTL audit; rc=$?; [ "$rc" -le 2 ]; }
@@ -2320,7 +2378,10 @@ pm_op_write_next_volume() {
     next_tape "$label" || return 1
     vinit "$label" || return 1
     TCTL volume write "$label" --device "$TAPE_DEV" || return 1
-    cp -a "$SRC" "$sd/pm-snapshot-$label"
+    # Freeze the baseline for THIS volume from what was staged, not from the
+    # live source (see pm_capture_staged).
+    mkdir -p "$sd/pm-snapshot-$label"
+    cp -a "$sd/pm-staged/." "$sd/pm-snapshot-$label/"
     PM_WRITTEN+=("$label")
 }
 
@@ -2328,7 +2389,14 @@ pm_op_restore_latest_and_diff() {
     if [ "${#PM_WRITTEN[@]}" -eq 0 ]; then skip "$PM_CHECK_NAME" "no volume written yet this walk"; return $?; fi
     local label="${PM_WRITTEN[-1]}" sd u to
     sd="$(dirname "$HOME_DIR")"
-    load_volume_tape "$label" || return 1
+    # $label is the MOST RECENT write, which in single-cartridge mode is exactly
+    # what is still in the drive — there is nothing to reload. load_volume_tape
+    # refuses unconditionally under --single-cartridge (it exists to fetch
+    # SUPERSEDED cartridges, which really are gone), so calling it here failed a
+    # check that should simply proceed against the loaded tape.
+    if [ "$SINGLE_CARTRIDGE" != 1 ]; then
+        load_volume_tape "$label" || return 1
+    fi
     for u in photos docs big; do
         to="$sd/pm-restore-$label-$u"
         if TCTL restore unit --unit "$u" --from "$label" --to "$to" --device "$TAPE_DEV" >/dev/null 2>&1; then
@@ -2387,16 +2455,33 @@ d = json.load(sys.stdin)
 assert d.get("integrity_ok"), d
 ' || { echo "db fsck not clean after op \"$op\": $fsck_json"; return 1; }
 
-    local audit_rc pm_audit_json="$RUN/log-pm.audit.json"
-    TCTL audit --json >"$pm_audit_json" 2>&1; audit_rc=$?
+    # Per-step, not a single overwritten file: the old shared path meant the
+    # only surviving json was the LAST step's, so a failing step's evidence was
+    # gone by the time anyone read the report. And stderr must NOT be folded in
+    # (`2>&1`) — one stray line makes the file unparseable, which audit_passes
+    # reports as "non-copy_count violations", blaming the policy for a plumbing
+    # problem.
+    local audit_rc pm_audit_json="$RUN/log-pm.${PM_STEP_TAG:-step}.audit.json"
+    TCTL audit --json >"$pm_audit_json" 2>"$RUN/log-pm.${PM_STEP_TAG:-step}.audit.stderr"; audit_rc=$?
     case "$op" in
         mutate:*) audit_passes "$audit_rc" "$pm_audit_json" || [ "$audit_rc" -le 2 ] || { echo "audit exited $audit_rc (>2) after \"$op\""; return 1; } ;;
-        *)        audit_passes "$audit_rc" "$pm_audit_json" || { echo "audit exited $audit_rc after \"$op\" with non-copy_count violations"; return 1; } ;;
+        *)        audit_passes "$audit_rc" "$pm_audit_json" || {
+                      echo "audit exited $audit_rc after \"$op\"; audit_passes rejected it. json:"
+                      cat "$pm_audit_json"
+                      echo "--- stderr ---"; cat "$RUN/log-pm.${PM_STEP_TAG:-step}.audit.stderr"
+                      return 1; } ;;
     esac
 }
 
 scenario_permute() {
     check pm.setup bootstrap_archive_v1 VOL-A
+    # bootstrap_archive_v1 stages every unit itself, so seed the staged baseline
+    # from it — otherwise the first write would have nothing to compare against.
+    if [ "$DRY_RUN" != 1 ]; then
+        for _u in photos docs big; do
+            [ -d "$SRC/$_u" ] && pm_capture_staged "$_u"
+        done
+    fi
 
     if [ "$DRY_RUN" = 1 ]; then
         echo "PLAN: seed=$SEED steps=$STEPS op sequence:"
@@ -2422,6 +2507,7 @@ scenario_permute() {
         PM_CHECK_NAME="pm.step$i.$op"
         # shellcheck disable=SC2086  # word-splitting the (unit|report-name) arg is intentional
         check "$PM_CHECK_NAME" pm_run_step $line
+        PM_STEP_TAG="step$i"
         check "pm.step$i.invariants" pm_post_step_invariants "$op"
     done <"$seqfile"
 
