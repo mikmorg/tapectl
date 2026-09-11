@@ -26,6 +26,45 @@
 //!   than accusing the row of something nobody could have prevented.
 //!
 //! `stage_sets.origin` (migration 010) is the discriminant.
+//!
+//! # The query half (coordinator decision 2026-09-11, architecture review C1)
+//!
+//! `classify`/`gap`/`marker` answer the deep question once fed a recipient
+//! list. The question that FEEDS them — "which stage sets, on which
+//! volumes, with what recorded recipient list and origin" — used to be
+//! hand-written SQL in four places (`audit`'s `escrow_coverage` check,
+//! `report copies`' `escrow_gaps_by_unit`, `catalog locate`'s
+//! `locate_rows`, and the `volume write` pre-flight's
+//! `stage_sets_lacking_escrow`), and the copies had already drifted:
+//! different reason strings for the same verdict. [`stage_set_coverage`] is
+//! the single query behind all four now, mirroring how issue #73 collapsed
+//! six hand-written copy/location counts into `policy::coverage`.
+//!
+//! **Volume filter: [`crate::policy::coverage::in_service`], not
+//! [`crate::policy::coverage::eligible`] and not an ad-hoc status list.**
+//! Both alternatives were wrong in different directions:
+//! - `eligible` (`sealed`-only) is the ADR-0004 durability question ("does
+//!   this volume contribute a COPY"). Escrow asks a different one: "does the
+//!   CURRENT escrow key open the bytes this volume holds". An `active`/`full`
+//!   volume mid-write already holds sealed slices from earlier stage sets on
+//!   the same tape and has not yet been sealed itself — `eligible` would
+//!   hide those from the escrow check for no reason connected to escrow.
+//! - The ad-hoc list (`NOT IN ('retired','erased','missing','blank')`) let
+//!   `quarantined` volumes through — exactly the #96 failure mode in a new
+//!   dimension: a status added to the schema after the list was written
+//!   defaults to being INCLUDED rather than reviewed.
+//!
+//! `in_service` is "holds bytes we account for" — the right question for
+//! escrow, which is about bytes that physically exist somewhere tapectl
+//! still considers live inventory.
+//!
+//! `encrypted = 0` is folded in as its own [`Coverage::Gap`] here (never in
+//! [`classify`], whose signature stays fixed): `stage create` has hard-coded
+//! `encrypted = 1` on every INSERT since #115 made escrow registration a
+//! staging precondition, so a `0` today can only be a legacy or corrupt row
+//! — fail-closed reporting is correct, not a new false alarm.
+
+use rusqlite::OptionalExtension;
 
 /// Where a `stage_sets` row came from — the `origin` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +153,180 @@ pub fn marker(fingerprints: Option<&str>, origin: Origin, escrow: Option<&str>) 
             Coverage::Gap(_) => "NO",
         },
     }
+}
+
+// ── The query half ──────────────────────────────────────────────────────
+
+/// Which slice of escrow coverage [`stage_set_coverage`] is being asked
+/// about. A typed enum, not a free-form predicate, for the same reason
+/// [`crate::policy::coverage::CoverageScope`] is: the generated SQL defines
+/// its own aliases, and a caller-supplied fragment would bind to whatever
+/// happened to be in scope.
+#[derive(Debug, Clone, Copy)]
+pub enum Scope<'a> {
+    /// Every completed write of this unit's stage sets, on an in-service
+    /// volume — across every snapshot, not only the current one. An escrow
+    /// gap on a superseded snapshot's tape is still a gap; nothing in the
+    /// four call sites wants it hidden.
+    Unit(i64),
+    /// The same, for every unit in the catalog. `report copies --unit` with
+    /// no filter, and `report copies` overall, are the callers.
+    AllUnits,
+    /// A specific set of stage sets by id, with NO `writes`/`volumes` join.
+    /// This is the `volume write` pre-flight's shape: a stage set about to
+    /// be written has no `writes` row yet, completed or otherwise, so there
+    /// is no volume to filter on. A stage set id absent from `stage_sets`
+    /// entirely (or whose snapshot/unit chain is broken) still gets a row —
+    /// fail-closed, not silently dropped.
+    StageSets(&'a [i64]),
+}
+
+/// One stage set's escrow verdict, as reported by [`stage_set_coverage`].
+#[derive(Debug, Clone)]
+pub struct CoveredStageSet {
+    pub stage_set_id: i64,
+    pub unit_name: String,
+    /// The volume this stage set's completed write landed on. `None` for
+    /// [`Scope::StageSets`] — there is no completed write to name yet.
+    pub volume_label: Option<String>,
+    pub coverage: Coverage,
+}
+
+/// Classify one row already read from the database: the `encrypted = 0`
+/// case is folded in here, in the one place, rather than in [`classify`]
+/// (whose signature this task must not change) or duplicated at every call
+/// site.
+fn classify_row(
+    fingerprints: Option<&str>,
+    origin: &str,
+    encrypted: i64,
+    escrow: &str,
+) -> Coverage {
+    if encrypted == 0 {
+        return Coverage::Gap("staged with encrypted=0".to_string());
+    }
+    classify(fingerprints, Origin::parse(origin), escrow)
+}
+
+/// **The** query behind "escrow coverage of a stage set" — see the module
+/// header for why the volume filter is [`crate::policy::coverage::in_service`]
+/// and why `encrypted = 0` is handled here rather than in [`classify`].
+///
+/// Do not inline this SQL at a fifth call site. Four already drifted from
+/// each other before this function existed.
+pub fn stage_set_coverage(
+    conn: &rusqlite::Connection,
+    scope: Scope,
+    escrow: &str,
+) -> crate::error::Result<Vec<CoveredStageSet>> {
+    match scope {
+        Scope::StageSets(ids) => stage_set_coverage_by_id(conn, ids, escrow),
+        Scope::Unit(unit_id) => stage_set_coverage_via_writes(conn, Some(unit_id), escrow),
+        Scope::AllUnits => stage_set_coverage_via_writes(conn, None, escrow),
+    }
+}
+
+/// [`Scope::Unit`] / [`Scope::AllUnits`]: every completed write on an
+/// in-service volume, joined back to its unit.
+fn stage_set_coverage_via_writes(
+    conn: &rusqlite::Connection,
+    unit_id: Option<i64>,
+    escrow: &str,
+) -> crate::error::Result<Vec<CoveredStageSet>> {
+    let in_service = crate::policy::coverage::in_service("v");
+    let mut sql = format!(
+        "SELECT ss.id, u.name, v.label, ss.key_fingerprints, ss.origin, ss.encrypted
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE w.status = 'completed' AND {in_service}"
+    );
+    if unit_id.is_some() {
+        sql.push_str(" AND s.unit_id = ?1");
+    }
+    sql.push_str(" ORDER BY u.name, v.label, ss.id");
+
+    let mut stmt = conn.prepare(&sql)?;
+    #[allow(clippy::type_complexity)]
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(i64, String, String, Option<String>, String, i64)> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    };
+    let rows: Vec<_> = match unit_id {
+        Some(id) => stmt
+            .query_map(rusqlite::params![id], map_row)?
+            .collect::<std::result::Result<_, _>>()?,
+        None => stmt
+            .query_map([], map_row)?
+            .collect::<std::result::Result<_, _>>()?,
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(stage_set_id, unit_name, volume_label, fingerprints, origin, encrypted)| {
+                CoveredStageSet {
+                    stage_set_id,
+                    unit_name,
+                    volume_label: Some(volume_label),
+                    coverage: classify_row(fingerprints.as_deref(), &origin, encrypted, escrow),
+                }
+            },
+        )
+        .collect())
+}
+
+/// [`Scope::StageSets`]: by id, no `writes`/`volumes` join. Mirrors the
+/// per-id lookup `stage_sets_lacking_escrow` used to run inline, including
+/// its fail-closed handling of an id with no surviving row.
+fn stage_set_coverage_by_id(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+    escrow: &str,
+) -> crate::error::Result<Vec<CoveredStageSet>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.name, ss.key_fingerprints, ss.origin, ss.encrypted
+         FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE ss.id = ?1",
+    )?;
+    let mut out = Vec::with_capacity(ids.len());
+    for &stage_set_id in ids {
+        let row: Option<(String, Option<String>, String, i64)> = stmt
+            .query_row(rusqlite::params![stage_set_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?;
+        let (unit_name, coverage) = match row {
+            // No row at all (or a broken snapshot/unit chain): as unprovable
+            // as a NULL recipient list — same fail-closed answer, same
+            // wording `stage_sets_lacking_escrow` always used.
+            None => (
+                format!("<unknown unit for stage set {stage_set_id}>"),
+                Coverage::Gap("no recorded recipient list".to_string()),
+            ),
+            Some((unit_name, fingerprints, origin, encrypted)) => (
+                unit_name,
+                classify_row(fingerprints.as_deref(), &origin, encrypted, escrow),
+            ),
+        };
+        out.push(CoveredStageSet {
+            stage_set_id,
+            unit_name,
+            volume_label: None,
+            coverage,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -207,5 +420,243 @@ mod tests {
         assert_eq!(Origin::parse("rebuilt"), Origin::Rebuilt);
         assert_eq!(Origin::parse("staged"), Origin::Staged);
         assert_eq!(Origin::parse("anything else"), Origin::Staged);
+    }
+
+    mod query {
+        use super::*;
+        use crate::db;
+        use rusqlite::{params, Connection};
+
+        const ESCROW: &str = "age1escrowescrowescrow";
+
+        /// One unit `photos`, one snapshot, one stage set, one completed
+        /// write to a volume `VOL1` of the given `status`. Returns
+        /// `(conn, unit_id, stage_set_id)`.
+        fn setup(
+            status: &str,
+            fingerprints: Option<&str>,
+            origin: &str,
+            encrypted: i64,
+        ) -> (Connection, i64, i64) {
+            let conn = db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-photos', 'photos', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/tmp/photos')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets
+                    (snapshot_id, status, slice_size, encrypted, key_fingerprints, origin)
+                 VALUES (?1, 'staged', 524288, ?2, ?3, ?4)",
+                params![snap_id, encrypted, fingerprints, origin],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes
+                    (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('VOL1', 'lto', 'lto0', 'LTO-6', 2500000000000, ?1)",
+                params![status],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss_id, snap_id, vol_id],
+            )
+            .unwrap();
+            (conn, unit_id, ss_id)
+        }
+
+        #[test]
+        fn a_covered_row() {
+            let (conn, unit_id, ss_id) =
+                setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 1);
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].stage_set_id, ss_id);
+            assert_eq!(rows[0].volume_label.as_deref(), Some("VOL1"));
+            assert_eq!(rows[0].coverage, Coverage::Covered);
+        }
+
+        #[test]
+        fn a_gap_row() {
+            let (conn, unit_id, _ss_id) = setup("sealed", Some(r#"["age1alice"]"#), "staged", 1);
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert!(matches!(rows[0].coverage, Coverage::Gap(_)));
+        }
+
+        #[test]
+        fn an_unknown_rebuilt_row() {
+            let (conn, unit_id, _ss_id) = setup("sealed", None, "rebuilt", 1);
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].coverage, Coverage::Unknown);
+        }
+
+        /// `stage create` has hard-coded `encrypted = 1` since #115, so a
+        /// `0` today can only be a legacy/corrupt row. Handled here, not in
+        /// `classify`.
+        #[test]
+        fn an_encrypted_zero_row_is_a_gap() {
+            let (conn, unit_id, _ss_id) =
+                setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 0);
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(
+                rows[0].coverage,
+                Coverage::Gap("staged with encrypted=0".to_string())
+            );
+        }
+
+        /// The volume filter is `in_service`, not `eligible` and not the old
+        /// ad-hoc status list — see the module header. A retired volume
+        /// fails all three, so this does not distinguish them, but it does
+        /// pin that a dead cartridge's stage set is excluded, not reported
+        /// as a gap.
+        #[test]
+        fn a_row_on_a_retired_volume_is_excluded() {
+            let (conn, unit_id, _ss_id) = setup(
+                "retired",
+                Some(r#"["age1escrowescrowescrow"]"#),
+                "staged",
+                1,
+            );
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert!(
+                rows.is_empty(),
+                "a retired volume is not in_service: {rows:?}"
+            );
+        }
+
+        /// The ad-hoc status list this replaces let `quarantined` volumes
+        /// through (they were not in its NOT-IN list) — exactly the #96
+        /// failure mode in a new dimension. `in_service` excludes them.
+        #[test]
+        fn a_row_on_a_quarantined_volume_is_excluded() {
+            let (conn, unit_id, _ss_id) = setup(
+                "quarantined",
+                Some(r#"["age1escrowescrowescrow"]"#),
+                "staged",
+                1,
+            );
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert!(
+                rows.is_empty(),
+                "a quarantined volume is not in_service: {rows:?}"
+            );
+        }
+
+        #[test]
+        fn stage_sets_scope_reports_an_unknown_id_as_a_gap() {
+            let conn = db::open_memory().unwrap();
+            let rows = stage_set_coverage(&conn, Scope::StageSets(&[999]), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].stage_set_id, 999);
+            assert!(
+                rows[0].unit_name.contains("unknown"),
+                "{}",
+                rows[0].unit_name
+            );
+            assert_eq!(rows[0].volume_label, None);
+            assert_eq!(
+                rows[0].coverage,
+                Coverage::Gap("no recorded recipient list".to_string())
+            );
+        }
+
+        /// `Scope::StageSets` has no volume join at all — a stage set about
+        /// to be written has no completed write yet. Pin that a real,
+        /// covered row still resolves correctly through that path.
+        #[test]
+        fn stage_sets_scope_covers_a_real_row_with_no_volume_join() {
+            let (conn, _unit_id, ss_id) =
+                setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 1);
+            let rows = stage_set_coverage(&conn, Scope::StageSets(&[ss_id]), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].coverage, Coverage::Covered);
+            assert_eq!(rows[0].volume_label, None);
+        }
+
+        #[test]
+        fn unit_scope_excludes_other_units() {
+            let (conn, unit_id, _ss_id) =
+                setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 1);
+
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t2', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-other', 'other', ?1, 'mtime_size', 1, 'active')",
+                params![tid2],
+            )
+            .unwrap();
+            let other_unit = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/tmp/other')",
+                params![other_unit],
+            )
+            .unwrap();
+            let snap2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+                 VALUES (?1, 'staged', 524288, 1, '[\"age1alice\"]')",
+                params![snap2],
+            )
+            .unwrap();
+            let ss2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes
+                    (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('VOL2', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss2, snap2, vol2],
+            )
+            .unwrap();
+
+            let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "must not see the other unit's stage set: {rows:?}"
+            );
+            assert_eq!(rows[0].unit_name, "photos");
+        }
+
+        #[test]
+        fn all_units_scope_includes_every_unit() {
+            let (conn, _unit_id, _ss_id) = setup("sealed", Some(r#"["age1alice"]"#), "staged", 1);
+            let rows = stage_set_coverage(&conn, Scope::AllUnits, ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].unit_name, "photos");
+        }
     }
 }
