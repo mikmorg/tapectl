@@ -16,7 +16,7 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — IN PROGRESS.**
+- **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
   queue is the seven candidates of the architecture review — not in the repo
   (report: `/tmp/architecture-review-20260911-180729.html`, artifact
@@ -94,7 +94,7 @@ the normative design set named in the Policy block below.
   **All seven landed.** CTO batch answered 2026-09-11 evening: (Q1) **no
   generation stamp** in catalog.db — the shape probe is the reader;
   (Q2) **add the twelve table-only columns to `--json`** — additive, pins
-  updated deliberately (follow-up **C2b**, dispatched); (Q3) **keep
+  updated deliberately (follow-up **C2b**, LANDED — twelve keys, raw values, names following each command family's existing `--json` conventions; pins extended in place); (Q3) **keep
   `in_service`** for escrow findings — quarantined volumes excluded, per
   Copy's definition.
   **Lesson (C4 caught it in the act): `git stash` is shared across every
