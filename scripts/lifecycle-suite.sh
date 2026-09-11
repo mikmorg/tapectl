@@ -809,7 +809,13 @@ row = sqlite3.connect(sys.argv[1]).execute(
        JOIN snapshots s ON s.id = ss.snapshot_id
        JOIN units u ON u.id = s.unit_id
        WHERE u.name = ? AND sl.staging_path IS NOT NULL
-       ORDER BY sl.slice_number LIMIT 1""",
+       -- NEWEST stage set first. Ordering by slice_number alone could pick a
+       -- slice staged under a PREVIOUS owner (before `tenant reassign`), which
+       -- the previous owner's key legitimately still decrypts -- sealed media
+       -- cannot be retroactively re-encrypted. Isolation means the CURRENT
+       -- owner's data is not readable by another tenant; historical slices are
+       -- a separate question (see #131).
+       ORDER BY ss.id DESC, sl.slice_number LIMIT 1""",
     (sys.argv[2],),
 ).fetchone()
 print(row[0] if row else "")
@@ -2341,7 +2347,11 @@ pm_op_stage() {
     # paper over a genuine staging defect.
     if [ "$rc" -ne 0 ] && grep -q 'source file missing' <<<"$out"; then
         echo "pm_op_stage: snapshot went stale (source drifted) — re-running snapshot create and retrying"
-        TCTL snapshot create "$1" || return 1
+        # Via pm_op_snapshot, not `TCTL snapshot create` directly: it also bumps
+        # PM_SNAPSHOT_COUNT, which mark-reclaimable-oldest gates on. Calling
+        # tapectl straight here would undercount versions and make that op SKIP
+        # a unit that really does have >=2.
+        pm_op_snapshot "$1" || return 1
         out="$(TCTL stage create "$1" 2>&1)"; rc=$?
         printf '%s\n' "$out"
     fi

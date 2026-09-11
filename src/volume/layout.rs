@@ -299,7 +299,7 @@ padding can be defeated without knowing the exact size:
 ///   Per-file PASS/FAIL lines, nonzero exit on any FAIL.
 /// - `--find-envelope --key K`: trial-decrypt envelope positions (found by
 ///   type in the file map), as v1.
-/// - `--restore --key K --to DIR [--unit U]`: slice positions/sizes come from
+/// - `--restore --key K --to DIR [--unit U] [--version N]`: slice positions/sizes come from
 ///   the decrypted MANIFEST, cross-checked against the file map's
 ///   `size_bytes`/`sha256_encrypted` before each slice is trusted/decrypted.
 ///
@@ -326,7 +326,7 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --info                                       Show tape layout + seal verdict
 #   ./RESTORE.sh --verify                                     Keyless integrity check (no key needed)
 #   ./RESTORE.sh --find-envelope --key KEYFILE                Decrypt your envelope
-#   ./RESTORE.sh --restore --key KEYFILE --to DIR [--unit U]  Full restore
+#   ./RESTORE.sh --restore --key KEYFILE --to DIR [--unit U] [--version N]
 #
 # Requirements: mt, dd, age, dar, sha256sum, head, truncate
 # Total files on tape: __TOTAL_FILES__
@@ -896,7 +896,7 @@ manifest_has_unit() { # <manifest_path> <unit_name>
 }
 
 do_restore() {
-  local keyfile=$1 destdir=$2 target_unit=$3
+  local keyfile=$1 destdir=$2 target_unit=$3 want_version=${4:-}
 
   mkdir -p "$destdir"
 
@@ -971,25 +971,59 @@ do_restore() {
 
   # Step 3: parse slices for target unit from MANIFEST.toml
   info "Parsing slices for unit: $target_unit"
-  awk -v unit="$target_unit" '
+  # A volume can carry the SAME unit more than once — two snapshot versions, two
+  # stage sets. Collecting every matching [[units]] block concatenated both
+  # versions' slices and handed the mix to dar (issue #131). Worse, when the
+  # versions have different recipients (a `tenant reassign` between them), the
+  # first slice is one this key cannot open and the failure reads as "wrong
+  # key". So: buffer per block and emit exactly one version's slices.
+  awk -v unit="$target_unit" -v want="${want_version:-}" '
     function flush() {
-      if (in_s && num != "") print num "|" tpos "|" eb "|" sha
+      if (in_s && num != "") {
+        n[blk]++
+        slice[blk, n[blk]] = num "|" tpos "|" eb "|" sha
+      }
       in_s = 0; num = ""; tpos = ""; eb = ""; sha = ""
     }
-    /^\[\[units\]\]/               { in_u = 0; flush() }
-    /^name = /                     { gsub(/"/, "", $3); if ($3 == unit) in_u = 1 }
+    /^\[\[units\]\]/ { flush(); blk++; hit[blk] = 0; ver[blk] = -1; in_u = 0; next }
+    /^name = / {
+      gsub(/"/, "", $3)
+      if ($3 == unit) { in_u = 1; hit[blk] = 1 } else { in_u = 0 }
+    }
+    in_u && /^snapshot_version = / { ver[blk] = $3 + 0 }
     in_u && /^\[\[units\.slices\]\]/ { flush(); in_s = 1; next }
     in_s && /^number = /           { num = $3 }
     in_s && /^tape_position = /    { tpos = $3 }
     in_s && /^encrypted_bytes = /  { eb = $3 }
     in_s && /^sha256_encrypted = / { gsub(/"/, "", $3); sha = $3 }
-    END { flush() }
-  ' "$manifest" >"$WORK/slices.txt"
+    END {
+      flush()
+      best = -1; pick = 0
+      for (b = 1; b <= blk; b++) {
+        if (!hit[b]) continue
+        if (want != "") { if (ver[b] == want + 0) { pick = b; best = ver[b] } }
+        else if (ver[b] >= best) { best = ver[b]; pick = b }
+      }
+      if (pick) {
+        print best > "/dev/stderr"
+        for (i = 1; i <= n[pick]; i++) print slice[pick, i]
+      }
+    }
+  ' "$manifest" >"$WORK/slices.txt" 2>"$WORK/picked_version.txt"
 
-  local nslices
+  local nslices picked
   nslices=$(wc -l <"$WORK/slices.txt")
-  [ "$nslices" -gt 0 ] || die "no slices found for unit '$target_unit'"
-  info "$nslices slice(s) to read"
+  picked=$(tr -d ' \n' <"$WORK/picked_version.txt" 2>/dev/null)
+  if [ "$nslices" -eq 0 ]; then
+    if [ -n "${want_version:-}" ]; then
+      die "unit '$target_unit' has no version $want_version on this volume — run --info, or omit --version for the newest"
+    fi
+    die "no slices found for unit '$target_unit'"
+  fi
+  # Always say which version is being restored: a volume can hold several, and
+  # silently picking one is how an heir restores the wrong data believing it is
+  # current.
+  info "Restoring '$target_unit' snapshot version ${picked:-unknown} ($nslices slice(s))"
 
   # Step 4: cross-check each slice against the front index, then verify+decrypt
   local dar_dir="$WORK/dar"
@@ -1064,7 +1098,7 @@ case "${1:-}" in
   ;;
 --restore)
   shift
-  key="" dest="" unit=""
+  key="" dest="" unit="" want=""
   while [ $# -gt 0 ]; do
     case "$1" in
     --key)
@@ -1079,13 +1113,18 @@ case "${1:-}" in
       unit="${2:-}"
       shift 2
       ;;
+    --version)
+      want="${2:-}"
+      shift 2
+      ;;
     *) die "unknown option: $1" ;;
     esac
   done
-  [ -n "$key" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U]"
-  [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U]"
+  [ -n "$key" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+  [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
   [ -f "$key" ] || die "key file not found: $key"
-  do_restore "$key" "$dest" "$unit"
+  [ -z "$want" ] || require_uint version "$want"
+  do_restore "$key" "$dest" "$unit" "$want"
   ;;
 --help | -h)
   echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL (layout v2)"
@@ -1094,7 +1133,9 @@ case "${1:-}" in
   echo "  $0 --info                                       Show tape layout + seal verdict"
   echo "  $0 --verify                                     Keyless integrity check"
   echo "  $0 --find-envelope --key KEYFILE                Decrypt your envelope"
-  echo "  $0 --restore --key KEYFILE --to DIR [--unit U]  Full restore"
+  echo "  $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+  echo "      Full restore. Without --version the NEWEST version of the unit on"
+  echo "      this volume is restored; --info lists what is here."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
@@ -1992,5 +2033,109 @@ mod tests {
              cover validate_segment, or narrow validate_segment.",
             label.len()
         );
+    }
+
+    /// Issue #131: a volume can carry the SAME unit twice — two snapshot
+    /// versions, two stage sets. RESTORE.sh used to collect every matching
+    /// [[units]] block, concatenating both versions' slices and handing the mix
+    /// to dar. When the versions had different recipients (a `tenant reassign`
+    /// between them) the first slice was one the key could not open, and the
+    /// failure read as "wrong key" — on the heir path, where there is no DB to
+    /// fall back on.
+    ///
+    /// Drives the real awk out of the real generated script, so the selection
+    /// rule cannot rot independently of the script that ships.
+    #[test]
+    fn restore_sh_picks_one_version_of_a_unit_present_twice() {
+        use std::process::{Command, Stdio};
+
+        let script = generate_restore_script_v2("MULTI1", 20);
+        let start = script
+            .find("awk -v unit=\"$target_unit\"")
+            .expect("version-selecting awk must be present");
+        let body = &script[start..];
+        let open = body.find('\'').expect("awk program opens");
+        let close = body[open + 1..].find('\'').expect("awk program closes");
+        let program = &body[open + 1..open + 1 + close];
+
+        let manifest = "\
+[[units]]
+name = \"photos\"
+snapshot_version = 1
+[[units.slices]]
+number = 1
+tape_position = 20
+encrypted_bytes = 111
+sha256_encrypted = \"aaa\"
+
+[[units]]
+name = \"docs\"
+snapshot_version = 1
+[[units.slices]]
+number = 1
+tape_position = 21
+encrypted_bytes = 222
+sha256_encrypted = \"bbb\"
+
+[[units]]
+name = \"photos\"
+snapshot_version = 2
+[[units.slices]]
+number = 1
+tape_position = 30
+encrypted_bytes = 333
+sha256_encrypted = \"ccc\"
+";
+        let dir = std::env::temp_dir().join(format!("tapectl-awk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let man = dir.join("MANIFEST.toml");
+        std::fs::write(&man, manifest).unwrap();
+        let prog = dir.join("sel.awk");
+        std::fs::write(&prog, program).unwrap();
+
+        let run = |unit: &str, want: &str| -> String {
+            let mut c = Command::new("awk")
+                .args([
+                    "-v",
+                    &format!("unit={unit}"),
+                    "-v",
+                    &format!("want={want}"),
+                    "-f",
+                    prog.to_str().unwrap(),
+                    man.to_str().unwrap(),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn awk");
+            let _ = c.stdin.take();
+            let o = c.wait_with_output().unwrap();
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        // Newest version by default — NOT both versions concatenated.
+        let newest = run("photos", "");
+        assert_eq!(
+            newest.lines().count(),
+            1,
+            "expected exactly one version's slices, got:\n{newest}"
+        );
+        assert!(newest.contains("|30|"), "expected v2's slice:\n{newest}");
+        assert!(
+            !newest.contains("|20|"),
+            "v1's slice must not be mixed in:\n{newest}"
+        );
+
+        // An explicit older version is selectable.
+        let v1 = run("photos", "1");
+        assert!(v1.contains("|20|"), "expected v1's slice:\n{v1}");
+        assert!(!v1.contains("|30|"), "v2 must not leak in:\n{v1}");
+
+        // A unit present once is unaffected, and a missing version yields
+        // nothing (the caller turns that into a clear error).
+        assert!(run("docs", "").contains("|21|"));
+        assert!(run("photos", "9").trim().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
