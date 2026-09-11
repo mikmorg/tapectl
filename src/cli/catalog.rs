@@ -127,6 +127,16 @@ struct LocationRow {
     /// not with the escrow key". `-` when no escrow is registered at all;
     /// `?` when the row was rebuilt from a tape that carries no recipient
     /// list (#137) — not covered, but attestable.
+    ///
+    /// Sourced from `policy::escrow::stage_set_coverage`, which filters
+    /// volumes by `in_service` (coordinator decision, architecture review
+    /// C1) — narrower than the unfiltered listing above, which shows every
+    /// volume including retired/erased/quarantined ones so a cartridge is
+    /// never hidden. A row on a NOT-in_service volume therefore has no
+    /// verdict to look up and also renders `-`: not "no escrow registered",
+    /// but "the escrow question is not asked about media we no longer
+    /// account for". `Serviceable` above is the column that already says
+    /// this volume cannot serve a restore either way.
     #[tabled(rename = "Escrow")]
     escrow: String,
 }
@@ -145,7 +155,9 @@ struct LocationRow {
 ///
 /// Serviceability reuses `policy::coverage::eligible` — the same ADR-0004
 /// predicate the destructive gates and reports use (issue #89) — so `locate`
-/// cannot disagree with them about whether coverage exists.
+/// cannot disagree with them about whether coverage exists. This is a
+/// DIFFERENT question from the escrow marker below and deliberately keeps
+/// its own source rather than routing through `policy::escrow`.
 fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     let escrow = crate::db::queries::escrow_public_key(conn)?;
     let sealed = crate::policy::coverage::eligible("v");
@@ -157,7 +169,7 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                    FROM volume_deposits d
                    JOIN locations dl ON dl.id = d.location_id
                   WHERE d.volume_id = v.id),
-                ss.key_fingerprints, ss.origin
+                ss.id
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
@@ -166,10 +178,30 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
          WHERE s.unit_id = ?1 AND w.status = 'completed'
          ORDER BY s.version DESC, v.label"
     );
+
+    // The escrow marker's source: one call to `policy::escrow`, indexed by
+    // `stage_set_id` rather than volume label — a volume can hold more than
+    // one of this unit's stage sets bin-packed together, each with its own
+    // verdict (e.g. staged before and after an escrow swap). See the
+    // `escrow` field's doc comment for what a row absent from this map
+    // means.
+    let coverage: std::collections::HashMap<i64, crate::policy::escrow::Coverage> = match &escrow {
+        Some(pk) => crate::policy::escrow::stage_set_coverage(
+            conn,
+            crate::policy::escrow::Scope::Unit(unit_id),
+            pk,
+        )?
+        .into_iter()
+        .map(|r| (r.stage_set_id, r.coverage))
+        .collect(),
+        None => std::collections::HashMap::new(),
+    };
+
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![unit_id], |row| {
             let serviceable: i64 = row.get(6)?;
+            let stage_set_id: i64 = row.get(8)?;
             Ok(LocationRow {
                 volume: row.get(0)?,
                 status: row.get(1)?,
@@ -181,12 +213,12 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                 warehouse: row
                     .get::<_, Option<String>>(7)?
                     .unwrap_or_else(|| "-".into()),
-                escrow: crate::policy::escrow::marker(
-                    row.get::<_, Option<String>>(8)?.as_deref(),
-                    crate::policy::escrow::Origin::parse(&row.get::<_, String>(9)?),
-                    escrow.as_deref(),
-                )
-                .to_string(),
+                escrow: match coverage.get(&stage_set_id) {
+                    None => "-".to_string(),
+                    Some(crate::policy::escrow::Coverage::Covered) => "yes".to_string(),
+                    Some(crate::policy::escrow::Coverage::Unknown) => "?".to_string(),
+                    Some(crate::policy::escrow::Coverage::Gap(_)) => "NO".to_string(),
+                },
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
