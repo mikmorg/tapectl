@@ -629,9 +629,10 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
 
 /// Volume labels per unit that the CURRENT escrow recipient cannot recover.
 ///
-/// Shares `policy::escrow`'s fail-closed classification and `audit`'s media
-/// filter with `escrow_coverage` (#125), so `report copies`, `catalog locate`
-/// and `audit` cannot disagree about a volume.
+/// Routes through `policy::escrow::stage_set_coverage`, the same query
+/// `audit`'s `escrow_coverage` check and `catalog locate` use (architecture
+/// review C1), so `report copies`, `catalog locate` and `audit` cannot
+/// disagree about a volume.
 fn escrow_gaps_by_unit(
     conn: &Connection,
     unit_filter: Option<&str>,
