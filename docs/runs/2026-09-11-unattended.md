@@ -26,6 +26,19 @@ picking the first queue row that is not `landed`.
 
 Resolve by serial, never by number — they move across reboots.
 
+## Build discipline on this VM
+
+**Another Claude session shares this machine** (seen 2026-09-11 07:40: a
+`cargo test --all-targets` under `/scratch/homorg`, target dir
+`/scratch/homorg-target`). Two Rust builds on 10 GB do not fit, and the loser is
+killed. Consequences for this run:
+
+- Run cargo in the **foreground** with `CARGO_BUILD_JOBS=1`. Backgrounded cargo
+  is what gets OOM-killed — twice on 09-11 before this was diagnosed.
+- An OOM kill is contention, **not** a broken build. Re-run it; do not start
+  debugging a failure that never happened.
+- Leave the other session's processes alone. They are someone else's work.
+
 ## Queue (ordered by heir-path risk)
 
 | # | Item | State |
