@@ -22,11 +22,18 @@ the normative design set named in the Policy block below.
   (report: `/tmp/architecture-review-20260911-180729.html`, artifact
   https://claude.ai/code/artifact/5625257c-2dcb-43ee-aaf5-6c679cb5c3f1).
   Take in this order — dependency and blast radius, not preference:
-  1. **C1** escrow coverage: `policy::escrow` grows the query half (mirror
-     `policy::coverage::CoverageQuery`); the four callers (audit, locate,
-     report copies, write pre-flight) call it; the write pre-flight's private
-     JSON parse and reason strings are deleted. Volume filter: **`in_service`**
-     (coordinator decision, recorded in the commit; the CTO can flip it).
+  1. ~~**C1**~~ — **LANDED `..7b26f57`** (sonnet worker, 7 commits + 1
+     coordinator). `policy::escrow::stage_set_coverage(conn, Scope, escrow)`
+     owns the SQL; `Scope::{Unit, AllUnits}` filter volumes by `in_service`
+     and skip `encrypted = 0` (audit's `encryption` violation owns that);
+     `Scope::StageSets` is the write pre-flight (no volume join, fail-closed
+     on a missing id); `Scope::UnitAnyVolume` is `catalog locate`, which
+     lists retired cartridges on purpose (#57) and so answers escrow for
+     every row. The write pre-flight's private JSON parse and its two
+     divergent reason strings are gone. **User-visible:** quarantined
+     volumes no longer appear in audit/report escrow findings (they are not
+     in_service; Copy is defined as unquarantined) — flag to the CTO as FYI,
+     not a question. 760 lib / 878 total, gate GREEN.
   2. ~~**C3**~~ — **LANDED `bed8338..ed14c92`** (cherry-picked from a sonnet
      worker, 4 commits). `volume::manifest::Manifest` with `to_toml` (the
      moved hand format, byte-identical — `tests/on_tape_golden.rs` passed
