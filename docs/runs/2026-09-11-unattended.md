@@ -49,7 +49,7 @@ killed. Consequences for this run:
 | 4 | `rfc.restore_file_symlink` — `restore file` dereferences symlinks | **landed** |
 | 5 | #132 — `quick-archive --volume` says only "volume not found" | **landed** (option 1, per the ratified #124b precedent) |
 | 6 | #125 — the `escrow: no` markers in `report copies` / `catalog locate` | **landed** |
-| 7 | #126 — `backend add` command | queued |
+| 7 | #126 — `backend add` command | **landed** |
 | 8 | #1 — wayfinder map refresh | queued |
 
 Discovered work is filed as an issue and listed under Discoveries, not worked —
@@ -60,6 +60,7 @@ unless it is a regression this run caused, or it blocks a queued item.
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 08:40 | #126 | landed. `tapectl backend add`, appended as text so comments survive. **The end-to-end run found a bug no unit test could**: `init` serialized `lto = []`, which TOML rejects alongside a later `[[backends.lto]]` table — the command could not append to the file `init` had just written. Fixed both ends. Verified against the real LTO-6 by-id path: add exit 0, `config check` exit 0, duplicate name rejected. 720 lib tests (+6). |
 | 09-11 08:28 | #125 | landed, closing the issue. New `policy::escrow` holds the fail-closed classification; `audit`, `catalog locate` (new Escrow column) and `report copies` (per-unit note + `volumes_without_escrow` in --json) all route through it. 714 lib tests (+5). No gate: nothing under the restore-path path set. |
 | 09-11 08:15 | #132 | landed. Pre-flight volume check + actionable error + clap help + man pages. Settled as option 1 on the CTO's own 2026-09-10 Q4 precedent (error+example now, ergonomic command later); auto-init left open on the issue. Found a second problem: the old check fired inside `volume_write`, so three steps' work was done and staged before failing. 709 lib tests (+1), quick-archive scenario 14/14 on mhvtl. |
 | 09-11 08:06 | `rfc.restore_file_symlink` | landed. `restore file` now preserves symlinks, and a second bug in the same lines is fixed: `.exists()` followed the link, so a dangling symlink was reported "not found in restored unit" though dar had restored it correctly. 708 lib tests (+3), gate GREEN 26/26, and `restore-file-and-catalog` 10/10 **on mhvtl tape** — the check itself now passes, not just the unit tests. |
@@ -73,4 +74,5 @@ unless it is a regression this run caused, or it blocks a queued item.
 | Finding | Issue |
 |---|---|
 | `layout_version = 1` in the envelope on a v2 tape — separate schema, or stale constant? **deferred** | [#134](https://github.com/mikmorg/tapectl/issues/134) `needs:cto` |
+| `config check` reports `block_size`/`hardware_compression` as "parsed but not consumed" for a backend that never set them — the decorative scan reads the parsed config, so serde defaults look like operator choices | not filed (cosmetic; noticed working #126) |
 | `/^name = /` unguarded by table context in three heir awks — safe today, silent slice loss if any table gains a `name` key | [#135](https://github.com/mikmorg/tapectl/issues/135) |

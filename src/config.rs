@@ -121,7 +121,12 @@ impl Default for DarConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendsConfig {
-    #[serde(default)]
+    // Skipped when empty so a fresh `init` does not write a bare `lto = []`.
+    // That stub is not harmless: TOML rejects a later `[[backends.lto]]` table
+    // as a duplicate key, so `backend add` (#126) could not append to the very
+    // file `init` had just written. Deserialization is unaffected — the
+    // `default` covers an absent key, which is what "no drives yet" means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lto: Vec<LtoBackendConfig>,
 }
 

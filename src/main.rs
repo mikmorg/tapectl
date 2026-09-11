@@ -229,6 +229,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 &conn, &paths, &cfg, path, tenant, volume, tag, device, cli.json,
             )?;
         }
+        Commands::Backend { ref command } => {
+            cli::backend::run(&paths, command, cli.json)?;
+        }
         Commands::Db { ref command } => {
             // Body lives in `cli::db` (issue #112). The exit CODE comes back
             // here because acting on it — terminating the process — is the

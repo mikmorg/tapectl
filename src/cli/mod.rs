@@ -1,5 +1,6 @@
 pub mod archive_set;
 pub mod audit;
+pub mod backend;
 pub mod cartridge;
 pub mod catalog;
 pub mod collection;
@@ -226,6 +227,12 @@ pub enum Commands {
         device: String,
     },
 
+    /// Tape drive backends
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommands,
+    },
+
     /// Database operations
     Db {
         #[command(subcommand)]
@@ -243,6 +250,38 @@ pub enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+/// Tape drive backend configuration (#126).
+#[derive(Subcommand, Debug)]
+pub enum BackendCommands {
+    /// Add an LTO tape drive to the config
+    ///
+    /// Writes a validated `[[backends.lto]]` block, appended so existing
+    /// comments survive. Find your drive with `ls -l /dev/tape/by-id/`, and
+    /// `lsscsi -g` for the sg node. Prefer the by-id paths: /dev/nstN
+    /// numbering is not stable across reboots.
+    Add {
+        /// Name for this drive, used to select it later. Letters, digits,
+        /// dot, underscore and dash.
+        #[arg(long)]
+        name: String,
+        /// Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
+        #[arg(long)]
+        device_tape: String,
+        /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1
+        #[arg(long)]
+        device_sg: String,
+        /// Media type, e.g. LTO-6
+        #[arg(long, default_value = "LTO-6")]
+        media_type: String,
+        /// Uncompressed nominal capacity, e.g. 2.5TB
+        #[arg(long, default_value = "2.5TB")]
+        capacity: String,
+        /// Headroom reserved before end-of-tape, e.g. 50M
+        #[arg(long)]
+        enospc_buffer: Option<String>,
     },
 }
 

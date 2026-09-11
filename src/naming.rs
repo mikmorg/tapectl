@@ -109,6 +109,14 @@ pub fn validate_tenant_name(name: &str) -> Result<()> {
     validate_segment(name, "tenant name", name)
 }
 
+/// Validate a backend name (#126). Single segment, same allowlist: it is a
+/// TOML key value an operator types on a command line and that `volume write`
+/// resolves by string match, so the path-separator and shell-metacharacter
+/// rejections apply for the same reasons they do to a tenant.
+pub fn validate_backend_name(name: &str) -> Result<()> {
+    validate_segment(name, "backend name", name)
+}
+
 /// Validate a volume label. Single segment, same reasoning as a tenant
 /// name: it is joined into the read-slices staging directory name.
 pub fn validate_volume_label(label: &str) -> Result<()> {
