@@ -1896,13 +1896,26 @@ assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
 # recipients are operator + escrow only, so a tenant key cannot open it.
 # That refusal has its own unit test; what this arm proves is the path that
 # works.
+#
+# Review finding 4 (2026-09-11): this arm used to `init --no-escrow` and
+# never import one, so escrow state was simply absent from the scenario it
+# exists to test. It now follows the DR procedure exactly — init WITHOUT a
+# new escrow identity, then import the ORIGINAL escrow public key — and
+# proves both halves: BEFORE the import the rebuilt rows cannot be covered
+# and `audit` names the mismatch; AFTER it they read `yes` (the receipt rode
+# the tape in catalog.db) and the mismatch is gone.
 dl_scenario_d_catalog_rebuild() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: new home (init only); copy operator key; tapectl catalog rebuild --from-volume --key OPKEY --label VOL-A --json (assert units>0); tapectl catalog locate photos (assert VOL-A); tapectl restore unit --unit photos --from VOL-A (assert identical); tapectl volume verify VOL-A --full; rebuild AGAIN (assert no_changes)"
+        echo "PLAN: new home (init only); copy operator key; tapectl catalog rebuild --from-volume --key OPKEY --label VOL-A --json (assert units>0); tapectl catalog locate photos (assert VOL-A); tapectl restore unit --unit photos --from VOL-A (assert identical); tapectl volume verify VOL-A --full; key import --escrow the ORIGINAL public key and assert locate says yes + audit has no escrow findings; rebuild AGAIN (assert no_changes); then in a SECOND home with a plain init (replacement escrow identity) rebuild and assert locate says NO + audit names escrow_identity_mismatch exactly once with the import command"
         return 0
     fi
     local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-d"
     mkdir -p "$newhome"
+    # `--no-escrow` here is the DR recipe, not a shortcut: a fresh `init`
+    # would mint a replacement escrow identity, and every escrow check
+    # compares against the REGISTERED recipient. The original is imported
+    # below, after the rebuild, so the "forgot to import" state is measured
+    # first.
     NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" --no-escrow >"$sd/dl.d.init.txt" 2>&1 || { cat "$sd/dl.d.init.txt"; return 1; }
 
     local opkey="$sd/dl.d.operator.age.key"
@@ -1943,6 +1956,27 @@ assert d["units_without_tenant_envelope"] == [], d
         echo "'volume verify' — which the rebuild's own output tells the operator to run — failed:"
         cat "$sd/dl.d.verify.txt"; return 1; }
 
+    # --- Escrow, review finding 4. Two homes, because ADR-0005 permits
+    # exactly one escrow identity and NO command replaces it: the state an
+    # operator reaches by running a plain `init` cannot be repaired in place,
+    # only avoided. So the happy path (this home) imports the ORIGINAL escrow
+    # public key into a home that never minted one, and the mistake is
+    # measured in a second home below.
+    NEWHOME_TCTL "$newhome" key import --escrow "$HOME_DIR/keys/$OPERATOR-escrow.age.pub" >"$sd/dl.d.escrow-import.txt" 2>&1 \
+        || { echo "could not import the original escrow key into the rebuilt home:"; cat "$sd/dl.d.escrow-import.txt"; return 1; }
+    local llog2="$sd/dl.d.locate-after.json"
+    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$llog2" 2>&1 || { cat "$llog2"; return 1; }
+    grep -q '"escrow": *"yes"' "$llog2" || { echo "with the ORIGINAL escrow key registered, the rebuilt rows must be covered — the receipt rode the tape in catalog.db:"; cat "$llog2"; return 1; }
+    local alog2="$sd/dl.d.audit-after.json"
+    NEWHOME_TCTL "$newhome" audit --json >"$alog2" 2>&1 || true   # advisory exit codes are fine
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+checks = [f["check"] for f in d.get("findings", [])]
+assert "escrow_identity_mismatch" not in checks, ("mismatch reported with the original key registered", checks)
+assert "escrow_coverage" not in checks, ("coverage warning with the original key registered", checks)
+' "$alog2" || { cat "$alog2"; return 1; }
+
     # Idempotence, against a real tape rather than a MemStore: the second
     # pass must change nothing. This is what makes it safe to walk a shelf.
     local rlog2="$sd/dl.d.rebuild2.json"
@@ -1953,6 +1987,29 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["no_changes"], d
 ' "$rlog2" || { echo "a second catalog rebuild was not a no-op:"; cat "$rlog2"; return 1; }
+
+    # --- The mistake, measured: a plain `init` mints a REPLACEMENT escrow
+    # identity. Every receipt on the tape names the original, so the rebuilt
+    # rows cannot be covered, and audit must say so ONCE and name the key —
+    # not N times without ever saying why.
+    local wrong="$sd/newhome-d-wronginit"
+    mkdir -p "$wrong"
+    NEWHOME_TCTL "$wrong" init --operator "$OPERATOR" >"$sd/dl.d2.init.txt" 2>&1 || { cat "$sd/dl.d2.init.txt"; return 1; }
+    local rlog3="$sd/dl.d2.rebuild.json"
+    NEWHOME_TCTL "$wrong" catalog rebuild --from-volume --device "$TAPE_DEV" \
+        --key "$opkey" --label VOL-A --json >"$rlog3" 2>&1 || { cat "$rlog3"; return 1; }
+    local llog3="$sd/dl.d2.locate.json"
+    NEWHOME_TCTL "$wrong" catalog locate photos --json >"$llog3" 2>&1 || { cat "$llog3"; return 1; }
+    grep -q '"escrow": *"NO"' "$llog3" || { echo "with a replacement escrow identity registered, locate must say NO:"; cat "$llog3"; return 1; }
+    local alog3="$sd/dl.d2.audit.json"
+    NEWHOME_TCTL "$wrong" audit --json >"$alog3" 2>&1 || true
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+hits = [f for f in d.get("findings", []) if f["check"] == "escrow_identity_mismatch"]
+assert len(hits) == 1, ("expected exactly one escrow_identity_mismatch", [f["check"] for f in d.get("findings", [])])
+assert "key import --escrow age1" in hits[0]["action"], hits[0]
+' "$alog3" || { echo "audit did not diagnose the replaced escrow identity once, naming the key:"; cat "$alog3"; return 1; }
 }
 
 # (c) The pure heir path: a directory holding ONLY RESTORE.sh and the
