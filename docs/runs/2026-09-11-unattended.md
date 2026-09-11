@@ -65,7 +65,7 @@ Same rules as round 1 (`.claude/skills/unattended-run/SKILL.md`).
 |---|---|---|
 | 9 | #134 — drop the stale `layout_version = 1` from the envelope manifest | **landed** `64d3f91` |
 | 10 | #135 — scope the heir version selector to the `[[units]]` head | **landed** `64d3f91` |
-| 11 | #136 — `catalog rebuild --from-volume --key K` | in progress |
+| 11 | #136 — `catalog rebuild --from-volume --key K` | **landed** `edef129` |
 
 Ratified #136 design: operator/escrow key only (a tenant key is refused and
 pointed at `RESTORE.sh`); an `events` row for provenance, **no new column**;
@@ -76,7 +76,39 @@ not bundle verification — `volume verify` already exists.
 A real-drive confirmation pass is owed at the end of this round for the
 #134/#135 heir-path byte changes; it is batched, not per-commit.
 
-## Real-drive confirmation pass — DONE 2026-09-11 12:45 UTC
+## Real-drive confirmation pass #2 — OWED, BLOCKED (#134/#135)
+
+`64d3f91` changed frozen on-tape bytes again: the envelope `MANIFEST.toml`
+(#134 dropped `layout_version = 1`) and File 2's RESTORE.sh (#135 scoped the
+version selector to the `[[units]]` head). That owes a second pass on the real
+LTO-6, and it is blocked the same way the first one was — the auto-mode
+classifier refuses `--i-will-lose-the-cartridge` as irreversible deletion, and
+the CTO's 12:40 grant did not persist into `.claude/settings.local.json`.
+
+To unblock, add a persistent rule rather than a one-time approval:
+
+```json
+"Bash(./scripts/lifecycle-suite.sh:*)"
+```
+
+Then run, with `EW7VWMVKF6` loaded in `scsi-HUJ808A5L4-nst`:
+
+```bash
+./scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst0 \
+    --erase short --single-cartridge --i-will-lose-the-cartridge EW7VWMVKF6
+```
+
+and read back the two changed zones off the cartridge: File 2 must carry the
+`in_head` guard, and the envelope `MANIFEST.toml`, decrypted with a tenant
+key, must carry no `layout_version`.
+
+**What is NOT outstanding:** both changes are already proven on mhvtl tape —
+the gate is GREEN 26/26 including `heir_extract_script`, `heir_find_envelope`,
+`heir_restore` and `heir_restore_symlink_unit` against the new bytes. The gap
+is narrowly "the same bytes on real hardware", which is the class of thing the
+2026-09-10 session showed can still differ.
+
+## Real-drive confirmation pass #1 — DONE 2026-09-11 12:45 UTC
 
 #133 and #130 changed frozen on-tape bytes (File 0, File 1, File 2 and the
 envelope's RECOVERY.md) and owed a pass on real hardware. It was blocked for a
@@ -110,6 +142,8 @@ value` instead of dying silently, and `--info` announces
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 14:20 | #134/#135 | real-drive pass **BLOCKED AGAIN**. The auto-mode classifier refused `--i-will-lose-the-cartridge` as irreversible deletion; the grant the CTO made at 12:40 was session-scoped and did not persist as a rule in `.claude/settings.local.json`. Not retried in variant forms. Everything the pass would confirm is already green on mhvtl (gate 26/26, including `heir_restore` and `heir_find_envelope` against the new File 2); what is outstanding is narrowly "the same bytes land on real LTO-6 hardware". |
+| 09-11 14:12 | #136 | landed `edef129`, closing the issue. Gate GREEN 26/26. **db-loss 6/6 — green for the first time**: arm (b) was this suite's last expected failure, and arm (d) rebuilt 3 units / 2 tenants / 14 slices / 22 file rows off mhvtl tape, restored `photos` byte-identical through the rebuilt rows, then rebuilt again to all zeros. 730 lib tests (+7), 836 total. |
 | 09-11 14:05 | #136 | implemented. New `volume::envelope` (the first Rust code that reads an envelope BACK — the write path packed them and only bash ever unpacked them) and `volume::rebuild`. 9 integration tests drive the **real** write session into a `MemStore` and rebuild from those exact bytes; the load-bearing assertion runs `restore_unit`'s verbatim resolution join. Two negative controls confirmed red at distinct assertions. |
 | 09-11 13:40 | #136 | **two of the three design questions collapsed on evidence, one deferred.** `tenants` has no `public_key` (it is on `encryption_keys`) and `restore` loads identities from `keys/` on disk — so a rebuilt tenant row is structurally complete, not a stub. Manifest-authoritative is forced, not chosen: `catalog.db` carries neither `sha256_plain` nor `tape_position`. The third — rebuilt sets can never show escrow coverage — went to the CTO as #137. |
 | 09-11 13:20 | — | queue reopened after the CTO ratified all three grilling rounds. #134/#135 landed `64d3f91`; #136 authorized to build. |
