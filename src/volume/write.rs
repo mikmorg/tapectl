@@ -128,7 +128,7 @@ pub fn volume_init(
         .backends
         .lto
         .first()
-        .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
+        .ok_or_else(|| crate::config::no_lto_backend_error(None))?;
 
     let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
     let media_type = &backend.media_type;
@@ -244,7 +244,7 @@ fn blocking_validation_errors(
 #[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow
 pub fn volume_write(
     conn: &Connection,
-    _paths: &TapectlPaths,
+    paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
@@ -294,7 +294,7 @@ pub fn volume_write(
         .backends
         .lto
         .first()
-        .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
+        .ok_or_else(|| crate::config::no_lto_backend_error(Some(paths)))?;
     let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
@@ -501,7 +501,7 @@ pub fn volume_write(
 /// `volume_write` rather than copying them.
 pub fn volume_resume(
     conn: &Connection,
-    _paths: &TapectlPaths,
+    paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
@@ -552,7 +552,7 @@ pub fn volume_resume(
         .backends
         .lto
         .first()
-        .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
+        .ok_or_else(|| crate::config::no_lto_backend_error(Some(paths)))?;
     let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;

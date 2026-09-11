@@ -261,9 +261,22 @@ fn cmd_init(
     // Create directory structure
     paths.ensure_dirs()?;
 
-    // Write default config
+    // Write default config, then append the commented [[backends.lto]] example.
+    // It has to go on after serialization: an empty Vec serializes to nothing,
+    // and toml round-trips drop comments, so the section cannot be carried in
+    // the struct — leaving a fresh config with no hint that a tape drive must
+    // be declared at all, or what it needs (#124).
     let cfg = Config::default();
     cfg.save(&paths.config_file)?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.config_file)
+            .context("failed to reopen config to append the backend example")?;
+        f.write_all(tapectl::config::LTO_BACKEND_EXAMPLE.as_bytes())
+            .context("failed to append the backend example")?;
+    }
 
     // Create database with schema
     let conn = db::open(&paths.db_file).context("failed to create database")?;

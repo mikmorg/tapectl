@@ -488,6 +488,53 @@ impl Config {
     }
 }
 
+/// The `[[backends.lto]]` block a user must add before anything can touch tape,
+/// as commented-out TOML.
+///
+/// Serde cannot emit this: an empty `Vec<LtoBackendConfig>` serializes to
+/// nothing at all, so a fresh config.toml gives no hint that the section exists
+/// or what it must contain. `init` appends this after serialization (TOML
+/// round-trips drop comments, so it cannot live in the struct), and
+/// [`no_lto_backend_error`] points at it.
+pub const LTO_BACKEND_EXAMPLE: &str = r#"
+# ---------------------------------------------------------------------------
+# Tape drive. Uncomment and edit before `volume write` / `collection run`.
+# Find your drive:  ls -l /dev/tape/by-id/   (and `lsscsi -g` for the sg node)
+#
+# Prefer the by-id paths: /dev/nstN numbering is not stable across reboots.
+# ---------------------------------------------------------------------------
+# [[backends.lto]]
+# name = "lto6"
+# device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"
+# device_sg = "/dev/sg1"
+# media_type = "LTO-6"
+# nominal_capacity = "2.5TB"
+# hardware_compression = false
+"#;
+
+/// Error for "tape was asked for, but no drive is configured".
+///
+/// Shared by every site that resolves a tape backend so they cannot drift.
+/// The bare string this replaced ("no LTO backend configured") stated a fact
+/// and left the user to guess the file, the section name and its fields —
+/// which is most of `init`'s first-run cliff (#124).
+/// `paths` is optional only because two call sites do not carry it; the
+/// literal fallback is the documented default home.
+pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
+    let file = paths.map_or_else(
+        // Honest about the uncertainty: home resolution also honours --home and
+        // TAPECTL_HOME, which are not reachable from here.
+        || "your tapectl config (by default ~/.tapectl/config.toml)".to_string(),
+        |p| p.config_file.display().to_string(),
+    );
+    TapectlError::Config(format!(
+        "no LTO backend configured — tapectl does not know what tape drive to use.\n\n\
+         Add a [[backends.lto]] section to {file}:\n{}\n\n\
+         `tapectl init` leaves a commented-out example there to uncomment.",
+        LTO_BACKEND_EXAMPLE.trim_end(),
+    ))
+}
+
 /// Resolved paths for the tapectl home directory.
 #[derive(Debug, Clone)]
 pub struct TapectlPaths {
@@ -705,5 +752,55 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
         assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// The commented `[[backends.lto]]` example `init` writes is the first
+    /// thing a user edits, and the error message reprints it verbatim. If a
+    /// field is renamed, made required, or dropped, the example silently
+    /// becomes instructions that produce a config the tool then rejects.
+    ///
+    /// So: uncomment it exactly as a user would and require that it parses into
+    /// a real backend.
+    #[test]
+    fn the_commented_lto_example_is_a_valid_backend_once_uncommented() {
+        let uncommented: String = LTO_BACKEND_EXAMPLE
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("# ---") && !l.trim().is_empty())
+            .map(|l| l.trim_start().trim_start_matches('#').trim_start())
+            .filter(|l| l.starts_with("[[") || l.contains(" = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cfg: Config = toml::from_str(&uncommented).unwrap_or_else(|e| {
+            panic!("uncommented example is not valid config: {e}\n{uncommented}")
+        });
+
+        assert_eq!(
+            cfg.backends.lto.len(),
+            1,
+            "example should define exactly one backend, got:\n{uncommented}"
+        );
+        let b = &cfg.backends.lto[0];
+        assert!(!b.name.is_empty());
+        assert!(b.device_tape.starts_with("/dev/"));
+        assert!(b.device_sg.starts_with("/dev/"));
+        // The capacity string must survive the same parser the write path uses.
+        crate::staging::parse_size_to_bytes(&b.nominal_capacity)
+            .expect("example nominal_capacity must parse");
+    }
+
+    /// As shipped (fully commented) the example must be inert: appending it to
+    /// a freshly serialized config must still parse, and must NOT declare a
+    /// backend — otherwise `init` would hand every new user a half-configured
+    /// drive pointing at a placeholder device path.
+    #[test]
+    fn the_example_is_inert_until_the_user_uncomments_it() {
+        let mut text = toml::to_string_pretty(&Config::default()).unwrap();
+        text.push_str(LTO_BACKEND_EXAMPLE);
+        let cfg: Config = toml::from_str(&text).expect("config + example must parse");
+        assert!(
+            cfg.backends.lto.is_empty(),
+            "the shipped example must declare no backend"
+        );
     }
 }

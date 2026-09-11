@@ -55,7 +55,7 @@ pub fn plan_for_collection(
         .backends
         .lto
         .first()
-        .ok_or_else(|| TapectlError::Config("no LTO backend configured".into()))?;
+        .ok_or_else(|| crate::config::no_lto_backend_error(None))?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
     // valid byte count, so a successfully parsed `Ok` is already guaranteed
