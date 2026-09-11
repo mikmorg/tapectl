@@ -55,9 +55,15 @@ the normative design set named in the Policy block below.
   4. **C7** Store: `TapeStore::open_read` moves to the CLI; `volume_identify`,
      `read_slices`, `compact_read`, `restore_raw`, `rebuild` take
      `&mut dyn Store`.
-  5. **C5** catalog.db: schema const + row types + shape probe in one module
-     both sides import. A generation STAMP would be bytes on tape → CTO
-     question, queued; the consolidation itself is not.
+  5. ~~**C5**~~ — **LANDED `..e6d800c`** (sonnet worker, 5 commits).
+     `db::ontape_catalog` owns SCHEMA, `Generation::{Original,
+     WithOwnershipAndReceipts}`, `detect_generation` (probes `tenants` +
+     `key_fingerprints`; a file with one but not the other is refused as
+     corrupt/hand-edited, naming which half is present), typed rows,
+     `write`/`read`; `catalog_snapshot` is a compatibility surface;
+     `rebuild::Supplement::load` is a caller. Shape unchanged. **Queued CTO
+     question:** a generation STAMP inside catalog.db (bytes on tape) — not
+     needed today; the probe is the reader. 766 lib / 884 total, gate GREEN.
   6. **C2** row structs derive `Serialize`; JSON arm = `to_string_pretty`.
      **Existing JSON key names are a contract** — `#[serde(rename)]` keeps
      every key exactly as shipped; `cli_smoke.rs` assertions must not change.
