@@ -60,6 +60,7 @@ unless it is a regression this run caused, or it blocks a queued item.
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 07:55 | #133 | CI red on `89fa1f6` — the new argv test spawns the heir script, whose prereq loop needs mt/age/dar; CI has none. Fixed hermetically with PATH stubs (`da18e61`), verified against a reconstructed CI PATH. Issue reopened until CI is green. **Lesson: a test that spawns the generated script inherits its tool requirements.** |
 | 09-11 07:48 | #130 | landed. Caveat added to all THREE heir documents — the issue named two; RECOVERY.md had the same defect. 705 lib tests (+1), gate GREEN 26/26. Settled, not deferred: correcting wrong instructions is not a design fork. Owes the same real-drive pass as #133. |
 | 09-11 07:35 | #133 | landed. 704 lib tests (+2), clippy/fmt clean, gate GREEN 26/26 on `/dev/nst1`. All 3 negative controls confirmed failing pre-fix at distinct assertion lines. **Owes a real-drive confirmation pass** — it changes File 2's bytes; batched to end of queue. |
 
