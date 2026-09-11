@@ -1530,6 +1530,36 @@ pub fn volume_import(
     }
     Ok(())
 }
+/// What `quick-archive` says when its `--volume` label does not exist.
+///
+/// Pure, and separate from the check, for the same reason
+/// `config::no_lto_backend_error` is (#124b): the bare
+/// `error: volume not found: VOL-Q` said nothing about the contract or the
+/// fix, and cost a real debugging detour — the lifecycle suite's quick-archive
+/// scenario had no `volume init` at all, and #128 recorded the resulting
+/// failure as a single-cartridge media limitation rather than a missing setup
+/// step.
+fn missing_volume_error(volume: &str, device: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "volume \"{volume}\" does not exist\n\n\
+         quick-archive writes to a volume that is already initialized — it does \
+         not create one.\n\
+         Initialize it first, then re-run this command:\n\n    \
+         tapectl volume init {volume} --device {device}\n\n\
+         `tapectl volume list` shows the labels you already have."
+    ))
+}
+
+/// Does a volume with this label exist? Separated from `quick_archive` so the
+/// pre-flight can be tested without a tape device or a staging pipeline.
+fn volume_exists(conn: &Connection, label: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM volumes WHERE label = ?1",
+        rusqlite::params![label],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
 
 /// `tapectl quick-archive`: unit init -> snapshot -> stage -> write.
 #[allow(clippy::too_many_arguments)]
@@ -1544,6 +1574,23 @@ pub fn quick_archive(
     device: &str,
     json_output: bool,
 ) -> Result<()> {
+    // Step 0: the volume must already exist.
+    //
+    // Without this, the label is not looked up until deep inside
+    // `volume_write` — by which time steps 1-3 have created a unit, taken a
+    // snapshot and staged an encrypted slice set. The operator saw three
+    // success lines followed by a bare "volume not found", with staged data
+    // left behind to clean up (#132). Checking first costs one query and makes
+    // the failure free.
+    //
+    // quick-archive deliberately does NOT initialize the volume itself. That
+    // keeps `volume init`'s device/blank-cartridge checks and ADR-0003's
+    // refusal to touch a sealed tape in one place. Whether "quick" ought to
+    // imply auto-init is a separate question, left open on #132.
+    if !volume_exists(conn, volume)? {
+        return Err(missing_volume_error(volume, device));
+    }
+
     // Step 1: init unit
     let unit_id = crate::unit::init_unit(conn, paths, path, tenant, None, tag, None)?;
     let unit_name: String = conn.query_row(
@@ -1607,6 +1654,36 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+
+    /// #132: quick-archive's `--volume` must already exist, and the failure
+    /// has to say so. The old message was a bare "volume not found", raised
+    /// deep inside `volume_write` — after a unit, a snapshot and a staged
+    /// slice set had already been created and left behind.
+    #[test]
+    fn a_missing_quick_archive_volume_names_the_command_that_creates_it() {
+        let conn = crate::db::open_memory().unwrap();
+        assert!(!volume_exists(&conn, "VOL-Q").unwrap());
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('VOL-Q', 'lto', 'lto', 'LTO-6', 1, 'initialized')",
+            [],
+        )
+        .unwrap();
+        assert!(volume_exists(&conn, "VOL-Q").unwrap());
+
+        let msg = missing_volume_error("VOL-Q", "/dev/nst3").to_string();
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(
+            msg.contains("tapectl volume init VOL-Q --device /dev/nst3"),
+            "the error must name the exact command, with the device the \
+             operator actually passed:\n{msg}"
+        );
+        assert!(
+            msg.contains("does not create one"),
+            "the contract must be stated, not implied:\n{msg}"
+        );
     }
 
     fn setup_conn_with_unit(current_path: &str) -> (Connection, i64) {

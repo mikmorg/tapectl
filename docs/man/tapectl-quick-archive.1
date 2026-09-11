@@ -7,6 +7,8 @@ tapectl\-quick\-archive \- Quick archive: create + stage + write in one flow
 \fBtapectl quick\-archive\fR [\fB\-\-json\fR] <\fB\-\-tenant\fR> [\fB\-\-dry\-run\fR] <\fB\-\-volume\fR> [\fB\-t\fR|\fB\-\-tag\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
 .SH DESCRIPTION
 Quick archive: create + stage + write in one flow
+.PP
+The volume must already exist — run `tapectl volume init LABEL \-\-device /dev/nstN` first. This command creates the unit, snapshot and stage set, but not the volume.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -19,7 +21,7 @@ Tenant name
 Show what would be done without making changes
 .TP
 \fB\-\-volume\fR \fI<VOLUME>\fR
-Volume label
+Label of an ALREADY\-INITIALIZED volume to write to. Create it with `tapectl volume init LABEL \-\-device ...`; quick\-archive does not
 .TP
 \fB\-t\fR, \fB\-\-tag\fR \fI<TAG>\fR
 Tags

@@ -204,13 +204,18 @@ pub enum Commands {
     },
 
     /// Quick archive: create + stage + write in one flow
+    ///
+    /// The volume must already exist — run `tapectl volume init LABEL
+    /// --device /dev/nstN` first. This command creates the unit, snapshot and
+    /// stage set, but not the volume.
     QuickArchive {
         /// Path to directory
         path: String,
         /// Tenant name
         #[arg(long)]
         tenant: String,
-        /// Volume label
+        /// Label of an ALREADY-INITIALIZED volume to write to. Create it with
+        /// `tapectl volume init LABEL --device ...`; quick-archive does not.
         #[arg(long)]
         volume: String,
         /// Tags
