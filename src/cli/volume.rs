@@ -3,7 +3,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::Result;
-use crate::store::Tier;
+use crate::store::{TapeStore, Tier};
 use crate::volume::write;
 
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 512 * 1024; // 512 KB
@@ -369,7 +369,8 @@ pub fn run(
         }
 
         VolumeCommands::Identify { device } => {
-            let id = write::volume_identify(device, DEFAULT_BLOCK_SIZE)?;
+            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let id = write::volume_identify(&mut store)?;
             println!("{id}");
         }
 
@@ -387,7 +388,8 @@ pub fn run(
         }
 
         VolumeCommands::ReadSlices { from, unit, device } => {
-            let report = write::read_slices(conn, config, from, unit, device, DEFAULT_BLOCK_SIZE)?;
+            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let report = write::read_slices(conn, config, from, unit, &mut store)?;
             if json_output {
                 println!(
                     "{}",
@@ -480,7 +482,8 @@ pub fn run(
         }
 
         VolumeCommands::CompactRead { label, device } => {
-            let report = write::compact_read(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
+            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let report = write::compact_read(conn, config, label, &mut store)?;
             if json_output {
                 println!(
                     "{}",
@@ -543,7 +546,13 @@ pub fn run(
         } => {
             // Interactive: run all 3 steps
             println!("=== Step 1: Reading live slices from \"{label}\" ===");
-            let report = write::compact_read(conn, config, label, device, DEFAULT_BLOCK_SIZE)?;
+            // Scoped so the read-only store (and its device fd) closes
+            // before step 2 opens the same device for writing — the st
+            // driver refuses a second concurrent open (EBUSY).
+            let report = {
+                let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+                write::compact_read(conn, config, label, &mut store)?
+            };
             println!(
                 "  Read {} slices ({} MB)",
                 report.slices_read,

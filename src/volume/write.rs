@@ -11,7 +11,6 @@ use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::staging;
 use crate::tape::health;
-use crate::tape::ioctl::TapeDevice;
 use crate::tape::mam::MamInfo;
 use crate::util::{HashingWriter, TruncatingWriter};
 
@@ -1371,10 +1370,13 @@ pub fn volume_verify(
 /// within that text (`v2-open-questions.md` §2.7: "volume_identify reads
 /// File 0 only... needs the v2 magic accepted alongside v1" — true by
 /// construction, since this never parses the magic at all).
-pub fn volume_identify(device: &str, block_size: usize) -> Result<String> {
-    let mut tape = TapeDevice::open_read(device, block_size)?;
-    tape.rewind()?;
-    let data = tape.read_file()?;
+///
+/// Takes an already-open `store` (ADR-0006) — the caller opens
+/// `TapeStore::open_read` (or, in tests, hands in a `MemStore`), so this
+/// function is directly unit-testable with no tape device.
+pub fn volume_identify(store: &mut dyn Store) -> Result<String> {
+    let mut data = Vec::new();
+    store.read_file(0, &mut data)?;
     let text = String::from_utf8_lossy(&data).to_string();
     Ok(text.trim_end_matches('\0').to_string())
 }
@@ -1410,13 +1412,12 @@ enum SliceStreamOutcome {
 /// invariant that check-then-write used to give for free.
 ///
 /// The verdict/cleanup logic is centralized HERE rather than inlined in
-/// each of `read_slices`/`compact_read`, specifically so it is
-/// unit-testable with `MemStore`: both callers' own signatures hard-depend
-/// on a real tape device path (`TapeStore::open_read`), so this function is
-/// the only layer a fixture can reach without mhvtl — mirrors
-/// `restore.rs::restore_one_slice_inner`'s pass 1 (`TruncatingWriter` over
-/// a `HashingWriter` over the destination file) for the same reason
-/// `restore_one_slice` is itself store-injectable.
+/// each of `read_slices`/`compact_read` because both share it verbatim, one
+/// call per slice — mirrors `restore.rs::restore_one_slice_inner`'s pass 1
+/// (`TruncatingWriter` over a `HashingWriter` over the destination file).
+/// `read_slices`/`compact_read` themselves now take `&mut dyn Store` too
+/// (ADR-0006, C7): the seam is at the entry point, so `MemStore` drives the
+/// real functions directly — no store-shaped inner twin needed here.
 fn stream_verify_slice_to_staging(
     store: &mut dyn Store,
     position: u32,
@@ -1451,13 +1452,16 @@ fn stream_verify_slice_to_staging(
 /// Position-based, driven entirely from `write_positions` (DB), not the
 /// on-tape index — unaffected by the v2 index relocation
 /// (`v2-open-questions.md` §2.7).
+///
+/// Takes an already-open `store` (ADR-0006) rather than a device path — the
+/// caller opens `TapeStore::open_read`, so this function is directly
+/// unit-testable against a `MemStore` fixture.
 pub fn read_slices(
     conn: &Connection,
     config: &Config,
     from_label: &str,
     unit_name: &str,
-    device: &str,
-    block_size: usize,
+    store: &mut dyn Store,
 ) -> Result<ReadSlicesReport> {
     // Look up source volume
     let from_vol_id: i64 = conn
@@ -1517,7 +1521,6 @@ pub fn read_slices(
         std::path::Path::new(staging_dir).join(format!("clone-{from_label}-{unit_name}"));
     fs::create_dir_all(&clone_dir)?;
 
-    let mut store = TapeStore::open_read(device, block_size)?;
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
     let mut affected_stage_sets = HashSet::new();
@@ -1536,7 +1539,7 @@ pub fn read_slices(
         let slice_path = clone_dir.join(format!("slice_{slice_db_id}.dat"));
 
         match stream_verify_slice_to_staging(
-            &mut store,
+            store,
             pos,
             *enc_bytes as u64,
             &[sha_on_vol.as_str(), sha_encrypted.as_str()],
@@ -1604,12 +1607,15 @@ pub struct CompactReadReport {
 
 /// Compact-read: read live encrypted slices from a volume to staging.
 /// "Live" means the snapshot is NOT reclaimable or purged.
+///
+/// Takes an already-open `store` (ADR-0006) rather than a device path — the
+/// caller opens `TapeStore::open_read`, so this function is directly
+/// unit-testable against a `MemStore` fixture.
 pub fn compact_read(
     conn: &Connection,
     config: &Config,
     label: &str,
-    device: &str,
-    block_size: usize,
+    store: &mut dyn Store,
 ) -> Result<CompactReadReport> {
     let volume_id: i64 = conn
         .query_row(
@@ -1656,7 +1662,6 @@ pub fn compact_read(
     let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
     fs::create_dir_all(&compact_dir)?;
 
-    let mut store = TapeStore::open_read(device, block_size)?;
     let mut total_bytes: i64 = 0;
     let mut slices_read: i64 = 0;
     let mut slices_skipped: i64 = 0;
@@ -1669,7 +1674,7 @@ pub fn compact_read(
         let slice_path = compact_dir.join(format!("slice_{slice_db_id}.dat"));
 
         match stream_verify_slice_to_staging(
-            &mut store,
+            store,
             pos,
             *enc_bytes as u64,
             &[sha_on_vol.as_str(), sha_encrypted.as_str()],
@@ -1978,14 +1983,14 @@ mod tests {
     // --- stream_verify_slice_to_staging (issue #86: read_slices/
     // compact_read streaming) -----------------------------------------------
     //
-    // `read_slices`/`compact_read` themselves have zero test coverage
-    // (before or after this change) because their public signatures
-    // hard-depend on a real tape device path (`TapeStore::open_read` opens
-    // an actual device node) — mhvtl is the only thing that can exercise
-    // them end-to-end. `stream_verify_slice_to_staging` is the per-slice
-    // logic extracted specifically so it takes `&mut dyn Store` instead,
-    // making it the one layer these tests CAN reach, mirroring
-    // `restore.rs::restore_one_slice`'s own store-injectable shape.
+    // `stream_verify_slice_to_staging` is the per-slice logic shared by both
+    // `read_slices` and `compact_read`, one call per slice — factored out
+    // because both callers need it verbatim, not because it is the only
+    // testable layer. `read_slices`/`compact_read` themselves now take
+    // `&mut dyn Store` directly too (ADR-0006, C7): the CLI opens
+    // `TapeStore::open_read` once and hands the store in, so the entry
+    // points are the test surface — see the `read_slices_with_a_mem_store_...`
+    // and `compact_read_with_a_mem_store_...` tests further down.
     // (`MemStore` is imported once, further down, by the fresh-write-contact
     // tests — a single `use` covers the whole flat `mod tests`.)
 
@@ -2111,6 +2116,188 @@ mod tests {
             !dest.exists(),
             "the empty file created before a failed read must not be left behind"
         );
+    }
+
+    // --- volume_identify (Store seam, C7) -----------------------------------
+
+    #[test]
+    fn volume_identify_reads_file_0_and_trims_padding() {
+        let params = layout::IdThunkV2Params {
+            label: "IDTEST",
+            uuid: "22222222-2222-2222-2222-222222222222",
+            media_type: "LTO-6",
+            tapectl_version: "0.2.0",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: 6,
+            mam_manufacturer: "IBM",
+            mam_serial: "SERIAL1",
+            mam_length: 1,
+            mam_loads: 1,
+            created_at: "2026-09-11T00:00:00Z",
+        };
+        let thunk_text = layout::generate_id_thunk_v2(&params);
+
+        // Block size smaller than the thunk text so the store genuinely
+        // pads position 0 to a block boundary — proving trim_end_matches
+        // strips real padding, not a no-op on an already-aligned buffer.
+        let mut store = MemStore::new(64);
+        store
+            .execute(&mut thunk_text.as_bytes(), thunk_text.len() as u64, false)
+            .unwrap();
+
+        let id = volume_identify(&mut store).unwrap();
+        assert!(id.contains("IDTEST"), "id thunk missing label: {id}");
+        assert!(!id.ends_with('\0'), "block padding must be trimmed: {id:?}");
+    }
+
+    // --- read_slices / compact_read via MemStore (Store seam, C7) ----------
+    //
+    // Both entry points now take `&mut dyn Store` directly, so a `MemStore`
+    // drives the real function bodies end-to-end — no store-shaped inner
+    // twin needed. Each fixture builds just enough DB state (tenant, unit,
+    // snapshot, stage_set, stage_slice, volume, write, write_position) for
+    // the function's own SQL to find one slice, plus a MemStore holding that
+    // slice's true (unpadded) plaintext at the matching tape position.
+
+    /// Insert one tenant/unit/snapshot/stage_set/stage_slice/volume/write/
+    /// write_position chain for `label`/`unit_name`, with `slice_bytes` as
+    /// the slice's plaintext content recorded at tape `position`. Returns
+    /// the stage_slice id. `write_status`/`snapshot_status` let callers
+    /// exercise `compact_read`'s extra filters (`w.status = 'completed'`,
+    /// `s.status NOT IN ('reclaimable', 'purged')`).
+    fn seed_one_slice_fixture(
+        conn: &Connection,
+        label: &str,
+        unit_name: &str,
+        position: u32,
+        slice_bytes: &[u8],
+        write_status: &str,
+        snapshot_status: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+            params![unit_name, tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            &format!(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, '{snapshot_status}', '/tmp', 1, ?2)"
+            ),
+            params![unit_id, slice_bytes.len() as i64],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        let hash = direct_hash(slice_bytes);
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (?1, 1, ?2, ?2, ?3, ?3)",
+            params![ss_id, slice_bytes.len() as i64, hash],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            params![label],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            &format!(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, '{write_status}')"
+            ),
+            params![ss_id, snap_id, volume_id],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status, sha256_on_volume)
+             VALUES (?1, ?2, ?3, 'written', ?4)",
+            params![write_id, slice_id, position.to_string(), hash],
+        )
+        .unwrap();
+        slice_id
+    }
+
+    fn mem_store_with_slice_at(position: u32, bytes: &[u8]) -> MemStore {
+        let mut store = MemStore::new(4096);
+        for p in 0..=position {
+            if p == position {
+                store
+                    .execute(&mut Cursor::new(bytes.to_vec()), bytes.len() as u64, false)
+                    .unwrap();
+            } else {
+                store
+                    .execute(&mut Cursor::new(vec![0u8]), 1, false)
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn read_slices_with_a_mem_store_stages_the_slice_and_updates_staging_path() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"read_slices MemStore fixture plaintext, repeated. ".repeat(10);
+        let slice_id =
+            seed_one_slice_fixture(&conn, "RSLABEL", "rs-unit", 4, &data, "completed", "staged");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+        let mut store = mem_store_with_slice_at(4, &data);
+
+        let report = read_slices(&conn, &config, "RSLABEL", "rs-unit", &mut store).unwrap();
+        assert_eq!(report.slices_read, 1);
+        assert_eq!(report.bytes_read, data.len() as i64);
+
+        let staging_path: String = conn
+            .query_row(
+                "SELECT staging_path FROM stage_slices WHERE id = ?1",
+                params![slice_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!staging_path.is_empty());
+        let on_disk = fs::read(&staging_path).unwrap();
+        assert_eq!(on_disk, data, "staged bytes must be the true plaintext");
+    }
+
+    #[test]
+    fn compact_read_with_a_mem_store_stages_live_slices() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"compact_read MemStore fixture plaintext, repeated. ".repeat(10);
+        seed_one_slice_fixture(&conn, "CRLABEL", "cr-unit", 4, &data, "completed", "staged");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+        let mut store = mem_store_with_slice_at(4, &data);
+
+        let report = compact_read(&conn, &config, "CRLABEL", &mut store).unwrap();
+        assert_eq!(report.slices_read, 1);
+        assert_eq!(report.slices_skipped, 0);
+        assert_eq!(report.bytes_read, data.len() as i64);
     }
 
     #[test]
