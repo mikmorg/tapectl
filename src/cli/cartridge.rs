@@ -50,21 +50,36 @@ pub enum CartridgeCommands {
 struct CartridgeRow {
     #[tabled(rename = "Barcode")]
     barcode: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). JSON key is the field's own name, matching
+    /// `cartridge info --json`'s existing "media_type" key for the same
+    /// column (see `CartridgeCommands::Info` below).
     #[tabled(rename = "Type")]
-    #[serde(skip)]
     media_type: String,
     #[tabled(rename = "Status")]
     status: String,
-    #[tabled(rename = "Loads")]
-    #[serde(skip)]
-    loads: String,
-    #[tabled(rename = "Volume")]
-    #[serde(skip)]
-    volume: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). Raw `total_load_count` (matches `cartridge info
+    /// --json`'s "loads" key for the same column).
+    #[tabled(rename = "Loads", display_with = "display_opt_i64")]
+    loads: Option<i64>,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b).
+    #[tabled(rename = "Volume", display_with = "display_opt_string")]
+    volume: Option<String>,
 }
 
-/// `cartridge list --json` shape. `media_type`/`loads`/`volume` have no
-/// JSON counterpart today and none is added here.
+fn display_opt_i64(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn display_opt_string(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
+}
+
+/// `cartridge list --json` shape. `media_type`/`loads`/`volume` were
+/// table-only until CTO decision 2026-09-11 (architecture review C2
+/// follow-up, C2b).
 fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -207,11 +222,8 @@ fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<Cartrid
                 barcode: row.get(0)?,
                 media_type: row.get(1)?,
                 status: row.get(2)?,
-                loads: row
-                    .get::<_, Option<i64>>(3)?
-                    .map(|n| n.to_string())
-                    .unwrap_or_default(),
-                volume: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                loads: row.get::<_, Option<i64>>(3)?,
+                volume: row.get::<_, Option<String>>(4)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -223,7 +235,8 @@ mod tests {
     use super::*;
 
     /// `cartridge list --json` shape (issue: C2 row-listing drift).
-    /// `media_type`/`loads`/`volume` are table-only and must not appear.
+    /// `media_type`/`loads`/`volume` are additive since CTO decision
+    /// 2026-09-11 (architecture review C2 follow-up, C2b).
     #[test]
     fn pin_cartridge_rows_json_shape() {
         let rows = vec![
@@ -231,15 +244,15 @@ mod tests {
                 barcode: "A001L6".to_string(),
                 media_type: "LTO-6".to_string(),
                 status: "available".to_string(),
-                loads: "12".to_string(),
-                volume: "L6-0001".to_string(),
+                loads: Some(12),
+                volume: Some("L6-0001".to_string()),
             },
             CartridgeRow {
                 barcode: "A002L6".to_string(),
                 media_type: "LTO-6".to_string(),
                 status: "retired_permanent".to_string(),
-                loads: String::new(),
-                volume: String::new(),
+                loads: None,
+                volume: None,
             },
         ];
         let value = cartridge_rows_to_json(&rows);

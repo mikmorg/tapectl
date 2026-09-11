@@ -86,9 +86,12 @@ struct FileRow {
     path: String,
     #[tabled(rename = "Size")]
     size: String,
-    #[tabled(rename = "Modified")]
-    #[serde(skip)]
-    modified: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b): the raw `modified_at` column is nullable, so this
+    /// carries `Option<String>` (the DB's own timestamp string, unchanged)
+    /// rather than the empty-string fallback the table used internally.
+    #[tabled(rename = "Modified", display_with = "display_opt_string")]
+    modified: Option<String>,
     #[tabled(rename = "SHA256")]
     sha256: String,
 }
@@ -100,8 +103,12 @@ fn serialize_trimmed<S: serde::Serializer>(
     serializer.serialize_str(value.trim())
 }
 
-/// `catalog ls --json` shape. `modified` has no JSON counterpart today and
-/// none is added here.
+fn display_opt_string(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
+}
+
+/// `catalog ls --json` shape. `modified` was table-only before CTO decision
+/// 2026-09-11 (architecture review C2 follow-up, C2b) added it as `Option<String>`.
 fn file_rows_to_json(rows: &[FileRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -309,7 +316,7 @@ pub fn run(
                         } else {
                             format_size(size)
                         },
-                        modified: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        modified: row.get::<_, Option<String>>(2)?,
                         sha256: row
                             .get::<_, Option<String>>(3)?
                             .map(|s| short_hash(&s))
@@ -656,13 +663,13 @@ mod tests {
             FileRow {
                 path: "d subdir".to_string(),
                 size: "-".to_string(),
-                modified: "2026-01-01T00:00:00Z".to_string(),
+                modified: Some("2026-01-01T00:00:00Z".to_string()),
                 sha256: "(unstaged)".to_string(),
             },
             FileRow {
                 path: "  some/file.txt".to_string(),
                 size: "1.2 KB".to_string(),
-                modified: String::new(),
+                modified: None,
                 sha256: "0123456789ab...".to_string(),
             },
         ];

@@ -40,9 +40,19 @@ struct StagingRow {
     #[tabled(rename = "Writes")]
     #[serde(rename = "write_count")]
     writes: i64,
-    #[tabled(rename = "Staged")]
-    #[serde(skip)]
-    staged: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). Renamed to `staged_at` (not `staged`) to match its
+    /// sibling fields' convention in this struct — `id`/`slices`/
+    /// `encrypted_bytes`/`writes` all serialize under the fuller DB-native
+    /// name (`stage_set_id`/`num_slices`/`total_encrypted_size`/
+    /// `write_count`) rather than the short display-oriented field name.
+    #[tabled(rename = "Staged", display_with = "display_opt_string")]
+    #[serde(rename = "staged_at")]
+    staged: Option<String>,
+}
+
+fn display_opt_string(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
 }
 
 fn display_opt_i64(v: &Option<i64>) -> String {
@@ -64,7 +74,8 @@ fn display_size_mb(v: &Option<i64>) -> String {
 /// row-listing drift; previously the JSON branch read straight from the
 /// query results and the table branch built `StagingRow` separately from
 /// the same source, which is how #125-style drift happens even without a
-/// hand-rolled reverse-parse).
+/// hand-rolled reverse-parse). `staged` (JSON `staged_at`) was table-only
+/// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
 fn staging_rows_to_json(rows: &[StagingRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -89,7 +100,7 @@ pub fn run(
                     slices: i.num_slices,
                     encrypted_bytes: i.total_encrypted_size,
                     writes: i.write_count,
-                    staged: i.staged_at.unwrap_or_default(),
+                    staged: i.staged_at,
                 })
                 .collect();
             if json_output {
@@ -188,7 +199,7 @@ mod tests {
                 slices: Some(3),
                 encrypted_bytes: Some(5_242_881),
                 writes: 1,
-                staged: "2026-07-01T00:00:00Z".to_string(),
+                staged: Some("2026-07-01T00:00:00Z".to_string()),
             },
             StagingRow {
                 id: 2,
@@ -198,7 +209,7 @@ mod tests {
                 slices: None,
                 encrypted_bytes: None,
                 writes: 0,
-                staged: String::new(),
+                staged: None,
             },
         ];
         let value = staging_rows_to_json(&rows);

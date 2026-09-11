@@ -53,16 +53,30 @@ struct StageRow {
     status: String,
     #[tabled(rename = "Slices")]
     slices: String,
-    #[tabled(rename = "Encrypted")]
-    #[serde(skip)]
-    encrypted_size: String,
-    #[tabled(rename = "Staged At")]
-    #[serde(skip)]
-    staged_at: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). Raw bytes; renamed to `total_encrypted_size` to
+    /// match `stage info --json`'s existing key for the same
+    /// `ss.total_encrypted_size` column (see `StageCommands::Info` below).
+    #[tabled(rename = "Encrypted", display_with = "display_encrypted_mb")]
+    #[serde(rename = "total_encrypted_size")]
+    encrypted_size: Option<i64>,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b).
+    #[tabled(rename = "Staged At", display_with = "display_opt_string")]
+    staged_at: Option<String>,
 }
 
-/// `stage list --json` shape. `encrypted_size`/`staged_at` have no JSON
-/// counterpart today and none is added here.
+fn display_encrypted_mb(v: &Option<i64>) -> String {
+    v.map(|s| format!("{} MB", s / (1024 * 1024)))
+        .unwrap_or_default()
+}
+
+fn display_opt_string(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
+}
+
+/// `stage list --json` shape. `encrypted_size`/`staged_at` were table-only
+/// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
 fn stage_rows_to_json(rows: &[StageRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -106,10 +120,8 @@ pub fn run(
                             .get::<_, Option<i64>>(4)?
                             .map(|n| n.to_string())
                             .unwrap_or_default(),
-                        encrypted_size: enc_size
-                            .map(|s| format!("{} MB", s / (1024 * 1024)))
-                            .unwrap_or_default(),
-                        staged_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        encrypted_size: enc_size,
+                        staged_at: row.get::<_, Option<String>>(6)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -350,7 +362,11 @@ mod tests {
     use tempfile::TempDir;
 
     /// `stage list --json` shape (issue: C2 row-listing drift).
-    /// `encrypted_size`/`staged_at` are table-only and must not appear.
+    /// `encrypted_size`/`staged_at` are additive since CTO decision
+    /// 2026-09-11 (architecture review C2 follow-up, C2b). The byte count
+    /// (125_829_121) is deliberately not an even multiple of 1 MiB, proving
+    /// the JSON carries the raw fact rather than a value recomputed from
+    /// the table's "120 MB" text.
     #[test]
     fn pin_stage_rows_json_shape() {
         let rows = vec![
@@ -360,8 +376,8 @@ mod tests {
                 version: 2,
                 status: "staged".to_string(),
                 slices: "3".to_string(),
-                encrypted_size: "120 MB".to_string(),
-                staged_at: "2026-07-01T00:00:00Z".to_string(),
+                encrypted_size: Some(125_829_121),
+                staged_at: Some("2026-07-01T00:00:00Z".to_string()),
             },
             StageRow {
                 id: 2,
@@ -369,8 +385,8 @@ mod tests {
                 version: 1,
                 status: "staging".to_string(),
                 slices: String::new(),
-                encrypted_size: String::new(),
-                staged_at: String::new(),
+                encrypted_size: None,
+                staged_at: None,
             },
         ];
         let value = stage_rows_to_json(&rows);

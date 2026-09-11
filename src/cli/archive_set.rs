@@ -148,19 +148,40 @@ struct ArchiveSetRow {
     name: String,
     #[tabled(rename = "Copies")]
     min_copies: String,
-    #[tabled(rename = "Locations")]
-    #[serde(skip)]
-    locations: String,
-    #[tabled(rename = "Verify Days")]
-    #[serde(skip)]
-    verify_days: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). `required_locations` is stored as a JSON array
+    /// string (or NULL); `None` covers both NULL and an unparseable value
+    /// (corruption `policy::resolve` already treats as fatal elsewhere) so
+    /// this never silently invents an empty list for "not configured".
+    #[tabled(rename = "Locations", display_with = "display_locations")]
+    locations: Option<Vec<String>>,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b).
+    #[tabled(rename = "Verify Days", display_with = "display_opt_i64")]
+    verify_days: Option<i64>,
     #[tabled(rename = "Units")]
     #[serde(rename = "units")]
     unit_count: i64,
 }
 
-/// `archive-set list --json` shape. `locations`/`verify_days` have no JSON
-/// counterpart today and none is added here.
+/// Reproduces the pre-existing table text byte-for-byte: `None` (NULL
+/// `required_locations`, or unparseable) renders "-"; `Some` re-serializes
+/// to the same compact JSON array text the column stored (`create`/`edit`/
+/// `sync` write via `serde_json::to_string`, so round-tripping through
+/// `Vec<String>` reproduces it exactly).
+fn display_locations(v: &Option<Vec<String>>) -> String {
+    match v {
+        None => "-".to_string(),
+        Some(list) => serde_json::to_string(list).unwrap_or_else(|_| "-".to_string()),
+    }
+}
+
+fn display_opt_i64(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+/// `archive-set list --json` shape. `locations`/`verify_days` were table-only
+/// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
 fn archive_set_rows_to_json(rows: &[ArchiveSetRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -479,11 +500,10 @@ pub fn run(
                             .get::<_, Option<i64>>(1)?
                             .map(|n| n.to_string())
                             .unwrap_or("-".into()),
-                        locations: row.get::<_, Option<String>>(2)?.unwrap_or("-".into()),
-                        verify_days: row
-                            .get::<_, Option<i64>>(3)?
-                            .map(|n| n.to_string())
-                            .unwrap_or("-".into()),
+                        locations: row
+                            .get::<_, Option<String>>(2)?
+                            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
+                        verify_days: row.get::<_, Option<i64>>(3)?,
                         unit_count: row.get(4)?,
                     })
                 })?
@@ -729,22 +749,24 @@ mod tests {
     use super::*;
 
     /// `archive-set list --json` shape (issue: C2 row-listing drift).
-    /// `locations`/`verify_days` are table-only and must not appear.
+    /// `locations`/`verify_days` are additive since CTO decision 2026-09-11
+    /// (architecture review C2 follow-up, C2b) -- row0 has real values,
+    /// row1 has neither configured (`None`).
     #[test]
     fn pin_archive_set_rows_json_shape() {
         let rows = vec![
             ArchiveSetRow {
                 name: "daily".to_string(),
                 min_copies: "3".to_string(),
-                locations: "-".to_string(),
-                verify_days: "90".to_string(),
+                locations: Some(vec!["home".to_string(), "offsite".to_string()]),
+                verify_days: Some(90),
                 unit_count: 5,
             },
             ArchiveSetRow {
                 name: "ephemeral".to_string(),
                 min_copies: "-".to_string(),
-                locations: "-".to_string(),
-                verify_days: "-".to_string(),
+                locations: None,
+                verify_days: None,
                 unit_count: 0,
             },
         ];

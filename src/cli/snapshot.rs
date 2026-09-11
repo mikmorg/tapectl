@@ -81,19 +81,40 @@ struct SnapshotRow {
     version: i64,
     #[tabled(rename = "Status")]
     status: String,
-    #[tabled(rename = "Files")]
-    #[serde(skip)]
-    files: String,
-    #[tabled(rename = "Size")]
-    #[serde(skip)]
-    size: String,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). Renamed to `file_count` to match `snapshot create
+    /// --json`'s existing key for the same `file_count` column.
+    #[tabled(rename = "Files", display_with = "display_opt_i64")]
+    #[serde(rename = "file_count")]
+    files: Option<i64>,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). Raw bytes; renamed to `total_size` to match
+    /// `snapshot create --json`'s existing key for the same `total_size`
+    /// column.
+    #[tabled(rename = "Size", display_with = "display_size_mb")]
+    #[serde(rename = "total_size")]
+    size: Option<i64>,
+    /// Table-only until CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b). `created_at` is NOT NULL, so this stays a plain
+    /// `String` (not `Option`) -- renamed to match the DB column name and
+    /// the "Created" timestamp convention used elsewhere (e.g. `TenantRow`,
+    /// `StagingRow.staged_at`).
     #[tabled(rename = "Created")]
-    #[serde(skip)]
+    #[serde(rename = "created_at")]
     created: String,
 }
 
-/// `snapshot list --json` shape. `files`/`size`/`created` have no JSON
-/// counterpart today and none is added here.
+fn display_opt_i64(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn display_size_mb(v: &Option<i64>) -> String {
+    v.map(|s| format!("{} MB", s / (1024 * 1024)))
+        .unwrap_or_default()
+}
+
+/// `snapshot list --json` shape. `files`/`size`/`created` were table-only
+/// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
 fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -198,13 +219,8 @@ pub fn run(
                         unit: row.get(1)?,
                         version: row.get(2)?,
                         status: row.get(3)?,
-                        files: row
-                            .get::<_, Option<i64>>(4)?
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
-                        size: size
-                            .map(|s| format!("{} MB", s / (1024 * 1024)))
-                            .unwrap_or_default(),
+                        files: row.get::<_, Option<i64>>(4)?,
+                        size,
                         created: row.get(6)?,
                     })
                 })?
@@ -230,7 +246,11 @@ mod tests {
     use super::*;
 
     /// `snapshot list --json` shape (issue: C2 row-listing drift).
-    /// `files`/`size`/`created` are table-only and must not appear.
+    /// `files`/`size`/`created` are additive since CTO decision 2026-09-11
+    /// (architecture review C2 follow-up, C2b). The byte count
+    /// (125_829_121) is deliberately not an even multiple of 1 MiB, proving
+    /// the JSON carries the raw fact rather than a value recomputed from
+    /// the table's "120 MB" text.
     #[test]
     fn pin_snapshot_rows_json_shape() {
         let rows = vec![
@@ -239,8 +259,8 @@ mod tests {
                 unit: "backups".to_string(),
                 version: 3,
                 status: "current".to_string(),
-                files: "42".to_string(),
-                size: "120 MB".to_string(),
+                files: Some(42),
+                size: Some(125_829_121),
                 created: "2026-07-01T00:00:00Z".to_string(),
             },
             SnapshotRow {
@@ -248,8 +268,8 @@ mod tests {
                 unit: "photos".to_string(),
                 version: 1,
                 status: "reclaimable".to_string(),
-                files: String::new(),
-                size: String::new(),
+                files: None,
+                size: None,
                 created: String::new(),
             },
         ];
