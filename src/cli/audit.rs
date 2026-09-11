@@ -335,43 +335,27 @@ fn collect_findings(
         // re-stage and rewrite, or accept the orphaning the swap intended — so
         // audit reports it and does not block.
         if let Some(ref escrow) = escrow_pubkey {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT v.label, ss.id, ss.key_fingerprints, ss.origin
-                 FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 JOIN stage_sets ss ON ss.id = w.stage_set_id
-                 JOIN snapshots s ON s.id = w.snapshot_id
-                 WHERE s.unit_id = ?1
-                   AND w.status = 'completed'
-                   AND ss.encrypted = 1
-                   -- Exclude dead media rather than listing live statuses: a
-                   -- status added later (003 added 'sealed' and 'quarantined')
-                   -- then defaults to being REPORTED rather than silently
-                   -- skipped. An allowlist here would have missed every
-                   -- 'sealed' volume — i.e. exactly the ones this check is for.
-                   AND v.status NOT IN ('retired', 'erased', 'missing', 'blank')
-                 ORDER BY v.label",
+            // The query (which stage sets, on which volumes, with what
+            // recorded recipient list) lives in `policy::escrow` so this
+            // check, `catalog locate`, `report copies` and the write
+            // pre-flight cannot disagree. A rebuilt row (#137) gets the
+            // same verdict with a different explanation.
+            let rows = crate::policy::escrow::stage_set_coverage(
+                conn,
+                crate::policy::escrow::Scope::Unit(unit.id),
+                escrow,
             )?;
-            let rows = stmt.query_map(params![unit.id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
 
             for row in rows {
-                let (label, stage_set_id, fingerprints, origin) = row?;
-                // Fail-closed classification lives in `policy::escrow` so this
-                // check, `catalog locate`, `report copies` and the write
-                // pre-flight cannot disagree. A rebuilt row (#137) gets the
-                // same verdict with a different explanation.
-                let reason = crate::policy::escrow::gap(
-                    fingerprints.as_deref(),
-                    crate::policy::escrow::Origin::parse(&origin),
-                    escrow,
-                );
+                let stage_set_id = row.stage_set_id;
+                let label = row.volume_label.as_deref().unwrap_or("?");
+                let reason = match row.coverage {
+                    crate::policy::escrow::Coverage::Covered => None,
+                    crate::policy::escrow::Coverage::Unknown => {
+                        Some(crate::policy::escrow::UNKNOWN_REASON.to_string())
+                    }
+                    crate::policy::escrow::Coverage::Gap(reason) => Some(reason),
+                };
 
                 if let Some(reason) = reason {
                     warnings.push(AuditFinding {
