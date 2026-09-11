@@ -76,6 +76,33 @@ not bundle verification — `volume verify` already exists.
 A real-drive confirmation pass is owed at the end of this round for the
 #134/#135 heir-path byte changes; it is batched, not per-commit.
 
+## Real-drive confirmation pass #3 — DONE 2026-09-11 18:15 UTC (catalog.db shape)
+
+`4292cf9` changed operator-envelope bytes on every future tape: `catalog.db`
+gained `tenants`, `stage_sets.key_fingerprints` and `stage_slices.sha256_plain`.
+Same command, same guard (`sg_read_attr` must report `EW7VWMVKF6` before the
+erase):
+
+    ./scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst0 \
+        --erase short --single-cartridge --i-will-lose-the-cartridge EW7VWMVKF6
+
+**45 checks, 45 passed, 0 failed, 0 skipped** on the real HP LTO-6.
+
+Then the operator envelope the matrix had dumped raw off the cartridge
+(`matrix-fy-big/raw/0006_operator_envelope.bin`, 52,227 bytes) was decrypted
+with the operator key and its `catalog.db` queried:
+
+| Evidence off `EW7VWMVKF6` | Result |
+|---|---|
+| tables | `tenants, units, snapshots, stage_sets, stage_slices, files` |
+| `stage_sets` columns | `…, total_encrypted_size, key_fingerprints` |
+| `stage_slices` columns | `…, encrypted_bytes, sha256_plain, sha256_encrypted` |
+| `tenants` rows | `alice, bob` |
+| receipts | 3 of 3 stage sets carry `key_fingerprints` |
+| plaintext hashes | present on all 14 slices |
+
+That is the whole of review finding 2 (a), on tape.
+
 ## Real-drive confirmation pass #2 — DONE 2026-09-11 14:50 UTC (#134/#135)
 
 `64d3f91` changed frozen on-tape bytes again: the envelope `MANIFEST.toml`
@@ -201,6 +228,43 @@ Round 2's lessons, both of which cost a real correction:
   preconditions and an audit consequence, and inferring it from a data fact
   silenced every check that mattered. The same shape as #105: the downgrade
   was silent, so the tool could not tell.
+
+**Round 3 — the CTO's design review, all six items landed, attended.**
+"review all of this, I think it points to design gaps that need addressing"
+produced `docs/audits/2026-09-11-rebuild-findings-review.md`: one live defect
+and four design gaps, grilled across two rounds, thirteen answers ratified.
+Landed in order, one commit each, master `103ba99`:
+
+| commit | item |
+|---|---|
+| `ba8a4a1` | #138 — `audit` scopes per check; tape-only units are audited again (3/3/3/0 across the four statuses, re-measured with the real binary) |
+| `d5c9638` `08b1dd1` | third escrow state (`stage_sets.origin`, `?`), `escrow_identity_mismatch` diagnosis |
+| `4292cf9` | `catalog.db` is a complete rebuild source — tenants, receipts, plain hashes on the tape |
+| `3249ac6` | attestation: `catalog rebuild --key <escrow>` decrypts one slice header per stage set; `Store::read_file_head` |
+| `e0cfbff` | `catalog locate --json` carries the escrow marker |
+| `a7f2921` | db-loss arm (d) follows the DR procedure and measures both escrow states on tape |
+| `103ba99` | DR procedure as a composition; "self-describing" defined; review corrections |
+
+745 lib tests at the end of round 3 (730 at its start). Gate GREEN 26/26 on
+every tape-path commit, CI green at every push but one (fmt, fixed), db-loss
+6/6 with escrow measured, real-drive pass #3 45/45 with the new envelope
+bytes read back off the cartridge. #137 closed; #139 filed as the follow-up.
+
+Round 3's lessons:
+
+- **Measure the thing before describing it.** Every prediction about how a
+  rebuilt catalog would misbehave was wrong in direction or degree until it
+  was run: "noisy" was actually *quiet* (#138), "violation" was a *warning*,
+  "niche" was *default-on*. The review's value came from four commands run
+  against a real artifact, not from reading.
+- **A fact found while writing the docs changed the design.** "No command
+  replaces a registered escrow identity" surfaced while writing the DR text,
+  turned finding 4 from advice into a hard ordering constraint, made
+  attestation's registered-key guard load-bearing, forced arm (d) into two
+  homes, and produced #139. Docs are not the last step; they are a test.
+- **The other session's build is a real constraint on this VM.** Two commit
+  chains were OOM-killed mid-`clippy`; nothing was lost because git steps
+  were ordered before cargo steps. Keep it that way.
 
 One process note, twice over: `Closes #NNN` in a commit message auto-closes
 the issue **on push, before CI finishes**. It went green both times, but the
