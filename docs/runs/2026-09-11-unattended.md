@@ -174,8 +174,8 @@ value` instead of dying silently, and `--info` announces
 obligation blocked.** Round 2 reopened the queue above with #134/#135/#136.
 
 **Round 2 — queue: 3 items, all landed.** #134 and #135 in `64d3f91`; #136 in
-`edef129` + `85ca9f2`. 723 lib tests at the start of round 2, **733** at the
-end; 839 total. Gate GREEN 26/26 on every tape-path commit, CI green on every
+`edef129` + `60dca6f`. 723 lib tests at the start of round 2, **730** at the
+end; 839 total (the round's last three are integration tests). Gate GREEN 26/26 on every tape-path commit, CI green on every
 push, and `db-loss` reached 6/6 — the first time that scenario has been fully
 green, because its arm (b) was the suite's last standing expected failure.
 
