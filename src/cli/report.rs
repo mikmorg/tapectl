@@ -642,7 +642,7 @@ fn escrow_gaps_by_unit(
     };
 
     let mut sql = String::from(
-        "SELECT DISTINCT u.name, v.label, ss.key_fingerprints
+        "SELECT DISTINCT u.name, v.label, ss.key_fingerprints, ss.origin
            FROM writes w
            JOIN volumes v ON v.id = w.volume_id
            JOIN stage_sets ss ON ss.id = w.stage_set_id
@@ -663,9 +663,10 @@ fn escrow_gaps_by_unit(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
         ))
     };
-    let rows: Vec<(String, String, Option<String>)> = match unit_filter {
+    let rows: Vec<(String, String, Option<String>, String)> = match unit_filter {
         Some(u) => stmt
             .query_map(rusqlite::params![u], map)?
             .collect::<std::result::Result<_, _>>()?,
@@ -674,8 +675,16 @@ fn escrow_gaps_by_unit(
             .collect::<std::result::Result<_, _>>()?,
     };
 
-    for (unit, label, fingerprints) in rows {
-        if crate::policy::escrow::gap(fingerprints.as_deref(), &escrow).is_some() {
+    for (unit, label, fingerprints, origin) in rows {
+        // Unknown (rebuilt, #137) is listed too: it is not covered, and
+        // this report answers "which volumes can the escrow key not open".
+        if crate::policy::escrow::gap(
+            fingerprints.as_deref(),
+            crate::policy::escrow::Origin::parse(&origin),
+            &escrow,
+        )
+        .is_some()
+        {
             out.entry(unit).or_default().push(label);
         }
     }

@@ -124,7 +124,9 @@ struct LocationRow {
     /// Whether the CURRENT escrow recipient can still recover this volume
     /// (#125). `locate` answers "where do I go to get this back"; for a
     /// volume staged before an escrow swap the honest answer includes "and
-    /// not with the escrow key". `-` when no escrow is registered at all.
+    /// not with the escrow key". `-` when no escrow is registered at all;
+    /// `?` when the row was rebuilt from a tape that carries no recipient
+    /// list (#137) — not covered, but attestable.
     #[tabled(rename = "Escrow")]
     escrow: String,
 }
@@ -155,7 +157,7 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                    FROM volume_deposits d
                    JOIN locations dl ON dl.id = d.location_id
                   WHERE d.volume_id = v.id),
-                ss.key_fingerprints
+                ss.key_fingerprints, ss.origin
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
@@ -181,6 +183,7 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                     .unwrap_or_else(|| "-".into()),
                 escrow: crate::policy::escrow::marker(
                     row.get::<_, Option<String>>(8)?.as_deref(),
+                    crate::policy::escrow::Origin::parse(&row.get::<_, String>(9)?),
                     escrow.as_deref(),
                 )
                 .to_string(),

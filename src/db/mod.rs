@@ -112,6 +112,11 @@ fn migrations() -> Migrations<'static> {
         // column. Nullable with no default — NULL means "not recorded", 0
         // means "recorded, none raised". See the migration header.
         M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+        // 010 adds stage_sets.origin ('staged' | 'rebuilt') (issue #137): a
+        // stage set rebuilt from a tape's envelope has no recorded recipient
+        // list, and the escrow predicate must tell "never written down" from
+        // "could not have been written down". See the migration header.
+        M::up(include_str!("migrations/010_stage_set_origin.sql")),
     ])
 }
 

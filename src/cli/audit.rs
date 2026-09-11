@@ -336,7 +336,7 @@ fn collect_findings(
         // audit reports it and does not block.
         if let Some(ref escrow) = escrow_pubkey {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT v.label, ss.id, ss.key_fingerprints
+                "SELECT DISTINCT v.label, ss.id, ss.key_fingerprints, ss.origin
                  FROM writes w
                  JOIN volumes v ON v.id = w.volume_id
                  JOIN stage_sets ss ON ss.id = w.stage_set_id
@@ -357,14 +357,21 @@ fn collect_findings(
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
 
             for row in rows {
-                let (label, stage_set_id, fingerprints) = row?;
+                let (label, stage_set_id, fingerprints, origin) = row?;
                 // Fail-closed classification lives in `policy::escrow` so this
-                // check, `catalog locate` and `report copies` cannot disagree.
-                let reason = crate::policy::escrow::gap(fingerprints.as_deref(), escrow);
+                // check, `catalog locate`, `report copies` and the write
+                // pre-flight cannot disagree. A rebuilt row (#137) gets the
+                // same verdict with a different explanation.
+                let reason = crate::policy::escrow::gap(
+                    fingerprints.as_deref(),
+                    crate::policy::escrow::Origin::parse(&origin),
+                    escrow,
+                );
 
                 if let Some(reason) = reason {
                     warnings.push(AuditFinding {
@@ -489,6 +496,7 @@ fn collect_findings(
             config.compaction.utilization_threshold,
         )?);
         warnings.extend(escrow_kit_findings(conn)?);
+        warnings.extend(escrow_identity_findings(conn, escrow_pubkey.as_deref())?);
     }
 
     Ok((violations, warnings))
@@ -510,6 +518,92 @@ fn collect_findings(
 ///   - sealed volumes exist and no kit was ever generated;
 ///   - a kit exists but volumes were sealed after it.
 ///
+/// One finding, not N, when the archive was encrypted to an escrow key that
+/// is not the current one (issue #137, CTO grilling Q4/Q12).
+///
+/// The situation this exists for: a machine rebuilt after a disaster. `init`
+/// creates a NEW escrow identity; every tape was encrypted to the old one;
+/// and every surviving receipt then reads "encrypted without the current
+/// escrow recipient" — technically true, practically "you have not run
+/// `key import --escrow` with the original key yet". Per-unit findings say
+/// it N times without ever saying *that*. This says it once, and names the
+/// key.
+///
+/// Rule: over the stage sets the current escrow key cannot open (recorded
+/// list present, key absent), intersect their recipient lists, then subtract
+/// the current escrow key and every public key `encryption_keys` knows —
+/// tenant and operator keys are recipients too, and are not candidates. If
+/// exactly one key survives it is almost certainly the former escrow
+/// recipient; if several survive (tenant keys not re-registered either) they
+/// are all named, since the operator can tell which is which. Fires on
+/// **one or more** such stage sets, not "all": the realistic case has the
+/// operator already writing new tapes under the new identity.
+///
+/// Advisory (exit 1). Never suppresses the per-unit findings, which remain
+/// true; it prints ahead of them because it explains them.
+fn escrow_identity_findings(conn: &Connection, escrow: Option<&str>) -> Result<Vec<AuditFinding>> {
+    let Some(escrow) = escrow else {
+        return Ok(Vec::new()); // nothing registered; nothing to compare against
+    };
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT ss.id, ss.key_fingerprints
+           FROM stage_sets ss
+           JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
+           JOIN volumes v ON v.id = w.volume_id
+          WHERE ss.encrypted = 1 AND ss.key_fingerprints IS NOT NULL AND {}",
+        crate::policy::coverage::eligible("v")
+    ))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+
+    let mut uncovered: Vec<std::collections::BTreeSet<String>> = Vec::new();
+    for row in rows {
+        let (_, json) = row?;
+        let Ok(keys) = serde_json::from_str::<Vec<String>>(&json) else {
+            continue; // unreadable lists are reported per unit; no identity to infer
+        };
+        if keys.iter().any(|k| k == escrow) {
+            continue;
+        }
+        uncovered.push(keys.into_iter().collect());
+    }
+    if uncovered.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut shared = uncovered[0].clone();
+    for set in &uncovered[1..] {
+        shared = shared.intersection(set).cloned().collect();
+    }
+    shared.remove(escrow);
+
+    let mut known = conn.prepare("SELECT public_key FROM encryption_keys")?;
+    for key in known.query_map([], |r| r.get::<_, String>(0))? {
+        shared.remove(&key?);
+    }
+    if shared.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let candidates: Vec<&str> = shared.iter().map(String::as_str).collect();
+    Ok(vec![AuditFinding {
+        unit: "archive".into(),
+        check: "escrow_identity_mismatch".into(),
+        message: format!(
+            "{} stage set(s) the current escrow key cannot open all name a recipient \
+             this catalog does not recognise: {} — if this machine was rebuilt after \
+             a disaster, that is probably the original escrow key, and the current \
+             identity is a replacement `init` created",
+            uncovered.len(),
+            candidates.join(", "),
+        ),
+        action: format!(
+            "tapectl key import --escrow {}   # the ORIGINAL escrow public key, from the heir kit",
+            candidates[0]
+        ),
+    }])
+}
+
 /// Deliberately silent when there are no sealed volumes at all: a fresh
 /// install nagging about a kit for an archive that does not yet exist is
 /// noise, and noise is how advisory checks get ignored.
@@ -1837,5 +1931,164 @@ mod tests {
     fn escrow_coverage_is_skipped_when_no_escrow_is_registered() {
         let conn = setup_escrow_coverage(Some(r#"["age1alice"]"#), false);
         assert!(escrow_findings(&conn).is_empty());
+    }
+
+    /// #137 / Q12: after a disaster `init` creates a NEW escrow identity and
+    /// every receipt names the OLD one. One finding that names the old key,
+    /// not N findings that do not.
+    mod escrow_identity {
+        use super::*;
+
+        fn setup(current_escrow: &str, lists: &[&str], registered: &[&str]) -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            // Through the real helper, so the row is shaped the way
+            // `queries::escrow_public_key` (is_escrow = 1) actually finds it.
+            crate::db::queries::insert_escrow_key(
+                &conn,
+                tid,
+                "escrow",
+                current_escrow,
+                current_escrow,
+                None,
+            )
+            .unwrap();
+            for (i, k) in registered.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+                     VALUES (?1, ?2, ?3, ?3, 'primary', 1)",
+                    params![tid, format!("k{i}"), k],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, status) VALUES ('u', 'u', ?1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let uid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('V', 'lto', 'lto0', 1, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vid = conn.last_insert_rowid();
+            for (i, list) in lists.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, ?2, 'full', 'current', '/src')",
+                    params![uid, i as i64 + 1],
+                )
+                .unwrap();
+                let sid = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+                     VALUES (?1, 'staged', 1, 1, ?2)",
+                    params![sid, list],
+                )
+                .unwrap();
+                let ssid = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, completed_at)
+                     VALUES (?1, ?2, ?3, 'completed', '2026-01-01')",
+                    params![ssid, sid, vid],
+                )
+                .unwrap();
+            }
+            conn
+        }
+
+        fn findings(conn: &Connection, escrow: &str) -> Vec<AuditFinding> {
+            escrow_identity_findings(conn, Some(escrow)).unwrap()
+        }
+
+        #[test]
+        fn the_former_escrow_key_is_named_once_with_the_import_command() {
+            // Two stage sets, both to the old escrow key + alice's registered key.
+            let conn = setup(
+                "age1new",
+                &[r#"["age1alice","age1old"]"#, r#"["age1alice","age1old"]"#],
+                &["age1alice"],
+            );
+            let f = findings(&conn, "age1new");
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert_eq!(f[0].check, "escrow_identity_mismatch");
+            assert!(f[0].message.contains("2 stage set(s)"), "{}", f[0].message);
+            assert!(f[0].message.contains("age1old"), "{}", f[0].message);
+            assert!(
+                !f[0].message.contains("age1alice"),
+                "a registered key is not a candidate"
+            );
+            assert!(
+                f[0].action.contains("key import --escrow age1old"),
+                "{}",
+                f[0].action
+            );
+        }
+
+        #[test]
+        fn covered_stage_sets_produce_nothing() {
+            let conn = setup("age1new", &[r#"["age1alice","age1new"]"#], &["age1alice"]);
+            assert!(findings(&conn, "age1new").is_empty());
+        }
+
+        #[test]
+        fn one_uncovered_stage_set_is_enough_even_beside_covered_ones() {
+            // The realistic shape: the operator has already written a new tape.
+            let conn = setup(
+                "age1new",
+                &[r#"["age1alice","age1old"]"#, r#"["age1alice","age1new"]"#],
+                &["age1alice"],
+            );
+            let f = findings(&conn, "age1new");
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert!(f[0].message.contains("1 stage set(s)"), "{}", f[0].message);
+        }
+
+        #[test]
+        fn no_shared_unknown_recipient_means_no_diagnosis() {
+            // Two different old keys: nothing is common, so nothing to name —
+            // the per-unit findings carry it.
+            let conn = setup(
+                "age1new",
+                &[r#"["age1alice","age1old1"]"#, r#"["age1alice","age1old2"]"#],
+                &["age1alice"],
+            );
+            assert!(findings(&conn, "age1new").is_empty());
+        }
+
+        #[test]
+        fn unregistered_tenant_keys_are_named_too_since_the_operator_can_tell() {
+            let conn = setup("age1new", &[r#"["age1alice","age1old"]"#], &[]);
+            let f = findings(&conn, "age1new");
+            assert_eq!(f.len(), 1);
+            assert!(f[0].message.contains("age1alice") && f[0].message.contains("age1old"));
+        }
+
+        /// The wiring: the diagnosis must reach `collect_findings`, or the
+        /// unit tests above prove a function nobody calls.
+        #[test]
+        fn the_diagnosis_reaches_the_audit_run() {
+            let conn = setup("age1new", &[r#"["age1alice","age1old"]"#], &["age1alice"]);
+            let (_violations, warnings) =
+                collect_findings(&conn, &Config::default(), None).unwrap();
+            assert!(
+                warnings.iter().any(|f| f.check == "escrow_identity_mismatch"),
+                "not wired: {:?}",
+                warnings.iter().map(|f| &f.check).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn no_registered_escrow_is_silent() {
+            let conn = setup("age1new", &[r#"["age1old"]"#], &[]);
+            assert!(escrow_identity_findings(&conn, None).unwrap().is_empty());
+        }
     }
 }

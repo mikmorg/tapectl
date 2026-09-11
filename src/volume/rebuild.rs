@@ -658,9 +658,9 @@ fn ensure_stage_set(
     // fail-closes on that, so every rebuilt unit reports `escrow: NO` — see
     // the module header and issue #137.
     tx.execute(
-        "INSERT INTO stage_sets (snapshot_id, status, dar_version, dar_command, slice_size,
+        "INSERT INTO stage_sets (snapshot_id, status, origin, dar_version, dar_command, slice_size,
                                  num_slices, total_dar_size, total_encrypted_size, staged_at, notes)
-         VALUES (?1, 'cleaned', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8)",
+         VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8)",
         params![
             snapshot_id,
             unit.dar_version,

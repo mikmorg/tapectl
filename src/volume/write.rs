@@ -831,7 +831,7 @@ fn stage_sets_lacking_escrow(
     escrow_public_key: &str,
 ) -> Result<Vec<(i64, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT u.name, ss.key_fingerprints, ss.encrypted
+        "SELECT u.name, ss.key_fingerprints, ss.encrypted, ss.origin
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
@@ -839,14 +839,14 @@ fn stage_sets_lacking_escrow(
     )?;
     let mut lacking = Vec::new();
     for &stage_set_id in stage_set_ids {
-        let row: Option<(String, Option<String>, i64)> = stmt
+        let row: Option<(String, Option<String>, i64, String)> = stmt
             .query_row(params![stage_set_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?;
         // No row at all (or no unit behind it) is as unprovable as a NULL
         // list — same fail-closed answer, same wording.
-        let Some((unit_name, fingerprints, encrypted)) = row else {
+        let Some((unit_name, fingerprints, encrypted, origin)) = row else {
             lacking.push((
                 stage_set_id,
                 format!("<unknown unit for stage set {stage_set_id}>"),
@@ -861,6 +861,14 @@ fn stage_sets_lacking_escrow(
             "staged with encrypted=0"
         } else {
             match fingerprints.as_deref() {
+                // A rebuilt row (#137, CTO Q8): still refused — fail-closed
+                // is the verdict — but the reason names the attest path, and
+                // `--allow-missing-escrow` remains the sanctioned override.
+                None if crate::policy::escrow::Origin::parse(&origin)
+                    == crate::policy::escrow::Origin::Rebuilt =>
+                {
+                    crate::policy::escrow::UNKNOWN_REASON
+                }
                 None => "no recorded recipient list",
                 Some(json) => match serde_json::from_str::<Vec<String>>(json) {
                     Err(_) => "recipient list unparseable",

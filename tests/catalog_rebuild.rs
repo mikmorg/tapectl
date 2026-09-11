@@ -787,3 +787,41 @@ fn the_escrow_key_rebuilds_as_well_as_the_operator_key() {
         assert_eq!(&got, expected, "unit {unit_name}");
     }
 }
+
+/// #137: rebuilt stage sets carry `origin = 'rebuilt'`, which is what lets
+/// the escrow predicate say "unknown — attest it" instead of "no recorded
+/// recipient list" — the same verdict, a different explanation.
+#[test]
+fn rebuilt_stage_sets_are_marked_as_such() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let (rebuilt, total): (i64, i64) = conn
+        .query_row(
+            "SELECT SUM(origin = 'rebuilt'), COUNT(*) FROM stage_sets",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(total, UNITS.len() as i64);
+    assert_eq!(rebuilt, total, "every rebuilt stage set must say so");
+
+    // And through the predicate: unknown, not a gap.
+    let fp: Option<String> = conn
+        .query_row("SELECT key_fingerprints FROM stage_sets LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        tapectl::policy::escrow::marker(
+            fp.as_deref(),
+            tapectl::policy::escrow::Origin::Rebuilt,
+            Some("age1anything"),
+        ),
+        "?"
+    );
+}
