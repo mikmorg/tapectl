@@ -114,16 +114,22 @@ converts "use judgment" into "don't do X".}}
 
 1. Base sanity check (above). Then `git branch --show-current` — confirm it is
    your assigned branch, not master.
-2. Apply changes in order; `cargo check --all-targets` after each.
-3. Full gate: `cargo fmt --all -- --check && cargo clippy --all-targets --
+2. **Run every cargo command synchronously, in the foreground.** Never
+   background one, never arm a Monitor or wait on a "completion
+   notification" — the coordinator sends none, and three workers on
+   2026-09-11 each stalled for minutes waiting on one. A baseline `cargo
+   test` is run first, waited on, and its totals recorded; no file is
+   touched until it returns.
+3. Apply changes in order; `cargo check --all-targets` after each.
+4. Full gate: `cargo fmt --all -- --check && cargo clippy --all-targets --
    -D warnings && cargo test` — green AND test count >= baseline. Never pipe
    clippy through `tail`; warnings print ABOVE the "Finished" line and a tail
    hides them.
-4. If you changed any clap definition: `cargo run --example gen_man` and
+5. If you changed any clap definition: `cargo run --example gen_man` and
    commit docs/man.
-5. Commit per change, conventional style (see `git log --oneline -5`), body
+6. Commit per change, conventional style (see `git log --oneline -5`), body
    citing the design section that mandates it.
-6. Do NOT push. Do NOT merge.
+7. Do NOT push. Do NOT merge.
 
 ### Final report (return verbatim — this is data for the coordinator, not
 prose for a user)
