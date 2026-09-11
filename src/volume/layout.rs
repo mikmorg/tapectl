@@ -337,7 +337,12 @@ padding can be defeated without knowing the exact size:
 /// Tools used: mt, dd, age, dar, sha256sum, head, truncate, plus standard
 /// coreutils (awk/sed/grep/tr) — no TOML collection, per the grammar contract.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
-    r#"#!/usr/bin/env bash
+    use crate::volume::restore_script::{
+        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_PARSE_FILE_LIST,
+        AWK_SELECT_VERSION, AWK_UNIT_LIST,
+    };
+
+    let script = r#"#!/usr/bin/env bash
 # RESTORE.sh — Emergency restore script for tapectl volume __LABEL__ (layout v2)
 # This script restores data from this tape WITHOUT tapectl installed.
 # It reads the tape's front index (File 3), the seal marker (last file),
@@ -489,17 +494,7 @@ toml_val() {
 # has neither; everything else has both).
 parse_front_index_entries() {
   local file=$1
-  awk '
-    /^\[\[files\]\]/ {
-      if (p != "") print p "|" t "|" s "|" h
-      p = ""; t = ""; s = ""; h = ""
-    }
-    /^position = /         { p = $3 }
-    /^type = /             { t = $3; gsub(/"/, "", t) }
-    /^size_bytes = /       { s = $3 }
-    /^sha256_encrypted = / { h = $3; gsub(/"/, "", h) }
-    END { if (p != "") print p "|" t "|" s "|" h }
-  ' "$file"
+  awk '__AWK_PARSE_FILE_LIST__' "$file"
 }
 
 # Front-index self-consistency check (sec 2.5): positions strictly
@@ -512,31 +507,7 @@ parse_front_index_entries() {
 # accumulated and only checked in END, where `exit` really does terminate.
 check_file_list_consistency() {
   local list=$1 expected_total=${2:-}
-  awk -F'|' -v expected="$expected_total" '
-    {
-      row = NR - 1
-      if ($1 !~ /^[0-9]+$/)   { badpos = 1 }
-      else if ($1 + 0 != row) { badcontig = 1 }
-      if ($2 == "front_index") {
-        fi_count++
-        if ($1 + 0 != 3) { badfipos = 1 }
-      }
-      if ($2 == "seal_marker") { seal_count++; seal_row = NR }
-      last_row = NR
-    }
-    END {
-      if (NR == 0)              { print "empty file list" > "/dev/stderr"; exit 1 }
-      if (badpos)               { print "a position value is not a non-negative integer" > "/dev/stderr"; exit 1 }
-      if (badcontig)            { print "positions are not contiguous from 0" > "/dev/stderr"; exit 1 }
-      if (fi_count + 0 != 1)    { print "expected exactly one front_index entry, found " fi_count+0 > "/dev/stderr"; exit 1 }
-      if (badfipos)             { print "front_index entry not at position 3" > "/dev/stderr"; exit 1 }
-      if (seal_count + 0 != 1)  { print "expected exactly one seal_marker entry, found " seal_count+0 > "/dev/stderr"; exit 1 }
-      if (seal_row != last_row) { print "seal_marker entry is not the last file" > "/dev/stderr"; exit 1 }
-      if (expected != "" && NR != expected + 0) {
-        print "entry count " NR " does not match expected total " expected > "/dev/stderr"; exit 1
-      }
-    }
-  ' "$list"
+  awk -F'|' -v expected="$expected_total" '__AWK_CHECK_FILE_LIST__' "$list"
 }
 
 # Look up size_bytes / sha256_encrypted for a given tape file position.
@@ -547,7 +518,7 @@ file_hash_at() { awk -F'|' -v p="$1" '$1 == p { print $4; exit }' "$2"; }
 # already position-sorted, and the format's fixed zone order already puts
 # tenant envelope(s) before the operator envelope before its backup).
 envelope_positions() {
-  awk -F'|' '$2=="tenant_envelope" || $2=="operator_envelope" || $2=="operator_envelope_backup" { print $1 }' "$1"
+  awk -F'|' '__AWK_FIND_ENVELOPE__' "$1"
 }
 
 # ---- bootstrap (File 0 — identity + pointers only in layout v2) ----
@@ -909,12 +880,7 @@ do_find_envelope() {
 # Does an envelope MANIFEST.toml list a given unit under [[units]]? Exit 0 if
 # so. Used by --restore to pick the right envelope for a universal key (#127).
 manifest_has_unit() { # <manifest_path> <unit_name>
-  awk -v u="$2" '
-    /^\[\[units\]\]/ { in_u = 1; next }
-    in_u && /^name = / { gsub(/"/, "", $3); if ($3 == u) found = 1; in_u = 0 }
-    /^\[/             { in_u = 0 }
-    END { exit(found ? 0 : 1) }
-  ' "$1"
+  awk -v u="$2" '__AWK_MANIFEST_HAS_UNIT__' "$1"
 }
 
 do_restore() {
@@ -973,15 +939,7 @@ do_restore() {
   local -a unit_names
   while IFS= read -r uname; do
     unit_names+=("$uname")
-  done < <(awk '
-    /^\[\[units\]\]/ { in_u = 1; next }
-    # !seen[] — a volume can carry the SAME unit in several snapshot versions,
-    # one [[units]] block each. Listing it once per block made a single unit
-    # look like several and pushed the plain --restore (no --unit) form into
-    # the "multiple units" branch, printing the same name twice (#133).
-    in_u && /^name = / { gsub(/"/, "", $3); if (!seen[$3]++) print $3; in_u = 0 }
-    /^\[/              { in_u = 0 }
-  ' "$manifest")
+  done < <(awk '__AWK_UNIT_LIST__' "$manifest")
 
   [ ${#unit_names[@]} -gt 0 ] || die "no units in manifest"
 
@@ -1003,50 +961,7 @@ do_restore() {
   # versions have different recipients (a `tenant reassign` between them), the
   # first slice is one this key cannot open and the failure reads as "wrong
   # key". So: buffer per block and emit exactly one version's slices.
-  awk -v unit="$target_unit" -v want="${want_version:-}" '
-    function flush() {
-      if (in_s && num != "") {
-        n[blk]++
-        slice[blk, n[blk]] = num "|" tpos "|" eb "|" sha
-      }
-      in_s = 0; num = ""; tpos = ""; eb = ""; sha = ""
-    }
-    # in_head tracks POSITION (are we in the key/value region directly under
-    # [[units]]?); in_u tracks IDENTITY (is this block the unit we want?).
-    # Separate on purpose: name and snapshot_version belong to the block head,
-    # so honouring them anywhere else — a name key added to [[units.slices]],
-    # or to some future table — would silently retarget the selector and drop
-    # the remaining slices. A wrong answer with no error is the worst failure
-    # this script can produce (#135).
-    #
-    # No apostrophes in these comments: the whole program is single-quoted in
-    # the shell, so one would end it mid-awk and break the generated script.
-    /^\[\[units\]\]/ { flush(); blk++; hit[blk] = 0; ver[blk] = -1; in_u = 0; in_head = 1; next }
-    /^\[/ { in_head = 0 }
-    in_head && /^name = / {
-      gsub(/"/, "", $3)
-      if ($3 == unit) { in_u = 1; hit[blk] = 1 } else { in_u = 0 }
-    }
-    in_u && in_head && /^snapshot_version = / { ver[blk] = $3 + 0 }
-    in_u && /^\[\[units\.slices\]\]/ { flush(); in_s = 1; next }
-    in_s && /^number = /           { num = $3 }
-    in_s && /^tape_position = /    { tpos = $3 }
-    in_s && /^encrypted_bytes = /  { eb = $3 }
-    in_s && /^sha256_encrypted = / { gsub(/"/, "", $3); sha = $3 }
-    END {
-      flush()
-      best = -1; pick = 0
-      for (b = 1; b <= blk; b++) {
-        if (!hit[b]) continue
-        if (want != "") { if (ver[b] == want + 0) { pick = b; best = ver[b] } }
-        else if (ver[b] >= best) { best = ver[b]; pick = b }
-      }
-      if (pick) {
-        print best > "/dev/stderr"
-        for (i = 1; i <= n[pick]; i++) print slice[pick, i]
-      }
-    }
-  ' "$manifest" >"$WORK/slices.txt" 2>"$WORK/picked_version.txt"
+  awk -v unit="$target_unit" -v want="${want_version:-}" '__AWK_SELECT_VERSION__' "$manifest" >"$WORK/slices.txt" 2>"$WORK/picked_version.txt"
 
   local nslices picked
   nslices=$(wc -l <"$WORK/slices.txt")
@@ -1196,9 +1111,29 @@ case "${1:-}" in
   exit 2
   ;;
 esac
-"#
-    .replace("__LABEL__", label)
-    .replace("__TOTAL_FILES__", &total_files.to_string())
+"#;
+
+    let result = script
+        .replace("__AWK_PARSE_FILE_LIST__", AWK_PARSE_FILE_LIST)
+        .replace("__AWK_CHECK_FILE_LIST__", AWK_CHECK_FILE_LIST)
+        .replace("__AWK_FIND_ENVELOPE__", AWK_FIND_ENVELOPE)
+        .replace("__AWK_MANIFEST_HAS_UNIT__", AWK_MANIFEST_HAS_UNIT)
+        .replace("__AWK_UNIT_LIST__", AWK_UNIT_LIST)
+        .replace("__AWK_SELECT_VERSION__", AWK_SELECT_VERSION)
+        .replace("__LABEL__", label)
+        .replace("__TOTAL_FILES__", &total_files.to_string());
+
+    // No named-fragment placeholder may survive assembly — a stray one would
+    // mean a placeholder in the template does not match any const's name (or
+    // vice versa), and would ship an inert `__AWK_...__` token straight onto
+    // tape. Debug-only: `no_awk_placeholder_survives_assembly` (mod tests)
+    // covers the release-mode case unconditionally.
+    debug_assert!(
+        !result.contains("__AWK_"),
+        "an __AWK_*__ placeholder was not substituted in generate_restore_script_v2"
+    );
+
+    result
 }
 
 /// Generate the planning header content — pre-v2 this was written as a

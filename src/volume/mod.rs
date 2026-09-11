@@ -7,5 +7,6 @@ pub mod manifest;
 pub mod raw;
 pub mod rebuild;
 pub mod restore;
+pub(crate) mod restore_script;
 pub mod session;
 pub mod write;
