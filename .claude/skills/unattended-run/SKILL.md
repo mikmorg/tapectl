@@ -36,22 +36,27 @@ Sort every fork by how hard it is to undo.
   purpose: the CTO can answer either one from a phone.
 - **Halt** — safety, or anything irreversible. Stop the run and wait.
 
+Correcting text or behaviour that is unambiguously wrong is a **settle** even
+when it lands on tape. *Defer* is for forks where a reasonable CTO could choose
+either way — not for fixing something that is simply incorrect.
+
 A fork that feels like *settle* but touches a **red line** below is a *halt*.
 
 ## Tape work runs on mhvtl
 
-mhvtl has 4 drives and 43 loaded slots, so `mtx` gives multi-cartridge scenarios
-unattended. That is the default for every tape operation.
+mhvtl drives a changer under `mtx`, so multi-cartridge scenarios run unattended.
+That is the default for every tape operation.
 
 Resolve every device by serial through `/dev/tape/by-id/` — `scsi-HUJ808A5L4-nst`
 is the real HP LTO-6, `scsi-XYZZY_A*` are mhvtl. The `nstN` numbers move across
-reboots, and the drives have swapped places at least once.
+reboots, and the drives have swapped places at least once. The run file records
+which numbers they hold today; `ls -l /dev/tape/by-id/` settles it if they moved
+again.
 
 The real drive earns a **confirmation pass** only for changes to tape bytes,
-batched to the end of the queue rather than run per-item. It holds cartridge
-`EW7VWMVKF6`, which the CTO has declared expendable — standing consent for
-`--i-will-lose-the-cartridge EW7VWMVKF6`. There is no autoloader, so that one
-cartridge is the whole real-hardware budget until the CTO returns.
+batched to the end of the queue rather than run per-item. It has no autoloader,
+so the sanctioned cartridge named in the run file is the entire real-hardware
+budget until the CTO returns — consent covers that cartridge and no other.
 
 ## Landing work
 
@@ -71,8 +76,11 @@ What "done" requires scales with what the change touches:
 ## Stopping
 
 The run ends on whichever fires first: the queue empties, **two consecutive
-iterations land no commit** (the loop is spinning), or the wall-clock bound in
-the run file passes.
+iterations that neither land, defer, nor file** (the loop is spinning), or the
+wall-clock bound in the run file passes.
+
+Deferring a question and filing a discovery are both progress. Only an iteration
+that produces none of the three counts toward the stop.
 
 Write the closeout into the run file before stopping — what landed, what
 deferred, what is still open.

@@ -3,17 +3,26 @@
 Rules: `.claude/skills/unattended-run/SKILL.md`. Mechanics: `/autopilot`.
 
 **Wall-clock bound: end of Sunday 2026-09-13.** Started Friday 2026-09-11 06:18 UTC.
-Ends earlier if the queue empties or two consecutive iterations land no commit.
+Ends earlier if the queue empties, or two consecutive iterations neither land,
+defer, nor file.
 
 **Cold start:** read this file top to bottom, then `git log --oneline -15`. The
 queue below is authoritative; the log says how far it got.
+
+**Known failure mode — nothing restarts this run.** The loop keeps working while
+the session lives, but no scheduler can revive it: session cron is in-memory and
+dies with the session, and scheduled *cloud* agents run in a sandbox with no
+`/dev/nst0`, no mhvtl and no passed-through drive. This work is bound to this VM.
+So if the progress log stops early, the session dropped — that is the expected
+shape of the failure, not a crash to investigate. Resume by reading this file and
+picking the first queue row that is not `landed`.
 
 ## Devices (verified 2026-09-11 06:18 UTC, post-reboot)
 
 | Device | Serial | Role |
 |---|---|---|
-| `/dev/nst0` | `scsi-HUJ808A5L4-nst` | real HP LTO-6, cartridge `EW7VWMVKF6` (expendable) |
-| `/dev/nst1`–`nst4` | `scsi-XYZZY_A1..A4` | mhvtl, changer `/dev/sg4`, 43 slots loaded |
+| `/dev/nst0` | `scsi-HUJ808A5L4-nst` | real HP LTO-6 — **sanctioned cartridge `EW7VWMVKF6`** (FUJIFILM, 2017), declared expendable by the CTO 2026-09-11: standing consent for `--i-will-lose-the-cartridge EW7VWMVKF6`, that cartridge only |
+| `/dev/nst1`–`nst4` | `scsi-XYZZY_A1..A4` | mhvtl, changer `/dev/sg4` (`mtx status` for slots) |
 
 Resolve by serial, never by number — they move across reboots.
 
