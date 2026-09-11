@@ -44,9 +44,14 @@ the normative design set named in the Policy block below.
      of the three awk fixtures now come from the writer; the #135 decoy
      fixture stays hand-typed because the writer cannot emit a `name` inside
      a slice block. 749 lib / 867 total, gate GREEN, CI read after push.
-  3. **C6** RESTORE.sh: named awk fragments assembled into the script;
-     **generated script byte-identical**, pinned by a golden hash test; the
-     awk tests take their MANIFEST from `Manifest::to_toml`.
+  3. ~~**C6**~~ — **LANDED `..6551b46`** (sonnet worker, 3 commits). Six
+     `pub(crate)` consts in `volume::restore_script` (`AWK_PARSE_FILE_LIST`,
+     `AWK_CHECK_FILE_LIST`, `AWK_FIND_ENVELOPE`, `AWK_MANIFEST_HAS_UNIT`,
+     `AWK_UNIT_LIST`, `AWK_SELECT_VERSION`) spliced by `.replace` into the
+     template; six plain field-extraction awks stay inline. The golden hash
+     passed unchanged; three new tests pin fragment presence, no surviving
+     placeholder, and no apostrophe in any fragment. Tests reference the
+     #131/#133/#135 rules by name now. 763 lib / 881 total, gate GREEN.
   4. **C7** Store: `TapeStore::open_read` moves to the CLI; `volume_identify`,
      `read_slices`, `compact_read`, `restore_raw`, `rebuild` take
      `&mut dyn Store`.
