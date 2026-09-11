@@ -588,13 +588,16 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
 
 fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
     let rows = copies_rows(conn, unit_filter)?;
+    let gaps = escrow_gaps_by_unit(conn, unit_filter)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
             .map(|(name, copies, locs, vols, deposits)| {
+                let no_escrow = gaps.get(name).cloned().unwrap_or_default();
                 serde_json::json!({"unit": name, "copies": copies, "locations": locs,
-                                   "volumes": vols, "warehouse_deposits": deposits})
+                                   "volumes": vols, "warehouse_deposits": deposits,
+                                   "volumes_without_escrow": no_escrow})
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -605,9 +608,78 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
                 warehouse_note(*deposits),
                 vols.as_deref().unwrap_or("-")
             );
+            // A copy the current escrow key cannot open still counts as a
+            // copy — it is real data on a real cartridge — so this is a note
+            // beside the count, never a deduction from it. Silently lowering
+            // the number would make an archive look less safe than it is;
+            // omitting the note makes it look more recoverable than it is.
+            if let Some(labels) = gaps.get(name) {
+                if !labels.is_empty() {
+                    println!(
+                        "      escrow: NO on {} — the current escrow key cannot recover {}",
+                        labels.join(", "),
+                        if labels.len() == 1 { "it" } else { "them" }
+                    );
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Volume labels per unit that the CURRENT escrow recipient cannot recover.
+///
+/// Shares `policy::escrow`'s fail-closed classification and `audit`'s media
+/// filter with `escrow_coverage` (#125), so `report copies`, `catalog locate`
+/// and `audit` cannot disagree about a volume.
+fn escrow_gaps_by_unit(
+    conn: &Connection,
+    unit_filter: Option<&str>,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let Some(escrow) = crate::db::queries::escrow_public_key(conn)? else {
+        return Ok(out); // nothing registered; nothing to compare against
+    };
+
+    let mut sql = String::from(
+        "SELECT DISTINCT u.name, v.label, ss.key_fingerprints
+           FROM writes w
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_sets ss ON ss.id = w.stage_set_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          WHERE w.status = 'completed'
+            AND ss.encrypted = 1
+            AND v.status NOT IN ('retired', 'erased', 'missing', 'blank')",
+    );
+    if unit_filter.is_some() {
+        sql.push_str(" AND u.name = ?1");
+    }
+    sql.push_str(" ORDER BY u.name, v.label");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |row: &rusqlite::Row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    };
+    let rows: Vec<(String, String, Option<String>)> = match unit_filter {
+        Some(u) => stmt
+            .query_map(rusqlite::params![u], map)?
+            .collect::<std::result::Result<_, _>>()?,
+        None => stmt
+            .query_map([], map)?
+            .collect::<std::result::Result<_, _>>()?,
+    };
+
+    for (unit, label, fingerprints) in rows {
+        if crate::policy::escrow::gap(fingerprints.as_deref(), &escrow).is_some() {
+            out.entry(unit).or_default().push(label);
+        }
+    }
+    Ok(out)
 }
 
 /// Per-unit `(name, copies, locations, warehouse_deposits)` rows behind
@@ -1320,6 +1392,87 @@ mod tests {
     //! scan and confirm the filter now actually narrows the result.
     use super::*;
     use rusqlite::params;
+
+    /// #125's remaining half: the fact `audit` reports must also be visible
+    /// where an operator looks when planning a restore. Built on the same
+    /// fixture shape as `audit`'s own escrow tests and asserting the same
+    /// verdict, so the two surfaces are pinned to each other rather than
+    /// merely written to agree.
+    #[test]
+    fn report_copies_names_volumes_the_escrow_key_cannot_recover() {
+        const ESCROW: &str = "age1escrowescrowescrow";
+        let build = |fingerprints: Option<&str>, escrow_registered: bool| {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            if escrow_registered {
+                crate::db::queries::insert_escrow_key(&conn, tid, "escrow", ESCROW, ESCROW, None)
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-esc', 'escunit', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+                 VALUES (?1, 'staged', 524288, 1, ?2)",
+                params![snap_id, fingerprints],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('ESCVOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss_id, snap_id, vol_id],
+            )
+            .unwrap();
+            conn
+        };
+
+        // Staged without the escrow recipient — named.
+        let conn = build(Some(r#"["age1alice","age1operator"]"#), true);
+        assert_eq!(
+            escrow_gaps_by_unit(&conn, None).unwrap().get("escunit"),
+            Some(&vec!["ESCVOL".to_string()])
+        );
+
+        // Escrow among the recipients — silent.
+        let conn = build(Some(&format!(r#"["age1alice","{ESCROW}"]"#)), true);
+        assert!(escrow_gaps_by_unit(&conn, None).unwrap().is_empty());
+
+        // Fail closed: no recorded list is reported, not presumed covered.
+        let conn = build(None, true);
+        assert_eq!(
+            escrow_gaps_by_unit(&conn, None).unwrap().get("escunit"),
+            Some(&vec!["ESCVOL".to_string()])
+        );
+
+        // No escrow registered at all: nothing to compare against, so no
+        // claim is made in either direction.
+        let conn = build(Some(r#"["age1alice"]"#), false);
+        assert!(escrow_gaps_by_unit(&conn, None).unwrap().is_empty());
+    }
     use tempfile::TempDir;
 
     /// Issue #73 / ADR-0006: the three advisory surfaces that print a

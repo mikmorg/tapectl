@@ -8,6 +8,7 @@ pub mod compression_capability;
 pub mod coverage;
 pub mod decorative;
 pub mod depth_check;
+pub mod escrow;
 pub mod evidence;
 pub mod reclaimable;
 pub mod shadowing;

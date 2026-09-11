@@ -330,17 +330,9 @@ fn collect_findings(
 
             for row in rows {
                 let (label, stage_set_id, fingerprints) = row?;
-                // Fail closed: an absent or unparseable recipient list is
-                // reported, not assumed covered. A stage set that recorded no
-                // list cannot be shown to be escrow-recoverable.
-                let reason = match fingerprints.as_deref() {
-                    None => Some("no recorded recipient list".to_string()),
-                    Some(json) => match serde_json::from_str::<Vec<String>>(json) {
-                        Ok(keys) if keys.iter().any(|k| k == escrow) => None,
-                        Ok(_) => Some("encrypted without the current escrow recipient".to_string()),
-                        Err(_) => Some("recipient list is unreadable".to_string()),
-                    },
-                };
+                // Fail-closed classification lives in `policy::escrow` so this
+                // check, `catalog locate` and `report copies` cannot disagree.
+                let reason = crate::policy::escrow::gap(fingerprints.as_deref(), escrow);
 
                 if let Some(reason) = reason {
                     warnings.push(AuditFinding {

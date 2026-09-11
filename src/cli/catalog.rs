@@ -86,6 +86,12 @@ struct LocationRow {
     /// `Location`, which means "where the cartridge physically sits".
     #[tabled(rename = "Warehouse")]
     warehouse: String,
+    /// Whether the CURRENT escrow recipient can still recover this volume
+    /// (#125). `locate` answers "where do I go to get this back"; for a
+    /// volume staged before an escrow swap the honest answer includes "and
+    /// not with the escrow key". `-` when no escrow is registered at all.
+    #[tabled(rename = "Escrow")]
+    escrow: String,
 }
 
 /// Where a unit's completed writes live, and whether each can actually
@@ -104,6 +110,7 @@ struct LocationRow {
 /// predicate the destructive gates and reports use (issue #89) — so `locate`
 /// cannot disagree with them about whether coverage exists.
 fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
+    let escrow = crate::db::queries::escrow_public_key(conn)?;
     let sealed = crate::policy::coverage::eligible("v");
     let sql = format!(
         "SELECT v.label, v.status, COALESCE(l.name, 'unknown'),
@@ -112,7 +119,8 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                 (SELECT GROUP_CONCAT(dl.name)
                    FROM volume_deposits d
                    JOIN locations dl ON dl.id = d.location_id
-                  WHERE d.volume_id = v.id)
+                  WHERE d.volume_id = v.id),
+                ss.key_fingerprints
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
@@ -136,6 +144,11 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                 warehouse: row
                     .get::<_, Option<String>>(7)?
                     .unwrap_or_else(|| "-".into()),
+                escrow: crate::policy::escrow::marker(
+                    row.get::<_, Option<String>>(8)?.as_deref(),
+                    escrow.as_deref(),
+                )
+                .to_string(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
