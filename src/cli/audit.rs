@@ -2079,7 +2079,9 @@ mod tests {
             let (_violations, warnings) =
                 collect_findings(&conn, &Config::default(), None).unwrap();
             assert!(
-                warnings.iter().any(|f| f.check == "escrow_identity_mismatch"),
+                warnings
+                    .iter()
+                    .any(|f| f.check == "escrow_identity_mismatch"),
                 "not wired: {:?}",
                 warnings.iter().map(|f| &f.check).collect::<Vec<_>>()
             );
