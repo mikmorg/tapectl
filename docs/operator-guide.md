@@ -863,8 +863,40 @@ notably not `tapectl`.
 
 ### If you hold the operator or escrow key: rebuild the catalog
 
-`catalog rebuild` reads a sealed tape and inserts whatever catalog rows are
-missing, so `restore`, `catalog ls` and `report` work again:
+There are two sources, and the procedure is to use both, in this order:
+
+1. **Restore the heir kit's database.** `key escrow-kit` bundled the **whole**
+   `tapectl.db` at generation time (ADR-0009) — every row, every escrow
+   receipt — as `catalog.db.age`, encrypted to the escrow key. That is the
+   catalog as of the last kit.
+2. **Rebuild every tape sealed since.** `audit`'s `escrow_kit_stale` names
+   exactly that set. `catalog rebuild --from-volume` reconstructs each one
+   from the tape's own envelope.
+
+Before either step, on a rebuilt machine:
+
+```bash
+tapectl init --no-escrow                      # do NOT let init mint a new escrow identity
+tapectl key import --escrow age1…             # the ORIGINAL escrow public key, from the kit's cover sheet
+```
+
+Every escrow check compares against the escrow recipient this catalog has
+*registered*. A plain `init` registers a brand-new one, and every tape was
+encrypted to the old one — so until the original is imported, everything
+reads `NO: encrypted without the current escrow recipient`, `volume write`
+refuses to re-copy, and nothing can be attested. `audit` will tell you this
+happened (`escrow_identity_mismatch`, naming the key), but the import is
+step one regardless.
+
+**If you already ran a plain `init`:** there is only ever one escrow identity
+(ADR-0005) and no command replaces it — `key import --escrow` refuses while
+one is registered. The new home holds nothing yet, so remove it and start
+again with `init --no-escrow`. Do this *before* restoring or rebuilding
+anything into it.
+([#139](https://github.com/mikmorg/tapectl/issues/139) proposes
+`init --escrow-public-key` so there is no wrong order to get into.)
+
+Then, for each tape newer than the kit:
 
 ```bash
 tapectl catalog rebuild --from-volume \
@@ -883,8 +915,20 @@ What comes back, and from where:
 |---|---|
 | volume identity, media, capacity | the ID thunk (tape file 0) |
 | units, snapshots, slice map, plaintext hashes | each envelope's `MANIFEST.toml` |
-| tenant ownership | the tenant envelopes |
-| the per-file index and original source paths | the operator envelope's `catalog.db` |
+| tenant ownership, escrow receipts, the per-file index | the operator envelope's `catalog.db` (tapes written after 2026-09-11); older tapes give ownership from the tenant envelopes and no receipt |
+
+**Escrow coverage on rebuilt rows.** A tape written after 2026-09-11 carries
+each stage set's recipient list, so its rebuilt rows are covered like any
+other. An older tape does not, and those rows show **`?`** in
+`catalog locate` — *unknown*, not covered: `audit` warns, and `volume write`
+still needs `--allow-missing-escrow` to re-copy them. Two ways to resolve it:
+
+- **Attest.** Run the rebuild again with the escrow key itself:
+  `catalog rebuild --from-volume --device … --key <escrow secret key>`. If
+  that key is the one this catalog has registered, the command decrypts one
+  slice *header* per stage set — a few hundred bytes, not the slice — and
+  records the coverage it just proved. Rows it cannot open stay `?`.
+- **Re-stage** the unit to a new tape, which records a fresh receipt.
 
 Rebuilt units come back as `active`, so `audit` sees them. Expect it to start
 reporting the truth immediately — a single cartridge is one copy, and if your
@@ -895,14 +939,10 @@ tapectl audit                       # exit 2 on a one-copy rebuild is correct
 tapectl volume verify --label VOL0001 --device /dev/nst0 --full
 ```
 
-Three things it deliberately does not do:
+Two things the rebuild deliberately does not do:
 
 - **It does not verify the tape.** The hashes it records are the tape's own
-  claim about itself. Run `tapectl volume verify --label VOL0001` afterwards to
-  turn that into a checked claim.
-- **It cannot rebuild escrow coverage.** No tape records a recipient list, so
-  rebuilt units report `escrow: NO` and `audit` will flag them. Unknown is not
-  the same as covered — see issue #137.
+  claim about itself. `volume verify` turns that into a checked claim.
 - **It refuses a tenant key**, because a tenant key cannot open the operator
   envelope. That is not a restriction on the tenant: they do not need a catalog
   at all, and the refusal points them at RESTORE.sh above.

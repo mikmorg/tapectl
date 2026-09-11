@@ -89,6 +89,30 @@ and all content metadata live only inside the encrypted envelopes and the catalo
 which itself rides each volume encrypted (the operator envelope's catalog snapshot,
 #83) and survives the machine via the Heir Kit (#69).
 
+**Self-describing — what that promises (normative, 2026-09-11).** The phrase
+is used throughout this repo and was defined nowhere; #136 was the first
+attempt to reconstruct the *operator's* view from tape, which is how the
+boundary became visible. A sealed volume promises two things and withholds
+a third:
+
+1. **Data.** Every unit on it is restorable by its tenant with that tenant's
+   key and standard tools — `mt`, `dd`, `age`, `dar`, `sha256sum` — with no
+   tapectl and no database (`RESTORE.sh`, tape file 2). This is the heir path
+   and it is proven on real hardware.
+2. **Catalog.** With the operator or escrow key, `catalog rebuild --from-volume`
+   reconstructs everything the catalog knew about this write *at staging
+   time*: volume identity, units, snapshots, the slice map and plaintext
+   hashes (the envelope `MANIFEST.toml`), tenant ownership, each stage set's
+   recorded recipient list and the per-file index (the operator envelope's
+   `catalog.db`). Tapes written before 2026-09-11 carry an older `catalog.db`
+   without ownership or receipts; the rebuild takes ownership from the
+   tenant envelopes and reports the receipt as unknown.
+3. **Never on the tape:** where the cartridge is, whether it has been
+   verified and when, what policy applies to a unit, warehouse deposits, and
+   any fact the catalog knows only because the operator did something after
+   the write. Those survive a lost database only through `db backup` and the
+   Heir Kit (ADR-0009).
+
 **Accepted disclosure (operator ruling, 2026-07-22).** Encryption overhead is
 deterministic and compression is off, so an on-tape size approximates the content
 size it encloses — and at fine unit granularity (one folder = one unit = one slice,

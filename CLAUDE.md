@@ -168,7 +168,7 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 - **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical first-fit batch selector, stage-once/write-N-copies/release
 
 **Design principles:**
-- Volumes are self-describing — full restore possible without the database or tapectl
+- Volumes are self-describing — full data restore without the database or tapectl, and catalog rebuild with the operator/escrow key; what that does and does not promise is defined in `docs/design/volume-format-v2.md` ("Self-describing — what that promises")
 - Strict tenant isolation — zero content metadata in plaintext on tape; tenant envelopes use age trial-decryption
 - Multi-tenant bin-packing on shared volumes
 - Physical cartridges tracked separately from logical volumes (cartridges can be erased/reused)

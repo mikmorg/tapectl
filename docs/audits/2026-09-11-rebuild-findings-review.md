@@ -126,6 +126,13 @@ Ok(_) => Some("encrypted without the current escrow recipient"),
 
 ## #137, restated
 
+> **Correction (later the same day):** `escrow_coverage` was already an `audit`
+> **warning** (exit 1), not a violation, before any of this. The review above
+> and the issue thread called it an "un-clearable violation"; that overstated
+> it. What the third state buys is *distinguishability* — wording, `?` in
+> `catalog locate`, and what the write gate says — not a severity change.
+
+
 The original framing said the consequence "only bites once you're actually using escrow". That was wrong: `init` creates escrow by default and `volume write` refuses to write without it (#115). On a normal install a rebuilt unit shows `NO`, and the cost is paid twice — a permanent audit finding, and `--allow-missing-escrow` on the exact operation wanted after a disaster.
 
 Findings 3 and 4 change its shape. With a kit restored and the original escrow key imported, the noise is confined to post-kit tapes, and regenerating the kit is already the prescribed remedy. With Finding 2a, it stops arising on new tapes at all.
@@ -138,11 +145,11 @@ Findings 3 and 4 change its shape. With a kit restored and the original escrow k
 
 | # | Item | Tag | Where |
 |---|---|---|---|
-| 1 | `audit` scoping per check | settle, **fix** | #138 |
-| 2 | `catalog.db` becomes a complete rebuild source | defer | grill |
+| 1 | `audit` scoping per check | settle, **fix** | #138 — **landed `ba8a4a1`** |
+| 2 | `catalog.db` becomes a complete rebuild source | defer | grilled 2026-09-11, ratified (a) — **landed `4292cf9`** |
 | 3 | DR section written as kit + rebuild | settle, docs | operator guide |
 | 4 | import the original escrow key; fix arm (d); verify the kit prints it | settle | operator guide, lifecycle suite, #69 |
 | 5 | define "self-describing" | settle, docs | `volume-format-v2.md` |
-| — | #137 decision: accept narrowed noise, or third state | defer | grill, with 2 |
+| — | #137 decision: accept narrowed noise, or third state | defer | grilled, ratified: third state + attestation — **landed `d5c9638`** (third state) |
 
 Two items want the CTO (2 and the #137 choice); they are the same decision seen from two sides and should be grilled together. Everything else is a settle and can proceed on ratification.
