@@ -328,6 +328,9 @@ pub fn run(
                             "slices": r.slices,
                             "written": r.written,
                             "serviceable": r.serviceable == "yes",
+                            // Same words as the table column: "yes" / "NO" /
+                            // "?" (rebuilt, unknown) / "-" (no escrow registered).
+                            "escrow": r.escrow,
                             "warehouse_deposits": if r.warehouse == "-" {
                                 Vec::new()
                             } else {
