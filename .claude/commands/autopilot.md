@@ -18,7 +18,7 @@ the normative design set named in the Policy block below.
 
 - **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — IN PROGRESS.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
-  queue is the seven candidates in `docs/audits/2026-09-11-deepening-review`
+  queue is the seven candidates of the architecture review — not in the repo
   (report: `/tmp/architecture-review-20260911-180729.html`, artifact
   https://claude.ai/code/artifact/5625257c-2dcb-43ee-aaf5-6c679cb5c3f1).
   Take in this order — dependency and blast radius, not preference:
@@ -27,9 +27,16 @@ the normative design set named in the Policy block below.
      report copies, write pre-flight) call it; the write pre-flight's private
      JSON parse and reason strings are deleted. Volume filter: **`in_service`**
      (coordinator decision, recorded in the commit; the CTO can flip it).
-  2. **C3** MANIFEST.toml: one `format::Manifest` type, `to_toml`/`from_toml`.
-     **Bytes on tape must be identical** — a golden test pins the writer's
-     output before and after; `to_toml` keeps the hand format.
+  2. ~~**C3**~~ — **LANDED `bed8338..ed14c92`** (cherry-picked from a sonnet
+     worker, 4 commits). `volume::manifest::Manifest` with `to_toml` (the
+     moved hand format, byte-identical — `tests/on_tape_golden.rs` passed
+     unchanged) and `from_toml` (serde, tolerant of pre-#134
+     `layout_version`); `layout::ManifestUnit`/`envelope::*` are re-exports,
+     `EnvelopeManifest` stays a nested view because `rebuild.rs` reads
+     `.manifest.manifest.tenant`; `tape_position` is i64 on both sides. Two
+     of the three awk fixtures now come from the writer; the #135 decoy
+     fixture stays hand-typed because the writer cannot emit a `name` inside
+     a slice block. 749 lib / 867 total, gate GREEN, CI read after push.
   3. **C6** RESTORE.sh: named awk fragments assembled into the script;
      **generated script byte-identical**, pinned by a golden hash test; the
      awk tests take their MANIFEST from `Manifest::to_toml`.
