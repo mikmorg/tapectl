@@ -1372,41 +1372,21 @@ front_index_sha256 = "{front_index_sha256}"
 }
 
 /// Generate MANIFEST.toml for a tenant envelope.
+///
+/// A thin wrapper over [`crate::volume::manifest::Manifest::to_toml`] — the
+/// single writer/reader type for the on-tape envelope manifest (see
+/// `src/volume/manifest.rs`). Kept here, under its original name and
+/// signature, because every call site addresses it as `layout::
+/// generate_manifest_toml`.
 pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestUnit]) -> String {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut s = format!(
-        r#"[manifest]
-volume = "{label}"
-tenant = "{tenant_name}"
-created_at = "{now}"
-
-"#
-    );
-
-    for unit in units {
-        s.push_str(&format!(
-            "[[units]]\nname = \"{}\"\nuuid = \"{}\"\nsnapshot_version = {}\nstage_set_id = {}\n",
-            unit.name, unit.uuid, unit.snapshot_version, unit.stage_set_id,
-        ));
-        if let Some(ref dar_ver) = unit.dar_version {
-            s.push_str(&format!("dar_version = \"{dar_ver}\"\n"));
-        }
-        if let Some(ref cmd) = unit.dar_command {
-            // TOML basic-string escape for the command line.
-            let esc = cmd.replace('\\', "\\\\").replace('"', "\\\"");
-            s.push_str(&format!("dar_command = \"{esc}\"\n"));
-        }
-        s.push('\n');
-        for slice in &unit.slices {
-            s.push_str(&format!(
-                "[[units.slices]]\nnumber = {}\ntape_position = {}\nsize_bytes = {}\nencrypted_bytes = {}\nsha256_plain = \"{}\"\nsha256_encrypted = \"{}\"\n\n",
-                slice.number, slice.tape_position, slice.size_bytes,
-                slice.encrypted_bytes, slice.sha256_plain, slice.sha256_encrypted,
-            ));
-        }
-    }
-
-    s
+    let manifest = crate::volume::manifest::Manifest {
+        volume: label.to_string(),
+        tenant: tenant_name.to_string(),
+        created_at: now,
+        units: units.to_vec(),
+    };
+    manifest.to_toml()
 }
 
 /// Generate RECOVERY.md for a tenant envelope.
@@ -1494,24 +1474,13 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
     s
 }
 
-pub struct ManifestUnit {
-    pub name: String,
-    pub uuid: String,
-    pub snapshot_version: i64,
-    pub stage_set_id: i64,
-    pub dar_version: Option<String>,
-    pub dar_command: Option<String>,
-    pub slices: Vec<ManifestSlice>,
-}
-
-pub struct ManifestSlice {
-    pub number: i64,
-    pub tape_position: i32,
-    pub size_bytes: i64,
-    pub encrypted_bytes: i64,
-    pub sha256_plain: String,
-    pub sha256_encrypted: String,
-}
+/// Re-exported so every existing `layout::ManifestUnit` / `layout::
+/// ManifestSlice` path keeps compiling. The canonical definitions live in
+/// [`crate::volume::manifest`], which both this module's writer and
+/// `envelope`'s reader now share. `ManifestSlice::tape_position` is `i64`
+/// here (previously `i32` in this module) — the reader's original, wider
+/// type; the writer's `i32` was the narrower mistake.
+pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 
 #[cfg(test)]
 mod tests {
@@ -2202,34 +2171,34 @@ mod tests {
         let close = body[open + 1..].find('\'').expect("awk program closes");
         let program = &body[open + 1..open + 1 + close];
 
-        let manifest = "\
-[[units]]
-name = \"photos\"
-snapshot_version = 1
-[[units.slices]]
-number = 1
-tape_position = 20
-encrypted_bytes = 111
-sha256_encrypted = \"aaa\"
-
-[[units]]
-name = \"docs\"
-snapshot_version = 1
-[[units.slices]]
-number = 1
-tape_position = 21
-encrypted_bytes = 222
-sha256_encrypted = \"bbb\"
-
-[[units]]
-name = \"photos\"
-snapshot_version = 2
-[[units.slices]]
-number = 1
-tape_position = 30
-encrypted_bytes = 333
-sha256_encrypted = \"ccc\"
-";
+        // Built through the real writer, not hand-typed: a hand-typed sample
+        // would keep parsing after the writer's shape changed underneath it.
+        let unit =
+            |name: &str, version: i64, tape_position: i64, eb: i64, sha: &str| ManifestUnit {
+                name: name.to_string(),
+                uuid: format!("uuid-{name}-{version}"),
+                snapshot_version: version,
+                stage_set_id: version,
+                dar_version: None,
+                dar_command: None,
+                slices: vec![ManifestSlice {
+                    number: 1,
+                    tape_position,
+                    size_bytes: 1,
+                    encrypted_bytes: eb,
+                    sha256_plain: "x".repeat(64),
+                    sha256_encrypted: sha.to_string(),
+                }],
+            };
+        let manifest = generate_manifest_toml(
+            "MULTI1",
+            "alice",
+            &[
+                unit("photos", 1, 20, 111, "aaa"),
+                unit("docs", 1, 21, 222, "bbb"),
+                unit("photos", 2, 30, 333, "ccc"),
+            ],
+        );
         let dir = std::env::temp_dir().join(format!("tapectl-awk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let man = dir.join("MANIFEST.toml");
@@ -2306,23 +2275,22 @@ sha256_encrypted = \"ccc\"
         let close = body[open + 1..].find('\'').expect("awk program closes");
         let program = &body[open + 1..open + 1 + close];
 
-        let manifest = "\
-[manifest]
-volume = \"MULTI2\"
-tenant = \"alice\"
-
-[[units]]
-name = \"photos\"
-snapshot_version = 1
-
-[[units]]
-name = \"photos\"
-snapshot_version = 2
-
-[[units]]
-name = \"docs\"
-snapshot_version = 1
-";
+        // Built through the real writer, not hand-typed (see the sibling
+        // #131 test above for why).
+        let unit = |name: &str, version: i64| ManifestUnit {
+            name: name.to_string(),
+            uuid: format!("uuid-{name}-{version}"),
+            snapshot_version: version,
+            stage_set_id: version,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![],
+        };
+        let manifest = generate_manifest_toml(
+            "MULTI2",
+            "alice",
+            &[unit("photos", 1), unit("photos", 2), unit("docs", 1)],
+        );
         let dir = std::env::temp_dir().join(format!("tapectl-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let man = dir.join("MANIFEST.toml");
