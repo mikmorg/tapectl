@@ -76,37 +76,32 @@ not bundle verification — `volume verify` already exists.
 A real-drive confirmation pass is owed at the end of this round for the
 #134/#135 heir-path byte changes; it is batched, not per-commit.
 
-## Real-drive confirmation pass #2 — OWED, BLOCKED (#134/#135)
+## Real-drive confirmation pass #2 — DONE 2026-09-11 14:50 UTC (#134/#135)
 
 `64d3f91` changed frozen on-tape bytes again: the envelope `MANIFEST.toml`
 (#134 dropped `layout_version = 1`) and File 2's RESTORE.sh (#135 scoped the
-version selector to the `[[units]]` head). That owes a second pass on the real
-LTO-6, and it is blocked the same way the first one was — the auto-mode
-classifier refuses `--i-will-lose-the-cartridge` as irreversible deletion, and
-the CTO's 12:40 grant did not persist into `.claude/settings.local.json`.
+version selector to the `[[units]]` head). The CTO granted the permission and
+it ran, with a guard that aborts unless `sg_read_attr /dev/sg0` reports the
+sanctioned expendable cartridge:
 
-To unblock, add a persistent rule rather than a one-time approval:
+    ./scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst0 \
+        --erase short --single-cartridge --i-will-lose-the-cartridge EW7VWMVKF6
 
-```json
-"Bash(./scripts/lifecycle-suite.sh:*)"
-```
+**45 checks, 45 passed, 0 failed, 0 skipped** on the real HP LTO-6.
 
-Then run, with `EW7VWMVKF6` loaded in `scsi-HUJ808A5L4-nst`:
+As in pass #1, the suite passing is not the same claim as "the new bytes are
+on the tape", so both changed zones were read back off the cartridge:
 
-```bash
-./scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst0 \
-    --erase short --single-cartridge --i-will-lose-the-cartridge EW7VWMVKF6
-```
+| Change | Evidence off `EW7VWMVKF6` |
+|---|---|
+| #135, File 2 | `dd` from tape file 2 carries the `in_head` guard at lines 675-691 (`/^\[\[units\]\]/ ... in_head = 1`, `/^\[/ { in_head = 0 }`, `in_u && in_head && /^snapshot_version = /`), and the extracted script is `bash -n` clean |
+| #134, envelope manifest | the envelope at tape file 4, decrypted with alice's key, has a `[manifest]` header of `volume` / `tenant` / `created_at` and **zero** occurrences of `layout_version` anywhere |
 
-and read back the two changed zones off the cartridge: File 2 must carry the
-`in_head` guard, and the envelope `MANIFEST.toml`, decrypted with a tenant
-key, must carry no `layout_version`.
-
-**What is NOT outstanding:** both changes are already proven on mhvtl tape —
-the gate is GREEN 26/26 including `heir_extract_script`, `heir_find_envelope`,
-`heir_restore` and `heir_restore_symlink_unit` against the new bytes. The gap
-is narrowly "the same bytes on real hardware", which is the class of thing the
-2026-09-10 session showed can still differ.
+And the script read *off the cartridge* was executed, not merely grepped:
+`--find-envelope --key alice-primary.age.key` walked the ID thunk, found the
+tenant envelope at file 4, decrypted it, and printed the slice map
+(`tape_position = 8..14`) — which is the #135 selector doing its job on real
+tape.
 
 ## Real-drive confirmation pass #1 — DONE 2026-09-11 12:45 UTC
 
@@ -142,6 +137,7 @@ value` instead of dying silently, and `--info` announces
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 14:50 | #134/#135 | **real-drive pass #2 DONE — 45/45 on the HP LTO-6.** The CTO granted the permission. Both changed zones read back off `EW7VWMVKF6`: File 2 carries the `in_head` guard and is `bash -n` clean; the envelope at file 4, decrypted with alice's key, has no `layout_version`. The script taken off the cartridge was executed, not grepped — `--find-envelope` found and decrypted the tenant envelope and printed `tape_position = 8..14`. |
 | 09-11 14:45 | #136 | **follow-up: a rebuilt catalog was QUIETER than the truth.** Rebuilt units were inserted `tape_only`; `audit` scopes every per-unit check to `status = 'active'`, so the rebuilt catalog reported 0 violations where the one it replaced reported 3 `copy_count` violations for the same units on the same tape. Fixed to `active` — which is also the honest value, since `tape_only` is a policy state `mark-tape-only` sets after checking preconditions. Negative control confirmed red. Also: `volumes.backend_name` was the invented literal `"rebuilt"`; now resolved from config like `volume_import`. And `volume verify --full`, which the command's own output tells the operator to run next, was never exercised — it is now arm (d)'s last step, 23/23. 839 tests (+3), gate GREEN 26/26, db-loss 6/6. |
 | 09-11 14:20 | #134/#135 | real-drive pass **BLOCKED AGAIN**. The auto-mode classifier refused `--i-will-lose-the-cartridge` as irreversible deletion; the grant the CTO made at 12:40 was session-scoped and did not persist as a rule in `.claude/settings.local.json`. Not retried in variant forms. Everything the pass would confirm is already green on mhvtl (gate 26/26, including `heir_restore` and `heir_find_envelope` against the new File 2); what is outstanding is narrowly "the same bytes land on real LTO-6 hardware". |
 | 09-11 14:12 | #136 | landed `edef129`, closing the issue. Gate GREEN 26/26. **db-loss 6/6 — green for the first time**: arm (b) was this suite's last expected failure, and arm (d) rebuilt 3 units / 2 tenants / 14 slices / 22 file rows off mhvtl tape, restored `photos` byte-identical through the rebuilt rows, then rebuilt again to all zeros. 730 lib tests (+7), 836 total. |
@@ -180,8 +176,8 @@ push, and `db-loss` reached 6/6 — the first time that scenario has been fully
 green, because its arm (b) was the suite's last standing expected failure.
 
 Deferred to the CTO: **#137** (a rebuilt catalog can never prove escrow
-coverage). Blocked: the **second real-drive confirmation pass**, on a
-permission rule rather than on anything technical — see the section above.
+coverage) — the only thing left open. The **second real-drive confirmation
+pass is DONE**, 45/45, with both changed zones read back off the cartridge.
 
 Round 2's lessons, both of which cost a real correction:
 
