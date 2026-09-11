@@ -22,15 +22,20 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 use crate::error::{Result, TapectlError};
 use crate::store::Store;
 use crate::util::TruncatingWriter;
 use crate::volume::format::ParsedIndexEntry;
+pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 
 /// The `[manifest]` header of an envelope's `MANIFEST.toml`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+///
+/// A local, nested mirror of the flat header fields on
+/// [`crate::volume::manifest::Manifest`] (the single on-tape MANIFEST.toml
+/// type, shared with the writer). Kept nested here — rather than flattened
+/// onto [`EnvelopeManifest`] — because existing callers (`volume::rebuild`)
+/// address it as `envelope.manifest.manifest.tenant`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestHeader {
     /// Volume label, as the writing tapectl knew it.
     pub volume: String,
@@ -41,48 +46,14 @@ pub struct ManifestHeader {
     pub created_at: String,
 }
 
-/// One `[[units.slices]]` block.
-///
-/// `tape_position` is the file number on tape and is NOT the slice number:
-/// slices begin after the envelopes (position 8 on a typical layout), and
-/// the two diverge further on a multi-unit volume. Confusing them yields a
-/// broken archive — see the `#72` retrieval-guide note.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ManifestSlice {
-    pub number: i64,
-    pub tape_position: i64,
-    pub size_bytes: i64,
-    pub encrypted_bytes: i64,
-    /// Present ONLY here. The on-tape `catalog.db` omits `sha256_plain`, and
-    /// the plaintext front index may never carry it.
-    pub sha256_plain: String,
-    pub sha256_encrypted: String,
-}
-
-/// One `[[units]]` block and its slices.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ManifestUnit {
-    pub name: String,
-    pub uuid: String,
-    pub snapshot_version: i64,
-    pub stage_set_id: i64,
-    #[serde(default)]
-    pub dar_version: Option<String>,
-    #[serde(default)]
-    pub dar_command: Option<String>,
-    #[serde(default)]
-    pub slices: Vec<ManifestSlice>,
-}
-
 /// A parsed envelope `MANIFEST.toml`.
 ///
-/// Deliberately NOT `deny_unknown_fields`: tapes written before #134 carry a
-/// `layout_version = 1` key in `[manifest]` that no longer exists, and a
-/// rebuild must read those tapes. Pinned by a test.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// A nested view over [`crate::volume::manifest::Manifest`], kept in this
+/// shape (rather than a plain re-export of `Manifest`) for the existing
+/// `.manifest.manifest.tenant`-style call sites in `volume::rebuild`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvelopeManifest {
     pub manifest: ManifestHeader,
-    #[serde(default)]
     pub units: Vec<ManifestUnit>,
 }
 
@@ -95,9 +66,20 @@ impl EnvelopeManifest {
 }
 
 /// Parse an envelope `MANIFEST.toml`.
+///
+/// Thin wrapper over [`crate::volume::manifest::Manifest::from_toml`] that
+/// reshapes the flat [`crate::volume::manifest::Manifest`] into the nested
+/// [`EnvelopeManifest`] this module's callers expect.
 pub fn parse_manifest(text: &str) -> Result<EnvelopeManifest> {
-    toml::from_str(text)
-        .map_err(|e| TapectlError::Other(format!("envelope MANIFEST.toml: parse failed: {e}")))
+    let m = crate::volume::manifest::Manifest::from_toml(text)?;
+    Ok(EnvelopeManifest {
+        manifest: ManifestHeader {
+            volume: m.volume,
+            tenant: m.tenant,
+            created_at: m.created_at,
+        },
+        units: m.units,
+    })
 }
 
 /// An envelope opened off tape.
