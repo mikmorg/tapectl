@@ -64,9 +64,18 @@ the normative design set named in the Policy block below.
      `rebuild::Supplement::load` is a caller. Shape unchanged. **Queued CTO
      question:** a generation STAMP inside catalog.db (bytes on tape) — not
      needed today; the probe is the reader. 766 lib / 884 total, gate GREEN.
-  6. **C2** row structs derive `Serialize`; JSON arm = `to_string_pretty`.
-     **Existing JSON key names are a contract** — `#[serde(rename)]` keeps
-     every key exactly as shipped; `cli_smoke.rs` assertions must not change.
+  6. ~~**C2**~~ — **LANDED `..d13de21`** (sonnet worker, 4 commits). The
+     JSON shape of every row listing was PINNED first (one test per struct,
+     from the pre-refactor `json!` arm), then eight row structs got typed
+     fields + `Serialize` with `#[serde(rename)]`/`serialize_with` so both
+     views derive from one struct; `catalog.rs` no longer reverse-parses its
+     own display strings. Three commands (`tenant list`, `key list`, `unit
+     list`) keep serializing `db::models` directly — richer than the row,
+     so wiring the row would change the contract either way; they got
+     `Serialize` + a parity pin and a doc comment. **Queued CTO question:**
+     twelve table-only columns have no `--json` counterpart (e.g.
+     `FileRow.modified`, `SnapshotRow.{files,size,created}`); adding keys is
+     a contract change. 777 lib / 895 total; no tape path, no gate owed.
   7. **C4** audit check table + one runner; findings order and text identical.
   Rules for this queue: one worktree sub-agent per item (sonnet), coordinator
   reviews and cherry-picks, full gate after each, mhvtl gate for anything under
