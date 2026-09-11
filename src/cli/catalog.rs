@@ -85,6 +85,17 @@ struct FileRow {
     sha256: String,
 }
 
+/// `catalog ls --json` shape, extracted verbatim from the inline closure so
+/// it is a single seam pinned by a unit test (issue: C2 row-listing drift).
+/// `modified` has no JSON counterpart today and none is added here.
+fn file_rows_to_json(rows: &[FileRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| serde_json::json!({"path": r.path.trim(), "size": r.size, "sha256": r.sha256}))
+            .collect(),
+    )
+}
+
 #[derive(Tabled, Debug)]
 struct LocationRow {
     #[tabled(rename = "Volume")]
@@ -223,6 +234,37 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     Ok(rows)
 }
 
+/// `catalog locate --json` shape, extracted verbatim from the inline closure
+/// so it is a single seam pinned by a unit test (issue: C2 row-listing
+/// drift). Still reverse-parses `serviceable`/`warehouse` out of their
+/// display strings at this stage -- change 2 retypes the fields so this
+/// becomes a straight `serde_json::to_value(rows)`.
+fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "volume": r.volume,
+                    "status": r.status,
+                    "location": r.location,
+                    "version": r.version,
+                    "slices": r.slices,
+                    "written": r.written,
+                    "serviceable": r.serviceable == "yes",
+                    // Same words as the table column: "yes" / "NO" /
+                    // "?" (rebuilt, unknown) / "-" (no escrow registered).
+                    "escrow": r.escrow,
+                    "warehouse_deposits": if r.warehouse == "-" {
+                        Vec::new()
+                    } else {
+                        r.warehouse.split(',').map(str::to_string).collect::<Vec<_>>()
+                    },
+                })
+            })
+            .collect(),
+    )
+}
+
 pub fn run(
     conn: &Connection,
     config: &crate::config::Config,
@@ -279,13 +321,10 @@ pub fn run(
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if json_output {
-                let json: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({"path": r.path.trim(), "size": r.size, "sha256": r.sha256})
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&file_rows_to_json(&rows)).unwrap()
+                );
             } else if rows.is_empty() {
                 println!("no files found");
             } else {
@@ -347,29 +386,10 @@ pub fn run(
             let rows = locate_rows(conn, unit_row.id)?;
 
             if json_output {
-                let json: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "volume": r.volume,
-                            "status": r.status,
-                            "location": r.location,
-                            "version": r.version,
-                            "slices": r.slices,
-                            "written": r.written,
-                            "serviceable": r.serviceable == "yes",
-                            // Same words as the table column: "yes" / "NO" /
-                            // "?" (rebuilt, unknown) / "-" (no escrow registered).
-                            "escrow": r.escrow,
-                            "warehouse_deposits": if r.warehouse == "-" {
-                                Vec::new()
-                            } else {
-                                r.warehouse.split(',').map(str::to_string).collect::<Vec<_>>()
-                            },
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&location_rows_to_json(&rows)).unwrap()
+                );
             } else if rows.is_empty() {
                 println!("unit \"{unit}\" not found on any volume");
             } else {
@@ -623,6 +643,70 @@ mod tests {
 
     use super::*;
     use crate::db;
+
+    // --- C2 pins: `catalog ls`/`catalog locate` --json shapes, locked down
+    // BEFORE the row structs are retyped (issue: C2 row-listing drift). ---
+
+    /// `d ` (or `  `) is prefixed onto `path` for table display and then
+    /// `.trim()`-ed for JSON in the current code. `.trim()` strips
+    /// whitespace only, so a directory row's `"d "` prefix survives into
+    /// JSON — that quirk is part of the pinned contract, not a bug this
+    /// task fixes.
+    #[test]
+    fn pin_file_rows_json_shape() {
+        let rows = vec![
+            FileRow {
+                path: "d subdir".to_string(),
+                size: "-".to_string(),
+                modified: "2026-01-01T00:00:00Z".to_string(),
+                sha256: "(unstaged)".to_string(),
+            },
+            FileRow {
+                path: "  some/file.txt".to_string(),
+                size: "1.2 KB".to_string(),
+                modified: String::new(),
+                sha256: "0123456789ab...".to_string(),
+            },
+        ];
+        let value = file_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"path":"d subdir","sha256":"(unstaged)","size":"-"},{"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KB"}]"#
+        );
+    }
+
+    #[test]
+    fn pin_location_rows_json_shape() {
+        let rows = vec![
+            LocationRow {
+                volume: "L6-0001".to_string(),
+                status: "sealed".to_string(),
+                location: "unknown".to_string(),
+                version: 1,
+                slices: 3,
+                written: "2026-07-01T00:00:00Z".to_string(),
+                serviceable: "yes".to_string(),
+                warehouse: "-".to_string(),
+                escrow: "-".to_string(),
+            },
+            LocationRow {
+                volume: "L6-0002".to_string(),
+                status: "quarantined".to_string(),
+                location: "parents-house".to_string(),
+                version: 2,
+                slices: 0,
+                written: String::new(),
+                serviceable: "NO".to_string(),
+                warehouse: "glacier,vault2".to_string(),
+                escrow: "?".to_string(),
+            },
+        ];
+        let value = location_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"escrow":"-","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"escrow":"?","location":"parents-house","serviceable":false,"slices":0,"status":"quarantined","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
+        );
+    }
 
     /// A unit with completed writes to two volumes: one `sealed`, one in
     /// `second_status`. The second volume is given a physical location; the

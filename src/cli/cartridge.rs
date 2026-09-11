@@ -59,6 +59,18 @@ struct CartridgeRow {
     volume: String,
 }
 
+/// `cartridge list --json` shape, extracted verbatim from the inline closure
+/// so it is a single seam pinned by a unit test (issue: C2 row-listing
+/// drift). `media_type`/`loads`/`volume` have no JSON counterpart today and
+/// none is added here.
+fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| serde_json::json!({"barcode": r.barcode, "status": r.status}))
+            .collect(),
+    )
+}
+
 pub fn run(
     conn: &Connection,
     command: &CartridgeCommands,
@@ -92,11 +104,7 @@ pub fn run(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!(rows
-                        .iter()
-                        .map(|r| serde_json::json!({"barcode": r.barcode, "status": r.status}))
-                        .collect::<Vec<_>>()))
-                    .unwrap()
+                    serde_json::to_string_pretty(&cartridge_rows_to_json(&rows)).unwrap()
                 );
             } else if rows.is_empty() {
                 println!("no cartridges registered");
@@ -215,6 +223,33 @@ fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<Cartrid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cartridge list --json` shape (issue: C2 row-listing drift).
+    /// `media_type`/`loads`/`volume` are table-only and must not appear.
+    #[test]
+    fn pin_cartridge_rows_json_shape() {
+        let rows = vec![
+            CartridgeRow {
+                barcode: "A001L6".to_string(),
+                media_type: "LTO-6".to_string(),
+                status: "available".to_string(),
+                loads: "12".to_string(),
+                volume: "L6-0001".to_string(),
+            },
+            CartridgeRow {
+                barcode: "A002L6".to_string(),
+                media_type: "LTO-6".to_string(),
+                status: "retired_permanent".to_string(),
+                loads: String::new(),
+                volume: String::new(),
+            },
+        ];
+        let value = cartridge_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"barcode":"A001L6","status":"available"},{"barcode":"A002L6","status":"retired_permanent"}]"#
+        );
+    }
 
     fn seed() -> Connection {
         let conn = crate::db::open_memory().unwrap();

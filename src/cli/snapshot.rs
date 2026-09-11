@@ -88,6 +88,20 @@ struct SnapshotRow {
     created: String,
 }
 
+/// `snapshot list --json` shape, extracted verbatim from the inline closure
+/// so it is a single seam pinned by a unit test (issue: C2 row-listing
+/// drift). `files`/`size`/`created` have no JSON counterpart today and none
+/// is added here.
+fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({"id": r.id, "unit": r.unit, "version": r.version, "status": r.status})
+            })
+            .collect(),
+    )
+}
+
 pub fn run(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -201,9 +215,10 @@ pub fn run(
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!(rows.iter().map(|r| {
-                    serde_json::json!({"id": r.id, "unit": r.unit, "version": r.version, "status": r.status})
-                }).collect::<Vec<_>>())).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&snapshot_rows_to_json(&rows)).unwrap()
+                );
             } else if rows.is_empty() {
                 println!("no snapshots found");
             } else {
@@ -212,4 +227,40 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `snapshot list --json` shape (issue: C2 row-listing drift).
+    /// `files`/`size`/`created` are table-only and must not appear.
+    #[test]
+    fn pin_snapshot_rows_json_shape() {
+        let rows = vec![
+            SnapshotRow {
+                id: 10,
+                unit: "backups".to_string(),
+                version: 3,
+                status: "current".to_string(),
+                files: "42".to_string(),
+                size: "120 MB".to_string(),
+                created: "2026-07-01T00:00:00Z".to_string(),
+            },
+            SnapshotRow {
+                id: 11,
+                unit: "photos".to_string(),
+                version: 1,
+                status: "reclaimable".to_string(),
+                files: String::new(),
+                size: String::new(),
+                created: String::new(),
+            },
+        ];
+        let value = snapshot_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"id":10,"status":"current","unit":"backups","version":3},{"id":11,"status":"reclaimable","unit":"photos","version":1}]"#
+        );
+    }
 }

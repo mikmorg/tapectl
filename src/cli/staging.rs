@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::Connection;
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
@@ -19,9 +20,10 @@ pub enum StagingCommands {
     },
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct StagingRow {
     #[tabled(rename = "ID")]
+    #[serde(rename = "stage_set_id")]
     id: i64,
     #[tabled(rename = "Unit")]
     unit: String,
@@ -29,14 +31,42 @@ struct StagingRow {
     version: i64,
     #[tabled(rename = "Status")]
     status: String,
-    #[tabled(rename = "Slices")]
-    slices: String,
-    #[tabled(rename = "Size (MB)")]
-    size_mb: String,
+    #[tabled(rename = "Slices", display_with = "display_opt_i64")]
+    #[serde(rename = "num_slices")]
+    slices: Option<i64>,
+    #[tabled(rename = "Size (MB)", display_with = "display_size_mb")]
+    #[serde(rename = "total_encrypted_size")]
+    encrypted_bytes: Option<i64>,
     #[tabled(rename = "Writes")]
+    #[serde(rename = "write_count")]
     writes: i64,
     #[tabled(rename = "Staged")]
+    #[serde(skip)]
     staged: String,
+}
+
+fn display_opt_i64(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn display_size_mb(v: &Option<i64>) -> String {
+    v.map(|s| (s / (1024 * 1024)).to_string())
+        .unwrap_or_default()
+}
+
+/// `staging status --json` shape. Change 1 already types `slices` and
+/// `encrypted_bytes` as `Option<i64>` (rather than the pre-formatted display
+/// strings the table needs) because the MB division the table performs is
+/// lossy -- a string-typed intermediate row could not reconstruct the exact
+/// byte count the JSON contract requires, so there is no honest "verbatim,
+/// then retype later" split for this one field. The row is built once in
+/// `run` and shared by both the table and JSON branches (issue: C2
+/// row-listing drift; previously the JSON branch read straight from the
+/// query results and the table branch built `StagingRow` separately from
+/// the same source, which is how #125-style drift happens even without a
+/// hand-rolled reverse-parse).
+fn staging_rows_to_json(rows: &[StagingRow]) -> serde_json::Value {
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(
@@ -49,41 +79,27 @@ pub fn run(
     match command {
         StagingCommands::Status => {
             let info = clean::staging_status(conn)?;
+            let rows: Vec<StagingRow> = info
+                .into_iter()
+                .map(|i| StagingRow {
+                    id: i.stage_set_id,
+                    unit: i.unit_name,
+                    version: i.version,
+                    status: i.status,
+                    slices: i.num_slices,
+                    encrypted_bytes: i.total_encrypted_size,
+                    writes: i.write_count,
+                    staged: i.staged_at.unwrap_or_default(),
+                })
+                .collect();
             if json_output {
-                let json_rows: Vec<serde_json::Value> = info
-                    .iter()
-                    .map(|i| {
-                        serde_json::json!({
-                            "stage_set_id": i.stage_set_id,
-                            "unit": i.unit_name,
-                            "version": i.version,
-                            "status": i.status,
-                            "num_slices": i.num_slices,
-                            "total_encrypted_size": i.total_encrypted_size,
-                            "write_count": i.write_count,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&json_rows).unwrap());
-            } else if info.is_empty() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&staging_rows_to_json(&rows)).unwrap()
+                );
+            } else if rows.is_empty() {
                 println!("no staged data");
             } else {
-                let rows: Vec<StagingRow> = info
-                    .into_iter()
-                    .map(|i| StagingRow {
-                        id: i.stage_set_id,
-                        unit: i.unit_name,
-                        version: i.version,
-                        status: i.status,
-                        slices: i.num_slices.map(|n| n.to_string()).unwrap_or_default(),
-                        size_mb: i
-                            .total_encrypted_size
-                            .map(|s| (s / (1024 * 1024)).to_string())
-                            .unwrap_or_default(),
-                        writes: i.write_count,
-                        staged: i.staged_at.unwrap_or_default(),
-                    })
-                    .collect();
                 println!("{}", Table::new(rows));
             }
         }
@@ -150,4 +166,45 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `staging status --json` shape (issue: C2 row-listing drift). One row
+    /// has every optional field populated with a byte count that is NOT an
+    /// even multiple of 1 MiB -- proof the JSON carries raw bytes, not the
+    /// table's lossy MB-divided display value. The other row has every
+    /// optional field absent (`null`).
+    #[test]
+    fn pin_staging_rows_json_shape() {
+        let rows = vec![
+            StagingRow {
+                id: 1,
+                unit: "backups".to_string(),
+                version: 2,
+                status: "staged".to_string(),
+                slices: Some(3),
+                encrypted_bytes: Some(5_242_881),
+                writes: 1,
+                staged: "2026-07-01T00:00:00Z".to_string(),
+            },
+            StagingRow {
+                id: 2,
+                unit: "photos".to_string(),
+                version: 1,
+                status: "staging".to_string(),
+                slices: None,
+                encrypted_bytes: None,
+                writes: 0,
+                staged: String::new(),
+            },
+        ];
+        let value = staging_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"num_slices":3,"stage_set_id":1,"status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"stage_set_id":2,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
+        );
+    }
 }

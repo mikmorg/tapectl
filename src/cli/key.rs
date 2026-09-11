@@ -2,6 +2,7 @@ use std::path::Path;
 
 use clap::Subcommand;
 use rusqlite::Connection;
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::TapectlPaths;
@@ -98,7 +99,14 @@ pub enum KeyCommands {
     },
 }
 
-#[derive(Tabled)]
+/// Table-only: `key list --json` serializes `db::models::EncryptionKey`
+/// directly (already `Serialize`, and richer than this display row -- it
+/// carries `id`/`tenant_id`/`public_key` and the untruncated fingerprint
+/// that `KeyRow` reformats for the table), so there is no hand-rolled JSON
+/// derived from `KeyRow` to keep in sync. The `Serialize` derive and its pin
+/// below exist for structural parity with the other ten row structs;
+/// nothing in `run()` calls it.
+#[derive(Tabled, Serialize)]
 struct KeyRow {
     #[tabled(rename = "Alias")]
     alias: String,
@@ -585,5 +593,41 @@ fn truncate_fingerprint(fp: &str) -> String {
         format!("{}...", &fp[..24])
     } else {
         fp.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `KeyRow`'s own `Serialize` shape (issue: C2 row-listing drift). Not
+    /// wired into `key list --json`, which already serializes
+    /// `db::models::EncryptionKey` directly -- see the doc comment on
+    /// `KeyRow`.
+    #[test]
+    fn pin_key_rows_json_shape() {
+        let rows = vec![
+            KeyRow {
+                alias: "tenantA-primary".to_string(),
+                key_type: "primary".to_string(),
+                is_active: "yes".to_string(),
+                escrow: String::new(),
+                fingerprint: "AB12...".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            KeyRow {
+                alias: "operator-escrow".to_string(),
+                key_type: "escrow".to_string(),
+                is_active: "no".to_string(),
+                escrow: "ESCROW (ADR-0005)".to_string(),
+                fingerprint: "CD34...".to_string(),
+                created_at: "2026-02-01T00:00:00Z".to_string(),
+            },
+        ];
+        let value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"alias":"tenantA-primary","created_at":"2026-01-01T00:00:00Z","escrow":"","fingerprint":"AB12...","is_active":"yes","key_type":"primary"},{"alias":"operator-escrow","created_at":"2026-02-01T00:00:00Z","escrow":"ESCROW (ADR-0005)","fingerprint":"CD34...","is_active":"no","key_type":"escrow"}]"#
+        );
     }
 }

@@ -155,6 +155,20 @@ struct ArchiveSetRow {
     unit_count: i64,
 }
 
+/// `archive-set list --json` shape, extracted verbatim from the inline
+/// closure so it is a single seam pinned by a unit test (issue: C2
+/// row-listing drift). `locations`/`verify_days` have no JSON counterpart
+/// today and none is added here.
+fn archive_set_rows_to_json(rows: &[ArchiveSetRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({"name": r.name, "min_copies": r.min_copies, "units": r.unit_count})
+            })
+            .collect(),
+    )
+}
+
 pub fn run(
     conn: &Connection,
     config: &Config,
@@ -482,11 +496,7 @@ pub fn run(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!(rows
-                        .iter()
-                        .map(|r| serde_json::json!({"name": r.name, "min_copies": r.min_copies, "units": r.unit_count}))
-                        .collect::<Vec<_>>()))
-                    .unwrap()
+                    serde_json::to_string_pretty(&archive_set_rows_to_json(&rows)).unwrap()
                 );
             } else if rows.is_empty() {
                 println!("no archive sets defined");
@@ -721,6 +731,33 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `archive-set list --json` shape (issue: C2 row-listing drift).
+    /// `locations`/`verify_days` are table-only and must not appear.
+    #[test]
+    fn pin_archive_set_rows_json_shape() {
+        let rows = vec![
+            ArchiveSetRow {
+                name: "daily".to_string(),
+                min_copies: "3".to_string(),
+                locations: "-".to_string(),
+                verify_days: "90".to_string(),
+                unit_count: 5,
+            },
+            ArchiveSetRow {
+                name: "ephemeral".to_string(),
+                min_copies: "-".to_string(),
+                locations: "-".to_string(),
+                verify_days: "-".to_string(),
+                unit_count: 0,
+            },
+        ];
+        let value = archive_set_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"min_copies":"3","name":"daily","units":5},{"min_copies":"-","name":"ephemeral","units":0}]"#
+        );
+    }
 
     fn fresh_conn() -> Connection {
         crate::db::open_memory().unwrap()

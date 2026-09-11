@@ -54,6 +54,21 @@ struct LocationRow {
     description: String,
 }
 
+/// `location list --json` shape, extracted verbatim from the inline closure
+/// so it is a single seam pinned by a unit test (issue: C2 row-listing
+/// drift). Every table column already has a JSON counterpart here.
+fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({"name": r.name, "kind": r.kind,
+                      "volumes": r.volumes, "deposits": r.deposits,
+                      "description": r.description})
+            })
+            .collect(),
+    )
+}
+
 pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> Result<()> {
     match command {
         LocationCommands::Add {
@@ -96,20 +111,14 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             if json_output {
+                // `description` is included because the table shows it and,
+                // since #72, it is where a warehouse's `s3://bucket/prefix`
+                // lives -- there is deliberately no separate URI column.
+                // Omitting it cost the JSON consumer the one field that says
+                // where the bytes actually are.
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!(rows
-                        .iter()
-                        // `description` is included because the table shows it
-                        // and, since #72, it is where a warehouse's
-                        // `s3://bucket/prefix` lives -- there is deliberately no
-                        // separate URI column. Omitting it cost the JSON consumer
-                        // the one field that says where the bytes actually are.
-                        .map(|r| serde_json::json!({"name": r.name, "kind": r.kind,
-                              "volumes": r.volumes, "deposits": r.deposits,
-                              "description": r.description}))
-                        .collect::<Vec<_>>()))
-                    .unwrap()
+                    serde_json::to_string_pretty(&location_rows_to_json(&rows)).unwrap()
                 );
             } else if rows.is_empty() {
                 println!("no locations defined");
@@ -296,6 +305,32 @@ pub fn move_volume(conn: &Connection, volume_label: &str, location_name: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `location list --json` shape (issue: C2 row-listing drift).
+    #[test]
+    fn pin_location_rows_json_shape() {
+        let rows = vec![
+            LocationRow {
+                name: "home".to_string(),
+                kind: "shelf".to_string(),
+                volumes: 3,
+                deposits: 0,
+                description: "offsite".to_string(),
+            },
+            LocationRow {
+                name: "glacier".to_string(),
+                kind: "warehouse".to_string(),
+                volumes: 0,
+                deposits: 5,
+                description: String::new(),
+            },
+        ];
+        let value = location_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"deposits":0,"description":"offsite","kind":"shelf","name":"home","volumes":3},{"deposits":5,"description":"","kind":"warehouse","name":"glacier","volumes":0}]"#
+        );
+    }
 
     /// Seed one shelf location, one warehouse location, and a sealed volume.
     fn setup() -> Connection {

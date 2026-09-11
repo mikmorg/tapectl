@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::Connection;
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::TapectlPaths;
@@ -46,7 +47,13 @@ pub enum TenantCommands {
     },
 }
 
-#[derive(Tabled)]
+/// Table-only: `tenant list --json` serializes `db::models::Tenant` directly
+/// (already `Serialize`, and richer than this display row -- it carries
+/// `id` and the raw `is_operator` bool that `TenantRow` reformats for the
+/// table), so there is no hand-rolled JSON derived from `TenantRow` to keep
+/// in sync. The `Serialize` derive and its pin below exist for structural
+/// parity with the other ten row structs; nothing in `run()` calls it.
+#[derive(Tabled, Serialize)]
 struct TenantRow {
     #[tabled(rename = "Name")]
     name: String,
@@ -174,4 +181,37 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TenantRow`'s own `Serialize` shape (issue: C2 row-listing drift).
+    /// Not wired into `tenant list --json`, which already serializes
+    /// `db::models::Tenant` directly -- see the doc comment on `TenantRow`.
+    #[test]
+    fn pin_tenant_rows_json_shape() {
+        let rows = vec![
+            TenantRow {
+                name: "alice".to_string(),
+                status: "active".to_string(),
+                is_operator: "yes".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                description: "primary".to_string(),
+            },
+            TenantRow {
+                name: "bob".to_string(),
+                status: "deleted".to_string(),
+                is_operator: String::new(),
+                created_at: "2026-02-01T00:00:00Z".to_string(),
+                description: String::new(),
+            },
+        ];
+        let value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"created_at":"2026-01-01T00:00:00Z","description":"primary","is_operator":"yes","name":"alice","status":"active"},{"created_at":"2026-02-01T00:00:00Z","description":"","is_operator":"","name":"bob","status":"deleted"}]"#
+        );
+    }
 }

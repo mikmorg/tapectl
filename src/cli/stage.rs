@@ -58,6 +58,23 @@ struct StageRow {
     staged_at: String,
 }
 
+/// `stage list --json` shape, extracted verbatim from the inline closure so
+/// it is a single seam pinned by a unit test (issue: C2 row-listing drift).
+/// `encrypted_size`/`staged_at` have no JSON counterpart today and none is
+/// added here.
+fn stage_rows_to_json(rows: &[StageRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id, "unit": r.unit, "version": r.version,
+                    "status": r.status, "slices": r.slices,
+                })
+            })
+            .collect(),
+    )
+}
+
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -108,14 +125,7 @@ pub fn run(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!(rows
-                        .iter()
-                        .map(|r| serde_json::json!({
-                            "id": r.id, "unit": r.unit, "version": r.version,
-                            "status": r.status, "slices": r.slices,
-                        }))
-                        .collect::<Vec<_>>()))
-                    .unwrap()
+                    serde_json::to_string_pretty(&stage_rows_to_json(&rows)).unwrap()
                 );
             } else if rows.is_empty() {
                 println!("no stage sets found");
@@ -346,6 +356,37 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// `stage list --json` shape (issue: C2 row-listing drift).
+    /// `encrypted_size`/`staged_at` are table-only and must not appear.
+    #[test]
+    fn pin_stage_rows_json_shape() {
+        let rows = vec![
+            StageRow {
+                id: 1,
+                unit: "backups".to_string(),
+                version: 2,
+                status: "staged".to_string(),
+                slices: "3".to_string(),
+                encrypted_size: "120 MB".to_string(),
+                staged_at: "2026-07-01T00:00:00Z".to_string(),
+            },
+            StageRow {
+                id: 2,
+                unit: "photos".to_string(),
+                version: 1,
+                status: "staging".to_string(),
+                slices: String::new(),
+                encrypted_size: String::new(),
+                staged_at: String::new(),
+            },
+        ];
+        let value = stage_rows_to_json(&rows);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"id":1,"slices":"3","status":"staged","unit":"backups","version":2},{"id":2,"slices":"","status":"staging","unit":"photos","version":1}]"#
+        );
+    }
 
     /// (conn, paths, config) with a tenant "alice" and a unit "unit1"
     /// registered, source content already written. Caller drives

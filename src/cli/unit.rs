@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::Connection;
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
@@ -101,7 +102,15 @@ pub enum UnitCommands {
     },
 }
 
-#[derive(Tabled)]
+/// Table-only: `unit list --json` serializes `db::models::Unit` directly
+/// (already `Serialize`), so there is no hand-rolled JSON derived from
+/// `UnitRow` to keep in sync -- and the two aren't even shaped alike:
+/// `UnitRow.tenant` is a resolved tenant NAME and `UnitRow.tags` is a
+/// joined-in, comma-separated string, neither of which `Unit` carries
+/// (it has `tenant_id` and no tags at all). The `Serialize` derive and its
+/// pin below exist for structural parity with the other ten row structs;
+/// nothing in `run()` calls it.
+#[derive(Tabled, Serialize)]
 struct UnitRow {
     #[tabled(rename = "Name")]
     name: String,
@@ -448,6 +457,34 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use tempfile::TempDir;
+
+    /// `UnitRow`'s own `Serialize` shape (issue: C2 row-listing drift). Not
+    /// wired into `unit list --json`, which already serializes
+    /// `db::models::Unit` directly -- see the doc comment on `UnitRow`.
+    #[test]
+    fn pin_unit_rows_json_shape() {
+        let rows = vec![
+            UnitRow {
+                name: "photos".to_string(),
+                status: "active".to_string(),
+                tenant: "alice".to_string(),
+                path: "/home/alice/photos".to_string(),
+                tags: "family, vacation".to_string(),
+            },
+            UnitRow {
+                name: "scratch".to_string(),
+                status: "tape_only".to_string(),
+                tenant: "?".to_string(),
+                path: String::new(),
+                tags: String::new(),
+            },
+        ];
+        let value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"[{"name":"photos","path":"/home/alice/photos","status":"active","tags":"family, vacation","tenant":"alice"},{"name":"scratch","path":"","status":"tape_only","tags":"","tenant":"?"}]"#
+        );
+    }
 
     fn setup_unit(current_path: &str, checksum_mode: &str) -> (Connection, i64) {
         // Full migration set (not just 001) — snapshot_create's real walk
