@@ -641,51 +641,27 @@ fn escrow_gaps_by_unit(
         return Ok(out); // nothing registered; nothing to compare against
     };
 
-    let mut sql = String::from(
-        "SELECT DISTINCT u.name, v.label, ss.key_fingerprints, ss.origin
-           FROM writes w
-           JOIN volumes v ON v.id = w.volume_id
-           JOIN stage_sets ss ON ss.id = w.stage_set_id
-           JOIN snapshots s ON s.id = w.snapshot_id
-           JOIN units u ON u.id = s.unit_id
-          WHERE w.status = 'completed'
-            AND ss.encrypted = 1
-            AND v.status NOT IN ('retired', 'erased', 'missing', 'blank')",
-    );
-    if unit_filter.is_some() {
-        sql.push_str(" AND u.name = ?1");
-    }
-    sql.push_str(" ORDER BY u.name, v.label");
-
-    let mut stmt = conn.prepare(&sql)?;
-    let map = |row: &rusqlite::Row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-        ))
+    // The query (which stage sets, on which volumes, with what recorded
+    // recipient list) lives in `policy::escrow` so this report, `audit` and
+    // `catalog locate` cannot disagree about a volume.
+    let scope = match unit_filter {
+        Some(name) => match crate::db::queries::get_unit_by_name(conn, name)? {
+            Some(unit) => crate::policy::escrow::Scope::Unit(unit.id),
+            None => return Ok(out), // no such unit; nothing to report
+        },
+        None => crate::policy::escrow::Scope::AllUnits,
     };
-    let rows: Vec<(String, String, Option<String>, String)> = match unit_filter {
-        Some(u) => stmt
-            .query_map(rusqlite::params![u], map)?
-            .collect::<std::result::Result<_, _>>()?,
-        None => stmt
-            .query_map([], map)?
-            .collect::<std::result::Result<_, _>>()?,
-    };
+    let rows = crate::policy::escrow::stage_set_coverage(conn, scope, &escrow)?;
 
-    for (unit, label, fingerprints, origin) in rows {
+    for row in rows {
         // Unknown (rebuilt, #137) is listed too: it is not covered, and
         // this report answers "which volumes can the escrow key not open".
-        if crate::policy::escrow::gap(
-            fingerprints.as_deref(),
-            crate::policy::escrow::Origin::parse(&origin),
-            &escrow,
-        )
-        .is_some()
-        {
-            out.entry(unit).or_default().push(label);
+        if !matches!(row.coverage, crate::policy::escrow::Coverage::Covered) {
+            let label = row.volume_label.unwrap_or_default();
+            let labels = out.entry(row.unit_name).or_default();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
         }
     }
     Ok(out)
