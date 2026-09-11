@@ -179,6 +179,15 @@ pub enum Scope<'a> {
     /// entirely (or whose snapshot/unit chain is broken) still gets a row —
     /// fail-closed, not silently dropped.
     StageSets(&'a [i64]),
+    /// Every completed write of this unit's stage sets on ANY volume,
+    /// whatever its status — retired, quarantined, erased included — and
+    /// including unencrypted stage sets. `catalog locate` lists every
+    /// volume a unit was ever written to (issue #57: a retired cartridge
+    /// must be distinguishable from a sealed one, not absent), so its
+    /// escrow column has to be answered for every row it lists. The
+    /// question is about bytes, not custody: a retired cartridge either
+    /// opens with the escrow key or it does not.
+    UnitAnyVolume(i64),
 }
 
 /// One stage set's escrow verdict, as reported by [`stage_set_coverage`].
@@ -221,28 +230,53 @@ pub fn stage_set_coverage(
 ) -> crate::error::Result<Vec<CoveredStageSet>> {
     match scope {
         Scope::StageSets(ids) => stage_set_coverage_by_id(conn, ids, escrow),
-        Scope::Unit(unit_id) => stage_set_coverage_via_writes(conn, Some(unit_id), escrow),
-        Scope::AllUnits => stage_set_coverage_via_writes(conn, None, escrow),
+        Scope::Unit(unit_id) => {
+            stage_set_coverage_via_writes(conn, Some(unit_id), Volumes::InService, escrow)
+        }
+        Scope::AllUnits => stage_set_coverage_via_writes(conn, None, Volumes::InService, escrow),
+        Scope::UnitAnyVolume(unit_id) => {
+            stage_set_coverage_via_writes(conn, Some(unit_id), Volumes::Any, escrow)
+        }
     }
 }
 
-/// [`Scope::Unit`] / [`Scope::AllUnits`]: every completed write on an
-/// in-service volume, joined back to its unit.
+/// Which volumes a via-`writes` scope reports on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Volumes {
+    /// `coverage::in_service` — the reporting scopes (`audit`, `report
+    /// copies`). These also skip `encrypted = 0` stage sets: `audit`'s
+    /// `encryption` VIOLATION already owns "this was written in the clear",
+    /// and reporting the same fact a second time as an escrow WARNING is
+    /// noise, not information. The write pre-flight (`Scope::StageSets`)
+    /// still sees them, because there nothing else does.
+    InService,
+    /// No status filter and no encryption filter — `catalog locate`.
+    Any,
+}
+
+/// [`Scope::Unit`] / [`Scope::AllUnits`] / [`Scope::UnitAnyVolume`]: every
+/// completed write, joined back to its unit, on the volumes `volumes` says.
 fn stage_set_coverage_via_writes(
     conn: &rusqlite::Connection,
     unit_id: Option<i64>,
+    volumes: Volumes,
     escrow: &str,
 ) -> crate::error::Result<Vec<CoveredStageSet>> {
-    let in_service = crate::policy::coverage::in_service("v");
-    let mut sql = format!(
+    let mut sql = String::from(
         "SELECT ss.id, u.name, v.label, ss.key_fingerprints, ss.origin, ss.encrypted
          FROM writes w
          JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
          JOIN volumes v ON v.id = w.volume_id
-         WHERE w.status = 'completed' AND {in_service}"
+         WHERE w.status = 'completed'",
     );
+    if volumes == Volumes::InService {
+        sql.push_str(&format!(
+            " AND {} AND ss.encrypted = 1",
+            crate::policy::coverage::in_service("v")
+        ));
+    }
     if unit_id.is_some() {
         sql.push_str(" AND s.unit_id = ?1");
     }
@@ -515,15 +549,42 @@ mod tests {
         /// `0` today can only be a legacy/corrupt row. Handled here, not in
         /// `classify`.
         #[test]
-        fn an_encrypted_zero_row_is_a_gap() {
-            let (conn, unit_id, _ss_id) =
+        fn an_encrypted_zero_row_is_left_to_the_encryption_check_by_the_reporting_scopes() {
+            let (conn, unit_id, ss_id) =
                 setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 0);
+            // audit / report copies: not this check's fact — `encryption` owns it.
             let rows = stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW).unwrap();
-            assert_eq!(rows.len(), 1, "{rows:?}");
-            assert_eq!(
-                rows[0].coverage,
-                Coverage::Gap("staged with encrypted=0".to_string())
+            assert!(rows.is_empty(), "{rows:?}");
+            let rows = stage_set_coverage(&conn, Scope::AllUnits, ESCROW).unwrap();
+            assert!(rows.is_empty(), "{rows:?}");
+            // the write pre-flight and locate: still a gap, in those words.
+            for scope in [Scope::StageSets(&[ss_id]), Scope::UnitAnyVolume(unit_id)] {
+                let rows = stage_set_coverage(&conn, scope, ESCROW).unwrap();
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                assert_eq!(
+                    rows[0].coverage,
+                    Coverage::Gap("staged with encrypted=0".to_string())
+                );
+            }
+        }
+
+        /// `catalog locate` lists a retired cartridge on purpose (#57), so
+        /// its escrow column is answered there too — the bytes on it either
+        /// open with the escrow key or they do not.
+        #[test]
+        fn unit_any_volume_scope_answers_for_a_retired_volume() {
+            let (conn, unit_id, _ss_id) = setup(
+                "retired",
+                Some(r#"["age1escrowescrowescrow"]"#),
+                "staged",
+                1,
             );
+            assert!(stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW)
+                .unwrap()
+                .is_empty());
+            let rows = stage_set_coverage(&conn, Scope::UnitAnyVolume(unit_id), ESCROW).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].coverage, Coverage::Covered);
         }
 
         /// The volume filter is `in_service`, not `eligible` and not the old

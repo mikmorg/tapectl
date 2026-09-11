@@ -128,15 +128,13 @@ struct LocationRow {
     /// `?` when the row was rebuilt from a tape that carries no recipient
     /// list (#137) — not covered, but attestable.
     ///
-    /// Sourced from `policy::escrow::stage_set_coverage`, which filters
-    /// volumes by `in_service` (coordinator decision, architecture review
-    /// C1) — narrower than the unfiltered listing above, which shows every
-    /// volume including retired/erased/quarantined ones so a cartridge is
-    /// never hidden. A row on a NOT-in_service volume therefore has no
-    /// verdict to look up and also renders `-`: not "no escrow registered",
-    /// but "the escrow question is not asked about media we no longer
-    /// account for". `Serviceable` above is the column that already says
-    /// this volume cannot serve a restore either way.
+    /// Sourced from `policy::escrow::stage_set_coverage` with
+    /// `Scope::UnitAnyVolume`: answered for EVERY volume this listing shows,
+    /// retired/erased/quarantined included, because `locate` lists those on
+    /// purpose (#57) and the escrow question is about bytes, not custody — a
+    /// retired cartridge either opens with the escrow key or it does not.
+    /// `-` therefore means exactly one thing here: no escrow recipient is
+    /// registered. `?` is a rebuilt row the tape could not vouch for (#137).
     #[tabled(rename = "Escrow")]
     escrow: String,
 }
@@ -188,7 +186,7 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     let coverage: std::collections::HashMap<i64, crate::policy::escrow::Coverage> = match &escrow {
         Some(pk) => crate::policy::escrow::stage_set_coverage(
             conn,
-            crate::policy::escrow::Scope::Unit(unit_id),
+            crate::policy::escrow::Scope::UnitAnyVolume(unit_id),
             pk,
         )?
         .into_iter()
