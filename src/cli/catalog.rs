@@ -5,6 +5,7 @@ use clap::Subcommand;
 /// Fixed tape block size, matching every other tape-reading command here.
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::error::{Result, TapectlError};
@@ -73,30 +74,39 @@ pub enum CatalogCommands {
     },
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct FileRow {
+    /// `d `/`  ` is prefixed onto the real path for table display (below).
+    /// JSON trims it via `serialize_trimmed` -- which, for a directory row,
+    /// strips only the trailing space: `.trim()` removes whitespace, not
+    /// the `d` itself, so a directory's JSON `path` keeps its `"d "`
+    /// prefix. That is the existing, pinned contract, not fixed here.
     #[tabled(rename = "Path")]
+    #[serde(serialize_with = "serialize_trimmed")]
     path: String,
     #[tabled(rename = "Size")]
     size: String,
     #[tabled(rename = "Modified")]
+    #[serde(skip)]
     modified: String,
     #[tabled(rename = "SHA256")]
     sha256: String,
 }
 
-/// `catalog ls --json` shape, extracted verbatim from the inline closure so
-/// it is a single seam pinned by a unit test (issue: C2 row-listing drift).
-/// `modified` has no JSON counterpart today and none is added here.
-fn file_rows_to_json(rows: &[FileRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| serde_json::json!({"path": r.path.trim(), "size": r.size, "sha256": r.sha256}))
-            .collect(),
-    )
+fn serialize_trimmed<S: serde::Serializer>(
+    value: &str,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(value.trim())
 }
 
-#[derive(Tabled, Debug)]
+/// `catalog ls --json` shape. `modified` has no JSON counterpart today and
+/// none is added here.
+fn file_rows_to_json(rows: &[FileRow]) -> serde_json::Value {
+    serde_json::to_value(rows).unwrap()
+}
+
+#[derive(Tabled, Debug, Serialize)]
 struct LocationRow {
     #[tabled(rename = "Volume")]
     volume: String,
@@ -123,15 +133,16 @@ struct LocationRow {
     /// `policy::coverage::eligible` predicate the destructive gates and
     /// reports use (issue #89), so `locate` can never disagree with them
     /// about whether coverage exists.
-    #[tabled(rename = "Serviceable")]
-    serviceable: String,
+    #[tabled(rename = "Serviceable", display_with = "display_serviceable")]
+    serviceable: bool,
     /// The warehouse location(s) this volume has been DEPOSITED to
-    /// (ADR-0006), or `-`. `locate` answers "where do I go to get this
+    /// (ADR-0006), or empty. `locate` answers "where do I go to get this
     /// back", and for a deposited volume one of the answers is not a
     /// building. Rendered as a separate column rather than folded into
     /// `Location`, which means "where the cartridge physically sits".
-    #[tabled(rename = "Warehouse")]
-    warehouse: String,
+    #[tabled(rename = "Warehouse", display_with = "display_warehouse")]
+    #[serde(rename = "warehouse_deposits")]
+    warehouse: Vec<String>,
     /// Whether the CURRENT escrow recipient can still recover this volume
     /// (#125). `locate` answers "where do I go to get this back"; for a
     /// volume staged before an escrow swap the honest answer includes "and
@@ -148,6 +159,18 @@ struct LocationRow {
     /// registered. `?` is a rebuilt row the tape could not vouch for (#137).
     #[tabled(rename = "Escrow")]
     escrow: String,
+}
+
+fn display_serviceable(v: &bool) -> String {
+    if *v { "yes" } else { "NO" }.to_string()
+}
+
+fn display_warehouse(v: &[String]) -> String {
+    if v.is_empty() {
+        "-".to_string()
+    } else {
+        v.join(",")
+    }
 }
 
 /// Where a unit's completed writes live, and whether each can actually
@@ -218,10 +241,11 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                 version: row.get(3)?,
                 slices: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 written: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                serviceable: if serviceable == 1 { "yes" } else { "NO" }.to_string(),
+                serviceable: serviceable == 1,
                 warehouse: row
                     .get::<_, Option<String>>(7)?
-                    .unwrap_or_else(|| "-".into()),
+                    .map(|s| s.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
                 escrow: match coverage.get(&stage_set_id) {
                     None => "-".to_string(),
                     Some(crate::policy::escrow::Coverage::Covered) => "yes".to_string(),
@@ -234,35 +258,9 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     Ok(rows)
 }
 
-/// `catalog locate --json` shape, extracted verbatim from the inline closure
-/// so it is a single seam pinned by a unit test (issue: C2 row-listing
-/// drift). Still reverse-parses `serviceable`/`warehouse` out of their
-/// display strings at this stage -- change 2 retypes the fields so this
-/// becomes a straight `serde_json::to_value(rows)`.
+/// `catalog locate --json` shape.
 fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
-    serde_json::Value::Array(
-        rows.iter()
-            .map(|r| {
-                serde_json::json!({
-                    "volume": r.volume,
-                    "status": r.status,
-                    "location": r.location,
-                    "version": r.version,
-                    "slices": r.slices,
-                    "written": r.written,
-                    "serviceable": r.serviceable == "yes",
-                    // Same words as the table column: "yes" / "NO" /
-                    // "?" (rebuilt, unknown) / "-" (no escrow registered).
-                    "escrow": r.escrow,
-                    "warehouse_deposits": if r.warehouse == "-" {
-                        Vec::new()
-                    } else {
-                        r.warehouse.split(',').map(str::to_string).collect::<Vec<_>>()
-                    },
-                })
-            })
-            .collect(),
-    )
+    serde_json::to_value(rows).unwrap()
 }
 
 pub fn run(
@@ -398,7 +396,7 @@ pub fn run(
                 // skim past when you are about to walk to a shelf.
                 let unserviceable: Vec<&str> = rows
                     .iter()
-                    .filter(|r| r.serviceable != "yes")
+                    .filter(|r| !r.serviceable)
                     .map(|r| r.volume.as_str())
                     .collect();
                 if !unserviceable.is_empty() {
@@ -685,8 +683,8 @@ mod tests {
                 version: 1,
                 slices: 3,
                 written: "2026-07-01T00:00:00Z".to_string(),
-                serviceable: "yes".to_string(),
-                warehouse: "-".to_string(),
+                serviceable: true,
+                warehouse: vec![],
                 escrow: "-".to_string(),
             },
             LocationRow {
@@ -696,8 +694,8 @@ mod tests {
                 version: 2,
                 slices: 0,
                 written: String::new(),
-                serviceable: "NO".to_string(),
-                warehouse: "glacier,vault2".to_string(),
+                serviceable: false,
+                warehouse: vec!["glacier".to_string(), "vault2".to_string()],
                 escrow: "?".to_string(),
             },
         ];
@@ -807,8 +805,8 @@ mod tests {
             other.status, status,
             "status column must show the real state"
         );
-        assert_eq!(
-            other.serviceable, "NO",
+        assert!(
+            !other.serviceable,
             "a {status} volume cannot serve a restore (ADR-0004)"
         );
 
@@ -816,7 +814,7 @@ mod tests {
             .iter()
             .find(|r| r.volume == "L6-SEALED")
             .expect("the sealed volume must appear");
-        assert_eq!(sealed.serviceable, "yes");
+        assert!(sealed.serviceable);
     }
 
     #[test]
@@ -866,7 +864,7 @@ mod tests {
             rows[0].location, "home",
             "the cartridge is still on a shelf"
         );
-        assert_eq!(rows[0].warehouse, "glacier");
+        assert_eq!(rows[0].warehouse, vec!["glacier".to_string()]);
 
         conn.execute(
             "DELETE FROM volume_deposits WHERE volume_id = ?1",
@@ -874,7 +872,10 @@ mod tests {
         )
         .unwrap();
         let rows = locate_rows(&conn, unit_id).unwrap();
-        assert_eq!(rows[0].warehouse, "-", "no deposits renders as a dash");
+        assert!(
+            rows[0].warehouse.is_empty(),
+            "no deposits renders as an empty list"
+        );
     }
 
     #[test]
@@ -887,7 +888,7 @@ mod tests {
         let unit_id = unit_id_of(&conn, "loc-agree");
         let rows = locate_rows(&conn, unit_id).unwrap();
 
-        let serviceable_count = rows.iter().filter(|r| r.serviceable == "yes").count() as i64;
+        let serviceable_count = rows.iter().filter(|r| r.serviceable).count() as i64;
 
         // Routed through the gates' own expression rather than a seventh
         // hand-written copy of it (issue #73). Note the scope of the
