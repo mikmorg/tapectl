@@ -751,7 +751,7 @@ mod tests {
         let value = archive_set_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"min_copies":"3","name":"daily","units":5},{"min_copies":"-","name":"ephemeral","units":0}]"#
+            r#"[{"locations":["home","offsite"],"min_copies":"3","name":"daily","units":5,"verify_days":90},{"locations":null,"min_copies":"-","name":"ephemeral","units":0,"verify_days":null}]"#
         );
     }
 

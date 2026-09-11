@@ -669,7 +669,7 @@ mod tests {
         let value = file_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"path":"d subdir","sha256":"(unstaged)","size":"-"},{"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KB"}]"#
+            r#"[{"modified":"2026-01-01T00:00:00Z","path":"d subdir","sha256":"(unstaged)","size":"-"},{"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KB"}]"#
         );
     }
 

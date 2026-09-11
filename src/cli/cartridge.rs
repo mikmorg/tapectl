@@ -245,7 +245,7 @@ mod tests {
         let value = cartridge_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"barcode":"A001L6","status":"available"},{"barcode":"A002L6","status":"retired_permanent"}]"#
+            r#"[{"barcode":"A001L6","loads":12,"media_type":"LTO-6","status":"available","volume":"L6-0001"},{"barcode":"A002L6","loads":null,"media_type":"LTO-6","status":"retired_permanent","volume":null}]"#
         );
     }
 

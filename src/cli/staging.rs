@@ -204,7 +204,7 @@ mod tests {
         let value = staging_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"num_slices":3,"stage_set_id":1,"status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"stage_set_id":2,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
+            r#"[{"num_slices":3,"stage_set_id":1,"staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"stage_set_id":2,"staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
         );
     }
 }

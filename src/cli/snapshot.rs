@@ -256,7 +256,7 @@ mod tests {
         let value = snapshot_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"id":10,"status":"current","unit":"backups","version":3},{"id":11,"status":"reclaimable","unit":"photos","version":1}]"#
+            r#"[{"created_at":"2026-07-01T00:00:00Z","file_count":42,"id":10,"status":"current","total_size":125829121,"unit":"backups","version":3},{"created_at":"","file_count":null,"id":11,"status":"reclaimable","total_size":null,"unit":"photos","version":1}]"#
         );
     }
 }

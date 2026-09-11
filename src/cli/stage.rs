@@ -376,7 +376,7 @@ mod tests {
         let value = stage_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"id":1,"slices":"3","status":"staged","unit":"backups","version":2},{"id":2,"slices":"","status":"staging","unit":"photos","version":1}]"#
+            r#"[{"id":1,"slices":"3","staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":125829121,"unit":"backups","version":2},{"id":2,"slices":"","staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1}]"#
         );
     }
 
