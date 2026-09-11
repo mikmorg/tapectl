@@ -128,13 +128,20 @@ and therefore the failure, is identical.
 - **`cartridge mark-erased`'s gate is the cartridge's DB status**
   (`pending_erase`, set by `volume retire`), not whether a physical erase
   happened — the DB has no way to observe that.
-- Two checks are **expected to fail today, on purpose**: `escrow-ordering`'s
-  stage-before-escrow refusal (issue #115, landing separately) and
-  `restore-file-and-catalog`'s symlink-via-`restore file` case (`fs::copy`
-  dereferences — `src/volume/restore.rs:369`). `db-loss`'s scenario (b) is
-  also expected to fail: top-level `import` inserts only a bare `volumes`
-  row, no units/writes, so a follow-on `restore unit` has nothing to resolve.
-  All three are logged as such, not silently softened.
+- One check is **expected to fail today, on purpose**: `db-loss`'s scenario
+  (b). Top-level `import` inserts only a bare `volumes` row — no units, no
+  writes — so a follow-on `restore unit` has nothing to resolve against.
+  Whether that is a defect in `import` or a missing recovery command is a
+  design question, deferred on
+  [#136](https://github.com/mikmorg/tapectl/issues/136); the constraint that
+  decides it is that the plaintext zones carry no unit names by invariant, so
+  any rebuild-from-tape must decrypt an envelope. Logged as a failure, not
+  silently softened.
+- Two former expected failures are now fixed:
+  `restore-file-and-catalog`'s symlink case (`restore file` dereferenced via
+  `fs::copy` while `restore unit` preserved the link — the two commands
+  disagreed about the same archive entry) and `escrow-ordering`'s
+  stage-before-escrow refusal (#115).
 
 ## Not covered here
 

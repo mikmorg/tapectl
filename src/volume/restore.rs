@@ -366,13 +366,16 @@ pub fn restore_file(
         false,
     )?;
 
-    // Copy the requested file to dest_dir
+    // Copy the requested file to dest_dir.
+    //
+    // `symlink_metadata`, not `exists()`: a unit may legitimately contain a
+    // symlink pointing outside itself, and `exists()` follows the link, so a
+    // dangling one was reported as "not found in restored unit" when it had in
+    // fact been restored correctly by dar.
     let source_file = tmp.path().join(file_path);
-    if !source_file.exists() {
-        return Err(TapectlError::Other(format!(
-            "file \"{file_path}\" not found in restored unit"
-        )));
-    }
+    let meta = fs::symlink_metadata(&source_file).map_err(|_| {
+        TapectlError::Other(format!("file \"{file_path}\" not found in restored unit"))
+    })?;
 
     let dest = Path::new(dest_dir).join(
         Path::new(file_path)
@@ -380,9 +383,35 @@ pub fn restore_file(
             .unwrap_or(std::ffi::OsStr::new(file_path)),
     );
     fs::create_dir_all(Path::new(dest_dir))?;
-    fs::copy(&source_file, &dest)?;
+    place_restored_entry(&source_file, &meta, &dest)?;
 
     info!(file = file_path, dest = %dest.display(), "file restored");
+    Ok(())
+}
+
+/// Put one restored entry at `dest`, preserving what it *is*.
+///
+/// Split out of `restore_file` so the symlink rule is reachable without a tape:
+/// everything around it needs a full `restore_unit` first, which made this the
+/// one restore behaviour no test could exercise.
+///
+/// `fs::copy` follows symlinks and writes the *target's* bytes, so
+/// `restore file` turned a symlink into a plain file while `restore unit` —
+/// which lets dar do the extraction — preserved it. Same archive, same entry,
+/// two different results depending on which command the operator reached for.
+fn place_restored_entry(source: &Path, meta: &fs::Metadata, dest: &Path) -> Result<()> {
+    if meta.is_symlink() {
+        let target = fs::read_link(source)?;
+        // `symlink()` refuses an existing path, and `fs::copy` (the non-symlink
+        // arm) silently overwrites — so remove first to keep both arms behaving
+        // the same way rather than making symlinks the one case that errors.
+        if fs::symlink_metadata(dest).is_ok() {
+            fs::remove_file(dest)?;
+        }
+        std::os::unix::fs::symlink(&target, dest)?;
+    } else {
+        fs::copy(source, dest)?;
+    }
     Ok(())
 }
 
@@ -790,5 +819,77 @@ mod tests {
         // future drift back toward whole-slice buffering is a deliberate,
         // visible edit to this test.
         assert_eq!(RESTORE_STREAM_BUFFER, 128 * 1024);
+    }
+
+    /// A symlink in a unit must come back as a symlink from `restore file`,
+    /// the way it already does from `restore unit`. `fs::copy` follows the
+    /// link and writes the target's bytes, so the two commands disagreed
+    /// about the same archive entry.
+    #[test]
+    fn a_symlink_is_restored_as_a_symlink_not_as_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, b"payload").unwrap();
+        let link = dir.path().join("link-ok");
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+
+        let dest = dir.path().join("out").join("link-ok");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        place_restored_entry(&link, &meta, &dest).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&dest).unwrap().is_symlink(),
+            "restored entry must still be a symlink"
+        );
+        assert_eq!(std::fs::read_link(&dest).unwrap(), Path::new("real.txt"));
+    }
+
+    /// A symlink pointing outside the unit is legitimate and restores as a
+    /// dangling link. The old `exists()` check followed it and reported the
+    /// entry missing, which is the same dereferencing bug wearing a different
+    /// hat: dar had restored it correctly and the command denied it was there.
+    #[test]
+    fn a_dangling_symlink_is_preserved_rather_than_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("points-away");
+        std::os::unix::fs::symlink("/nowhere/at/all", &link).unwrap();
+
+        assert!(
+            !link.exists(),
+            "precondition: exists() denies a dangling link"
+        );
+        let meta = std::fs::symlink_metadata(&link).expect("symlink_metadata still sees it");
+
+        let dest = dir.path().join("out").join("points-away");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        place_restored_entry(&link, &meta, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(&dest).unwrap(),
+            Path::new("/nowhere/at/all")
+        );
+    }
+
+    /// A plain file still overwrites, and a symlink now overwrites too. Before
+    /// the split these differed: `symlink()` refuses an existing path while
+    /// `fs::copy` replaces one.
+    #[test]
+    fn both_arms_overwrite_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("f.txt");
+        std::fs::write(&src, b"new").unwrap();
+        let dest = dir.path().join("dest");
+        std::fs::write(&dest, b"old").unwrap();
+
+        let meta = std::fs::symlink_metadata(&src).unwrap();
+        place_restored_entry(&src, &meta, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink("f.txt", &link).unwrap();
+        let lmeta = std::fs::symlink_metadata(&link).unwrap();
+        place_restored_entry(&link, &lmeta, &dest).unwrap();
+        assert!(std::fs::symlink_metadata(&dest).unwrap().is_symlink());
     }
 }

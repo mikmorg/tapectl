@@ -2058,13 +2058,13 @@ rfc_restore_file_empty() {
 # today — a real gap this suite surfaces (parallel to raw-volume's `import`
 # gap in db-loss), not a mistake in the assertion.
 rfc_restore_file_symlink() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl restore file --file link-ok --unit photos --from VOL-A --to DIR; assert restored AS A SYMLINK (documented gap: fs::copy dereferences, expected to fail today)"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl restore file --file link-ok --unit photos --from VOL-A --to DIR; assert restored AS A SYMLINK"; return 0; }
     local to="$RUN/rfc-file-link"
     TCTL restore file --file link-ok --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" || return 1
     [ -L "$to/link-ok" ] || {
-        echo "NOTE (expected, documented finding — src/volume/restore.rs:369): restore file's"
-        echo "  fs::copy dereferences a symlink source, so link-ok was restored as a plain"
-        echo "  file instead of a symlink. See docs/lifecycle-suite.md."
+        echo "restore file dereferenced a symlink: link-ok came back as a plain file."
+        echo "  'restore unit' preserves it, so the two commands disagree about the same"
+        echo "  archive entry. place_restored_entry (src/volume/restore.rs) is the fix site."
         return 1
     }
 }

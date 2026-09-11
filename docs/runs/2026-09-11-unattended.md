@@ -46,7 +46,7 @@ killed. Consequences for this run:
 | 1 | #133 — RESTORE.sh heir findings (4 defects + the missing test) | **landed** |
 | 2 | #130 — ID thunk and system guide hardcode `mt -f /dev/nst0` | **landed** (3 sites, not the 2 named) |
 | 3 | `dl.scenario_b` — bare `import` rebuilds only a volumes row | **deferred** → [#136](https://github.com/mikmorg/tapectl/issues/136) |
-| 4 | `rfc.restore_file_symlink` — `restore file` dereferences symlinks | queued |
+| 4 | `rfc.restore_file_symlink` — `restore file` dereferences symlinks | **landed** |
 | 5 | #132 — `quick-archive --volume` says only "volume not found" | queued |
 | 6 | #125 — the `escrow: no` markers in `report copies` / `catalog locate` | queued |
 | 7 | #126 — `backend add` command | queued |
@@ -60,6 +60,7 @@ unless it is a regression this run caused, or it blocks a queued item.
 | When (UTC) | Item | Outcome |
 |---|---|---|
 | 09-11 06:18 | — | run opened; skill, decisions file and this file created |
+| 09-11 08:06 | `rfc.restore_file_symlink` | landed. `restore file` now preserves symlinks, and a second bug in the same lines is fixed: `.exists()` followed the link, so a dangling symlink was reported "not found in restored unit" though dar had restored it correctly. 708 lib tests (+3), gate GREEN 26/26, and `restore-file-and-catalog` 10/10 **on mhvtl tape** — the check itself now passes, not just the unit tests. |
 | 09-11 08:02 | `dl.scenario_b` | **deferred**, not fixed. `import`'s job is registration; whether disaster recovery should rebuild the catalog from tape is a genuine fork the normative set does not settle. Surfaced the constraint that decides it: the plaintext zones carry no unit names by invariant, so any rebuild is a *keyed* operation. → #136, `needs:cto`. |
 | 09-11 07:55 | #133 | CI red on `89fa1f6` — the new argv test spawns the heir script, whose prereq loop needs mt/age/dar; CI has none. Fixed hermetically with PATH stubs (`da18e61`), verified against a reconstructed CI PATH. Issue reopened until CI is green. **Lesson: a test that spawns the generated script inherits its tool requirements.** |
 | 09-11 07:48 | #130 | landed. Caveat added to all THREE heir documents — the issue named two; RECOVERY.md had the same defect. 705 lib tests (+1), gate GREEN 26/26. Settled, not deferred: correcting wrong instructions is not a design fork. Owes the same real-drive pass as #133. |
