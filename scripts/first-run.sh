@@ -180,7 +180,7 @@ vercmp_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 toolchain_check() {
   local want have
   want="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")"
-  have="$(cd "$REPO" && rustc --version 2>/dev/null | awk '{print $2}')"
+  have="$( { cd "$REPO" && rustc --version 2>/dev/null || true; } | awk '{print $2}')"
   [ "$have" = "$want" ] || die "rustc is ${have:-absent} at $(command -v rustc || echo '<none>'), the repo pins $want — run step 1 (scripts/first-run.sh --from 1 --to 1)"
   case "$(command -v cargo)" in "$HOME"/.cargo/bin/*|"${CARGO_HOME:-/nonexistent}"/bin/*) ;; *) die "cargo at $(command -v cargo) is not rustup's — a distro cargo cannot build this crate; run step 1" ;; esac
 }
