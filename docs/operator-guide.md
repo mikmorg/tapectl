@@ -6,6 +6,36 @@
 > order, explaining each step and detecting what is already done. Prefer it
 > for a new machine; the text below is the same procedure, for reference.
 
+### 0. The service user
+
+tapectl runs as a dedicated nologin account, `tapectl`, not as your login.
+The reason is what `~/.tapectl` holds — the operator private key, every
+tenant private key, the catalog — and the fact that tapectl resolves that home
+purely from `$HOME`: under its own account those files share a home with
+nothing else, and the audit timer in `contrib/systemd/` gets the fixed `User=`
+and `HOME=` it needs. Tenants are key domains, not Unix accounts; one service
+user reads every tenant's data and encrypts each to its own key.
+
+The account needs exactly three things, each granted where it arises:
+
+```bash
+sudo useradd --system --create-home --home-dir /var/lib/tapectl \
+    --shell /usr/sbin/nologin --comment "tapectl archival service" tapectl
+sudo usermod -aG tape tapectl               # the group owning /dev/nst* and /dev/sg*
+sudo mkdir -p /mnt/staging && sudo chown tapectl /mnt/staging
+
+# read on every tree it archives, by POSIX ACL (package acl); write only on the
+# unit's top directory, for .tapectl-unit.toml; x on each ancestor to reach it
+sudo setfacl -R -m u:tapectl:rX /data/alice/photos
+sudo setfacl -R -d -m u:tapectl:rX /data/alice/photos     # files created later inherit
+sudo setfacl -m u:tapectl:rwX /data/alice/photos
+```
+
+Every command below is then `sudo -u tapectl -H tapectl …` (alias it). A
+restore destination must be writable by `tapectl`; restore itself needs no
+root — dar runs with `-O`. `first-run.sh --no-service-user` keeps the older
+run-as-yourself layout for a single-user machine.
+
 
 ### 1. Install Dependencies
 
@@ -85,8 +115,11 @@ expected, not corruption, when comparing tape trees before and after a mount.
 ### 2. Initialize tapectl
 
 ```bash
-tapectl init --operator mike
+sudo -u tapectl -H tapectl init --operator mike
 ```
+
+`--operator` is a label for the catalog, not the Unix account. The paths
+below are under the service user's home, `/var/lib/tapectl`.
 
 This creates:
 - `~/.tapectl/tapectl.db` (SQLite database)
@@ -617,7 +650,8 @@ sudo install -Dm644 contrib/systemd/tapectl-audit.service \
 sudo install -Dm644 contrib/systemd/tapectl-audit.timer \
     /etc/systemd/system/tapectl-audit.timer
 
-# Both CHANGEME placeholders in the .service must become your username —
+# User= and HOME= in the .service default to the tapectl service user; if you
+# run tapectl as yourself (--no-service-user), change both to your account —
 # tapectl resolves ~/.tapectl from $HOME, and a systemd service inherits none.
 sudoedit /etc/systemd/system/tapectl-audit.service
 

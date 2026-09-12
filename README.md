@@ -34,11 +34,13 @@ The binary is at `target/release/tapectl`.
 ## Quick Start
 
 The guided route: `scripts/first-run.sh` walks from a bare machine to the first
-sealed tape — toolchain, `dar`, build, tests, finding the drive by serial,
-`init` (with the escrow secret explained before it is printed), the Heir Kit,
-tenants and units, an optional rehearsal on a test cartridge, and the first
-write with `verify --full`. Resumable with `--from N`; `--home DIR` rehearses
-against a throwaway home. The manual route follows.
+sealed tape — toolchain, `dar`, build, tests, a `tapectl` service user that
+owns the keys and catalog, finding the drive by serial, `init` (with the escrow
+secret explained before it is printed), the Heir Kit, tenants and units (each
+tree granted to the service user by ACL), an optional rehearsal on a test
+cartridge, and the first write with `verify --full`. Resumable with `--from N`;
+`--home DIR` rehearses against a throwaway home; `--no-service-user` runs
+everything as you. The manual route follows.
 
 
 ```bash
