@@ -109,9 +109,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     if let Commands::Init {
         ref operator,
         no_escrow,
+        ref escrow_public_key,
     } = cli.command
     {
-        return cmd_init(&paths, operator.as_deref(), no_escrow, cli.json);
+        return cmd_init(
+            &paths,
+            operator.as_deref(),
+            no_escrow,
+            escrow_public_key.as_deref(),
+            cli.json,
+        );
     }
 
     // Completions don't need DB
@@ -255,11 +262,22 @@ fn cmd_init(
     paths: &TapectlPaths,
     operator_name: Option<&str>,
     no_escrow: bool,
+    escrow_public_key_arg: Option<&str>,
     json_output: bool,
 ) -> anyhow::Result<()> {
     if paths.is_initialized() {
         bail!("tapectl is already initialized at {}", paths.home.display());
     }
+
+    // #139: parse a supplied --escrow-public-key before any side effect below
+    // (directories, config, database) so a bad value leaves nothing behind —
+    // the disaster-recovery path depends on a failed `init` creating nothing
+    // to clean up. clap's `conflicts_with` already rules out this being set
+    // together with --no-escrow.
+    let adopted_escrow_public_key = escrow_public_key_arg
+        .map(tapectl::crypto::keys::read_or_parse_public_key)
+        .transpose()
+        .context("invalid --escrow-public-key")?;
 
     // Create directory structure
     paths.ensure_dirs()?;
@@ -298,10 +316,19 @@ fn cmd_init(
     // first command that even mentions escrow — which is exactly how a tape
     // was once sealed unrecoverable-by-escrow. Doing it here closes that
     // window at the source. `--no-escrow` opts out (adopt an existing identity
-    // with `key import --escrow` instead). The SECRET is printed once to
-    // STDERR and stored nowhere.
+    // with `key import --escrow` instead). `--escrow-public-key` is a third
+    // arm (CTO decision 2026-09-11, #139): the disaster-recovery form, where a
+    // rebuilt machine adopts the ORIGINAL escrow identity from the heir kit's
+    // cover sheet instead of minting a replacement that every existing tape
+    // was never encrypted to. In the mint arm the SECRET is printed once to
+    // STDERR and stored nowhere; the adopt arm has no secret to print — its
+    // secret half lives only on the heir kit.
     let escrow_public_key: Option<String> = if no_escrow {
         None
+    } else if let Some(ref value) = adopted_escrow_public_key {
+        let adopted = tapectl::cli::key::adopt_escrow_recipient(&conn, paths, value)
+            .context("failed to adopt the supplied escrow public key")?;
+        Some(adopted)
     } else {
         let created = tapectl::cli::key::create_escrow_recipient(&conn, paths, None)
             .context("failed to create the escrow recipient")?;
@@ -333,6 +360,11 @@ fn cmd_init(
         println!("  database: {}", paths.db_file.display());
         println!("  config:   {}", paths.config_file.display());
         match &escrow_public_key {
+            Some(pk) if adopted_escrow_public_key.is_some() => {
+                println!(
+                    "  escrow:   adopted {pk} (imported — its secret lives on the heir kit, not here)"
+                );
+            }
             Some(pk) => {
                 println!("  escrow:   {pk}");
                 println!(

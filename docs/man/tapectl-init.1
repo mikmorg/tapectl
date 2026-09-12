@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH tapectl-init 1  "tapectl-init " 
 .SH NAME
-tapectl\-init \- Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it)
+tapectl\-init \- Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it, or \-\-escrow\-public\-key to adopt an existing one instead of minting a new identity, #139)
 .SH SYNOPSIS
-\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-\-no\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-\-no\-escrow\fR] [\fB\-\-escrow\-public\-key\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it)
+Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it, or \-\-escrow\-public\-key to adopt an existing one instead of minting a new identity, #139)
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -20,6 +20,9 @@ Show what would be done without making changes
 .TP
 \fB\-\-no\-escrow\fR
 Do NOT create the permanent escrow recipient (ADR\-0005) at init. By default `init` generates it and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import \-\-escrow` instead, or in tests/tooling that register escrow separately
+.TP
+\fB\-\-escrow\-public\-key\fR \fI<KEY_OR_FILE>\fR
+Register THIS existing escrow public key (an age1… literal, or a path to a .pub file) instead of minting a new identity — the disaster\-recovery form: a rebuilt machine adopts the original recipient from the heir kit\*(Aqs cover sheet so every tape\*(Aqs receipts keep matching (#139)
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
