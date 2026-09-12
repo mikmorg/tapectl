@@ -128,6 +128,29 @@ future decrypt can fall back to.
 _Avoid_: backup key (collides with the operator's rotating backup alias),
 master key (implies it derives others; it doesn't)
 
+**Receipt**:
+The recipient list a stage set was encrypted to, recorded at staging
+(`stage_sets.key_fingerprints`) and, for volumes written after 2026-09-11,
+carried on the tape inside the operator envelope's `catalog.db`. It is a
+claim tapectl wrote down about its own encryption, and the only evidence
+escrow coverage has short of an Attestation. Escrow coverage reads three
+ways from it: **covered** (the current Escrow Recipient is on the list),
+**gap** (it is not, or the list is corrupt), **unknown** (a row rebuilt from
+a tape that carried no receipt — not covered, every gate still refuses, but
+the remedy is attestation, not re-staging).
+_Avoid_: fingerprint list (the column name, not the concept), key list
+
+**Attestation**:
+Escrow coverage proved rather than recorded: the Escrow Recipient's own key
+decrypts one slice header, so the slice is demonstrably readable by it.
+Only `catalog rebuild --key <escrow>` performs it, and only when the
+supplied key is the Escrow Recipient this catalog has registered — which is
+why a rebuilt machine must adopt the original identity before anything
+else. Stronger than a Receipt, and the only way an old tape's rebuilt rows
+leave **unknown**.
+_Avoid_: verification (that is the keyless integrity chain), proof of
+coverage (fine in prose, but the word the code uses is attest)
+
 **Heir Kit**:
 The physical artifact set that survives the machine: the printed Escrow
 Recipient identity, cover instructions, and a catalog snapshot encrypted

@@ -134,11 +134,18 @@ and therefore the failure, is identical.
   settled [#136](https://github.com/mikmorg/tapectl/issues/136) the other
   way: `import` registers a cartridge and that is all it was for, and
   rebuilding the catalog is its own command. Arm (b) now asserts that
-  refusal positively, and the new arm **(d)** drives
-  `catalog rebuild --from-volume` end to end: rebuild from the tape's
-  envelopes on an empty home, `catalog locate`, a real `restore unit` off
-  tape through the rebuilt rows, then a second rebuild that must change
-  nothing.
+  refusal positively, and arm **(d)** drives
+  `catalog rebuild --from-volume` end to end AND the disaster-recovery
+  recipe: `init --no-escrow`, rebuild from the tape's envelopes,
+  `catalog locate`, a real `restore unit` off tape through the rebuilt rows,
+  `volume verify --full`, then `key import --escrow` the ORIGINAL escrow key
+  and assert the rebuilt rows read `escrow: yes` (their receipts rode the
+  tape) with no escrow findings in `audit`; then a second rebuild that must
+  change nothing. The mistake is measured too, in a second home: a plain
+  `init` mints a replacement escrow identity, so the rebuilt rows read `NO`
+  and `audit` names `escrow_identity_mismatch` exactly once with the
+  `key import --escrow` command. (`init --escrow-public-key`, #139, is the
+  one-command form; the arm keeps the two-step on purpose.)
 - Three former expected failures are now fixed:
   `restore-file-and-catalog`'s symlink case (`restore file` dereferenced via
   `fs::copy` while `restore unit` preserved the link — the two commands

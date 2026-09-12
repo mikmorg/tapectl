@@ -73,26 +73,28 @@ tapectl quick-archive /media/tv/new-show --tenant mike --volume L6-0001
 ```
 tapectl init                    Bootstrap DB, config, operator tenant + keys
 tapectl tenant                  add, list, info, reassign, delete
-tapectl key                     generate, list, export, import, rotate
+tapectl key                     generate, list, export, import, rotate, escrow-kit
 tapectl unit                    init, init-bulk, list, status, tag, rename,
                                 discover, check-integrity, mark-tape-only
 tapectl snapshot                create, list, diff, delete, mark-reclaimable, purge
 tapectl stage                   create, list, info
 tapectl staging                 status, clean
-tapectl volume                  init, write, verify, identify, move, retire,
-                                read-slices, plan,
+tapectl volume                  init, write, resume, abort, verify, identify,
+                                move, retire, read-slices, plan, deposit,
                                 compact-read, compact-write, compact-finish, compact
 tapectl cartridge               register, list, info, mark-erased
 tapectl archive-set             create, edit, list, info, sync
 tapectl audit                   Policy compliance (--action-plan, --json)
-tapectl catalog                 ls, search, locate, stats
+tapectl catalog                 ls, search, locate, stats, rebuild
 tapectl location                add, list, info, rename
 tapectl report                  summary, fire-risk, copies, tape-only, dirty,
                                 pending, verify-status, health, capacity, age,
                                 events, compaction-candidates
-tapectl restore                 unit, file
+tapectl restore                 unit, file, raw-volume
 tapectl export                  Encrypted slices to directory
 tapectl import                  Pre-existing volume into DB
+tapectl collection              sync, status, plan, run
+tapectl backend                 add
 tapectl quick-archive           Create + stage + write in one flow
 tapectl db                      backup, fsck, export, import, stats
 tapectl config                  show, check
@@ -143,12 +145,20 @@ Per-unit config at `.tapectl-unit.toml` in each directory.
 
 ```
 src/
-  cli/          Clap-based subcommands (18 modules)
-  db/           SQLite with WAL, forward-only migrations, FTS5
-  policy/       3-level policy resolver
+  cli/          Clap-based subcommands (21 modules)
+  collection/   Folder-per-unit source roots: sync, plan, run
+  db/           SQLite with WAL, forward-only migrations, FTS5;
+                ontape_catalog.rs is the operator envelope's catalog.db
+  policy/       3-level resolver; coverage.rs (copy/location SQL),
+                escrow.rs (escrow coverage: covered / unknown / gap)
+  store.rs      The Store seam (ADR-0006): TapeStore, MemStore
   unit/         Archival units, dotfiles, discovery
   staging/      dar + age pipeline, sha256 validation
-  volume/       10-file tape layout, write, verify, clone, compact
+  volume/       Layout v2: build, session (typestate write), format
+                (front index / seal / ID thunk parsers), manifest
+                (MANIFEST.toml both directions), envelope (reads one
+                back), restore_script (RESTORE.sh from named awk
+                fragments), rebuild (catalog rebuild), raw, restore
   tape/         Linux st driver via ioctl
   crypto/       age multi-recipient encryption
   dar/          dar subprocess wrapper, XML catalog parsing
@@ -179,8 +189,17 @@ Two gated test suites exist for heavier validation:
 
 ```bash
 # mhvtl end-to-end round-trip, tenant isolation on real tape layout,
-# health log collection. Requires /dev/nst0 backed by mhvtl.
-TAPECTL_MHVTL=1 cargo test --test mhvtl_e2e -- --ignored --nocapture
+# health log collection. DEVICE NUMBERING IS NOT STABLE across reboots on a
+# host that also has a real drive: always set TAPECTL_GATE_TAPE, and check
+# `ls -l /dev/tape/by-id/` first (scsi-XYZZY_A* are mhvtl).
+TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 \
+    cargo test --test mhvtl_e2e -- --ignored --nocapture
+
+# The two operator-level suites on mhvtl: the 26-leg verification gate, and
+# the lifecycle suite (years of use in minutes, 13 scenarios, a 10-way
+# restore matrix). Both are documented in docs/.
+TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 scripts/mhvtl-verify-gate.sh
+scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
 
 # Performance scenarios (many files, many units, large file).
 # Gated because a full run takes ~2 minutes.

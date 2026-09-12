@@ -41,6 +41,30 @@ Milestones 0 through 5 are complete.
 
 **Milestone 7 (software-side complete):** Phases 1–9 landed. Lib target (Phase 1), module unit tests (Phase 2), sg_logs health collection (Phase 3), full audit trail wiring (Phase 4), mhvtl-gated E2E round-trip (Phase 5), library failure-mode tests (Phase 6), multi-tenant isolation tests (Phase 7 — crypto cross-decrypt rejection, plaintext-leak scan on raw tape bytes, both-tenants self-restore, tape-device lock for parallel mhvtl tests), performance harness (Phase 8 — `tests/performance.rs` gated on `TAPECTL_PERF_TESTS=1`, baselines in `docs/perf-baselines.md`), docs + man pages (Phase 9 — README Testing/Documentation sections, `examples/gen_man.rs` + `docs/man/*.1` via clap_mangen, `docs/lto6-validation-checklist.md`, written as a procedure stub in Phase 9 but **no longer one** — it was fleshed out and dry-run annotated against mhvtl on 2026-07-20 (#8) and records the ENOSPC fidelity gap; read it as usable procedure).
 
+**2026-09-11 — disaster recovery and the architecture review (complete).** Three
+review rounds on `catalog rebuild --from-volume` (#136) and what building it
+exposed, then seven deepenings, all landed and real-drive-validated (four
+45/45 passes on the HP LTO-6 that day and the next). What to know:
+- **The catalog is reconstructible from tape** with the operator or escrow key
+  (`volume::rebuild`, `volume::envelope`); tapes written after 2026-09-11 carry
+  tenant ownership and each stage set's escrow receipt in the operator
+  envelope's `catalog.db` (`db::ontape_catalog`, shape-probed, no stamp).
+- **Escrow coverage has three answers** — covered / unknown / gap —
+  through one predicate and one query (`policy::escrow`); a rebuilt row is
+  `unknown` (`stage_sets.origin`), attestable by `catalog rebuild --key <escrow>`
+  decrypting one slice header. `audit` names an escrow-identity mismatch once.
+- **The DR recipe is one command:** `init --escrow-public-key <original>` (#139).
+  No command replaces a registered escrow identity (ADR-0005).
+- **`audit` scopes per check** (`cli::audit::CHECKS`); tape-only units were
+  invisible to every check from Milestone 6 until #138.
+- **Byte pins:** `tests/on_tape_golden.rs` pins MANIFEST.toml and RESTORE.sh.
+  If one fails, the on-tape format changed — a CTO decision, never a re-pin.
+  `MANIFEST.toml` is one type both directions (`volume::manifest`); RESTORE.sh
+  is assembled from named awk fragments (`volume::restore_script`).
+- The full account: `docs/runs/2026-09-11-unattended.md`,
+  `docs/audits/2026-09-11-rebuild-findings-review.md`; the process rules that
+  outlived the run: `.claude/skills/unattended-run/SKILL.md`.
+
 **Handoff:** `docs/handoff.md` is the current division of remaining work into
 what an agent finishes and what needs the operator's hands (the Heir Kit
 ceremony, the LTO-6 session, the first production write).
@@ -156,14 +180,14 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 
 **Key subsystems:**
 - **CLI layer** (`src/cli/`): clap derive-based subcommands (tenant, unit, snapshot, stage, volume, catalog, restore, audit, etc.)
-- **Database** (`src/db/`): SQLite with WAL mode, forward-only numbered migrations, full audit trail
+- **Database** (`src/db/`): SQLite with WAL mode, forward-only numbered migrations, full audit trail; `ontape_catalog.rs` is the operator envelope's `catalog.db` — schema, generation probe, read and write in one place
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
 - **dar integration** (`src/dar/`): subprocess wrapper; minimum dar 2.6.x; XML catalog parsing via quick-xml
 - **Staging** (`src/staging/`): sha256 validation before archiving, age multi-recipient encryption, ephemeral slices
-- **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal parsers (`format.rs`), verify, read-slices
+- **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), RESTORE.sh from named awk fragments (`restore_script.rs`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
-- **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit
+- **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit; `coverage.rs` owns the copy/location SQL and every `volumes.status` predicate, `escrow.rs` owns escrow coverage (verdict AND query) — never inline either again
 - **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` are the remaining peers (#72/#73)
 - **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical first-fit batch selector, stage-once/write-N-copies/release
 

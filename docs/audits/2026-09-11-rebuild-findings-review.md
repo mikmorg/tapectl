@@ -147,9 +147,9 @@ Findings 3 and 4 change its shape. With a kit restored and the original escrow k
 |---|---|---|---|
 | 1 | `audit` scoping per check | settle, **fix** | #138 — **landed `ba8a4a1`** |
 | 2 | `catalog.db` becomes a complete rebuild source | defer | grilled 2026-09-11, ratified (a) — **landed `4292cf9`** |
-| 3 | DR section written as kit + rebuild | settle, docs | operator guide |
-| 4 | import the original escrow key; fix arm (d); verify the kit prints it | settle | operator guide, lifecycle suite, #69 |
-| 5 | define "self-describing" | settle, docs | `volume-format-v2.md` |
+| 3 | DR section written as kit + rebuild | settle, docs | **landed `103ba99`** |
+| 4 | import the original escrow key; fix arm (d); verify the kit prints it | settle | **landed `103ba99` + `a7f2921`**; kit text already says `key import --escrow`; **#139 (`init --escrow-public-key`) landed `b10b089`** |
+| 5 | define "self-describing" | settle, docs | **landed `103ba99`** |
 | — | #137 decision: accept narrowed noise, or third state | defer | grilled, ratified: third state + attestation — **landed `d5c9638`** (third state) |
 
 Two items want the CTO (2 and the #137 choice); they are the same decision seen from two sides and should be grilled together. Everything else is a settle and can proceed on ratification.
