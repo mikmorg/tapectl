@@ -369,7 +369,7 @@ EOF
   ADOPT=""
   if [ "$AUTO" != 1 ]; then ask ADOPT "existing escrow PUBLIC key to adopt (age1…, or a .pub path) — leave empty to mint a new one" ""; fi
   note "PAPER READY? The escrow secret appears exactly once, next."
-  confirm "Run init now?" || die "stopped before init"
+  confirm "Run init now? (type y — Enter means no, nothing has been created)" || die "stopped before init: nothing was minted or written. Re-run with --from $STEP and answer y when the paper is ready"
   if [ -n "$ADOPT" ]; then run_nolog tc init --operator "$OPERATOR" --escrow-public-key "$ADOPT"
   else run_nolog tc init --operator "$OPERATOR"; fi
   note "Written down? It will not be shown again."
