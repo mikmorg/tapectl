@@ -7,7 +7,7 @@
 # step 12, and every tape-touching command is confirmed by name):
 #
 #    1  Rust toolchain (rustup; the repo pins 1.94.1 in rust-toolchain.toml)
-#    2  runtime tools: dar >= 2.6, mt, sg3-utils, age, python3, lsscsi
+#    2  runtime tools: dar >= 2.6, mt, sg3-utils, python3, lsscsi (age optional: heir path + rehearsal)
 #    3  build tapectl (release) and optionally install it
 #    4  the ungated test suite (no tape needed)
 #    5  find the tape drive BY SERIAL and confirm it
@@ -176,20 +176,34 @@ explain <<'EOF'
 tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages and the cartridge's MAM. `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 11. `lsscsi` and `python3` are for step 5 and the lifecycle suite.
 EOF
 MISSING=()
-for t in dar mt sg_read_attr sg_logs age python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
+for t in dar mt sg_read_attr sg_logs python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
 if [ "${#MISSING[@]}" -gt 0 ]; then
   note "missing: ${MISSING[*]}"
   explain <<'EOF'
-Debian/Ubuntu package names: dar, mt-st, sg3-utils, age, python3, lsscsi.
+Debian/Ubuntu package names: dar, mt-st, sg3-utils, python3, lsscsi.
 EOF
-  if confirm "Run: sudo apt install dar mt-st sg3-utils age python3 lsscsi ?"; then run sudo apt install -y dar mt-st sg3-utils age python3 lsscsi; else die "install the missing tools and re-run with --from 2"; fi
+  if confirm "Run: sudo apt install dar mt-st sg3-utils python3 lsscsi ?"; then run sudo apt install -y dar mt-st sg3-utils python3 lsscsi; else die "install the missing tools and re-run with --from 2"; fi
+fi
+if ! command -v age >/dev/null 2>&1; then
+  explain <<'EOF'
+`age` (the CLI) is NOT needed by tapectl itself — the binary uses the rage crate. It is needed by RESTORE.sh, the heir path written to every tape, and therefore by the step-11 rehearsal, which runs that script off the tape. Debian ships an `age` package only from bookworm (12) onward; older releases have none, which is why apt cannot find it. Install it from the upstream release (a single static Go binary), or with `go install filippo.io/age/cmd/...@latest`, or skip it for now — step 11 will refuse to run without it, and nothing else here needs it.
+EOF
+  if confirm "Install age v1.3.2 from the upstream GitHub release into /usr/local/bin now?"; then
+    AGE_TAG="v1.3.2"
+    AGE_URL="https://github.com/FiloSottile/age/releases/download/${AGE_TAG}/age-${AGE_TAG}-linux-amd64.tar.gz"
+    TMPD="$(mktemp -d)"
+    run bash -c "curl -fsSL '$AGE_URL' | tar -xz -C '$TMPD'" || die "download failed — check the tag at https://github.com/FiloSottile/age/releases"
+    run sudo install -m 0755 "$TMPD/age/age" "$TMPD/age/age-keygen" /usr/local/bin/
+    rm -rf "$TMPD"
+    run age --version
+  else note "continuing without age — the step-11 rehearsal will be unavailable until it is installed"; fi
 fi
 DARV="$(dar --version 2>&1 | sed -n 's/.*dar version \([0-9.]*\).*/\1/p' | head -1)"
 [ -n "$DARV" ] || DARV="$(dar --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 [ -n "$DARV" ] || die "could not read dar's version (dar --version)"
 vercmp_ge "$DARV" "2.6.0" || die "dar $DARV is too old; tapectl needs >= 2.6"
 vercmp_ge "$DARV" "2.7.20" || note "dar $DARV works; 2.7.20+ is recommended (bookworm ships 2.7.x)"
-ok "dar $DARV, mt, sg3-utils, age, python3, lsscsi present"
+ok "dar $DARV, mt, sg3-utils, python3, lsscsi present$(command -v age >/dev/null 2>&1 && echo ", age present" || echo "; age ABSENT (heir-path script and rehearsal only)")"
 }
 
 # ================================================================ step 3
@@ -405,7 +419,8 @@ skip_if || {
 explain <<'EOF'
 Before real data, the lifecycle suite can run a whole simulated first year — write, verify, every restore path including the heir script off the tape — on a cartridge you are willing to lose. It ERASES that cartridge. It needs its barcode typed exactly, cross-checked against the cartridge's MAM. This is the step that proves the drive, the host's st driver and the binary you built agree.
 EOF
-if [ "$AUTO" = 1 ] && [ -z "$BARCODE" ]; then note "skipped under --auto: no --barcode given (erasing a cartridge is never a default)"
+if ! command -v age >/dev/null 2>&1; then note "skipped: the rehearsal runs RESTORE.sh off the tape, which needs the age CLI (step 2 explains how to install it)"
+elif [ "$AUTO" = 1 ] && [ -z "$BARCODE" ]; then note "skipped under --auto: no --barcode given (erasing a cartridge is never a default)"
 elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
   if [ -n "$SG" ]; then run sudo sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true; fi
   ask BARCODE "barcode/serial of the TEST cartridge in the drive (it will be erased)" "$BARCODE"
