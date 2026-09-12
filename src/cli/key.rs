@@ -526,11 +526,15 @@ fn import_escrow_key(
     let pub_key = adopt_escrow_recipient(conn, paths, value)?;
 
     // `adopt_escrow_recipient` above already resolved the operator tenant
-    // (and would have failed if it were missing), so this lookup cannot fail
-    // here — it exists only to recompute the alias for this command's own
-    // output, since `adopt_escrow_recipient`'s return is just the public key.
-    let operator = queries::get_operator_tenant(conn)?
-        .expect("operator tenant exists: adopt_escrow_recipient just used it");
+    // (and would have failed if it were missing), so this can't actually be
+    // absent here — it exists only to recompute the alias for this command's
+    // own output, since `adopt_escrow_recipient`'s return is just the public
+    // key. Same error as `adopt_escrow_recipient` itself, not a panic: there
+    // is no reason to add a new panic path in library code for a lookup this
+    // cheap to re-fail gracefully instead.
+    let operator = queries::get_operator_tenant(conn)?.ok_or_else(|| {
+        TapectlError::Other("no operator tenant — run `tapectl init` first".into())
+    })?;
     let full_alias = format!("{}-escrow", operator.name);
 
     if json_output {
