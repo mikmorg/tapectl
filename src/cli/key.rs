@@ -470,16 +470,18 @@ fn generate_escrow_key(
     Ok(())
 }
 
-/// `key import --escrow <pubkey>`: adopt an existing public key as the
-/// permanent escrow recipient, under the same refuse-if-exists rule as
-/// `key generate --escrow`. `value` may be a literal `age1...` string or a
-/// path to a file containing one (`crypto::keys::read_or_parse_public_key`).
-fn import_escrow_key(
+/// Adopt an existing public key as the permanent escrow recipient (ADR-0005),
+/// under the same refuse-if-exists rule as `key generate --escrow`. `value`
+/// may be a literal `age1...` string or a path to a file containing one
+/// (`crypto::keys::read_or_parse_public_key`). Returns the public key it
+/// registered. Shared by `key import --escrow` and `tapectl init
+/// --escrow-public-key` (issue #139) so the two adoption paths cannot drift
+/// in what they store.
+pub fn adopt_escrow_recipient(
     conn: &Connection,
     paths: &TapectlPaths,
     value: &str,
-    json_output: bool,
-) -> Result<()> {
+) -> Result<String> {
     if queries::escrow_key_exists(conn)? {
         return Err(escrow_already_registered_error());
     }
@@ -507,6 +509,29 @@ fn import_escrow_key(
 
     let pub_path = paths.keys_dir.join(format!("{full_alias}.age.pub"));
     keys::save_public_key(&pub_path, &pub_key)?;
+
+    Ok(pub_key)
+}
+
+/// `key import --escrow <pubkey>`: adopt an existing public key as the
+/// permanent escrow recipient, under the same refuse-if-exists rule as
+/// `key generate --escrow`. `value` may be a literal `age1...` string or a
+/// path to a file containing one (`crypto::keys::read_or_parse_public_key`).
+fn import_escrow_key(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    value: &str,
+    json_output: bool,
+) -> Result<()> {
+    let pub_key = adopt_escrow_recipient(conn, paths, value)?;
+
+    // `adopt_escrow_recipient` above already resolved the operator tenant
+    // (and would have failed if it were missing), so this lookup cannot fail
+    // here — it exists only to recompute the alias for this command's own
+    // output, since `adopt_escrow_recipient`'s return is just the public key.
+    let operator = queries::get_operator_tenant(conn)?
+        .expect("operator tenant exists: adopt_escrow_recipient just used it");
+    let full_alias = format!("{}-escrow", operator.name);
 
     if json_output {
         println!(
