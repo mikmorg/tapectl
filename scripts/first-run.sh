@@ -172,6 +172,18 @@ EOF
 }
 skip_if() { [ "$FROM" -gt "$STEP" ] && { note "skipped (--from $FROM)"; return 0; }; return 1; }
 vercmp_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+# rustup's env is loaded here, not only in step 1, so --from 3 never falls
+# through to a distro cargo that cannot parse edition 2021.
+# shellcheck disable=SC1091
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+# toolchain_check: cargo and rustc must be rustup's, at the pinned version.
+toolchain_check() {
+  local want have
+  want="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")"
+  have="$(cd "$REPO" && rustc --version 2>/dev/null | awk '{print $2}')"
+  [ "$have" = "$want" ] || die "rustc is ${have:-absent} at $(command -v rustc || echo '<none>'), the repo pins $want — run step 1 (scripts/first-run.sh --from 1 --to 1)"
+  case "$(command -v cargo)" in "$HOME"/.cargo/bin/*|"${CARGO_HOME:-/nonexistent}"/bin/*) ;; *) die "cargo at $(command -v cargo) is not rustup's — a distro cargo cannot build this crate; run step 1" ;; esac
+}
 
 # ================================================================ step 0
 printf '%stapectl first run%s — repo %s\n' "$B" "$R" "$REPO"
@@ -206,13 +218,9 @@ if ! command -v rustup >/dev/null 2>&1; then
     [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
   else die "rustup is required. https://rustup.rs"; fi
 fi
-# shellcheck disable=SC1091
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-WANT="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")"
 ( cd "$REPO" && run rustup show active-toolchain ) || true
-HAVE="$(cd "$REPO" && rustc --version 2>/dev/null | awk '{print $2}')"
-[ "$HAVE" = "$WANT" ] || die "rustc is $HAVE, the repo pins $WANT — run: cd $REPO && rustup show"
-ok "rustc $HAVE, cargo $(cargo --version | awk '{print $2}')"
+toolchain_check
+ok "rustc $(rustc --version | awk '{print $2}'), cargo $(cargo --version | awk '{print $2}') at $(command -v cargo)"
 }
 
 # ================================================================ step 2
@@ -260,6 +268,7 @@ explain <<'EOF'
 Everything validated on mhvtl and on the real drive so far ran the debug binary — it is the proven artifact. A release build is the same source with optimisation on: markedly faster at the sha256 hashing and age encryption a multi-hundred-gigabyte write is made of. Build release for production, then run one real-drive rehearsal on it (step 12) before you trust it with data, because a different binary is a different artifact. Install it to /usr/local/bin: the service user cannot execute a binary under your home.
 EOF
 if confirm "Build the release binary now (cargo build --release; a few minutes)?"; then
+  toolchain_check
   ( cd "$REPO" && run cargo build --release )
   TAPECTL="$REPO/target/release/tapectl"
   [ -x "$TAPECTL" ] || TAPECTL="${CARGO_TARGET_DIR:-$REPO/target}/release/tapectl"
@@ -279,7 +288,7 @@ if [ "$SKIP_TESTS" = 1 ]; then note "--skip-tests"; else
 explain <<'EOF'
 `cargo test` runs ~900 tests that need no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
 EOF
-if confirm "Run cargo test now?"; then ( cd "$REPO" && run cargo test ) || die "the suite is red on this machine — stop here and look"; ok "suite green"; fi
+if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && run cargo test ) || die "the suite is red on this machine — stop here and look"; ok "suite green"; fi
 fi
 }
 
