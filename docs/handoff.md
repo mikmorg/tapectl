@@ -49,8 +49,8 @@ Taken in severity order; every row below is closed.
 
 ## Tier B — agent-built, but only valuable if you then run it
 
-**The LTO-6 measurement harness — BUILT (`scripts/lto6-measure.sh`).** Run it
-first in the hardware session:
+**The LTO-6 measurement harness — BUILT and RUN (`scripts/lto6-measure.sh`,
+2026-09-10; results in the session journal).** For a future cartridge or drive:
 
 ```bash
 ./scripts/lto6-measure.sh --erase-cartridge <BARCODE>
@@ -105,11 +105,31 @@ restore end to end, so a synthetic rehearsal would mostly re-prove that.
   never 2) when volumes have been sealed since the last generation, so you get
   told rather than having to remember.
 
-### 2. The LTO-6 hardware session
+Two things learned on 2026-09-11 that belong on the cover sheet's mental
+model, since the kit is what an heir or a rebuilt machine starts from:
 
-Follow `docs/lto6-validation-checklist.md`, with the Tier-B harness doing the
-measurement. Pre-flight matters: SCSI enumeration shuffles, so discover the
-changer and the drive's sg node rather than assuming `/dev/sg0` or slot 1.
+- **The escrow identity can never be replaced, only imported first.** A
+  rebuilt machine must `init --no-escrow` and then `key import --escrow` the
+  original public key BEFORE restoring or rebuilding anything; a plain
+  `init` mints a replacement identity and no command replaces it (the empty
+  home has to be deleted and started again — #139 proposes
+  `init --escrow-public-key` so there is no wrong order). The operator guide's
+  Disaster Recovery section is the procedure.
+- **The catalog is reconstructible from tape** with the operator or escrow
+  key (`catalog rebuild --from-volume`), and tapes written after 2026-09-11
+  carry their escrow receipts; the kit's `catalog.db.age` is still the faster
+  and fuller starting point (locations, cartridges, verification history are
+  never on tape).
+
+### 2. ~~The LTO-6 hardware session~~ — DONE 2026-09-10
+
+`docs/lto6-session-journal-2026-09-10.md` is the record; the §5 open
+questions are answered there (block size 512 K vs 1 M is a wash, MAM
+over-report is +2 MiB). Three further real-drive confirmation passes ran on
+2026-09-11 (45/45 each) after heir-path and envelope byte changes, with the
+changed zones read back off the cartridge — see
+`docs/runs/2026-09-11-unattended.md`. The drive numbering hazard is real:
+resolve by serial through `/dev/tape/by-id/`, never by `/dev/nstN`.
 
 ### 3. The first production write
 
