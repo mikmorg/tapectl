@@ -90,6 +90,12 @@ restore end to end, so a synthetic rehearsal would mostly re-prove that.
 
 ## Tier C — only you can do these
 
+`scripts/first-run.sh` is the guided version of all three: it stops at the
+points below that need your hands (the printed escrow secret, the printed kit,
+the barcode of a cartridge you are willing to erase, the label you write on
+the production tape) and does everything around them.
+
+
 ### 1. The Heir Kit ceremony (the remainder of #69)
 
 **The command shipped in `d0c8503`** — run

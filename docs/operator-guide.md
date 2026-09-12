@@ -2,6 +2,11 @@
 
 ## Initial Setup
 
+> `scripts/first-run.sh` does everything in this section interactively, in
+> order, explaining each step and detecting what is already done. Prefer it
+> for a new machine; the text below is the same procedure, for reference.
+
+
 ### 1. Install Dependencies
 
 ```bash
