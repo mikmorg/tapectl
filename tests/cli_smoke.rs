@@ -89,6 +89,166 @@ fn init_creates_the_escrow_recipient_and_prints_its_secret_to_stderr() {
     );
 }
 
+/// #139: a rebuilt machine registers the ORIGINAL escrow identity at init
+/// instead of minting a replacement — the disaster-recovery arm. No secret
+/// exists on this machine to print; the secret half lives only on the heir
+/// kit that carries the public key being adopted here.
+#[test]
+fn init_with_escrow_public_key_adopts_it_and_prints_no_secret() {
+    let kp = tapectl::crypto::keys::generate_keypair();
+    let home = TempDir::new().unwrap();
+    let out = run_tapectl(
+        home.path(),
+        &["init", "--escrow-public-key", &kp.public_key, "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "init --escrow-public-key failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("AGE-SECRET-KEY-"),
+        "adopting an existing escrow key must not print a secret:\n{stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("init --json stdout did not parse as whole JSON: {e}\n{stdout}")
+    });
+    assert_eq!(
+        parsed["escrow_public_key"].as_str(),
+        Some(kp.public_key.as_str()),
+        "escrow_public_key should carry the adopted key, not a freshly minted one"
+    );
+
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).expect("open the initialized db");
+    let registered = tapectl::db::queries::escrow_public_key(&conn)
+        .expect("query escrow_public_key")
+        .expect("an escrow key should be registered");
+    assert_eq!(registered, kp.public_key);
+}
+
+/// Same as above, but the key is supplied as a path to a `.pub` file — the
+/// form `read_or_parse_public_key` also accepts.
+#[test]
+fn init_with_escrow_public_key_accepts_a_pub_file() {
+    let kp = tapectl::crypto::keys::generate_keypair();
+    let home = TempDir::new().unwrap();
+    let pub_file = home.path().join("original-escrow.age.pub");
+    std::fs::write(&pub_file, format!("{}\n", kp.public_key)).unwrap();
+
+    let out = run_tapectl(
+        home.path(),
+        &[
+            "init",
+            "--escrow-public-key",
+            pub_file.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "init --escrow-public-key <file> failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("init --json stdout did not parse as whole JSON: {e}\n{stdout}")
+    });
+    assert_eq!(
+        parsed["escrow_public_key"].as_str(),
+        Some(kp.public_key.as_str())
+    );
+
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).expect("open the initialized db");
+    let registered = tapectl::db::queries::escrow_public_key(&conn)
+        .expect("query escrow_public_key")
+        .expect("an escrow key should be registered");
+    assert_eq!(registered, kp.public_key);
+}
+
+/// clap's `conflicts_with` must reject the combination before anything runs.
+#[test]
+fn init_rejects_escrow_public_key_together_with_no_escrow() {
+    let kp = tapectl::crypto::keys::generate_keypair();
+    let home = TempDir::new().unwrap();
+    let out = run_tapectl(
+        home.path(),
+        &["init", "--no-escrow", "--escrow-public-key", &kp.public_key],
+    );
+    assert!(
+        !out.status.success(),
+        "clap should refuse --no-escrow together with --escrow-public-key"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "clap arg-conflict errors exit 2: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    assert!(
+        !db_path.exists(),
+        "a rejected init must create nothing: {} exists",
+        db_path.display()
+    );
+}
+
+/// A bad value must fail before any side effect — no half-initialised home
+/// left behind to "delete it and start over" (the fallback this flag exists
+/// to avoid needing).
+#[test]
+fn init_with_a_bad_escrow_public_key_creates_nothing() {
+    let home = TempDir::new().unwrap();
+    let out = run_tapectl(home.path(), &["init", "--escrow-public-key", "not-a-key"]);
+    assert!(
+        !out.status.success(),
+        "init must refuse a value that is neither an age1... literal nor a readable .pub file"
+    );
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    assert!(
+        !db_path.exists(),
+        "a bad --escrow-public-key must leave nothing behind: {} exists",
+        db_path.display()
+    );
+}
+
+/// ADR-0005: exactly one escrow identity, ever. Adopting at init registers
+/// it just as surely as `key generate --escrow`/`key import --escrow` would,
+/// so a later `key import --escrow` must refuse exactly the same way.
+#[test]
+fn a_subsequent_key_import_escrow_is_refused_after_adopting_at_init() {
+    let original = tapectl::crypto::keys::generate_keypair();
+    let another = tapectl::crypto::keys::generate_keypair();
+    let home = TempDir::new().unwrap();
+
+    let init_out = run_tapectl(
+        home.path(),
+        &["init", "--escrow-public-key", &original.public_key],
+    );
+    assert!(
+        init_out.status.success(),
+        "init --escrow-public-key failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let import_out = run_tapectl(
+        home.path(),
+        &["key", "import", "--escrow", &another.public_key],
+    );
+    assert!(
+        !import_out.status.success(),
+        "key import --escrow must refuse once init has already adopted an escrow recipient"
+    );
+    assert!(
+        String::from_utf8_lossy(&import_out.stderr).contains("already registered"),
+        "expected the already-registered message, got: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+}
+
 #[test]
 fn parses_global_json_flag_before_and_after_subcommand() {
     // `--json` is declared `#[arg(long, global = true)]` on `Cli`, so clap
