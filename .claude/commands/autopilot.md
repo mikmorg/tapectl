@@ -97,6 +97,16 @@ the normative design set named in the Policy block below.
   updated deliberately (follow-up **C2b**, LANDED — twelve keys, raw values, names following each command family's existing `--json` conventions; pins extended in place); (Q3) **keep
   `in_service`** for escrow findings — quarantined volumes excluded, per
   Copy's definition.
+  **#139 LANDED `..b10b089`** (2026-09-12, sonnet worker, 5 commits): `init
+  --escrow-public-key <KEY_OR_FILE>` adopts the original escrow identity at
+  init through `key::adopt_escrow_recipient`, shared with `key import
+  --escrow` so the two cannot drift; the key is parsed BEFORE the first side
+  effect, so a bad value leaves nothing on disk (verified: exit 2, empty
+  home); conflicts with `--no-escrow`; `--json` keys unchanged; man pages
+  regenerated, zero drift; five smoke tests. The DR recipe is now one
+  command. 784 lib / 907 total. **The queue is empty; the software side is
+  at a plateau — what remains is the CTO's: the Heir Kit ceremony and the
+  first production write (`docs/handoff.md`).**
   **Lesson (C4 caught it in the act): `git stash` is shared across every
   worktree of one `.git`.** A worker popped another worker's entry. No loss —
   it noticed and restored — but the template now bans `stash`; baselines run
