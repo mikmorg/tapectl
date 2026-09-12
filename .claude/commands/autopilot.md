@@ -16,7 +16,7 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed.**
+- **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed; real-drive pass #4 45/45 on 2026-09-12.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
   queue is the seven candidates of the architecture review — not in the repo
   (report: `/tmp/architecture-review-20260911-180729.html`, artifact

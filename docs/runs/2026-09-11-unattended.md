@@ -281,6 +281,16 @@ worktrees (a worker popped another's entry, noticed, restored — now banned in
 the template); and a review that measures four things beats one that reads
 forty files. Details per item in `.claude/commands/autopilot.md`.
 
+**Real-drive confirmation pass #4 — DONE 2026-09-12 01:35 UTC (the deepenings).**
+Not owed by the byte rule — the manifest and RESTORE.sh pins prove no byte
+moved — but C7 (read entry points through the Store), C6 (the assembled
+script) and C3 (the manifest type) had only run together on mhvtl.
+`first-year` on `EW7VWMVKF6`: **45 checks, 45 passed, 0 failed**, including
+the raw-volume, restore-sh and operator-envelope legs those changes sit
+under. The script the heir leg took off the cartridge is `bash -n` clean and
+carries `in_head = 1` (#135) and the `seen[]` dedupe (#133) — the named
+fragments, on tape.
+
 One process note, twice over: `Closes #NNN` in a commit message auto-closes
 the issue **on push, before CI finishes**. It went green both times, but the
 #133 rule stands — do not treat an issue as closed until CI is read.
