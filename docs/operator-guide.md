@@ -876,25 +876,31 @@ There are two sources, and the procedure is to use both, in this order:
 Before either step, on a rebuilt machine:
 
 ```bash
+tapectl init --escrow-public-key age1…        # the ORIGINAL, from the kit's cover sheet
+```
+
+This registers the original escrow recipient directly — there is no wrong
+order to get into. The equivalent two-step form still works, if you prefer it:
+
+```bash
 tapectl init --no-escrow                      # do NOT let init mint a new escrow identity
 tapectl key import --escrow age1…             # the ORIGINAL escrow public key, from the kit's cover sheet
 ```
 
 Every escrow check compares against the escrow recipient this catalog has
 *registered*. A plain `init` registers a brand-new one, and every tape was
-encrypted to the old one — so until the original is imported, everything
+encrypted to the old one — so until the original is registered, everything
 reads `NO: encrypted without the current escrow recipient`, `volume write`
 refuses to re-copy, and nothing can be attested. `audit` will tell you this
-happened (`escrow_identity_mismatch`, naming the key), but the import is
-step one regardless.
+happened (`escrow_identity_mismatch`, naming the key), but registering the
+original is step one regardless.
 
 **If you already ran a plain `init`:** there is only ever one escrow identity
-(ADR-0005) and no command replaces it — `key import --escrow` refuses while
-one is registered. The new home holds nothing yet, so remove it and start
-again with `init --no-escrow`. Do this *before* restoring or rebuilding
-anything into it.
-([#139](https://github.com/mikmorg/tapectl/issues/139) proposes
-`init --escrow-public-key` so there is no wrong order to get into.)
+(ADR-0005) and no command replaces it — neither `key import --escrow` nor
+`init --escrow-public-key` will adopt one while a (wrong) one is already
+registered. The new home holds nothing yet, so remove it and start again with
+`init --escrow-public-key age1…` (or the two-step form above). Do this
+*before* restoring or rebuilding anything into it.
 
 Then, for each tape newer than the kit:
 
