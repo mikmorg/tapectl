@@ -1027,9 +1027,11 @@ bootstrap_archive_v1() {
     vinit "$label" || return 1
     TCTL volume write "$label" --device "$TAPE_DEV" || return 1
     TCTL volume move "$label" --to vault || return 1
-    if [ "$DRY_RUN" != 1 ]; then
-        TCTL cartridge register --barcode "$LOADED_TAG" --media-type LTO-6 || return 1
-    fi
+    # No `cartridge register` here: since ADR-0010, `volume init` reads the
+    # medium serial from MAM and registers and binds the cartridge itself.
+    # Doing it by hand created a SECOND row (the mtx VolumeTag is not the MAM
+    # serial) and had to guess a generation - wrong on mhvtl, whose media is
+    # LTO-8, and wrong again on any drive fed another generation.
 }
 
 # bootstrap_two_volumes — bootstrap_archive_v1 plus a second, mutated
@@ -1091,9 +1093,25 @@ fy_write() {
     && TCTL volume write VOL-A --device "$TAPE_DEV"
 }
 fy_move()      { TCTL volume move VOL-A --to vault; }
+# ADR-0010 turned this step inside out: the operator no longer registers the
+# cartridge, `volume init` does it from the medium serial. The step now
+# ASSERTS the binding rather than performing it.
 fy_cartridge() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge register --barcode \$LOADED_TAG --media-type LTO-6"; return 0; }
-    TCTL cartridge register --barcode "$LOADED_TAG" --media-type LTO-6
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: assert volume init auto-registered and bound VOL-A's cartridge (ADR-0010)"; return 0; }
+    local out
+    out="$(python3 - "$HOME_DIR/tapectl.db" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT c.barcode, c.media_type, c.status FROM cartridges c "
+    "JOIN cartridge_volumes cv ON cv.cartridge_id = c.id "
+    "JOIN volumes v ON v.id = cv.volume_id "
+    "WHERE v.label = 'VOL-A' AND cv.unmounted_at IS NULL").fetchone()
+print("|".join(map(str, row)) if row else "")
+PY
+)"
+    [ -n "$out" ] || { echo "fy_cartridge: no cartridge bound to VOL-A - volume init did not bind (ADR-0010)"; return 1; }
+    echo "fy_cartridge: VOL-A bound to cartridge $out (barcode|generation|status)"
+    case "$out" in *"|in_use") ;; *) echo "fy_cartridge: bound cartridge is not in_use"; return 1 ;; esac
 }
 fy_audit() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl audit --json (record exit code; 0 or 1 both PASS)"; return 0; }
@@ -1782,7 +1800,23 @@ rr_volinit_volh_on_reused_cartridge_succeeds() {
 
 scenario_retire_and_reuse() {
     check rr.setup bootstrap_archive_v1 VOL-A
-    RR_VOLA_BARCODE="$LOADED_TAG"
+    # The barcode is whatever `volume init` bound (the MAM medium serial when
+    # one is readable), NOT the changer's VolumeTag - ADR-0010.
+    if [ "$DRY_RUN" = 1 ]; then
+        RR_VOLA_BARCODE="$LOADED_TAG"
+    else
+        RR_VOLA_BARCODE="$(python3 - "$HOME_DIR/tapectl.db" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT c.barcode FROM cartridges c "
+    "JOIN cartridge_volumes cv ON cv.cartridge_id = c.id "
+    "JOIN volumes v ON v.id = cv.volume_id "
+    "WHERE v.label = 'VOL-A' ORDER BY cv.id DESC LIMIT 1").fetchone()
+print(row[0] if row else "")
+PY
+)"
+        [ -n "$RR_VOLA_BARCODE" ] || RR_VOLA_BARCODE="$LOADED_TAG"
+    fi
 
     check rr.mark_erased_before_retire_refused rr_mark_erased_before_retire_refused
     check rr.retire_refused_sole_copy          rr_retire_refused_sole_copy
