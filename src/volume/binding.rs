@@ -155,6 +155,38 @@ pub(crate) fn lookup_cartridge(
     Ok(CartridgeLookup::default())
 }
 
+/// Refuse to bind a cartridge the operator has declared unfit (ADR-0011).
+///
+/// This is the ONE status-based refusal binding has, and it is deliberately
+/// not the second consent gate ADR-0010 rejected. The difference is the one
+/// ADR-0008 draws between risk and incoherence: `volume init` past File 0
+/// means the operator either loaded a blank tape or gave `--force`, and
+/// ADR-0010 lets that consent stand for the displacement. But no amount of
+/// consent makes a medium you have declared permanently unfit fit again —
+/// that is a fact about the plastic, not a risk to be accepted.
+///
+/// So this takes no `force` parameter AT ALL, structurally like
+/// `session.rs`'s `check_tape_contact`/`AlreadySealed`: a caller cannot
+/// defeat it even by mistake. The escape is `cartridge mark-erased`, the
+/// operator saying they were wrong — which is a different statement from
+/// "proceed anyway".
+///
+/// Every other status still binds silently: `in_use`, `pending_erase` and
+/// `available` are all ordinary reuse, and refusing them would be exactly
+/// the two-command catalog dance ADR-0010 refused to create.
+pub(crate) fn refuse_retired(row: &CartridgeRow) -> Result<()> {
+    if row.status == "retired_permanent" {
+        return Err(TapectlError::Other(format!(
+            "cartridge \"{}\" is retired_permanent and must never be written again \
+             (ADR-0011). This is a fact about the medium, not a risk judgement — \
+             --force does not override it. If the cartridge is in fact usable, say so \
+             with `tapectl cartridge mark-erased {}`, which is the only way back.",
+            row.barcode, row.barcode
+        )));
+    }
+    Ok(())
+}
+
 fn select_cartridge(conn: &Connection, column: &str, value: &str) -> Result<Option<CartridgeRow>> {
     // `column` is never operator input: both call sites pass a literal.
     let sql = format!(
@@ -421,6 +453,42 @@ mod tests {
         register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
         let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
         assert_eq!(found.row.unwrap().barcode, "BC001");
+    }
+
+    // ---- ADR-0011: the one status-based refusal binding has -------------
+
+    /// A medium the operator declared permanently unfit cannot be bound.
+    /// The message must name the way back, because there is exactly one.
+    #[test]
+    fn a_retired_permanent_cartridge_is_refused() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "retired_permanent");
+        let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        let err = refuse_retired(found.row.as_ref().unwrap())
+            .expect_err("a retired_permanent cartridge must never be written again");
+        let msg = err.to_string();
+        assert!(msg.contains("retired_permanent"), "got: {msg}");
+        assert!(
+            msg.contains("mark-erased"),
+            "the refusal must name the only way back; got: {msg}"
+        );
+    }
+
+    /// The refusal takes no `force` parameter AT ALL — it is structurally
+    /// un-overridable, like `session.rs`'s `AlreadySealed`. This test
+    /// exists so that adding one later fails to compile here first.
+    #[test]
+    fn every_other_status_still_binds_silently() {
+        // ADR-0010: binding relitigates nothing. `in_use` (a live volume),
+        // `pending_erase` (awaiting a bulk erase) and `available` are all
+        // ordinary reuse, and File 0 already made the decision.
+        for status in ["available", "in_use", "pending_erase"] {
+            let conn = db::open_memory().unwrap();
+            register(&conn, "BC001", "LTO-6", Some("SER-1"), status);
+            let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+            refuse_retired(found.row.as_ref().unwrap())
+                .unwrap_or_else(|e| panic!("status {status:?} must bind silently: {e}"));
+        }
     }
 
     #[test]

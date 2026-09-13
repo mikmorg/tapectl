@@ -183,6 +183,13 @@ pub fn volume_init(
     // resolution and the capacity resolution need it, and because a
     // `--cartridge` that names nothing must fail before the drive is touched.
     let lookup = binding::lookup_cartridge(conn, serial, cartridge_barcode)?;
+    // ADR-0011: the one status-based refusal binding has. A medium the
+    // operator declared permanently unfit cannot be written, and `--force`
+    // is deliberately not consulted — `refuse_retired` does not take it.
+    // Here with the other FACT checks, before the tape device is opened.
+    if let Some(row) = &lookup.row {
+        binding::refuse_retired(row)?;
+    }
     let row_gen = match &lookup.row {
         Some(r) => match crate::media::Generation::parse(&r.media_type) {
             Some(g) => Some((g, r.barcode.as_str())),

@@ -466,6 +466,304 @@ fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_r
     }
 }
 
+/// Retire a cartridge permanently: the medium must never be written again
+/// (ADR-0011, issue #148).
+///
+/// This is the cartridge-level peer of [`volume_retire`], and ADR-0011 says
+/// so explicitly — "it reuses that analysis rather than growing a second
+/// one". So the coverage question is answered by [`retire_impacts`], the
+/// one derivation `volume retire`, `unit mark-tape-only`, `compact-finish`
+/// and ADR-0010's binding already share.
+///
+/// **Why the bound volumes are retired too.** ADR-0011's justification for
+/// putting this at Tier 2 is that retiring a cartridge "removes a physical
+/// copy from every coverage count that policy computes". That is only TRUE
+/// if the volumes on it stop counting, and every coverage count in this
+/// codebase runs through `policy::coverage`, which is a `volumes.status`
+/// predicate. Leaving them `sealed` would mean displaying an impact
+/// analysis for a loss that never happens, `audit` going on crediting a
+/// medium the operator has declared unfit, and a Tier-2 gate that can never
+/// fire. The `cartridge_volumes` mounts stay OPEN — the volume is still
+/// physically on the cartridge; it is `cartridge mark-erased` that closes
+/// them, because that is when the bytes actually go.
+///
+/// ADR-0008 Tier 2, not Tier 3: the data may still be readable (ADR-0011 is
+/// explicit that retirement is "not an erasure"), so `--force`/`--yes`
+/// overrides, and a non-interactive session with neither refuses rather
+/// than hanging. `cartridge mark-erased` is the only way back out of
+/// `retired_permanent` — the operator saying they were wrong.
+pub fn cartridge_retire(
+    conn: &Connection,
+    barcode: &str,
+    reason: Option<&str>,
+    force: bool,
+    assume_yes: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    let (id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    if status == "retired_permanent" {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "barcode": barcode, "status": status, "changed": false,
+                })
+            );
+        } else {
+            println!("cartridge \"{barcode}\" is already retired_permanent; nothing to do");
+        }
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.label, v.status FROM cartridge_volumes cv
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL
+         ORDER BY v.label",
+    )?;
+    let mounted: Vec<(i64, String, String)> = stmt
+        .query_map(params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let volume_labels: Vec<String> = mounted.iter().map(|(_, l, _)| l.clone()).collect();
+
+    // One merged impact per unit across every volume on the cartridge.
+    //
+    // `bind_cartridge` closes every other open mount when it binds, so in
+    // practice a cartridge has AT MOST ONE open mount and this loop runs
+    // once. The merge is defensive, and it keeps the WORST reading of each
+    // unit (the lowest remaining copy count) so it can never under-report
+    // risk at the moment consent is asked.
+    let mut merged: Vec<RetireImpact> = Vec::new();
+    for (vol_id, _, _) in &mounted {
+        for impact in retire_impacts(conn, *vol_id)? {
+            match merged.iter_mut().find(|m| m.unit_name == impact.unit_name) {
+                Some(existing) if impact.other_copies < existing.other_copies => {
+                    *existing = impact;
+                }
+                Some(_) => {}
+                None => merged.push(impact),
+            }
+        }
+    }
+    merged.sort_by(|a, b| a.unit_name.cmp(&b.unit_name));
+
+    let at_risk: Vec<String> = merged
+        .iter()
+        .filter(|impact| impact.other_copies == 0)
+        .map(|impact| impact.unit_name.clone())
+        .collect();
+
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "barcode": barcode,
+                    "status": status,
+                    "volumes_to_retire": volume_labels,
+                    "affected_units": retire_impacts_json(&merged),
+                    "at_risk_units": at_risk,
+                    "dry_run": true,
+                })
+            );
+        } else {
+            print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
+            println!("\n  DRY RUN — no changes made.");
+        }
+        return Ok(());
+    }
+
+    // ADR-0008: consent is asked EVERY time, because retiring a cartridge is
+    // an irreversible-by-design declaration about a physical medium even
+    // when no unit loses coverage by it. What varies is the facts shown —
+    // and, per ADR-0004, the facts are shown at exactly this moment.
+    let action = format!("retire cartridge \"{barcode}\" permanently");
+    let mut facts: Vec<String> = at_risk
+        .iter()
+        .map(|name| format!("unit \"{name}\" would have ZERO copies remaining after this"))
+        .collect();
+    let now = chrono::Utc::now().naive_utc();
+    for impact in &merged {
+        if impact.other_copies != 0 {
+            if let Some(line) =
+                crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now)
+            {
+                facts.push(line);
+            }
+        }
+    }
+    for label in &volume_labels {
+        facts.push(format!(
+            "volume \"{label}\" is on this cartridge and will be retired with it"
+        ));
+    }
+    facts.push(format!(
+        "cartridge \"{barcode}\" will never be written again; \
+         `tapectl cartridge mark-erased {barcode}` is the only way back"
+    ));
+
+    if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
+        let reason_text = e.to_string();
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "barcode": barcode,
+                    "status": status,
+                    "affected_units": retire_impacts_json(&merged),
+                    "at_risk_units": at_risk,
+                    "consent": "refused",
+                    "reason": reason_text,
+                })
+            );
+        } else {
+            print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
+            println!("\n  REFUSED: {reason_text}");
+        }
+        return Err(e);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE cartridges SET status = 'retired_permanent' WHERE id = ?1",
+        params![id],
+    )?;
+    if let Some(reason) = reason {
+        // Append, never overwrite: the note is a maintenance log, and the
+        // reason a cartridge was retired is exactly the sort of thing that
+        // must not silently replace what someone wrote before it.
+        let line = format!(
+            "[{}] retired_permanent: {reason}",
+            chrono::Utc::now().format("%Y-%m-%d")
+        );
+        tx.execute(
+            "UPDATE cartridges
+             SET notes = CASE WHEN notes IS NULL OR notes = '' THEN ?1
+                              ELSE notes || char(10) || ?1 END
+             WHERE id = ?2",
+            params![line, id],
+        )?;
+    }
+    // `log_event` rather than `log_field_change`, for the `details` column:
+    // the reason a cartridge was declared unfit is the single most useful
+    // thing in its audit trail, and the field-change helper has no room for
+    // it (its last parameter is a tenant id).
+    events::log_event(
+        &tx,
+        "cartridge",
+        id,
+        Some(barcode),
+        "retired",
+        Some("status"),
+        Some(&status),
+        Some("retired_permanent"),
+        reason,
+        None,
+    )?;
+    for (vol_id, label, prior) in &mounted {
+        tx.execute(
+            "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+            params![vol_id],
+        )?;
+        events::log_event(
+            &tx,
+            "volume",
+            *vol_id,
+            Some(label),
+            "retired",
+            Some("status"),
+            Some(prior),
+            Some("retired"),
+            Some(&format!(
+                "cartridge \"{barcode}\" was retired permanently (ADR-0011); \
+                 this volume's medium must never be written again"
+            )),
+            None,
+        )?;
+    }
+    tx.commit()?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "barcode": barcode,
+                "status": "retired_permanent",
+                "volumes_retired": volume_labels,
+                "affected_units": retire_impacts_json(&merged),
+                "at_risk_units": at_risk,
+                "changed": true,
+            })
+        );
+    } else {
+        print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
+        println!("  Cartridge \"{barcode}\" retired permanently.");
+        for label in &volume_labels {
+            println!("  Volume \"{label}\" retired with it.");
+        }
+        println!("  `tapectl cartridge mark-erased {barcode}` is the only way back.");
+    }
+    Ok(())
+}
+
+fn print_cartridge_retire_impact(
+    barcode: &str,
+    status: &str,
+    volumes: &[String],
+    impacts: &[RetireImpact],
+    at_risk: &[String],
+) {
+    println!("Retiring cartridge \"{barcode}\" permanently");
+    println!("  Current status: {status}");
+    if volumes.is_empty() {
+        println!("  Volumes on it:  none");
+    } else {
+        println!("  Volumes on it:  {}", volumes.join(", "));
+    }
+    println!("  Affected units:");
+    if impacts.is_empty() {
+        println!("    (none)");
+    }
+    let now = chrono::Utc::now().naive_utc();
+    for impact in impacts {
+        let warning = if impact.other_copies == 0 {
+            " *** ZERO copies remaining! ***"
+        } else {
+            ""
+        };
+        println!(
+            "    {} [{}]: {} other copy/copies{warning}",
+            impact.unit_name, impact.unit_status, impact.other_copies
+        );
+        // ADR-0004 Tier 1: evidence age is displayed wherever a destructive
+        // operation consumes coverage, and never gates.
+        if impact.other_copies != 0 {
+            if let Some(line) =
+                crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now)
+            {
+                println!("      {line}");
+            }
+        }
+    }
+    if !at_risk.is_empty() {
+        println!(
+            "\n  WARNING: {} unit(s) will have ZERO copies after this retirement!",
+            at_risk.len()
+        );
+    }
+}
+
 /// Mark a cartridge as erased (available for reuse), moving any
 /// currently-mounted volume to `erased`.
 ///
@@ -1991,7 +2289,13 @@ mod tests {
         /// the same stage_set is also completed-written to a second volume,
         /// so the unit keeps one copy after `label` is retired (not at
         /// risk). Returns (conn, retiring_volume_id).
-        fn setup_volume_with_one_unit(label: &str, with_other_copy: bool) -> (Connection, i64) {
+        /// `pub(super)` since ADR-0011: `cartridge_retire`'s tests reuse
+        /// this exact shape, and a second copy of it would be a second
+        /// coverage fixture that could drift from this one.
+        pub(super) fn setup_volume_with_one_unit(
+            label: &str,
+            with_other_copy: bool,
+        ) -> (Connection, i64) {
             let conn = crate::db::open_memory().unwrap();
             conn.execute(
                 "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
@@ -2604,6 +2908,220 @@ mod tests {
             );
             snapshot_mark_reclaimable(&conn, &config, "agree-ok", 1, false, false)
                 .expect("assess said Releasable, so the gate must accept");
+        }
+    }
+
+    /// ADR-0011 / issue #148: `cartridge retire` — the writer
+    /// `retired_permanent` never had.
+    ///
+    /// Same no-real-stdin discipline as `volume_retire_consent` above:
+    /// `cartridge_retire` asks for consent on EVERY call (retiring a medium
+    /// is a declaration, not merely a risk), so every test here passes
+    /// `force` or `assume_yes`, both of which short-circuit `confirm()`
+    /// before it can touch stdin — or asserts the non-interactive refusal,
+    /// which `cli::consent`'s own tests prove never reads stdin either.
+    mod cartridge_retire {
+        use super::*;
+
+        /// A `retirable` cartridge holding volume `L6-CART` (via an open
+        /// `cartridge_volumes` mount) that carries `unitA`'s only completed
+        /// write, plus — when `with_other_copy` — a second sealed volume on
+        /// no cartridge carrying the same stage set. Returns
+        /// (conn, cartridge_id, volume_id).
+        fn setup(with_other_copy: bool) -> (Connection, i64, i64) {
+            let (conn, vol_id) = super::volume_retire_consent::setup_volume_with_one_unit(
+                "L6-CART",
+                with_other_copy,
+            );
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('BC-RET', 'LTO-6', 2500000000000, 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, vol_id],
+            )
+            .unwrap();
+            (conn, cart_id, vol_id)
+        }
+
+        fn status_of(conn: &Connection, table: &str, id: i64) -> String {
+            conn.query_row(
+                &format!("SELECT status FROM {table} WHERE id = ?1"),
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// The headline: `retired_permanent` finally has a writer, and the
+        /// volume on the cartridge is retired with it — without which
+        /// ADR-0011's own justification for the Tier-2 gate ("removes a
+        /// physical copy from every coverage count that policy computes")
+        /// would be false, since every coverage count is a
+        /// `volumes.status` predicate.
+        #[test]
+        fn retire_writes_the_status_and_retires_the_volume_on_it() {
+            let (conn, cart_id, vol_id) = setup(true);
+            cartridge_retire(&conn, "BC-RET", None, false, true, false, false)
+                .expect("--yes must satisfy the gate");
+
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "retired",
+                "a volume on a permanently retired medium must stop counting as coverage"
+            );
+        }
+
+        /// The `cartridge_volumes` mount stays OPEN: the volume is still
+        /// physically on the cartridge. `cartridge mark-erased` closes it,
+        /// because that is when the bytes actually go.
+        #[test]
+        fn retire_leaves_the_mount_open_because_the_bytes_are_still_there() {
+            let (conn, cart_id, _) = setup(true);
+            cartridge_retire(&conn, "BC-RET", None, false, true, false, false).unwrap();
+            let open: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cartridge_volumes
+                     WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
+                    params![cart_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(open, 1);
+        }
+
+        /// ADR-0008's non-hanging requirement, the half that matters most:
+        /// a non-interactive session with no `--yes`/`--force` REFUSES
+        /// rather than blocking on a prompt nobody can answer.
+        #[test]
+        fn non_interactive_without_consent_refuses_and_changes_nothing() {
+            let (conn, cart_id, vol_id) = setup(false);
+            // assume_yes=false, force=false. `confirm()` reads the real
+            // `stdin().is_terminal()`, which is false under `cargo test`'s
+            // captured stdin -- and `cli::consent`'s own tests prove that
+            // branch never attempts a read.
+            let err = cartridge_retire(&conn, "BC-RET", None, false, false, false, false)
+                .expect_err("no consent in a non-interactive session must refuse");
+            assert!(err.to_string().contains("refused"), "got: {err}");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "active",
+                "a refused retirement must not retire the volume either"
+            );
+        }
+
+        /// ADR-0008 Tier 2, not Tier 3: the data may still be readable, so
+        /// `--force` genuinely overrides the zero-copy case.
+        #[test]
+        fn force_overrides_the_zero_copy_case() {
+            let (conn, cart_id, _) = setup(false);
+            cartridge_retire(&conn, "BC-RET", None, true, false, false, false)
+                .expect("--force must override a zero-copy impact");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+        }
+
+        #[test]
+        fn dry_run_mutates_nothing() {
+            let (conn, cart_id, vol_id) = setup(false);
+            cartridge_retire(&conn, "BC-RET", None, false, false, true, false)
+                .expect("dry-run must succeed before any consent gate");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
+            assert_eq!(status_of(&conn, "volumes", vol_id), "active");
+            let events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = 'retired'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 0);
+        }
+
+        /// The reason APPENDS. A retirement reason silently replacing an
+        /// earlier maintenance note is how the one fact that explains a
+        /// dead cartridge gets lost.
+        #[test]
+        fn reason_appends_to_notes_and_never_overwrites() {
+            let (conn, _, _) = setup(true);
+            conn.execute(
+                "UPDATE cartridges SET notes = 'bought 2019' WHERE barcode = 'BC-RET'",
+                [],
+            )
+            .unwrap();
+            cartridge_retire(
+                &conn,
+                "BC-RET",
+                Some("read errors on 3 consecutive verifies"),
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            let notes: String = conn
+                .query_row(
+                    "SELECT notes FROM cartridges WHERE barcode = 'BC-RET'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(notes.starts_with("bought 2019"), "got: {notes}");
+            assert!(notes.contains("read errors on 3 consecutive verifies"));
+        }
+
+        /// A cartridge with no notes at all gets the reason as the whole
+        /// note, not a stray leading newline.
+        #[test]
+        fn reason_on_an_empty_note_does_not_lead_with_a_newline() {
+            let (conn, _, _) = setup(true);
+            cartridge_retire(&conn, "BC-RET", Some("worn"), false, true, false, false).unwrap();
+            let notes: String = conn
+                .query_row(
+                    "SELECT notes FROM cartridges WHERE barcode = 'BC-RET'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!notes.starts_with('\n'), "got: {notes:?}");
+            assert!(notes.contains("worn"));
+        }
+
+        /// Re-retiring is a no-op, not a second event and not a second
+        /// notes line.
+        #[test]
+        fn retiring_an_already_retired_cartridge_changes_nothing() {
+            let (conn, _, _) = setup(true);
+            cartridge_retire(&conn, "BC-RET", Some("worn"), false, true, false, false).unwrap();
+            let before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            cartridge_retire(&conn, "BC-RET", Some("worn again"), false, true, false, false)
+                .expect("a second retire is a no-op, not an error");
+            let after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(before, after);
+            let notes: String = conn
+                .query_row(
+                    "SELECT notes FROM cartridges WHERE barcode = 'BC-RET'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!notes.contains("worn again"));
+        }
+
+        #[test]
+        fn an_unknown_barcode_says_so() {
+            let (conn, _, _) = setup(true);
+            let err = cartridge_retire(&conn, "NOPE", None, true, true, false, false).unwrap_err();
+            assert!(err.to_string().contains("NOPE"));
         }
     }
 

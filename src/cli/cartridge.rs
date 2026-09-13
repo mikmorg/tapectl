@@ -58,6 +58,27 @@ pub enum CartridgeCommands {
         #[arg(long)]
         to: String,
     },
+    /// Retire a cartridge permanently — it must never be written again
+    ///
+    /// ADR-0011: for wear, read errors, or any judgement that the medium is
+    /// no longer fit to hold data. This is NOT an erasure and NOT a location
+    /// change: the bytes may still be readable, but nothing will ever write
+    /// to this cartridge again, and `volume init` refuses to bind it.
+    /// `cartridge mark-erased` is the only way back.
+    ///
+    /// ADR-0008 Tier 2: the coverage impact is displayed first, and
+    /// `--force`/`--yes` is required when a unit is left below its policy.
+    Retire {
+        /// Barcode
+        barcode: String,
+        /// Why (appended to the cartridge's notes, never overwriting them)
+        #[arg(long)]
+        reason: Option<String>,
+        /// Proceed even when a unit is left with no other copy (ADR-0008
+        /// Tier 2 — see cli::consent)
+        #[arg(long)]
+        force: bool,
+    },
     /// Mark a cartridge as erased (available for reuse)
     MarkErased {
         /// Barcode
@@ -243,6 +264,21 @@ pub fn run(
                     ),
                 }
             }
+        }
+        CartridgeCommands::Retire {
+            barcode,
+            reason,
+            force,
+        } => {
+            crate::cli::operations::cartridge_retire(
+                conn,
+                barcode,
+                reason.as_deref(),
+                *force,
+                yes,
+                dry_run,
+                json_output,
+            )?;
         }
         CartridgeCommands::MarkErased { barcode, force } => {
             crate::cli::operations::cartridge_mark_erased(
