@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tabled::{Table, Tabled};
 
@@ -391,6 +391,13 @@ fn mounted_volumes(conn: &Connection, cartridge_id: i64) -> Result<Vec<(i64, Str
 }
 
 /// Move a volume to a location (used by `volume move`).
+///
+/// ADR-0011: the name and meaning are unchanged, and now it also moves the
+/// cartridge the volume is bound to — plus any OTHER volume on that same
+/// cartridge, because they are all one piece of plastic and it is the
+/// plastic that travels. A volume with no binding (a warehouse deposit, an
+/// export, a tape written before ADR-0010 taught `volume init` to bind)
+/// moves alone, exactly as before.
 pub fn move_volume(
     conn: &Connection,
     volume_label: &str,
@@ -404,12 +411,30 @@ pub fn move_volume(
         )
         .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
 
-    move_together(
-        conn,
-        None,
-        &[(vol_id, volume_label.to_string())],
-        location_name,
-    )
+    let bound: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT c.id, c.barcode FROM cartridge_volumes cv
+             JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![vol_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    match bound {
+        Some((cart_id, barcode)) => {
+            // Every volume on that cartridge, not just this one: they share
+            // the medium, so they share the shelf.
+            let volumes = mounted_volumes(conn, cart_id)?;
+            move_together(conn, Some((cart_id, barcode)), &volumes, location_name)
+        }
+        None => move_together(
+            conn,
+            None,
+            &[(vol_id, volume_label.to_string())],
+            location_name,
+        ),
+    }
 }
 
 /// Move a cartridge to a location (used by `cartridge move`).
@@ -438,7 +463,6 @@ pub fn move_cartridge(conn: &Connection, barcode: &str, location_name: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::OptionalExtension;
 
     /// `location list --json` shape (issue: C2 row-listing drift).
     #[test]
@@ -631,6 +655,51 @@ mod tests {
             location_of(&conn, "volumes", "label", "L6-0002"),
             None,
             "a displaced volume's bytes are gone from this cartridge; it does not travel with it"
+        );
+    }
+
+    /// The other direction (ADR-0011: "`volume move` keeps its name and
+    /// meaning, and now also moves the cartridge the volume is bound to").
+    #[test]
+    fn volume_move_drags_the_cartridge_and_its_sibling_volume_along() {
+        let conn = setup_bound();
+        let outcome = move_volume(&conn, "L6-0001", "home").unwrap();
+
+        assert_eq!(outcome.cartridge.as_deref(), Some("A001L6"));
+        assert_eq!(outcome.volumes, vec!["L6-0001", "L6-0002"]);
+        assert_eq!(
+            location_of(&conn, "cartridges", "barcode", "A001L6").as_deref(),
+            Some("home"),
+            "the cartridge is the thing that physically moves"
+        );
+        assert_eq!(
+            location_of(&conn, "volumes", "label", "L6-0002").as_deref(),
+            Some("home"),
+            "a sibling volume on the same cartridge cannot stay behind"
+        );
+    }
+
+    /// The unbound shape stays exactly as it was: a volume with no cartridge
+    /// — a pre-ADR-0010 tape, an export — moves alone and touches no
+    /// cartridge row.
+    #[test]
+    fn volume_move_without_a_binding_moves_only_the_volume() {
+        let conn = setup_bound();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-LONE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+
+        let outcome = move_volume(&conn, "L6-LONE", "home").unwrap();
+        assert!(outcome.cartridge.is_none());
+        assert_eq!(outcome.volumes, vec!["L6-LONE"]);
+        assert_eq!(
+            location_of(&conn, "cartridges", "barcode", "A001L6"),
+            None,
+            "an unbound volume's move must not touch any cartridge"
         );
     }
 
