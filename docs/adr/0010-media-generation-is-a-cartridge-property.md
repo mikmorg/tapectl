@@ -39,7 +39,27 @@ knowledge. `volume init` matches it to `cartridges.serial_number`; failing that 
 `--cartridge <barcode>` the operator names and records the serial on that row; failing that
 it auto-registers a cartridge whose barcode *is* the serial and says so. A registered row
 whose `media_type` disagrees with the detected generation is an error — either the row is
-wrong or the wrong tape is loaded, and tapectl cannot tell which. Where no serial is readable
+wrong or the wrong tape is loaded, and tapectl cannot tell which. That contradiction is the
+*only* new refusal binding introduces: it is a fact error, not a risk judgement.
+
+**Binding adds no second consent gate.** The tempting rule — refuse when the cartridge is
+still bound to a live volume, and make `--force` or the retire lifecycle the way past — was
+considered and rejected. `volume init` already asks the tape itself: File 0 naming a sealed
+volume is refused unless `--force` (ADR-0003, #27), and that is the decision point, made
+against the medium's own evidence rather than the catalog's weaker claim about it. An
+operator who reached init past File 0 either loaded a blank or erased tape — in which case
+the data is already physically gone — or gave `--force`, which is the consent. Demanding a
+second override for the same act is the ceremony ADR-0008 warns about, and it would have
+made a physical `mt erase` followed by `volume init` — the most ordinary reuse there is —
+into a two-command catalog dance that teaches operators to reach for `--force` by reflex.
+
+So init *records* the displacement instead of relitigating it: the open
+`cartridge_volumes` mount is closed, the displaced volume moves to `erased`, an events row
+says why, and a warning names it together with any unit that just lost its last copy
+(`retire_impacts`, already written for `volume retire`). Nothing is blocked, which is
+ADR-0004; the catalog stops crediting a copy that no longer exists, which is the failure the
+lifecycle suite's own comment predicted ("single-cartridge copy counts may over-credit it");
+and `audit` reports the new coverage truthfully on the next run. Where no serial is readable
 (mhvtl exposes none) the volume is written unbound with a warning, so the virtual harnesses
 lose nothing. `volume write` re-reads the serial and refuses a cartridge that is not the one
 init bound — the same wrong-cartridge discipline as the File 0 check, one layer earlier.
