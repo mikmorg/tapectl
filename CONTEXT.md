@@ -195,6 +195,19 @@ archived already under a previous path and is resolved by dotfile uuid)
 
 ### Storage
 
+**Generation**:
+Which LTO the *medium* is — LTO-5, LTO-6, LTO-7 Type M — read from the
+cartridge's density code, never declared by the drive. It fixes the tape's
+capacity and decides whether the loaded drive may write it at all: a drive
+declares the one generation it *is*, and the compatibility tables say what
+that lets it write and read (ADR-0010). A cartridge's generation is a physical
+fact; a volume's `media_type` is the generation recorded when it was
+initialised.
+_Avoid_: media type as the name of the *concept* (it is the column that stores
+it), format (means the on-tape Layout Version), density (the code generation is
+read from, not the thing itself), drive generation as a synonym — the whole
+point is that the two differ
+
 **Store**:
 A first-class implementation of the storage interface, selected by a
 location's configuration: it executes a Layout at contact and confirms
