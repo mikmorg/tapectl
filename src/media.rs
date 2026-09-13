@@ -24,7 +24,13 @@ use std::fmt;
 /// compatibility tables below must be explicit match arms: any arithmetic on
 /// the discriminant ("prev" = n-1, "prev-1" = n-2) skips over or miscounts
 /// this variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Deliberately NOT `PartialOrd`/`Ord`: the compatibility tables below are
+/// explicit match arms precisely because generation compatibility is not a
+/// linear order (LTO-7 Type M sits between LTO-7 and LTO-8 but is neither
+/// "greater" nor "lesser" in a way arithmetic comparison could use safely).
+/// Deriving an ordering here would invite exactly the shortcut this module
+/// exists to rule out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Generation {
     Lto1,
     Lto2,
