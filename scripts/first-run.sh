@@ -572,7 +572,12 @@ EOF
     if [ -n "$BARCODE" ]; then
       if tc cartridge list --json 2>/dev/null | grep -q "\"$BARCODE\""; then ok "cartridge $BARCODE already registered"
       else
-        ask CGEN "generation of THIS cartridge (LTO-5 … LTO-9)" "${DGEN:-LTO-6}"
+        # Do NOT make the operator guess the generation: the drive already
+        # reports the loaded medium's density code, and a wrong guess is a hard
+        # stop at `volume init` ("registered as X, the loaded medium is Y").
+        CGEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
+        if [ -n "$CGEN" ]; then note "the loaded medium reports $CGEN"; else note "could not read the medium's density from the drive"; fi
+        ask CGEN "generation of THIS cartridge" "${CGEN:-${DGEN:-LTO-6}}"
         run tc cartridge register --barcode "$BARCODE" --media-type "$CGEN" || die "cartridge register failed"
       fi
       CART_ARG=(--cartridge "$BARCODE")
