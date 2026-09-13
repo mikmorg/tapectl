@@ -1,0 +1,48 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-cartridge-retire 1  "tapectl-cartridge-retire " 
+.SH NAME
+tapectl\-cartridge\-retire \- Retire a cartridge permanently — it must never be written again
+.SH SYNOPSIS
+\fBtapectl cartridge retire\fR [\fB\-\-json\fR] [\fB\-\-reason\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
+.SH DESCRIPTION
+Retire a cartridge permanently — it must never be written again
+.PP
+ADR\-0011: for wear, read errors, or any judgement that the medium is no longer fit to hold data. This is NOT an erasure and NOT a location change: the bytes may still be readable, but nothing will ever write to this cartridge again, and `volume init` refuses to bind it. `cartridge mark\-erased` is the only way back.
+.PP
+ADR\-0008 Tier 2: the coverage impact is displayed first, and `\-\-force`/`\-\-yes` is required when a unit is left below its policy.
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-reason\fR \fI<REASON>\fR
+Why (appended to the cartridge\*(Aqs notes, never overwriting them)
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-\-force\fR
+Proceed even when a unit is left with no other copy (ADR\-0008 Tier 2 — see cli::consent)
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, receipts, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIBARCODE\fR>
+Barcode

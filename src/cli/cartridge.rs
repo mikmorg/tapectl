@@ -199,7 +199,16 @@ pub fn run(
         }
         CartridgeCommands::Info { barcode } => {
             #[allow(clippy::type_complexity)]
-            let (id, media, status, loads, cap, created, notes, location): (i64, String, String, Option<i64>, i64, String, Option<String>, Option<String>) = conn
+            let (id, media, status, loads, cap, created, notes, location): (
+                i64,
+                String,
+                String,
+                Option<i64>,
+                i64,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = conn
                 .query_row(
                     // LEFT JOIN: a cartridge that has never been placed must
                     // still be inspectable (ADR-0011).
@@ -209,7 +218,18 @@ pub fn run(
                      LEFT JOIN locations l ON l.id = c.location_id
                      WHERE c.barcode = ?1",
                     params![barcode],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
                 )
                 .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
 

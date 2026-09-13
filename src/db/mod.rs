@@ -859,7 +859,11 @@ mod tests {
                 // ADR-0011: 'offsite' is not a status; it maps to 'available'
                 // and the place is recorded by location_id, which is retained.
                 ("BC-2".to_string(), "available".to_string(), Some(loc_id)),
-                ("BC-3".to_string(), "pending_erase".to_string(), Some(loc_id)),
+                (
+                    "BC-3".to_string(),
+                    "pending_erase".to_string(),
+                    Some(loc_id)
+                ),
             ]
         );
 

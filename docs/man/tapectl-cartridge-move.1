@@ -1,19 +1,21 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-volume-compact-finish 1  "tapectl-volume-compact-finish " 
+.TH tapectl-cartridge-move 1  "tapectl-cartridge-move " 
 .SH NAME
-tapectl\-volume\-compact\-finish \- Retire source volume after compaction (compaction step 3)
+tapectl\-cartridge\-move \- Move a cartridge to a location, taking its volumes with it
 .SH SYNOPSIS
-\fBtapectl volume compact\-finish\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl cartridge move\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
 .SH DESCRIPTION
-Retire source volume after compaction (compaction step 3)
+Move a cartridge to a location, taking its volumes with it
+.PP
+ADR\-0011: a cartridge\*(Aqs PLACE is a location, not a status. This moves `cartridges.location_id` and the `location_id` of every volume currently on the cartridge, in one transaction, so the shelf and the catalog cannot disagree. `volume move` does the same from the other end.
 .SH OPTIONS
-.TP
-\fB\-\-force\fR
-Proceed even when a unit is left with no other copy (ADR\-0008 Tier 2, issue #147 — see cli::consent). It does NOT defeat the Tier\-3 refusal: a live slice with no copy anywhere still stops the retirement outright, and nothing waives that
 .TP
 \fB\-\-json\fR
 Output in JSON format
+.TP
+\fB\-\-to\fR \fI<TO>\fR
+Destination location name
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
@@ -37,5 +39,5 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fILABEL\fR>
-Source volume label to retire
+<\fIBARCODE\fR>
+Barcode

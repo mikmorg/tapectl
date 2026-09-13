@@ -3101,8 +3101,16 @@ mod tests {
             let before: i64 = conn
                 .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
                 .unwrap();
-            cartridge_retire(&conn, "BC-RET", Some("worn again"), false, true, false, false)
-                .expect("a second retire is a no-op, not an error");
+            cartridge_retire(
+                &conn,
+                "BC-RET",
+                Some("worn again"),
+                false,
+                true,
+                false,
+                false,
+            )
+            .expect("a second retire is a no-op, not an error");
             let after: i64 = conn
                 .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
                 .unwrap();

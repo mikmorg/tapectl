@@ -442,7 +442,11 @@ pub fn move_volume(
 /// ADR-0011: `offsite` left `cartridges.status` because it was never a
 /// status — it is a place, and this is the writer for it. The cartridge is
 /// the thing that physically moves; every volume on it goes along.
-pub fn move_cartridge(conn: &Connection, barcode: &str, location_name: &str) -> Result<MoveOutcome> {
+pub fn move_cartridge(
+    conn: &Connection,
+    barcode: &str,
+    location_name: &str,
+) -> Result<MoveOutcome> {
     let cart_id: i64 = conn
         .query_row(
             "SELECT id FROM cartridges WHERE barcode = ?1",
@@ -734,7 +738,10 @@ mod tests {
         let conn = setup_bound();
         let err = move_cartridge(&conn, "A001L6", "hom").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("glacier") && msg.contains("home"), "got: {msg}");
+        assert!(
+            msg.contains("glacier") && msg.contains("home"),
+            "got: {msg}"
+        );
     }
 
     #[test]
