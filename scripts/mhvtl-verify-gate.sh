@@ -134,8 +134,8 @@ if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
 name = "gate-mhvtl"
 device_tape = "{tape}"
 device_sg = "{sg}"
-media_type = "LTO-6"
-nominal_capacity = "2.5T"
+generation = "LTO-8"
+capacity_override = "2.5T"
 usable_capacity_factor = 0.95
 manifest_reserve = "1G"
 enospc_buffer = "2G"

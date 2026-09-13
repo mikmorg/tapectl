@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-backend\-add \- Add an LTO tape drive to the config
 .SH SYNOPSIS
-\fBtapectl backend add\fR [\fB\-\-json\fR] <\fB\-\-name\fR> <\fB\-\-device\-tape\fR> [\fB\-\-dry\-run\fR] <\fB\-\-device\-sg\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-media\-type\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-capacity\fR] [\fB\-\-config\fR] [\fB\-\-enospc\-buffer\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl backend add\fR [\fB\-\-json\fR] <\fB\-\-name\fR> <\fB\-\-device\-tape\fR> [\fB\-\-dry\-run\fR] <\fB\-\-device\-sg\fR> [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-generation\fR> [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-capacity\-override\fR] [\fB\-\-config\fR] [\fB\-\-enospc\-buffer\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Add an LTO tape drive to the config
 .PP
@@ -29,14 +29,14 @@ SCSI generic node used for health/MAM queries, e.g. /dev/sg1
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
-\fB\-\-media\-type\fR \fI<MEDIA_TYPE>\fR [default: LTO\-6]
-Media type, e.g. LTO\-6
+\fB\-\-generation\fR \fI<GENERATION>\fR
+Generation this drive natively writes, e.g. LTO\-6 (ADR\-0010: a drive declares only what it can write; the medium\*(Aqs actual generation is detected at `volume init`, not declared here)
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip confirmation prompts
 .TP
-\fB\-\-capacity\fR \fI<CAPACITY>\fR [default: 2.5TB]
-Uncompressed nominal capacity, e.g. 2.5TB
+\fB\-\-capacity\-override\fR \fI<CAPACITY_OVERRIDE>\fR
+Capacity override — for virtual drives (mhvtl) and test harnesses only. A real drive\*(Aqs capacity follows the loaded cartridge\*(Aqs detected generation (ADR\-0010); leave this unset
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.

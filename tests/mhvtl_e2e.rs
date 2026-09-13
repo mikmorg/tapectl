@@ -210,8 +210,8 @@ fn setup_mhvtl(name: &str) -> Harness {
         device_sg: discover_devices(false)
             .map(|d| d.drive_sg)
             .unwrap_or_else(|| "/dev/sg1".into()),
-        media_type: "LTO-6".into(),
-        nominal_capacity: "2400G".into(),
+        generation: "LTO-8".into(),
+        capacity_override: Some("2400G".into()),
         usable_capacity_factor: 0.92,
         enospc_buffer: "50M".into(),
         block_size: "512K".into(),
