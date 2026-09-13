@@ -124,13 +124,22 @@ fn migrations() -> Migrations<'static> {
         // repeated serial would bind to an arbitrary row. See the migration
         // header for why it is partial.
         M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+        // 012 rebuilds `cartridges` (create/copy/drop/rename) to drop 'offsite'
+        // from its status CHECK and to index `location_id` (ADR-0011, issue
+        // #148): a cartridge's PLACE is a location, and its status is only its
+        // fitness to hold data. `.foreign_key_check()` for the same reason as
+        // 003 — `cartridge_volumes` holds a `REFERENCES cartridges(id)` FK, and
+        // a rebuild that renumbered rows would orphan it silently. See the
+        // migration header for the two traps in the rebuild order.
+        M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
     ])
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     // Migration 003 does DROP TABLE volumes while five tables (cartridge_volumes,
     // volume_movements, writes, verification_sessions, health_logs) hold rows with a
-    // `REFERENCES volumes(id)` foreign key. `configure()` turns `foreign_keys` ON for this
+    // `REFERENCES volumes(id)` foreign key. Migration 012 does the same to `cartridges`,
+    // which `cartridge_volumes` references. `configure()` turns `foreign_keys` ON for this
     // connection, and SQLite refuses to drop a table that other rows still reference while
     // FK enforcement is on.
     //
@@ -144,7 +153,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // already is by the time that SQL runs. So this has to happen here, outside the crate's
     // transaction, per steps 1 and 12 of SQLite's documented 12-step "Making Other Kinds Of
     // Table Schema Changes" procedure (step 10, the pre-commit foreign_key_check, is covered by
-    // `.foreign_key_check()` on the 003 migration above).
+    // `.foreign_key_check()` on the 003 and 012 migrations above).
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     let result = migrations()
         .to_latest(conn)
@@ -708,6 +717,240 @@ mod tests {
         assert!(
             err.is_err(),
             "CHECK constraint should reject unknown status values"
+        );
+    }
+
+    // --- Migration 012 (ADR-0011: the four-state cartridge lifecycle) ---
+
+    /// A connection migrated to exactly the 011 schema — the last point at
+    /// which `cartridges.status = 'offsite'` is still a legal value, so a row
+    /// carrying it can actually be seeded and then watched through the
+    /// rebuild. Mirrors `open_memory_at_002`, including `configure()`, so
+    /// `PRAGMA foreign_keys` is genuinely ON for the seeding below and the FK
+    /// assertions are real discriminators.
+    fn open_memory_at_011() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+        ];
+        // 003 drops `volumes` while five tables reference it; same reason as
+        // production `migrate()`.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    /// THE test for this migration, and the one the 12-step procedure exists
+    /// to make pass: a populated 011 database — including a cartridge bound to
+    /// a volume through `cartridge_volumes`, the one table holding a
+    /// `REFERENCES cartridges(id)` foreign key — survives the rebuild with its
+    /// row IDS INTACT.
+    ///
+    /// The join assertion is the real discriminator. An `INSERT INTO
+    /// cartridges_new SELECT ...` that omitted `id` would renumber every
+    /// cartridge, and `PRAGMA foreign_key_check` alone would NOT necessarily
+    /// catch it — with one cartridge, rowid 1 is handed straight back, and the
+    /// FK still resolves while pointing at what is, in general, a different
+    /// cartridge. So three rows are seeded and the join is checked by barcode.
+    #[test]
+    fn test_migrate_011_populated_db_to_012_preserves_ids_and_fk() {
+        let mut conn = open_memory_at_011();
+
+        conn.execute("INSERT INTO locations (name) VALUES ('home-rack')", [])
+            .unwrap();
+        let loc_id = conn.last_insert_rowid();
+
+        // Three cartridges so a renumbering cannot coincidentally land every
+        // row back on its own id, and one of them carries the doomed
+        // 'offsite' status — legal at 011, gone at 012.
+        for (bc, status) in [
+            ("BC-1", "in_use"),
+            ("BC-2", "offsite"),
+            ("BC-3", "pending_erase"),
+        ] {
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status, location_id)
+                 VALUES (?1, 'LTO-6', 2500000000000, ?2, ?3)",
+                rusqlite::params![bc, status, loc_id],
+            )
+            .unwrap();
+        }
+        let bc3_id: i64 = conn
+            .query_row(
+                "SELECT id FROM cartridges WHERE barcode = 'BC-3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Bind the LAST cartridge, so an off-by-one renumbering shows up.
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let vol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+            [bc3_id, vol_id],
+        )
+        .unwrap();
+
+        // The real production migrate(), with its real FK off/on wrapping.
+        migrate(&mut conn).unwrap();
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "PRAGMA foreign_key_check found violations after the cartridges rebuild"
+        );
+
+        // The join still names the SAME cartridge — proof the ids survived,
+        // not merely that they still resolve to something.
+        let joined: String = conn
+            .query_row(
+                "SELECT c.barcode FROM cartridge_volumes cv
+                 JOIN cartridges c ON c.id = cv.cartridge_id
+                 WHERE cv.volume_id = ?1",
+                [vol_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            joined, "BC-3",
+            "the rebuild renumbered cartridges and silently re-pointed the join"
+        );
+
+        // Every row survived, statuses mapped, location preserved.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cartridges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let statuses: Vec<(String, String, Option<i64>)> = conn
+            .prepare("SELECT barcode, status, location_id FROM cartridges ORDER BY barcode")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                ("BC-1".to_string(), "in_use".to_string(), Some(loc_id)),
+                // ADR-0011: 'offsite' is not a status; it maps to 'available'
+                // and the place is recorded by location_id, which is retained.
+                ("BC-2".to_string(), "available".to_string(), Some(loc_id)),
+                ("BC-3".to_string(), "pending_erase".to_string(), Some(loc_id)),
+            ]
+        );
+
+        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        assert!(report.integrity_ok, "db fsck integrity check failed");
+    }
+
+    /// 012 changes the status CHECK and nothing else: every column, type,
+    /// default, notnull and pk is identical either side of it.
+    #[test]
+    fn test_migration_012_changes_no_cartridge_column() {
+        let before = open_memory_at_011();
+        let cols_011 = table_info(&before, "cartridges");
+
+        let after = open_memory().unwrap();
+        let cols_012 = table_info(&after, "cartridges");
+
+        assert_eq!(
+            cols_011, cols_012,
+            "cartridges columns/defaults/notnull/pk changed by migration 012"
+        );
+    }
+
+    /// Every index the old table carried is back, plus the new location one.
+    /// A rebuild that forgot 011's partial unique index would silently
+    /// re-admit the duplicate medium serials it exists to prevent, and no
+    /// column-shape assertion would notice.
+    #[test]
+    fn test_migration_012_recreates_every_index_and_adds_location() {
+        let conn = open_memory().unwrap();
+        assert_eq!(
+            index_names(&conn, "cartridges"),
+            vec![
+                "idx_cartridges_barcode",
+                "idx_cartridges_location",
+                "idx_cartridges_serial_number",
+                "idx_cartridges_status",
+                // the implicit UNIQUE(barcode) autoindex
+                "sqlite_autoindex_cartridges_1",
+            ]
+        );
+
+        // And 011's index still ENFORCES, not merely exists.
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+             VALUES ('BC-1', 'LTO-6', 2500000000000, 'SERIAL1')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+             VALUES ('BC-2', 'LTO-6', 2500000000000, 'SERIAL1')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "the partial unique index on serial_number must survive the rebuild"
+        );
+        // ...and stay PARTIAL: two NULL serials are still fine.
+        for bc in ["BC-3", "BC-4"] {
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity)
+                 VALUES (?1, 'LTO-6', 2500000000000)",
+                rusqlite::params![bc],
+            )
+            .unwrap();
+        }
+    }
+
+    /// 'offsite' is gone from the CHECK and the other four still work. The
+    /// negative half matters most: a rebuild that dropped the CHECK entirely
+    /// would pass every other assertion in this file.
+    #[test]
+    fn test_migration_012_offsite_rejected_four_states_accepted() {
+        let conn = open_memory().unwrap();
+        for status in ["available", "in_use", "pending_erase", "retired_permanent"] {
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES (?1, 'LTO-6', 2500000000000, ?2)",
+                rusqlite::params![format!("BC-{status}"), status],
+            )
+            .unwrap_or_else(|e| panic!("status '{status}' should be insertable: {e}"));
+        }
+        let err = conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+             VALUES ('BC-offsite', 'LTO-6', 2500000000000, 'offsite')",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "'offsite' is a location, not a status (ADR-0011) — the CHECK must reject it"
         );
     }
 }

@@ -480,10 +480,15 @@ fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_r
 /// would happen and changes nothing.
 ///
 /// Note: `cartridges.status` has no `'erased'` value in its CHECK
-/// constraint (`available|in_use|pending_erase|retired_permanent|offsite`)
-/// — only `volumes.status` does. So this command's own namesake mutation
-/// is the cartridge moving to `'available'` (freed for reuse); it is the
-/// volume(s) that were mounted on it that move to `'erased'`.
+/// constraint (`available|in_use|pending_erase|retired_permanent` since
+/// migration 012 — ADR-0011 took `offsite` out, because a cartridge's
+/// place is a location) — only `volumes.status` does. So this command's
+/// own namesake mutation is the cartridge moving to `'available'` (freed
+/// for reuse); it is the volume(s) that were mounted on it that move to
+/// `'erased'`.
+///
+/// ADR-0011 also makes this the ONLY way out of `retired_permanent`: the
+/// operator saying they were wrong about the medium being unfit.
 pub fn cartridge_mark_erased(
     conn: &Connection,
     barcode: &str,
