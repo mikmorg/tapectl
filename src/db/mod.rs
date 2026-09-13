@@ -132,6 +132,16 @@ fn migrations() -> Migrations<'static> {
         // a rebuild that renumbered rows would orphan it silently. See the
         // migration header for the two traps in the rebuild order.
         M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+        // 013 rebuilds `manifest_entries` (create/copy/drop/rename) without
+        // `has_xattrs`/`has_acls` (issue #149): both were written as literal 0
+        // under a comment claiming they were populated on stage, and read by
+        // nothing — a column that is always zero misleads more than an absent
+        // one. dar owns xattr/ACL handling. `.foreign_key_check()` even though
+        // nothing holds a `REFERENCES manifest_entries(id)` FK: the table does
+        // hold one OUT (to `manifests`), and the check is cheap insurance that
+        // the rebuild carried every row's parent intact. See the migration
+        // header.
+        M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
     ])
 }
 
@@ -869,6 +879,182 @@ mod tests {
 
         let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
         assert!(report.integrity_ok, "db fsck integrity check failed");
+    }
+
+    // --- Migration 013 (issue #149: the two always-zero manifest flags) ---
+
+    /// A connection migrated to exactly the 012 schema — the last point at
+    /// which `manifest_entries.has_xattrs` / `.has_acls` still exist, so rows
+    /// carrying them can be seeded and watched through the rebuild.
+    fn open_memory_at_012() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+            M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+        ];
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    /// THE test for 013: a populated 012 database survives the rebuild with
+    /// its row IDs and its `manifest_id` parentage intact, and every column
+    /// 005 appended (`file_type`, `link_target`) still carries its value.
+    ///
+    /// Three entries are seeded, and the assertions read the LAST one, so an
+    /// off-by-one renumbering cannot coincidentally pass. `file_type` is the
+    /// discriminator for the column-ORDER trap specific to this migration:
+    /// 005 added it with `ALTER TABLE ... ADD COLUMN`, so it sits AFTER
+    /// `has_acls` in the live table. A rebuild that listed the new columns in
+    /// 001's order and copied with a bare positional SELECT would shift
+    /// `file_type` into `groupname` and lose it, and no row count or FK check
+    /// would notice.
+    #[test]
+    fn test_migrate_012_populated_db_to_013_preserves_ids_and_columns() {
+        let mut conn = open_memory_at_012();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('u-uuid', 'u', ?1, '/tmp/u', 'active')",
+            [tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, source_path, file_count, total_size)
+             VALUES (?1, 1, '/tmp/u', 3, 30)",
+            [unit_id],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO manifests (snapshot_id) VALUES (?1)",
+            [snapshot_id],
+        )
+        .unwrap();
+        let manifest_id = conn.last_insert_rowid();
+
+        for (path, ft, target) in [
+            ("a.txt", "regular", None::<&str>),
+            ("b", "dir", None),
+            ("c.lnk", "symlink", Some("../a.txt")),
+        ] {
+            conn.execute(
+                "INSERT INTO manifest_entries
+                    (manifest_id, path, size_bytes, mtime, is_directory, mode, uid, gid,
+                     username, groupname, has_xattrs, has_acls, file_type, link_target)
+                 VALUES (?1, ?2, 10, '2026-01-01T00:00:00Z', 0, 420, 1000, 1000,
+                         'mike', 'mike', 0, 0, ?3, ?4)",
+                rusqlite::params![manifest_id, path, ft, target],
+            )
+            .unwrap();
+        }
+        let last_id: i64 = conn
+            .query_row(
+                "SELECT id FROM manifest_entries WHERE path = 'c.lnk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manifest_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "the rebuild lost rows");
+
+        let (id, parent, path, ft, target, groupname): (
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT id, manifest_id, path, file_type, link_target, groupname
+                 FROM manifest_entries WHERE path = 'c.lnk'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(id, last_id, "the rebuild renumbered manifest_entries");
+        assert_eq!(parent, manifest_id);
+        assert_eq!(path, "c.lnk");
+        assert_eq!(ft, "symlink", "005's appended columns shifted in the copy");
+        assert_eq!(target.as_deref(), Some("../a.txt"));
+        assert_eq!(groupname.as_deref(), Some("mike"));
+
+        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        assert!(report.integrity_ok, "db fsck integrity check failed");
+    }
+
+    /// The columns are actually GONE, not merely unwritten — the whole point
+    /// of the migration. A `SELECT` naming either must now fail.
+    #[test]
+    fn test_migration_013_removes_the_two_flag_columns() {
+        let conn = open_memory().unwrap();
+        let names: Vec<String> = table_info(&conn, "manifest_entries")
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert!(!names.iter().any(|n| n == "has_xattrs"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "has_acls"), "{names:?}");
+        assert!(
+            conn.query_row("SELECT has_xattrs FROM manifest_entries", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "has_xattrs still resolves"
+        );
+    }
+
+    /// The only index the table carried is back. A rebuild that forgot it
+    /// would turn every manifest lookup into a full scan of the largest
+    /// table in the schema, and nothing else in the suite would notice.
+    #[test]
+    fn test_migration_013_recreates_the_manifest_index() {
+        let conn = open_memory().unwrap();
+        assert_eq!(
+            index_names(&conn, "manifest_entries"),
+            vec!["idx_manifest_entries_manifest"]
+        );
     }
 
     /// 012 changes the status CHECK and nothing else: every column, type,

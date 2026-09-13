@@ -101,10 +101,15 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> R
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     let mut manifest_insert = conn.prepare(
+        // No has_xattrs/has_acls (issue #149, migration 013): both were bound
+        // as literal 0 here under a comment claiming they were "populated on
+        // stage", nothing ever fulfilled it, and nothing ever read them. dar
+        // owns xattr/ACL handling and records what it preserved in its own
+        // archive catalog; a second copy here could only drift from it.
         "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime, is_directory,
-                                       mode, uid, gid, username, groupname, has_xattrs, has_acls,
+                                       mode, uid, gid, username, groupname,
                                        file_type, link_target)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
 
     for entry in &manifest_entries {
@@ -128,8 +133,6 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> R
             entry.gid,
             entry.username,
             entry.groupname,
-            0i32, // has_xattrs — populated on stage
-            0i32, // has_acls
             entry.file_type,
             entry.link_target,
         ])?;
