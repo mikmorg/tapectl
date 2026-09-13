@@ -204,6 +204,12 @@ pub enum VolumeCommands {
         /// `volume init` has detected the medium it is actually on.
         #[arg(long)]
         media: Option<String>,
+        /// Which configured drive to plan against, by its device path. Only
+        /// needed when more than one `[[backends.lto]]` is configured —
+        /// without it, planning errored outright on a multi-drive config
+        /// rather than asking.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Retire source volume after compaction (compaction step 3)
@@ -545,7 +551,11 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Plan { copies, media } => {
+        VolumeCommands::Plan {
+            copies,
+            media,
+            device,
+        } => {
             // Show what staged data would be written
             let mut stmt = conn.prepare(
                 "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size
@@ -599,7 +609,7 @@ pub fn run(
                     // ADR-0010: the figure follows the GENERATION being
                     // planned for (`--media`, else the drive's own), not a
                     // capacity declared on the drive.
-                    let backend = crate::config::resolve_lto_backend(config, None)?;
+                    let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
                     let tape_cap = backend.planning_capacity_bytes(media.as_deref())? as i64;
                     let factor = backend.usable_capacity_factor;
                     let usable = (tape_cap as f64 * factor) as i64;

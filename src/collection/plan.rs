@@ -42,6 +42,12 @@ pub fn plan_for_collection(
     // (ADR-0010) — sizing batches for LTO-5 stock in an LTO-6 drive, say.
     // `None` means the drive's native generation.
     media: Option<&str>,
+    // `--device`: WHICH drive to plan against. Resolved strictly, like every
+    // other write-adjacent command (ADR-0010, "Backends resolve by device").
+    // Before it existed this passed `None` unconditionally, so planning
+    // errored outright the moment a second drive was configured rather than
+    // asking which one was meant.
+    device: Option<&str>,
 ) -> Result<Vec<Batch>> {
     let pending = super::fingerprint::pending_units_for_collection(
         conn,
@@ -56,7 +62,7 @@ pub fn plan_for_collection(
         })
         .collect();
 
-    let backend = crate::config::resolve_lto_backend(config, None)?;
+    let backend = crate::config::resolve_lto_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
     // valid byte count, so a successfully parsed `Ok` is already guaranteed
@@ -130,12 +136,69 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let batches = plan_for_collection(&conn, &config, &lib, None).unwrap();
+        let batches = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
         assert_eq!(batches.len(), 1, "two 3 MiB units must fit one 10 MiB tape");
         assert_eq!(
             batches[0].unit_names(),
             vec!["testlib/alpha", "testlib/beta"]
         );
+    }
+
+    /// Spec W4 / ADR-0010: `collection plan` resolved with `None`, so a
+    /// second configured drive made it error outright instead of asking
+    /// which one. `--device` picks, and the batch sizes follow THAT drive's
+    /// capacity — not whichever backend happened to be first.
+    #[test]
+    fn plan_with_two_drives_sizes_batches_for_the_one_device_names() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        // Two drives: a 10 MiB one (both units fit as one batch) and a 4 MiB
+        // one (they cannot share a tape). The batch COUNT is the assertion,
+        // so picking the wrong drive cannot pass by coincidence.
+        let mut config = config_with_tiny_backend();
+        config.backends.lto.push(LtoBackendConfig {
+            name: "small".into(),
+            device_tape: "/dev/zero".into(),
+            device_sg: "/dev/null".into(),
+            generation: "LTO-8".into(),
+            capacity_override: Some("4M".into()),
+            usable_capacity_factor: 1.0,
+            enospc_buffer: "0".into(),
+        });
+
+        // Without a device, two drives is an error asking for one — not a
+        // silent pick.
+        let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
+        assert!(err.to_string().contains("--device"), "{err}");
+
+        let big = plan_for_collection(&conn, &config, &lib, None, Some("/dev/null")).unwrap();
+        assert_eq!(big.len(), 1, "10 MiB tape holds both 3 MiB units");
+
+        let small = plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero")).unwrap();
+        assert_eq!(small.len(), 2, "4 MiB tape cannot hold both 3 MiB units");
     }
 
     #[test]
@@ -167,7 +230,7 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_collection(&conn, &config, &lib, None).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
         assert!(
             err.to_string().contains("testlib/huge"),
             "error must name the offending unit: {err}"

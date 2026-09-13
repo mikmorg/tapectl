@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-plan \- Show bin\-packing plan for pending staged data
 .SH SYNOPSIS
-\fBtapectl volume plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-media\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl volume plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-media\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show bin\-packing plan for pending staged data
 .SH OPTIONS
@@ -20,6 +20,9 @@ Show what would be done without making changes
 .TP
 \fB\-\-media\fR \fI<MEDIA>\fR
 Estimate against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. counting LTO\-5 cartridges for an LTO\-6 drive. No cartridge need be loaded; this is an estimate, and the authoritative figure is each volume\*(Aqs own `capacity_bytes` once `volume init` has detected the medium it is actually on
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi\-drive config rather than asking
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

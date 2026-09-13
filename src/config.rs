@@ -173,26 +173,6 @@ fn default_enospc_buffer() -> String {
 }
 
 impl LtoBackendConfig {
-    /// This backend's declared native capacity in bytes — an alias for
-    /// [`Self::planning_capacity_bytes`] with no `--media` declaration.
-    ///
-    /// **No write path may call this.** ADR-0010 decision 3: capacity is
-    /// decided once at `volume init`, from the generation of the medium
-    /// ACTUALLY LOADED, and stored on `volumes.capacity_bytes`; every later
-    /// gate (`write`, `resume`, `verify`) reads that row and config is never
-    /// consulted for capacity again. Reading a drive's figure after init is
-    /// exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB. It
-    /// survives only for capacity PLANNING, before any cartridge is loaded —
-    /// and `planning_capacity_bytes` says that in its name.
-    ///
-    /// Both `generation` and `capacity_override` are already validated at
-    /// `Config::load` time (`Config::validate_sizes`); the error path here
-    /// only matters for a `Config` built directly (e.g. in tests) rather
-    /// than loaded from a file.
-    pub fn capacity_bytes(&self) -> Result<u64> {
-        self.planning_capacity_bytes(None)
-    }
-
     /// This drive's own native generation, parsed.
     pub fn native_generation(&self) -> Result<crate::media::Generation> {
         crate::media::Generation::parse(&self.generation).ok_or_else(|| {
@@ -206,6 +186,15 @@ impl LtoBackendConfig {
     /// Capacity for PLANNING a tape that is not loaded — `volume plan` and
     /// `collection plan`, which size batches before any cartridge is in the
     /// drive (ADR-0010, "Consequences").
+    ///
+    /// **No write path may call this.** ADR-0010 decision 3: capacity is
+    /// decided once at `volume init`, from the generation of the medium
+    /// ACTUALLY LOADED, and stored on `volumes.capacity_bytes`; every later
+    /// gate (`write`, `resume`, `verify`) reads that row and config is never
+    /// consulted for capacity again. Reading a drive's figure after init is
+    /// exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB. The name
+    /// says so, which is why the `capacity_bytes()` alias that did not is
+    /// gone (spec W4) rather than kept as a shorter way to say it.
     ///
     /// `media` is the operator's `--media <GEN>`, defaulting to this drive's
     /// native generation. The cartridge row is deliberately absent from the

@@ -214,14 +214,17 @@ pub fn volume_init(
     let (generation, media_source) =
         crate::tape::media_detect::resolve_media(&det, declared, row_gen, drive_gen)?;
     if !media_source.is_detected() {
-        let from = media_source.describe();
-        warn!(
-            %generation, %from,
-            "medium generation not detectable from this drive; assuming a declared value"
-        );
+        // ONE line, not two. This was `warn!` AND `eprintln!` with the same
+        // text, and tracing routes WARN to stderr — so the operator saw the
+        // notice twice and reasonably wondered what the second one meant.
+        // `eprintln!` is the one that survives: it is the operator-facing
+        // line, and a log level cannot filter it away. (The `warn!` above,
+        // about an unrecognised cartridge `media_type`, has no eprintln twin
+        // and stays as a log line.)
         eprintln!(
             "warning: medium generation not detectable from this drive; \
-             assuming {generation} (from {from})"
+             assuming {generation} (from {})",
+            media_source.describe()
         );
     }
 

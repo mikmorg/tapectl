@@ -71,8 +71,7 @@ fn init_creates_a_staging_directory_under_the_home_it_was_given() {
     let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "staging dir mode is {mode:o}, expected 700");
 
-    let config =
-        std::fs::read_to_string(home.path().join(".tapectl").join("config.toml")).unwrap();
+    let config = std::fs::read_to_string(home.path().join(".tapectl").join("config.toml")).unwrap();
     assert!(
         config.contains(staging.to_str().unwrap()),
         "config.toml does not point at the staging dir init created:\n{config}"
