@@ -210,6 +210,12 @@ pub enum VolumeCommands {
     CompactFinish {
         /// Source volume label to retire
         label: String,
+        /// Proceed even when a unit is left with no other copy (ADR-0008
+        /// Tier 2, issue #147 — see cli::consent). It does NOT defeat the
+        /// Tier-3 refusal: a live slice with no copy anywhere still stops
+        /// the retirement outright, and nothing waives that.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Interactive compaction: read + write + finish in one flow
@@ -228,6 +234,11 @@ pub enum VolumeCommands {
         /// See `volume write --allow-missing-escrow`.
         #[arg(long)]
         allow_missing_escrow: bool,
+        /// See `volume compact-finish --force` — step 3's ADR-0008 Tier-2
+        /// gate. With `--to` and this (or the global `--yes`), the whole
+        /// three-step flow runs non-interactively.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006).
@@ -611,8 +622,8 @@ pub fn run(
             }
         }
 
-        VolumeCommands::CompactFinish { label } => {
-            let report = write::compact_finish(conn, label)?;
+        VolumeCommands::CompactFinish { label, force } => {
+            let report = write::compact_finish(conn, label, *force || yes)?;
             if json_output {
                 println!(
                     "{}",
@@ -633,6 +644,7 @@ pub fn run(
             to,
             device,
             allow_missing_escrow,
+            force,
         } => {
             // Interactive: run all 3 steps. Strict resolution (ADR-0010):
             // step 2 writes, so this needs a real backend even though step 1
@@ -668,7 +680,7 @@ pub fn run(
             println!("  Write completed");
 
             println!("=== Step 3: Retiring source volume \"{label}\" ===");
-            let report = write::compact_finish(conn, label)?;
+            let report = write::compact_finish(conn, label, *force || yes)?;
             println!("  Volume \"{label}\" retired");
             if !json_output {
                 print_compact_finish_evidence(&report);
@@ -955,8 +967,14 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
                 .collect();
             let evidence_summary =
                 crate::policy::evidence::describe(&unit.unit_name, &unit.evidence, now);
+            // `status`/`remaining_copies` are ADDITIVE (issue #147), and
+            // named exactly as `operations::retire_impacts_json` names the
+            // same two facts — the shapes come from one derivation now, so
+            // they should read alike.
             serde_json::json!({
                 "unit": unit.unit_name,
+                "status": unit.unit_status,
+                "remaining_copies": unit.other_copies,
                 "evidence": evidence,
                 "evidence_summary": evidence_summary,
             })

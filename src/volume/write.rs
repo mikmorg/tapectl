@@ -2081,19 +2081,48 @@ pub fn compact_write(
     )
 }
 
-/// One unit affected by `compact_finish`'s retirement, together with the
-/// ADR-0004 remaining-coverage evidence for it after the source volume is
-/// excluded (issue #99). Mirrors `cli::operations::RetireImpact`'s
-/// evidence half — `compact_finish` retires a volume exactly like
-/// `volume_retire` does, so it consumes coverage the same way.
+/// One unit affected by `compact_finish`'s retirement: its remaining
+/// ADR-0004-eligible copy count with the source volume excluded, and the
+/// evidence behind it (issue #99).
+///
+/// It is `cli::operations::RetireImpact` in a public wrapper, because
+/// `compact_finish` retires a volume exactly like `volume_retire` does and
+/// therefore consumes coverage the same way. `RetireImpact` itself is
+/// `pub(crate)`, so this type carries the fields across rather than
+/// re-deriving any of them.
+#[derive(Debug)]
 pub struct CompactFinishReport {
     pub unit_name: String,
+    pub unit_status: String,
+    /// ADR-0004-eligible copies this unit still has on some OTHER volume.
+    /// Zero is the Tier-2 trigger (issue #147).
+    pub other_copies: i64,
     pub evidence: Vec<crate::policy::evidence::CoverageEvidence>,
 }
 
 /// Compact-finish: retire the source volume after compaction.
-/// Refuses if any live slice on this volume has no copy on another volume.
-pub fn compact_finish(conn: &Connection, label: &str) -> Result<Vec<CompactFinishReport>> {
+///
+/// Two gates, in this order, and the order is the ADR-0008 tier order:
+///
+/// 1. **Tier 3, absolute.** Any LIVE slice on this volume with no copy on
+///    another volume refuses outright. No flag defeats it — this is the
+///    zero-coverage case ADR-0008 says nothing may waive, and it runs
+///    first so that `--yes` can never reach it.
+/// 2. **Tier 2, overridable (issue #147).** If retiring the volume leaves
+///    any unit with ZERO ADR-0004-eligible copies elsewhere, the coverage
+///    facts are displayed and consent is required; `--force`/`--yes`
+///    overrides, and a non-interactive session with neither refuses rather
+///    than hanging. ADR-0008 names this command Tier 2, and until #147 it
+///    had only the Tier-3 refusal.
+///
+/// Gate 2 can fire where gate 1 does not: gate 1 asks about live SLICES
+/// (skipping reclaimable and purged snapshots), while coverage is a
+/// question about UNITS across every snapshot they ever had.
+pub fn compact_finish(
+    conn: &Connection,
+    label: &str,
+    assume_yes: bool,
+) -> Result<Vec<CompactFinishReport>> {
     let (vol_id, status): (i64, String) = conn
         .query_row(
             "SELECT id, status FROM volumes WHERE label = ?1",
@@ -2139,30 +2168,52 @@ pub fn compact_finish(conn: &Connection, label: &str) -> Result<Vec<CompactFinis
         )));
     }
 
-    // Units with a completed write on this volume -- the population whose
-    // coverage this retirement consumes (ADR-0004, issue #99). Gathered
-    // before the transaction below since retiring this volume doesn't
-    // change which units it touched.
-    let mut affected_stmt = conn.prepare(
-        "SELECT DISTINCT u.id, u.name
-         FROM units u
-         JOIN snapshots s ON s.unit_id = u.id
-         JOIN stage_sets ss ON ss.snapshot_id = s.id
-         JOIN writes w ON w.stage_set_id = ss.id
-         WHERE w.volume_id = ?1 AND w.status = 'completed'
-         ORDER BY u.name",
-    )?;
-    let affected_units: Vec<(i64, String)> = affected_stmt
-        .query_map(params![vol_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut report = Vec::with_capacity(affected_units.len());
-    for (unit_id, unit_name) in affected_units {
-        let evidence =
-            crate::policy::evidence::remaining_coverage_evidence(conn, unit_id, Some(vol_id))?;
-        report.push(CompactFinishReport {
-            unit_name,
-            evidence,
-        });
+    // The population whose coverage this retirement consumes (ADR-0004,
+    // issue #99), through `retire_impacts` — the ONE derivation `volume
+    // retire`, `unit mark-tape-only` and ADR-0010's binding already share.
+    // This used to be a near-copy of that query, missing only
+    // `other_copies`; two coverage queries that can disagree is how this
+    // codebase has been bitten before, so the copy is gone rather than
+    // extended.
+    let report: Vec<CompactFinishReport> = crate::cli::operations::retire_impacts(conn, vol_id)?
+        .into_iter()
+        .map(|impact| CompactFinishReport {
+            unit_name: impact.unit_name,
+            unit_status: impact.unit_status,
+            other_copies: impact.other_copies,
+            evidence: impact.evidence,
+        })
+        .collect();
+
+    // ADR-0008 Tier 2 (issue #147). Only the zero-copy case gates, exactly
+    // as `volume_retire` reads the tier: a retirement that leaves every
+    // affected unit with another copy is an ordinary operation.
+    let at_risk: Vec<&CompactFinishReport> =
+        report.iter().filter(|u| u.other_copies == 0).collect();
+    if !at_risk.is_empty() {
+        let action = format!("retire volume \"{label}\" (compact-finish)");
+        let mut facts: Vec<String> = at_risk
+            .iter()
+            .map(|u| {
+                format!(
+                    "unit \"{}\" [{}] would have ZERO copies remaining after this retirement",
+                    u.unit_name, u.unit_status
+                )
+            })
+            .collect();
+        // ADR-0004 Tier 1: evidence age for the units that DO retain
+        // coverage, shown at the moment consent is asked and never gating.
+        let now = chrono::Utc::now().naive_utc();
+        for unit in &report {
+            if unit.other_copies != 0 {
+                if let Some(line) =
+                    crate::policy::evidence::describe(&unit.unit_name, &unit.evidence, now)
+                {
+                    facts.push(line);
+                }
+            }
+        }
+        crate::cli::consent::confirm(&action, &facts, assume_yes)?;
     }
 
     // Retire volume + update cartridge atomically
@@ -2293,6 +2344,167 @@ mod tests {
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
     use sha2::{Digest, Sha256};
+
+    /// Issue #147: `compact-finish` is named Tier 2 by ADR-0008 and had
+    /// only the Tier-3 refusal. These prove the Tier-3 refusal still comes
+    /// FIRST and absolutely, that the new Tier-2 gate fires on zero
+    /// coverage, and that a non-interactive session refuses rather than
+    /// hangs. Every test passes `assume_yes` or asserts the non-TTY
+    /// refusal, so none can touch real stdin.
+    mod compact_finish_consent {
+        use super::*;
+        use rusqlite::params;
+
+        /// A source volume `L6-SRC` with `unitA`'s completed write on it,
+        /// and — when `with_other_copy` — the same stage set completed to a
+        /// sealed `L6-DST`, which is what makes the retirement safe. Every
+        /// snapshot here is `reclaimable`, so the TIER-3 slice check finds
+        /// nothing to complain about (it skips reclaimable/purged) and the
+        /// Tier-2 unit check is reached in isolation. That divergence is
+        /// the whole reason #147 exists.
+        fn setup(with_other_copy: bool) -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u1', 'unitA', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'reclaimable', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('L6-SRC', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let src = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss_id, snap_id, src],
+            )
+            .unwrap();
+            if with_other_copy {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES ('L6-DST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                    [],
+                )
+                .unwrap();
+                let dst = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss_id, snap_id, dst],
+                )
+                .unwrap();
+            }
+            conn
+        }
+
+        fn status_of(conn: &Connection, label: &str) -> String {
+            conn.query_row(
+                "SELECT status FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// The bug #147 names: a unit that ends with ZERO copies used to be
+        /// retired silently, because the Tier-3 slice check skips
+        /// reclaimable snapshots and nothing else looked.
+        #[test]
+        fn zero_remaining_copies_now_refuses_without_consent() {
+            let conn = setup(false);
+            let err = compact_finish(&conn, "L6-SRC", false)
+                .expect_err("a unit dropping to zero copies must gate (ADR-0008 Tier 2)");
+            assert!(err.to_string().contains("refused"), "got: {err}");
+            assert_eq!(
+                status_of(&conn, "L6-SRC"),
+                "sealed",
+                "a refused compact-finish must not retire the volume"
+            );
+        }
+
+        /// Tier 2, not Tier 3: `--force`/`--yes` genuinely overrides.
+        #[test]
+        fn assume_yes_overrides_the_zero_copy_gate() {
+            let conn = setup(false);
+            compact_finish(&conn, "L6-SRC", true).expect("--yes must override a Tier-2 gate");
+            assert_eq!(status_of(&conn, "L6-SRC"), "retired");
+        }
+
+        /// The ordinary case is untouched: every affected unit keeps a copy,
+        /// so no gate is reached and no consent is needed. This is what the
+        /// mhvtl lifecycle suite and `tests/integration.rs` exercise, both
+        /// of which run with stdin closed and no `--yes`.
+        #[test]
+        fn a_unit_that_keeps_a_copy_needs_no_consent_at_all() {
+            let conn = setup(true);
+            compact_finish(&conn, "L6-SRC", false)
+                .expect("no at-risk unit means no gate, exactly as before #147");
+            assert_eq!(status_of(&conn, "L6-SRC"), "retired");
+        }
+
+        /// The Tier-3 refusal stays FIRST and stays absolute — `--yes` must
+        /// not reach it. Here the snapshot is live ('current'), so the slice
+        /// check has something to find.
+        #[test]
+        fn the_tier_3_slice_refusal_still_wins_over_assume_yes() {
+            let conn = setup(false);
+            conn.execute(
+                "UPDATE snapshots SET status = 'current' WHERE unit_id = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           sha256_plain, encrypted_bytes, sha256_encrypted)
+                 VALUES (1, 0, 1024, 'cafe', 1024, 'deadbeef')",
+                [],
+            )
+            .unwrap();
+            let slice_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO write_positions (write_id, stage_slice_id, position,
+                                              sha256_on_volume, status)
+                 VALUES (1, ?1, '5', 'deadbeef', 'written')",
+                params![slice_id],
+            )
+            .unwrap();
+
+            let err = compact_finish(&conn, "L6-SRC", true)
+                .expect_err("no flag may defeat the Tier-3 refusal (ADR-0008)");
+            assert!(
+                err.to_string().contains("have no copy on another volume"),
+                "the Tier-3 refusal must be the one that fired; got: {err}"
+            );
+            assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
+        }
+    }
 
     fn direct_hash(data: &[u8]) -> String {
         let mut h = Sha256::new();
