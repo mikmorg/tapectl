@@ -555,20 +555,29 @@ if [ "$FROM" -le 13 ]; then
 explain <<'EOF'
 The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` runs dar, hashes, encrypts to every recipient and writes slices to staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and reads the seal back. A sealed volume is immutable: there is no append. Then `volume verify --full` reads every byte back against the front index, which turns the tape's claims into checked evidence.
 
+`volume init` also reads the loaded cartridge: its generation from the density code, which fixes this tape's capacity and is checked against what the drive can write, and its medium serial, which binds the volume to a cartridge in the catalog (ADR-0010). Nothing to set for a mixed LTO-5/LTO-6 shelf — each tape is planned against its own size.
+
 Label convention: something you can write on the cartridge, e.g. L6-0001.
 EOF
   [ -n "$DEVICE" ] || die "no device — run with --from 6"
   run as_svc mt -f "$DEVICE" status || true
   if as_svc mt -f "$DEVICE" status 2>/dev/null | grep -q DR_OPEN; then die "no cartridge loaded in $DEVICE"; fi
   ask LABEL "volume label" "${LABEL:-L6-0001}"
-  if [ -n "$SG" ] && confirm "Register the cartridge's barcode in the catalog (reads MAM)?"; then
-    MSER="$(sudo sg_read_attr "$SG" 2>/dev/null | awk -F: '/Medium serial number/{gsub(/ /,"",$2); print $2}')"
-    ask BARCODE "barcode" "${MSER:-}"
+  CART_ARG=()
+  explain <<'EOF'
+THE CARTRIDGE. You do not have to register this tape: `volume init` reads its medium serial from MAM and registers and binds a cartridge itself, so the catalog can answer "which physical tape is this volume on" without your typing anything. Register it by hand only if you want the catalog to use the barcode YOU write on the sticker instead of the medium's serial — worth it if you label tapes, because that label is what you will read off a shelf years from now.
+EOF
+  if confirm "Label this cartridge with your own barcode instead of its medium serial?"; then
+    ask BARCODE "barcode you will write on the cartridge" "${BARCODE:-${LABEL}}"
     if [ -n "$BARCODE" ]; then
       if tc cartridge list --json 2>/dev/null | grep -q "\"$BARCODE\""; then ok "cartridge $BARCODE already registered"
-      else run tc cartridge register --barcode "$BARCODE" --media-type "${MTYPE:-LTO-6}"; fi
+      else
+        ask CGEN "generation of THIS cartridge (LTO-5 … LTO-9)" "${DGEN:-LTO-6}"
+        run tc cartridge register --barcode "$BARCODE" --media-type "$CGEN" || die "cartridge register failed"
+      fi
+      CART_ARG=(--cartridge "$BARCODE")
     fi
-  fi
+  else note "volume init will register this cartridge from its medium serial"; fi
   UNITS="$(tc unit list --json 2>/dev/null | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("units",[]); print("\n".join(r.get("name","") for r in rows))
@@ -583,13 +592,13 @@ except Exception: pass' 2>/dev/null || true)"
   done <<< "$UNITS"
   run tc staging status || true
   confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" || die "stopped before writing"
-  if ! run tc volume init "$LABEL" --device "$DEVICE"; then
+  if ! run tc volume init "$LABEL" --device "$DEVICE" "${CART_ARG[@]}"; then
     explain <<'EOF'
 volume init refused. The usual reason: the cartridge's File 0 already identifies a DIFFERENT sealed volume, and sealed volumes are immutable (ADR-0003) — tapectl will not overwrite one by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first.
 EOF
     [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
     confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" || die "stopped"
-    run tc volume init "$LABEL" --device "$DEVICE" --force || die "volume init failed"
+    run tc volume init "$LABEL" --device "$DEVICE" "${CART_ARG[@]}" --force || die "volume init failed"
   fi
   run tc volume write "$LABEL" --device "$DEVICE" || die "write did not seal — read the output; the catalog knows exactly why"
   run tc volume verify "$LABEL" --device "$DEVICE" --full || die "verify FAILED — do not trust this tape"
