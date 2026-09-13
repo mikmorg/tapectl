@@ -216,6 +216,11 @@ pub enum VolumeCommands {
     Compact {
         /// Source volume label
         label: String,
+        /// Destination volume label. Without it the flow PROMPTS for one,
+        /// which needs a terminal — pass this to run compaction
+        /// non-interactively (issue #146, ADR-0008's non-hanging rule).
+        #[arg(long)]
+        to: Option<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -625,6 +630,7 @@ pub fn run(
 
         VolumeCommands::Compact {
             label,
+            to,
             device,
             allow_missing_escrow,
         } => {
@@ -646,16 +652,8 @@ pub fn run(
                 report.bytes_read / (1024 * 1024),
             );
 
-            println!("\nInsert destination tape and enter volume label:");
-            let mut dest_label = String::new();
-            std::io::stdin().read_line(&mut dest_label).ok();
-            let dest_label = dest_label.trim();
-
-            if dest_label.is_empty() {
-                return Err(crate::error::TapectlError::Other(
-                    "no destination label provided".into(),
-                ));
-            }
+            let dest_label = resolve_compact_destination(to.as_deref())?;
+            let dest_label = dest_label.as_str();
 
             println!("=== Step 2: Writing compaction slices to \"{dest_label}\" ===");
             write::compact_write(
@@ -868,6 +866,70 @@ fn run_deposit(conn: &Connection, command: &DepositCommands, json_output: bool) 
 /// `compact_finish` retired coverage for. Display-only, matching
 /// `cli::operations::print_retire_impact`'s evidence lines -- compaction
 /// retires the source volume exactly like `volume retire` does.
+/// The compaction destination label, resolved WITHOUT ever blocking on a
+/// prompt nobody can answer (issue #146).
+///
+/// `volume compact`'s step-2 destination used to be a bare
+/// `stdin().read_line()` with no terminal check, and the global `--yes` did
+/// not skip it — so a cron job, the mhvtl verify gate, or any redirected
+/// run hung here forever. That is precisely the failure shape ADR-0008
+/// names ("blocking forever on a handle that will never produce input",
+/// the issue #33 class), and its rule is absolute: refuse with a non-zero
+/// exit rather than wait.
+///
+/// This is NOT routed through `cli::consent::confirm`. That is the Tier-2
+/// y/N gate; this is a VALUE the operator has to supply, and there is no
+/// safe default to assume — `--yes` cannot invent a label. So the terminal
+/// check is the same (`std::io::IsTerminal`, no new dependency) and the
+/// override is `--to`.
+fn resolve_compact_destination(to: Option<&str>) -> Result<String> {
+    use std::io::IsTerminal;
+    resolve_compact_destination_with(to, std::io::stdin().is_terminal(), || {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        Ok(input)
+    })
+}
+
+/// [`resolve_compact_destination`] with the TTY answer and the read
+/// injected, so the non-interactive branch can be proven never to attempt
+/// the read that would hang — the same testing discipline as
+/// `cli::consent::confirm_with`.
+fn resolve_compact_destination_with(
+    to: Option<&str>,
+    is_tty: bool,
+    read_answer: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if let Some(label) = to {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(crate::error::TapectlError::Other(
+                "--to was given an empty destination label".into(),
+            ));
+        }
+        return Ok(label.to_string());
+    }
+
+    if !is_tty {
+        return Err(crate::error::TapectlError::Other(
+            "volume compact refused: a destination label is required and stdin is not a \
+             terminal, so there is nobody to prompt — re-run with `--to <LABEL>` (the \
+             destination tape must already be initialised)"
+                .into(),
+        ));
+    }
+
+    println!("\nInsert destination tape and enter volume label:");
+    let input = read_answer()?;
+    let label = input.trim();
+    if label.is_empty() {
+        return Err(crate::error::TapectlError::Other(
+            "no destination label provided".into(),
+        ));
+    }
+    Ok(label.to_string())
+}
+
 fn print_compact_finish_evidence(report: &[write::CompactFinishReport]) {
     let now = chrono::Utc::now().naive_utc();
     for unit in report {
@@ -918,6 +980,76 @@ fn verify_exit_code(report: &write::VerifyReport) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #146: `volume compact`'s destination-label prompt had no
+    /// terminal check, so a non-interactive run blocked forever on a handle
+    /// nobody would ever write to — the issue #33 failure shape ADR-0008
+    /// names by name. Every test here drives `resolve_compact_destination_with`
+    /// so both the TTY answer and the read are injected; the real
+    /// `resolve_compact_destination` is never called, exactly as
+    /// `cli::consent`'s own tests avoid the ambient terminal.
+    mod compact_destination {
+        use super::*;
+
+        /// The crux: the refusal path must not merely return an error, it
+        /// must never ATTEMPT the read that would hang.
+        #[test]
+        fn non_tty_without_to_refuses_and_never_reads_stdin() {
+            let err = resolve_compact_destination_with(None, false, || {
+                panic!("must never attempt to read stdin when non-TTY and --to was not given")
+            })
+            .expect_err("a non-interactive compaction with no --to must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains("refused"), "got: {msg}");
+            assert!(
+                msg.contains("--to"),
+                "the refusal must name the override; got: {msg}"
+            );
+        }
+
+        /// `--to` short-circuits before any stdin interaction, on a TTY or
+        /// not — that is what makes compaction scriptable.
+        #[test]
+        fn to_short_circuits_before_any_read() {
+            for is_tty in [true, false] {
+                let label = resolve_compact_destination_with(Some("L6-DST"), is_tty, || {
+                    panic!("--to must short-circuit before any stdin read")
+                })
+                .unwrap();
+                assert_eq!(label, "L6-DST");
+            }
+        }
+
+        #[test]
+        fn to_is_trimmed_and_an_empty_one_is_rejected() {
+            assert_eq!(
+                resolve_compact_destination_with(Some("  L6-DST\n"), false, || unreachable!())
+                    .unwrap(),
+                "L6-DST"
+            );
+            assert!(
+                resolve_compact_destination_with(Some("   "), false, || unreachable!()).is_err(),
+                "an empty --to is a mistake, not a request to prompt"
+            );
+        }
+
+        /// The interactive path still works — the fix is a terminal check,
+        /// not the removal of the prompt.
+        #[test]
+        fn a_tty_still_prompts_and_trims_the_answer() {
+            let label =
+                resolve_compact_destination_with(None, true, || Ok("  L6-DST \n".to_string()))
+                    .unwrap();
+            assert_eq!(label, "L6-DST");
+        }
+
+        /// A bare Enter is not a destination. It used to be caught after
+        /// the read; it still is.
+        #[test]
+        fn an_empty_answer_on_a_tty_is_refused() {
+            assert!(resolve_compact_destination_with(None, true, || Ok("\n".to_string())).is_err());
+        }
+    }
 
     /// `volume deposit` validation (issue #73 / ADR-0006). These are the
     /// only two refusals the whole feature adds; everything else about a
