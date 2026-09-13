@@ -105,6 +105,11 @@ and `volume plan` take `--media` for planning a tape that is not loaded, default
 drive's native generation. Migration 011 adds a partial unique index on
 `cartridges.serial_number`. `first-run.sh` stops asking the operator to register the
 cartridge by hand — init does it — and asks for the drive's generation instead of a media
-type. The design's §2.8 capacity model is recast (layer 1 now reads the generation table
+type. Binding also makes the **cartridge lifecycle live for the first time**: `in_use` was
+never written by any production path, and with it reachable, `retired_permanent` and
+`offsite` become states a cartridge can be pushed toward but never enter, because no command
+writes them (#148). Two consequences of the same dormancy — `compact-finish`'s
+`pending_erase` hand-off and `cartridge mark-erased`'s cascade both queried an always-empty
+join table — start working as written. The design's §2.8 capacity model is recast (layer 1 now reads the generation table
 rather than config) and §2.5 is extended (the binding the design assigned to `cartridge
 register` reading MAM is made by `volume init`); both are recorded in `design-errata.md`.
