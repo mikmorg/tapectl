@@ -556,6 +556,61 @@ pub fn update_unit_path(conn: &Connection, unit_id: i64, path: &str) -> Result<(
     Ok(())
 }
 
+/// One row of a unit's path trail: where it moved to, and when that move
+/// was recorded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnitPathRecord {
+    pub path: String,
+    /// `unit_path_history.observed_at` — when the unit was recorded AT this
+    /// path, not when it left it. The table has no departure timestamp and
+    /// inventing one would be a guess.
+    pub observed_at: String,
+}
+
+/// The paths this unit occupied BEFORE its current one, most recent first.
+///
+/// Issue #150: `unit_path_history` has been written on every rename since
+/// 001_initial.sql and read by nothing but its own unit test — a unit that
+/// moved twice had the trail on disk and no way to see it.
+///
+/// Two properties of the table shape what this can return, and both are
+/// facts about the data, not choices made here:
+///
+/// - It records DESTINATIONS ([`update_unit_path`] inserts the new path),
+///   so the most recent row is the unit's current path and is dropped here.
+///   Everything behind it is a genuine prior location.
+/// - `unit init` writes no row at all, so a unit's FIRST path is absent from
+///   the trail unless it has since moved away from it and back. That is
+///   unrecoverable after the fact; this does not paper over it by
+///   synthesising a row.
+pub fn unit_path_history(conn: &Connection, unit_id: i64) -> Result<Vec<UnitPathRecord>> {
+    let current: Option<String> = conn.query_row(
+        "SELECT current_path FROM units WHERE id = ?1",
+        params![unit_id],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT path, observed_at FROM unit_path_history
+         WHERE unit_id = ?1
+         ORDER BY id DESC",
+    )?;
+    let mut rows: Vec<UnitPathRecord> = stmt
+        .query_map(params![unit_id], |row| {
+            Ok(UnitPathRecord {
+                path: row.get(0)?,
+                observed_at: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // Drop the head iff it is where the unit is NOW — ordered by `id`, not
+    // `observed_at`, because two moves inside the same second share a
+    // timestamp and only the rowid orders them correctly.
+    if rows.first().map(|r| r.path.as_str()) == current.as_deref() {
+        rows.remove(0);
+    }
+    Ok(rows)
+}
+
 // ── Tags ──
 
 pub fn get_or_create_tag(conn: &Connection, name: &str) -> Result<i64> {
@@ -740,6 +795,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(history, 1);
+    }
+
+    /// Issue #150: the trail is readable, ordered newest-first, and does
+    /// not include where the unit is right now.
+    #[test]
+    fn unit_path_history_returns_prior_paths_newest_first() {
+        let conn = fresh_conn();
+        let tid = insert_tenant(&conn, "op", None, true).unwrap();
+        let uid = insert_unit(
+            &conn,
+            "u-uuid",
+            "u",
+            tid,
+            None,
+            "/path/a",
+            "mtime_size",
+            true,
+        )
+        .unwrap();
+
+        // `unit init` writes no history row, so /path/a is NOT in the trail
+        // — the one thing this function cannot recover, asserted here so
+        // nobody later "fixes" it by synthesising a row.
+        assert!(unit_path_history(&conn, uid).unwrap().is_empty());
+
+        update_unit_path(&conn, uid, "/path/b").unwrap();
+        update_unit_path(&conn, uid, "/path/c").unwrap();
+
+        let history = unit_path_history(&conn, uid).unwrap();
+        let paths: Vec<&str> = history.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/path/b"],
+            "the current path must not be listed as a prior one"
+        );
+        assert!(!history[0].observed_at.is_empty());
+    }
+
+    /// Two moves in the same second share an `observed_at`, so the ordering
+    /// (and therefore which row is dropped as "current") must come from the
+    /// rowid. Ordering by the timestamp would make this non-deterministic.
+    #[test]
+    fn unit_path_history_orders_by_rowid_not_timestamp() {
+        let conn = fresh_conn();
+        let tid = insert_tenant(&conn, "op", None, true).unwrap();
+        let uid = insert_unit(&conn, "u-uuid", "u", tid, None, "/a", "mtime_size", true).unwrap();
+
+        for p in ["/b", "/c", "/d"] {
+            update_unit_path(&conn, uid, p).unwrap();
+        }
+        let paths: Vec<String> = unit_path_history(&conn, uid)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(paths, vec!["/c".to_string(), "/b".to_string()]);
     }
 
     #[test]

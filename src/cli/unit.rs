@@ -245,6 +245,10 @@ pub fn run(
             let unit = resolve_unit(conn, name)?;
             let tags = queries::get_tags_for_unit(conn, unit.id)?;
             let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?;
+            // Issue #150: `unit_path_history` has been written on every
+            // rename since 001_initial.sql and read by nothing. This is the
+            // detail view, so this is where the trail belongs.
+            let prior_paths = queries::unit_path_history(conn, unit.id)?;
 
             if json_output {
                 println!(
@@ -253,6 +257,7 @@ pub fn run(
                         "unit": unit,
                         "tags": tags,
                         "tenant": tenant,
+                        "prior_paths": prior_paths,
                     })
                 );
             } else {
@@ -272,6 +277,15 @@ pub fn run(
                 println!("  Created:       {}", unit.created_at);
                 if !tags.is_empty() {
                     println!("  Tags:          {}", tags.join(", "));
+                }
+                if !prior_paths.is_empty() {
+                    // "recorded at" and not "moved away", because
+                    // `observed_at` is when the unit was seen AT that path;
+                    // the table has no departure timestamp.
+                    println!("  Prior paths:   (newest first, recorded at)");
+                    for rec in &prior_paths {
+                        println!("    {}  {}", rec.observed_at, rec.path);
+                    }
                 }
             }
         }
