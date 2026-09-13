@@ -365,17 +365,11 @@ mod tests {
     }
     #[test]
     fn native_capacity_lto5() {
-        assert_eq!(
-            Generation::Lto5.native_capacity_bytes(),
-            1_500_000_000_000
-        );
+        assert_eq!(Generation::Lto5.native_capacity_bytes(), 1_500_000_000_000);
     }
     #[test]
     fn native_capacity_lto6() {
-        assert_eq!(
-            Generation::Lto6.native_capacity_bytes(),
-            2_500_000_000_000
-        );
+        assert_eq!(Generation::Lto6.native_capacity_bytes(), 2_500_000_000_000);
     }
     #[test]
     fn native_capacity_lto7() {
@@ -390,17 +384,11 @@ mod tests {
     }
     #[test]
     fn native_capacity_lto8() {
-        assert_eq!(
-            Generation::Lto8.native_capacity_bytes(),
-            12_000_000_000_000
-        );
+        assert_eq!(Generation::Lto8.native_capacity_bytes(), 12_000_000_000_000);
     }
     #[test]
     fn native_capacity_lto9() {
-        assert_eq!(
-            Generation::Lto9.native_capacity_bytes(),
-            18_000_000_000_000
-        );
+        assert_eq!(Generation::Lto9.native_capacity_bytes(), 18_000_000_000_000);
     }
     #[test]
     fn native_capacity_lto10() {

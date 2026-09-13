@@ -326,3 +326,70 @@ impl TapeDevice {
         Ok(total)
     }
 }
+
+/// Read the drive's current density code via `MTIOCGET`'s `mt_dsreg` field
+/// (ADR-0010's third, last-resort detection source).
+///
+/// Opens `device` read-only and issues *only* `MTIOCGET` — deliberately not
+/// via [`TapeDevice::open_read`], whose construction calls `MTSETBLK`
+/// (`set_block_size`) as a side effect; `MTIOCGET` alone causes no tape
+/// motion and changes no drive state, unlike that. `None` means "not
+/// reported" (an unloaded drive, or one whose driver leaves the field 0).
+pub fn density_code(device: &str) -> Result<Option<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(device)
+        .map_err(|e| TapectlError::TapeIo(format!("open {device}: {e}")))?;
+    let mut mtget = MtGet::default();
+    let rc = unsafe { nix::libc::ioctl(file.as_raw_fd(), MTIOCGET, &mut mtget as *mut MtGet) };
+    if rc != 0 {
+        return Err(TapectlError::TapeIo(format!(
+            "MTIOCGET: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(density_from_dsreg(mtget.mt_dsreg))
+}
+
+/// Extract the density code byte from `MTIOCGET`'s `mt_dsreg` register: the
+/// top byte, `(dsreg >> 24) & 0xff`. `0` means "not reported" and is
+/// normalized to `None` rather than the misleading byte value `0x00`.
+pub fn density_from_dsreg(dsreg: i64) -> Option<u8> {
+    let code = ((dsreg >> 24) & 0xff) as u8;
+    if code == 0 {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+#[cfg(test)]
+mod density_tests {
+    use super::*;
+
+    #[test]
+    fn density_from_dsreg_extracts_the_top_byte() {
+        // Real LTO-6 capture shape: density 0x5a in the top byte, other
+        // bits carrying unrelated driver state.
+        assert_eq!(density_from_dsreg(0x5a00_1234), Some(0x5a));
+        assert_eq!(density_from_dsreg(0x5e00_0000), Some(0x5e));
+    }
+
+    #[test]
+    fn density_from_dsreg_zero_top_byte_is_none() {
+        assert_eq!(density_from_dsreg(0x0000_1234), None);
+        assert_eq!(density_from_dsreg(0), None);
+    }
+
+    #[test]
+    fn density_from_dsreg_negative_register_still_extracts_top_byte() {
+        // mt_dsreg is signed (i64); a real register value can set high bits.
+        assert_eq!(density_from_dsreg(-1i64), Some(0xff));
+    }
+
+    #[test]
+    fn density_code_on_a_nonexistent_device_errors_without_panicking() {
+        let err = density_code("/nonexistent/tapectl-media-detect-test-device").unwrap_err();
+        assert!(format!("{err}").contains("open"));
+    }
+}

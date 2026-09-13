@@ -21,6 +21,15 @@ pub struct MamInfo {
     pub load_count: Option<i64>,
     pub manufacturer: Option<String>,
     pub length_meters: Option<i64>,
+    /// "Medium density code" — the generation the physical medium was
+    /// formatted at, per ADR-0010's first (highest-priority) detection
+    /// source. `sg_read_attr` reports it as hex with a `0x` prefix, e.g.
+    /// `0x5a`.
+    pub medium_density_code: Option<u8>,
+    /// "Format density code" — ADR-0010's second detection source, used
+    /// when the medium density code is unavailable (mhvtl reports only
+    /// this one). Same `0x..` hex format.
+    pub format_density_code: Option<u8>,
 }
 
 /// Read MAM attributes from the drive's sg device.
@@ -63,9 +72,25 @@ pub fn parse_mam(raw: &str) -> MamInfo {
             }
         } else if label.eq_ignore_ascii_case("Medium length [m]") {
             m.length_meters = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Medium density code") {
+            m.medium_density_code = parse_hex_density(value);
+        } else if label.eq_ignore_ascii_case("Format density code") {
+            m.format_density_code = parse_hex_density(value);
         }
     }
     m
+}
+
+/// Parse a `sg_read_attr` density code value, e.g. `"0x5a"`, into its byte.
+fn parse_hex_density(value: &str) -> Option<u8> {
+    u8::from_str_radix(
+        value
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X"),
+        16,
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -148,6 +173,40 @@ mod tests {
         assert_eq!(m.serial.as_deref(), Some("EW7VWMVKF6"));
         assert_eq!(m.load_count, Some(1));
         assert_eq!(m.max_capacity_bytes, Some(2499053 * MIB));
+    }
+
+    /// ADR-0010 detection source 1: the real LTO-6 capture carries both
+    /// density fields (medium and format), each `0x5a` — LTO-6's density
+    /// code (`Generation::Lto6.density_code()`).
+    #[test]
+    fn parses_medium_and_format_density_codes_from_real_lto6_output() {
+        let m = parse_mam(LTO6_SAMPLE);
+        assert_eq!(m.medium_density_code, Some(0x5a));
+        assert_eq!(m.format_density_code, Some(0x5a));
+    }
+
+    // Shaped after mhvtl's actual `sg_read_attr` output (ADR-0010 detection
+    // source 2): mhvtl reports only the format density code, never a medium
+    // serial number, and its manufacturer string is the fixed "linuxVTL"
+    // rather than a real vendor.
+    const MHVTL_SHAPED_SAMPLE: &str = "Attribute values:
+  Remaining capacity in partition [MiB]: 2400000
+  Maximum capacity in partition [MiB]: 2400000
+  TapeAlert flags: 0
+  Load count: 3
+  Format density code: 0x5e
+  Medium manufacturer: linuxVTL
+  Medium length [m]: 900
+";
+
+    #[test]
+    fn mhvtl_shaped_sample_has_format_code_but_no_medium_code_or_serial() {
+        let m = parse_mam(MHVTL_SHAPED_SAMPLE);
+        assert_eq!(m.format_density_code, Some(0x5e));
+        assert_eq!(m.medium_density_code, None);
+        assert_eq!(m.serial, None);
+        assert_eq!(m.manufacturer.as_deref(), Some("linuxVTL"));
+        assert_eq!(m.length_meters, Some(900));
     }
 
     #[test]
