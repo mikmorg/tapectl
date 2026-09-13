@@ -1,3 +1,4 @@
+pub(crate) mod binding;
 pub mod build;
 pub mod envelope;
 pub mod format;

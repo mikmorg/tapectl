@@ -118,6 +118,12 @@ fn migrations() -> Migrations<'static> {
         // list, and the escrow predicate must tell "never written down" from
         // "could not have been written down". See the migration header.
         M::up(include_str!("migrations/010_stage_set_origin.sql")),
+        // 011 adds a PARTIAL unique index on cartridges.serial_number
+        // (ADR-0010): `volume init` binds the cartridge it is writing by
+        // matching the loaded medium's MAM serial to that column, so a
+        // repeated serial would bind to an arbitrary row. See the migration
+        // header for why it is partial.
+        M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
     ])
 }
 

@@ -303,11 +303,11 @@ pub fn volume_retire(
 /// ADR-0004-eligible copy count after the volume being retired is
 /// excluded, and (issue #91) the per-volume evidence backing that
 /// remaining coverage.
-struct RetireImpact {
-    unit_name: String,
-    unit_status: String,
-    other_copies: i64,
-    evidence: Vec<crate::policy::evidence::CoverageEvidence>,
+pub(crate) struct RetireImpact {
+    pub(crate) unit_name: String,
+    pub(crate) unit_status: String,
+    pub(crate) other_copies: i64,
+    pub(crate) evidence: Vec<crate::policy::evidence::CoverageEvidence>,
 }
 
 /// The impact analysis behind `volume_retire`: one [`RetireImpact`] per
@@ -328,7 +328,7 @@ struct RetireImpact {
 /// it regardless of what its current status happens to be. Issue #73: it
 /// goes through `coverage::copy_count_expr`, so a recorded warehouse
 /// deposit of some OTHER eligible volume counts as another copy.
-fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<RetireImpact>> {
+pub(crate) fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<RetireImpact>> {
     let sql = format!(
         "SELECT DISTINCT u.id, u.name, u.status,
                 {} as other_copies

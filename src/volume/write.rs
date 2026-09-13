@@ -16,6 +16,7 @@ use crate::util::{HashingWriter, TruncatingWriter};
 
 use crate::store::{Store, TapeStore, Tier};
 
+use super::binding;
 use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
 use super::format;
 use super::layout;
@@ -94,7 +95,35 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// loses nothing: any tape with a parseable File 0 already refuses via
 /// identity, sealed or not). No DB row is created for `label` until AFTER
 /// this check passes, so a refusal here leaves no stale `volumes` row behind
-/// to clean up.
+/// to clean up — and per ADR-0010 that now covers the CARTRIDGE rows too:
+/// nothing is registered, bound or displaced until File 0 has spoken.
+///
+/// ADR-0010 makes this the point where three facts about the physical medium
+/// are decided, once, and then never re-derived from config:
+///
+/// 1. **Generation** — detected from the drive
+///    ([`media_detect::detect`]), with `--media` / a matched cartridge row /
+///    the drive's own generation standing in only when nothing is readable
+///    ([`media_detect::resolve_media`]). A `--media` that contradicts a
+///    detected code is an error, and a drive that cannot write the detected
+///    generation is a hard refusal `--force` does not bypass: it is a
+///    physical fact, not a consent tier (ADR-0008).
+/// 2. **Capacity** — `capacity_override` -> the bound cartridge row ->
+///    the generation table ([`crate::media::resolve_capacity`]), stored on
+///    `volumes.capacity_bytes`. Every later gate reads that row; this is the
+///    fix for issue #141, where an LTO-5 cartridge in an LTO-6 drive was
+///    planned as 2.5 TB.
+/// 3. **Which cartridge** — bound via the MAM medium serial
+///    ([`crate::volume::binding`]), which is the first time any production
+///    path has written the `cartridge_volumes` join.
+///
+/// Ordering is load-bearing. Every FACT check (detect, the `--media`
+/// contradiction, `can_write`, a `--cartridge` that names no row) runs
+/// before the tape device is opened, so a wrong-tape or wrong-flag run costs
+/// nothing. Every catalog MUTATION runs after `check_fresh_write_contact`
+/// passes and inside one transaction, so a refused init never displaces a
+/// volume in the catalog.
+#[allow(clippy::too_many_arguments)] // conn/config + label/device/block_size + force + the two ADR-0010 declarations
 pub fn volume_init(
     conn: &Connection,
     config: &Config,
@@ -102,6 +131,13 @@ pub fn volume_init(
     device: &str,
     block_size: usize,
     force: bool,
+    // `--media <GEN>`: the operator's declaration of the loaded medium's
+    // generation. Only consulted when nothing could be detected; an error
+    // when it contradicts a detected density code.
+    declared_media: Option<&str>,
+    // `--cartridge <BARCODE>`: bind to this already-registered cartridge
+    // when the medium's serial matches no row (or no serial is readable).
+    cartridge_barcode: Option<&str>,
 ) -> Result<i64> {
     // Creation-time label validation (issue #103). A label reaches the
     // filesystem too: `volume_read_slices` below joins
@@ -124,9 +160,92 @@ pub fn volume_init(
     }
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
+    let drive_gen = crate::media::Generation::parse(&backend.generation).ok_or_else(|| {
+        TapectlError::Config(format!(
+            "backends.lto[\"{}\"].generation = {:?} is not a recognised LTO generation",
+            backend.name, backend.generation
+        ))
+    })?;
 
-    let nominal_capacity = backend.capacity_bytes()? as i64;
-    let media_type = &backend.generation;
+    // ---- ADR-0010 fact-finding, all before the tape device is opened ----
+    let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    let declared = match declared_media {
+        Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
+            TapectlError::Other(format!(
+                "--media {m:?} is not a recognised LTO generation \
+                 (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
+            ))
+        })?),
+        None => None,
+    };
+    let serial = det.mam.serial.as_deref();
+
+    // The row is looked up (never mutated) here because BOTH the generation
+    // resolution and the capacity resolution need it, and because a
+    // `--cartridge` that names nothing must fail before the drive is touched.
+    let lookup = binding::lookup_cartridge(conn, serial, cartridge_barcode)?;
+    let row_gen = match &lookup.row {
+        Some(r) => match crate::media::Generation::parse(&r.media_type) {
+            Some(g) => Some((g, r.barcode.as_str())),
+            None => {
+                // A row registered before ADR-0010 canonicalised the column,
+                // or hand-edited. It cannot arbitrate a generation, so it is
+                // ignored for that purpose and said so — its capacity figure
+                // is still usable, and `cartridge register` now refuses to
+                // create another one like it.
+                warn!(
+                    barcode = %r.barcode,
+                    media_type = %r.media_type,
+                    "cartridge media_type is not a recognised LTO generation; ignoring it \
+                     for generation resolution"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    let (generation, media_source) =
+        crate::tape::media_detect::resolve_media(&det, declared, row_gen, drive_gen)?;
+    if !media_source.is_detected() {
+        let from = media_source.describe();
+        warn!(
+            %generation, %from,
+            "medium generation not detectable from this drive; assuming a declared value"
+        );
+        eprintln!(
+            "warning: medium generation not detectable from this drive; \
+             assuming {generation} (from {from})"
+        );
+    }
+
+    // A physical fact, not a risk judgement: `--force` is deliberately NOT
+    // consulted (ADR-0010 decision 2, ADR-0008's tiers).
+    if !crate::media::Generation::can_write(drive_gen, generation) {
+        return Err(TapectlError::Other(format!(
+            "an {drive_gen} drive cannot write {generation} media. This is a physical \
+             limit of the drive, not a policy — --force does not override it. Load a \
+             {drive_gen}-writable cartridge, or write this one in a drive that can."
+        )));
+    }
+
+    let capacity_override = match &backend.capacity_override {
+        Some(v) => Some(staging::parse_size_to_bytes(v)? as u64),
+        None => None,
+    };
+    let (nominal_capacity, capacity_source) = crate::media::resolve_capacity(
+        capacity_override,
+        lookup.row.as_ref().map(|r| r.nominal_capacity as u64),
+        generation,
+    );
+    let nominal_capacity = nominal_capacity as i64;
+    info!(
+        label,
+        %generation,
+        nominal_capacity,
+        capacity_source = ?capacity_source,
+        "volume media resolved"
+    );
 
     // Generated here (not deferred to the `volume_uuid()` self-heal helper)
     // so the SAME value is used for the contact check below and the
@@ -146,18 +265,39 @@ pub fn volume_init(
     // doc comment notes this one exception).
     store.reposition_for_resume(0)?;
 
-    conn.execute(
-        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES (?1, ?2, 'lto', ?3, ?4, ?5, 'initialized')",
+    // ---- from here on the catalog changes; File 0 has consented --------
+    // One transaction: a `volumes` row that exists but is not bound, or a
+    // displacement recorded for a volume that was never created, are both
+    // worse than either change alone.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
+                              capacity_bytes, mam_capacity_bytes, mam_remaining_at_start, status)
+         VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, ?7, 'initialized')",
         params![
             label,
             candidate_uuid,
             backend.name,
-            media_type,
-            nominal_capacity
+            generation.as_str(),
+            nominal_capacity,
+            det.mam.max_capacity_bytes,
+            det.mam.remaining_bytes,
         ],
     )?;
-    let volume_id = conn.last_insert_rowid();
+    let volume_id = tx.last_insert_rowid();
+    let bound = binding::bind_cartridge(
+        &tx,
+        volume_id,
+        lookup.row.as_ref(),
+        serial,
+        generation,
+        nominal_capacity,
+        &det.mam,
+    )?;
+    events::log_created(&tx, "volume", volume_id, label, None)?;
+    tx.commit()?;
+
+    report_binding(label, &lookup, &bound);
 
     // Provisional total_files: unknown until the write session builds the
     // real Layout. Format §1's minimum shape is 4 front files + >=1 tenant
@@ -166,18 +306,22 @@ pub fn volume_init(
     // interpreted) when the write session rewrites File 0 from BOT.
     const PROVISIONAL_TOTAL_FILES: i32 = 8;
     let created_at = chrono::Utc::now().to_rfc3339();
+    // ADR-0010: real MAM values at init now. The FIELD NAMES and shape are
+    // unchanged (ADR-0007 — on-tape bytes are forever); only the values that
+    // were previously hardcoded zeros and blanks now say what the drive
+    // actually reported.
     let id_thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
         label,
         uuid: &candidate_uuid,
-        media_type,
+        media_type: generation.as_str(),
         tapectl_version: env!("CARGO_PKG_VERSION"),
         nominal_capacity,
-        mam_capacity: 0,
+        mam_capacity: det.mam.max_capacity_bytes.unwrap_or(0),
         total_files: PROVISIONAL_TOTAL_FILES,
-        mam_manufacturer: "",
-        mam_serial: "",
-        mam_length: 0,
-        mam_loads: 0,
+        mam_manufacturer: det.mam.manufacturer.as_deref().unwrap_or(""),
+        mam_serial: det.mam.serial.as_deref().unwrap_or(""),
+        mam_length: det.mam.length_meters.unwrap_or(0),
+        mam_loads: det.mam.load_count.unwrap_or(0),
         created_at: &created_at,
     });
 
@@ -188,8 +332,67 @@ pub fn volume_init(
     )?;
     info!(label = label, "volume initialized");
 
-    events::log_created(conn, "volume", volume_id, label, None)?;
     Ok(volume_id)
+}
+
+/// Say what the binding did — ADR-0010 requires init to WARN about a
+/// displacement, naming the volume and any unit that just lost its last
+/// copy, rather than refuse it. stderr, so `--json` stdout stays parseable.
+fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &binding::BindOutcome) {
+    if let Some(requested) = &lookup.superseded_request {
+        if let Some(actual) = &bound.barcode {
+            eprintln!(
+                "note: --cartridge {requested} was superseded by the loaded medium's own \
+                 serial, which is registered as cartridge {actual}"
+            );
+        }
+    }
+    match &bound.barcode {
+        Some(barcode) if bound.auto_registered => {
+            println!("cartridge {barcode} auto-registered from MAM (barcode = medium serial)");
+        }
+        Some(barcode) => {
+            println!("volume \"{label}\" bound to cartridge {barcode}");
+            if bound.serial_recorded {
+                println!("  medium serial recorded on cartridge {barcode}");
+            }
+        }
+        None => {
+            eprintln!(
+                "warning: no medium serial readable; volume \"{label}\" is not bound to a \
+                 cartridge. Copy counting cannot tell this cartridge from another, and \
+                 `volume write` cannot check you reloaded the same one."
+            );
+        }
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    for d in &bound.displaced {
+        eprintln!(
+            "warning: cartridge {} previously held volume \"{}\"; it is now marked erased \
+             because these bytes are being overwritten (ADR-0010).",
+            bound.barcode.as_deref().unwrap_or("?"),
+            d.label,
+        );
+        for impact in &d.impacts {
+            if impact.other_copies == 0 {
+                eprintln!(
+                    "         *** unit \"{}\" [{}] now has ZERO copies ***",
+                    impact.unit_name, impact.unit_status
+                );
+            } else {
+                let evidence =
+                    crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now);
+                eprintln!(
+                    "         unit \"{}\" [{}]: {} other copy/copies remain{}",
+                    impact.unit_name,
+                    impact.unit_status,
+                    impact.other_copies,
+                    evidence.map(|e| format!(" ({e})")).unwrap_or_default(),
+                );
+            }
+        }
+    }
 }
 
 /// Full volume write pipeline (`docs/design/v2-implementation-plan.md` T8):

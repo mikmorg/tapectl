@@ -24,9 +24,31 @@ pub enum VolumeCommands {
         /// default (issue #27) — loading the wrong cartridge would
         /// otherwise silently overwrite it. Never overrides a cartridge
         /// that is already SEALED (ADR-0003): bulk-erase the physical tape
-        /// and run `cartridge mark-erased` first for that case.
+        /// and run `cartridge mark-erased` first for that case. It also
+        /// never overrides the drive/media compatibility refusal, which is
+        /// a physical fact rather than a risk judgement (ADR-0010).
         #[arg(long)]
         force: bool,
+        /// Declare the loaded medium's generation (e.g. LTO-6, LTO-7-M8).
+        ///
+        /// Normally unnecessary and normally ignored: ADR-0010 DETECTS the
+        /// generation from the drive (MAM medium density code, else MAM
+        /// format density code, else the st driver's density register), and
+        /// a detected code is a fact about the tape that this flag cannot
+        /// override — a `--media` contradicting one is an error, not a hint.
+        /// It is consulted only when no source reports a recognised code.
+        #[arg(long)]
+        media: Option<String>,
+        /// Bind this volume to an already-registered cartridge by barcode.
+        ///
+        /// Normally unnecessary: `volume init` matches the loaded medium's
+        /// MAM serial to `cartridges.serial_number`, and auto-registers a
+        /// cartridge (barcode = that serial) when nothing matches. Use this
+        /// to attach the volume to a cartridge YOU labelled — the barcode on
+        /// the physical sticker — instead. A serial match wins over this
+        /// flag, since the serial was read off the medium.
+        #[arg(long)]
+        cartridge: Option<String>,
     },
 
     /// Write staged data to volume
@@ -274,10 +296,20 @@ pub fn run(
             label,
             device,
             force,
+            media,
+            cartridge,
         } => {
             let device = write_device(config, device.as_deref())?;
-            let vol_id =
-                write::volume_init(conn, config, label, &device, DEFAULT_BLOCK_SIZE, *force)?;
+            let vol_id = write::volume_init(
+                conn,
+                config,
+                label,
+                &device,
+                DEFAULT_BLOCK_SIZE,
+                *force,
+                media.as_deref(),
+                cartridge.as_deref(),
+            )?;
             if json_output {
                 println!(
                     "{}",

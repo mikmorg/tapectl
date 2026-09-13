@@ -362,7 +362,17 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
     // on this VM as of this writing per project notes, independent of this
     // change) — flagged for the coordinator to resolve before the next real
     // mhvtl run, most likely by erasing the scratch cartridge first.
-    volume::write::volume_init(&h.conn, &h.config, label, &tape_dev(), BLOCK_SIZE, false).unwrap();
+    volume::write::volume_init(
+        &h.conn,
+        &h.config,
+        label,
+        &tape_dev(),
+        BLOCK_SIZE,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
     volume::write::volume_write(
         &h.conn,
         &h.paths,
@@ -772,7 +782,17 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     // on this VM as of this writing per project notes, independent of this
     // change) — flagged for the coordinator to resolve before the next real
     // mhvtl run, most likely by erasing the scratch cartridge first.
-    volume::write::volume_init(&h.conn, &h.config, label, &tape_dev(), BLOCK_SIZE, false).unwrap();
+    volume::write::volume_init(
+        &h.conn,
+        &h.config,
+        label,
+        &tape_dev(),
+        BLOCK_SIZE,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
     volume::write::volume_write(
         &h.conn,
         &h.paths,

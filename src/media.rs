@@ -216,6 +216,60 @@ impl fmt::Display for Generation {
     }
 }
 
+/// Which of the three sources in [`resolve_capacity`]'s precedence produced
+/// the figure. Carried so the caller can SAY where the number came from —
+/// a 2400 MB "LTO-8" volume is alarming until you are told a drive
+/// `capacity_override` declared it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacitySource {
+    /// The drive's `capacity_override`: this drive lies about its media, as
+    /// mhvtl does.
+    DriveOverride,
+    /// The bound cartridge row's `nominal_capacity`, set by an operator at
+    /// `cartridge register --capacity`.
+    CartridgeRow,
+    /// The generation table's marketed native figure.
+    GenerationTable,
+}
+
+/// A volume's capacity in bytes, decided ONCE at `volume init` and then
+/// stored on `volumes.capacity_bytes` (ADR-0010, decision 3).
+///
+/// Two overrides in a fixed order ahead of the generation table:
+///
+/// 1. `override_bytes` — the drive's `capacity_override`. A drive that lies
+///    about its media wins outright, because nothing else can know: this is
+///    how the mhvtl harnesses make a virtual tape 2400 MB, and the only
+///    legitimate use on real hardware is a virtual drive.
+/// 2. `row_bytes` — the bound cartridge's `nominal_capacity`. An operator
+///    said so at `cartridge register --capacity`, and the operator can see
+///    things the table cannot: ADR-0010 names the LTO-10 case, which ships
+///    in both 30 TB and 40 TB cartridges that one generation figure cannot
+///    express.
+/// 3. the generation table (`Generation::native_capacity_bytes`).
+///
+/// Pure by construction so the precedence is testable without a drive, a
+/// config file or a database — every caller resolves the three inputs and
+/// hands them over. MAM's own reported capacity is deliberately NOT one of
+/// them: it stays informational (`docs/design/v2-open-questions.md` §D
+/// records the mhvtl over-report that makes trusting it unsafe).
+pub fn resolve_capacity(
+    override_bytes: Option<u64>,
+    row_bytes: Option<u64>,
+    generation: Generation,
+) -> (u64, CapacitySource) {
+    if let Some(b) = override_bytes {
+        return (b, CapacitySource::DriveOverride);
+    }
+    if let Some(b) = row_bytes {
+        return (b, CapacitySource::CartridgeRow);
+    }
+    (
+        generation.native_capacity_bytes(),
+        CapacitySource::GenerationTable,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +576,45 @@ mod tests {
             assert!(!Generation::can_write(Generation::Lto7M8, media));
             assert!(!Generation::can_read(Generation::Lto7M8, media));
         }
+    }
+
+    // ---- resolve_capacity (ADR-0010 decision 3) ----
+
+    #[test]
+    fn capacity_falls_back_to_the_generation_table() {
+        let (bytes, src) = resolve_capacity(None, None, Generation::Lto6);
+        assert_eq!(bytes, 2_500_000_000_000);
+        assert_eq!(src, CapacitySource::GenerationTable);
+    }
+
+    #[test]
+    fn capacity_prefers_the_cartridge_row_over_the_table() {
+        // The 40 TB LTO-10 case ADR-0010 names: one generation figure
+        // cannot express both cartridge sizes, so the operator declares it.
+        let (bytes, src) = resolve_capacity(None, Some(40_000_000_000_000), Generation::Lto10);
+        assert_eq!(bytes, 40_000_000_000_000);
+        assert_eq!(src, CapacitySource::CartridgeRow);
+    }
+
+    #[test]
+    fn capacity_prefers_the_drive_override_over_everything() {
+        // mhvtl's 2400 MB micro-tape: the drive lies, and nothing else can
+        // know, so it wins over both the row and the table.
+        let (bytes, src) = resolve_capacity(
+            Some(2_400 * 1024 * 1024),
+            Some(40_000_000_000_000),
+            Generation::Lto8,
+        );
+        assert_eq!(bytes, 2_400 * 1024 * 1024);
+        assert_eq!(src, CapacitySource::DriveOverride);
+    }
+
+    /// The whole point of issue #141: an LTO-5 cartridge in an LTO-6 drive
+    /// is 1.5 TB, not the 2.5 TB the drive's own generation would suggest.
+    #[test]
+    fn an_lto5_medium_is_planned_at_lto5_capacity_whatever_the_drive_is() {
+        let (bytes, _) = resolve_capacity(None, None, Generation::Lto5);
+        assert_eq!(bytes, 1_500_000_000_000);
+        assert_ne!(bytes, Generation::Lto6.native_capacity_bytes());
     }
 }
