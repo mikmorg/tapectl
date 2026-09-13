@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::Config;
 use crate::db::queries;
@@ -928,10 +928,37 @@ fn report_verify_status(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // Issue #142: the aggregate above says HOW MANY slices failed and never
+    // which. `verification_results` now knows, so the most recent failed
+    // session — the one an operator is actually acting on — names them.
+    let latest_failure = latest_failed_session(conn, volume_filter)?;
+
     if json_output {
         let json: Vec<serde_json::Value> = rows.iter().map(|(label, vtype, outcome, completed, checked, passed, failed)| {
             serde_json::json!({"volume": label, "type": vtype, "outcome": outcome, "completed": completed, "checked": checked, "passed": passed, "failed": failed})
         }).collect();
+        // The top level stays the ARRAY it has always been — a consumer that
+        // iterates it keeps working — and the detail rides on each element
+        // of it, attached to the session it belongs to.
+        let mut json = json;
+        if let Some(failure) = &latest_failure {
+            for row in json.iter_mut() {
+                let is_the_one = row.get("volume").and_then(|v| v.as_str()) == Some(&failure.label)
+                    && row.get("completed").and_then(|v| v.as_str())
+                        == failure.completed_at.as_deref();
+                if is_the_one {
+                    row["failing_positions"] = serde_json::json!(failure
+                        .failures
+                        .iter()
+                        .map(|f| serde_json::json!({
+                            "position": f.position,
+                            "result": f.result,
+                            "notes": f.notes,
+                        }))
+                        .collect::<Vec<_>>());
+                }
+            }
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         println!("no verification sessions found");
@@ -947,8 +974,100 @@ fn report_verify_status(
                 failed.unwrap_or(0),
             );
         }
+        if let Some(failure) = &latest_failure {
+            println!(
+                "\n  most recent failure — {} at {}:",
+                failure.label,
+                failure.completed_at.as_deref().unwrap_or("?")
+            );
+            if failure.failures.is_empty() {
+                // Honest about the gap rather than silent: a failure at a
+                // metadata position (seal marker, front index, an envelope)
+                // has no `write_positions` cursor row to hang a
+                // `verification_results` row on, so the session knows the
+                // count and this table cannot name it. `volume verify
+                // --json` prints the full evidence.
+                println!(
+                    "    no per-slice detail recorded — the failure was at a metadata \
+                     position, or predates issue #142. Re-run `volume verify --json` for \
+                     the full chain-walk evidence."
+                );
+            }
+            for f in &failure.failures {
+                println!("    position {}: {} — {}", f.position, f.result, f.notes);
+            }
+        }
     }
     Ok(())
+}
+
+/// One recorded per-slice verification failure.
+struct VerificationFailure {
+    position: String,
+    result: String,
+    notes: String,
+}
+
+/// The most recent FAILED verification session, with whatever per-slice
+/// detail `verification_results` holds for it (issue #142).
+struct LatestFailure {
+    label: String,
+    completed_at: Option<String>,
+    failures: Vec<VerificationFailure>,
+}
+
+fn latest_failed_session(
+    conn: &Connection,
+    volume_filter: Option<&str>,
+) -> Result<Option<LatestFailure>> {
+    let mut sql = String::from(
+        "SELECT vs.id, v.label, vs.completed_at
+         FROM verification_sessions vs
+         JOIN volumes v ON v.id = vs.volume_id
+         WHERE vs.outcome = 'failed'",
+    );
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(label) = volume_filter {
+        sql.push_str(" AND v.label = ?");
+        param_values.push(Box::new(label.to_string()));
+    }
+    // `id` breaks the tie: `completed_at` is second-resolution, so two
+    // sessions in one second would otherwise order arbitrarily.
+    sql.push_str(" ORDER BY vs.completed_at DESC, vs.id DESC LIMIT 1");
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+    let session: Option<(i64, String, Option<String>)> = conn
+        .query_row(&sql, params_ref.as_slice(), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?;
+    let Some((session_id, label, completed_at)) = session else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT wp.position, vr.result, COALESCE(vr.notes, '')
+         FROM verification_results vr
+         JOIN write_positions wp ON wp.id = vr.write_position_id
+         WHERE vr.session_id = ?1
+         ORDER BY CAST(wp.position AS INTEGER)",
+    )?;
+    let failures: Vec<VerificationFailure> = stmt
+        .query_map([session_id], |row| {
+            Ok(VerificationFailure {
+                position: row.get(0)?,
+                result: row.get(1)?,
+                notes: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(Some(LatestFailure {
+        label,
+        completed_at,
+        failures,
+    }))
 }
 
 fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bool) -> Result<()> {
@@ -1378,6 +1497,153 @@ mod tests {
     //! scan and confirm the filter now actually narrows the result.
     use super::*;
     use rusqlite::params;
+
+    /// Issue #142: `report verify-status` showed only the aggregate — "1
+    /// failed" with no way to learn which. `latest_failed_session` is the
+    /// query behind the new detail, tested directly rather than through the
+    /// println arms so the assertion is on the data, not on formatting.
+    mod verify_status_detail {
+        use super::*;
+
+        /// Seed one volume with one slice cursor row at `position`, plus a
+        /// verification session with `outcome` and, when failing, one
+        /// `verification_results` row pointing at that cursor.
+        fn seed(conn: &rusqlite::Connection, label: &str, position: &str, outcome: &str) -> i64 {
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES (?1, 0, 'active')",
+                params![format!("t-{label}")],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, status)
+                 VALUES (?1, ?1, ?2, 'active')",
+                params![format!("u-{label}"), tid],
+            )
+            .unwrap();
+            let uid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, 'current', '/tmp', 1, 10)",
+                params![uid],
+            )
+            .unwrap();
+            let snap = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 1)",
+                params![snap],
+            )
+            .unwrap();
+            let ss = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                     sha256_plain, sha256_encrypted)
+                 VALUES (?1, 1, 10, 10, 'aa', 'bb')",
+                params![ss],
+            )
+            .unwrap();
+            let slice = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            let vol = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss, snap, vol],
+            )
+            .unwrap();
+            let write_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                 VALUES (?1, ?2, ?3, 'written')",
+                params![write_id, slice, position],
+            )
+            .unwrap();
+            let wp = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                    (volume_id, verify_type, outcome, completed_at, slices_checked,
+                     slices_passed, slices_failed)
+                 VALUES (?1, 'full', ?2, datetime('now'), 1, 0, 1)",
+                params![vol, outcome],
+            )
+            .unwrap();
+            let session = conn.last_insert_rowid();
+            if outcome == "failed" {
+                conn.execute(
+                    "INSERT INTO verification_results
+                        (session_id, write_position_id, stage_slice_id, result, notes)
+                     VALUES (?1, ?2, ?3, 'failed_checksum', 'content_hash_mismatch: ...')",
+                    params![session, wp, slice],
+                )
+                .unwrap();
+            }
+            session
+        }
+
+        #[test]
+        fn the_most_recent_failed_session_names_its_failing_positions() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "VOL-A", "7", "failed");
+
+            let failure = latest_failed_session(&conn, None).unwrap().unwrap();
+            assert_eq!(failure.label, "VOL-A");
+            assert_eq!(failure.failures.len(), 1);
+            assert_eq!(failure.failures[0].position, "7");
+            assert_eq!(failure.failures[0].result, "failed_checksum");
+        }
+
+        #[test]
+        fn a_clean_history_has_no_failure_to_report() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "VOL-OK", "7", "passed");
+            assert!(latest_failed_session(&conn, None).unwrap().is_none());
+        }
+
+        /// The `--volume` filter narrows the detail the same way it narrows
+        /// the table above it — otherwise a filtered report would print one
+        /// volume's rows and another volume's failure under them.
+        #[test]
+        fn the_volume_filter_narrows_the_detail_too() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "VOL-A", "7", "failed");
+            seed(&conn, "VOL-B", "9", "failed");
+
+            let a = latest_failed_session(&conn, Some("VOL-A"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.label, "VOL-A");
+            assert_eq!(a.failures[0].position, "7");
+
+            assert!(latest_failed_session(&conn, Some("VOL-NONE"))
+                .unwrap()
+                .is_none());
+        }
+
+        /// A failure with no recordable detail (every mismatch at a metadata
+        /// position) still reports as a failure — with an empty list, which
+        /// the text arm renders as an explicit "no per-slice detail" line
+        /// rather than silence.
+        #[test]
+        fn a_failure_with_no_recorded_rows_still_reports_the_session() {
+            let conn = crate::db::open_memory().unwrap();
+            let session = seed(&conn, "VOL-M", "7", "failed");
+            conn.execute(
+                "DELETE FROM verification_results WHERE session_id = ?1",
+                params![session],
+            )
+            .unwrap();
+
+            let failure = latest_failed_session(&conn, None).unwrap().unwrap();
+            assert_eq!(failure.label, "VOL-M");
+            assert!(failure.failures.is_empty());
+        }
+    }
 
     /// #125's remaining half: the fact `audit` reports must also be visible
     /// where an operator looks when planning a restore. Built on the same

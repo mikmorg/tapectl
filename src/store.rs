@@ -71,6 +71,40 @@ pub enum MismatchKind {
     ContentHashMismatch,
 }
 
+impl MismatchKind {
+    /// A stable snake_case name for this kind.
+    ///
+    /// Written to `verification_results.notes` and to `volume verify
+    /// --json` (issue #142), so it is part of what an operator's scripts
+    /// read back — `{:?}` would be, too, but silently, and would change the
+    /// day someone renames a variant. Spelling it out makes that rename a
+    /// visible decision.
+    pub fn label(self) -> &'static str {
+        match self {
+            MismatchKind::SealUnreadable => "seal_unreadable",
+            MismatchKind::FrontIndexUnreadable => "front_index_unreadable",
+            MismatchKind::FrontIndexInconsistent => "front_index_inconsistent",
+            MismatchKind::FrontIndexDivergesFromSeal => "front_index_diverges_from_seal",
+            MismatchKind::NavigationDisagreement => "navigation_disagreement",
+            MismatchKind::ContentHashMismatch => "content_hash_mismatch",
+        }
+    }
+
+    /// Whether this kind's `expected`/`actual` are genuinely sha256 hex.
+    ///
+    /// Only these two compare hashes. For every other kind the strings are
+    /// sizes, counts or prose, and writing them into
+    /// `verification_results.expected_sha256` / `.actual_sha256` would make
+    /// those columns lie about their own type — the exact defect issue #142
+    /// exists to end, reintroduced one level down.
+    pub fn compares_hashes(self) -> bool {
+        matches!(
+            self,
+            MismatchKind::ContentHashMismatch | MismatchKind::FrontIndexDivergesFromSeal
+        )
+    }
+}
+
 /// One disagreement `confirm` found, at a specific tape position. Kept
 /// minimal and `Debug`-printable — a report structure, not a control type.
 #[derive(Debug, Clone, PartialEq, Eq)]

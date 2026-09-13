@@ -421,6 +421,23 @@ pub fn run(
             let report =
                 write::volume_verify(conn, config, label, &device, DEFAULT_BLOCK_SIZE, tier)?;
             if json_output {
+                // Issue #142: `failed: 3` without naming the three is the
+                // difference between an operator who knows what to re-copy
+                // and one who re-copies a whole tape. This array is the
+                // FULL evidence, including the metadata-position mismatches
+                // that `verification_results` cannot store a row for.
+                let mismatches: Vec<serde_json::Value> = report
+                    .mismatches
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "position": m.position,
+                            "kind": m.kind.label(),
+                            "expected": m.expected,
+                            "actual": m.actual,
+                        })
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::json!({
@@ -429,6 +446,7 @@ pub fn run(
                         "checked": report.checked,
                         "passed": report.passed,
                         "failed": report.failed,
+                        "mismatches": mismatches,
                     })
                 );
             } else {
@@ -436,6 +454,15 @@ pub fn run(
                     "verify {label} ({tier_name} tier): {} checked, {} passed, {} failed",
                     report.checked, report.passed, report.failed,
                 );
+                for m in &report.mismatches {
+                    println!(
+                        "    position {}: {} — expected {}, found {}",
+                        m.position,
+                        m.kind.label(),
+                        m.expected,
+                        m.actual
+                    );
+                }
             }
             // issue #45/H10: a failing verify must not exit 0 — a
             // cron-scheduled integrity check that finds corruption but
@@ -1276,6 +1303,7 @@ mod tests {
             checked: 10,
             passed: 10,
             failed: 0,
+            mismatches: Vec::new(),
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
     }
@@ -1286,6 +1314,7 @@ mod tests {
             checked: 10,
             passed: 9,
             failed: 1,
+            mismatches: Vec::new(),
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
     }
@@ -1296,6 +1325,7 @@ mod tests {
             checked: 3,
             passed: 0,
             failed: 3,
+            mismatches: Vec::new(),
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
     }

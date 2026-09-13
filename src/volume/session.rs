@@ -942,6 +942,11 @@ impl SealedPending {
                 vs_id,
             ],
         )?;
+        // Issue #142: the same per-mismatch detail `volume verify` records,
+        // through the same writer — write-time confirm is the OTHER producer
+        // of an `Evidence`, and a quarantine that cannot say which position
+        // failed is as unhelpful here as it was there.
+        super::write::record_verification_results(conn, vs_id, self.volume_id, &evidence)?;
 
         if passed {
             let tx = conn.unchecked_transaction()?;

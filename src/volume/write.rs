@@ -1639,6 +1639,103 @@ fn check_fresh_write_contact(
 /// metadata-file sizes/hashes are not recorded anywhere in the DB — only
 /// slice cursor rows are (`write_positions.stage_slice_id` is `NOT NULL`).
 /// See the T8 report for this as a known, accepted limitation.
+/// Record one `verification_results` row per mismatch (issue #142).
+///
+/// `verification_sessions` has always carried the AGGREGATE — how many
+/// slices failed — and `verification_results` has been defined and indexed
+/// since `001_initial.sql` with no writer at all. So a failed verify could
+/// say "3 failed" and never which three, which is the difference between an
+/// operator who knows what to re-copy and one who re-copies a whole tape.
+///
+/// WHAT CANNOT BE RECORDED, AND WHY THAT IS NOT A BUG HERE.
+/// `write_position_id` and `stage_slice_id` are both `NOT NULL REFERENCES`,
+/// and only SLICES get a `write_positions` cursor row — `write_positions.
+/// stage_slice_id` is `NOT NULL`, so the seal marker, the front index, the
+/// envelopes and every other metadata file have nothing to point at. A
+/// mismatch at one of those positions therefore has no row it could legally
+/// occupy, and this SKIPS it rather than inventing a cursor or relaxing the
+/// schema. Nothing is lost: every mismatch, recordable or not, is in
+/// `Evidence::mismatches`, which `volume verify --json` now prints in full
+/// and `warn!` has always logged, and the session aggregate still counts
+/// them all. The return value is how many rows were actually written, so a
+/// caller can tell "recorded" from "counted".
+///
+/// Returns the number of rows inserted.
+pub(crate) fn record_verification_results(
+    conn: &Connection,
+    session_id: i64,
+    volume_id: i64,
+    evidence: &crate::store::Evidence,
+) -> Result<usize> {
+    // `write_positions.position` is TEXT (001_initial.sql), holding the
+    // decimal position — matched as a string, the way every other writer
+    // in this file stores it (`position.to_string()`).
+    let mut cursor = conn.prepare(
+        "SELECT wp.id, wp.stage_slice_id
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         WHERE w.volume_id = ?1 AND wp.position = ?2
+         LIMIT 1",
+    )?;
+    let mut insert = conn.prepare(
+        "INSERT INTO verification_results
+            (session_id, write_position_id, stage_slice_id, result,
+             expected_sha256, actual_sha256, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+
+    let mut recorded = 0usize;
+    for m in &evidence.mismatches {
+        let found: Option<(i64, i64)> = cursor
+            .query_row(params![volume_id, m.position.to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((write_position_id, stage_slice_id)) = found else {
+            continue;
+        };
+        let hashes = m.kind.compares_hashes();
+        insert.execute(params![
+            session_id,
+            write_position_id,
+            stage_slice_id,
+            mismatch_result(m.kind),
+            hashes.then_some(m.expected.as_str()),
+            hashes.then_some(m.actual.as_str()),
+            // The true kind always survives here, even where `result` had to
+            // round it to one of the schema's five values.
+            format!(
+                "{}: expected {}, found {}",
+                m.kind.label(),
+                m.expected,
+                m.actual
+            ),
+        ])?;
+        recorded += 1;
+    }
+    Ok(recorded)
+}
+
+/// Map a [`crate::store::MismatchKind`] onto the fixed `verification_results.
+/// result` vocabulary (`001_initial.sql`: passed / failed_checksum /
+/// failed_read / failed_decrypt / skipped).
+///
+/// The v2 chain walk has six failure kinds and the column has five values,
+/// none of them added for it, so this is a lossy projection by construction.
+/// It is lossy in the SAFE direction — the true kind is always written to
+/// `notes` — and the split follows what the disagreement actually IS: two
+/// kinds compare sha256 hashes (`failed_checksum`), the other four are the
+/// bytes not being readable or not being what the map said (`failed_read`).
+/// `failed_decrypt` is never produced: the chain walk is KEYLESS by design
+/// (ADR-0007), so it never attempts a decryption that could fail.
+fn mismatch_result(kind: crate::store::MismatchKind) -> &'static str {
+    if kind.compares_hashes() {
+        "failed_checksum"
+    } else {
+        "failed_read"
+    }
+}
+
 pub fn volume_verify(
     conn: &Connection,
     config: &Config,
@@ -1673,6 +1770,39 @@ pub fn volume_verify(
     };
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
+    let report = volume_verify_with_store(conn, &mut store, label, volume_id, block_size, tier)?;
+
+    // Best-effort sg_logs health collection. Advisory only, and deliberately
+    // OUTSIDE the store-injectable half: it needs the drive's sg node, which
+    // a `MemStore` does not have.
+    if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
+        if let Ok((counters, raw)) = health::collect(&bk.device_sg) {
+            if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
+                warn!(err = %e, "health_logs insert failed");
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// [`volume_verify`] minus the tape device: everything from the front-index
+/// read through the `verification_sessions` / `verification_results` rows.
+///
+/// Split out for the reason ADR-0006 gives generally and
+/// [`volume_identify`] already demonstrates: with a `&mut dyn Store` the
+/// whole verify path — including its DB bookkeeping — is exercisable against
+/// a `MemStore` with no hardware, which is how issue #142's per-mismatch
+/// recording is tested at all. `volume_verify` keeps the drive-only parts
+/// (opening the device, sg_logs health collection).
+pub(crate) fn volume_verify_with_store(
+    conn: &Connection,
+    store: &mut dyn Store,
+    label: &str,
+    volume_id: i64,
+    block_size: usize,
+    tier: Tier,
+) -> Result<VerifyReport> {
     // Read File 3 (front index) raw; its true (pre-padding) length is
     // recovered by stripping trailing NUL padding — the same trick
     // `volume_identify` already uses for File 0, and the sanctioned
@@ -1742,7 +1872,12 @@ pub fn volume_verify(
     } else {
         "failed"
     };
-    conn.execute(
+    // One transaction (issue #142): the session aggregate and the per-mismatch
+    // detail describe the same verify, so a crash between them must leave
+    // neither rather than a session claiming "3 failed" with nothing to name
+    // them — which is precisely the state this change exists to end.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO verification_sessions
             (volume_id, verify_type, outcome, completed_at, slices_checked, slices_passed, slices_failed)
          VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5, ?6)",
@@ -1759,30 +1894,25 @@ pub fn volume_verify(
             evidence.mismatches.len() as i64,
         ],
     )?;
+    let session_id = tx.last_insert_rowid();
+    record_verification_results(&tx, session_id, volume_id, &evidence)?;
+    tx.commit()?;
 
     for m in &evidence.mismatches {
         warn!(
             position = m.position,
-            kind = ?m.kind,
+            kind = m.kind.label(),
             expected = %m.expected,
             actual = %m.actual,
             "verify mismatch"
         );
     }
 
-    // Best-effort sg_logs health collection. Advisory only.
-    if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
-        if let Ok((counters, raw)) = health::collect(&bk.device_sg) {
-            if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
-                warn!(err = %e, "health_logs insert failed");
-            }
-        }
-    }
-
     Ok(VerifyReport {
         checked: evidence.files_checked as usize,
         passed: (evidence.files_checked as usize).saturating_sub(evidence.mismatches.len()),
         failed: evidence.mismatches.len(),
+        mismatches: evidence.mismatches,
     })
 }
 
@@ -2358,6 +2488,13 @@ pub struct VerifyReport {
     pub checked: usize,
     pub passed: usize,
     pub failed: usize,
+    /// Every disagreement the chain walk found, in walk order (issue #142).
+    ///
+    /// A superset of what reached `verification_results`: a mismatch at a
+    /// metadata position has no `write_positions` cursor row to reference,
+    /// so it is reportable here and not storable there. See
+    /// [`record_verification_results`].
+    pub mismatches: Vec<crate::store::Mismatch>,
 }
 
 /// Gather the staged batch as `BuildUnit`s, ready for `build::build`.
@@ -2870,6 +3007,265 @@ mod tests {
         )
         .unwrap();
         slice_id
+    }
+
+    // ── issue #142: `verification_results` gets rows ──
+
+    /// A complete, self-consistent v2 tape in a `MemStore`: File 0 id thunk,
+    /// 1 guide, 2 RESTORE.sh, 3 front index, 4 data slice, 5 seal marker.
+    ///
+    /// `slice_on_tape` is what actually lands at position 4; the front index
+    /// always claims the hash of `slice_claimed`. Pass the same bytes twice
+    /// for a clean tape, different bytes for a corrupted one — that is the
+    /// whole corruption mechanism, and it is exactly what a bit-rotted tape
+    /// looks like to the keyless chain walk.
+    fn mem_store_v2_tape(label: &str, slice_claimed: &[u8], slice_on_tape: &[u8]) -> MemStore {
+        const BS: usize = 4096;
+        let id_thunk = format!("tapectl-volume-v2\n[volume]\nlabel = \"{label}\"\n").into_bytes();
+        let guide = b"SYSTEM GUIDE\n".to_vec();
+        let restore_sh = b"#!/bin/sh\n".to_vec();
+
+        // Every content file's entry carries its true size + the sha256 of
+        // its on-tape bytes; File 3 and the seal marker carry neither and
+        // one, respectively (the two self-referential exclusions, §3).
+        let mut files = vec![
+            layout::FrontIndexFile {
+                position: 0,
+                type_label: "id_thunk",
+                size_bytes: Some(id_thunk.len() as u64),
+                sha256_encrypted: Some(direct_hash(&id_thunk)),
+            },
+            layout::FrontIndexFile {
+                position: 1,
+                type_label: "system_guide",
+                size_bytes: Some(guide.len() as u64),
+                sha256_encrypted: Some(direct_hash(&guide)),
+            },
+            layout::FrontIndexFile {
+                position: 2,
+                type_label: "restore_sh",
+                size_bytes: Some(restore_sh.len() as u64),
+                sha256_encrypted: Some(direct_hash(&restore_sh)),
+            },
+            layout::FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: None,
+                sha256_encrypted: None,
+            },
+            layout::FrontIndexFile {
+                position: 4,
+                type_label: "data_slice",
+                size_bytes: Some(slice_claimed.len() as u64),
+                sha256_encrypted: Some(direct_hash(slice_claimed)),
+            },
+            layout::FrontIndexFile {
+                position: 5,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None,
+            },
+        ];
+
+        let fi_text = layout::generate_front_index(label, &files);
+        let fi_bytes = fi_text.clone().into_bytes();
+        // The seal marker's embedded copy fills in File 3's own figures,
+        // which are only known once File 3's bytes exist.
+        files[3].size_bytes = Some(fi_bytes.len() as u64);
+        files[3].sha256_encrypted = Some(direct_hash(&fi_bytes));
+        let seal_text = layout::generate_seal_marker(label, 6, &direct_hash(&fi_bytes), &files);
+
+        let mut store = MemStore::new(BS);
+        for bytes in [
+            id_thunk,
+            guide,
+            restore_sh,
+            fi_bytes,
+            slice_on_tape.to_vec(),
+            seal_text.into_bytes(),
+        ] {
+            store
+                .execute(&mut Cursor::new(bytes.clone()), bytes.len() as u64, false)
+                .unwrap();
+        }
+        store
+    }
+
+    fn verification_result_rows(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT wp.position, vr.result, COALESCE(vr.notes, '')
+             FROM verification_results vr
+             JOIN write_positions wp ON wp.id = vr.write_position_id
+             ORDER BY vr.id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    /// THE test for issue #142: a deliberately corrupted slice produces
+    /// EXACTLY ONE `verification_results` row, and that row names the
+    /// position that failed.
+    ///
+    /// Before this, `verification_sessions` recorded `slices_failed = 1` and
+    /// the table that exists to say WHICH had been empty since
+    /// `001_initial.sql`.
+    #[test]
+    fn a_corrupted_slice_writes_exactly_one_verification_result_naming_its_position() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the bytes the front index promises. ".repeat(4);
+        let rotted = b"the bytes the tape actually holds!! ".repeat(4);
+        assert_eq!(good.len(), rotted.len(), "same length: a HASH change only");
+
+        seed_one_slice_fixture(
+            &conn,
+            "VR-CORRUPT",
+            "vr-unit",
+            4,
+            &good,
+            "completed",
+            "staged",
+        );
+        let volume_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = 'VR-CORRUPT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("VR-CORRUPT", &good, &rotted);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-CORRUPT",
+            volume_id,
+            4096,
+            Tier::Integrity,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+        assert_eq!(report.mismatches[0].position, 4);
+
+        let rows = verification_result_rows(&conn);
+        assert_eq!(rows.len(), 1, "expected exactly one recorded row: {rows:?}");
+        assert_eq!(rows[0].0, "4", "the row must name the failing position");
+        assert_eq!(rows[0].1, "failed_checksum");
+        assert!(
+            rows[0].2.contains("content_hash_mismatch"),
+            "notes must carry the true MismatchKind: {}",
+            rows[0].2
+        );
+
+        // The hash columns are genuinely hashes for this kind.
+        let (expected, actual): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT expected_sha256, actual_sha256 FROM verification_results",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(expected.as_deref(), Some(direct_hash(&good).as_str()));
+        assert_eq!(actual.as_deref(), Some(direct_hash(&rotted).as_str()));
+
+        // And the session aggregate still agrees with the detail.
+        let failed: i64 = conn
+            .query_row("SELECT slices_failed FROM verification_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(failed, 1);
+    }
+
+    /// A clean tape writes a passing session and NO result rows — the table
+    /// records failures, not a row per file checked.
+    #[test]
+    fn a_clean_tape_writes_no_verification_result_rows() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "VR-CLEAN",
+            "vc-unit",
+            4,
+            &good,
+            "completed",
+            "staged",
+        );
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-CLEAN'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("VR-CLEAN", &good, &good);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-CLEAN",
+            volume_id,
+            4096,
+            Tier::Integrity,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
+        assert!(verification_result_rows(&conn).is_empty());
+        let outcome: String = conn
+            .query_row("SELECT outcome FROM verification_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(outcome, "passed");
+    }
+
+    /// A mismatch at a METADATA position is counted by the session and has
+    /// no `verification_results` row to occupy: `write_positions.
+    /// stage_slice_id` is `NOT NULL`, so only slices have a cursor row to
+    /// reference. Asserted, rather than left to be discovered, because the
+    /// alternative — relaxing the FK or inventing a cursor row — is the
+    /// wrong fix and someone will propose it.
+    #[test]
+    fn a_metadata_position_mismatch_is_counted_but_not_recordable() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"slice bytes that stay intact throughout. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-META", "vm-unit", 4, &good, "completed", "staged");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-META'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // Corrupt File 1 (the system guide) instead of the slice.
+        let mut store = mem_store_v2_tape("VR-META", &good, &good);
+        store.files[1] = b"TAMPERED GUIDE".to_vec();
+
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-META",
+            volume_id,
+            4096,
+            Tier::Integrity,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+        assert_eq!(report.mismatches[0].position, 1);
+        assert!(
+            verification_result_rows(&conn).is_empty(),
+            "a metadata position has no write_positions row to reference"
+        );
+        // The session still counts it, so nothing is silently dropped.
+        let failed: i64 = conn
+            .query_row("SELECT slices_failed FROM verification_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(failed, 1);
     }
 
     fn mem_store_with_slice_at(position: u32, bytes: &[u8]) -> MemStore {
