@@ -65,6 +65,40 @@ exposed, then seven deepenings, all landed and real-drive-validated (four
   `docs/audits/2026-09-11-rebuild-findings-review.md`; the process rules that
   outlived the run: `.claude/skills/unattended-run/SKILL.md`.
 
+**2026-09-13 — the media-generation redesign (complete).** The last redesign before
+first production use, triggered by "how do I write both LTO-5 and LTO-6 from this
+LTO-6 drive". The answer exposed that a property of the *cartridge* was being read
+from the *drive's* config, and an audit for that same shape found more. Two ADRs
+govern the result:
+- **ADR-0010 — generation is a cartridge property.** A drive declares only the one
+  generation it is (`[[backends.lto]].generation`); `media_type`/`nominal_capacity`
+  are gone from config and a stale key is refused by name. The medium's generation is
+  DETECTED at `volume init` (`src/media.rs` tables + `src/tape/media_detect.rs`: MAM
+  medium density code → MAM format code → the st driver's density register), and
+  capacity follows it, overridden by the cartridge row then by the drive's
+  `capacity_override` (virtual drives only). It is decided ONCE at init and stored in
+  `volumes.capacity_bytes`; **no path reads capacity from config after init**. A drive
+  that cannot write the detected medium refuses, and `--force` never overrides it.
+  `volume init` also BINDS the cartridge (`src/volume/binding.rs`) from the MAM medium
+  serial, auto-registering one when nothing matches — which is why
+  `cartridge_volumes`, written only by tests until now, is live.
+- **ADR-0011 — a cartridge's place is a location, not a status.** `offsite` left the
+  status CHECK (migration 012 rebuilds the table to four states); `cartridge move` and
+  `volume move` share one mover so the shelf and the catalog cannot drift.
+  `cartridge retire` writes `retired_permanent` under an ADR-0008 Tier-2 gate and
+  retires the volumes on it; `volume retire` frees the cartridge it was the last live
+  volume on.
+- **Binding records a displacement, it never gates one.** Re-initialising a cartridge
+  closes the open mount, marks the displaced volume `erased`, and warns naming any unit
+  left without a copy. The File 0 check is the consent point (ADR-0003) and a second
+  gate was deliberately rejected. The mhvtl gate proves it: four volumes initialised on
+  one cartridge in one run, no `--force`, three left `erased`.
+- `--device` no longer defaults to `/dev/nst0` anywhere. Write paths resolve it
+  strictly (`config::resolve_lto_backend`), read paths leniently
+  (`config::resolve_device`) so DR still works with keys and no `backend add`.
+- The audit that came with it is recorded in `docs/design-errata.md` (four design
+  promises no code keeps) and issues #142-#152.
+
 **Handoff:** `docs/handoff.md` is the current division of remaining work into
 what an agent finishes and what needs the operator's hands (the Heir Kit
 ceremony, the LTO-6 session, the first production write).
