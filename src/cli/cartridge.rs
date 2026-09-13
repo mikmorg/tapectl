@@ -102,6 +102,12 @@ struct CartridgeRow {
     media_type: String,
     #[tabled(rename = "Status")]
     status: String,
+    /// ADR-0011: the question an operator asks of a cartridge most often
+    /// ("where is it?") and could not ask before — `cartridges.location_id`
+    /// had no reader. Empty when the cartridge has never been placed.
+    /// ADDITIVE in `--json`, per the C2b discipline noted above.
+    #[tabled(rename = "Location", display_with = "display_opt_string")]
+    location: Option<String>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). Raw `total_load_count` (matches `cartridge info
     /// --json`'s "loads" key for the same column).
@@ -123,7 +129,7 @@ fn display_opt_string(v: &Option<String>) -> String {
 
 /// `cartridge list --json` shape. `media_type`/`loads`/`volume` were
 /// table-only until CTO decision 2026-09-11 (architecture review C2
-/// follow-up, C2b).
+/// follow-up, C2b); `location` is additive since ADR-0011.
 fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -192,12 +198,18 @@ pub fn run(
             }
         }
         CartridgeCommands::Info { barcode } => {
-            let (id, media, status, loads, cap, created, notes): (i64, String, String, Option<i64>, i64, String, Option<String>) = conn
+            #[allow(clippy::type_complexity)]
+            let (id, media, status, loads, cap, created, notes, location): (i64, String, String, Option<i64>, i64, String, Option<String>, Option<String>) = conn
                 .query_row(
-                    "SELECT id, media_type, status, total_load_count, nominal_capacity, created_at, notes
-                     FROM cartridges WHERE barcode = ?1",
+                    // LEFT JOIN: a cartridge that has never been placed must
+                    // still be inspectable (ADR-0011).
+                    "SELECT c.id, c.media_type, c.status, c.total_load_count, c.nominal_capacity,
+                            c.created_at, c.notes, l.name
+                     FROM cartridges c
+                     LEFT JOIN locations l ON l.id = c.location_id
+                     WHERE c.barcode = ?1",
                     params![barcode],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
                 )
                 .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
 
@@ -218,12 +230,17 @@ pub fn run(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"barcode": barcode, "media_type": media, "status": status, "loads": loads, "volumes": volumes.len()})
+                    // `location` is ADDITIVE (ADR-0011).
+                    serde_json::json!({"barcode": barcode, "media_type": media, "status": status, "loads": loads, "location": location, "volumes": volumes.len()})
                 );
             } else {
                 println!("Cartridge: {barcode}");
                 println!("  Type:     {media}");
                 println!("  Status:   {status}");
+                println!(
+                    "  Location: {}",
+                    location.as_deref().unwrap_or("(not placed)")
+                );
                 println!("  Loads:    {}", loads.unwrap_or(0));
                 println!("  Capacity: {} GB", cap / (1024 * 1024 * 1024));
                 println!("  Created:  {created}");
@@ -304,12 +321,17 @@ pub fn run(
 /// every other query in this file binds, and one interpolated string is how
 /// the habit erodes.
 fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<CartridgeRow>> {
+    // LEFT JOIN, not JOIN: `location_id` is nullable and a cartridge that
+    // has never been placed must still appear in the list. The same
+    // reasoning as `catalog.rs`'s volume listing.
     const SELECT: &str = "SELECT c.barcode, c.media_type, c.status, c.total_load_count,
                 (SELECT v.label FROM cartridge_volumes cv
                  JOIN volumes v ON v.id = cv.volume_id
                  WHERE cv.cartridge_id = c.id AND cv.unmounted_at IS NULL
-                 LIMIT 1) as current_vol
-         FROM cartridges c";
+                 LIMIT 1) as current_vol,
+                l.name as location
+         FROM cartridges c
+         LEFT JOIN locations l ON l.id = c.location_id";
     let sql = match status {
         Some(_) => format!("{SELECT} WHERE c.status = ?1 ORDER BY c.barcode"),
         None => format!("{SELECT} ORDER BY c.barcode"),
@@ -327,6 +349,7 @@ fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<Cartrid
                 status: row.get(2)?,
                 loads: row.get::<_, Option<i64>>(3)?,
                 volume: row.get::<_, Option<String>>(4)?,
+                location: row.get::<_, Option<String>>(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -339,7 +362,10 @@ mod tests {
 
     /// `cartridge list --json` shape (issue: C2 row-listing drift).
     /// `media_type`/`loads`/`volume` are additive since CTO decision
-    /// 2026-09-11 (architecture review C2 follow-up, C2b).
+    /// 2026-09-11 (architecture review C2 follow-up, C2b); `location` is
+    /// additive since ADR-0011, which made a cartridge's place a location
+    /// rather than a status and gave `cartridges.location_id` its first
+    /// reader.
     #[test]
     fn pin_cartridge_rows_json_shape() {
         let rows = vec![
@@ -349,6 +375,7 @@ mod tests {
                 status: "available".to_string(),
                 loads: Some(12),
                 volume: Some("L6-0001".to_string()),
+                location: Some("home-rack".to_string()),
             },
             CartridgeRow {
                 barcode: "A002L6".to_string(),
@@ -356,12 +383,13 @@ mod tests {
                 status: "retired_permanent".to_string(),
                 loads: None,
                 volume: None,
+                location: None,
             },
         ];
         let value = cartridge_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"barcode":"A001L6","loads":12,"media_type":"LTO-6","status":"available","volume":"L6-0001"},{"barcode":"A002L6","loads":null,"media_type":"LTO-6","status":"retired_permanent","volume":null}]"#
+            r#"[{"barcode":"A001L6","loads":12,"location":"home-rack","media_type":"LTO-6","status":"available","volume":"L6-0001"},{"barcode":"A002L6","loads":null,"location":null,"media_type":"LTO-6","status":"retired_permanent","volume":null}]"#
         );
     }
 
@@ -394,6 +422,33 @@ mod tests {
         let rows = cartridge_rows(&conn, Some("available")).unwrap();
         assert_eq!(rows.len(), 2, "only the two available cartridges");
         assert!(rows.iter().all(|r| r.status == "available"));
+    }
+
+    /// ADR-0011: `cartridges.location_id` finally has a reader. The LEFT
+    /// JOIN matters — a cartridge that has never been placed must still be
+    /// listed, not silently dropped, which is exactly what an inner join
+    /// would do to every cartridge in a fresh catalog.
+    #[test]
+    fn list_shows_the_location_and_keeps_unplaced_cartridges() {
+        let conn = seed();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home-rack', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cartridges SET location_id = (SELECT id FROM locations WHERE name = 'home-rack')
+             WHERE barcode = 'A001L6'",
+            [],
+        )
+        .unwrap();
+
+        let rows = cartridge_rows(&conn, None).unwrap();
+        assert_eq!(rows.len(), 3, "an unplaced cartridge must not vanish");
+        let placed = rows.iter().find(|r| r.barcode == "A001L6").unwrap();
+        assert_eq!(placed.location.as_deref(), Some("home-rack"));
+        let unplaced = rows.iter().find(|r| r.barcode == "A002L6").unwrap();
+        assert_eq!(unplaced.location, None);
     }
 
     #[test]
