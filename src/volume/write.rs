@@ -401,6 +401,97 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
     }
 }
 
+/// Bind a volume that `volume init` left unbound, now that a medium serial
+/// is readable (W3 Change 8, ADR-0010's ladder unchanged).
+///
+/// `volume init` writes a volume unbound whenever no medium serial could be
+/// read — the case ADR-0010 keeps working so serial-less virtual harnesses
+/// lose nothing. But an unbound volume costs real things: copy counting
+/// cannot tell this cartridge from another, and
+/// [`check_loaded_cartridge`] has nothing to compare against, so the
+/// wrong-cartridge check silently passes. If `volume write` CAN read a
+/// serial, binding here recovers all of that before a single slice is
+/// written.
+///
+/// Deliberately a no-op in every other case:
+///
+/// - The volume already has an open mount — [`check_loaded_cartridge`] has
+///   just confirmed it is the right one, and rebinding would be a
+///   displacement nobody asked for.
+/// - No serial readable — exactly as at init, the volume stays unbound.
+/// - No generation resolvable — auto-registering a cartridge needs one, and
+///   inventing it is how a row starts lying.
+///
+/// There is no `--cartridge` on `volume write`, so this is the serial-only
+/// half of the ladder: match a registered row by serial, else auto-register
+/// one whose barcode IS the serial. ADR-0011's `refuse_retired` applies
+/// here for the same reason it applies at init.
+#[allow(clippy::too_many_arguments)] // conn + volume identity + the three ADR-0010 facts
+fn bind_late(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    det: &crate::tape::media_detect::Detected,
+    volume_media_type: Option<&str>,
+    drive_generation: &str,
+    nominal_capacity: i64,
+) -> Result<()> {
+    let already_bound: Option<i64> = conn
+        .query_row(
+            "SELECT cartridge_id FROM cartridge_volumes
+             WHERE volume_id = ?1 AND unmounted_at IS NULL",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if already_bound.is_some() {
+        return Ok(());
+    }
+    let Some(serial) = det.mam.serial.as_deref() else {
+        return Ok(());
+    };
+    // The volume's own recorded generation first (ADR-0010 decided it at
+    // init from the medium that was loaded), then what the drive detects
+    // now, then the drive's native generation.
+    let Some(generation) = volume_media_type
+        .and_then(crate::media::Generation::parse)
+        .or(det.generation)
+        .or_else(|| crate::media::Generation::parse(drive_generation))
+    else {
+        return Ok(());
+    };
+
+    let lookup = binding::lookup_cartridge(conn, Some(serial), None)?;
+    if let Some(row) = &lookup.row {
+        binding::refuse_retired(row)?;
+    }
+
+    // Its own transaction: the `volumes` row this binds already exists and
+    // is committed, so there is no larger unit of work to join — but the
+    // displacement bookkeeping inside `bind_cartridge` is still all-or-
+    // nothing.
+    let tx = conn.unchecked_transaction()?;
+    let bound = binding::bind_cartridge(
+        &tx,
+        volume_id,
+        lookup.row.as_ref(),
+        Some(serial),
+        generation,
+        nominal_capacity,
+        &det.mam,
+    )?;
+    tx.commit()?;
+
+    if bound.barcode.is_some() {
+        eprintln!(
+            "note: volume \"{label}\" was unbound after `volume init` (no medium serial was \
+             readable then); binding it now from the loaded medium."
+        );
+        report_binding(label, &lookup, &bound);
+    }
+    Ok(())
+}
+
 /// A volume's own recorded capacity and media generation — the ADR-0010
 /// authority for both, decided once at `volume init` from the medium that
 /// was actually loaded.
@@ -648,6 +739,18 @@ pub fn volume_write(
     // single slice — never mind before anything is written.
     check_loaded_cartridge(conn, volume_id, label, mam.serial.as_deref())?;
     check_loaded_generation(label, &det, volume_media_type.as_deref())?;
+
+    // ADR-0010's binding ladder, one stage later, for the volume `volume
+    // init` could not bind (W3 Change 8).
+    bind_late(
+        conn,
+        volume_id,
+        label,
+        &det,
+        volume_media_type.as_deref(),
+        &backend.generation,
+        nominal_capacity,
+    )?;
 
     let volume_uuid = volume_uuid(conn, volume_id)?;
     let created_at = chrono::Utc::now().to_rfc3339();
@@ -3805,6 +3908,154 @@ mod tests {
         assert!(
             check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, default_force).is_err()
         );
+    }
+
+    /// W3 Change 8: `volume write` binds a volume that `volume init` could
+    /// not, because no medium serial was readable then and one is now.
+    /// `bind_late` takes a `Detected` and a `Connection`, so the whole
+    /// ladder drills without a drive.
+    mod late_binding {
+        use super::*;
+        use crate::media::Generation;
+        use crate::tape::mam::MamInfo;
+        use crate::tape::media_detect::{DetectSource, Detected};
+
+        fn det_with_serial(serial: Option<&str>) -> Detected {
+            Detected {
+                generation: Some(Generation::Lto6),
+                code: Generation::Lto6.density_code(),
+                source: DetectSource::MamMedium,
+                mam: MamInfo {
+                    serial: serial.map(str::to_string),
+                    ..MamInfo::default()
+                },
+            }
+        }
+
+        /// An UNBOUND volume, the state `volume init` leaves behind when the
+        /// drive reports no medium serial.
+        fn unbound_volume() -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            (conn, vol_id)
+        }
+
+        fn bound_barcode(conn: &Connection, vol_id: i64) -> Option<String> {
+            conn.query_row(
+                "SELECT c.barcode FROM cartridge_volumes cv
+                 JOIN cartridges c ON c.id = cv.cartridge_id
+                 WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+                params![vol_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        }
+
+        fn call(conn: &Connection, vol_id: i64, det: &Detected) -> Result<()> {
+            bind_late(
+                conn,
+                vol_id,
+                "L6-0001",
+                det,
+                Some("LTO-6"),
+                "LTO-6",
+                2_500_000_000_000,
+            )
+        }
+
+        /// The headline: a serial readable now auto-registers a cartridge
+        /// whose barcode IS that serial, exactly as init's ladder does.
+        #[test]
+        fn a_readable_serial_binds_a_volume_init_left_unbound() {
+            let (conn, vol_id) = unbound_volume();
+            call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
+            assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("SER-1"));
+        }
+
+        /// A registered cartridge carrying that serial wins over
+        /// auto-registration — the same match init makes.
+        #[test]
+        fn a_registered_serial_binds_to_that_row_not_a_new_one() {
+            let (conn, vol_id) = unbound_volume();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A001L6', 'LTO-6', 2500000000000, 'SER-1', 'available')",
+                [],
+            )
+            .unwrap();
+            call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
+            assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("A001L6"));
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM cartridges", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "an existing row must not be duplicated");
+        }
+
+        /// No serial: unchanged from ADR-0010 — the volume stays unbound and
+        /// the serial-less virtual harnesses lose nothing.
+        #[test]
+        fn no_serial_leaves_the_volume_unbound_without_erroring() {
+            let (conn, vol_id) = unbound_volume();
+            call(&conn, vol_id, &det_with_serial(None)).unwrap();
+            assert_eq!(bound_barcode(&conn, vol_id), None);
+        }
+
+        /// An already-bound volume is left strictly alone.
+        /// `check_loaded_cartridge` has just confirmed it is the right
+        /// cartridge, and rebinding would record a displacement nobody
+        /// asked for.
+        #[test]
+        fn an_already_bound_volume_is_not_rebound() {
+            let (conn, vol_id) = unbound_volume();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A001L6', 'LTO-6', 2500000000000, 'SER-1', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, vol_id],
+            )
+            .unwrap();
+
+            call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
+            assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("A001L6"));
+            let events: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(events, 0, "a no-op must write nothing at all");
+        }
+
+        /// ADR-0011 applies here for the same reason it applies at init: no
+        /// amount of consent makes a medium declared unfit fit again, and
+        /// `bind_late` has no `force` to consult either.
+        #[test]
+        fn a_retired_permanent_cartridge_is_refused_here_too() {
+            let (conn, vol_id) = unbound_volume();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A001L6', 'LTO-6', 2500000000000, 'SER-1', 'retired_permanent')",
+                [],
+            )
+            .unwrap();
+            let err = call(&conn, vol_id, &det_with_serial(Some("SER-1")))
+                .expect_err("a retired_permanent cartridge must never be written");
+            assert!(err.to_string().contains("mark-erased"), "got: {err}");
+            assert_eq!(bound_barcode(&conn, vol_id), None);
+        }
     }
 
     // --- ADR-0010: the write path's wrong-cartridge / wrong-medium checks ---
