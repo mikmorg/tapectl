@@ -219,6 +219,12 @@ pub enum VolumeCommands {
     },
 
     /// Interactive compaction: read + write + finish in one flow
+    ///
+    /// Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may
+    /// refuse non-interactively without `--force`. When it does, the
+    /// destination tape is already written and sealed and nothing is lost:
+    /// `volume compact-finish <SOURCE> --force` completes the flow without
+    /// re-reading or re-writing anything.
     Compact {
         /// Source volume label
         label: String,
@@ -680,7 +686,39 @@ pub fn run(
             println!("  Write completed");
 
             println!("=== Step 3: Retiring source volume \"{label}\" ===");
-            let report = write::compact_finish(conn, label, *force || yes)?;
+            // Step 2 has already written and sealed the destination by now,
+            // so a step-3 consent refusal must not read as "the compaction
+            // failed" — it read as that in every earlier draft, and the
+            // operator's rational response would have been to redo a
+            // multi-hour write that had already succeeded.
+            //
+            // A PRE-FLIGHT gate was considered and rejected: before step 2
+            // the destination holds nothing, so `retire_impacts` reports
+            // ZERO other copies for every LIVE unit on the source (its only
+            // copy IS the source, which is what compaction is about to fix).
+            // Gating there would demand `--force` for ordinary compaction
+            // and invert the gate's meaning. Only after step 2 does the
+            // at-risk set narrow to units whose content was not carried
+            // forward — exactly the issue #147 case that should gate.
+            let report = write::compact_finish(conn, label, *force || yes).inspect_err(|e| {
+                // ONLY the consent refusal. `compact_finish`'s other
+                // failure is the Tier-3 refusal, and after a successful
+                // compact-write that means a live slice was not carried
+                // forward — a bug, not a `--force` situation. Naming
+                // `--force` as the recovery for it is precisely the
+                // confusion ADR-0008 warns about.
+                let msg = e.to_string();
+                if msg.contains("refused: non-interactive session")
+                    || msg.contains("aborted, not confirmed")
+                {
+                    eprintln!(
+                        "\nNothing was lost: destination \"{dest_label}\" is written and \
+                         sealed, and source \"{label}\" is simply not retired yet.\n\
+                         To complete step 3 without re-reading or re-writing anything:\n    \
+                         tapectl volume compact-finish {label} --force"
+                    );
+                }
+            })?;
             println!("  Volume \"{label}\" retired");
             if !json_output {
                 print_compact_finish_evidence(&report);

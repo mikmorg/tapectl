@@ -873,6 +873,12 @@ mod tests {
 
     /// 012 changes the status CHECK and nothing else: every column, type,
     /// default, notnull and pk is identical either side of it.
+    ///
+    /// Note what this does NOT prove: `PRAGMA table_info` does not report
+    /// CHECK constraints, so this test would pass even if the rebuild had
+    /// dropped the CHECK entirely. That half is
+    /// `test_migration_012_offsite_rejected_four_states_accepted`'s job,
+    /// and it is written with a negative assertion for exactly this reason.
     #[test]
     fn test_migration_012_changes_no_cartridge_column() {
         let before = open_memory_at_011();

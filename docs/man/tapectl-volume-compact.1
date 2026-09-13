@@ -7,6 +7,8 @@ tapectl\-volume\-compact \- Interactive compaction: read + write + finish in one
 \fBtapectl volume compact\fR [\fB\-\-json\fR] [\fB\-\-to\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-force\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Interactive compaction: read + write + finish in one flow
+.PP
+Step 3 applies `compact\-finish`\*(Aqs ADR\-0008 Tier\-2 gate and may refuse non\-interactively without `\-\-force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact\-finish <SOURCE> \-\-force` completes the flow without re\-reading or re\-writing anything.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
