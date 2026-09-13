@@ -490,7 +490,24 @@ EOF
     [ -d "$UP" ] || { note "$UP is not a directory"; UP=""; [ "$AUTO" = 1 ] && break; continue; }
     grant_read "$UP" || { note "$SVC_USER cannot read $UP — not registering it"; UP=""; [ "$AUTO" = 1 ] && break; continue; }
     ask UNAME "unit name" "$TENANT/$(basename "$UP")"
-    run tc unit init --tenant "$TENANT" --name "$UNAME" "$UP" || note "(unit init failed — see above)"
+    if ! run tc unit init --tenant "$TENANT" --name "$UNAME" "$UP"; then
+      # A .tapectl-unit.toml already in the directory means this unit was
+      # registered before — by an earlier run, or on the machine this one is
+      # replacing. The dotfile carries the uuid, so the right move is to adopt
+      # it, not to overwrite it: `unit discover` scans the configured
+      # watch_roots and registers what it finds.
+      if [ -f "$UP/.tapectl-unit.toml" ]; then
+        note "$UP already carries a .tapectl-unit.toml — adopting it instead of re-creating"
+        WR="$(as_svc sed -n 's/^watch_roots *= *//p' "$CFG" | head -1)"
+        if [ -z "$WR" ] || [ "$WR" = "[]" ]; then
+          as_svc sed -i "s|^watch_roots *= *\[\]|watch_roots = [\"$UP\"]|" "$CFG" \
+            || note "could not add $UP to watch_roots — add it by hand and run: tapectl unit discover"
+        fi
+        run tc unit discover || note "(unit discover found nothing — check watch_roots in $CFG)"
+      else
+        note "(unit init failed — see above)"
+      fi
+    fi
     UP=""; [ "$AUTO" = 1 ] && break
   done
   NT=$((NT+1)); [ "$AUTO" = 1 ] && ADD_MORE=0
