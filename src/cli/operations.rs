@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{info, warn};
 
 use crate::config::{Config, TapectlPaths};
@@ -276,13 +276,18 @@ pub fn volume_retire(
         print_retire_impact(label, &status, &impacts, &at_risk);
     }
 
-    // Actually retire
-    conn.execute(
+    // Actually retire. ONE transaction: the volume's status and the
+    // cartridge's are the two halves of the same fact (ADR-0011, "Retiring a
+    // volume frees its cartridge"), and a crash between them would leave a
+    // cartridge marked in_use with nothing live on it — a tape the operator
+    // is told not to reuse and has no reason not to.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE volumes SET status = 'retired' WHERE id = ?1",
         params![vol_id],
     )?;
     events::log_field_change(
-        conn,
+        &tx,
         "volume",
         vol_id,
         label,
@@ -292,11 +297,100 @@ pub fn volume_retire(
         "retired",
         None,
     )?;
+    let freed = free_cartridge_if_last_live(&tx, vol_id)?;
+    tx.commit()?;
 
     if !json_output {
         println!("  Volume \"{label}\" retired.");
+        if let Some(barcode) = &freed {
+            println!(
+                "  Cartridge {barcode} is now pending_erase — it holds no live volume. \
+                 `tapectl cartridge mark-erased {barcode}` after you erase it."
+            );
+        }
     }
     Ok(())
+}
+
+/// Move the cartridge this volume was on to `pending_erase`, if this was the
+/// last live volume on it. Returns the barcode when the cartridge changed.
+///
+/// ADR-0011's lifecycle diagram names `volume retire` as a writer of
+/// `pending_erase`, and until ADR-0010's binding no volume knew which
+/// cartridge it was on, so only `compact-finish` ever wrote that state. This
+/// is what makes it reachable by the ordinary path.
+///
+/// Three refusals, each for its own reason:
+///
+/// - **Other live volumes remain.** The cartridge still holds data someone
+///   could restore from; nothing about it has changed. "Live" is
+///   `policy::coverage::in_service`, the named predicate, never an inlined
+///   status list (an `initialized` volume is deliberately NOT live here: it
+///   is provisioned and holds no bytes, and `volume init` binds a
+///   `pending_erase` cartridge without consent anyway, so this costs nothing
+///   and reopening the tape for reuse is the point).
+/// - **The cartridge is `retired_permanent`.** ADR-0011 is explicit that
+///   `cartridge mark-erased` is its only exit — "the operator saying they
+///   were wrong". Retiring a volume is not that statement, and must not
+///   quietly undo a condemnation.
+/// - **The cartridge is already `available` or `pending_erase`.** Nothing to
+///   do; both already mean "not holding live data".
+///
+/// The mount is deliberately left OPEN (`cartridge_volumes.unmounted_at`
+/// untouched): the bytes are still physically there until someone erases
+/// them, and `cartridge mark-erased` is the step that says otherwise.
+fn free_cartridge_if_last_live(conn: &Connection, vol_id: i64) -> Result<Option<String>> {
+    let mounted: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT c.id, c.barcode, c.status FROM cartridge_volumes cv
+             JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![vol_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((cartridge_id, barcode, status)) = mounted else {
+        return Ok(None);
+    };
+
+    if status != "in_use" {
+        return Ok(None);
+    }
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM cartridge_volumes cv
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL
+           AND cv.volume_id != ?2 AND {}",
+        crate::policy::coverage::in_service("v")
+    );
+    let others: i64 = conn.query_row(&sql, params![cartridge_id, vol_id], |row| row.get(0))?;
+    if others > 0 {
+        return Ok(None);
+    }
+
+    // `AND status = 'in_use'` again in the UPDATE, not only in the check
+    // above: belt and braces against a future caller reaching this with a
+    // cartridge it has not read.
+    let changed = conn.execute(
+        "UPDATE cartridges SET status = 'pending_erase' WHERE id = ?1 AND status = 'in_use'",
+        params![cartridge_id],
+    )?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    events::log_field_change(
+        conn,
+        "cartridge",
+        cartridge_id,
+        &barcode,
+        "updated",
+        "status",
+        Some(&status),
+        "pending_erase",
+        None,
+    )?;
+    Ok(Some(barcode))
 }
 
 /// One impacted unit's retire-impact row: its name/status, its remaining
@@ -3040,6 +3134,164 @@ mod tests {
     /// `force` or `assume_yes`, both of which short-circuit `confirm()`
     /// before it can touch stdin — or asserts the non-interactive refusal,
     /// which `cli::consent`'s own tests prove never reads stdin either.
+    /// ADR-0011, "Retiring a volume frees its cartridge": until ADR-0010's
+    /// binding, no volume knew which cartridge it was on, so only
+    /// `compact-finish` ever wrote `pending_erase`. `volume retire` is named
+    /// as a writer of it in the lifecycle diagram and finally is one.
+    mod volume_retire_frees_its_cartridge {
+        use super::*;
+
+        /// `L6-CART` on cartridge `BC-FREE` (in_use, open mount), with
+        /// another sealed copy of its unit elsewhere so retirement needs no
+        /// consent gate.
+        fn setup() -> (Connection, i64, i64) {
+            let (conn, vol_id) =
+                super::volume_retire_consent::setup_volume_with_one_unit("L6-CART", true);
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('BC-FREE', 'LTO-6', 2500000000000, 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, vol_id],
+            )
+            .unwrap();
+            (conn, cart_id, vol_id)
+        }
+
+        fn cartridge_status(conn: &Connection, id: i64) -> String {
+            conn.query_row(
+                "SELECT status FROM cartridges WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// Mount a second volume with `status` on the same cartridge.
+        fn add_volume_on(conn: &Connection, cart_id: i64, label: &str, status: &str) -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2)",
+                params![label, status],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, id],
+            )
+            .unwrap();
+            id
+        }
+
+        /// The headline: the last live volume goes, the cartridge follows.
+        #[test]
+        fn retiring_the_last_live_volume_moves_the_cartridge_to_pending_erase() {
+            let (conn, cart_id, _) = setup();
+            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            assert_eq!(cartridge_status(&conn, cart_id), "pending_erase");
+
+            // With an event, so the lifecycle is auditable rather than a
+            // status that changed by itself.
+            let events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE entity_type = 'cartridge' AND entity_id = ?1
+                       AND new_value = 'pending_erase'",
+                    params![cart_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 1, "the cartridge status change must be logged");
+        }
+
+        /// The mount stays OPEN: the bytes are still physically on the tape
+        /// until someone erases it, and `cartridge mark-erased` is the step
+        /// that says otherwise (ADR-0011).
+        #[test]
+        fn the_mount_is_left_open_for_mark_erased_to_close() {
+            let (conn, cart_id, vol_id) = setup();
+            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            let open: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cartridge_volumes
+                     WHERE cartridge_id = ?1 AND volume_id = ?2 AND unmounted_at IS NULL",
+                    params![cart_id, vol_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(open, 1);
+        }
+
+        /// Another live volume remains: the cartridge still holds data
+        /// someone could restore from, and nothing about it has changed.
+        #[test]
+        fn another_live_volume_on_the_cartridge_leaves_it_in_use() {
+            let (conn, cart_id, _) = setup();
+            add_volume_on(&conn, cart_id, "L6-OTHER", "sealed");
+            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            assert_eq!(cartridge_status(&conn, cart_id), "in_use");
+        }
+
+        /// A volume that is already retired/erased is NOT live, so it does
+        /// not hold the cartridge hostage — `coverage::in_service` is the
+        /// predicate, not "is there any row".
+        #[test]
+        fn an_already_retired_neighbour_does_not_hold_the_cartridge() {
+            let (conn, cart_id, _) = setup();
+            add_volume_on(&conn, cart_id, "L6-DEAD", "retired");
+            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            assert_eq!(cartridge_status(&conn, cart_id), "pending_erase");
+        }
+
+        /// ADR-0011 is explicit that `cartridge mark-erased` is the ONLY
+        /// exit from `retired_permanent` — "the operator saying they were
+        /// wrong". Retiring a volume is not that statement and must not
+        /// quietly undo a condemnation.
+        #[test]
+        fn a_retired_permanent_cartridge_is_never_reopened() {
+            let (conn, cart_id, _) = setup();
+            conn.execute(
+                "UPDATE cartridges SET status = 'retired_permanent' WHERE id = ?1",
+                params![cart_id],
+            )
+            .unwrap();
+            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            assert_eq!(cartridge_status(&conn, cart_id), "retired_permanent");
+        }
+
+        /// A volume bound to nothing (pre-ADR-0010, or a drive with no
+        /// readable medium serial) retires exactly as before.
+        #[test]
+        fn an_unbound_volume_retires_with_no_cartridge_to_free() {
+            let (conn, vol_id) =
+                super::volume_retire_consent::setup_volume_with_one_unit("L6-LOOSE", true);
+            volume_retire(&conn, "L6-LOOSE", false, false, false).unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![vol_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "retired");
+        }
+
+        /// `--dry-run` reports and changes nothing — including the
+        /// cartridge, which is the half a new writer could easily forget.
+        #[test]
+        fn dry_run_does_not_free_the_cartridge() {
+            let (conn, cart_id, _) = setup();
+            volume_retire(&conn, "L6-CART", false, true, false).unwrap();
+            assert_eq!(cartridge_status(&conn, cart_id), "in_use");
+        }
+    }
+
     mod cartridge_retire {
         use super::*;
 
