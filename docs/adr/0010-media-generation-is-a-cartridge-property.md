@@ -44,6 +44,13 @@ wrong or the wrong tape is loaded, and tapectl cannot tell which. Where no seria
 lose nothing. `volume write` re-reads the serial and refuses a cartridge that is not the one
 init bound — the same wrong-cartridge discipline as the File 0 check, one layer earlier.
 
+**Read paths stay usable without a configured drive.** The strict device→backend resolution
+below governs the write paths, which genuinely need the drive's factor, ENOSPC buffer and sg
+node. `identify`, `verify`, `read-slices`, `restore` and `catalog rebuild` take an explicit
+`--device` as given and treat the backend as optional, because the machine that most needs
+them is the rebuilt one that has keys and no `backend add` yet (ADR-0005's DR path). They
+need no configured capacity: after init, capacity lives on the volume row.
+
 **Backends resolve by device.** `--device` no longer defaults to `/dev/nst0` — the exact
 numbering hazard `docs/lto6-drive-passthrough.md` warns about — and no path reads
 `backends.lto.first()` again. With `--device`, the backend is the entry whose `device_tape`
@@ -66,7 +73,10 @@ LTO-1 only by declaration). Compatibility is the LTO consortium's published char
 generation and read two back; LTO-8 reads and writes LTO-7, LTO-7 Type M and LTO-8; LTO-9
 reads and writes LTO-8 and LTO-9 only; LTO-10 is LTO-10 only. Native capacities are the
 marketed decimal figures (LTO-5 1.5 TB, LTO-6 2.5 TB, LTO-7 6 TB, Type M 9 TB, LTO-8 12 TB,
-LTO-9 18 TB, LTO-10 30 TB). Both tables live in one module (`src/media.rs`) with a unit test
+LTO-9 18 TB, LTO-10 30 TB). LTO-10 ships in both 30 TB and 40 TB cartridges, which a single
+generation figure cannot express; the table carries 30 TB and the cartridge row's
+`nominal_capacity` — set at `cartridge register --capacity` and ahead of the table in the
+precedence — is how a 40 TB cartridge is declared. Both tables live in one module (`src/media.rs`) with a unit test
 per row; they are not derived from a formula, because the formula stopped holding at LTO-8.
 
 **Consequences.** `backend add` takes `--generation` and `--capacity-override`; `cartridge
