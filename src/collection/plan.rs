@@ -37,6 +37,10 @@ pub fn plan_for_collection(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
+    // `--media <GEN>`: plan for a generation other than the drive's own
+    // (ADR-0010) — sizing batches for LTO-5 stock in an LTO-6 drive, say.
+    // `None` means the drive's native generation.
+    media: Option<&str>,
 ) -> Result<Vec<Batch>> {
     let pending = super::fingerprint::pending_units_for_collection(
         conn,
@@ -56,7 +60,7 @@ pub fn plan_for_collection(
     // negative value with `Err` rather than letting one flow through as a
     // valid byte count, so a successfully parsed `Ok` is already guaranteed
     // non-negative here.
-    let nominal = backend.capacity_bytes()?;
+    let nominal = backend.planning_capacity_bytes(media)?;
     let usable = (nominal as f64 * backend.usable_capacity_factor) as u64;
     let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
     let budget = usable.saturating_sub(enospc_buffer);
@@ -127,7 +131,7 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let batches = plan_for_collection(&conn, &config, &lib).unwrap();
+        let batches = plan_for_collection(&conn, &config, &lib, None).unwrap();
         assert_eq!(batches.len(), 1, "two 3 MiB units must fit one 10 MiB tape");
         assert_eq!(
             batches[0].unit_names(),
@@ -164,7 +168,7 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_collection(&conn, &config, &lib).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib, None).unwrap_err();
         assert!(
             err.to_string().contains("testlib/huge"),
             "error must name the offending unit: {err}"

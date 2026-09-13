@@ -186,32 +186,61 @@ fn default_block_size() -> String {
 }
 
 impl LtoBackendConfig {
-    /// This backend's declared native capacity in bytes: `capacity_override`
-    /// when the drive lies about its media (mhvtl, or an operator-declared
-    /// oversized cartridge), else the generation table
-    /// (`crate::media::Generation::native_capacity_bytes`).
+    /// This backend's declared native capacity in bytes — an alias for
+    /// [`Self::planning_capacity_bytes`] with no `--media` declaration.
     ///
-    /// ADR-0010: this is the DRIVE's figure only, standing in for the
-    /// removed `nominal_capacity` field at call sites that read it before
-    /// `volume init` has bound a cartridge (capacity *planning* estimates,
-    /// and the write-path capacity gate, which a later change moves onto
-    /// `volumes.capacity_bytes` — the authoritative figure once a volume
-    /// exists). Both `generation` and `capacity_override` are already
-    /// validated at `Config::load` time (`Config::validate_sizes`); the
-    /// error path here only matters for a `Config` built directly (e.g. in
-    /// tests) rather than loaded from a file.
+    /// **No write path may call this.** ADR-0010 decision 3: capacity is
+    /// decided once at `volume init`, from the generation of the medium
+    /// ACTUALLY LOADED, and stored on `volumes.capacity_bytes`; every later
+    /// gate (`write`, `resume`, `verify`) reads that row and config is never
+    /// consulted for capacity again. Reading a drive's figure after init is
+    /// exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB. It
+    /// survives only for capacity PLANNING, before any cartridge is loaded —
+    /// and `planning_capacity_bytes` says that in its name.
+    ///
+    /// Both `generation` and `capacity_override` are already validated at
+    /// `Config::load` time (`Config::validate_sizes`); the error path here
+    /// only matters for a `Config` built directly (e.g. in tests) rather
+    /// than loaded from a file.
     pub fn capacity_bytes(&self) -> Result<u64> {
-        if let Some(cap) = &self.capacity_override {
-            return Ok(crate::staging::parse_size_to_bytes(cap)? as u64);
-        }
-        crate::media::Generation::parse(&self.generation)
-            .map(crate::media::Generation::native_capacity_bytes)
-            .ok_or_else(|| {
-                TapectlError::Config(format!(
-                    "backends.lto[\"{}\"].generation = {:?} is not a recognised LTO generation",
-                    self.name, self.generation
+        self.planning_capacity_bytes(None)
+    }
+
+    /// This drive's own native generation, parsed.
+    pub fn native_generation(&self) -> Result<crate::media::Generation> {
+        crate::media::Generation::parse(&self.generation).ok_or_else(|| {
+            TapectlError::Config(format!(
+                "backends.lto[\"{}\"].generation = {:?} is not a recognised LTO generation",
+                self.name, self.generation
+            ))
+        })
+    }
+
+    /// Capacity for PLANNING a tape that is not loaded — `volume plan` and
+    /// `collection plan`, which size batches before any cartridge is in the
+    /// drive (ADR-0010, "Consequences").
+    ///
+    /// `media` is the operator's `--media <GEN>`, defaulting to this drive's
+    /// native generation. The cartridge row is deliberately absent from the
+    /// precedence that [`crate::media::resolve_capacity`] applies here:
+    /// nothing is bound yet, because nothing has been initialised. Once a
+    /// volume exists, its own `volumes.capacity_bytes` is the authoritative
+    /// figure and config is never consulted again.
+    pub fn planning_capacity_bytes(&self, media: Option<&str>) -> Result<u64> {
+        let generation = match media {
+            Some(m) => crate::media::Generation::parse(m).ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "--media {m:?} is not a recognised LTO generation \
+                     (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
                 ))
-            })
+            })?,
+            None => self.native_generation()?,
+        };
+        let override_bytes = match &self.capacity_override {
+            Some(cap) => Some(crate::staging::parse_size_to_bytes(cap)? as u64),
+            None => None,
+        };
+        Ok(crate::media::resolve_capacity(override_bytes, None, generation).0)
     }
 }
 

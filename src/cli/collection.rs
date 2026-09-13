@@ -32,6 +32,11 @@ pub enum CollectionCommands {
         /// this scales the printed cartridge-count estimate).
         #[arg(long, default_value = "2")]
         copies: i64,
+        /// Plan against this media generation rather than the drive's own
+        /// (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6
+        /// drive will write. No cartridge need be loaded.
+        #[arg(long)]
+        media: Option<String>,
     },
 
     /// Execute one batch: stage every unit in it once, write one session
@@ -71,7 +76,9 @@ pub fn run(
             cmd_sync(conn, paths, config, *dry_run, json_output)
         }
         CollectionCommands::Status => cmd_status(conn, config, json_output),
-        CollectionCommands::Plan { copies } => cmd_plan(conn, config, *copies, json_output),
+        CollectionCommands::Plan { copies, media } => {
+            cmd_plan(conn, config, *copies, media.as_deref(), json_output)
+        }
         CollectionCommands::Run {
             collection: name,
             batch,
@@ -193,7 +200,13 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<(
     Ok(())
 }
 
-fn cmd_plan(conn: &Connection, config: &Config, copies: i64, json_output: bool) -> Result<()> {
+fn cmd_plan(
+    conn: &Connection,
+    config: &Config,
+    copies: i64,
+    media: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
     if config.collections.is_empty() {
         no_libraries_configured(json_output);
         return Ok(());
@@ -201,7 +214,7 @@ fn cmd_plan(conn: &Connection, config: &Config, copies: i64, json_output: bool) 
 
     let mut rows = Vec::new();
     for lib in &config.collections {
-        let batches = collection::plan::plan_for_collection(conn, config, lib)?;
+        let batches = collection::plan::plan_for_collection(conn, config, lib, media)?;
         rows.push((lib.name.clone(), batches));
     }
 
@@ -270,7 +283,9 @@ fn cmd_run(
     json_output: bool,
 ) -> Result<()> {
     let lib = collection::find_collection(config, collection_name)?;
-    let batches = collection::plan::plan_for_collection(conn, config, lib)?;
+    // No `--media` here: `collection run` writes to volumes that are already
+    // `volume init`-ed, so each destination's real capacity is on its own row.
+    let batches = collection::plan::plan_for_collection(conn, config, lib, None)?;
     let batch = batches.get(batch_idx).ok_or_else(|| {
         TapectlError::Other(format!(
             "collection \"{collection_name}\": batch {batch_idx} does not exist \

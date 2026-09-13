@@ -197,6 +197,13 @@ pub enum VolumeCommands {
         /// Number of copies to plan
         #[arg(long, default_value = "1")]
         copies: i64,
+        /// Estimate against this media generation rather than the drive's
+        /// own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6
+        /// drive. No cartridge need be loaded; this is an estimate, and the
+        /// authoritative figure is each volume's own `capacity_bytes` once
+        /// `volume init` has detected the medium it is actually on.
+        #[arg(long)]
+        media: Option<String>,
     },
 
     /// Retire source volume after compaction (compaction step 3)
@@ -461,7 +468,7 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Plan { copies } => {
+        VolumeCommands::Plan { copies, media } => {
             // Show what staged data would be written
             let mut stmt = conn.prepare(
                 "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size
@@ -511,9 +518,12 @@ pub fn run(
                         total_bytes / (1024 * 1024),
                         total_bytes * copies / (1024 * 1024),
                     );
-                    // Estimate tapes needed from configured LTO backend
+                    // Estimate tapes needed from the configured LTO backend.
+                    // ADR-0010: the figure follows the GENERATION being
+                    // planned for (`--media`, else the drive's own), not a
+                    // capacity declared on the drive.
                     let backend = crate::config::resolve_lto_backend(config, None)?;
-                    let tape_cap = backend.capacity_bytes()? as i64;
+                    let tape_cap = backend.planning_capacity_bytes(media.as_deref())? as i64;
                     let factor = backend.usable_capacity_factor;
                     let usable = (tape_cap as f64 * factor) as i64;
                     let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;

@@ -11,7 +11,6 @@ use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::staging;
 use crate::tape::health;
-use crate::tape::mam::MamInfo;
 use crate::util::{HashingWriter, TruncatingWriter};
 
 use crate::store::{Store, TapeStore, Tier};
@@ -395,6 +394,94 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
     }
 }
 
+/// A volume's own recorded capacity and media generation — the ADR-0010
+/// authority for both, decided once at `volume init` from the medium that
+/// was actually loaded.
+///
+/// Every write-path gate after init reads this instead of config. Issue #141
+/// is exactly what happens when it does not: an LTO-5 cartridge planned at
+/// the LTO-6 drive's 2.5 TB, run to a real end-of-tape.
+fn volume_media(conn: &Connection, volume_id: i64, label: &str) -> Result<(i64, Option<String>)> {
+    conn.query_row(
+        "SELECT capacity_bytes, media_type FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))
+}
+
+/// Refuse a cartridge that is not the one `volume init` bound (ADR-0010,
+/// "`volume write` re-reads the serial").
+///
+/// The same wrong-cartridge discipline as the File 0 check, one layer
+/// earlier and from a different witness: File 0 says what was written to
+/// this tape, the MAM serial says which tape it is. Silent — not an error —
+/// whenever either side is unknown: an unbound volume (no serial was
+/// readable at init, as on some virtual drives), a cartridge row with no
+/// recorded serial, or a drive that reports none now. A check that cannot
+/// see cannot refuse.
+///
+/// Unlike the File 0 check there is no `--force`: this compares two recorded
+/// serials, and disagreement means the operator loaded a different physical
+/// cartridge than the one this volume was planned for. Continuing would
+/// overwrite it while the catalog kept crediting the other one.
+fn check_loaded_cartridge(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    loaded_serial: Option<&str>,
+) -> Result<()> {
+    let Some(loaded) = loaded_serial else {
+        return Ok(());
+    };
+    let bound: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT c.serial_number, c.barcode
+             FROM cartridge_volumes cv
+             JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![volume_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(initialised_on), barcode)) = bound else {
+        return Ok(());
+    };
+    if initialised_on != loaded {
+        return Err(TapectlError::Other(format!(
+            "wrong cartridge: volume \"{label}\" was initialised on {initialised_on} \
+             (cartridge {barcode}), the drive holds {loaded}. Load that cartridge, or \
+             `volume init` a new label on this one."
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a medium whose detected generation is not the one this volume was
+/// initialised on (ADR-0010). Silent when nothing is detected or the row
+/// predates ADR-0010 and records no parseable generation — the same
+/// cannot-see-cannot-refuse rule as [`check_loaded_cartridge`].
+fn check_loaded_generation(
+    label: &str,
+    det: &crate::tape::media_detect::Detected,
+    volume_media_type: Option<&str>,
+) -> Result<()> {
+    let (Some(detected), Some(recorded)) = (
+        det.generation,
+        volume_media_type.and_then(crate::media::Generation::parse),
+    ) else {
+        return Ok(());
+    };
+    if detected != recorded {
+        return Err(TapectlError::Other(format!(
+            "wrong medium: volume \"{label}\" was initialised on {recorded} media, the \
+             drive holds {detected}. Its plan, capacity gate and ID thunk all assume \
+             {recorded}."
+        )));
+    }
+    Ok(())
+}
+
 /// Full volume write pipeline (`docs/design/v2-implementation-plan.md` T8):
 /// orchestration only. Gather the staged batch, assemble `BuildInputs` from
 /// the DB, `build()` the Layout, then drive the §9 typestate session —
@@ -445,9 +532,10 @@ pub fn volume_write(
     // Unused now that backend resolution goes through `resolve_lto_backend`
     // (ADR-0010) rather than `no_lto_backend_error(Some(paths))`. Kept as a
     // parameter (not removed) since it is public API called positionally
-    // from `cli::volume` and directly from tests, and the next change on
-    // this ADR (cartridge binding at `volume init`/`write`) is expected to
-    // need it again for its own error messages.
+    // from `cli::volume`, from `collection::batch` and directly from tests.
+    // The ADR's cartridge binding turned out not to need it: every message
+    // it emits names a barcode or a medium serial, neither of which lives
+    // under the tapectl home.
     _paths: &TapectlPaths,
     config: &Config,
     label: &str,
@@ -495,7 +583,11 @@ pub fn volume_write(
     }
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
-    let nominal_capacity = backend.capacity_bytes()? as i64;
+    // ADR-0010 decision 3: capacity was decided ONCE, at `volume init`, from
+    // the generation of the medium actually loaded — config is never
+    // consulted for it again. Reading `backends.lto[].nominal_capacity` here
+    // is exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB.
+    let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
     // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
@@ -523,26 +615,32 @@ pub fn volume_write(
         escrow_public_key,
     } = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
 
-    // MAM (best-effort, informational; never gates the write — the pre-flight
-    // capacity gate below reads the configured nominal capacity, which is
-    // reliable, per `layout-session.md`'s validation point 1). Read before
-    // the tape stream itself is touched, so real values (where available)
-    // land in the ID thunk instead of the placeholder zeros/blanks v1 always
-    // wrote regardless of what MAM reported.
-    let mam = match crate::tape::mam::read_mam(&backend.device_sg) {
-        Ok(mam) => {
-            let _ = conn.execute(
-                "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
-                 WHERE id = ?3",
-                params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
-            );
-            mam
-        }
-        Err(e) => {
-            warn!(err = %e, "MAM read failed (continuing)");
-            MamInfo::default()
-        }
-    };
+    // One read of the loaded medium, serving three purposes (ADR-0010): the
+    // wrong-cartridge and wrong-generation checks immediately below, the MAM
+    // bookkeeping UPDATE, and the ID thunk's MAM fields. Read before the tape
+    // stream itself is opened — `detect` opens the device read-only and drops
+    // the fd, and the st driver refuses a second concurrent open.
+    //
+    // MAM capacity stays informational and never gates the write: the
+    // pre-flight capacity gate reads `volumes.capacity_bytes`, which was
+    // decided at init from the medium's detected generation
+    // (`layout-session.md`'s validation point 1).
+    let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    let mam = det.mam.clone();
+    if mam.max_capacity_bytes.is_some() || mam.remaining_bytes.is_some() {
+        let _ = conn.execute(
+            "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
+             WHERE id = ?3",
+            params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
+        );
+    }
+
+    // Wrong-cartridge discipline, one layer earlier than the File 0 check
+    // (ADR-0010): the volume knows which medium serial it was initialised
+    // on, so a swapped cartridge is caught before `build()` materialises a
+    // single slice — never mind before anything is written.
+    check_loaded_cartridge(conn, volume_id, label, mam.serial.as_deref())?;
+    check_loaded_generation(label, &det, volume_media_type.as_deref())?;
 
     let volume_uuid = volume_uuid(conn, volume_id)?;
     let created_at = chrono::Utc::now().to_rfc3339();
@@ -569,7 +667,10 @@ pub fn volume_write(
     let inputs = BuildInputs {
         label: label.to_string(),
         volume_uuid,
-        media_type: backend.generation.clone(),
+        // The generation of the medium this volume was initialised on, not
+        // the drive's (ADR-0010). Blank only for a pre-ADR-0010 row that
+        // never recorded one.
+        media_type: volume_media_type.clone().unwrap_or_default(),
         tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at,
         block_size: block_size as u64,
@@ -750,7 +851,10 @@ pub fn volume_resume(
     let SessionKeys { keys, .. } = assemble_session_keys(conn, &tenant_ids, &stage_set_ids)?;
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
-    let nominal_capacity = backend.capacity_bytes()? as i64;
+    // ADR-0010 decision 3: the volume's own row, never config. Resume must
+    // in any case reuse the figure the interrupted session planned against —
+    // a capacity that moved mid-session would be a different plan.
+    let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
@@ -1439,15 +1543,20 @@ pub fn volume_verify(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
+    // Capacity comes from the volume's own row (ADR-0010 decision 3) — the
+    // figure decided at init from the medium actually loaded. Only the
+    // usable-capacity FACTOR is a property of the drive.
+    //
     // LENIENT (ADR-0010): verify is a read path and must keep working with
     // no backend configured for this device (`crate::config::resolve_device`
     // never errors when `device` is given) — the same `None => 0` fallback
-    // as before covers that case.
+    // as before covers that case, and costs nothing, since verify only reads.
+    let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
     let usable_bytes = match crate::config::resolve_device(config, Some(device))
         .ok()
         .and_then(|(_, b)| b)
     {
-        Some(b) => (b.capacity_bytes()? as f64 * b.usable_capacity_factor) as u64,
+        Some(b) => (nominal_capacity as f64 * b.usable_capacity_factor) as u64,
         None => 0,
     };
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
@@ -3475,5 +3584,134 @@ mod tests {
         assert!(
             check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, default_force).is_err()
         );
+    }
+
+    // --- ADR-0010: the write path's wrong-cartridge / wrong-medium checks ---
+    //
+    // Both are pure enough to drill without a drive: one takes a
+    // `Connection` and a serial string, the other a `Detected` and a row's
+    // recorded generation.
+    mod loaded_medium_checks {
+        use super::*;
+        use crate::media::Generation;
+        use crate::tape::mam::MamInfo;
+        use crate::tape::media_detect::{DetectSource, Detected};
+
+        /// A volume bound to a cartridge whose `serial_number` is `serial`.
+        fn bound_volume(serial: Option<&str>) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('BC001', 'LTO-6', 2500000000000, ?1, 'in_use')",
+                params![serial],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, vol_id],
+            )
+            .unwrap();
+            (conn, vol_id)
+        }
+
+        fn detected(g: Option<Generation>) -> Detected {
+            Detected {
+                generation: g,
+                code: g.and_then(Generation::density_code),
+                source: if g.is_some() {
+                    DetectSource::MamMedium
+                } else {
+                    DetectSource::None
+                },
+                mam: MamInfo::default(),
+            }
+        }
+
+        #[test]
+        fn the_same_cartridge_passes() {
+            let (conn, vol) = bound_volume(Some("SER-1"));
+            check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-1")).unwrap();
+        }
+
+        #[test]
+        fn a_different_cartridge_is_refused_naming_both_serials() {
+            let (conn, vol) = bound_volume(Some("SER-1"));
+            let err = check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-2"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("wrong cartridge"), "{err}");
+            assert!(err.contains("initialised on SER-1"), "{err}");
+            assert!(err.contains("the drive holds SER-2"), "{err}");
+            assert!(err.contains("cartridge BC001"), "{err}");
+        }
+
+        /// A check that cannot see cannot refuse — ADR-0010 keeps virtual
+        /// drives that expose no medium serial working unchanged.
+        #[test]
+        fn an_unreadable_serial_is_silent_rather_than_a_refusal() {
+            let (conn, vol) = bound_volume(Some("SER-1"));
+            check_loaded_cartridge(&conn, vol, "L6-0001", None).unwrap();
+        }
+
+        #[test]
+        fn a_cartridge_row_with_no_recorded_serial_is_silent() {
+            let (conn, vol) = bound_volume(None);
+            check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-2")).unwrap();
+        }
+
+        #[test]
+        fn an_unbound_volume_is_silent() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let vol = conn.last_insert_rowid();
+            check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-2")).unwrap();
+        }
+
+        #[test]
+        fn the_same_generation_passes() {
+            check_loaded_generation("L6-0001", &detected(Some(Generation::Lto6)), Some("LTO-6"))
+                .unwrap();
+        }
+
+        #[test]
+        fn a_different_generation_is_refused() {
+            let err = check_loaded_generation(
+                "L6-0001",
+                &detected(Some(Generation::Lto5)),
+                Some("LTO-6"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("wrong medium"), "{err}");
+            assert!(err.contains("initialised on LTO-6 media"), "{err}");
+            assert!(err.contains("the drive holds LTO-5"), "{err}");
+        }
+
+        #[test]
+        fn an_undetectable_generation_is_silent() {
+            check_loaded_generation("L6-0001", &detected(None), Some("LTO-6")).unwrap();
+        }
+
+        /// A `volumes` row written before ADR-0010 can hold anything in
+        /// `media_type`; it cannot arbitrate, so it does not refuse.
+        #[test]
+        fn an_unparseable_recorded_generation_is_silent() {
+            check_loaded_generation("L6-0001", &detected(Some(Generation::Lto6)), Some("lto6?"))
+                .unwrap();
+            check_loaded_generation("L6-0001", &detected(Some(Generation::Lto6)), None).unwrap();
+        }
     }
 }
