@@ -13,6 +13,7 @@ pub mod staging;
 pub mod tape;
 pub mod volume;
 
+pub mod media;
 pub mod naming;
 pub mod policy;
 pub mod store;
