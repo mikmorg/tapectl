@@ -409,12 +409,12 @@ CFG="$EFFECTIVE_HOME/config.toml"
 if as_svc grep -q '^\[\[backends.lto\]\]' "$CFG" 2>/dev/null; then ok "a [[backends.lto]] entry already exists in $CFG"; run as_svc grep -A5 '^\[\[backends.lto\]\]' "$CFG" || true
 else
 explain <<'EOF'
-`backend add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. Media type and nominal capacity default to LTO-6 / 2.5TB; change them for another generation.
+`backend add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. You declare what the DRIVE is — its own generation — and nothing about the tapes you will feed it: each cartridge's generation is read from its density code when the volume is initialised, and that is what fixes the tape's capacity. So one LTO-6 drive handles LTO-5 and LTO-6 cartridges with nothing to change between them, and media the drive cannot write is refused before the tape is touched (ADR-0010).
 EOF
   [ -n "$DEVICE" ] || die "no device chosen — run with --from 6"
   ask BNAME "backend name" "lto6"
-  ask MTYPE "media type" "LTO-6"
-  run tc backend add --name "$BNAME" --device-tape "$DEVICE" --device-sg "$SG" --media-type "$MTYPE"
+  ask DGEN "generation this DRIVE natively writes (LTO-5 … LTO-9)" "LTO-6"
+  run tc backend add --name "$BNAME" --device-tape "$DEVICE" --device-sg "$SG" --generation "$DGEN"
   run tc config check || true
 fi
 }
