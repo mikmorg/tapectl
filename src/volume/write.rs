@@ -2459,13 +2459,15 @@ pub fn compact_finish(
         params![vol_id],
     )?;
 
-    // Mark cartridge as pending_erase if bound
-    tx.execute(
-        "UPDATE cartridges SET status = 'pending_erase'
-         WHERE id IN (SELECT cartridge_id FROM cartridge_volumes
-                      WHERE volume_id = ?1 AND unmounted_at IS NULL)",
-        params![vol_id],
-    )?;
+    // Free the cartridge through the ONE guarded writer (ADR-0011). This was
+    // a second, bare UPDATE that fired on any status: it would walk a
+    // `retired_permanent` cartridge -- a medium the operator has declared
+    // unfit and which `cartridge retire` gated behind a Tier-2 consent
+    // prompt -- back to `pending_erase`, silently and without an event, and
+    // `cartridge mark-erased` would then accept it. The shared helper keeps
+    // the `in_use` precondition, the other-live-volume check and the audit
+    // trail identical on both paths.
+    crate::cli::operations::free_cartridge_if_last_live(&tx, vol_id)?;
 
     events::log_field_change(
         &tx,

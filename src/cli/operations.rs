@@ -339,7 +339,10 @@ pub fn volume_retire(
 /// The mount is deliberately left OPEN (`cartridge_volumes.unmounted_at`
 /// untouched): the bytes are still physically there until someone erases
 /// them, and `cartridge mark-erased` is the step that says otherwise.
-fn free_cartridge_if_last_live(conn: &Connection, vol_id: i64) -> Result<Option<String>> {
+pub(crate) fn free_cartridge_if_last_live(
+    conn: &Connection,
+    vol_id: i64,
+) -> Result<Option<String>> {
     let mounted: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT c.id, c.barcode, c.status FROM cartridge_volumes cv

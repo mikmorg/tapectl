@@ -361,6 +361,39 @@ pub(crate) fn bind_cartridge(
         params![cartridge_id, volume_id],
     )?;
 
+    // ADR-0011 promises that a cartridge's place and its volumes' places
+    // "cannot disagree", and reasons about `cartridge move` and `volume move`
+    // as the only writers of the pair. Binding is a THIRD writer: it attaches
+    // a volume to a cartridge that may already sit somewhere, and a volume
+    // written to a cartridge on the offsite shelf would otherwise be recorded
+    // nowhere at all -- `catalog locate` would have no answer for the very
+    // tape whose place the catalog knows. Inherit it, the same way
+    // `move_together` records one, so the guarantee holds for every writer
+    // rather than for two of the three.
+    let cart_loc: Option<i64> = conn.query_row(
+        "SELECT location_id FROM cartridges WHERE id = ?1",
+        params![cartridge_id],
+        |row| row.get(0),
+    )?;
+    if let Some(loc_id) = cart_loc {
+        let vol_loc: Option<i64> = conn.query_row(
+            "SELECT location_id FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |row| row.get(0),
+        )?;
+        if vol_loc.is_none() {
+            conn.execute(
+                "INSERT INTO volume_movements (volume_id, from_location, to_location)
+                 VALUES (?1, NULL, ?2)",
+                params![volume_id, loc_id],
+            )?;
+            conn.execute(
+                "UPDATE volumes SET location_id = ?1 WHERE id = ?2",
+                params![loc_id, volume_id],
+            )?;
+        }
+    }
+
     // `in_use` unconditionally, from ANY prior status. A precondition here
     // would be a consent gate in disguise: `pending_erase -> mt erase ->
     // volume init` is exactly the ordinary reuse ADR-0010 protects.
@@ -590,6 +623,96 @@ mod tests {
         assert!(out.displaced.is_empty());
         assert_eq!(cartridge_status(&conn, cart_id), "in_use");
         assert_eq!(open_mounts(&conn, cart_id), vec![vol]);
+    }
+
+    /// ADR-0011 promises a cartridge's place and its volumes' places "cannot
+    /// disagree", reasoning about `cartridge move` and `volume move` as the
+    /// only writers of the pair. Binding is the third writer, and it was
+    /// silently not one: a volume written to a cartridge already on the
+    /// offsite shelf was recorded nowhere, so `catalog locate` had no answer
+    /// for the one tape whose place the catalog knew.
+    #[test]
+    fn a_bound_volume_inherits_its_cartridge_location() {
+        let conn = db::open_memory().unwrap();
+        conn.execute("INSERT INTO locations (name) VALUES ('bank')", [])
+            .unwrap();
+        let loc: i64 = conn
+            .query_row("SELECT id FROM locations WHERE name = 'bank'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        let cart_id = found.row.as_ref().unwrap().id;
+        conn.execute(
+            "UPDATE cartridges SET location_id = ?1 WHERE id = ?2",
+            rusqlite::params![loc, cart_id],
+        )
+        .unwrap();
+        let vol = new_volume(&conn, "L6-0001");
+
+        bind_cartridge(
+            &conn,
+            vol,
+            found.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo::default(),
+        )
+        .unwrap();
+
+        let vol_loc: Option<i64> = conn
+            .query_row(
+                "SELECT location_id FROM volumes WHERE id = ?1",
+                rusqlite::params![vol],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vol_loc,
+            Some(loc),
+            "a volume bound to a located cartridge must inherit its location"
+        );
+        let movements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM volume_movements WHERE volume_id = ?1 AND to_location = ?2",
+                rusqlite::params![vol, loc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            movements, 1,
+            "the inherited place must leave a movement row"
+        );
+    }
+
+    /// A cartridge with no location leaves the volume's location alone —
+    /// inheriting NULL over NULL must not manufacture a movement row.
+    #[test]
+    fn binding_an_unlocated_cartridge_records_no_movement() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        let vol = new_volume(&conn, "L6-0001");
+        bind_cartridge(
+            &conn,
+            vol,
+            found.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo::default(),
+        )
+        .unwrap();
+        let movements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM volume_movements WHERE volume_id = ?1",
+                rusqlite::params![vol],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(movements, 0);
     }
 
     /// ADR-0010: no medium serial (some virtual drives expose none) means no

@@ -26,7 +26,11 @@ constraint and **location becomes the single mechanism**:
   export — moves alone, exactly as before.
 
 Both write the same two rows, so the cartridge's place and its volumes' places cannot
-disagree. `catalog locate` is unchanged and keeps answering from the volume.
+disagree — and so does the third writer of that pair, which this ADR originally missed:
+ADR-0010's `volume init` binding attaches a volume to a cartridge that may already sit
+somewhere, and a volume written to a cartridge on the offsite shelf would otherwise be
+recorded nowhere at all. A bound volume inherits its cartridge's location, with the same
+`volume_movements` row a move leaves. `catalog locate` is unchanged and keeps answering from the volume.
 
 **`retired_permanent` is a status, and it needs a writer with a consent gate.** A cartridge
 retired for wear or read errors is not a location change and not an erasure: the data may
