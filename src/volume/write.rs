@@ -123,14 +123,10 @@ pub fn volume_init(
         )));
     }
 
-    let backend = config
-        .backends
-        .lto
-        .first()
-        .ok_or_else(|| crate::config::no_lto_backend_error(None))?;
+    let backend = crate::config::resolve_lto_backend(config, Some(device))?;
 
-    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
-    let media_type = &backend.media_type;
+    let nominal_capacity = backend.capacity_bytes()? as i64;
+    let media_type = &backend.generation;
 
     // Generated here (not deferred to the `volume_uuid()` self-heal helper)
     // so the SAME value is used for the contact check below and the
@@ -243,7 +239,13 @@ fn blocking_validation_errors(
 #[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow
 pub fn volume_write(
     conn: &Connection,
-    paths: &TapectlPaths,
+    // Unused now that backend resolution goes through `resolve_lto_backend`
+    // (ADR-0010) rather than `no_lto_backend_error(Some(paths))`. Kept as a
+    // parameter (not removed) since it is public API called positionally
+    // from `cli::volume` and directly from tests, and the next change on
+    // this ADR (cartridge binding at `volume init`/`write`) is expected to
+    // need it again for its own error messages.
+    _paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
@@ -289,12 +291,8 @@ pub fn volume_write(
         ));
     }
 
-    let backend = config
-        .backends
-        .lto
-        .first()
-        .ok_or_else(|| crate::config::no_lto_backend_error(Some(paths)))?;
-    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
+    let backend = crate::config::resolve_lto_backend(config, Some(device))?;
+    let nominal_capacity = backend.capacity_bytes()? as i64;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
     // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
@@ -368,7 +366,7 @@ pub fn volume_write(
     let inputs = BuildInputs {
         label: label.to_string(),
         volume_uuid,
-        media_type: backend.media_type.clone(),
+        media_type: backend.generation.clone(),
         tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at,
         block_size: block_size as u64,
@@ -500,7 +498,8 @@ pub fn volume_write(
 /// `volume_write` rather than copying them.
 pub fn volume_resume(
     conn: &Connection,
-    paths: &TapectlPaths,
+    // See `volume_write`'s `_paths` for why this is unused but kept.
+    _paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
@@ -547,12 +546,8 @@ pub fn volume_resume(
     let stage_set_ids = stage_set_ids_for_layout(conn, &layout_snapshot)?;
     let SessionKeys { keys, .. } = assemble_session_keys(conn, &tenant_ids, &stage_set_ids)?;
 
-    let backend = config
-        .backends
-        .lto
-        .first()
-        .ok_or_else(|| crate::config::no_lto_backend_error(Some(paths)))?;
-    let nominal_capacity = staging::parse_size_to_bytes(&backend.nominal_capacity)?;
+    let backend = crate::config::resolve_lto_backend(config, Some(device))?;
+    let nominal_capacity = backend.capacity_bytes()? as i64;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
@@ -1241,11 +1236,15 @@ pub fn volume_verify(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    let usable_bytes = match config.backends.lto.first() {
-        Some(b) => {
-            (staging::parse_size_to_bytes(&b.nominal_capacity)? as f64 * b.usable_capacity_factor)
-                as u64
-        }
+    // LENIENT (ADR-0010): verify is a read path and must keep working with
+    // no backend configured for this device (`crate::config::resolve_device`
+    // never errors when `device` is given) — the same `None => 0` fallback
+    // as before covers that case.
+    let usable_bytes = match crate::config::resolve_device(config, Some(device))
+        .ok()
+        .and_then(|(_, b)| b)
+    {
+        Some(b) => (b.capacity_bytes()? as f64 * b.usable_capacity_factor) as u64,
         None => 0,
     };
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;

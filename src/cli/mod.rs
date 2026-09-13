@@ -282,12 +282,16 @@ pub enum BackendCommands {
         /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1
         #[arg(long)]
         device_sg: String,
-        /// Media type, e.g. LTO-6
-        #[arg(long, default_value = "LTO-6")]
-        media_type: String,
-        /// Uncompressed nominal capacity, e.g. 2.5TB
-        #[arg(long, default_value = "2.5TB")]
-        capacity: String,
+        /// Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a
+        /// drive declares only what it can write; the medium's actual
+        /// generation is detected at `volume init`, not declared here).
+        #[arg(long)]
+        generation: String,
+        /// Capacity override — for virtual drives (mhvtl) and test
+        /// harnesses only. A real drive's capacity follows the loaded
+        /// cartridge's detected generation (ADR-0010); leave this unset.
+        #[arg(long)]
+        capacity_override: Option<String>,
         /// Headroom reserved before end-of-tape, e.g. 50M
         #[arg(long)]
         enospc_buffer: Option<String>,

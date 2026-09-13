@@ -101,6 +101,19 @@ pub fn run(
                         crate::policy::depth_check::check_staging(&loaded.staging.directory);
                     let tape_device_checks = crate::policy::depth_check::scan_tape_devices(&loaded);
 
+                    // ADR-0010: `capacity_override` exists for virtual
+                    // drives (mhvtl) and test harnesses only — a real drive
+                    // should let capacity follow the loaded cartridge's
+                    // detected generation. Advisory only, like every other
+                    // scan here: never touches the exit code.
+                    let capacity_override_hits: Vec<&str> = loaded
+                        .backends
+                        .lto
+                        .iter()
+                        .filter(|b| b.capacity_override.is_some())
+                        .map(|b| b.name.as_str())
+                        .collect();
+
                     if json_output {
                         let shadowing_json: Vec<_> = shadowing_hits
                             .iter()
@@ -210,6 +223,7 @@ pub fn run(
                                 "staging": staging_json,
                                 "tape_devices": tape_devices_json,
                                 "unsupported_compression": unsupported_compression_json,
+                                "capacity_override_backends": capacity_override_hits,
                             })
                         );
                     } else {
@@ -256,6 +270,13 @@ pub fn run(
                         }
                         for hit in &unsupported_compression_hits {
                             println!("{}", crate::policy::compression_capability::describe(hit));
+                        }
+                        for name in &capacity_override_hits {
+                            println!(
+                                "warning: backend \"{name}\" sets capacity_override — intended \
+                                 for virtual drives (mhvtl) only; a real drive's capacity should \
+                                 come from the loaded cartridge's detected generation (ADR-0010)."
+                            );
                         }
                     }
                 }

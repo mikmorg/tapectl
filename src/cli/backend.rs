@@ -15,16 +15,16 @@ pub fn run(paths: &TapectlPaths, command: &BackendCommands, json_output: bool) -
             name,
             device_tape,
             device_sg,
-            media_type,
-            capacity,
+            generation,
+            capacity_override,
             enospc_buffer,
         } => add(
             paths,
             name,
             device_tape,
             device_sg,
-            media_type,
-            capacity,
+            generation,
+            capacity_override.as_deref(),
             enospc_buffer.as_deref(),
             json_output,
         ),
@@ -38,20 +38,24 @@ pub fn run(paths: &TapectlPaths, command: &BackendCommands, json_output: bool) -
 /// absent: both are inert today (#118, #121 — the write path's block size is a
 /// format constant), and offering an operator a knob that does nothing is the
 /// false assurance `config check`'s decorative-key scan exists to complain
-/// about. Their serde defaults apply.
+/// about. Their serde defaults apply. `capacity_override` (ADR-0010) is
+/// likewise absent unless explicitly given — a real drive's capacity follows
+/// the loaded cartridge's detected generation, not this config.
 pub fn backend_block(
     name: &str,
     device_tape: &str,
     device_sg: &str,
-    media_type: &str,
-    capacity: &str,
+    generation: &str,
+    capacity_override: Option<&str>,
     enospc_buffer: Option<&str>,
 ) -> String {
     let mut s = format!(
         "\n[[backends.lto]]\nname = \"{name}\"\ndevice_tape = \"{device_tape}\"\n\
-         device_sg = \"{device_sg}\"\nmedia_type = \"{media_type}\"\n\
-         nominal_capacity = \"{capacity}\"\n"
+         device_sg = \"{device_sg}\"\ngeneration = \"{generation}\"\n"
     );
+    if let Some(cap) = capacity_override {
+        s.push_str(&format!("capacity_override = \"{cap}\"\n"));
+    }
     if let Some(buf) = enospc_buffer {
         s.push_str(&format!("enospc_buffer = \"{buf}\"\n"));
     }
@@ -90,17 +94,29 @@ fn add(
     name: &str,
     device_tape: &str,
     device_sg: &str,
-    media_type: &str,
-    capacity: &str,
+    generation: &str,
+    capacity_override: Option<&str>,
     enospc_buffer: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
     crate::naming::validate_backend_name(name)?;
 
-    // Sizes are validated here rather than at the next `Config::load`, so a
-    // typo is rejected while the operator is still looking at the command
-    // that caused it (#59's boundary-validation rule).
-    crate::staging::parse_size_to_bytes(capacity)?;
+    // Validated here rather than at the next `Config::load`, so a typo is
+    // rejected while the operator is still looking at the command that
+    // caused it (#59's boundary-validation rule). The canonical spelling
+    // (not the operator's raw one) is what gets written to the file, so
+    // `LTO6`/`l6`/`LTO-6` all land the same way.
+    let generation = crate::media::Generation::parse(generation)
+        .ok_or_else(|| {
+            TapectlError::Other(format!(
+                "{generation:?} is not a recognised LTO generation \
+                 (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
+            ))
+        })?
+        .as_str();
+    if let Some(cap) = capacity_override {
+        crate::staging::parse_size_to_bytes(cap)?;
+    }
     if let Some(buf) = enospc_buffer {
         crate::staging::parse_size_to_bytes(buf)?;
     }
@@ -148,8 +164,8 @@ fn add(
         name,
         device_tape,
         device_sg,
-        media_type,
-        capacity,
+        generation,
+        capacity_override,
         enospc_buffer,
     );
     let mut f = std::fs::OpenOptions::new()
@@ -174,12 +190,12 @@ fn add(
         println!(
             "{}",
             serde_json::json!({"backend": name, "device_tape": device_tape,
-                               "device_sg": device_sg, "media_type": media_type,
+                               "device_sg": device_sg, "generation": generation,
                                "status": "added"})
         );
     } else {
         println!(
-            "backend \"{name}\" added to {} ({media_type}, {capacity}, tape={device_tape}, sg={device_sg})",
+            "backend \"{name}\" added to {} ({generation}, tape={device_tape}, sg={device_sg})",
             paths.config_file.display()
         );
         println!("verify it with: tapectl config check");
@@ -203,7 +219,7 @@ mod tests {
                 "/dev/tape/by-id/scsi-ABC-nst",
                 "/dev/sg1",
                 "LTO-6",
-                "2.5TB",
+                Some("2.5TB"),
                 Some("50M"),
             )
         );
@@ -212,25 +228,28 @@ mod tests {
         assert_eq!(b.name, "hp-lto6");
         assert_eq!(b.device_tape, "/dev/tape/by-id/scsi-ABC-nst");
         assert_eq!(b.device_sg, "/dev/sg1");
-        assert_eq!(b.media_type, "LTO-6");
-        assert_eq!(b.nominal_capacity, "2.5TB");
+        assert_eq!(b.generation, "LTO-6");
+        assert_eq!(b.capacity_override.as_deref(), Some("2.5TB"));
         assert_eq!(b.enospc_buffer, "50M");
     }
 
     /// Omitted knobs fall back to their serde defaults rather than being
     /// written out as operator choices (#118/#121: both are inert).
+    /// `capacity_override` (ADR-0010) is likewise absent by default.
     #[test]
     fn inert_knobs_are_absent_and_defaulted() {
-        let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", "2.5TB", None);
+        let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None);
         assert!(!block.contains("block_size"), "{block}");
         assert!(!block.contains("hardware_compression"), "{block}");
         assert!(!block.contains("enospc_buffer"), "{block}");
+        assert!(!block.contains("capacity_override"), "{block}");
 
         let cfg: Config = toml::from_str(&format!("[dar]\nbinary = \"dar\"\n{block}")).unwrap();
         let b = &cfg.backends.lto[0];
         assert_eq!(b.block_size, "512K");
         assert!(!b.hardware_compression);
         assert_eq!(b.enospc_buffer, "50M");
+        assert!(b.capacity_override.is_none());
     }
 
     /// The end-to-end failure this command shipped with for about ten
@@ -243,7 +262,7 @@ mod tests {
     fn an_empty_lto_stub_is_cleared_so_the_appended_table_parses() {
         let before =
             "[dar]\nbinary = \"dar\"\n\n[backends]\nlto = []\n\n[defaults]\nhash = \"sha256\"\n";
-        let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", "2.5TB", None);
+        let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None);
         assert!(
             toml::from_str::<Config>(&format!("{before}{block}")).is_err(),
             "precondition: the stub and the table really do collide"
@@ -282,7 +301,7 @@ mod tests {
             "# operator note: the drive lives in the basement\n[dar]\nbinary = \"dar\"\n";
         let after = format!(
             "{original}{}",
-            backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", "2.5TB", None)
+            backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None)
         );
         assert!(after.contains("# operator note: the drive lives in the basement"));
         assert!(toml::from_str::<Config>(&after).is_ok());

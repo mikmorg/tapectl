@@ -1505,10 +1505,8 @@ pub fn volume_import(
     // Resolve backend_name from configured backend of this type, else fall back
     // to the type string so the row remains self-consistent.
     let backend_name = match backend {
-        "lto" => config
-            .backends
-            .lto
-            .first()
+        "lto" => crate::config::resolve_lto_backend(config, None)
+            .ok()
             .map(|b| b.name.clone())
             .unwrap_or_else(|| backend.to_string()),
         _ => backend.to_string(),

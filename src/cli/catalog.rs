@@ -440,7 +440,9 @@ pub fn run(
                 key,
                 label.as_deref(),
                 tenant,
-                config.backends.lto.first().map(|b| b.name.as_str()),
+                crate::config::resolve_lto_backend(config, Some(device))
+                    .ok()
+                    .map(|b| b.name.as_str()),
                 &scratch,
             );
             // The scratch dir holds decrypted MANIFEST/catalog.db copies —

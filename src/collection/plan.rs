@@ -51,16 +51,12 @@ pub fn plan_for_collection(
         })
         .collect();
 
-    let backend = config
-        .backends
-        .lto
-        .first()
-        .ok_or_else(|| crate::config::no_lto_backend_error(None))?;
+    let backend = crate::config::resolve_lto_backend(config, None)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
     // valid byte count, so a successfully parsed `Ok` is already guaranteed
     // non-negative here.
-    let nominal = crate::staging::parse_size_to_bytes(&backend.nominal_capacity)? as u64;
+    let nominal = backend.capacity_bytes()?;
     let usable = (nominal as f64 * backend.usable_capacity_factor) as u64;
     let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
     let budget = usable.saturating_sub(enospc_buffer);

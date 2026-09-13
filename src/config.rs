@@ -130,13 +130,34 @@ pub struct BackendsConfig {
     pub lto: Vec<LtoBackendConfig>,
 }
 
+/// A configured LTO drive.
+///
+/// ADR-0010: a drive declares only what it can natively write
+/// (`generation`) — the medium's actual generation is a fact about the
+/// cartridge, detected at `volume init` (`tape::media_detect`), never
+/// declared here. `media_type`/`nominal_capacity` (the pre-ADR-0010 fields)
+/// are rejected by name via `#[serde(deny_unknown_fields)]` — see
+/// [`Config::load`]'s stale-field pre-scan for the friendly error a stale
+/// config gets instead of a raw serde message. `capacity_override` survives
+/// as the sole legitimate way to lie about capacity, for virtual drives
+/// (mhvtl) and the microcosm test harnesses only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LtoBackendConfig {
     pub name: String,
     pub device_tape: String,
     pub device_sg: String,
-    pub media_type: String,
-    pub nominal_capacity: String,
+    /// The generation this drive natively writes, e.g. `"LTO-6"`. Parsed via
+    /// `crate::media::Generation::parse` — `config check` (and every
+    /// `Config::load`, via `validate_sizes`) errors if it does not parse.
+    pub generation: String,
+    /// Capacity override for a drive that lies about its media (mhvtl) or a
+    /// cartridge whose real capacity differs from its generation's marketed
+    /// figure. Checked ahead of the bound cartridge row and the generation
+    /// table in every capacity resolution (ADR-0010); `config check` warns
+    /// when this is set, since a real drive should never need it.
+    #[serde(default)]
+    pub capacity_override: Option<String>,
     #[serde(default = "default_usable_capacity_factor")]
     pub usable_capacity_factor: f64,
     #[serde(default = "default_enospc_buffer")]
@@ -162,6 +183,36 @@ fn default_block_size() -> String {
     // uses), so this default is currently only misleading, not dangerous,
     // but it should read as what the format actually fixes.
     "512K".to_string()
+}
+
+impl LtoBackendConfig {
+    /// This backend's declared native capacity in bytes: `capacity_override`
+    /// when the drive lies about its media (mhvtl, or an operator-declared
+    /// oversized cartridge), else the generation table
+    /// (`crate::media::Generation::native_capacity_bytes`).
+    ///
+    /// ADR-0010: this is the DRIVE's figure only, standing in for the
+    /// removed `nominal_capacity` field at call sites that read it before
+    /// `volume init` has bound a cartridge (capacity *planning* estimates,
+    /// and the write-path capacity gate, which a later change moves onto
+    /// `volumes.capacity_bytes` — the authoritative figure once a volume
+    /// exists). Both `generation` and `capacity_override` are already
+    /// validated at `Config::load` time (`Config::validate_sizes`); the
+    /// error path here only matters for a `Config` built directly (e.g. in
+    /// tests) rather than loaded from a file.
+    pub fn capacity_bytes(&self) -> Result<u64> {
+        if let Some(cap) = &self.capacity_override {
+            return Ok(crate::staging::parse_size_to_bytes(cap)? as u64);
+        }
+        crate::media::Generation::parse(&self.generation)
+            .map(crate::media::Generation::native_capacity_bytes)
+            .ok_or_else(|| {
+                TapectlError::Config(format!(
+                    "backends.lto[\"{}\"].generation = {:?} is not a recognised LTO generation",
+                    self.name, self.generation
+                ))
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +489,15 @@ impl Config {
             return Err(TapectlError::ConfigNotFound(path.display().to_string()));
         }
         let content = std::fs::read_to_string(path)?;
+        // ADR-0010 renamed `backends.lto[].media_type`/`.nominal_capacity` to
+        // `.generation`/`.capacity_override`, and `LtoBackendConfig` now
+        // rejects unknown fields — a stale config with either old key would
+        // otherwise fail with serde's generic "unknown field" message. Catch
+        // it here, before serde ever sees it, so the operator gets the exact
+        // remediation instead.
+        if let Some(msg) = stale_lto_fields_message(&content) {
+            return Err(TapectlError::Config(msg));
+        }
         let config: Config =
             toml::from_str(&content).map_err(|e| TapectlError::Config(e.to_string()))?;
         config.validate_sizes()?;
@@ -450,7 +510,12 @@ impl Config {
     /// size-typed field is named in its own error so the operator can find
     /// it without grepping the TOML: `defaults.slice_size`,
     /// `defaults.large_file_warn_threshold`, and each configured LTO
-    /// backend's `nominal_capacity`/`enospc_buffer`.
+    /// backend's `enospc_buffer`/`capacity_override`.
+    ///
+    /// Also rejects an unparseable `backends.lto[].generation` (ADR-0010):
+    /// every capacity and compatibility decision downstream reads this via
+    /// `crate::media::Generation::parse`, so a bad value should fail loudly
+    /// here rather than downstream as a confusing `None`.
     ///
     /// `backends.lto[].block_size` and `packing.min_free_for_append` are
     /// size-typed strings too but are dead config — nothing in the write
@@ -465,12 +530,21 @@ impl Config {
             |e| TapectlError::Config(format!("defaults.large_file_warn_threshold = {e}")),
         )?;
         for (i, backend) in self.backends.lto.iter().enumerate() {
-            crate::staging::parse_size_to_bytes(&backend.nominal_capacity).map_err(|e| {
-                TapectlError::Config(format!(
-                    "backends.lto[{i}] (\"{}\").nominal_capacity = {e}",
-                    backend.name
-                ))
-            })?;
+            if crate::media::Generation::parse(&backend.generation).is_none() {
+                return Err(TapectlError::Config(format!(
+                    "backends.lto[{i}] (\"{}\").generation = {:?} is not a recognised LTO \
+                     generation (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)",
+                    backend.name, backend.generation
+                )));
+            }
+            if let Some(cap) = &backend.capacity_override {
+                crate::staging::parse_size_to_bytes(cap).map_err(|e| {
+                    TapectlError::Config(format!(
+                        "backends.lto[{i}] (\"{}\").capacity_override = {e}",
+                        backend.name
+                    ))
+                })?;
+            }
             crate::staging::parse_size_to_bytes(&backend.enospc_buffer).map_err(|e| {
                 TapectlError::Config(format!(
                     "backends.lto[{i}] (\"{}\").enospc_buffer = {e}",
@@ -512,8 +586,7 @@ pub const LTO_BACKEND_EXAMPLE: &str = r#"
 # name = "lto6"
 # device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"
 # device_sg = "/dev/sg1"
-# media_type = "LTO-6"
-# nominal_capacity = "2.5TB"
+# generation = "LTO-6"
 # hardware_compression = false
 "#;
 
@@ -538,6 +611,162 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
          `tapectl init` leaves a commented-out example there to uncomment.",
         LTO_BACKEND_EXAMPLE.trim_end(),
     ))
+}
+
+/// If `content` (raw, unparsed config TOML) declares a `[[backends.lto]]`
+/// entry still carrying the pre-ADR-0010 `media_type` or `nominal_capacity`
+/// keys, return the exact remediation message for it.
+///
+/// Parses `content` as generic `toml::Value` rather than scanning lines by
+/// hand, so comments and quoting are handled the way TOML actually defines
+/// them, not approximately. Returns `None` (letting the normal parse error
+/// surface unchanged) when `content` is not even syntactically valid TOML —
+/// this check only ever *sharpens* an error that was going to happen anyway,
+/// never introduces a new failure mode of its own.
+fn stale_lto_fields_message(content: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(content).ok()?;
+    let backends = value.get("backends")?.get("lto")?.as_array()?;
+    for entry in backends {
+        let table = entry.as_table()?;
+        if table.contains_key("media_type") || table.contains_key("nominal_capacity") {
+            let name = table.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            return Some(format!(
+                "backends.lto[\"{name}\"]: \"media_type\" and \"nominal_capacity\" moved — \
+                 declare the DRIVE's generation as generation = \"LTO-6\"; capacity now \
+                 follows the cartridge's generation (ADR-0010); capacity_override is for \
+                 virtual drives only"
+            ));
+        }
+    }
+    None
+}
+
+/// Match a configured `device_tape` against a requested device path.
+///
+/// String equality first (the common case, and the only comparison that
+/// works for paths that don't exist — every microcosm test fixture uses
+/// `/dev/null` or a nonexistent placeholder for both); falling back to
+/// `std::fs::canonicalize` of both sides so a by-id symlink and the
+/// `/dev/nstN` it resolves to are recognised as the same drive.
+/// Canonicalize errors (either side missing) are treated as "no match", not
+/// propagated — this is a best-effort convenience, not a filesystem check.
+fn device_matches(configured: &str, requested: &str) -> bool {
+    if configured == requested {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(configured),
+        std::fs::canonicalize(requested),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Resolve the configured LTO backend for a WRITE path (`volume init`,
+/// `write`, `resume`, `compact-read`, `compact-write`) — STRICT (ADR-0010):
+/// an explicit `device` that matches no configured `device_tape` is an
+/// error, never a silent fallback to "whichever backend happened to be
+/// first", which is the exact shape of issue #141.
+///
+/// - `device` given: the backend whose `device_tape` matches (string or
+///   canonicalized path); no match is an error naming every configured
+///   `device_tape` so the operator can see what does exist.
+/// - `device` absent: the sole configured backend; zero is
+///   [`no_lto_backend_error`]; more than one is an error naming every
+///   backend and asking for `--device`.
+pub fn resolve_lto_backend<'a>(
+    config: &'a Config,
+    device: Option<&str>,
+) -> Result<&'a LtoBackendConfig> {
+    if let Some(dev) = device {
+        return config
+            .backends
+            .lto
+            .iter()
+            .find(|b| device_matches(&b.device_tape, dev))
+            .ok_or_else(|| {
+                let configured: Vec<&str> = config
+                    .backends
+                    .lto
+                    .iter()
+                    .map(|b| b.device_tape.as_str())
+                    .collect();
+                TapectlError::Config(format!(
+                    "no [[backends.lto]] entry has device_tape = {dev} (configured: {})",
+                    if configured.is_empty() {
+                        "none".to_string()
+                    } else {
+                        configured.join(", ")
+                    }
+                ))
+            });
+    }
+    match config.backends.lto.len() {
+        0 => Err(no_lto_backend_error(None)),
+        1 => Ok(&config.backends.lto[0]),
+        _ => {
+            let names: Vec<&str> = config
+                .backends
+                .lto
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect();
+            Err(TapectlError::Config(format!(
+                "multiple LTO backends configured ({}); pass --device to select one",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// Resolve a device path (and, if known, its backend) for a READ path
+/// (`volume identify`, `verify`, `read-slices`, `catalog rebuild`,
+/// `restore`) — LENIENT (ADR-0010): these must stay usable on a rebuilt
+/// machine that has keys and no `backend add` yet (ADR-0005's DR path), so
+/// an explicit `device` is used exactly as given and the backend is
+/// whatever matches it, or `None` — this function never errors when
+/// `device` is `Some`.
+///
+/// - `device` given: returned as-is, paired with whatever backend matches it
+///   (or `None`).
+/// - `device` absent: the sole configured backend's `device_tape`; zero
+///   backends is an error (there is truly nothing to read from); more than
+///   one is an error asking for `--device`, mirroring
+///   [`resolve_lto_backend`].
+pub fn resolve_device<'a>(
+    config: &'a Config,
+    device: Option<&str>,
+) -> Result<(String, Option<&'a LtoBackendConfig>)> {
+    if let Some(dev) = device {
+        let backend = config
+            .backends
+            .lto
+            .iter()
+            .find(|b| device_matches(&b.device_tape, dev));
+        return Ok((dev.to_string(), backend));
+    }
+    match config.backends.lto.len() {
+        0 => Err(TapectlError::Config(
+            "no drive configured and no --device given".to_string(),
+        )),
+        1 => {
+            let b = &config.backends.lto[0];
+            Ok((b.device_tape.clone(), Some(b)))
+        }
+        _ => {
+            let names: Vec<&str> = config
+                .backends
+                .lto
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect();
+            Err(TapectlError::Config(format!(
+                "multiple LTO backends configured ({}); pass --device to select one",
+                names.join(", ")
+            )))
+        }
+    }
 }
 
 /// Resolved paths for the tapectl home directory.
@@ -789,9 +1018,13 @@ mod tests {
         assert!(!b.name.is_empty());
         assert!(b.device_tape.starts_with("/dev/"));
         assert!(b.device_sg.starts_with("/dev/"));
-        // The capacity string must survive the same parser the write path uses.
-        crate::staging::parse_size_to_bytes(&b.nominal_capacity)
-            .expect("example nominal_capacity must parse");
+        // ADR-0010: the example declares a generation, not a capacity — it
+        // must survive the same parser `config check`/`Config::load` uses.
+        assert!(
+            crate::media::Generation::parse(&b.generation).is_some(),
+            "example generation {:?} must parse",
+            b.generation
+        );
     }
 
     /// As shipped (fully commented) the example must be inert: appending it to
@@ -807,5 +1040,189 @@ mod tests {
             cfg.backends.lto.is_empty(),
             "the shipped example must declare no backend"
         );
+    }
+
+    // ---- ADR-0010: stale-field pre-scan ----
+
+    #[test]
+    fn stale_media_type_is_named_with_the_exact_remediation() {
+        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+                     device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
+                     nominal_capacity = \"2.5TB\"\n";
+        let msg = stale_lto_fields_message(text).expect("must be flagged");
+        assert!(msg.contains("backends.lto[\"lto1\"]"), "{msg}");
+        assert!(
+            msg.contains("media_type") && msg.contains("nominal_capacity"),
+            "{msg}"
+        );
+        assert!(msg.contains("ADR-0010"), "{msg}");
+    }
+
+    #[test]
+    fn stale_nominal_capacity_alone_is_also_flagged() {
+        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
+                     nominal_capacity = \"2.5TB\"\n";
+        assert!(stale_lto_fields_message(text).is_some());
+    }
+
+    #[test]
+    fn a_clean_generation_only_backend_is_not_flagged() {
+        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n";
+        assert!(stale_lto_fields_message(text).is_none());
+    }
+
+    #[test]
+    fn syntactically_invalid_toml_is_not_flagged_here() {
+        // Not this function's job — the normal toml::from_str error surfaces
+        // unchanged for a genuinely broken file.
+        assert!(stale_lto_fields_message("this is not [ toml").is_none());
+    }
+
+    #[test]
+    fn config_load_rejects_a_stale_backend_with_the_friendly_message() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+             device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
+             nominal_capacity = \"2.5TB\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("moved"), "{msg}");
+        assert!(msg.contains("ADR-0010"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_an_unparseable_generation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"not-a-generation\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("generation"), "{err}");
+    }
+
+    // ---- ADR-0010: resolve_lto_backend (strict) ----
+
+    fn backend_with(name: &str, device_tape: &str) -> LtoBackendConfig {
+        LtoBackendConfig {
+            name: name.to_string(),
+            device_tape: device_tape.to_string(),
+            device_sg: "/dev/sg0".to_string(),
+            generation: "LTO-6".to_string(),
+            capacity_override: None,
+            usable_capacity_factor: default_usable_capacity_factor(),
+            enospc_buffer: default_enospc_buffer(),
+            block_size: default_block_size(),
+            hardware_compression: false,
+        }
+    }
+
+    #[test]
+    fn resolve_lto_backend_with_device_matches_by_string() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        let b = resolve_lto_backend(&config, Some("/dev/null")).unwrap();
+        assert_eq!(b.name, "a");
+    }
+
+    #[test]
+    fn resolve_lto_backend_with_device_and_no_match_errors_naming_configured() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        let err = resolve_lto_backend(&config, Some("/dev/nonexistent-xyz")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/dev/null"), "{msg}");
+        assert!(msg.contains("/dev/nonexistent-xyz"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_lto_backend_no_device_sole_backend_is_used() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        let b = resolve_lto_backend(&config, None).unwrap();
+        assert_eq!(b.name, "a");
+    }
+
+    #[test]
+    fn resolve_lto_backend_no_device_zero_backends_is_no_lto_backend_error() {
+        let config = Config::default();
+        let err = resolve_lto_backend(&config, None).unwrap_err();
+        assert!(err.to_string().contains("no LTO backend configured"));
+    }
+
+    #[test]
+    fn resolve_lto_backend_no_device_multiple_backends_errors_naming_them() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        config.backends.lto.push(backend_with("b", "/dev/zero"));
+        let err = resolve_lto_backend(&config, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('a') && msg.contains('b'), "{msg}");
+        assert!(msg.contains("--device"), "{msg}");
+    }
+
+    // ---- ADR-0010: resolve_device (lenient) ----
+
+    #[test]
+    fn resolve_device_with_device_never_errors_even_with_zero_backends() {
+        let config = Config::default();
+        let (device, backend) = resolve_device(&config, Some("/dev/whatever")).unwrap();
+        assert_eq!(device, "/dev/whatever");
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn resolve_device_with_device_finds_a_matching_backend() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        let (device, backend) = resolve_device(&config, Some("/dev/null")).unwrap();
+        assert_eq!(device, "/dev/null");
+        assert_eq!(backend.unwrap().name, "a");
+    }
+
+    #[test]
+    fn resolve_device_with_device_and_no_matching_backend_returns_none_not_error() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        let (device, backend) = resolve_device(&config, Some("/dev/nonexistent-xyz")).unwrap();
+        assert_eq!(device, "/dev/nonexistent-xyz");
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn resolve_device_no_device_sole_backend_is_used() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        let (device, backend) = resolve_device(&config, None).unwrap();
+        assert_eq!(device, "/dev/null");
+        assert_eq!(backend.unwrap().name, "a");
+    }
+
+    #[test]
+    fn resolve_device_no_device_zero_backends_errors() {
+        let config = Config::default();
+        let err = resolve_device(&config, None).unwrap_err();
+        assert!(err.to_string().contains("no drive configured"));
+    }
+
+    #[test]
+    fn resolve_device_no_device_multiple_backends_errors_naming_them() {
+        let mut config = Config::default();
+        config.backends.lto.push(backend_with("a", "/dev/null"));
+        config.backends.lto.push(backend_with("b", "/dev/zero"));
+        let err = resolve_device(&config, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('a') && msg.contains('b'), "{msg}");
+        assert!(msg.contains("--device"), "{msg}");
     }
 }
