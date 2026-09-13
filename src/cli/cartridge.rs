@@ -44,6 +44,20 @@ pub enum CartridgeCommands {
         /// Barcode
         barcode: String,
     },
+    /// Move a cartridge to a location, taking its volumes with it
+    ///
+    /// ADR-0011: a cartridge's PLACE is a location, not a status. This moves
+    /// `cartridges.location_id` and the `location_id` of every volume
+    /// currently on the cartridge, in one transaction, so the shelf and the
+    /// catalog cannot disagree. `volume move` does the same from the other
+    /// end.
+    Move {
+        /// Barcode
+        barcode: String,
+        /// Destination location name
+        #[arg(long)]
+        to: String,
+    },
     /// Mark a cartridge as erased (available for reuse)
     MarkErased {
         /// Barcode
@@ -205,6 +219,28 @@ pub fn run(
                         };
                         println!("    {label} ({status}, mounted {mounted})");
                     }
+                }
+            }
+        }
+        CartridgeCommands::Move { barcode, to } => {
+            let outcome = crate::cli::location::move_cartridge(conn, barcode, to)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "barcode": barcode,
+                        "location": to,
+                        "volumes_moved": outcome.volumes,
+                    })
+                );
+            } else {
+                println!("cartridge \"{barcode}\" moved to \"{to}\"");
+                match outcome.volumes.len() {
+                    0 => println!("  no volumes on this cartridge"),
+                    n => println!(
+                        "  {n} volume(s) moved with it: {}",
+                        outcome.volumes.join(", ")
+                    ),
                 }
             }
         }

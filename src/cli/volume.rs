@@ -429,11 +429,39 @@ pub fn run(
         }
 
         VolumeCommands::Move { label, to } => {
-            crate::cli::location::move_volume(conn, label, to)?;
+            let outcome = crate::cli::location::move_volume(conn, label, to)?;
             if json_output {
-                println!("{}", serde_json::json!({"label": label, "location": to}));
+                // `cartridge`/`volumes_moved` are ADDITIVE (ADR-0011): the
+                // move now carries the cartridge and any other volume on it,
+                // and a consumer that only reads `label`/`location` sees
+                // exactly what it saw before.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "label": label,
+                        "location": to,
+                        "cartridge": outcome.cartridge,
+                        "volumes_moved": outcome.volumes,
+                    })
+                );
             } else {
                 println!("volume \"{label}\" moved to \"{to}\"");
+                if let Some(barcode) = &outcome.cartridge {
+                    println!("  cartridge \"{barcode}\" moved with it");
+                    let others: Vec<&String> =
+                        outcome.volumes.iter().filter(|l| *l != label).collect();
+                    if !others.is_empty() {
+                        println!(
+                            "  {} other volume(s) on that cartridge moved too: {}",
+                            others.len(),
+                            others
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
             }
         }
 

@@ -219,23 +219,51 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
     Ok(())
 }
 
-/// Move a volume to a location (used by volume move command).
-pub fn move_volume(conn: &Connection, volume_label: &str, location_name: &str) -> Result<()> {
-    let vol_id: i64 = conn
-        .query_row(
-            "SELECT id FROM volumes WHERE label = ?1",
-            params![volume_label],
-            |row| row.get(0),
-        )
-        .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
+/// Everything one move touched: the cartridge that physically moved (when
+/// there was one) and every volume that went with it.
+#[derive(Debug)]
+pub struct MoveOutcome {
+    pub cartridge: Option<String>,
+    pub volumes: Vec<String>,
+}
 
+/// The single mover behind BOTH `volume move` and `cartridge move`
+/// (ADR-0011: "Both write the same two rows, so the cartridge's place and
+/// its volumes' places cannot disagree").
+///
+/// There is deliberately no second implementation. A cartridge is the thing
+/// that physically moves and the data goes with it, so whichever noun the
+/// operator names, the same rows change: `cartridges.location_id`, and
+/// `volumes.location_id` for every volume currently mounted on it. Two
+/// writers would let a cartridge sit in `offsite` while its volume claimed
+/// `home-rack` — the exact drift ADR-0011 removed the `offsite` STATUS to
+/// prevent.
+///
+/// `volume_movements` gets a row per volume regardless of which command was
+/// used, so a volume's movement history does not depend on which noun the
+/// operator happened to type.
+fn move_together(
+    conn: &Connection,
+    cartridge: Option<(i64, String)>,
+    volumes: &[(i64, String)],
+    location_name: &str,
+) -> Result<MoveOutcome> {
     let (loc_id, loc_kind): (i64, String) = conn
         .query_row(
             "SELECT id, kind FROM locations WHERE name = ?1",
             params![location_name],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|_| TapectlError::Other(format!("location \"{location_name}\" not found")))?;
+        .map_err(|_| {
+            let known = known_location_names(conn).unwrap_or_default();
+            let list = if known.is_empty() {
+                "no locations are defined yet — add one with `tapectl location add <NAME>`"
+                    .to_string()
+            } else {
+                format!("known locations: {}", known.join(", "))
+            };
+            TapectlError::Other(format!("location \"{location_name}\" not found ({list})"))
+        })?;
 
     // Issue #100 (fallout from #73). `volumes.location_id` answers exactly one
     // question — "where do I go to fetch this cartridge" — and the answer can
@@ -248,55 +276,169 @@ pub fn move_volume(conn: &Connection, volume_label: &str, location_name: &str) -
     // deposits, and a deposit never moves). See the header of
     // 007_warehouse_locations.sql.
     //
-    // `move_volume` is the only production writer of `volumes.location_id` —
-    // audited at the time of this change — so this one refusal closes the
-    // whole path.
+    // ADR-0011 adds `cartridges.location_id` as a second column this refusal
+    // has to cover, and it covers it for the same reason and more literally:
+    // a physical cartridge cannot be inside a bucket. This function is the
+    // only production writer of EITHER column, so the one refusal still closes
+    // the whole path.
     if loc_kind == "warehouse" {
+        let hint = volumes
+            .first()
+            .map(|(_, label)| {
+                format!(
+                    "To record that a copy of this volume was uploaded to \
+                     \"{location_name}\", use:\n    \
+                     tapectl volume deposit add {label} --to {location_name}"
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "A warehouse only ever receives RECORDED deposits of sealed volumes \
+                     (`tapectl volume deposit add <LABEL> --to {location_name}`)."
+                )
+            });
         return Err(TapectlError::Other(format!(
             "\"{location_name}\" is a warehouse location, and a physical cartridge cannot \
-             be moved into one — `volumes.location_id` records where to go to FETCH the \
-             tape. To record that a copy of this volume was uploaded to \
-             \"{location_name}\", use:\n    \
-             tapectl volume deposit add {volume_label} --to {location_name}"
+             be moved into one — `location_id` records where to go to FETCH the \
+             tape. {hint}"
         )));
     }
 
-    let old_loc: Option<i64> = conn.query_row(
-        "SELECT location_id FROM volumes WHERE id = ?1",
-        params![vol_id],
-        |row| row.get(0),
-    )?;
+    // One transaction: a cartridge recorded in a new place while its volumes
+    // still claim the old one is precisely the disagreement ADR-0011 exists to
+    // make impossible, and a half-applied move would create it.
+    let tx = conn.unchecked_transaction()?;
 
-    // Record movement
-    conn.execute(
-        "INSERT INTO volume_movements (volume_id, from_location, to_location)
-         VALUES (?1, ?2, ?3)",
-        params![vol_id, old_loc, loc_id],
-    )?;
+    if let Some((cart_id, barcode)) = &cartridge {
+        let old_loc: Option<i64> = tx.query_row(
+            "SELECT location_id FROM cartridges WHERE id = ?1",
+            params![cart_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "UPDATE cartridges SET location_id = ?1 WHERE id = ?2",
+            params![loc_id, cart_id],
+        )?;
+        events::log_field_change(
+            &tx,
+            "cartridge",
+            *cart_id,
+            barcode,
+            "moved",
+            "location",
+            old_loc.map(|id| id.to_string()).as_deref(),
+            location_name,
+            None,
+        )?;
+    }
 
-    conn.execute(
-        "UPDATE volumes SET location_id = ?1 WHERE id = ?2",
-        params![loc_id, vol_id],
-    )?;
+    for (vol_id, label) in volumes {
+        let old_loc: Option<i64> = tx.query_row(
+            "SELECT location_id FROM volumes WHERE id = ?1",
+            params![vol_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO volume_movements (volume_id, from_location, to_location)
+             VALUES (?1, ?2, ?3)",
+            params![vol_id, old_loc, loc_id],
+        )?;
+        tx.execute(
+            "UPDATE volumes SET location_id = ?1 WHERE id = ?2",
+            params![loc_id, vol_id],
+        )?;
+        events::log_field_change(
+            &tx,
+            "volume",
+            *vol_id,
+            label,
+            "moved",
+            "location",
+            old_loc.map(|id| id.to_string()).as_deref(),
+            location_name,
+            None,
+        )?;
+    }
 
-    events::log_field_change(
+    tx.commit()?;
+
+    Ok(MoveOutcome {
+        cartridge: cartridge.map(|(_, barcode)| barcode),
+        volumes: volumes.iter().map(|(_, label)| label.clone()).collect(),
+    })
+}
+
+fn known_location_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM locations ORDER BY name")?;
+    let names = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(names)
+}
+
+/// Every volume currently mounted on `cartridge_id`, in label order.
+fn mounted_volumes(conn: &Connection, cartridge_id: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.label FROM cartridge_volumes cv
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL
+         ORDER BY v.label",
+    )?;
+    let rows = stmt
+        .query_map(params![cartridge_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Move a volume to a location (used by `volume move`).
+pub fn move_volume(
+    conn: &Connection,
+    volume_label: &str,
+    location_name: &str,
+) -> Result<MoveOutcome> {
+    let vol_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![volume_label],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
+
+    move_together(
         conn,
-        "volume",
-        vol_id,
-        volume_label,
-        "moved",
-        "location",
-        old_loc.map(|id| id.to_string()).as_deref(),
-        location_name,
         None,
-    )?;
+        &[(vol_id, volume_label.to_string())],
+        location_name,
+    )
+}
 
-    Ok(())
+/// Move a cartridge to a location (used by `cartridge move`).
+///
+/// ADR-0011: `offsite` left `cartridges.status` because it was never a
+/// status — it is a place, and this is the writer for it. The cartridge is
+/// the thing that physically moves; every volume on it goes along.
+pub fn move_cartridge(conn: &Connection, barcode: &str, location_name: &str) -> Result<MoveOutcome> {
+    let cart_id: i64 = conn
+        .query_row(
+            "SELECT id FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |row| row.get(0),
+        )
+        .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    let volumes = mounted_volumes(conn, cart_id)?;
+    move_together(
+        conn,
+        Some((cart_id, barcode.to_string())),
+        &volumes,
+        location_name,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     /// `location list --json` shape (issue: C2 row-listing drift).
     #[test]
@@ -396,6 +538,141 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM volume_movements", [], |r| r.get(0))
             .unwrap();
         assert_eq!(movements, 1);
+    }
+
+    // ---- ADR-0011: a cartridge's place is a location ----
+
+    /// Seed `setup()` plus a cartridge holding `L6-0001` and a second volume
+    /// `L6-0002` on the SAME cartridge — the multi-volume shape that makes
+    /// "the cartridge is the thing that moves" visible.
+    fn setup_bound() -> Connection {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-0002', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+             VALUES ('A001L6', 'LTO-6', 2500000000000, 'in_use')",
+            [],
+        )
+        .unwrap();
+        let cart_id = conn.last_insert_rowid();
+        for label in ["L6-0001", "L6-0002"] {
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id)
+                 SELECT ?1, id FROM volumes WHERE label = ?2",
+                params![cart_id, label],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn location_of(conn: &Connection, table: &str, key_col: &str, key: &str) -> Option<String> {
+        conn.query_row(
+            &format!(
+                "SELECT l.name FROM {table} t JOIN locations l ON l.id = t.location_id
+                 WHERE t.{key_col} = ?1"
+            ),
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// ADR-0011's whole point: the cartridge's place and its volumes' places
+    /// cannot disagree, because one writer sets both.
+    #[test]
+    fn cartridge_move_moves_the_cartridge_and_every_volume_on_it() {
+        let conn = setup_bound();
+        let outcome = move_cartridge(&conn, "A001L6", "home").unwrap();
+
+        assert_eq!(outcome.cartridge.as_deref(), Some("A001L6"));
+        assert_eq!(outcome.volumes, vec!["L6-0001", "L6-0002"]);
+        assert_eq!(
+            location_of(&conn, "cartridges", "barcode", "A001L6").as_deref(),
+            Some("home")
+        );
+        for label in ["L6-0001", "L6-0002"] {
+            assert_eq!(
+                location_of(&conn, "volumes", "label", label).as_deref(),
+                Some("home"),
+                "volume {label} must move with the plastic it is written on"
+            );
+        }
+        // Movement history does not depend on which noun the operator typed.
+        let movements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM volume_movements", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(movements, 2);
+    }
+
+    /// An UNMOUNTED (displaced) volume is not on the cartridge any more, so
+    /// it must not be dragged around by it. `cartridge_volumes.unmounted_at`
+    /// is the discriminator every other path in this codebase uses.
+    #[test]
+    fn an_unmounted_volume_does_not_move_with_the_cartridge() {
+        let conn = setup_bound();
+        conn.execute(
+            "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
+             WHERE volume_id = (SELECT id FROM volumes WHERE label = 'L6-0002')",
+            [],
+        )
+        .unwrap();
+
+        let outcome = move_cartridge(&conn, "A001L6", "home").unwrap();
+        assert_eq!(outcome.volumes, vec!["L6-0001"]);
+        assert_eq!(
+            location_of(&conn, "volumes", "label", "L6-0002"),
+            None,
+            "a displaced volume's bytes are gone from this cartridge; it does not travel with it"
+        );
+    }
+
+    /// Issue #100's refusal now guards `cartridges.location_id` too — a
+    /// physical cartridge cannot be inside an S3 bucket, and it is more
+    /// literally true of the cartridge than of the volume.
+    #[test]
+    fn cartridge_move_refuses_a_warehouse_destination() {
+        let conn = setup_bound();
+        let err = move_cartridge(&conn, "A001L6", "glacier")
+            .expect_err("a cartridge cannot be moved into cold cloud storage");
+        assert!(
+            err.to_string().contains("volume deposit add"),
+            "the refusal must name the thing the operator probably meant; got: {err}"
+        );
+        assert_eq!(
+            location_of(&conn, "cartridges", "barcode", "A001L6"),
+            None,
+            "a refused move must not update the cartridge's location"
+        );
+        assert_eq!(
+            location_of(&conn, "volumes", "label", "L6-0001"),
+            None,
+            "a refused move must not update any volume's location either"
+        );
+    }
+
+    /// An unknown destination names the ones that exist — the operator
+    /// mistyped, and the fix is right there.
+    #[test]
+    fn an_unknown_location_names_the_known_ones() {
+        let conn = setup_bound();
+        let err = move_cartridge(&conn, "A001L6", "hom").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("glacier") && msg.contains("home"), "got: {msg}");
+    }
+
+    #[test]
+    fn moving_an_unknown_cartridge_says_so() {
+        let conn = setup_bound();
+        let err = move_cartridge(&conn, "NOPE", "home").unwrap_err();
+        assert!(err.to_string().contains("NOPE"));
     }
 
     /// An unknown location must still be a not-found error, not the new
