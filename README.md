@@ -42,6 +42,11 @@ cartridge, and the first write with `verify --full`. Resumable with `--from N`;
 `--home DIR` rehearses against a throwaway home; `--no-service-user` runs
 everything as you. The manual route follows.
 
+One drive handles more than one LTO generation. Declare what the drive *is*
+(`generation = "LTO-6"`); each cartridge's own generation is read from its
+density code when the volume is initialised, and that is what fixes the tape's
+capacity and whether the drive may write it at all.
+
 
 ```bash
 # Initialize tapectl (creates ~/.tapectl with DB, config, operator keys)

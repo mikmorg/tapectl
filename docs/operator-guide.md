@@ -137,9 +137,10 @@ binary = "/usr/bin/dar"    # Path to dar binary
 
 [[backends.lto]]
 name = "lto-primary"
-device_tape = "/dev/nst0"
-media_type = "LTO-6"
-nominal_capacity = "2500G"
+device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"   # by-id: /dev/nstN moves across reboots
+device_sg = "/dev/sg1"
+generation = "LTO-6"        # what the DRIVE is, not what you feed it
+# capacity_override = "2400M"   # virtual drives and test harnesses only
 
 [staging]
 directory = "/mnt/staging"  # Needs space for dar + encrypted slices
@@ -844,12 +845,34 @@ tapectl volume compact L6-0001 --device /dev/nst0
 
 ## Cartridge Tracking
 
+You usually do not register cartridges by hand. `volume init` reads the medium
+serial from the cartridge's MAM, matches it to a cartridge you already
+registered, and registers one for you if there is none — so the catalog knows
+which physical tape carries which volume without your typing it (ADR-0010).
+Register by hand only when you want your own barcode rather than the medium
+serial, and do it before the first `volume init` on that tape.
+
 ```bash
-tapectl cartridge register --barcode L6-0001 --media-type LTO-6
-tapectl cartridge list
+tapectl cartridge register --barcode L6-0001 --media-type LTO-6   # optional; capacity comes from the generation
+tapectl cartridge list                      # barcode, generation, status, location, volume
 tapectl cartridge info L6-0001
-tapectl cartridge mark-erased L6-0001  # After physical erase
+tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
+tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
+tapectl cartridge mark-erased L6-0001       # after a physical erase, and the only way back from retire
 ```
+
+**A cartridge's place is a location, never a status** (ADR-0011). "Offsite" is
+a location you named with `location add`, and `cartridge move` puts the
+cartridge and all its volumes there in one step, so the shelf and the catalog
+cannot drift apart. `volume move` does the same from the other end.
+
+**Mixing LTO generations.** An LTO-6 drive writes LTO-5 and LTO-6 media, so one
+drive can hold both. Declare the drive once as `generation = "LTO-6"`; tapectl
+reads each cartridge's own generation from its density code at `volume init`
+and plans that tape against that generation's capacity — 1.5 TB for LTO-5,
+2.5 TB for LTO-6. There is nothing to change between tapes and nothing to
+remember. If you load media the drive cannot write, `volume init` refuses
+before touching the tape, and no `--force` overrides it.
 
 ## Key Management
 
