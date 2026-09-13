@@ -33,7 +33,7 @@
 //! error, because either the row is wrong or the wrong tape is loaded and
 //! tapectl cannot tell which.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::cli::operations::{retire_impacts, RetireImpact};
 use crate::db::events;
@@ -130,6 +130,22 @@ pub(crate) fn lookup_cartridge(
                  from its MAM serial."
             ))
         })?;
+        // Reaching here means the loaded medium's serial matched no row. If
+        // this one already carries a DIFFERENT serial it is a different
+        // physical cartridge, and binding anyway would strand the volume:
+        // the first `volume write` re-reads the serial and refuses. Silently
+        // re-pointing the row at this medium instead would be worse — it
+        // would rewrite one cartridge's identity and history as another's.
+        if let (Some(recorded), Some(loaded)) = (&row.serial_number, serial) {
+            if recorded != loaded {
+                return Err(TapectlError::Other(format!(
+                    "cartridge \"{barcode}\" is registered with medium serial {recorded}, \
+                     but the drive holds {loaded}. That is a different physical cartridge. \
+                     Load {barcode}, or omit --cartridge and let this medium register \
+                     itself."
+                )));
+            }
+        }
         return Ok(CartridgeLookup {
             row: Some(row),
             superseded_request: None,
@@ -145,6 +161,10 @@ fn select_cartridge(conn: &Connection, column: &str, value: &str) -> Result<Opti
         "SELECT id, barcode, media_type, nominal_capacity, status, serial_number
          FROM cartridges WHERE {column} = ?1"
     );
+    // `.optional()?`, never `.ok()`: a locked database or a malformed query
+    // must surface as an error, not silently read as "not registered" — which
+    // would auto-register a duplicate cartridge for a tape that already has
+    // one.
     let row = conn
         .query_row(&sql, params![value], |r| {
             Ok(CartridgeRow {
@@ -156,7 +176,7 @@ fn select_cartridge(conn: &Connection, column: &str, value: &str) -> Result<Opti
                 serial_number: r.get(5)?,
             })
         })
-        .ok();
+        .optional()?;
     Ok(row)
 }
 
@@ -246,18 +266,18 @@ pub(crate) fn bind_cartridge(
 
     // --- record the displacement (ADR-0010: never refuse it) -------------
     let mut stmt = conn.prepare(
-        "SELECT v.id, v.label FROM cartridge_volumes cv
+        "SELECT v.id, v.label, v.status FROM cartridge_volumes cv
          JOIN volumes v ON v.id = cv.volume_id
          WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL AND cv.volume_id != ?2",
     )?;
-    let displaced: Vec<(i64, String)> = stmt
+    let displaced: Vec<(i64, String, String)> = stmt
         .query_map(params![cartridge_id, volume_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
-    for (vol_id, label) in &displaced {
+    for (vol_id, label, prior) in &displaced {
         // Computed BEFORE the status change, so the evidence describes the
         // world the operator is being warned about.
         let impacts = retire_impacts(conn, *vol_id)?;
@@ -266,7 +286,15 @@ pub(crate) fn bind_cartridge(
             params![vol_id],
         )?;
         events::log_field_change(
-            conn, "volume", *vol_id, label, "erased", "status", None, "erased", None,
+            conn,
+            "volume",
+            *vol_id,
+            label,
+            "erased",
+            "status",
+            Some(prior),
+            "erased",
+            None,
         )?;
         events::log_event(
             conn,
@@ -424,6 +452,47 @@ mod tests {
         let found = lookup_cartridge(&conn, Some("SER-1"), Some("BC002")).unwrap();
         assert_eq!(found.row.unwrap().barcode, "BC001");
         assert_eq!(found.superseded_request.as_deref(), Some("BC002"));
+    }
+
+    /// `--cartridge B` where B already carries a DIFFERENT medium serial is
+    /// a different physical cartridge. Binding anyway would strand the
+    /// volume — the first `volume write` re-reads the serial and refuses —
+    /// and re-pointing B's row at this medium would rewrite one cartridge's
+    /// identity as another's.
+    #[test]
+    fn cartridge_flag_naming_a_row_with_a_different_serial_is_an_error() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let err = lookup_cartridge(&conn, Some("SER-2"), Some("BC001"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("registered with medium serial SER-1"), "{err}");
+        assert!(err.contains("the drive holds SER-2"), "{err}");
+    }
+
+    /// ...but re-naming the SAME cartridge is fine, and so is naming one
+    /// that has never been in a drive.
+    #[test]
+    fn cartridge_flag_naming_a_matching_or_serial_less_row_is_accepted() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        register(&conn, "BC002", "LTO-6", None, "available");
+        assert_eq!(
+            lookup_cartridge(&conn, Some("SER-1"), Some("BC001"))
+                .unwrap()
+                .row
+                .unwrap()
+                .barcode,
+            "BC001"
+        );
+        assert_eq!(
+            lookup_cartridge(&conn, Some("SER-9"), Some("BC002"))
+                .unwrap()
+                .row
+                .unwrap()
+                .barcode,
+            "BC002"
+        );
     }
 
     // ---- bind_cartridge --------------------------------------------------

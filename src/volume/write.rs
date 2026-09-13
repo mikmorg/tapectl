@@ -348,12 +348,12 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
     }
     match &bound.barcode {
         Some(barcode) if bound.auto_registered => {
-            println!("cartridge {barcode} auto-registered from MAM (barcode = medium serial)");
+            eprintln!("cartridge {barcode} auto-registered from MAM (barcode = medium serial)");
         }
         Some(barcode) => {
-            println!("volume \"{label}\" bound to cartridge {barcode}");
+            eprintln!("volume \"{label}\" bound to cartridge {barcode}");
             if bound.serial_recorded {
-                println!("  medium serial recorded on cartridge {barcode}");
+                eprintln!("  medium serial recorded on cartridge {barcode}");
             }
         }
         None => {
@@ -668,9 +668,11 @@ pub fn volume_write(
         label: label.to_string(),
         volume_uuid,
         // The generation of the medium this volume was initialised on, not
-        // the drive's (ADR-0010). Blank only for a pre-ADR-0010 row that
-        // never recorded one.
-        media_type: volume_media_type.clone().unwrap_or_default(),
+        // the drive's (ADR-0010). Only a pre-ADR-0010 row can lack one, and
+        // the drive's own generation is a better ID-thunk value than a blank.
+        media_type: volume_media_type
+            .clone()
+            .unwrap_or_else(|| backend.generation.clone()),
         tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at,
         block_size: block_size as u64,
