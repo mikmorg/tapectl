@@ -34,7 +34,7 @@
 # the service user can execute (your home is not traversable by it):
 #   install -m 0755 target/debug/tapectl /scratch/fr-bin/tapectl
 #   scripts/first-run.sh --auto --home /tmp/fr-home --tapectl /scratch/fr-bin/tapectl \
-#       --device /dev/tape/by-id/scsi-XYZZY_A1-nst --sg /dev/sg1 --label L6-TEST \
+#       --device /dev/tape/by-id/scsi-XYZZY_A1-nst --sg /dev/sg1 --generation LTO-8 --label L6-TEST \
 #       --tenant alice --unit-path /tmp/fr-src/photos --skip-build --skip-tests
 set -euo pipefail
 
@@ -44,7 +44,7 @@ FROM=0
 TO=99
 TAPECTL=""             # binary; resolved in step 0 unless given
 AUTO=0                 # accept defaults for non-destructive prompts
-DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; BARCODE=""
+DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; BARCODE=""; DGEN=""
 SKIP_BUILD=0; SKIP_TESTS=0
 SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
 usage() {
@@ -61,6 +61,7 @@ Options:
   --auto            take defaults for non-destructive prompts (for scripted rehearsal)
   --device PATH     tape device by-id path (skips the interactive pick in step 5)
   --sg PATH         matching /dev/sgN (derived from sysfs when omitted)
+  --generation GEN  the generation this DRIVE natively writes (default asked; e.g. LTO-6)
   --label L         first volume label (default asked; e.g. L6-0001)
   --operator NAME   operator name for init (default: \$USER)
   --tenant NAME     first tenant (default asked)
@@ -82,6 +83,7 @@ while [ $# -gt 0 ]; do
     --auto) AUTO=1; shift ;;
     --device) DEVICE="$2"; shift 2 ;;
     --sg) SG="$2"; shift 2 ;;
+    --generation) DGEN="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
     --operator) OPERATOR="$2"; shift 2 ;;
     --tenant) TENANT="$2"; shift 2 ;;
@@ -413,7 +415,12 @@ explain <<'EOF'
 EOF
   [ -n "$DEVICE" ] || die "no device chosen — run with --from 6"
   ask BNAME "backend name" "lto6"
-  ask DGEN "generation this DRIVE natively writes (LTO-5 … LTO-9)" "LTO-6"
+  # Default to what the drive reports for the loaded medium: on a drive holding
+  # its own native generation that is the right answer, and it is never a worse
+  # guess than a hardcoded one.
+  DSEEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
+  [ -n "$DSEEN" ] && note "the drive currently reports $DSEEN media loaded"
+  ask DGEN "generation this DRIVE natively writes (LTO-5 … LTO-9)" "${DGEN:-${DSEEN:-LTO-6}}"
   run tc backend add --name "$BNAME" --device-tape "$DEVICE" --device-sg "$SG" --generation "$DGEN"
   run tc config check || true
 fi
