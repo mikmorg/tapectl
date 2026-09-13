@@ -35,7 +35,25 @@ writes it, and it is Tier 2 under ADR-0008 — it removes a physical copy from e
 count that policy computes, so the evidence is displayed first and `--force`/`--yes` is
 required when any unit is left below its policy. It is the cartridge-level peer of `volume
 retire`, which already does exactly this analysis, and it reuses that analysis rather than
-growing a second one. A retired cartridge cannot be bound by `volume init`, and that refusal
+growing a second one.
+
+**Retiring a cartridge retires the volumes on it.** That sentence above — "removes a
+physical copy from every coverage count" — is only true if something makes it true, and
+every coverage count in `policy::coverage` is a predicate over `volumes.status`. So
+`cartridge retire` sets its bound volumes to `retired` in the same transaction. Without it
+the command's own justification would be false: `audit` would go on crediting a full copy to
+a medium the operator has just declared unfit, which is the over-crediting direction, the
+dangerous one. It does not claim the data is unreadable — a retired volume can still be
+restored from, and the mounts stay open so `cartridge mark-erased` remains the step that
+says the bytes are gone. It claims only that a tape you have condemned must stop counting as
+a copy you could fall back on.
+
+**Retiring a volume frees its cartridge.** The reverse direction already existed for
+compaction — `compact-finish` sets the cartridge to `pending_erase` — but `volume retire`
+never touched `cartridges` at all, because until ADR-0010 no volume knew which cartridge it
+was on. Now that it does, retiring the last live volume on a cartridge moves that cartridge
+to `pending_erase`, which is what makes the state reachable by the ordinary path rather than
+only through compaction. A retired cartridge cannot be bound by `volume init`, and that refusal
 is a fact error, not a risk judgement: ADR-0010 lets init record a displacement without
 consent because File 0 already decided it, but no amount of consent makes a medium you have
 declared unfit fit again. The escape is `cartridge mark-erased`, which is the operator saying
