@@ -297,7 +297,17 @@ fn cmd_init(
     // and toml round-trips drop comments, so the section cannot be carried in
     // the struct — leaving a fresh config with no hint that a tape drive must
     // be declared at all, or what it needs (#124).
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // Issue #140: the staging default is `<tapectl home>/staging`, and the
+    // home a fresh init is actually using may be `--home`/`TAPECTL_HOME`
+    // rather than the default one the serde default can see. Record the real
+    // one, and CREATE it here with the same 0700 discipline as the rest of
+    // the home — a default path that does not exist is what made
+    // `config check`'s staging warning fire on every stock machine.
+    let staging_dir = paths.home.join("staging");
+    std::fs::create_dir_all(&staging_dir).context("failed to create the staging directory")?;
+    tapectl::config::secure_path(&staging_dir, 0o700);
+    cfg.staging.directory = staging_dir.to_string_lossy().into_owned();
     cfg.save(&paths.config_file)?;
     {
         use std::io::Write;

@@ -346,8 +346,23 @@ pub struct StagingConfig {
     pub directory: String,
 }
 
+/// Issue #140: this was `/mnt/staging`, a path that does not exist on a
+/// stock machine and is root-owned where it does. `config check` has warned
+/// about it since #62 — but a default that is always wrong makes a warning
+/// into noise, and `init` was writing it into every fresh config.
+///
+/// `<tapectl home>/staging` at least exists and is writable by the user who
+/// ran `init`, which creates it with the same 0700 discipline as the rest of
+/// the home. This free function cannot see `--home`/`TAPECTL_HOME` (it is a
+/// serde default, invoked with no context), so it answers for the DEFAULT
+/// home; `init` overwrites it with the real one before saving. That only
+/// matters for a config that omits `[staging] directory` entirely under a
+/// non-default home — a case `config check` still reports honestly.
 fn default_staging_dir() -> String {
-    "/mnt/staging".to_string()
+    default_home()
+        .join("staging")
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl Default for StagingConfig {
@@ -1100,6 +1115,22 @@ mod tests {
             cfg.backends.lto.is_empty(),
             "the shipped example must declare no backend"
         );
+    }
+
+    /// Issue #140: the default was `/mnt/staging`, which on a stock machine
+    /// does not exist and where it does is root-owned — so `init` wrote a
+    /// path that was never going to work and `config check` warned about it
+    /// forever. The default must now be somewhere the user who ran `init`
+    /// can actually write.
+    #[test]
+    fn the_default_staging_dir_lives_under_the_tapectl_home() {
+        let dir = default_staging_dir();
+        assert!(
+            dir.starts_with(default_home().to_string_lossy().as_ref()),
+            "staging default {dir} is not under the tapectl home"
+        );
+        assert!(dir.ends_with("staging"), "{dir}");
+        assert_ne!(dir, "/mnt/staging");
     }
 
     // ---- ADR-0010: stale-field pre-scan ----

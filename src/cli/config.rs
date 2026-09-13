@@ -99,6 +99,11 @@ pub fn run(
                     let dar_check = crate::policy::depth_check::check_dar(&loaded.dar.binary);
                     let staging_check =
                         crate::policy::depth_check::check_staging(&loaded.staging.directory);
+                    // Issue #140: the third staging check — is it big enough
+                    // for one cartridge? Advisory like the other two, and
+                    // silent when no drive is configured.
+                    let staging_space_check =
+                        crate::policy::depth_check::check_staging_space(&loaded);
                     let tape_device_checks = crate::policy::depth_check::scan_tape_devices(&loaded);
 
                     // ADR-0010: `capacity_override` exists for virtual
@@ -189,6 +194,29 @@ pub fn run(
                                 serde_json::json!({"status": "writable", "path": path})
                             }
                         };
+                        let staging_space_json = match &staging_space_check {
+                            crate::policy::depth_check::StagingSpaceCheck::Unknown => {
+                                serde_json::Value::Null
+                            }
+                            crate::policy::depth_check::StagingSpaceCheck::Sufficient {
+                                path,
+                                free_bytes,
+                                tape_bytes,
+                            } => serde_json::json!({
+                                "status": "sufficient", "path": path,
+                                "free_bytes": free_bytes, "tape_bytes": tape_bytes,
+                            }),
+                            crate::policy::depth_check::StagingSpaceCheck::Tight {
+                                path,
+                                free_bytes,
+                                tape_bytes,
+                                generation,
+                            } => serde_json::json!({
+                                "status": "tight", "path": path,
+                                "free_bytes": free_bytes, "tape_bytes": tape_bytes,
+                                "generation": generation,
+                            }),
+                        };
                         let tape_devices_json: Vec<_> = tape_device_checks
                             .iter()
                             .map(|c| {
@@ -221,6 +249,7 @@ pub fn run(
                                 "unknown_keys": unknown_key_json,
                                 "dar": dar_json,
                                 "staging": staging_json,
+                                "staging_space": staging_space_json,
                                 "tape_devices": tape_devices_json,
                                 "unsupported_compression": unsupported_compression_json,
                                 "capacity_override_backends": capacity_override_hits,
@@ -256,6 +285,11 @@ pub fn run(
                             "{}",
                             crate::policy::depth_check::describe_staging(&staging_check)
                         );
+                        if let Some(line) =
+                            crate::policy::depth_check::describe_staging_space(&staging_space_check)
+                        {
+                            println!("{line}");
+                        }
                         for check in &tape_device_checks {
                             println!(
                                 "{}",

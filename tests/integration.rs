@@ -1857,9 +1857,9 @@ fn test_volume_write_refuses_over_capacity() {
         enospc_buffer: "0".into(),
     });
     // build() materializes the Layout's generated zones under
-    // config.staging.directory before validate ever runs — the default
-    // ("/mnt/staging") isn't writable in a test sandbox, so point it at this
-    // test's own tmp dir.
+    // config.staging.directory before validate ever runs. `Config::default()`
+    // names `<default home>/staging` (issue #140), which this test has never
+    // created, so point it at this test's own tmp dir.
     config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
     let paths = TapectlPaths::new(tmp.path().to_path_buf());
 

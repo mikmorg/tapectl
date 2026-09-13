@@ -210,6 +210,145 @@ pub fn describe_staging(check: &StagingCheck) -> String {
     }
 }
 
+/// Whether the staging filesystem can hold one full cartridge (issue #140).
+///
+/// The THIRD staging check, beside existence and writability. Those two ask
+/// whether staging works at all; this asks whether it is big enough for the
+/// job, which is a different failure and a much later one — `stage create`
+/// fills staging with dar slices and their encrypted copies before anything
+/// reaches tape, so an undersized staging directory fails PARTWAY through a
+/// long archive rather than at the start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagingSpaceCheck {
+    /// Free space is at least one cartridge.
+    Sufficient {
+        path: String,
+        free_bytes: u64,
+        tape_bytes: u64,
+    },
+    /// Free space is less than one cartridge.
+    Tight {
+        path: String,
+        free_bytes: u64,
+        tape_bytes: u64,
+        /// The generation the figure came from, for the message.
+        generation: String,
+    },
+    /// The filesystem could not be interrogated (staging missing, or a
+    /// `statvfs` failure). Silent: the existence/writability checks already
+    /// say what is wrong, and repeating it is noise.
+    Unknown,
+}
+
+/// Free bytes on the filesystem holding `dir`, or `None` if it cannot be
+/// interrogated.
+///
+/// `blocks_available` (not `blocks_free`) and `fragment_size` (not
+/// `block_size`): `blocks_available` excludes the reserved-for-root blocks
+/// an unprivileged `stage create` cannot use, and POSIX defines the block
+/// counts in units of `f_frsize`. Using `f_bsize` — the "preferred I/O
+/// size" — happens to give the same answer on ext4 and is wrong in general.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let stat = nix::sys::statvfs::statvfs(dir).ok()?;
+    Some(stat.blocks_available() as u64 * stat.fragment_size())
+}
+
+/// Compare staging's free space against the largest configured drive's
+/// planning capacity.
+///
+/// The LARGEST of several drives, deliberately: the operator can stage for
+/// any of them, and warning against the smallest would clear a directory
+/// that cannot hold the tape they are about to write.
+///
+/// Skipped silently (`Unknown`) when no backend is configured — there is no
+/// cartridge size to compare against, and inventing one would be a guess.
+/// Uses `planning_capacity_bytes(None)`, the ADR-0010 "no cartridge is
+/// loaded" figure, which is exactly the situation `config check` is in.
+pub fn check_staging_space(config: &Config) -> StagingSpaceCheck {
+    let dir = &config.staging.directory;
+    let Some(biggest) = config
+        .backends
+        .lto
+        .iter()
+        .filter_map(|b| b.planning_capacity_bytes(None).ok().map(|c| (c, b)))
+        .max_by_key(|(c, _)| *c)
+    else {
+        return StagingSpaceCheck::Unknown;
+    };
+    let (tape_bytes, backend) = biggest;
+    let Some(free_bytes) = free_bytes(Path::new(dir)) else {
+        return StagingSpaceCheck::Unknown;
+    };
+    if free_bytes >= tape_bytes {
+        StagingSpaceCheck::Sufficient {
+            path: dir.clone(),
+            free_bytes,
+            tape_bytes,
+        }
+    } else {
+        StagingSpaceCheck::Tight {
+            path: dir.clone(),
+            free_bytes,
+            tape_bytes,
+            generation: backend.generation.clone(),
+        }
+    }
+}
+
+/// The advisory line for a staging-space check, or `None` when there is
+/// nothing to say. Pure.
+///
+/// Advisory only, like every other line here: it never changes `config
+/// check`'s exit code (ADR-0004). A tight staging directory is a real
+/// constraint, not an invalid config — an operator who archives one unit at
+/// a time is fine with it.
+pub fn describe_staging_space(check: &StagingSpaceCheck) -> Option<String> {
+    match check {
+        StagingSpaceCheck::Unknown => None,
+        StagingSpaceCheck::Sufficient {
+            path,
+            free_bytes,
+            tape_bytes,
+        } => Some(format!(
+            "staging: '{path}' has {} free — enough for one {} cartridge",
+            decimal_bytes(*free_bytes),
+            decimal_bytes(*tape_bytes),
+        )),
+        StagingSpaceCheck::Tight {
+            path,
+            free_bytes,
+            tape_bytes,
+            generation,
+        } => Some(format!(
+            "warning: staging '{path}' has {} free; one {generation} cartridge is up to {} — \
+             stage create will fail partway if you fill a tape in one session",
+            decimal_bytes(*free_bytes),
+            decimal_bytes(*tape_bytes),
+        )),
+    }
+}
+
+/// Render bytes in DECIMAL units (kB/MB/GB/TB), matching how tape
+/// generations are marketed and how `media::Generation` stores them
+/// (LTO-6 = 2_500_000_000_000). Using binary units here would render a
+/// 2.5 TB cartridge as "2.3 TiB" and invite the operator to think tapectl
+/// had mis-read the drive.
+fn decimal_bytes(bytes: u64) -> String {
+    const K: f64 = 1_000.0;
+    let b = bytes as f64;
+    if b >= K * K * K * K {
+        format!("{:.1} TB", b / (K * K * K * K))
+    } else if b >= K * K * K {
+        format!("{:.1} GB", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.1} MB", b / (K * K))
+    } else if b >= K {
+        format!("{:.1} kB", b / K)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Existence of one backend's configured device paths. A mild, informational
 /// note, not a warning — a tape device legitimately does not exist when the
 /// drive isn't attached, which is the normal state on a dev VM. **Only
@@ -469,6 +608,129 @@ mod tests {
             .filter_map(|e| e.ok())
             .collect();
         assert!(leftover.is_empty(), "probe file was not cleaned up");
+    }
+
+    // -- check_staging_space / describe_staging_space (issue #140) --
+
+    fn backend_with_capacity(
+        name: &str,
+        generation: &str,
+        cap: &str,
+    ) -> crate::config::LtoBackendConfig {
+        crate::config::LtoBackendConfig {
+            name: name.to_string(),
+            device_tape: "/dev/null".to_string(),
+            device_sg: "/dev/null".to_string(),
+            generation: generation.to_string(),
+            capacity_override: Some(cap.to_string()),
+            usable_capacity_factor: 0.92,
+            enospc_buffer: "50M".to_string(),
+        }
+    }
+
+    /// No drive configured: silent. There is no cartridge size to compare
+    /// against and inventing one would be a guess.
+    #[test]
+    fn staging_space_with_no_backend_is_silent() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        let check = check_staging_space(&config);
+        assert_eq!(check, StagingSpaceCheck::Unknown);
+        assert!(describe_staging_space(&check).is_none());
+    }
+
+    /// A real LTO-6 (2.5 TB) against a tempdir on this machine: no dev box
+    /// has 2.5 TB free on /tmp, so this is the warning case, and it warns
+    /// with the numbers in it.
+    #[test]
+    fn staging_space_smaller_than_a_cartridge_warns_with_both_figures() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        config
+            .backends
+            .lto
+            .push(backend_with_capacity("lto6", "LTO-6", "2.5T"));
+
+        let check = check_staging_space(&config);
+        let StagingSpaceCheck::Tight { tape_bytes, .. } = &check else {
+            panic!("expected Tight on a tempdir vs a 2.5 TB cartridge, got {check:?}");
+        };
+        assert!(*tape_bytes >= 2_000_000_000_000);
+
+        let line = describe_staging_space(&check).unwrap();
+        assert!(line.starts_with("warning:"), "{line}");
+        assert!(line.contains("LTO-6"), "{line}");
+        assert!(line.contains("fail partway"), "{line}");
+    }
+
+    /// A one-byte "cartridge": any filesystem clears it, so this is the
+    /// sufficient case, and it must NOT read as a warning.
+    #[test]
+    fn staging_space_larger_than_a_cartridge_is_not_a_warning() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        config
+            .backends
+            .lto
+            .push(backend_with_capacity("tiny", "LTO-6", "1"));
+
+        let check = check_staging_space(&config);
+        assert!(
+            matches!(check, StagingSpaceCheck::Sufficient { .. }),
+            "{check:?}"
+        );
+        let line = describe_staging_space(&check).unwrap();
+        assert!(!line.contains("warning"), "{line}");
+    }
+
+    /// Several drives: the LARGEST decides. Warning against the smallest
+    /// would clear a directory that cannot hold the tape the operator is
+    /// about to write.
+    #[test]
+    fn staging_space_compares_against_the_largest_configured_drive() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        config
+            .backends
+            .lto
+            .push(backend_with_capacity("tiny", "LTO-6", "1"));
+        config
+            .backends
+            .lto
+            .push(backend_with_capacity("huge", "LTO-9", "18T"));
+
+        let check = check_staging_space(&config);
+        let StagingSpaceCheck::Tight { generation, .. } = &check else {
+            panic!("the 18 TB drive must decide, got {check:?}");
+        };
+        assert_eq!(generation, "LTO-9");
+    }
+
+    /// A staging directory that does not exist is `Unknown`, not a panic
+    /// and not a bogus zero: `check_staging` already reports the absence,
+    /// and saying it twice is noise.
+    #[test]
+    fn staging_space_on_a_missing_directory_is_silent() {
+        let mut config = Config::default();
+        config.staging.directory = "/nonexistent/tapectl/staging/for/tests".to_string();
+        config
+            .backends
+            .lto
+            .push(backend_with_capacity("lto6", "LTO-6", "2.5T"));
+        assert_eq!(check_staging_space(&config), StagingSpaceCheck::Unknown);
+    }
+
+    /// Decimal units, matching how tape generations are marketed and stored
+    /// — a 2.5 TB cartridge rendered as "2.3 TiB" reads like a mis-detection.
+    #[test]
+    fn decimal_bytes_uses_marketing_units_not_binary_ones() {
+        assert_eq!(decimal_bytes(2_500_000_000_000), "2.5 TB");
+        assert_eq!(decimal_bytes(40_000_000_000), "40.0 GB");
+        assert_eq!(decimal_bytes(512), "512 B");
     }
 
     #[test]

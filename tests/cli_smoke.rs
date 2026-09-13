@@ -44,6 +44,55 @@ fn parses_init_with_operator() {
     }
 }
 
+/// Issue #140: `init` used to write `staging.directory = "/mnt/staging"` —
+/// a path that does not exist on a stock machine and is root-owned where it
+/// does, so `config check` warned about the default on every fresh install.
+/// It now writes `<home>/staging` and CREATES it, 0700 like the rest of the
+/// home, under whatever `--home` was actually used.
+#[test]
+fn init_creates_a_staging_directory_under_the_home_it_was_given() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempDir::new().unwrap();
+    let out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `run_tapectl` sets HOME, so the tapectl home is `$HOME/.tapectl`.
+    let staging = home.path().join(".tapectl").join("staging");
+    assert!(
+        staging.is_dir(),
+        "init did not create {}",
+        staging.display()
+    );
+    let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "staging dir mode is {mode:o}, expected 700");
+
+    let config =
+        std::fs::read_to_string(home.path().join(".tapectl").join("config.toml")).unwrap();
+    assert!(
+        config.contains(staging.to_str().unwrap()),
+        "config.toml does not point at the staging dir init created:\n{config}"
+    );
+    assert!(
+        !config.contains("/mnt/staging"),
+        "the old unusable default is still being written:\n{config}"
+    );
+
+    // And `config check` is now quiet about staging on a fresh install,
+    // which is the whole point — a default that is always wrong turns its
+    // own warning into noise.
+    let check = run_tapectl(home.path(), &["config", "check"]);
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        !text.contains("staging directory") || !text.contains("does not exist"),
+        "config check still warns about staging on a fresh init:\n{text}"
+    );
+}
+
 #[test]
 fn init_creates_the_escrow_recipient_and_prints_its_secret_to_stderr() {
     // Q3 (CTO 2026-09-10): `init` creates the permanent escrow recipient so the
@@ -524,8 +573,9 @@ fn db_export_emits_one_parseable_json_document() {
 /// Bring up a throwaway `HOME` far enough to run `stage create`: init,
 /// operator tenant already created by `init`, a fresh tenant + key, a unit
 /// pointing at `source_dir`, and one snapshot of it. Also repoints
-/// `config.toml`'s `staging.directory` at `staging_dir` — `init`'s default
-/// (`/mnt/staging`) is an arbitrary system path this test must never touch.
+/// `config.toml`'s `staging.directory` at `staging_dir` — `init` creates
+/// `<home>/staging` (issue #140), and this test wants its own tmpdir so the
+/// staged bytes land where the test can see and clean them.
 ///
 /// Returns the unit name to pass to `stage create`.
 fn prepare_home_for_staging(
