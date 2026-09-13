@@ -138,8 +138,6 @@ generation = "LTO-8"
 capacity_override = "2.5T"
 usable_capacity_factor = 0.95
 enospc_buffer = "2G"
-block_size = "512K"
-hardware_compression = false
 '''
 open(cfg, 'w').write(t)
 PY
