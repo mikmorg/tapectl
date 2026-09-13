@@ -13,6 +13,46 @@ built (`scripts/lto6-measure.sh`).
 Heir Kit ceremony, the LTO-6 session on real media, and the first production
 write. None of them is blocked on a decision — each needs your hands.
 
+---
+
+## STOP — read this before the first production write (2026-09-13)
+
+The media-generation redesign (ADR-0010, ADR-0011) is landed, gated and
+hardware-verified on branch `media-generation-model`: 1085 tests, the mhvtl
+verify gate GREEN 26/26 against an empty EXPECTED_FAIL, and the lifecycle
+suite's `first-year` scenario GREEN 45/45. One LTO-6 drive now handles LTO-5
+and LTO-6 cartridges with nothing to change between tapes.
+
+**But the adversarial review that followed it found three high-severity
+defects, and the first production write should wait for them**
+(`docs/audits/2026-09-13-post-redesign-review.md`, 59 confirmed findings):
+
+- **#153 — copy counting treats versions as copies.** A unit with v1 on one
+  tape and v2 on another reads as two copies. At the shipped default of two,
+  `unit mark-tape-only` passes its consent gate and tells you it is safe to
+  delete the source. Reproduced with the real binary. Predates this redesign;
+  the same inflated number feeds `audit`, three reports and the location check,
+  so nothing contradicts it. **This is the one that can lose data.**
+- **#154 — late binding commits the displacement before the tape-contact
+  check**, so a `volume write` that is then refused has already marked a live
+  volume erased in the catalog.
+- **#155 — `volume init --cartridge` displaces a live volume on a typed
+  barcode alone** when no medium serial is readable. This is a hole in
+  ADR-0010's reasoning, not only its code: the ADR justifies having no second
+  consent gate on the grounds that the File 0 check already decided consent,
+  which does not hold when the displacement is driven by what was typed.
+  ADR-0010 needs amending alongside the fix.
+
+The remaining 56 findings are medium and low and are written up with evidence
+and a proposed fix in the same audit. The ones worth knowing before an
+operator session: disaster recovery rebuilds no cartridge identity, so a
+recovered tape cannot be re-bound; `db fsck --repair` cannot repair, because
+its deletes violate the same foreign keys; and generation capacities are
+decimal while every operator-facing `--capacity` parses as binary.
+
+The review's completeness critic did not finish (session limit), so that list
+is not certified complete.
+
 ## Where the project actually stands
 
 - Milestones 0–7 complete; the Layout-v2 regear landed in full (T0–T11).
