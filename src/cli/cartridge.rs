@@ -14,12 +14,21 @@ pub enum CartridgeCommands {
         /// Barcode label
         #[arg(long)]
         barcode: String,
-        /// Media type (e.g., LTO-6, LTO-7, LTO-8)
+        /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
         #[arg(long)]
         media_type: String,
-        /// Nominal capacity (e.g., "2500G")
-        #[arg(long, default_value = "2500G")]
-        capacity: String,
+        /// Nominal capacity, e.g. "2500G". Defaults to the generation
+        /// table's marketed figure (ADR-0010) when omitted — give this
+        /// explicitly only when the physical cartridge really differs (a
+        /// declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...).
+        #[arg(long)]
+        capacity: Option<String>,
+        /// Medium serial number (MAM), if already known — `volume init`
+        /// records this itself when it auto-registers or matches a
+        /// cartridge from a loaded tape's MAM; set it by hand only when
+        /// pre-registering a cartridge that has not been loaded yet.
+        #[arg(long)]
+        serial: Option<String>,
         /// Notes
         #[arg(long)]
         notes: Option<String>,
@@ -96,20 +105,42 @@ pub fn run(
             barcode,
             media_type,
             capacity,
+            serial,
             notes,
         } => {
-            let cap = staging::parse_size_to_bytes(capacity)?;
+            // ADR-0010: stored canonical, not the operator's raw spelling,
+            // so a later comparison against a detected generation
+            // (`volume init`) is a plain string match.
+            let generation = crate::media::Generation::parse(media_type).ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "{media_type:?} is not a recognised LTO generation \
+                     (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
+                ))
+            })?;
+            let canonical_media_type = generation.as_str();
+            let (cap, capacity_display) = match capacity {
+                Some(c) => (staging::parse_size_to_bytes(c)?, c.clone()),
+                None => {
+                    let bytes = generation.native_capacity_bytes();
+                    (
+                        bytes as i64,
+                        format!("{bytes} bytes, the {canonical_media_type} default"),
+                    )
+                }
+            };
             conn.execute(
-                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, notes)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![barcode, media_type, cap, notes],
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, notes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![barcode, canonical_media_type, cap, serial, notes],
             )?;
             let id = conn.last_insert_rowid();
             events::log_created(conn, "cartridge", id, barcode, None)?;
             if json_output {
                 println!("{}", serde_json::json!({"id": id, "barcode": barcode}));
             } else {
-                println!("cartridge \"{barcode}\" registered (id={id}, {media_type}, {capacity})");
+                println!(
+                    "cartridge \"{barcode}\" registered (id={id}, {canonical_media_type}, {capacity_display})"
+                );
             }
         }
         CartridgeCommands::List { status } => {
@@ -311,5 +342,91 @@ mod tests {
             "a quoted payload must match no rows, not inject (got {} rows)",
             rows.len()
         );
+    }
+
+    // ---- ADR-0010: `cartridge register` ----
+
+    fn register(
+        conn: &Connection,
+        barcode: &str,
+        media_type: &str,
+        capacity: Option<&str>,
+        serial: Option<&str>,
+    ) -> Result<()> {
+        run(
+            conn,
+            &CartridgeCommands::Register {
+                barcode: barcode.to_string(),
+                media_type: media_type.to_string(),
+                capacity: capacity.map(str::to_string),
+                serial: serial.map(str::to_string),
+                notes: None,
+            },
+            false,
+            true,
+            false,
+        )
+    }
+
+    fn stored_row(conn: &Connection, barcode: &str) -> (String, i64, Option<String>) {
+        conn.query_row(
+            "SELECT media_type, nominal_capacity, serial_number FROM cartridges WHERE barcode = ?1",
+            rusqlite::params![barcode],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn register_stores_the_canonical_generation_spelling() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "lto6", None, None).unwrap();
+        let (media_type, ..) = stored_row(&conn, "B001");
+        assert_eq!(media_type, "LTO-6");
+    }
+
+    #[test]
+    fn register_rejects_an_unrecognised_generation() {
+        let conn = crate::db::open_memory().unwrap();
+        let err = register(&conn, "B001", "not-a-generation", None, None).unwrap_err();
+        assert!(err.to_string().contains("not-a-generation"));
+    }
+
+    #[test]
+    fn register_without_capacity_defaults_from_the_generation_table() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let (_, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(
+            cap,
+            crate::media::Generation::Lto6.native_capacity_bytes() as i64
+        );
+    }
+
+    #[test]
+    fn register_with_explicit_capacity_overrides_the_table() {
+        let conn = crate::db::open_memory().unwrap();
+        // A declared 40 TB LTO-10 cartridge (ADR-0010 explicitly calls this
+        // out: a single generation figure cannot express both LTO-10
+        // capacities, so the operator states it here).
+        register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
+        let (_, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(cap, staging::parse_size_to_bytes("40000G").unwrap());
+    }
+
+    #[test]
+    fn register_persists_an_explicit_serial() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, Some("EW7VWMVKF6")).unwrap();
+        let (_, _, serial) = stored_row(&conn, "B001");
+        assert_eq!(serial.as_deref(), Some("EW7VWMVKF6"));
+    }
+
+    #[test]
+    fn register_without_serial_leaves_it_null() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let (_, _, serial) = stored_row(&conn, "B001");
+        assert_eq!(serial, None);
     }
 }
