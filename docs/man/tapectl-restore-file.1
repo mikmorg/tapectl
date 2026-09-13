@@ -38,8 +38,8 @@ Path to config file.
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
-Tape device
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.

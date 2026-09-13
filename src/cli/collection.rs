@@ -52,9 +52,10 @@ pub enum CollectionCommands {
         /// --label L2` for two copies).
         #[arg(long = "label")]
         labels: Vec<String>,
-        /// Tape device path.
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 }
 
@@ -83,7 +84,7 @@ pub fn run(
             name,
             *batch,
             labels,
-            device,
+            &crate::cli::write_device(config, device.as_deref())?,
             json_output,
         ),
     }

@@ -1,6 +1,7 @@
 use clap::Subcommand;
 use rusqlite::Connection;
 
+use crate::cli::{read_device, write_device};
 use crate::config::{Config, TapectlPaths};
 use crate::error::Result;
 use crate::store::{TapeStore, Tier};
@@ -14,9 +15,10 @@ pub enum VolumeCommands {
     Init {
         /// Volume label (e.g., L6-0001)
         label: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// Overwrite a cartridge whose File 0 already identifies a
         /// DIFFERENT volume (e.g. a mislabeled or stale tape). Refused by
         /// default (issue #27) — loading the wrong cartridge would
@@ -31,9 +33,10 @@ pub enum VolumeCommands {
     Write {
         /// Volume label
         label: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// See `volume init --force` — same override, same limits.
         #[arg(long)]
         force: bool,
@@ -56,9 +59,10 @@ pub enum VolumeCommands {
     Resume {
         /// Volume label
         label: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Deliberately abandon a volume's unfinished write session (issue #94):
@@ -90,9 +94,10 @@ pub enum VolumeCommands {
     Verify {
         /// Volume label
         label: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// Full integrity chain walk (default): hash every content file
         /// against the front index's ciphertext hashes.
         #[arg(long, conflicts_with = "quick")]
@@ -105,9 +110,10 @@ pub enum VolumeCommands {
 
     /// Identify a tape (read ID thunk)
     Identify {
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Move a volume to a location
@@ -133,18 +139,20 @@ pub enum VolumeCommands {
         /// Unit name to read
         #[arg(long)]
         unit: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Read live encrypted slices from a volume to staging (compaction step 1)
     CompactRead {
         /// Source volume label
         label: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Write compaction slices from staging to destination (compaction step 2)
@@ -152,9 +160,10 @@ pub enum VolumeCommands {
         /// Destination volume label
         #[arg(long)]
         destination: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// See `volume write --allow-missing-escrow`. A compaction whose
         /// source volume predates the escrow recipient needs this to proceed.
         #[arg(long)]
@@ -178,9 +187,10 @@ pub enum VolumeCommands {
     Compact {
         /// Source volume label
         label: String,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// See `volume write --allow-missing-escrow`.
         #[arg(long)]
         allow_missing_escrow: bool,
@@ -265,8 +275,9 @@ pub fn run(
             device,
             force,
         } => {
+            let device = write_device(config, device.as_deref())?;
             let vol_id =
-                write::volume_init(conn, config, label, device, DEFAULT_BLOCK_SIZE, *force)?;
+                write::volume_init(conn, config, label, &device, DEFAULT_BLOCK_SIZE, *force)?;
             if json_output {
                 println!(
                     "{}",
@@ -283,12 +294,13 @@ pub fn run(
             force,
             allow_missing_escrow,
         } => {
+            let device = write_device(config, device.as_deref())?;
             write::volume_write(
                 conn,
                 paths,
                 config,
                 label,
-                device,
+                &device,
                 DEFAULT_BLOCK_SIZE,
                 *force,
                 *allow_missing_escrow,
@@ -304,7 +316,8 @@ pub fn run(
         }
 
         VolumeCommands::Resume { label, device } => {
-            write::volume_resume(conn, paths, config, label, device, DEFAULT_BLOCK_SIZE)?;
+            let device = write_device(config, device.as_deref())?;
+            write::volume_resume(conn, paths, config, label, &device, DEFAULT_BLOCK_SIZE)?;
             if json_output {
                 println!(
                     "{}",
@@ -343,8 +356,9 @@ pub fn run(
                 Tier::default()
             };
             let tier_name = if *quick { "quick" } else { "full" };
+            let device = read_device(config, device.as_deref())?;
             let report =
-                write::volume_verify(conn, config, label, device, DEFAULT_BLOCK_SIZE, tier)?;
+                write::volume_verify(conn, config, label, &device, DEFAULT_BLOCK_SIZE, tier)?;
             if json_output {
                 println!(
                     "{}",
@@ -369,7 +383,8 @@ pub fn run(
         }
 
         VolumeCommands::Identify { device } => {
-            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let device = read_device(config, device.as_deref())?;
+            let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let id = write::volume_identify(&mut store)?;
             println!("{id}");
         }
@@ -388,7 +403,8 @@ pub fn run(
         }
 
         VolumeCommands::ReadSlices { from, unit, device } => {
-            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let device = read_device(config, device.as_deref())?;
+            let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = write::read_slices(conn, config, from, unit, &mut store)?;
             if json_output {
                 println!(
@@ -478,7 +494,8 @@ pub fn run(
         }
 
         VolumeCommands::CompactRead { label, device } => {
-            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let device = read_device(config, device.as_deref())?;
+            let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = write::compact_read(conn, config, label, &mut store)?;
             if json_output {
                 println!(
@@ -499,12 +516,13 @@ pub fn run(
             device,
             allow_missing_escrow,
         } => {
+            let device = write_device(config, device.as_deref())?;
             write::compact_write(
                 conn,
                 paths,
                 config,
                 destination,
-                device,
+                &device,
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
             )?;
@@ -540,13 +558,16 @@ pub fn run(
             device,
             allow_missing_escrow,
         } => {
-            // Interactive: run all 3 steps
+            // Interactive: run all 3 steps. Strict resolution (ADR-0010):
+            // step 2 writes, so this needs a real backend even though step 1
+            // only reads.
+            let device = write_device(config, device.as_deref())?;
             println!("=== Step 1: Reading live slices from \"{label}\" ===");
             // Scoped so the read-only store (and its device fd) closes
             // before step 2 opens the same device for writing — the st
             // driver refuses a second concurrent open (EBUSY).
             let report = {
-                let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+                let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
                 write::compact_read(conn, config, label, &mut store)?
             };
             println!(
@@ -572,7 +593,7 @@ pub fn run(
                 paths,
                 config,
                 dest_label,
-                device,
+                &device,
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
             )?;

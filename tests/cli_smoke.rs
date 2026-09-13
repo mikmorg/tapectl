@@ -1014,3 +1014,71 @@ fn home_plus_config_does_not_warn() {
         "an explicit --home must not trigger the deprecation warning; stderr={stderr}"
     );
 }
+
+/// ADR-0010, "Read paths stay usable without a configured drive": the
+/// machine that most needs `identify`/`verify`/`read-slices`/`restore`/
+/// `catalog rebuild` is the rebuilt one that has keys and no `backend add`
+/// yet (ADR-0005's DR path). An explicit `--device` must therefore be taken
+/// exactly as given, with the backend treated as optional — never refused
+/// for want of configuration.
+///
+/// The discriminator is WHICH error comes back: reaching the tape layer and
+/// failing to open a nonexistent device proves the lenient resolver let the
+/// path through. A "no [[backends.lto]] entry ..." error would prove the
+/// strict resolver was wired to a read path.
+#[test]
+fn read_paths_accept_an_explicit_device_with_zero_backends_configured() {
+    let home = TempDir::new().unwrap();
+    let init = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    const DEV: &str = "/nonexistent/tapectl-dr-path-nst";
+    for args in [
+        vec!["volume", "identify", "--device", DEV],
+        vec!["restore", "raw-volume", "--device", DEV, "--to", "/tmp"],
+    ] {
+        let out = run_tapectl(home.path(), &args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} unexpectedly succeeded");
+        assert!(
+            err.contains(DEV),
+            "{args:?} must fail at the DEVICE, naming it; got:\n{err}"
+        );
+        assert!(
+            !err.contains("[[backends.lto]]") && !err.contains("no drive configured"),
+            "{args:?} is a read path and must not demand a configured backend \
+             (ADR-0010's DR path); got:\n{err}"
+        );
+    }
+}
+
+/// The other half of the same split: a WRITE path with zero backends is
+/// refused by name, because it genuinely needs the drive's usable-capacity
+/// factor, ENOSPC buffer and sg node.
+#[test]
+fn write_paths_refuse_an_unconfigured_device_by_name() {
+    let home = TempDir::new().unwrap();
+    let init = run_tapectl(home.path(), &["init"]);
+    assert!(init.status.success());
+
+    let out = run_tapectl(
+        home.path(),
+        &[
+            "volume",
+            "init",
+            "DRGATE01",
+            "--device",
+            "/nonexistent/tapectl-dr-path-nst",
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "write path unexpectedly succeeded");
+    assert!(
+        err.contains("[[backends.lto]]"),
+        "a write path with no configured backend must say so; got:\n{err}"
+    );
+}

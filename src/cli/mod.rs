@@ -231,9 +231,10 @@ pub enum Commands {
         /// Tags
         #[arg(long, short)]
         tag: Vec<String>,
-        /// Tape device path
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Tape drive backends
@@ -338,4 +339,40 @@ pub enum ConfigCommands {
     Show,
     /// Check configuration validity
     Check,
+}
+
+/// Resolve a `--device` for a WRITE path — STRICT (ADR-0010, "Backends
+/// resolve by device").
+///
+/// A write needs the drive's own factor, ENOSPC buffer and sg node, so the
+/// device must belong to a configured backend: the one whose `device_tape`
+/// matches (canonicalised), else the sole configured backend, else an error
+/// naming the candidates. The backend's own `device_tape` is returned rather
+/// than the operator's spelling of it, so a by-id link and its `/dev/nstN`
+/// target reach the tape layer as one path.
+///
+/// The counterpart for read paths is [`read_device`]; the split is the whole
+/// point, so every call site should say which one it is.
+pub(crate) fn write_device(
+    config: &crate::config::Config,
+    device: Option<&str>,
+) -> crate::error::Result<String> {
+    Ok(crate::config::resolve_lto_backend(config, device)?
+        .device_tape
+        .clone())
+}
+
+/// Resolve a `--device` for a READ path — LENIENT (ADR-0010, "Read paths
+/// stay usable without a configured drive").
+///
+/// `identify`, `verify`, `read-slices`, `restore` and `catalog rebuild` must
+/// work on the rebuilt machine that has keys and no `backend add` yet
+/// (ADR-0005's DR path), so an explicit `--device` is taken exactly as given
+/// and no backend need exist at all. Only the no-`--device` case can fail,
+/// and then because there is genuinely nothing to read from.
+pub(crate) fn read_device(
+    config: &crate::config::Config,
+    device: Option<&str>,
+) -> crate::error::Result<String> {
+    Ok(crate::config::resolve_device(config, device)?.0)
 }

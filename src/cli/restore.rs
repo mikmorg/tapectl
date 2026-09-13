@@ -21,9 +21,10 @@ pub enum RestoreCommands {
         /// Destination directory
         #[arg(long)]
         to: String,
-        /// Tape device
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// Show what would be restored without restoring
         #[arg(long)]
         dry_run: bool,
@@ -43,17 +44,19 @@ pub enum RestoreCommands {
         /// Destination directory
         #[arg(long)]
         to: String,
-        /// Tape device
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
     },
 
     /// Dump every file off a tape verbatim, using only what is on the tape
     /// itself (no database needed) — the emergency/heir path
     RawVolume {
-        /// Tape device
-        #[arg(long, default_value = "/dev/nst0")]
-        device: String,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
         /// Destination directory
         #[arg(long = "to")]
         to: String,
@@ -79,6 +82,7 @@ pub fn run(
             device,
             dry_run,
         } => {
+            let device = crate::cli::read_device(config, device.as_deref())?;
             let report = volume::restore::restore_unit(
                 conn,
                 paths,
@@ -86,7 +90,7 @@ pub fn run(
                 unit,
                 from,
                 to,
-                device,
+                &device,
                 DEFAULT_BLOCK_SIZE,
                 *dry_run,
             )?;
@@ -122,6 +126,7 @@ pub fn run(
             to,
             device,
         } => {
+            let device = crate::cli::read_device(config, device.as_deref())?;
             volume::restore::restore_file(
                 conn,
                 paths,
@@ -130,7 +135,7 @@ pub fn run(
                 file,
                 from,
                 to,
-                device,
+                &device,
                 DEFAULT_BLOCK_SIZE,
             )?;
 
@@ -146,7 +151,8 @@ pub fn run(
 
         RestoreCommands::RawVolume { device, to, from } => {
             let dest = std::path::Path::new(to);
-            let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+            let device = crate::cli::read_device(config, device.as_deref())?;
+            let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = volume::raw::restore_raw(&mut store, dest, from.as_deref())?;
 
             if json_output {

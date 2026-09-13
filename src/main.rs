@@ -233,7 +233,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref device,
         } => {
             cli::operations::quick_archive(
-                &conn, &paths, &cfg, path, tenant, volume, tag, device, cli.json,
+                &conn,
+                &paths,
+                &cfg,
+                path,
+                tenant,
+                volume,
+                tag,
+                device.as_deref(),
+                cli.json,
             )?;
         }
         Commands::Backend { ref command } => {

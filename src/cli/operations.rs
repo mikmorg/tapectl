@@ -1569,9 +1569,15 @@ pub fn quick_archive(
     tenant: &str,
     volume: &str,
     tag: &[String],
-    device: &str,
+    device: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
+    // quick-archive ends in `volume write`, so `--device` resolves STRICTLY
+    // (ADR-0010, "Backends resolve by device"): the drive must be a
+    // configured backend, because the write path needs its usable-capacity
+    // factor, ENOSPC buffer and sg node.
+    let device = &crate::cli::write_device(config, device)?;
+
     // Step 0: the volume must already exist.
     //
     // Without this, the label is not looked up until deep inside

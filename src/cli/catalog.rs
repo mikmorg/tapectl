@@ -50,14 +50,19 @@ pub enum CatalogCommands {
         /// rather than implied so a later `--from-export` is additive.
         #[arg(long = "from-volume")]
         from_volume: bool,
-        /// Tape device. Deliberately has NO default: `/dev/nstN` numbering
-        /// is not stable across reboots on a host with more than one drive,
-        /// and unlike a read-only dump this command writes what it reads
-        /// into the catalog — a silent wrong-device default would file one
-        /// tape's contents under another's. Resolve by serial through
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        ///
+        /// There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN`
+        /// numbering is not stable across reboots on a host with more than
+        /// one drive, and unlike a read-only dump this command writes what
+        /// it reads into the catalog — a silent wrong-device default would
+        /// file one tape's contents under another's. The sole configured
+        /// backend's `device_tape` is not a guess about which drive you
+        /// meant; a guessed device number is. Resolve by serial through
         /// `/dev/tape/by-id/`.
         #[arg(long)]
-        device: String,
+        device: Option<String>,
         /// Operator or escrow secret key file. A tenant key cannot open the
         /// operator envelope and is refused with a pointer at RESTORE.sh.
         #[arg(long)]
@@ -431,18 +436,21 @@ pub fn run(
                         .to_string(),
                 ));
             }
+            // LENIENT (ADR-0010): rebuild is the disaster-recovery read
+            // path — the machine running it typically has keys and no
+            // `backend add` yet, so the backend is optional and only names
+            // the resulting volume row's `backend_name`.
+            let (device, backend) = crate::config::resolve_device(config, device.as_deref())?;
             let scratch =
                 std::env::temp_dir().join(format!("tapectl-rebuild-{}", std::process::id()));
             let report = crate::volume::rebuild::rebuild_from_volume(
                 conn,
-                device,
+                &device,
                 DEFAULT_BLOCK_SIZE,
                 key,
                 label.as_deref(),
                 tenant,
-                crate::config::resolve_lto_backend(config, Some(device))
-                    .ok()
-                    .map(|b| b.name.as_str()),
+                backend.map(|b| b.name.as_str()),
                 &scratch,
             );
             // The scratch dir holds decrypted MANIFEST/catalog.db copies —

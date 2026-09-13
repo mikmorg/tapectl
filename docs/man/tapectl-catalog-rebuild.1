@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-catalog\-rebuild \- Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 .SH SYNOPSIS
-\fBtapectl catalog rebuild\fR [\fB\-\-from\-volume\fR] [\fB\-\-json\fR] <\fB\-\-device\fR> [\fB\-\-dry\-run\fR] <\fB\-\-key\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-label\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-tenant\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl catalog rebuild\fR [\fB\-\-from\-volume\fR] [\fB\-\-json\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] <\fB\-\-key\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-label\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-tenant\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 .SH OPTIONS
@@ -16,7 +16,9 @@ Rebuild from a sealed tape volume. The only source today; named rather than impl
 Output in JSON format
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device. Deliberately has NO default: `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read\-only dump this command writes what it reads into the catalog — a silent wrong\-device default would file one tape\*(Aqs contents under another\*(Aqs. Resolve by serial through `/dev/tape/by\-id/`
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured.
+
+There is still no `/dev/nst0` fallback (ADR\-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read\-only dump this command writes what it reads into the catalog — a silent wrong\-device default would file one tape\*(Aqs contents under another\*(Aqs. The sole configured backend\*(Aqs `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by\-id/`.
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes

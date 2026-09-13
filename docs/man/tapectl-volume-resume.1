@@ -9,8 +9,8 @@ tapectl\-volume\-resume \- Resume an interrupted write session (issue #25). Relo
 Resume an interrupted write session (issue #25). Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them, and it refuses (quarantining the volume) if the loaded tape\*(Aqs File 0 does not match, or if the tape is already sealed. There is no \-\-force: `volume write \-\-force` overrides a wrong\-cartridge finding before anything is written, which has no meaning for a tape this session has already partly written
 .SH OPTIONS
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
-Tape device path
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-\-json\fR
 Output in JSON format

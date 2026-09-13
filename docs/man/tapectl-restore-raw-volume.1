@@ -9,8 +9,8 @@ tapectl\-restore\-raw\-volume \- Dump every file off a tape verbatim, using only
 Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
 .SH OPTIONS
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
-Tape device
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-\-json\fR
 Output in JSON format

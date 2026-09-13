@@ -9,8 +9,8 @@ tapectl\-volume\-verify \- Verify volume contents via the keyless chain walk (se
 Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
 .SH OPTIONS
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR [default: /dev/nst0]
-Tape device path
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-\-json\fR
 Output in JSON format
