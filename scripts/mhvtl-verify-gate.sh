@@ -137,7 +137,6 @@ device_sg = "{sg}"
 generation = "LTO-8"
 capacity_override = "2.5T"
 usable_capacity_factor = 0.95
-manifest_reserve = "1G"
 enospc_buffer = "2G"
 block_size = "512K"
 hardware_compression = false
