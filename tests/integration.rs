@@ -1855,8 +1855,6 @@ fn test_volume_write_refuses_over_capacity() {
         capacity_override: Some("1M".into()),
         usable_capacity_factor: 1.0,
         enospc_buffer: "0".into(),
-        block_size: "512K".into(),
-        hardware_compression: false,
     });
     // build() materializes the Layout's generated zones under
     // config.staging.directory before validate ever runs — the default
@@ -1955,8 +1953,6 @@ fn test_volume_write_refuses_when_an_unresolved_write_session_already_exists() {
         capacity_override: Some("2500G".into()),
         usable_capacity_factor: 1.0,
         enospc_buffer: "0".into(),
-        block_size: "512K".into(),
-        hardware_compression: false,
     });
     config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
     let paths = TapectlPaths::new(tmp.path().to_path_buf());
@@ -2060,8 +2056,6 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         capacity_override: Some("2500G".into()),
         usable_capacity_factor: 1.0,
         enospc_buffer: "0".into(),
-        block_size: "512K".into(),
-        hardware_compression: false,
     });
     config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
     let paths = TapectlPaths::new(tmp.path().to_path_buf());

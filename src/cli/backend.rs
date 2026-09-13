@@ -34,13 +34,13 @@ pub fn run(paths: &TapectlPaths, command: &BackendCommands, json_output: bool) -
 /// The `[[backends.lto]]` block for these values.
 ///
 /// Pure, so the text is testable and the command cannot drift from what the
-/// tests assert. `block_size` and `hardware_compression` are deliberately
-/// absent: both are inert today (#118, #121 — the write path's block size is a
-/// format constant), and offering an operator a knob that does nothing is the
-/// false assurance `config check`'s decorative-key scan exists to complain
-/// about. Their serde defaults apply. `capacity_override` (ADR-0010) is
-/// likewise absent unless explicitly given — a real drive's capacity follows
-/// the loaded cartridge's detected generation, not this config.
+/// tests assert. `block_size` and `hardware_compression` were deliberately
+/// absent here while they still parsed (#118, #121 — offering an operator a
+/// knob that does nothing is a false assurance); spec W4 has since deleted
+/// both from `LtoBackendConfig` entirely, so a block carrying either would
+/// now fail to load. `capacity_override` (ADR-0010) is absent unless
+/// explicitly given — a real drive's capacity follows the loaded cartridge's
+/// detected generation, not this config.
 pub fn backend_block(
     name: &str,
     device_tape: &str,
@@ -234,8 +234,10 @@ mod tests {
     }
 
     /// Omitted knobs fall back to their serde defaults rather than being
-    /// written out as operator choices (#118/#121: both are inert).
-    /// `capacity_override` (ADR-0010) is likewise absent by default.
+    /// written out as operator choices. `block_size`/`hardware_compression`
+    /// are checked for absence still, and now for a stronger reason than
+    /// #118/#121: spec W4 deleted both, so emitting either would produce a
+    /// block that `Config::load` rejects outright.
     #[test]
     fn inert_knobs_are_absent_and_defaulted() {
         let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None);
@@ -246,8 +248,6 @@ mod tests {
 
         let cfg: Config = toml::from_str(&format!("[dar]\nbinary = \"dar\"\n{block}")).unwrap();
         let b = &cfg.backends.lto[0];
-        assert_eq!(b.block_size, "512K");
-        assert!(!b.hardware_compression);
         assert_eq!(b.enospc_buffer, "50M");
         assert!(b.capacity_override.is_none());
     }

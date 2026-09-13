@@ -25,11 +25,12 @@ use super::selector::{self, Batch};
 
 /// The format-constant block size every write path pads against
 /// (`docs/design/v2-open-questions.md` §8: "block size — format constant,
-/// never scales"). `LtoBackendConfig.block_size` is NOT this figure — that
-/// field is unread anywhere in the write path (dead config; T10 leaves it
-/// alone per the "decorative keys" R&D-exit note). Every real call site
-/// hardcodes 512 KiB (see `cli::volume::DEFAULT_BLOCK_SIZE`); this mirrors
-/// that rather than reading the unread field.
+/// never scales"). There is deliberately no config knob for it:
+/// `LtoBackendConfig.block_size` existed, was read by nothing, and was
+/// deleted in spec W4 — `src/volume/layout.rs` bakes 512 KiB into the
+/// on-tape recovery text an heir reads, so a per-drive value could only
+/// ever disagree with the tape. Every real call site hardcodes it (see
+/// `cli::volume::DEFAULT_BLOCK_SIZE`); this mirrors that.
 const BLOCK_SIZE: u64 = 512 * 1024;
 
 /// Compute one collection's batches against its resolved LTO backend capacity.
@@ -96,8 +97,6 @@ mod tests {
             capacity_override: Some("10M".into()),
             usable_capacity_factor: 1.0,
             enospc_buffer: "0".into(),
-            block_size: "512K".into(),
-            hardware_compression: false,
         });
         config
     }

@@ -114,8 +114,6 @@ fn setup(name: &str) -> PerfHarness {
         capacity_override: Some("2400G".into()),
         usable_capacity_factor: 0.92,
         enospc_buffer: "50M".into(),
-        block_size: "512K".into(),
-        hardware_compression: false,
     });
 
     PerfHarness {

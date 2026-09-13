@@ -136,7 +136,8 @@ pub struct BackendsConfig {
 /// (`generation`) — the medium's actual generation is a fact about the
 /// cartridge, detected at `volume init` (`tape::media_detect`), never
 /// declared here. `media_type`/`nominal_capacity` (the pre-ADR-0010 fields)
-/// are rejected by name via `#[serde(deny_unknown_fields)]` — see
+/// and `block_size`/`hardware_compression` (deleted as inert, spec W4) are
+/// rejected by name via `#[serde(deny_unknown_fields)]` — see
 /// [`Config::load`]'s stale-field pre-scan for the friendly error a stale
 /// config gets instead of a raw serde message. `capacity_override` survives
 /// as the sole legitimate way to lie about capacity, for virtual drives
@@ -162,10 +163,6 @@ pub struct LtoBackendConfig {
     pub usable_capacity_factor: f64,
     #[serde(default = "default_enospc_buffer")]
     pub enospc_buffer: String,
-    #[serde(default = "default_block_size")]
-    pub block_size: String,
-    #[serde(default)]
-    pub hardware_compression: bool,
 }
 
 fn default_usable_capacity_factor() -> f64 {
@@ -173,16 +170,6 @@ fn default_usable_capacity_factor() -> f64 {
 }
 fn default_enospc_buffer() -> String {
     "50M".to_string()
-}
-fn default_block_size() -> String {
-    // Issue #121: the write path's block size is a format constant that
-    // never scales (docs/design/v2-open-questions.md:442,
-    // volume-format-v2.md §1/D7) -- this default was "1M", silently
-    // contradicting it. The field is still inert today
-    // (cli::volume::DEFAULT_BLOCK_SIZE is what the write path actually
-    // uses), so this default is currently only misleading, not dangerous,
-    // but it should read as what the format actually fixes.
-    "512K".to_string()
 }
 
 impl LtoBackendConfig {
@@ -421,8 +408,6 @@ pub struct PackingConfig {
     pub strategy: String,
     #[serde(default = "default_fill_threshold")]
     pub fill_threshold: f64,
-    #[serde(default = "default_min_free_for_append")]
-    pub min_free_for_append: String,
 }
 
 fn default_packing_strategy() -> String {
@@ -431,16 +416,12 @@ fn default_packing_strategy() -> String {
 fn default_fill_threshold() -> f64 {
     0.95
 }
-fn default_min_free_for_append() -> String {
-    "50G".to_string()
-}
 
 impl Default for PackingConfig {
     fn default() -> Self {
         Self {
             strategy: default_packing_strategy(),
             fill_threshold: default_fill_threshold(),
-            min_free_for_append: default_min_free_for_append(),
         }
     }
 }
@@ -546,12 +527,11 @@ impl Config {
     /// `crate::media::Generation::parse`, so a bad value should fail loudly
     /// here rather than downstream as a confusing `None`.
     ///
-    /// `backends.lto[].block_size` and `packing.min_free_for_append` are
-    /// size-typed strings too but are dead config — nothing in the write
-    /// path reads either (see `collection/plan.rs`'s `BLOCK_SIZE` comment
-    /// for `block_size`; `min_free_for_append` has no reader at all) — so
-    /// they are deliberately NOT validated here to avoid rejecting a config
-    /// file over a field tapectl never acts on.
+    /// `backends.lto[].block_size`, `.hardware_compression` and
+    /// `packing.min_free_for_append` used to be size/bool-typed strings here
+    /// too. They are gone (spec W4): a config still carrying one is rejected
+    /// by name in [`Config::load`]'s stale-field pre-scan, which is a
+    /// sharper answer than validating a value nothing acts on.
     fn validate_sizes(&self) -> Result<()> {
         crate::staging::parse_size_to_bytes(&self.defaults.slice_size)
             .map_err(|e| TapectlError::Config(format!("defaults.slice_size = {e}")))?;
@@ -616,7 +596,6 @@ pub const LTO_BACKEND_EXAMPLE: &str = r#"
 # device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"
 # device_sg = "/dev/sg1"
 # generation = "LTO-6"
-# hardware_compression = false
 "#;
 
 /// Error for "tape was asked for, but no drive is configured".
@@ -642,9 +621,19 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
     ))
 }
 
-/// If `content` (raw, unparsed config TOML) declares a `[[backends.lto]]`
-/// entry still carrying the pre-ADR-0010 `media_type` or `nominal_capacity`
-/// keys, return the exact remediation message for it.
+/// If `content` (raw, unparsed config TOML) still carries a key that has
+/// been removed from the schema, return the exact remediation message for
+/// it.
+///
+/// Two removals feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
+/// `.nominal_capacity`, so their message says where the fact went. Spec W4
+/// DELETED `backends.lto[].block_size`, `.hardware_compression` and
+/// `packing.min_free_for_append` outright because nothing ever read them, so
+/// their message says why there is nowhere for the value to go. Both are one
+/// mechanism on purpose: `LtoBackendConfig` has `deny_unknown_fields` and
+/// would otherwise fail with serde's generic "unknown field" line, and
+/// `PackingConfig` does NOT, so `min_free_for_append` would otherwise be
+/// silently swallowed — the worst outcome of the three.
 ///
 /// Parses `content` as generic `toml::Value` rather than scanning lines by
 /// hand, so comments and quoting are handled the way TOML actually defines
@@ -652,13 +641,25 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
 /// surface unchanged) when `content` is not even syntactically valid TOML —
 /// this check only ever *sharpens* an error that was going to happen anyway,
 /// never introduces a new failure mode of its own.
+///
+/// The `[packing]` and `[[backends.lto]]` scans are INDEPENDENT: a config
+/// with no `[[backends.lto]]` at all must still be told about a stale
+/// `packing.min_free_for_append`, so neither may short-circuit the other.
 fn stale_lto_fields_message(content: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(content).ok()?;
+    if let Some(msg) = stale_backend_fields_message(&value) {
+        return Some(msg);
+    }
+    stale_packing_fields_message(&value)
+}
+
+/// The `[[backends.lto]]` half of [`stale_lto_fields_message`].
+fn stale_backend_fields_message(value: &toml::Value) -> Option<String> {
     let backends = value.get("backends")?.get("lto")?.as_array()?;
     for entry in backends {
         let table = entry.as_table()?;
+        let name = table.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         if table.contains_key("media_type") || table.contains_key("nominal_capacity") {
-            let name = table.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             return Some(format!(
                 "backends.lto[\"{name}\"]: \"media_type\" and \"nominal_capacity\" moved — \
                  declare the DRIVE's generation as generation = \"LTO-6\"; capacity now \
@@ -666,6 +667,36 @@ fn stale_lto_fields_message(content: &str) -> Option<String> {
                  virtual drives only"
             ));
         }
+        if table.contains_key("block_size") {
+            return Some(format!(
+                "backends.lto[\"{name}\"]: \"block_size\" was removed — the write path's block \
+                 size is a FORMAT CONSTANT (512 KiB, volume-format-v2.md §1/D7), not a drive \
+                 setting: the on-tape recovery text an heir reads has it baked in, so a \
+                 per-drive value could only ever disagree with the tape. Delete the line."
+            ));
+        }
+        if table.contains_key("hardware_compression") {
+            return Some(format!(
+                "backends.lto[\"{name}\"]: \"hardware_compression\" was removed — the write \
+                 path disables drive compression unconditionally on every open \
+                 (TapeStore::open -> MTCOMPRESSION 0), so the knob could never re-enable it \
+                 and a true value was silently ignored. Delete the line."
+            ));
+        }
+    }
+    None
+}
+
+/// The `[packing]` half of [`stale_lto_fields_message`].
+fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
+    let packing = value.get("packing")?.as_table()?;
+    if packing.contains_key("min_free_for_append") {
+        return Some(
+            "packing.min_free_for_append was removed — append is rejected outright \
+             (ADR-0003), so there has never been an append path for this to gate. \
+             Delete the line."
+                .to_string(),
+        );
     }
     None
 }
@@ -1102,6 +1133,74 @@ mod tests {
         assert!(stale_lto_fields_message(text).is_none());
     }
 
+    // ---- Spec W4: removed keys are named, with the reason ----
+
+    #[test]
+    fn a_removed_block_size_is_named_with_the_format_constant_reason() {
+        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
+                     block_size = \"512K\"\n";
+        let msg = stale_lto_fields_message(text).expect("must be flagged");
+        assert!(msg.contains("block_size"), "{msg}");
+        assert!(msg.contains("FORMAT CONSTANT"), "{msg}");
+        assert!(msg.contains("volume-format-v2.md"), "{msg}");
+    }
+
+    #[test]
+    fn a_removed_hardware_compression_is_named_with_the_always_off_reason() {
+        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
+                     hardware_compression = false\n";
+        let msg = stale_lto_fields_message(text).expect("must be flagged");
+        assert!(msg.contains("hardware_compression"), "{msg}");
+        assert!(msg.contains("MTCOMPRESSION"), "{msg}");
+    }
+
+    /// `PackingConfig` has no `deny_unknown_fields`, so without this
+    /// pre-scan a stale `min_free_for_append` would be silently swallowed
+    /// rather than rejected — the one removal of the three that serde does
+    /// not catch on its own.
+    #[test]
+    fn a_removed_min_free_for_append_is_named_with_adr_0003() {
+        let text = "[packing]\nmin_free_for_append = \"50G\"\n";
+        let msg = stale_lto_fields_message(text).expect("must be flagged");
+        assert!(msg.contains("min_free_for_append"), "{msg}");
+        assert!(msg.contains("ADR-0003"), "{msg}");
+    }
+
+    /// The two halves must not short-circuit each other: a config with a
+    /// stale `[packing]` key and no `[[backends.lto]]` at all is the exact
+    /// shape a naive single-expression scan would miss.
+    #[test]
+    fn a_stale_packing_key_is_found_with_no_backends_configured() {
+        let text = "[packing]\nstrategy = \"best_fit_decreasing\"\n\
+                     min_free_for_append = \"50G\"\n";
+        assert!(stale_lto_fields_message(text).is_some());
+    }
+
+    #[test]
+    fn config_load_rejects_a_removed_key_with_the_friendly_message() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
+             block_size = \"512K\"\nhardware_compression = false\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("block_size"), "{msg}");
+        assert!(msg.contains("was removed"), "{msg}");
+    }
+
+    #[test]
+    fn a_clean_packing_table_is_not_flagged() {
+        let text = "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n";
+        assert!(stale_lto_fields_message(text).is_none());
+    }
+
     #[test]
     fn syntactically_invalid_toml_is_not_flagged_here() {
         // Not this function's job — the normal toml::from_str error surfaces
@@ -1151,8 +1250,6 @@ mod tests {
             capacity_override: None,
             usable_capacity_factor: default_usable_capacity_factor(),
             enospc_buffer: default_enospc_buffer(),
-            block_size: default_block_size(),
-            hardware_compression: false,
         }
     }
 
