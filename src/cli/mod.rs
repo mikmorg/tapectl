@@ -208,6 +208,14 @@ pub enum Commands {
         /// Capacity (e.g., "2500G")
         #[arg(long, default_value = "2500G")]
         capacity: String,
+        /// Which configured drive this volume belongs to, by its device path
+        /// (ADR-0010). Only needed when more than one `[[backends.lto]]` is
+        /// configured — with one drive, or none, the behaviour is unchanged.
+        /// Resolved leniently: this command only writes a catalog row and
+        /// never touches the device, so a path no backend claims is not an
+        /// error (issue #151).
+        #[arg(long)]
+        device: Option<String>,
         /// Notes
         #[arg(long)]
         notes: Option<String>,

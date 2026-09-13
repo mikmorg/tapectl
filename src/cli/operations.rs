@@ -1793,6 +1793,15 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 // bodies alongside `db` and `config`.
 
 /// `tapectl import`: register a pre-existing volume in the database.
+///
+/// `device` selects WHICH configured drive the imported volume belongs to
+/// (issue #151). Before it existed this resolved with `None` and errored
+/// outright on a multi-drive config — the command had a `backend_name`
+/// column to fill and nothing to fill it from. Resolution is LENIENT
+/// (`config::resolve_device`, ADR-0010) rather than strict, because this
+/// command writes one catalog row and never opens the device: a path no
+/// backend claims, or no backend at all, falls back to the backend TYPE
+/// string so the row stays self-consistent, exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub fn volume_import(
     conn: &Connection,
@@ -1801,15 +1810,17 @@ pub fn volume_import(
     backend: &str,
     media_type: &str,
     capacity: &str,
+    device: Option<&str>,
     notes: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
     let cap_bytes = crate::staging::parse_size_to_bytes(capacity)?;
-    // Resolve backend_name from configured backend of this type, else fall back
-    // to the type string so the row remains self-consistent.
+    // Resolve backend_name from the configured backend this device names,
+    // else fall back to the type string so the row remains self-consistent.
     let backend_name = match backend {
-        "lto" => crate::config::resolve_lto_backend(config, None)
+        "lto" => crate::config::resolve_device(config, device)
             .ok()
+            .and_then(|(_, b)| b)
             .map(|b| b.name.clone())
             .unwrap_or_else(|| backend.to_string()),
         _ => backend.to_string(),
@@ -2281,6 +2292,115 @@ mod tests {
     /// (which short-circuit before any stdin interaction). The "refuses
     /// without consent" behavior itself is proven exhaustively, with
     /// dependency-injected stdin, in `cli::consent`'s own test module.
+    /// Issue #151: `import` had a `backend_name` column to fill and no way
+    /// for the operator to say which drive the volume came off, so it
+    /// resolved with `None` — fine with one drive, an outright error with
+    /// two, and silently "whichever was first" in spirit.
+    mod import_device {
+        use super::*;
+        use crate::config::{Config, LtoBackendConfig};
+
+        fn backend(name: &str, device_tape: &str) -> LtoBackendConfig {
+            LtoBackendConfig {
+                name: name.to_string(),
+                device_tape: device_tape.to_string(),
+                device_sg: "/dev/null".to_string(),
+                generation: "LTO-6".to_string(),
+                capacity_override: None,
+                usable_capacity_factor: 0.92,
+                enospc_buffer: "50M".to_string(),
+            }
+        }
+
+        fn backend_name_of(conn: &Connection, label: &str) -> String {
+            conn.query_row(
+                "SELECT backend_name FROM volumes WHERE label = ?1",
+                rusqlite::params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// The regression: two drives configured, and `--device` picks the
+        /// one the operator names rather than erroring or guessing.
+        #[test]
+        fn device_selects_which_of_two_backends_is_recorded() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut config = Config::default();
+            config.backends.lto.push(backend("lto-a", "/dev/null"));
+            config.backends.lto.push(backend("lto-b", "/dev/zero"));
+
+            volume_import(
+                &conn,
+                &config,
+                "L6-IMP",
+                "lto",
+                "LTO-6",
+                "2500G",
+                Some("/dev/zero"),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto-b");
+        }
+
+        /// No flag, one drive: unchanged from before #151.
+        #[test]
+        fn no_device_with_one_backend_is_unchanged() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut config = Config::default();
+            config.backends.lto.push(backend("lto-a", "/dev/null"));
+
+            volume_import(
+                &conn, &config, "L6-IMP", "lto", "LTO-6", "2500G", None, None, false,
+            )
+            .unwrap();
+            assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto-a");
+        }
+
+        /// LENIENT on purpose (ADR-0010's read-path rule): `import` writes
+        /// one catalog row and never opens the device, so no configured
+        /// backend at all still imports, falling back to the backend TYPE
+        /// so the row stays self-consistent. A strict resolver here would
+        /// make the DR machine — keys restored, no `backend add` yet —
+        /// unable to register the tapes it is holding.
+        #[test]
+        fn no_backend_configured_still_imports_under_the_type_name() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+
+            volume_import(
+                &conn, &config, "L6-IMP", "lto", "LTO-6", "2500G", None, None, false,
+            )
+            .unwrap();
+            assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto");
+        }
+
+        /// A `--device` no backend claims is likewise not an error, for the
+        /// same reason.
+        #[test]
+        fn an_unclaimed_device_falls_back_to_the_type_name() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut config = Config::default();
+            config.backends.lto.push(backend("lto-a", "/dev/null"));
+
+            volume_import(
+                &conn,
+                &config,
+                "L6-IMP",
+                "lto",
+                "LTO-6",
+                "2500G",
+                Some("/dev/nst9"),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto");
+        }
+    }
+
     mod volume_retire_consent {
         use super::*;
 

@@ -212,6 +212,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref backend,
             ref media_type,
             ref capacity,
+            ref device,
             ref notes,
         } => {
             cli::operations::volume_import(
@@ -221,6 +222,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 backend,
                 media_type,
                 capacity,
+                device.as_deref(),
                 notes.as_deref(),
                 cli.json,
             )?;
