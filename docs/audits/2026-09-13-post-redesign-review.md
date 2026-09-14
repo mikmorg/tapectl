@@ -6,7 +6,16 @@ skeptics under distinct lenses — does the code say this, is it handled elsewhe
 is the consequence real — and kept only when fewer than half refuted it.
 
 **59 confirmed, 6 refuted.** 205 agents; the completeness
-critic did not finish (session limit), so this list is not certified complete.
+critic did not finish on the first attempt (session limit) and was resumed — its
+pass is appended below, so this list *is* certified complete as of 2026-09-14.
+
+> **RATIFIED — read this before acting on any finding below.** Every open question
+> this review raised was put to the CTO on 2026-09-14 and answered. The rulings are
+> in `docs/adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md`,
+> with dated corrections inside ADR-0010 and ADR-0011 where this review found their
+> own text wrong. **Where a "Fix:" bullet below disagrees with a ruling, the ruling
+> wins** — several do, and the filed issues say which. Do not re-open a ratified
+> question; see the closing Status section for the queue.
 
 Reviewers were told which cleanup work was in flight and which issues were already
 filed, so nothing here duplicates #140–#152.
@@ -623,3 +632,29 @@ I went after what the nine lenses did not open: the location side of ADR-0011 (e
 location) and the compaction `pending_erase` finding are FIXED in `8fb7eff`;
 ADR-0011 is corrected. The `location info`/`location list` gap and the
 `catalog rebuild` status finding remain open.
+
+## Status — ratified and filed (2026-09-14)
+
+This review is closed as a *document*: nothing further is decided here. What
+happened to it:
+
+- **Every question it raised was ratified by the CTO on 2026-09-14.** The
+  decisions live in ADR-0012; the corrections to ADR-0010/0011's own text are
+  dated inside those ADRs. `CONTEXT.md` gained *Version*, *Cartridge Identity*
+  and *Barcode*, and recast *Copy*.
+- **The ten duplicate clusters the critic named were merged before filing**, so
+  the ~44 distinct defects are one issue each, not 56. Several findings were
+  merged further where one ruling governs them (the four `import` write-ups, the
+  two `--status` filter findings, the five stale-comment findings).
+- **The queue is the GitHub label `review-2026-09-13`**, worked in severity
+  order; `consent-path` marks the consent-tier and cartridge-identity issues,
+  which are sequenced and gated together. Each issue states its ruling as *the*
+  fix. The rules autopilot works under are in the Policy block of
+  `.claude/commands/autopilot.md` (2026-09-14 entry).
+- **Two findings are explicitly not queue work.** The MAM maximum-capacity unit
+  question (MiB vs MB) is `needs:cto`: it is settled by writing an expendable
+  cartridge to end-of-tape during the operator's real-drive rehearsal, not by
+  code. `volume calibrate` (#145) is closed as rejected, for the same reason.
+- **Nothing ships to a production tape until the label is empty**, documentation
+  included, followed by a re-run of this review on the resulting diff. See
+  `docs/handoff.md`.
