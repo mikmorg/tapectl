@@ -87,10 +87,19 @@ resumable while the same session's Layout remains valid.
 _Avoid_: open, partial
 
 **Copy**:
-A unit's stage_set claim on a sealed, unquarantined, unretired volume — the
-unit of coverage in derivations. Seal status decides eligibility; evidence age
-qualifies presentation (warnings at destructive moments) but never eligibility.
-_Avoid_: backup, replica
+A claim to the same bytes on another medium: one snapshot Version of a unit,
+identical in content, on a sealed, unquarantined, unretired volume — the unit
+of coverage in derivations. A newer Version is not a copy of an older one,
+however little changed, so a unit is as covered as its least-covered current
+Version. Seal status decides eligibility; evidence age qualifies presentation
+(warnings at destructive moments) but never eligibility.
+_Avoid_: backup, replica, "a copy of the unit" (coverage is per Version)
+
+**Version**:
+A snapshot's ordinal within its unit, minted only when the unit's content
+differs from its latest current snapshot. Two Versions of a unit therefore
+never hold identical content: a version number names content, not a moment.
+_Avoid_: revision, generation (reserved for LTO media)
 
 **Current**:
 A snapshot that has been sealed onto a volume and still counts. **More than one
@@ -207,6 +216,19 @@ _Avoid_: media type as the name of the *concept* (it is the column that stores
 it), format (means the on-tape Layout Version), density (the code generation is
 read from, not the thing itself), drive generation as a synonym — the whole
 point is that the two differ
+
+**Cartridge Identity**:
+The name a cartridge is known by for life: the serial its memory chip reports,
+read at first contact and never changed; only where no chip can be read, the
+Barcode the operator registered it under at first write. The tape records at
+init which of the two it carries.
+_Avoid_: barcode (a label, below), id, sticker
+
+**Barcode**:
+The human-readable label on a cartridge — a sticker, applied or replaced at
+the operator's convenience and never an identity. A cartridge registered from
+its chip wears its serial as a placeholder Barcode until it is relabelled.
+_Avoid_: serial, identifier, cartridge name
 
 **Store**:
 A first-class implementation of the storage interface, selected by a

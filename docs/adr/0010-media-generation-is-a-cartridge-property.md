@@ -20,9 +20,9 @@ drive, and the drive's only media fact is which generations it can write and rea
 2. **The medium's generation is detected from the drive at `volume init`**, not declared:
    MAM *medium density code*, else MAM *format density code*, else the `st` driver's density
    register (`MTIOCGET`). Only when none of those yields a known code does tapectl fall
-   back to a declaration — `--media`, then a serial-matched cartridge row, then the drive's
-   own generation — and it says so. A `--media` that contradicts a detected code is an error,
-   not a hint. A drive that cannot write the detected generation is a hard refusal that
+   back to a declaration — `--generation`, then a serial-matched cartridge row, then the
+   drive's own generation — and it says so. A `--generation` that contradicts a detected code
+   is an error, not a hint. A drive that cannot write the detected generation is a hard refusal that
    `--force` does not override: it is a physical fact, not a consent tier (ADR-0008).
 3. **Capacity is a function of generation** with two overrides in a fixed order: the drive's
    `capacity_override` (the drive lies, as mhvtl does) → the bound cartridge row's
@@ -37,18 +37,27 @@ drive, and the drive's only media fact is which generations it can write and rea
 because nothing knew which cartridge it was writing. The MAM medium serial is that
 knowledge. `volume init` matches it to `cartridges.serial_number`; failing that it binds the
 `--cartridge <barcode>` the operator names and records the serial on that row; failing that
-it auto-registers a cartridge whose barcode *is* the serial and says so. A registered row
-whose `media_type` disagrees with the detected generation is an error — either the row is
-wrong or the wrong tape is loaded, and tapectl cannot tell which. That contradiction is the
-*only* new refusal binding introduces: it is a fact error, not a risk judgement.
+it auto-registers a cartridge whose barcode *is* the serial and says so — a placeholder,
+relabelled when a sticker is applied (ADR-0012). Where no serial is readable at all,
+`--cartridge` is required (ADR-0012; this ADR originally wrote the volume unbound with a
+warning). A registered row whose `media_type` disagrees with the detected generation is an
+error — either the row is wrong or the wrong tape is loaded, and tapectl cannot tell which.
+That is a fact error, not a risk judgement, and so are the two the lookup adds beside it: a
+`--cartridge` naming a barcode that was never registered, and one naming a row that already
+carries a *different* medium serial (a different physical cartridge). *Correction
+2026-09-14: the original text called the generation disagreement "the only new refusal".*
 
 **Binding adds no second consent gate.** The tempting rule — refuse when the cartridge is
 still bound to a live volume, and make `--force` or the retire lifecycle the way past — was
-considered and rejected. `volume init` already asks the tape itself: File 0 naming a sealed
-volume is refused unless `--force` (ADR-0003, #27), and that is the decision point, made
-against the medium's own evidence rather than the catalog's weaker claim about it. An
-operator who reached init past File 0 either loaded a blank or erased tape — in which case
-the data is already physically gone — or gave `--force`, which is the consent. Demanding a
+considered and rejected. `volume init` already asks the tape itself: a File 0 naming a
+*sealed* volume is refused absolutely — nothing passes it, `--force` included (ADR-0003,
+ADR-0008 Tier 3) — and a File 0 naming another *unsealed* volume, or one too damaged to
+parse, is refused unless `--force` (#27). That is the decision point, made against the
+medium's own evidence rather than the catalog's weaker claim about it. An operator who
+reached init past File 0 either loaded a blank or erased tape — in which case the data is
+already physically gone — or gave `--force` over an unsealed one, which is the consent.
+*Correction 2026-09-14: the original text said a sealed volume "is refused unless
+`--force`"; the code never allowed that, and ADR-0003 forbids it.* Demanding a
 second override for the same act is the ceremony ADR-0008 warns about, and it would have
 made a physical `mt erase` followed by `volume init` — the most ordinary reuse there is —
 into a two-command catalog dance that teaches operators to reach for `--force` by reflex.
@@ -59,10 +68,17 @@ says why, and a warning names it together with any unit that just lost its last 
 (`retire_impacts`, already written for `volume retire`). Nothing is blocked, which is
 ADR-0004; the catalog stops crediting a copy that no longer exists, which is the failure the
 lifecycle suite's own comment predicted ("single-cartridge copy counts may over-credit it");
-and `audit` reports the new coverage truthfully on the next run. Where no serial is readable
-(mhvtl exposes none) the volume is written unbound with a warning, so the virtual harnesses
-lose nothing. `volume write` re-reads the serial and refuses a cartridge that is not the one
-init bound — the same wrong-cartridge discipline as the File 0 check, one layer earlier.
+and `audit` reports the new coverage truthfully on the next run. **This holds only when the
+serial proves the tape in the drive is the cartridge being displaced.** With no readable
+serial, a blank tape plus a `--cartridge` bound to a live volume is undecidable — the same
+tape erased, or a different tape wearing that sticker — and ADR-0012 refuses it: retire the
+volume first. *Correction 2026-09-14: the original text said "where no serial is readable
+(mhvtl exposes none) the volume is written unbound with a warning". Both halves were wrong:
+mhvtl reports a stable medium serial (`E01001L8_1775794348`, in the repo's own recording
+and fixture), and an unbound volume is a copy the catalog cannot place.* `volume write`
+re-reads the serial and refuses a cartridge that is not the one init bound — the same
+wrong-cartridge discipline as the File 0 check, one layer earlier — and binds only *after*
+that check, so a refused write displaces nothing (#154).
 
 **Read paths stay usable without a configured drive.** The strict device→backend resolution
 below governs the write paths, which genuinely need the drive's factor, ENOSPC buffer and sg
@@ -81,14 +97,20 @@ fix for multiple physical drives, which the old code could configure but never s
 **What this does not change.** The on-tape format: the ID thunk and MANIFEST keep every
 field name and shape (`media_type`, `nominal_capacity_bytes`, the `[media]` MAM block); only
 values change, and `tests/on_tape_golden.rs` must stay green without a re-pin (ADR-0007).
+*Amendment 2026-09-14: ADR-0012 adds one field to the ID thunk's `[media]` table,
+`cartridge_identity_source` (`"mam"` or `"operator"`), beside `cartridge_serial`. Additive,
+ratified by the CTO, and to be recorded in `docs/design/volume-format-v2.md` when it lands.*
 The `volumes.media_type` and `cartridges.media_type` columns keep their names and now always
 hold a generation string tapectl can parse. Tenants, units, policy, the write session, the
 Store trait — untouched.
 
 **Facts encoded, and their sources.** Density codes are the `st` driver's, as listed in
 mt-st's `mt.c` (0x42 LTO-2, 0x44 LTO-3, 0x46 LTO-4, 0x58 LTO-5, 0x5A LTO-6, 0x5C LTO-7,
-0x5D LTO-7 Type M, 0x5E LTO-8, 0x60 LTO-9; 0x40 is shared with DLT1 and is accepted as
-LTO-1 only by declaration). Compatibility is the LTO consortium's published chart
+0x5D LTO-7 Type M, 0x5E LTO-8, 0x60 LTO-9; 0x40 is shared with DLT1 and is detected as
+LTO-1 — a DLT1 cartridge cannot physically be in an LTO drive, so the ambiguity is
+academic. *Correction 2026-09-14: the original text said 0x40 was "accepted as LTO-1 only by
+declaration"; the code auto-detected it from the start, and the CTO ratified the code.*).
+Compatibility is the LTO consortium's published chart
 (lto.org/lto-generation-compatibility): generations 1–7 write their own and the prior
 generation and read two back; LTO-8 reads and writes LTO-7, LTO-7 Type M and LTO-8; LTO-9
 reads and writes LTO-8 and LTO-9 only; LTO-10 is LTO-10 only. Native capacities are the
@@ -100,9 +122,10 @@ precedence — is how a 40 TB cartridge is declared. Both tables live in one mod
 per row; they are not derived from a formula, because the formula stopped holding at LTO-8.
 
 **Consequences.** `backend add` takes `--generation` and `--capacity-override`; `cartridge
-register` validates `--media-type` and defaults `--capacity` from the table; `collection plan`
-and `volume plan` take `--media` for planning a tape that is not loaded, defaulting to the
-drive's native generation. Migration 011 adds a partial unique index on
+register` validates `--generation` and defaults `--capacity` from the table; `collection plan`
+and `volume plan` take `--generation` for planning a tape that is not loaded, defaulting to
+the drive's native generation (the flag is spelled `--generation` on every command — ADR-0012;
+`--media`/`--media-type` were the original spellings). Migration 011 adds a partial unique index on
 `cartridges.serial_number`. `first-run.sh` stops asking the operator to register the
 cartridge by hand — init does it — and asks for the drive's generation instead of a media
 type. Binding also makes the **cartridge lifecycle live for the first time**: `in_use` was

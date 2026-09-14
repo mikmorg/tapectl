@@ -15,43 +15,41 @@ write. None of them is blocked on a decision — each needs your hands.
 
 ---
 
-## STOP — read this before the first production write (2026-09-13)
+## STOP — read this before the first production write (updated 2026-09-14)
 
 The media-generation redesign (ADR-0010, ADR-0011) is landed, gated and
-hardware-verified on branch `media-generation-model`: 1085 tests, the mhvtl
-verify gate GREEN 26/26 against an empty EXPECTED_FAIL, and the lifecycle
-suite's `first-year` scenario GREEN 45/45. One LTO-6 drive now handles LTO-5
-and LTO-6 cartridges with nothing to change between tapes.
+hardware-verified: 1087 tests, the mhvtl verify gate GREEN 26/26 against an
+empty EXPECTED_FAIL, and the lifecycle suite's `first-year` scenario GREEN
+45/45. One LTO-6 drive now handles LTO-5 and LTO-6 cartridges with nothing to
+change between tapes.
 
-**But the adversarial review that followed it found three high-severity
-defects, and the first production write should wait for them**
-(`docs/audits/2026-09-13-post-redesign-review.md`, 59 confirmed findings):
+The adversarial review that followed it
+(`docs/audits/2026-09-13-post-redesign-review.md`, 59 confirmed findings,
+~44 distinct) was grilled question by question and **every ruling was
+ratified on 2026-09-14**. The decisions are in
+`docs/adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md`;
+the corrections to ADR-0010/0011's own text are dated inside them.
 
-- **#153 — copy counting treats versions as copies.** A unit with v1 on one
-  tape and v2 on another reads as two copies. At the shipped default of two,
-  `unit mark-tape-only` passes its consent gate and tells you it is safe to
-  delete the source. Reproduced with the real binary. Predates this redesign;
-  the same inflated number feeds `audit`, three reports and the location check,
-  so nothing contradicts it. **This is the one that can lose data.**
-- **#154 — late binding commits the displacement before the tape-contact
-  check**, so a `volume write` that is then refused has already marked a live
-  volume erased in the catalog.
-- **#155 — `volume init --cartridge` displaces a live volume on a typed
-  barcode alone** when no medium serial is readable. This is a hole in
-  ADR-0010's reasoning, not only its code: the ADR justifies having no second
-  consent gate on the grounds that the File 0 check already decided consent,
-  which does not hold when the displacement is driven by what was typed.
-  ADR-0010 needs amending alongside the fix.
+**The first production write now waits on three things, and only these:**
 
-The remaining 56 findings are medium and low and are written up with evidence
-and a proposed fix in the same audit. The ones worth knowing before an
-operator session: disaster recovery rebuilds no cartridge identity, so a
-recovered tape cannot be re-bound; `db fsck --repair` cannot repair, because
-its deletes violate the same foreign keys; and generation capacities are
-decimal while every operator-facing `--capacity` parses as binary.
+1. **The GitHub label `review-2026-09-13` is empty** — every finding and every
+   ratified ruling is filed under it, severity-ordered, and autopilot works
+   it to zero. *Everything* is in scope before the first write, documentation
+   cleanups included (the CTO's Q3 ruling overrode "code first, docs later").
+   Autopilot may correct a record's *facts*; it may not re-open a *decision*.
+   Decisions it cannot make are parked and batched to you, and it never
+   reports the queue empty while anything is parked.
+2. **The adversarial review is re-run on the resulting diff**, the same way
+   (`docs/audits/` gets the record), before the write — not after.
+3. **A real-drive rehearsal on an expendable cartridge on home2**, which also
+   settles the one open measurement: MAM's maximum-capacity attribute is
+   either MiB or MB (a 10 % question; the code assumes MiB). Write that
+   cartridge to end-of-tape and record where ENOSPC fell.
 
-The review's completeness critic did not finish (session limit), so that list
-is not certified complete.
+The finding that can lose data is still **#153 — copy counting treats
+versions as copies** (v1 on one tape and v2 on another read as two copies, so
+`unit mark-tape-only` tells you it is safe to delete the source). It is
+severity-first in the queue and its ruling is ADR-0012's first paragraph.
 
 ## Where the project actually stands
 
@@ -183,6 +181,27 @@ An explicit hard stop for autopilot. Nothing writes real data to real media
 without you.
 
 ## Decisions already ratified — do not re-litigate
+
+**2026-09-14 — the pre-production rulings**, recorded in ADR-0012 (the
+decisions), dated corrections inside ADR-0010/0011, and `CONTEXT.md` (*Copy*,
+*Version*, *Cartridge Identity*, *Barcode*). The process rulings that are not
+domain decisions live only here:
+
+1. The queue is the GitHub label `review-2026-09-13`, worked in severity
+   order; the ~44 distinct findings were deduplicated before filing (the
+   critic named the ten clusters) and each issue states its ADR-0012 ruling
+   as *the* fix, not an option.
+2. `media-generation-model` merged to master before autopilot started.
+3. All work — code and documentation — before the first production write.
+4. Autopilot corrects a record's facts, never its decisions.
+5. The mhvtl gate runs per item only for write-path and restore-path changes;
+   everything else is gated in batches.
+6. `#143` (config set/add/remove) and `#144` (--policy-aware packing) are
+   excluded from the queue; `#145` (volume calibrate) is rejected.
+7. Decisions autopilot cannot make are parked, batched, and never reported
+   as an empty queue.
+8. The adversarial review is re-run on the diff before the write.
+9. The real-drive rehearsal on an expendable cartridge is a hard prerequisite.
 
 Recorded in `docs/adr/0009-heir-kit-contents-and-staleness.md` and the
 `§2.16` row of `docs/design-errata.md` (2026-08-01):

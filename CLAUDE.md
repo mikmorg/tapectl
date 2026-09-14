@@ -88,11 +88,22 @@ govern the result:
   `cartridge retire` writes `retired_permanent` under an ADR-0008 Tier-2 gate and
   retires the volumes on it; `volume retire` frees the cartridge it was the last live
   volume on.
-- **Binding records a displacement, it never gates one.** Re-initialising a cartridge
-  closes the open mount, marks the displaced volume `erased`, and warns naming any unit
-  left without a copy. The File 0 check is the consent point (ADR-0003) and a second
-  gate was deliberately rejected. The mhvtl gate proves it: four volumes initialised on
-  one cartridge in one run, no `--force`, three left `erased`.
+- **Binding records a displacement, it never gates one** — when the serial proves which
+  cartridge is in the drive. Re-initialising a cartridge closes the open mount, marks the
+  displaced volume `erased`, and warns naming any unit left without a copy. The File 0
+  check is the consent point (ADR-0003) and a second gate was deliberately rejected. The
+  mhvtl gate proves it: four volumes initialised on one cartridge in one run, no
+  `--force`, three left `erased`. The one carve-out (ADR-0012): with no readable serial,
+  a blank tape plus a `--cartridge` bound to a live volume is refused.
+- **2026-09-14 — ADR-0012, the pre-production rulings.** The review's questions were
+  grilled and ratified in full: a *Copy* is identical content, counted per Version (a
+  unit is as covered as its least-covered live version, and a version is minted only
+  when content changed); a cartridge's identity is its chip serial, the barcode a
+  relabelable sticker; the retire family's zero floor is absolute (ADR-0008 Tier 3, the
+  code had it inverted); cartridge capacities are decimal, data sizes binary; unknown
+  config keys are errors everywhere; `volume calibrate` is not built. The work queue is
+  the GitHub label `review-2026-09-13`; nothing ships to a production tape until it is
+  empty, including documentation.
 - `--device` no longer defaults to `/dev/nst0` anywhere. Write paths resolve it
   strictly (`config::resolve_lto_backend`), read paths leniently
   (`config::resolve_device`) so DR still works with keys and no `backend add`.

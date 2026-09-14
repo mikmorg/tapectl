@@ -35,11 +35,13 @@ recorded nowhere at all. A bound volume inherits its cartridge's location, with 
 **`retired_permanent` is a status, and it needs a writer with a consent gate.** A cartridge
 retired for wear or read errors is not a location change and not an erasure: the data may
 still be readable, but the medium must never be written again. `cartridge retire <barcode>`
-writes it, and it is Tier 2 under ADR-0008 — it removes a physical copy from every coverage
-count that policy computes, so the evidence is displayed first and `--force`/`--yes` is
-required when any unit is left below its policy. It is the cartridge-level peer of `volume
-retire`, which already does exactly this analysis, and it reuses that analysis rather than
-growing a second one.
+writes it, and it is tiered under ADR-0008 — it removes a physical copy from every coverage
+count that policy computes, so the evidence is displayed first; `--force`/`--yes` is
+required when any unit is left below its policy (Tier 2), and it is refused outright when any
+current snapshot would be left with no eligible copy at all (Tier 3, ADR-0012). When nothing
+loses coverage there is nothing to consent to and it asks for nothing. It is the
+cartridge-level peer of `volume retire`, which already does exactly this analysis, and it
+reuses that analysis rather than growing a second one.
 
 **Retiring a cartridge retires the volumes on it.** That sentence above — "removes a
 physical copy from every coverage count" — is only true if something makes it true, and
@@ -60,18 +62,27 @@ to `pending_erase`, which is what makes the state reachable by the ordinary path
 only through compaction. A retired cartridge cannot be bound by `volume init`, and that refusal
 is a fact error, not a risk judgement: ADR-0010 lets init record a displacement without
 consent because File 0 already decided it, but no amount of consent makes a medium you have
-declared unfit fit again. The escape is `cartridge mark-erased`, which is the operator saying
-they were wrong.
+declared unfit fit again. The way back is `cartridge unretire` (Tier 1), which reverses the
+retirement and restores each bound volume's prior status — the operator saying they were
+wrong about the *medium*. `cartridge mark-erased` is a different statement, that the *bytes*
+are gone, and it marks the volumes `erased` accordingly. *Correction 2026-09-14: the original
+text named `mark-erased` as the escape, which would have turned "I was wrong to condemn this
+tape" into "the data on it is gone".*
 
 **The lifecycle is therefore four states, each with a writer:**
 
 ```
 available ──volume init──> in_use ──compact-finish/volume retire──> pending_erase
-    ^                                                                     │
+    ^                        ^                                            │
+    │                        └──────────── volume init ───────────────────┤
     └──────────────────── cartridge mark-erased ──────────────────────────┘
     │
-    └──> retired_permanent  (cartridge retire; mark-erased is the only way back)
+    └──> retired_permanent  (cartridge retire; cartridge unretire is the way back)
 ```
+
+*Correction 2026-09-14: the diagram gained the `pending_erase → in_use` edge, which
+`volume init` writes (ordinary reuse after a bulk erase, ADR-0010), and `unretire` replaced
+`mark-erased` as the way back from `retired_permanent`.*
 
 **Consequences.** Migration 012 rebuilds `cartridges` with the four-value CHECK and adds the
 index on `location_id` the column never had. `cartridge list`/`info` gain the location
