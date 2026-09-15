@@ -104,8 +104,11 @@ pub enum CoverageScope<'a> {
     /// alias (`"u.id"`) when the expression is embedded as a correlated
     /// subquery in a per-unit report.
     ///
-    /// `current_only` restricts to the unit's CURRENT snapshot. Most
-    /// callers want that (`audit`, `unit mark-tape-only`, the reports);
+    /// `current_only` restricts to the unit's CURRENT snapshots — plural:
+    /// `snapshots.status` permits more than one `'current'` row per unit
+    /// at once (issue #153), and `copy_count_expr`/`location_count_expr`
+    /// take the MIN across all of them, not their union. Most callers
+    /// want that (`audit`, `unit mark-tape-only`, the reports);
     /// `volume retire`'s impact analysis deliberately does not, because it
     /// asks what coverage a unit has on ANY snapshot the retired cartridge
     /// participates in.
@@ -312,6 +315,11 @@ pub fn location_count_expr(q: &CoverageQuery) -> String {
 /// deposits. Purely for DISPLAY: the advisory surfaces print it beside the
 /// total so a warehouse copy is visibly distinguishable rather than
 /// silently folded into a number that looks like tapes on a shelf.
+///
+/// Deliberately NOT per-version-MINed (issue #153): nothing gates on this
+/// value, and a display count that disagrees with the total it is meant
+/// to break down would confuse rather than protect — leave it the plain
+/// union it has always been.
 pub fn deposit_count_expr(q: &CoverageQuery) -> String {
     format!("(SELECT COUNT(*) FROM ({}))", scoped_deposits(q, "cd.id"))
 }
