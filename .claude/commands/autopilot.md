@@ -46,6 +46,15 @@ the normative design set named in the Policy block below.
      fork that no ruling answers, park it (rule 4). If an issue's *facts* are
      wrong (a drifted line number, a claim the code no longer supports), correct
      the record in the issue and carry on.
+     **Verify, don't trust — this applies to the issue bodies themselves.** They
+     were drafted against ADR-0012 and their citations re-checked by their
+     drafters, but the independent adversarial pass that was supposed to follow
+     **never ran** (the account's session limit killed it twice). So every
+     file:line in an issue is a lead, not evidence: grep it before acting on it,
+     exactly as you would a sub-agent's report. Where an issue says "ratified",
+     check it names the ADR paragraph it rests on; a step that only *applies* a
+     ruling is ordinary engineering you may exercise judgement on (#166 and #178
+     carry explicit comments drawing that line, and are the pattern for the rest).
   3. **Gate per item only for write-path and restore-path changes** (`src/volume`,
      `src/tape`, `src/store.rs`, RESTORE.sh — every issue's Acceptance section
      says which it is). For those, run
