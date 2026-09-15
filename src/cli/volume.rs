@@ -1154,7 +1154,16 @@ struct VolumeRow {
     /// never re-derived (rule #4). `None` when the volume carries no unit
     /// yet (e.g. freshly `initialized`), rendered "—": that is a different
     /// fact from a unit really having zero copies, which renders `0`.
-    #[tabled(rename = "COPIES", display_with = "display_copies")]
+    ///
+    /// The header is "MIN COPIES", not "COPIES", deliberately. This is a
+    /// fact about the least-covered UNIT on this tape, not about the tape:
+    /// a volume is one physical object and "copies of a volume" is not a
+    /// meaningful quantity. Under a bare "COPIES" header the cell reads as
+    /// a property of the row it sits in — the exact failure #91 records,
+    /// where a coverage string that was true beside its context asserted
+    /// something false when read alone. The question this answers is "if I
+    /// lose this tape, how thin does anything on it get".
+    #[tabled(rename = "MIN COPIES", display_with = "display_copies")]
     copies: Option<i64>,
     /// This volume's own most recent PASSED `verification_sessions` row
     /// (raw timestamp; `None` = never verified). Deliberately a fresh
@@ -2208,6 +2217,59 @@ mod tests {
             assert_eq!(
                 erased.cartridge, None,
                 "an unbound volume must still appear"
+            );
+        }
+
+        /// A DISPLACED volume keeps its cartridge column.
+        ///
+        /// ADR-0010's re-initialisation path closes the displaced volume's
+        /// mount (`cartridge_volumes.unmounted_at`) and marks it `erased`,
+        /// leaving the row in place. The cartridge join is deliberately NOT
+        /// filtered on `unmounted_at IS NULL`, so the volume still reports
+        /// which physical tape it lived on — the question an operator asks
+        /// of an erased volume is exactly "which cartridge got reused".
+        ///
+        /// `cartridge_volumes` is `UNIQUE(volume_id)` (001_initial.sql:222),
+        /// so an unfiltered join can never duplicate a row here. Pinned
+        /// because the filter looks like an omission: adding
+        /// `unmounted_at IS NULL` would silently blank this column for every
+        /// displaced volume, and the status column already says `erased`, so
+        /// nothing here implies the bytes are still there.
+        #[test]
+        fn a_displaced_volume_still_names_the_cartridge_it_lived_on() {
+            let conn = seed();
+            let cart_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM cartridges WHERE barcode = 'E01001L8_17757943'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let vol_id: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'L6-0004'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            // The shape re-initialisation leaves behind: a CLOSED mount.
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, mounted_at, unmounted_at)
+                 VALUES (?1, ?2, datetime('now','-30 days'), datetime('now','-1 day'))",
+                rusqlite::params![cart_id, vol_id],
+            )
+            .unwrap();
+
+            let rows = volume_rows(&conn, None).unwrap();
+            assert_eq!(
+                rows.len(),
+                5,
+                "UNIQUE(volume_id) means a closed mount cannot duplicate the row"
+            );
+            let displaced = rows.iter().find(|r| r.label == "L6-0004").unwrap();
+            assert_eq!(displaced.status, "erased");
+            assert_eq!(
+                displaced.cartridge.as_deref(),
+                Some("E01001L8_17757943"),
+                "a displaced volume must still name the cartridge it lived on"
             );
         }
 
