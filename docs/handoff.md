@@ -46,6 +46,13 @@ the corrections to ADR-0010/0011's own text are dated inside them.
    either MiB or MB (a 10 % question; the code assumes MiB). Write that
    cartridge to end-of-tape and record where ENOSPC fell.
 
+**Run that rehearsal early** (ruled 2026-09-15) — whenever your week allows,
+not after the queue drains. It measures hardware facts, which none of the
+queued defects can distort, and it is the only step that can invalidate an
+assumption *before* forty issues of work are built on it. `scripts/lto6-measure.sh`
+is the harness; extend it rather than writing a new one. A second, final
+rehearsal on the finished tree still happens before the first write.
+
 The finding that can lose data is still **#153 — copy counting treats
 versions as copies** (v1 on one tape and v2 on another read as two copies, so
 `unit mark-tape-only` tells you it is safe to delete the source). It is

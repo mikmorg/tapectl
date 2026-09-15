@@ -40,8 +40,27 @@ yourself; base repair is the coordinator's call.
 
 **Build rule.** Debug/check only — NEVER `--release`. Every cargo invocation
 sets CARGO_TARGET_DIR=/scratch/tapectl-target (the / partition is small).
-When agents run in parallel, use /scratch/tapectl-target-<branch> instead — a
-shared target dir serializes builds on cargo's lock.
+When agents run in parallel, use /scratch/tapectl-target-<branch> instead, so
+each worker keeps its own incremental cache.
+
+**Build lock — mandatory whenever workers run in parallel.** Wrap EVERY cargo
+invocation in `flock /scratch/tapectl-build.lock`:
+
+```bash
+CARGO_TARGET_DIR=/scratch/tapectl-target-<branch> \
+  flock /scratch/tapectl-build.lock cargo test
+```
+
+This VM has 9 GB of RAM and 16 cores, so the bottleneck is memory during
+linking, not CPU: two concurrent cargo builds OOM-kill each other and
+whatever else is running (2026-07-30, and again during the v2 regear). A
+per-worker target dir alone does not prevent that — it makes it *more* likely,
+because nothing serializes the builds. A *shared* target dir would serialize
+them via cargo's own lock but forces a cold rebuild on every switch between
+worktrees, since cargo fingerprints on the workspace path. The flock gives you
+both: incremental caches per worker, one build at a time across all of them.
+Expect to wait on the lock; that wait is the feature. Reading, editing and
+thinking all proceed in parallel — only linking is serialized.
 
 **tapectl guardrails.**
 1. Never touch /dev/nst* or /dev/sg*, and never run TAPECTL_MHVTL=1 suites —
@@ -114,22 +133,39 @@ converts "use judgment" into "don't do X".}}
 
 1. Base sanity check (above). Then `git branch --show-current` — confirm it is
    your assigned branch, not master.
-2. **Run every cargo command synchronously, in the foreground.** Never
+2. **Re-confirm the defect before writing anything.** Your task cites specific
+   files, lines and symbols. Those citations were drafted against an earlier
+   tree and were NOT independently verified — the verification pass that was
+   meant to check them never ran. So grep each one yourself and confirm the
+   defect is still there, in the form described. Three outcomes:
+   - it is there as described → proceed;
+   - it is there but the line numbers or details have drifted → note the
+     correction in your final report and proceed;
+   - **it is not there at all, or the code already does the right thing** →
+     STOP and report "DEFECT NOT PRESENT" with what you actually found. Do not
+     invent work to justify the task, and do not "fix" code that is already
+     correct. A task built on a stale citation is the coordinator's problem to
+     re-scope, not yours to paper over.
+   Where the task says a step is "ratified", that means an ADR paragraph
+   settles it and you may not re-open it. Where a step merely *applies* a
+   ruling, it is ordinary engineering and your judgement is welcome — issues
+   #166 and #178 carry comments drawing that line explicitly.
+3. **Run every cargo command synchronously, in the foreground.** Never
    background one, never arm a Monitor or wait on a "completion
    notification" — the coordinator sends none, and three workers on
    2026-09-11 each stalled for minutes waiting on one. A baseline `cargo
    test` is run first, waited on, and its totals recorded; no file is
    touched until it returns.
-3. Apply changes in order; `cargo check --all-targets` after each.
-4. Full gate: `cargo fmt --all -- --check && cargo clippy --all-targets --
+4. Apply changes in order; `cargo check --all-targets` after each.
+5. Full gate: `cargo fmt --all -- --check && cargo clippy --all-targets --
    -D warnings && cargo test` — green AND test count >= baseline. Never pipe
    clippy through `tail`; warnings print ABOVE the "Finished" line and a tail
    hides them.
-5. If you changed any clap definition: `cargo run --example gen_man` and
+6. If you changed any clap definition: `cargo run --example gen_man` and
    commit docs/man.
-6. Commit per change, conventional style (see `git log --oneline -5`), body
+7. Commit per change, conventional style (see `git log --oneline -5`), body
    citing the design section that mandates it.
-7. Do NOT push. Do NOT merge.
+8. Do NOT push. Do NOT merge.
 
 ### Final report (return verbatim — this is data for the coordinator, not
 prose for a user)

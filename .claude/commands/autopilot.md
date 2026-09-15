@@ -16,6 +16,80 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
+- **HOW TO RUN THE QUEUE — CTO rulings 2026-09-15. Read with the queue entry
+  below; these six answers govern it.**
+  1. **No separate verification pass; verify at pickup.** The adversarial check
+     on the issue bodies never ran (session limit, twice), so every citation in
+     every issue is a lead. `worktree-agent.md` process step 2 is now the
+     substitute and is **mandatory in every worker prompt**: re-confirm the cited
+     defect exists before writing anything, and report `DEFECT NOT PRESENT`
+     rather than inventing work. A stale citation is a re-scope for you, not a
+     problem for the worker to paper over.
+  2. **Two issues do not land unattended: #153 and #147.** They change what the
+     system tells the operator immediately before data is deleted. Land each on a
+     branch and show the CTO the diff **and** the before/after terminal output of
+     the affected commands on a fixture; merge only on their word. Every other
+     issue follows standing integration policy (cherry-pick, gate, push).
+  3. **#160 is split three ways** — #160 (catalog: serial write-once +
+     `cartridge relabel`), #192 (tape: File 0 `cartridge_identity_source` + the
+     no-serial `--cartridge` requirement), #193 (corroboration at every contact).
+     Land in that order. #192 is the only one touching on-tape bytes; it gets a
+     worker to itself.
+  4. **No config migration.** The strict-keys work (#171/#172/#173) invalidates
+     any config in the field, and that was already ruled acceptable. Whichever of
+     the three lands last owns two things instead: the load error names the
+     offending key and says to re-run `tapectl init`, and `first-run.sh` detects
+     an unloadable config and offers to regenerate it.
+  5. **The home2 real-drive rehearsal runs EARLY and independently of this
+     queue** — whenever the CTO's week allows, not after the queue drains. It
+     measures hardware facts (ENOSPC, the #182 MAM unit), which no queued defect
+     can distort, and it is the only step that can invalidate an assumption
+     before 40 issues of work are built on it. The *final* pre-write rehearsal
+     still happens as ratified. Autopilot never starts a rehearsal itself: the
+     drive is not on this VM.
+  6. **Run the loop; accept the interruptions.** The account's session limit will
+     stop the loop mid-queue. That is a pause, not a loss, because each item is
+     committed and pushed before the next begins and this Policy block plus the
+     memory checkpoint tell a fresh session exactly where things stand. Do not
+     shrink the work to dodge the limit.
+
+- **PARALLELISM — up to three workers, never two builds.** This VM has 9 GB of
+  RAM and 16 cores: the bottleneck is memory during linking, and two concurrent
+  cargo builds OOM-kill each other. The rule is therefore **per-worker
+  `CARGO_TARGET_DIR` plus a shared `flock /scratch/tapectl-build.lock` around
+  every cargo invocation** (`worktree-agent.md`, Build lock). Reading, editing
+  and thinking run in parallel; only linking serializes. Choose concurrent items
+  so **no two touch the same file** — `src/volume/write.rs` is the hot one, named
+  by #154, #160, #192, #193, #155 and #147, so at most one of those runs at a
+  time. Pure-Markdown items (#180, #181) and pure-`scripts/` items (#156, #179)
+  need no build at all and can always ride alongside.
+
+  **The high tier, in waves** (→ means the next wave waits):
+  - **H1: #153 ∥ #159 ∥ #154.** File-disjoint — `policy/coverage.rs` +
+    `operations.rs`; `staging/` + `unit/` + `collection/`; `volume/write.rs`
+    ordering. #153 goes to the CTO review queue when done and **must not block
+    the wave** — that is the main reason to run three here.
+  - → **H2: #160** alone (`binding.rs`, `cartridge.rs`, and `write.rs`'s serial
+    guard, which needs #154 merged first). Ride #180 and #181 alongside.
+  - → **H3: #192** alone (on-tape bytes; `layout.rs`, `format.rs`,
+    `tests/format_v2.rs`, `docs/design/volume-format-v2.md`). Ride #156/#179
+    alongside. Stop and report if `tests/on_tape_golden.rs` turns out to pin
+    File 0 — a re-pin is a CTO decision.
+  - → **H4: #155**, then **#193**, serially: both sit on `binding.rs`/`write.rs`.
+  - → **H5: #147** (needs #153 merged for `operations.rs` and for "zero" to mean
+    zero per version). Second CTO review gate.
+
+  **Then #170 alone**, before the rest of the mediums: the `--generation` rename
+  touches every CLI file and would conflict with almost any concurrent change.
+  Everything filed after it writes the new spelling.
+
+  **After that**, group the remaining mediums and lows three at a time by
+  disjoint area, e.g. config (#171→#172→#173 serial, then #174, #186 serial on
+  `backend.rs`) ∥ pipeline (#161, #175, #176, #177, #152) ∥ docs/comments (#189,
+  #190, #191, #188). Cartridge/tape items (#162, #163, #164, #167, #183, #184,
+  #187) and restore items (#158, #165) both depend on the identity set, so they
+  come after H4.
+
 - **THE PRE-PRODUCTION QUEUE 2026-09-14 — GitHub label `review-2026-09-13`, 40
   issues. Nothing ships to a production tape until it is empty, documentation
   included.** The 2026-09-13 adversarial review
