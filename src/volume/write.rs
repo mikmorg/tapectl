@@ -319,6 +319,28 @@ pub fn volume_init(
     // interpreted) when the write session rewrites File 0 from BOT.
     const PROVISIONAL_TOTAL_FILES: i32 = 8;
     let created_at = chrono::Utc::now().to_rfc3339();
+
+    // The identity the binding just recorded (ADR-0012, issue #192), by the
+    // same rule the permanent File 0 resolves from the catalog a moment later
+    // in `volume_write`: `serial` IS the MAM read, so `Some` is a
+    // chip-reported identity and `None` is the operator's `--cartridge`
+    // barcode. These are discarded bytes, but a provisional File 0 that
+    // disagrees with the permanent one is a trap for whoever reads init's
+    // output and reasonably believes it.
+    //
+    // `bound.cartridge_id.is_none()` means nothing was bound at all, which
+    // `require_named_cartridge` above no longer permits at init; the arm
+    // stays because "unknown is said by saying nothing" is the correct
+    // fallback, not because it is reachable.
+    let (identity_serial, identity_source) = match (&bound.cartridge_id, &bound.barcode, serial) {
+        (Some(_), _, Some(s)) => (s.to_string(), Some("mam")),
+        (Some(_), Some(barcode), None) => (barcode.clone(), Some("operator")),
+        _ => (
+            det.mam.serial.as_deref().unwrap_or("").to_string(),
+            None::<&str>,
+        ),
+    };
+
     // ADR-0010: real MAM values at init now. The FIELD NAMES and shape are
     // unchanged (ADR-0007 — on-tape bytes are forever); only the values that
     // were previously hardcoded zeros and blanks now say what the drive
@@ -332,11 +354,11 @@ pub fn volume_init(
         mam_capacity: det.mam.max_capacity_bytes.unwrap_or(0),
         total_files: PROVISIONAL_TOTAL_FILES,
         mam_manufacturer: det.mam.manufacturer.as_deref().unwrap_or(""),
-        mam_serial: det.mam.serial.as_deref().unwrap_or(""),
+        mam_serial: &identity_serial,
         mam_length: det.mam.length_meters.unwrap_or(0),
         mam_loads: det.mam.load_count.unwrap_or(0),
         created_at: &created_at,
-        cartridge_identity_source: None,
+        cartridge_identity_source: identity_source,
     });
 
     store.execute(
