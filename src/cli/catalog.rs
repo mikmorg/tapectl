@@ -971,6 +971,66 @@ mod tests {
         );
     }
 
+    /// Issue #196: `locate_rows`'s MERGE of `per_volume_verification` into
+    /// each row, not just the query in isolation. A wrong key or a
+    /// silently-defaulted lookup would make every row read `never` and
+    /// every other test here would still pass -- the JSON pins build
+    /// `LocationRow` literals directly, and `policy::evidence`'s own tests
+    /// never touch `catalog::locate_rows` at all. This is the one place
+    /// that exercises the actual merge, end to end.
+    ///
+    /// Also pins the `outcome = 'passed'` filter at this layer: L6-SEALED
+    /// gets a `'failed'` session and must still render as never-verified,
+    /// not pick up the failed attempt's timestamp.
+    #[test]
+    fn locate_rows_carries_last_verified_from_the_evidence_module_per_volume() {
+        let conn = setup_unit_on_two_volumes("loc-verified", "sealed");
+        let other_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'L6-OTHER'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let sealed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = 'L6-SEALED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+             VALUES (?1, '2026-08-01 12:00:00', 'passed')",
+            params![other_id],
+        )
+        .unwrap();
+        // A FAILED session on the other volume must not count as evidence
+        // -- `outcome = 'passed'` lives in the join's ON clause precisely
+        // so this row still renders `None`, not the failed attempt's date.
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+             VALUES (?1, '2026-08-15 00:00:00', 'failed')",
+            params![sealed_id],
+        )
+        .unwrap();
+
+        let rows = locate_rows(&conn, unit_id_of(&conn, "loc-verified")).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let verified = rows.iter().find(|r| r.volume == "L6-OTHER").unwrap();
+        assert_eq!(
+            verified.last_verified.as_deref(),
+            Some("2026-08-01 12:00:00"),
+            "L6-OTHER's passed session must surface as its last_verified"
+        );
+
+        let never = rows.iter().find(|r| r.volume == "L6-SEALED").unwrap();
+        assert_eq!(
+            never.last_verified, None,
+            "L6-SEALED has only a FAILED session -- it must still render as \
+             never-verified, not pick up the failed attempt's timestamp: {never:?}"
+        );
+    }
+
     /// Issue #73 / ADR-0006: `locate` answers "where do I go to get this
     /// back". For a deposited volume one of the answers is a warehouse,
     /// and it must be visible as its own column -- never folded into
