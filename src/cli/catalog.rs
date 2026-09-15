@@ -527,7 +527,7 @@ pub fn run(
                 }
                 println!(
                     "  the slice hashes recorded are the tape's own claim; run \
-                     `tapectl volume verify --label {}` to check them",
+                     `tapectl volume verify {}` to check them",
                     report.label
                 );
                 if report.attested > 0 {
