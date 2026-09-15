@@ -85,9 +85,58 @@ pub fn execute_batch(
 
     // Stage once: snapshot + stage every unit in this batch, in the
     // batch's own (name-ordered) sequence.
+    //
+    // ADR-0012 / issue #159: `snapshot_create_detailed` may report an
+    // existing version instead of minting one. `selector`/`plan` picked
+    // this batch from units that looked pending at plan time, but a
+    // unit's on-disk state can still match an existing row by the time
+    // this loop actually runs — so `minted: false` is a normal outcome
+    // here, not an error, and each of its `status` values means something
+    // different for staging: explicit arms rather than one blanket
+    // "skip if unchanged", which would silently stop staging a snapshot
+    // that was created but never staged.
     for u in &batch.units {
-        let snapshot_id = crate::staging::snapshot_create(conn, &u.name, config)?;
-        crate::staging::stage_create(conn, paths, config, snapshot_id)?;
+        let outcome = crate::staging::snapshot_create_detailed(conn, &u.name, config)?;
+        match (outcome.minted, outcome.status.as_str()) {
+            // A fresh version was minted — always needs staging.
+            (true, _) => {
+                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+            }
+            // Existing but never-staged content (ADR-0012 reuse, Change 3)
+            // — the row already exists, but its slices don't yet.
+            (false, "created") => {
+                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+            }
+            // Already staged: a stage_set with live slices exists for this
+            // exact content (`stage_set_has_live_slices`) — re-staging
+            // would silently produce a second, unrelated copy. Nothing to
+            // do for this unit in this batch.
+            (false, "staged") => {}
+            // The plan saw this unit as pending, but by the time this
+            // batch actually ran, its on-disk content matched the already-
+            // written live version again (e.g. a revert) — a race, not an
+            // error. Nothing to stage.
+            (false, "current") => {
+                tracing::warn!(
+                    unit = %u.name,
+                    version = outcome.version,
+                    "planned as pending, but on-disk content now matches the \
+                     live version — nothing to stage (race)"
+                );
+            }
+            // Not reachable today (`snapshot_create_detailed` only returns
+            // `minted: false` for created/staged/current) — staged
+            // defensively rather than silently dropping the unit if that
+            // contract ever grows another status.
+            (false, other) => {
+                tracing::warn!(
+                    unit = %u.name,
+                    status = other,
+                    "unminted snapshot with an unexpected status — staging anyway"
+                );
+                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+            }
+        }
     }
 
     // Session per copy — sequential, abort-on-first-failure (see doc
