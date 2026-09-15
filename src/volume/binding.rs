@@ -155,6 +155,51 @@ pub(crate) fn lookup_cartridge(
     Ok(CartridgeLookup::default())
 }
 
+/// Refuse a `volume init` that can identify no cartridge at all (ADR-0012).
+///
+/// When the drive reports no medium serial AND no `--cartridge` named a
+/// registered row, there is nothing to bind to. ADR-0010 wrote such a volume
+/// unbound with a warning; ADR-0012 removed that outcome **at init**, because
+/// a volume no cartridge claims is a copy the catalog cannot place: copy
+/// counting cannot tell this cartridge from another, `check_loaded_cartridge`
+/// has nothing to compare against, and File 0 can attest no identity — the
+/// three things the rest of this module exists to provide.
+///
+/// Like [`refuse_retired`] this takes no `force`: it is a fact tapectl cannot
+/// resolve on its own, not a risk to accept. The operator knows which
+/// cartridge is in the drive and says so; nothing about `--force` would tell
+/// tapectl.
+///
+/// **This lives here but is called only from `volume_init`, deliberately.**
+/// [`bind_cartridge`] must keep accepting `(None, None)` as a clean no-op:
+/// `bind_late` also calls it, has no `--cartridge` to offer, and that no-op
+/// is what keeps `volume write` working on volumes initialised before this
+/// rule existed. A refusal inside `bind_cartridge` would break them. Pure and
+/// separate so it can be drilled directly, and so the refusal can run with
+/// the other FACT checks — before the tape device is opened and before the
+/// transaction, so a refused init leaves nothing behind.
+pub(crate) fn require_named_cartridge(
+    serial: Option<&str>,
+    row: Option<&CartridgeRow>,
+) -> Result<()> {
+    if serial.is_some() || row.is_some() {
+        return Ok(());
+    }
+    Err(TapectlError::Other(
+        "this drive reports no medium serial, so tapectl cannot tell which physical \
+         cartridge is loaded. Name it:\n    \
+         tapectl volume init <label> --device <dev> --cartridge <barcode>\n\
+         \n\
+         A volume no cartridge claims is a copy the catalog cannot place: copy counting \
+         cannot tell it from another tape, `volume write` cannot check you reloaded the \
+         same one, and the tape itself can record no identity. Register the cartridge \
+         first if it is new (`tapectl cartridge register --barcode <barcode> \
+         --media-type <GEN>`). There is no --force for this — it is a fact tapectl \
+         cannot resolve on its own, not a risk to accept."
+            .to_string(),
+    ))
+}
+
 /// Refuse to bind a cartridge the operator has declared unfit (ADR-0011).
 ///
 /// This is the ONE status-based refusal binding has, and it is deliberately
@@ -778,9 +823,54 @@ mod tests {
         assert_eq!(movements, 0);
     }
 
+    // ---- ADR-0012: init must be able to name the cartridge --------------
+
+    /// The `(None, None)` input — no medium serial, no `--cartridge` — is the
+    /// one case `volume init` refuses (ADR-0012). Everything else passes
+    /// through untouched, including the barcode-only case that IS the
+    /// operator naming the cartridge.
+    #[test]
+    fn init_refuses_only_when_nothing_can_name_the_cartridge() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let row = lookup_cartridge(&conn, Some("SER-1"), None).unwrap().row;
+
+        // A chip serial names it.
+        require_named_cartridge(Some("SER-1"), None).unwrap();
+        // A `--cartridge` that matched a registered row names it.
+        require_named_cartridge(None, row.as_ref()).unwrap();
+        // Both is fine too.
+        require_named_cartridge(Some("SER-1"), row.as_ref()).unwrap();
+
+        let err = require_named_cartridge(None, None)
+            .expect_err("nothing can name the loaded cartridge; init must refuse")
+            .to_string();
+        assert!(
+            err.contains("--cartridge"),
+            "the refusal must name the flag; got: {err}"
+        );
+        assert!(
+            err.contains("no medium serial"),
+            "the refusal must say why; got: {err}"
+        );
+        // `--force` is named only to say it does not exist here, exactly as
+        // `refuse_retired` does — never offered as a way past.
+        assert!(
+            err.contains("no --force for this"),
+            "the refusal must close the --force door explicitly; got: {err}"
+        );
+    }
+
     /// ADR-0010: no medium serial (some virtual drives expose none) means no
-    /// binding, and that must be a clean unbound write rather than an error
-    /// — the virtual harnesses lose nothing but the binding.
+    /// binding, and that must be a clean unbound write rather than an error.
+    ///
+    /// **This is now the `bind_late` path specifically.** ADR-0012 made
+    /// `volume_init` refuse `(None, None)` before it ever reaches here
+    /// ([`require_named_cartridge`], drilled just above), but `bind_late` —
+    /// which has no `--cartridge` to offer — still calls `bind_cartridge`
+    /// with this shape, and its silent no-op is what keeps `volume write`
+    /// working on volumes initialised before that rule existed. This test is
+    /// the only coverage of that input, so it stays.
     #[test]
     fn no_serial_and_no_row_leaves_the_volume_unbound_without_erroring() {
         let conn = db::open_memory().unwrap();

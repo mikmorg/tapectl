@@ -187,6 +187,13 @@ pub fn volume_init(
     // resolution and the capacity resolution need it, and because a
     // `--cartridge` that names nothing must fail before the drive is touched.
     let lookup = binding::lookup_cartridge(conn, serial, cartridge_barcode)?;
+    // ADR-0012: a volume no cartridge claims is a copy the catalog cannot
+    // place, so the unbound-with-a-warning outcome no longer exists AT INIT.
+    // With the other FACT checks, before the drive is opened and before the
+    // transaction — a refusal must leave nothing behind. `bind_late` keeps
+    // the `(None, None)` no-op, which is what still lets `volume write` run
+    // on volumes initialised before this rule.
+    binding::require_named_cartridge(serial, lookup.row.as_ref())?;
     // ADR-0011: the one status-based refusal binding has. A medium the
     // operator declared permanently unfit cannot be written, and `--force`
     // is deliberately not consulted — `refuse_retired` does not take it.
