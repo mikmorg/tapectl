@@ -853,24 +853,6 @@ pub fn volume_write(
     // start at BOT exactly like an untouched fresh session would.
     store.reposition_for_resume(0)?;
 
-    // ADR-0010's binding ladder, one stage later, for the volume `volume
-    // init` could not bind (W3 Change 8) — moved here, below the File 0
-    // contact check, so a refused write cannot displace a volume in the
-    // catalog (issue #154: this used to run before `build`/`validate`/
-    // `TapeStore::open`/`check_fresh_write_contact`, so any of those four
-    // refusals left a committed displacement with nothing to roll it back).
-    // Mirrors `volume_init`'s ordering exactly (see the invariant comment
-    // above `volume_init`).
-    bind_late(
-        conn,
-        volume_id,
-        label,
-        &det,
-        volume_media_type.as_deref(),
-        &backend.generation,
-        nominal_capacity,
-    )?;
-
     let validated = built.into_validated(&keys, &mut store).map_err(|errs| {
         TapectlError::Other(format!(
             "volume \"{label}\" failed validation at contact: {}",
@@ -880,6 +862,34 @@ pub fn volume_write(
                 .join("; ")
         ))
     })?;
+
+    // ADR-0010's binding ladder, one stage later, for the volume `volume init`
+    // could not bind (W3 Change 8) — placed here, after every refusal this
+    // write can still suffer, so a refused write cannot displace a volume in
+    // the catalog (issue #154). It used to run before `build`/`validate`/
+    // `TapeStore::open`/`check_fresh_write_contact`, so any of those four
+    // refusals left a committed displacement with nothing to roll it back.
+    //
+    // It sits below `into_validated` as well, which is NOT merely a re-run of
+    // the pre-flight `validate` above: it additionally compares the layout
+    // against `store.capacity()`, read from the drive that is only now open.
+    // An over-capacity refusal is the most routine pre-write refusal there is
+    // and can fire for the first time here, so binding above this line would
+    // leave exactly the displacement this issue exists to prevent, for the
+    // likeliest refusal of all. `into_validated` takes no `Connection` and
+    // touches no cartridge state, so this is the latest point before `plan()`
+    // writes anything, and nothing in between needs the binding.
+    //
+    // Mirrors `volume_init`'s ordering (see the invariant comment above it).
+    bind_late(
+        conn,
+        volume_id,
+        label,
+        &det,
+        volume_media_type.as_deref(),
+        &backend.generation,
+        nominal_capacity,
+    )?;
 
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
     let execute_outcome = planned.execute(conn, &mut store)?;
