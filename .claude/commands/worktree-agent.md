@@ -152,12 +152,24 @@ converts "use judgment" into "don't do X".}}
    settles it and you may not re-open it. Where a step merely *applies* a
    ruling, it is ordinary engineering and your judgement is welcome — issues
    #166 and #178 carry comments drawing that line explicitly.
-3. **Run every cargo command synchronously, in the foreground.** Never
-   background one, never arm a Monitor or wait on a "completion
-   notification" — the coordinator sends none, and three workers on
-   2026-09-11 each stalled for minutes waiting on one. A baseline `cargo
-   test` is run first, waited on, and its totals recorded; no file is
+3. **Run every cargo command synchronously, in the foreground.** Issue ONE
+   Bash call containing the cargo command. It will sit there for minutes and
+   then hand you the output. **That blocking IS how you wait.** A baseline
+   `cargo test` is run first, waited on, and its totals recorded; no file is
    touched until it returns.
+
+   - WRONG: `run_in_background: true`, then polling the output file; arming
+     a Monitor or an `until` loop; waiting for a "completion notification".
+   - RIGHT: `cd <worktree> && CARGO_TARGET_DIR=… flock /scratch/tapectl-build.lock cargo test 2>&1 | tail -40`
+     — one call, it blocks, it returns the answer.
+
+   **No completion notification is coming — the coordinator sends none.**
+   Every attempt to make this asynchronous costs a full turn and produces
+   nothing. Three workers stalled this way on 2026-09-11, and the #154
+   worker stalled three times on 2026-09-15 with this prohibition already
+   in its prompt — which is why it is now an example rather than a rule.
+   Sitting behind the shared `flock` for several minutes while another
+   worker links is normal and expected; let it block.
 4. Apply changes in order; `cargo check --all-targets` after each.
 5. Full gate: `cargo fmt --all -- --check && cargo clippy --all-targets --
    -D warnings && cargo test` — green AND test count >= baseline. Never pipe
