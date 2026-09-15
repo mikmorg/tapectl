@@ -2030,14 +2030,61 @@ pub fn volume_import(
 /// scenario had no `volume init` at all, and #128 recorded the resulting
 /// failure as a single-cartridge media limitation rather than a missing setup
 /// step.
-fn missing_volume_error(volume: &str, device: &str) -> TapectlError {
+/// The labels this archive already has, newest first, for the missing-volume
+/// error to name.
+///
+/// The error used to end "`tapectl volume list` shows the labels you already
+/// have". There is no `volume list` subcommand (issue #190) — and there is no
+/// other command that lists volume labels either: `report capacity` and
+/// `report summary` give counts, `catalog locate` answers a different question,
+/// and `report copies` lists only volumes that already carry a unit, so it
+/// cannot show the initialized-but-unwritten volume this error is about. So the
+/// error answers the question itself instead of naming a command.
+fn known_volume_labels(conn: &Connection) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT label FROM volumes ORDER BY COALESCE(first_write, created_at) DESC, id DESC",
+    ) {
+        Ok(s) => s,
+        // Listing existing labels is a courtesy on an error path; failing to
+        // gather them must never replace the real error with a database one.
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+fn missing_volume_error(volume: &str, device: &str, known: &[String]) -> TapectlError {
+    // At most ten, so an archive with hundreds of tapes does not bury the
+    // instruction above it; the count tells the operator there are more.
+    const SHOWN: usize = 10;
+    let have = if known.is_empty() {
+        "This archive has no volumes yet — the command above creates its first.".to_string()
+    } else {
+        let listed = known
+            .iter()
+            .take(SHOWN)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if known.len() > SHOWN {
+            format!(
+                "Volumes you already have ({} total, most recent first): {listed}, …",
+                known.len()
+            )
+        } else {
+            format!("Volumes you already have: {listed}")
+        }
+    };
     TapectlError::Other(format!(
         "volume \"{volume}\" does not exist\n\n\
          quick-archive writes to a volume that is already initialized — it does \
          not create one.\n\
          Initialize it first, then re-run this command:\n\n    \
          tapectl volume init {volume} --device {device}\n\n\
-         `tapectl volume list` shows the labels you already have."
+         {have}"
     ))
 }
 
@@ -2085,7 +2132,11 @@ pub fn quick_archive(
     // refusal to touch a sealed tape in one place. Whether "quick" ought to
     // imply auto-init is a separate question, left open on #132.
     if !volume_exists(conn, volume)? {
-        return Err(missing_volume_error(volume, device));
+        return Err(missing_volume_error(
+            volume,
+            device,
+            &known_volume_labels(conn),
+        ));
     }
 
     // Step 1: init unit
@@ -2170,7 +2221,8 @@ mod tests {
         .unwrap();
         assert!(volume_exists(&conn, "VOL-Q").unwrap());
 
-        let msg = missing_volume_error("VOL-Q", "/dev/nst3").to_string();
+        let msg =
+            missing_volume_error("VOL-Q", "/dev/nst3", &known_volume_labels(&conn)).to_string();
         assert!(msg.contains("does not exist"), "{msg}");
         assert!(
             msg.contains("tapectl volume init VOL-Q --device /dev/nst3"),
@@ -2181,6 +2233,29 @@ mod tests {
             msg.contains("does not create one"),
             "the contract must be stated, not implied:\n{msg}"
         );
+        // Issue #190: the error used to end by naming `tapectl volume list`,
+        // which does not exist. Nothing lists volume labels, so the error
+        // lists them itself.
+        assert!(
+            !msg.contains("volume list"),
+            "must not name a subcommand that does not exist:\n{msg}"
+        );
+        assert!(
+            msg.contains("VOL-Q") && msg.contains("Volumes you already have"),
+            "the error must NAME the labels the archive has:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn a_missing_volume_on_an_empty_archive_says_so_rather_than_listing_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        let msg =
+            missing_volume_error("VOL-Q", "/dev/nst3", &known_volume_labels(&conn)).to_string();
+        assert!(
+            msg.contains("no volumes yet"),
+            "an empty archive must say so, not print an empty list:\n{msg}"
+        );
+        assert!(!msg.contains("Volumes you already have"), "{msg}");
     }
 
     fn setup_conn_with_unit(current_path: &str) -> (Connection, i64) {
