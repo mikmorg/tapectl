@@ -1003,6 +1003,70 @@ pub fn cartridge_mark_erased(
     Ok(())
 }
 
+/// Issue #153 / ADR-0012: which of a unit's `'current'` versions has the
+/// FEWEST copies, and how many. `copy_count_expr` under
+/// `CoverageScope::Unit { current_only: true }` already returns exactly
+/// this minimum as a single number ("a unit is as covered as its
+/// least-covered live version") — this answers the operator's next
+/// question, staring at that number: WHICH version, out of how many.
+struct ThinnestCurrentVersion {
+    version: i64,
+    copies: i64,
+    total_current_versions: i64,
+}
+
+impl ThinnestCurrentVersion {
+    /// A standalone-safe evidence line (the #91 lesson: this is printed
+    /// with zero surrounding context, so it must read as true alone).
+    /// Naming the VERSION — not the unit — is load-bearing: "coverage
+    /// rests on 1 copy" would misread as the unit's overall coverage,
+    /// when `copy_count` (the unit-wide minimum, printed alongside this)
+    /// already IS that number; this line exists only to say which
+    /// version it came from.
+    fn describe(&self) -> String {
+        format!(
+            "version {} of {} current versions has the fewest copies: {}",
+            self.version, self.total_current_versions, self.copies
+        )
+    }
+}
+
+/// Query, not expression string (unlike [`crate::policy::coverage`]'s
+/// functions): this needs the actual per-version numbers to report which
+/// version is thinnest, not just the aggregate minimum. Built on the same
+/// [`crate::policy::coverage::copy_count_expr`], scoped per snapshot, so
+/// it can never disagree with the unit-wide count it explains. Returns
+/// `None` for a unit with no current snapshot.
+fn thinnest_current_version(
+    conn: &Connection,
+    unit_id: i64,
+) -> Result<Option<ThinnestCurrentVersion>> {
+    let per_snapshot = crate::policy::coverage::CoverageQuery {
+        scope: crate::policy::coverage::CoverageScope::Snapshot { id_expr: "pcv.id" },
+        exclude_volume: None,
+    };
+    let copy_expr = crate::policy::coverage::copy_count_expr(&per_snapshot);
+    let sql = format!(
+        "SELECT pcv.version, {copy_expr} AS c
+         FROM snapshots pcv
+         WHERE pcv.unit_id = ?1 AND pcv.status = 'current'
+         ORDER BY c ASC, pcv.version ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<(i64, i64)> = stmt
+        .query_map(params![unit_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let total = rows.len() as i64;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|(version, copies)| ThinnestCurrentVersion {
+            version,
+            copies,
+            total_current_versions: total,
+        }))
+}
+
 /// Mark a unit as tape-only with enforcement.
 pub fn unit_mark_tape_only(
     conn: &Connection,
@@ -1038,6 +1102,12 @@ pub fn unit_mark_tape_only(
     );
     let (copy_count, location_count): (i64, i64) =
         conn.query_row(&sql, params![unit.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+    // Issue #153 / ADR-0012: `copy_count` above is already the MINIMUM
+    // across the unit's current versions -- this names WHICH version that
+    // minimum belongs to, so the operator isn't left staring at a single
+    // number for a unit that may carry several.
+    let thinnest_version = thinnest_current_version(conn, unit.id)?;
 
     // Reuses `fingerprint::classify` — the same scan backing `unit status
     // --dirty` and `report dirty` — so these can never disagree about
@@ -1147,6 +1217,14 @@ pub fn unit_mark_tape_only(
 
     if json_output {
         let evidence_json: Vec<serde_json::Value> = evidence.iter().map(evidence_json).collect();
+        let thinnest_json = thinnest_version.as_ref().map(|t| {
+            serde_json::json!({
+                "version": t.version,
+                "copies": t.copies,
+                "total_current_versions": t.total_current_versions,
+                "note": t.describe(),
+            })
+        });
         println!(
             "{}",
             serde_json::json!({
@@ -1156,12 +1234,16 @@ pub fn unit_mark_tape_only(
                 "locations": location_count,
                 "evidence": evidence_json,
                 "evidence_summary": evidence_summary,
+                "thinnest_current_version": thinnest_json,
             })
         );
     } else {
         println!(
             "unit \"{unit_name}\" marked tape-only ({copy_count} copies, {location_count} locations)"
         );
+        if let Some(t) = &thinnest_version {
+            println!("  {}", t.describe());
+        }
         if let Some(line) = &evidence_summary {
             println!("  {line}");
         }
@@ -3082,6 +3164,157 @@ mod tests {
 
             let audit_copies = crate::cli::audit::copy_count_for_unit(&conn, unit_id).unwrap();
             assert_eq!(audit_copies, 1, "audit must agree with the gate: 1, not 2");
+        }
+    }
+
+    /// Issue #153 / ADR-0012: which of a unit's current versions is
+    /// thinnest, surfaced by `unit mark-tape-only` alongside the
+    /// unit-wide minimum `copy_count` computes.
+    mod thinnest_version_display {
+        use super::*;
+
+        /// tenant + unit + TWO `'current'` snapshots with DIFFERING copy
+        /// counts: v1 on two sealed volumes (2 copies), v2 on one (1
+        /// copy) -- the thinnest. Returns `(conn, unit_id)`.
+        fn setup_unit_with_two_current_versions_of_differing_thinness(
+            name: &str,
+        ) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                params![format!("uuid-{name}"), name, tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+
+            // v1: two sealed volumes -- 2 copies.
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap1 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap1],
+            )
+            .unwrap();
+            let ss1 = conn.last_insert_rowid();
+            for label in [format!("{name}-A"), format!("{name}-B")] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                              capacity_bytes, status)
+                         VALUES ('{label}', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                    ),
+                    [],
+                )
+                .unwrap();
+                let vid = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss1, snap1, vid],
+                )
+                .unwrap();
+            }
+
+            // v2: one sealed volume -- 1 copy, the thinnest.
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 2, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap2],
+            )
+            .unwrap();
+            let ss2 = conn.last_insert_rowid();
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES ('{name}-C', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vid2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss2, snap2, vid2],
+            )
+            .unwrap();
+
+            (conn, unit_id)
+        }
+
+        #[test]
+        fn thinnest_current_version_picks_the_version_with_fewer_copies() {
+            let (conn, unit_id) =
+                setup_unit_with_two_current_versions_of_differing_thinness("mv-thin");
+            let thinnest = thinnest_current_version(&conn, unit_id).unwrap().unwrap();
+            assert_eq!(thinnest.version, 2, "v2 has only 1 copy, v1 has 2");
+            assert_eq!(thinnest.copies, 1);
+            assert_eq!(thinnest.total_current_versions, 2);
+            assert_eq!(
+                thinnest.describe(),
+                "version 2 of 2 current versions has the fewest copies: 1",
+                "must name the VERSION, not just the count -- the #91 lesson: \
+                 this line is read with zero surrounding context"
+            );
+        }
+
+        #[test]
+        fn thinnest_current_version_is_none_without_a_current_snapshot() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('uuid-mv-empty', 'mv-empty', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            assert!(thinnest_current_version(&conn, unit_id).unwrap().is_none());
+        }
+
+        /// The CLI command must not choke computing this display: same
+        /// fixture, driven through `unit_mark_tape_only` end to end.
+        #[test]
+        fn mark_tape_only_succeeds_and_computes_a_thinnest_version_for_a_multi_version_unit() {
+            let (conn, unit_id) =
+                setup_unit_with_two_current_versions_of_differing_thinness("mv-thin-cli");
+            let mut config = Config::default();
+            // Isolate the display from the Tier-2 gate: this fixture's
+            // unit-wide copy_count is MIN(2, 1) = 1 under the #153 fix,
+            // which would otherwise refuse below the default threshold of
+            // 2 -- zero out the thresholds so the command reaches the
+            // evidence display unconditionally.
+            config.defaults.min_copies_for_tape_only = 0;
+            config.defaults.min_locations_for_tape_only = 0;
+            unit_mark_tape_only(&conn, &config, "mv-thin-cli", false, false)
+                .expect("command must succeed and compute the thinnest-version display");
+            let thinnest = thinnest_current_version(&conn, unit_id).unwrap().unwrap();
+            assert_eq!(thinnest.version, 2);
+            assert_eq!(thinnest.copies, 1);
         }
     }
 
