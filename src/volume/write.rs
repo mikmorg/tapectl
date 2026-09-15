@@ -400,6 +400,13 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
                 eprintln!("  medium serial recorded on cartridge {barcode}");
             }
         }
+        // Unreachable from `volume_init` since ADR-0012 (issue #192):
+        // `require_named_cartridge` refuses that case before the transaction
+        // opens, so there is no longer an unbound-with-a-warning outcome to
+        // report. Kept rather than made an `unreachable!()` — `report_binding`
+        // describes a `BindOutcome`, and `bind_late` can still legitimately
+        // produce an unbound one on a legacy volume. A warning is the right
+        // thing to print if that ever reaches here; a panic is not.
         None => {
             eprintln!(
                 "warning: no medium serial readable; volume \"{label}\" is not bound to a \

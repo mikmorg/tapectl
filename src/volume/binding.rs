@@ -27,11 +27,19 @@
 //! stops crediting a copy that no longer physically exists, which is the
 //! over-crediting the lifecycle suite's own comment predicted.
 //!
-//! The one refusal binding DOES introduce lives in
-//! [`crate::tape::media_detect::resolve_media`], not here: a registered row
-//! whose `media_type` disagrees with the DETECTED generation is a fact
-//! error, because either the row is wrong or the wrong tape is loaded and
-//! tapectl cannot tell which.
+//! The refusals binding DOES introduce are all fact errors rather than
+//! consent gates — tapectl refuses because it cannot tell what is true, not
+//! because it wants the operator to insist:
+//!
+//! - [`crate::tape::media_detect::resolve_media`] (not in this module): a
+//!   registered row whose `media_type` disagrees with the DETECTED generation
+//!   means either the row is wrong or the wrong tape is loaded.
+//! - [`refuse_retired`]: no amount of consent makes a medium declared
+//!   permanently unfit fit again (ADR-0011).
+//! - [`require_named_cartridge`]: no serial and no `--cartridge` leaves
+//!   nothing to bind to at all (ADR-0012, issue #192).
+//!
+//! None of the three takes a `force`, structurally.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -79,8 +87,14 @@ pub(crate) struct Displaced {
 /// What [`bind_cartridge`] did, in enough detail for the caller to say it.
 #[derive(Default)]
 pub(crate) struct BindOutcome {
-    /// `None` when no medium serial was readable — the volume is written
-    /// unbound, which is what keeps serial-less virtual harnesses working.
+    /// `None` when nothing could be bound. Since ADR-0012 (issue #192)
+    /// `volume init` refuses before reaching that state
+    /// ([`require_named_cartridge`]), so at init this is always `Some`; the
+    /// `None` case survives for [`bind_late`], whose no-op on a serial-less
+    /// drive is what keeps `volume write` working on volumes initialised
+    /// before that rule existed.
+    ///
+    /// [`bind_late`]: crate::volume::write
     pub cartridge_id: Option<i64>,
     pub barcode: Option<String>,
     /// The cartridge row did not exist and was created from MAM, with its
