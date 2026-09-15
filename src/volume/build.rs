@@ -222,6 +222,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         mam_length: inputs.mam_length,
         mam_loads: inputs.mam_loads,
         created_at: &inputs.created_at,
+        cartridge_identity_source: None,
     };
     let id_thunk_bytes = layout::generate_id_thunk_v2(&id_thunk_params);
     let (id_thunk_path, id_thunk_size, id_thunk_hash) =

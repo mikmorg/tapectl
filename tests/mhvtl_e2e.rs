@@ -1183,6 +1183,11 @@ fn write_hand_corrupted_volume(device: &str, block_size: usize, label: &str) -> 
         mam_length: 0,
         mam_loads: 0,
         created_at,
+        // Synthetic tape, no binding behind it — absent means unknown
+        // (`docs/design/volume-format-v2.md` §1.1), and `None` renders
+        // byte-identically to the pre-#192 thunk, so this fixture's recorded
+        // bytes are unchanged.
+        cartridge_identity_source: None,
     });
     let guide_text = generate_system_guide_v2(label, TOTAL_FILES);
     let restore_text = generate_restore_script_v2(label, TOTAL_FILES);

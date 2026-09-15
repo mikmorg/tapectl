@@ -336,6 +336,7 @@ pub fn volume_init(
         mam_length: det.mam.length_meters.unwrap_or(0),
         mam_loads: det.mam.load_count.unwrap_or(0),
         created_at: &created_at,
+        cartridge_identity_source: None,
     });
 
     store.execute(
@@ -2932,6 +2933,7 @@ mod tests {
             mam_length: 1,
             mam_loads: 1,
             created_at: "2026-09-11T00:00:00Z",
+            cartridge_identity_source: None,
         };
         let thunk_text = layout::generate_id_thunk_v2(&params);
 
@@ -4117,6 +4119,7 @@ mod tests {
             mam_length: 0,
             mam_loads: 0,
             created_at: "2026-07-28T00:00:00Z",
+            cartridge_identity_source: None,
         });
         let mut padded = thunk.into_bytes();
         padded.resize(FW_BS as usize, 0);

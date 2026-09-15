@@ -2081,6 +2081,7 @@ mod tests {
             mam_length: 0,
             mam_loads: 0,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         });
         let mut thunk_padded = thunk.into_bytes();
         thunk_padded.resize(BS as usize, 0);
@@ -2142,6 +2143,7 @@ mod tests {
             mam_length: 0,
             mam_loads: 0,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         };
         let wrong_bytes = layout::generate_id_thunk_v2(&wrong_params).into_bytes();
         let mut padded = wrong_bytes;
@@ -2340,6 +2342,7 @@ mod tests {
             mam_length: 0,
             mam_loads: 0,
             created_at: "2026-07-28T00:00:00Z",
+            cartridge_identity_source: None,
         });
         let mut padded = thunk.into_bytes();
         padded.resize(BS as usize, 0);

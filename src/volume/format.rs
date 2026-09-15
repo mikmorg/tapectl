@@ -565,6 +565,7 @@ mod tests {
             mam_length: 846,
             mam_loads: 5,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         }
     }
 

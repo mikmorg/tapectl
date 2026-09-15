@@ -262,6 +262,7 @@ mod tests {
             mam_length: 1,
             mam_loads: 1,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         };
         let id_thunk_text = generate_id_thunk_v2(&params);
         let seal_text = generate_seal_marker(label, files.len() as i32, "unused", &files);

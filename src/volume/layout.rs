@@ -27,6 +27,25 @@ pub struct IdThunkV2Params<'a> {
     /// also matters for resume, which depends on frozen (not regenerated)
     /// bytes — see `ContentSource::Materialized`'s doc comment.
     pub created_at: &'a str,
+    /// How `cartridge_serial` was established — `"mam"` (the cartridge's own
+    /// chip reported it) or `"operator"` (no serial was readable when this
+    /// volume was bound, so the operator named the cartridge with
+    /// `volume init --cartridge <barcode>` and `cartridge_serial` carries
+    /// THAT barcode). `docs/design/volume-format-v2.md` §1.1, ADR-0012.
+    ///
+    /// `None` OMITS the line entirely, and that is load-bearing: absent means
+    /// UNKNOWN and must never read as `"mam"`. Every tape written before this
+    /// field existed omits it, and those tapes stay readable forever — a
+    /// reader that defaulted the absent case to `"mam"` would make all of
+    /// them falsely attest a chip-verified serial.
+    ///
+    /// Injected, like `created_at`, rather than derived from a live MAM read
+    /// in here: the value records how the identity was established AT THE
+    /// BINDING (read back from `cartridge_volumes.identity_source`), not what
+    /// the drive happens to report at this contact. Deriving it from the
+    /// contact would make the same physical tape attest different provenance
+    /// depending on which drive wrote it.
+    pub cartridge_identity_source: Option<&'a str>,
 }
 
 /// Generate the v2 ID thunk (File 0) content. Per sheet §2.3 and
@@ -58,8 +77,18 @@ pub fn generate_id_thunk_v2(params: &IdThunkV2Params) -> String {
         mam_length,
         mam_loads,
         created_at: now,
+        cartridge_identity_source,
     } = *params;
     let seal_marker = total_files - 1;
+    // Absent means unknown (§1.1): an unknown provenance emits NO line at
+    // all, so a pre-#192 File 0 and a post-#192 one with nothing to say are
+    // byte-identical. Rendered as a whole line here (rather than as a value
+    // spliced into the template) precisely so `None` can contribute zero
+    // bytes — a template with an empty value would still leave the key.
+    let identity_source_line = match cartridge_identity_source {
+        Some(src) => format!("cartridge_identity_source = \"{src}\"\n"),
+        None => String::new(),
+    };
     format!(
         r#"================================================================
                      TAPECTL ARCHIVAL VOLUME
@@ -123,7 +152,7 @@ total_files = {total_files}
 [media]
 cartridge_manufacturer = "{mam_manufacturer}"
 cartridge_serial = "{mam_serial}"
-tape_length_meters = {mam_length}
+{identity_source_line}tape_length_meters = {mam_length}
 load_count_at_write = {mam_loads}
 "#
     )
@@ -1697,6 +1726,7 @@ mod tests {
             mam_length: 846,
             mam_loads: 5,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         };
         let units = vec![ManifestUnit {
             name: "alpha".into(),
@@ -1819,6 +1849,7 @@ mod tests {
             mam_length: 846,
             mam_loads: 5,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         };
         let s = generate_id_thunk_v2(&params);
         let toml_start = s.find("[volume]").expect("has [volume] section");
@@ -1894,12 +1925,73 @@ mod tests {
             mam_length: 846,
             mam_loads: 1,
             created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
         };
         let a = generate_id_thunk_v2(&params);
         let b = generate_id_thunk_v2(&params);
         assert_eq!(
             a, b,
             "id thunk must be byte-identical across two calls with the same created_at"
+        );
+    }
+
+    /// THE COMPATIBILITY GUARANTEE for every tape already written (issue
+    /// #192). `cartridge_identity_source` is emitted only when it is known;
+    /// with `None` the ID thunk must be byte-for-byte what it was before the
+    /// field existed — not "equivalent TOML", not "the same minus a blank
+    /// line". A stray newline here would be invisible to every TOML parser
+    /// and would still change File 0's size and hash in the front index, so
+    /// the pin is on the exact bytes.
+    ///
+    /// The constant below was taken from the generator BEFORE the field was
+    /// added. It is not a golden-file re-pin of the on-tape format (File 0 is
+    /// deliberately unpinned, `tests/on_tape_golden.rs`) — it pins only that
+    /// the ABSENT case is unchanged. If a later change to the ID thunk makes
+    /// this fail, that later change is what must be justified.
+    #[test]
+    fn id_thunk_with_no_identity_source_is_byte_identical_to_the_pre_field_output() {
+        use sha2::{Digest, Sha256};
+
+        let params = IdThunkV2Params {
+            label: "COMPAT1",
+            uuid: "11111111-2222-3333-4444-555555555555",
+            media_type: "LTO-6",
+            tapectl_version: "0.2.0",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 27,
+            mam_manufacturer: "IBM",
+            mam_serial: "SERIAL1",
+            mam_length: 846,
+            mam_loads: 5,
+            created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
+        };
+        let rendered = generate_id_thunk_v2(&params);
+        let mut h = Sha256::new();
+        h.update(rendered.as_bytes());
+        let digest = format!("{:x}", h.finalize());
+        assert_eq!(
+            digest, "1fb03cbe041201afb2f47c77f60c1504eb94d8ea14df2d53b9ffae8f45fcd373",
+            "the absent case must render exactly as it did before \
+             cartridge_identity_source existed"
+        );
+
+        // ...and the present case differs by exactly one inserted line, in
+        // exactly one place: immediately after `cartridge_serial`, inside
+        // `[media]` (`docs/design/volume-format-v2.md` §1.1).
+        let with_source = generate_id_thunk_v2(&IdThunkV2Params {
+            cartridge_identity_source: Some("mam"),
+            ..params
+        });
+        assert_eq!(
+            with_source,
+            rendered.replace(
+                "cartridge_serial = \"SERIAL1\"\n",
+                "cartridge_serial = \"SERIAL1\"\ncartridge_identity_source = \"mam\"\n",
+            ),
+            "the field must be one line, directly after cartridge_serial, and change \
+             nothing else"
         );
     }
 
