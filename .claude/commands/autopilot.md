@@ -198,6 +198,38 @@ the normative design set named in the Policy block below.
      the CTO's real-drive rehearsal on an expendable cartridge on home2, which
      also settles #182. Do not attempt the rehearsal yourself — the drive is not
      on this VM.
+- **THE INVENTORY SURFACE — ratified 2026-09-15, deliberately NOT in the queue.**
+  Four angles onto the catalog, so the archive can be questioned from any
+  direction. Ratified over four grilling rounds; the record is the artifact
+  https://claude.ai/code/artifact/5f486244-2747-4d25-b5ba-0e5f0d78eca9 and the
+  trigger is recorded on #14.
+  - **#195** `volume list` / `volume info` — NEW, unlabelled. Volume is the only
+    noun in the CLI with neither, and #190 could not repoint its own error at a
+    listing command because none exists.
+  - **#196** per-copy evidence age in `catalog locate` — NEW, unlabelled. This is
+    #14's own unkept promise ("what does land: #57 grows the git-annex-whereis
+    shape … per-copy evidence age with a last-known-not-live caveat"); #57
+    shipped everything except the evidence age and is closed.
+  - **#157** (location views show cartridges) and **#184** (`total_load_count`
+    wired from MAM) KEEP their `review-2026-09-13` label and still gate the first
+    write — they were defects before this design and still are.
+  **The gating rule, and do not get this wrong:** #195 and #196 are unlabelled on
+  the CTO's ruling, exactly like #143/#144. `review-2026-09-13` is a DEFECT queue;
+  letting a convenience feature gate the first production write inverts the
+  priority that queue exists to express. "Queue empty" still means the label is
+  empty — #195/#196 being open does not block the first write, and must not be
+  counted against it.
+  **Rules for this work:** catalog-only, never opens a drive (so no mhvtl gate is
+  owed and it stays usable on a rebuilt machine with no `backend add`); every
+  status visible by default, since ADR-0011 makes retired mean unfit-to-write and
+  not unreadable; unplaced rows appear as `(not placed)`; counts route through
+  `policy::coverage`, escrow through `policy::escrow`, evidence age through
+  `policy::evidence` — never re-derived, and never `audit.rs`'s `verify_age`
+  query, which would make never-verified volumes vanish. No new top-level command:
+  `browse` is taken twice over and `CONTEXT.md` reserves `library` for the changer.
+  **Declined and still declined:** TUI, FUSE mount, web view, daemon (#13, #14).
+  The changer (`mtx`, slot addresses) is deferred until a real fleet exists.
+
   8. Standing constraints, unchanged: no new dependencies; never weaken a gate,
      test, clippy setting or `EXPECTED_FAIL`; `tests/on_tape_golden.rs` is never
      re-pinned (a byte change is a CTO decision); `git stash` is banned in every
