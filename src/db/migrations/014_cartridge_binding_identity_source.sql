@@ -1,0 +1,51 @@
+-- 014: a binding records WHICH identity it was established under.
+--
+-- ADR-0012 ("A cartridge is known by the serial its chip reports; a barcode is
+-- a label"), ADR-0010's 2026-09-14 amendment, issue #192.
+--
+-- File 0's `[media]` table gains `cartridge_identity_source` -- "mam" or
+-- "operator" -- beside `cartridge_serial`, so a reader (the heir path
+-- included) can tell a chip-reported serial from a barcode somebody typed.
+-- That value has to come from somewhere at write time, and none of the three
+-- obvious sources works:
+--
+--   * A fresh MAM read at `volume write`. Honest about THAT CONTACT, but it
+--     makes the tape and the catalog disagree about the identity STRING: a
+--     volume bound by barcode at init (no serial readable) whose MAM happens
+--     to read in a later drive would get a chip serial stamped on tape, while
+--     `bind_late` early-returns at `already_bound` and the catalog never
+--     associates that serial with the binding. It would also make the same
+--     physical tape attest different provenance depending on which drive wrote
+--     it. `volume write` has no `--cartridge` either, so the operator's
+--     barcode is not even in scope there.
+--   * `cartridges.serial_number IS NOT NULL`. `cartridge register --serial
+--     <S>` lets an operator TYPE a serial into the same column a MAM read
+--     writes, so "the row has a serial" cannot mean "a chip reported it"
+--     (issue #197 covers that defect on its own terms).
+--   * A `serial_source` column on `cartridges`. That answers "is this
+--     CARTRIDGE's serial chip-verified", but the ruling asks "which identity
+--     was this BINDING established under". A chip-verified cartridge bound
+--     while its MAM was unreadable must record barcode + 'operator', and a
+--     cartridge-level column cannot express that.
+--
+-- So the provenance is a property of the BINDING, recorded here, once, when
+-- the volume is bound -- and read back at write time from the catalog. MAM
+-- corroborates the medium at each later contact; it does not supply this.
+--
+-- `bind_cartridge` writes 'mam' exactly when its `serial` argument is `Some`.
+-- That argument IS the MAM read, so the rule is direct and has no inference in
+-- it: `Some` means the chip identified this cartridge, `None` means the
+-- operator named it with `volume init --cartridge <barcode>`.
+--
+-- NULLABLE, and no table rebuild: this is a plain ADD COLUMN. Every row
+-- written before this migration stays NULL, which means UNKNOWN -- File 0 then
+-- OMITS the field entirely, because absent means unknown and must never mean
+-- 'mam' (`docs/design/volume-format-v2.md` §1.1). Defaulting legacy rows to
+-- 'mam' would make every tape they describe falsely attest a chip-verified
+-- serial.
+--
+-- The CHECK permits NULL explicitly rather than relying on SQLite's
+-- CHECK-passes-on-NULL rule, so the intent is legible in the schema itself.
+
+ALTER TABLE cartridge_volumes ADD COLUMN identity_source TEXT
+    CHECK (identity_source IS NULL OR identity_source IN ('mam','operator'));

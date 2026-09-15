@@ -390,9 +390,28 @@ pub(crate) fn bind_cartridge(
     )?;
 
     // --- bind ------------------------------------------------------------
+    // `identity_source` records which identity THIS BINDING was established
+    // under (ADR-0012, migration 014, issue #192), and the rule has no
+    // inference in it: `serial` IS the MAM read, so `Some` means the chip
+    // identified this cartridge and `None` means the operator named it with
+    // `volume init --cartridge <barcode>`. `volume write` reads this back to
+    // fill File 0's `[media].cartridge_identity_source`, taking
+    // `cartridges.serial_number` for 'mam' and `.barcode` for 'operator', so
+    // the tape and the catalog cannot disagree about which string identifies
+    // the cartridge.
+    //
+    // `bind_late` always reaches here with `Some` (it early-returns when no
+    // serial is readable), so a late binding is always 'mam' — which is
+    // exactly right: it exists only because a serial became readable.
+    //
+    // The `OR IGNORE` is left alone deliberately. That a re-bind of the same
+    // pair is silently dropped is a real defect, but it is issue #162's, not
+    // this change's.
+    let identity_source = if serial.is_some() { "mam" } else { "operator" };
     conn.execute(
-        "INSERT OR IGNORE INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
-        params![cartridge_id, volume_id],
+        "INSERT OR IGNORE INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, ?3)",
+        params![cartridge_id, volume_id, identity_source],
     )?;
 
     // ADR-0011 promises that a cartridge's place and its volumes' places
@@ -494,6 +513,16 @@ mod tests {
         conn.query_row(
             "SELECT status FROM cartridges WHERE id = ?1",
             params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn binding_identity_source(conn: &Connection, volume_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT identity_source FROM cartridge_volumes
+             WHERE volume_id = ?1 AND unmounted_at IS NULL",
+            params![volume_id],
             |r| r.get(0),
         )
         .unwrap()
@@ -769,6 +798,52 @@ mod tests {
         assert!(out.cartridge_id.is_none());
         assert!(out.barcode.is_none());
         assert!(!out.auto_registered);
+    }
+
+    /// Migration 014 / ADR-0012: the binding records which identity it was
+    /// established under, and the rule is exactly "did the chip say so".
+    /// `volume write` reads this back to fill File 0's
+    /// `[media].cartridge_identity_source`, so getting it wrong here seals a
+    /// provenance claim the catalog does not support.
+    #[test]
+    fn the_binding_records_whether_the_chip_or_the_operator_named_the_cartridge() {
+        // A MAM serial was read: the chip identified this cartridge.
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        let vol = new_volume(&conn, "L6-0001");
+        bind_cartridge(
+            &conn,
+            vol,
+            found.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo::default(),
+        )
+        .unwrap();
+        assert_eq!(binding_identity_source(&conn, vol).as_deref(), Some("mam"));
+
+        // No serial was readable, so the operator named the cartridge with
+        // `--cartridge BC002`. The identity on tape will be that barcode.
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC002", "LTO-6", None, "available");
+        let found = lookup_cartridge(&conn, None, Some("BC002")).unwrap();
+        let vol = new_volume(&conn, "L6-0002");
+        bind_cartridge(
+            &conn,
+            vol,
+            found.row.as_ref(),
+            None,
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding_identity_source(&conn, vol).as_deref(),
+            Some("operator")
+        );
     }
 
     #[test]

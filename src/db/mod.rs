@@ -142,6 +142,18 @@ fn migrations() -> Migrations<'static> {
         // the rebuild carried every row's parent intact. See the migration
         // header.
         M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
+        // 014 adds the nullable `cartridge_volumes.identity_source` ('mam' |
+        // 'operator'), the provenance of the identity a binding was
+        // established under (ADR-0012, ADR-0010's 2026-09-14 amendment, issue
+        // #192). It is what File 0's `[media].cartridge_identity_source` is
+        // read back from at write time, so the tape and the catalog cannot
+        // disagree about which string identifies the cartridge. A plain ADD
+        // COLUMN — no rebuild, so no `.foreign_key_check()`; legacy rows stay
+        // NULL, which means unknown and never 'mam'. See the migration header
+        // for the three sources that were rejected.
+        M::up(include_str!(
+            "migrations/014_cartridge_binding_identity_source.sql"
+        )),
     ])
 }
 
