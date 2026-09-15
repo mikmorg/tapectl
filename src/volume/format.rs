@@ -282,6 +282,58 @@ pub fn parse_id_thunk_volume_meta(raw: &str) -> Result<IdThunkVolumeMeta> {
     })
 }
 
+/// The ID thunk (File 0)'s `[media]` cartridge identity — which physical
+/// cartridge this volume was written to, and **how that was established**
+/// (`docs/design/volume-format-v2.md` §1.1, ADR-0012).
+///
+/// A fourth parser over File 0 rather than fields bolted onto a sibling, for
+/// the same reason `IdThunkVolumeMeta` is a third: each documents exactly
+/// what its one consumer needs. This one answers a question no other parser
+/// can — whether `cartridge_serial` is verifiable against the MEDIUM (load
+/// the tape, read the MAM, compare) or only against the CATALOG.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdThunkMedia {
+    /// The cartridge's identity string. A chip-reported serial or an
+    /// operator-typed barcode — `identity_source` is what says which.
+    pub cartridge_serial: String,
+    /// `Some("mam")`, `Some("operator")`, or **`None` = UNKNOWN**.
+    ///
+    /// `None` is not a defaulted `"mam"` and must never be treated as one.
+    /// Every tape written before the field existed omits it, and those tapes
+    /// stay readable forever; a reader that defaulted the absent case would
+    /// make all of them falsely attest a chip-verified serial. A reader that
+    /// cannot tell must say so.
+    pub cartridge_identity_source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MediaToml {
+    cartridge_serial: String,
+    /// `#[serde(default)]` spelled out rather than leaning on `Option`'s
+    /// implicit one: the ABSENT case is the whole point of this field, and it
+    /// must be impossible to read this and wonder what a missing key does.
+    #[serde(default)]
+    cartridge_identity_source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdThunkMediaDoc {
+    media: MediaToml,
+}
+
+/// Parse the ID thunk (File 0)'s `[media]` cartridge identity. Same fail-safe
+/// convention as its three siblings: absent or malformed input is a normal
+/// `Err`, never a panic.
+pub fn parse_id_thunk_media(raw: &str) -> Result<IdThunkMedia> {
+    let body = toml_body(raw, "[media]", "id thunk media")?;
+    let doc: IdThunkMediaDoc = toml::from_str(body)
+        .map_err(|e| TapectlError::Other(format!("id thunk media: TOML parse failed: {e}")))?;
+    Ok(IdThunkMedia {
+        cartridge_serial: doc.media.cartridge_serial,
+        cartridge_identity_source: doc.media.cartridge_identity_source,
+    })
+}
+
 /// A violation of the §2.5 front-index self-consistency rules. Cheap checks
 /// that turn "subtly wrong map" into a loud, structured report rather than a
 /// silent bad read — every violation present is returned, not just the
@@ -633,6 +685,80 @@ mod tests {
     #[test]
     fn id_thunk_volume_meta_missing_marker_is_an_err_not_a_panic() {
         assert!(parse_id_thunk_volume_meta("no toml here at all").is_err());
+    }
+
+    // --- id thunk media (which cartridge, and how we know — #192) ---------
+
+    #[test]
+    fn id_thunk_media_round_trips_both_identity_sources() {
+        for source in ["mam", "operator"] {
+            let params = IdThunkV2Params {
+                cartridge_identity_source: Some(source),
+                ..sample_id_thunk_params("RT08", "44444444-5555-6666-7777-888888888888")
+            };
+            let parsed = parse_id_thunk_media(&generate_id_thunk_v2(&params)).expect("parses");
+            assert_eq!(parsed.cartridge_serial, "SERIAL1");
+            assert_eq!(parsed.cartridge_identity_source.as_deref(), Some(source));
+        }
+    }
+
+    /// THE rule that makes every pre-#192 tape safe to read
+    /// (`docs/design/volume-format-v2.md` §1.1): absent means UNKNOWN and
+    /// never "mam". The input here is a File 0 `[media]` body exactly as the
+    /// generator emitted it before the field existed — written as a literal,
+    /// not generated, so this cannot silently start testing the new shape.
+    #[test]
+    fn a_pre_change_file_0_reads_as_unknown_never_as_mam() {
+        let legacy = "\
+[media]
+cartridge_manufacturer = \"IBM\"
+cartridge_serial = \"SERIAL1\"
+tape_length_meters = 846
+load_count_at_write = 5
+";
+        let parsed = parse_id_thunk_media(legacy).expect("a pre-#192 File 0 must still parse");
+        assert_eq!(parsed.cartridge_serial, "SERIAL1");
+        assert_eq!(
+            parsed.cartridge_identity_source, None,
+            "an omitted cartridge_identity_source must read as unknown — defaulting it \
+             to \"mam\" would make every tape written before the field existed falsely \
+             attest a chip-verified serial"
+        );
+    }
+
+    /// The same, through the live generator: `None` in, nothing out.
+    #[test]
+    fn id_thunk_media_omits_the_source_entirely_when_it_is_unknown() {
+        let params = sample_id_thunk_params("RT09", "55555555-6666-7777-8888-999999999999");
+        let generated = generate_id_thunk_v2(&params);
+        assert!(
+            !generated.contains("cartridge_identity_source"),
+            "unknown must emit no key at all, not an empty value"
+        );
+        let parsed = parse_id_thunk_media(&generated).expect("parses");
+        assert!(parsed.cartridge_identity_source.is_none());
+    }
+
+    #[test]
+    fn id_thunk_media_parser_is_tolerant_of_trailing_block_padding_nuls() {
+        let params = IdThunkV2Params {
+            cartridge_identity_source: Some("operator"),
+            ..sample_id_thunk_params("RT10", "66666666-7777-8888-9999-aaaaaaaaaaaa")
+        };
+        let mut padded = generate_id_thunk_v2(&params).into_bytes();
+        padded.resize(padded.len() + 4096, 0);
+        let padded_str = String::from_utf8(padded).unwrap();
+
+        let parsed = parse_id_thunk_media(&padded_str).expect("parses despite NUL padding");
+        assert_eq!(
+            parsed.cartridge_identity_source.as_deref(),
+            Some("operator")
+        );
+    }
+
+    #[test]
+    fn id_thunk_media_missing_marker_is_an_err_not_a_panic() {
+        assert!(parse_id_thunk_media("no toml here at all").is_err());
     }
 
     // --- id thunk layout pointers (the foreign-tape seal-position check, #27) --

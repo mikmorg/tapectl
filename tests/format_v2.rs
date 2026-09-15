@@ -728,6 +728,64 @@ fn front_index_self_consistency_and_seal_file_count_match() {
     );
 }
 
+/// §1.1 (ADR-0012, issue #192): File 0 records HOW its `cartridge_serial`
+/// was established, and an heir can read that with **no key and no
+/// database** — from the recorded bytes of File 0 alone, exactly as
+/// `mt rewind; dd | tr -d '\0'` would hand them over.
+///
+/// This is the question no other plaintext file can answer: whether
+/// `cartridge_serial` is verifiable against the MEDIUM (load the tape, read
+/// the MAM, compare) or only against a catalog the heir may not have. A
+/// provenance field with no reader records something nothing consumes, so
+/// the reader is proven here, on real recorded bytes, rather than only in a
+/// generator round-trip.
+///
+/// Uses `shared_harness()` deliberately: its `mam_serial` is `"T7SERIAL"`
+/// with a `"mam"` binding behind it. `build_layout_only`'s serial is the
+/// empty string, so the same assertions there would pass vacuously.
+#[test]
+fn file_0_tells_a_keyless_heir_how_the_cartridge_serial_was_established() {
+    let h = shared_harness();
+
+    // Everything below comes from position 0's recorded bytes. No Layout, no
+    // key, no DB — the heir strips the block padding and reads the TOML.
+    let raw = &h.store.files[0];
+    let text = String::from_utf8_lossy(raw);
+    let text = text.trim_end_matches('\0');
+
+    let media = format::parse_id_thunk_media(text).expect("File 0's [media] table parses");
+    assert_eq!(
+        media.cartridge_serial, "T7SERIAL",
+        "File 0 must name the cartridge this volume was written to"
+    );
+    assert_eq!(
+        media.cartridge_identity_source.as_deref(),
+        Some("mam"),
+        "the harness binds from a chip-reported serial, so the tape must say so — \
+         this is what tells an heir the serial is checkable against the medium itself"
+    );
+
+    // §1.1: `[media]` must stay the LAST table. RESTORE.sh's `toml_val` is
+    // table-blind and first-match-wins across the tables its `sed`
+    // concatenates, so a key appended anywhere but the tail could shadow one
+    // an earlier table owns. Proven from the bytes, not from the generator.
+    let media_at = text.find("[media]").expect("File 0 has a [media] table");
+    assert!(
+        !text[media_at + "[media]".len()..].contains('['),
+        "[media] must remain the last table in File 0"
+    );
+
+    // And the new key sits inside `[media]`, after `cartridge_serial` —
+    // never in `[layout]`, whose key set is pinned to exactly three.
+    let serial_at = text
+        .find("cartridge_serial = ")
+        .expect("File 0 carries cartridge_serial");
+    let source_at = text
+        .find("cartridge_identity_source = ")
+        .expect("File 0 carries cartridge_identity_source");
+    assert!(media_at < serial_at && serial_at < source_at);
+}
+
 /// Assertion 3 (§1): v2 zone order — the fixed front files, envelopes
 /// strictly before slices, seal marker strictly last, and no
 /// `planning_header` entry anywhere (folded into the operator envelope's
