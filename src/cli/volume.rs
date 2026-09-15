@@ -1,5 +1,7 @@
 use clap::Subcommand;
 use rusqlite::Connection;
+use serde::Serialize;
+use tabled::{Table, Tabled};
 
 use crate::cli::{read_device, write_device};
 use crate::config::{Config, TapectlPaths};
@@ -262,6 +264,36 @@ pub enum VolumeCommands {
     Deposit {
         #[command(subcommand)]
         command: DepositCommands,
+    },
+
+    /// List every volume, most recently written first (issue #195).
+    ///
+    /// Catalog-only: never opens a drive. Every status is shown by default —
+    /// ADR-0011: retired means unfit to WRITE, not unreadable ("a retired
+    /// volume can still be restored from"), and the dangerous failure for an
+    /// inventory is a tape you forgot you had. `--status` narrows; nothing is
+    /// hidden without it.
+    List {
+        /// Only volumes in this status (e.g. sealed, retired, initialized,
+        /// erased). Every status is shown when omitted.
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// The dossier for one volume: capacity, media generation, cartridge
+    /// binding, location, units carried, write receipts, verification
+    /// history, warehouse deposits (issue #195).
+    ///
+    /// Catalog-only: never opens a drive. Summarises units carried by
+    /// default — the design probes ~280 units per cartridge
+    /// (docs/design/v2-open-questions.md:434) — pass `--units` to list every
+    /// one instead of the largest few.
+    Info {
+        /// Volume label
+        label: String,
+        /// List every unit carried by this volume instead of the summary
+        #[arg(long)]
+        units: bool,
     },
 }
 
@@ -777,6 +809,29 @@ pub fn run(
         }
 
         VolumeCommands::Deposit { command } => run_deposit(conn, command, json_output)?,
+
+        VolumeCommands::List { status } => {
+            let rows = volume_rows(conn, status.as_deref())?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&volume_rows_to_json(&rows)).unwrap()
+                );
+            } else if rows.is_empty() {
+                println!("no volumes");
+            } else {
+                println!("{}", Table::new(rows));
+            }
+        }
+
+        VolumeCommands::Info { label, units } => {
+            let info = volume_info(conn, label, *units)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&info).unwrap());
+            } else {
+                print_volume_info(&info);
+            }
+        }
     }
     Ok(exit_code)
 }
@@ -1070,6 +1125,620 @@ fn verify_exit_code(report: &write::VerifyReport) -> i32 {
     }
 }
 
+// ─────────────────────── `volume list` (issue #195) ───────────────────────
+
+/// One row of `volume list`. `#[derive(Tabled, Serialize)]` per the C2b
+/// discipline (`docs/design-errata.md`): the same struct backs the table and
+/// `--json`, every table column is a JSON key, and the stored value is the
+/// raw fact — `display_with` renders it for the table only.
+#[derive(Tabled, Serialize)]
+struct VolumeRow {
+    #[tabled(rename = "LABEL")]
+    label: String,
+    #[tabled(rename = "STATUS")]
+    status: String,
+    /// The cartridge this volume is bound to, by barcode
+    /// (`cartridge_volumes`, ADR-0010). `None` for a volume `volume init`
+    /// left unbound (no readable medium serial) — rendered "(unbound)",
+    /// matching the vocabulary `volume/binding.rs` already uses for this
+    /// state.
+    #[tabled(rename = "CARTRIDGE", display_with = "display_cartridge")]
+    cartridge: Option<String>,
+    /// `volumes.location_id` is nullable and every imported volume has none
+    /// (rule #3) — rendered "(not placed)", matching `cartridge.rs:315`'s
+    /// wording for the same fact about a cartridge.
+    #[tabled(rename = "LOCATION", display_with = "display_not_placed")]
+    location: Option<String>,
+    /// The worst (ADR-0012 per-version MIN) current coverage among the
+    /// units this volume carries, via `policy::coverage::copy_count_expr` —
+    /// never re-derived (rule #4). `None` when the volume carries no unit
+    /// yet (e.g. freshly `initialized`), rendered "—": that is a different
+    /// fact from a unit really having zero copies, which renders `0`.
+    #[tabled(rename = "COPIES", display_with = "display_copies")]
+    copies: Option<i64>,
+    /// This volume's own most recent PASSED `verification_sessions` row
+    /// (raw timestamp; `None` = never verified). Deliberately a fresh
+    /// per-volume query rather than `policy::evidence` (see
+    /// `remaining_coverage_evidence`'s doc): that module's queries are
+    /// scoped to a UNIT's coverage across many volumes and would require a
+    /// unit to correlate against, where this is a single volume's own
+    /// verification history — a different question at a different
+    /// granularity, so it is not "copying `audit.rs`'s trap," it is simply
+    /// out of that module's scope.
+    ///
+    /// Rendered via `Self::display_verified` (not a plain field function)
+    /// because the table cell also needs `copies`: a volume that has never
+    /// carried any data renders "—" (verification is not yet a meaningful
+    /// question), which must read as visibly different from "never" — a
+    /// volume WITH data nobody has checked (rule #6).
+    #[tabled(rename = "VERIFIED", display_with("Self::display_verified", self))]
+    verified: Option<String>,
+}
+
+impl VolumeRow {
+    fn display_verified(&self) -> String {
+        if self.copies.is_none() {
+            "—".to_string()
+        } else {
+            verified_display(self.verified.as_deref(), chrono::Utc::now().naive_utc())
+        }
+    }
+}
+
+fn display_cartridge(v: &Option<String>) -> String {
+    v.clone().unwrap_or_else(|| "(unbound)".to_string())
+}
+
+fn display_not_placed(v: &Option<String>) -> String {
+    v.clone().unwrap_or_else(|| "(not placed)".to_string())
+}
+
+fn display_copies(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "—".to_string())
+}
+
+/// The pure half of [`display_verified`], taking `now` as a parameter so the
+/// never-vs-aged rendering is deterministically testable (same split as
+/// `policy::evidence::describe`). An unparseable stamp renders raw, matching
+/// that module's honesty rule rather than silently reading as "never".
+fn verified_display(stamp: Option<&str>, now: chrono::NaiveDateTime) -> String {
+    match stamp {
+        None => "never".to_string(),
+        Some(raw) => match chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+            Ok(dt) => format!("{}d ago", (now - dt).num_days()),
+            Err(_) => raw.to_string(),
+        },
+    }
+}
+
+/// `volume list --json` shape (rule #7: raw values, the render functions are
+/// table-only).
+fn volume_rows_to_json(rows: &[VolumeRow]) -> serde_json::Value {
+    serde_json::to_value(rows).unwrap()
+}
+
+/// The query behind `volume list`, split out from the printing so the shape
+/// is directly assertable in tests without capturing stdout (same pattern
+/// as `cartridge_rows`/`report::copies_rows`).
+///
+/// Every status is returned by default (rule #2/#96) — the caller supplies
+/// `status` only to narrow, and it is bound, never interpolated (issue
+/// #110's precedent). `LEFT JOIN`s throughout: `cartridge_volumes`,
+/// `cartridges` and `locations` are all optional facts about a volume (rules
+/// #1/#3), so an unbound or unplaced volume must still appear rather than
+/// vanish behind an inner join.
+fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>> {
+    let scope = crate::policy::coverage::CoverageQuery::current_unit("cu.id");
+    let copy_expr = crate::policy::coverage::copy_count_expr(&scope);
+    // "Copies" here is the WORST current coverage (ADR-0012: a unit is as
+    // covered as its least-covered live version) among every unit this
+    // volume carries ANY completed write for — not just its current
+    // snapshot's writes, so a volume holding only a superseded version
+    // still shows a real number rather than "—", which must mean "no data
+    // at all" (a blank/initialized tape), a genuinely different fact.
+    // `copy_count_expr` already folds the per-version MIN in per unit; the
+    // outer `MIN` here takes the worst across the (possibly several) units
+    // bin-packed onto this one volume.
+    let mut sql = format!(
+        "SELECT v.label, v.status, c.barcode, l.name,
+                (SELECT MIN(per.copies) FROM (
+                    SELECT DISTINCT cu.id, ({copy_expr}) AS copies
+                    FROM writes cw2
+                    JOIN stage_sets css2 ON css2.id = cw2.stage_set_id
+                    JOIN snapshots cs2 ON cs2.id = css2.snapshot_id
+                    JOIN units cu ON cu.id = cs2.unit_id
+                    WHERE cw2.volume_id = v.id AND cw2.status = 'completed'
+                 ) per) AS copies,
+                (SELECT MAX(vs.completed_at) FROM verification_sessions vs
+                  WHERE vs.volume_id = v.id AND vs.outcome = 'passed') AS last_verified
+         FROM volumes v
+         LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
+         LEFT JOIN cartridges c ON c.id = cv.cartridge_id
+         LEFT JOIN locations l ON l.id = v.location_id"
+    );
+    if status.is_some() {
+        sql.push_str(" WHERE v.status = ?1");
+    }
+    sql.push_str(" ORDER BY COALESCE(v.first_write, v.created_at) DESC, v.id DESC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let bound: Vec<&dyn rusqlite::types::ToSql> = match &status {
+        Some(s) => vec![s],
+        None => vec![],
+    };
+    let rows = stmt
+        .query_map(bound.as_slice(), |row| {
+            Ok(VolumeRow {
+                label: row.get(0)?,
+                status: row.get(1)?,
+                cartridge: row.get(2)?,
+                location: row.get(3)?,
+                copies: row.get(4)?,
+                verified: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+// ─────────────────────── `volume info` (issue #195) ───────────────────────
+
+/// One unit this volume carries, aggregated across every completed write of
+/// it that landed on this volume (a unit can be written to the same volume
+/// more than once, e.g. successive snapshots or a compaction destination).
+#[derive(Debug, Clone, Serialize)]
+struct UnitOnVolume {
+    unit: String,
+    tenant: String,
+    /// The highest version of this unit carried by this volume.
+    version: i64,
+    bytes: i64,
+}
+
+/// One `writes` row: a receipt that a specific stage set was written to
+/// this volume, regardless of outcome — `volume info` shows the write
+/// history, not just the successes.
+#[derive(Debug, Clone, Serialize)]
+struct WriteReceipt {
+    unit: String,
+    version: i64,
+    status: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    num_slices: Option<i64>,
+    bytes: Option<i64>,
+}
+
+/// One `verification_sessions` row. Every outcome is shown here (unlike
+/// `VolumeRow::verified`, which is deliberately the latest PASSED session
+/// only) — a dossier's verification history is exactly the place a failed
+/// or aborted attempt belongs.
+#[derive(Debug, Clone, Serialize)]
+struct VerificationRow {
+    started_at: String,
+    completed_at: Option<String>,
+    verify_type: String,
+    outcome: String,
+    slices_checked: i64,
+    slices_passed: i64,
+    slices_failed: i64,
+}
+
+/// One recorded warehouse deposit (ADR-0006) of this volume's bytes — its
+/// own evidence class, never folded into a copy count (rule #5).
+#[derive(Debug, Clone, Serialize)]
+struct DepositRow {
+    location: String,
+    deposited_at: String,
+    receipt: Option<String>,
+    storage_class: Option<String>,
+    notes: Option<String>,
+}
+
+/// The dossier behind `volume info`. One struct backs both the plain-text
+/// print and `--json` (rule #7): nothing is computed twice, so the two
+/// renderings cannot drift apart.
+///
+/// Summarised by default (rule #8 / issue #195: the design probe models
+/// ~280 units per cartridge) — `unit_count`/`unit_total_bytes`/`tenants`/
+/// `largest_units` are always populated; `units` is `Some` only when
+/// `--units` asked for the full list.
+#[derive(Debug, Serialize)]
+struct VolumeInfo {
+    label: String,
+    status: String,
+    backend_type: String,
+    backend_name: String,
+    media_type: Option<String>,
+    capacity_bytes: i64,
+    bytes_written: i64,
+    location: Option<String>,
+    cartridge_barcode: Option<String>,
+    cartridge_serial: Option<String>,
+    created_at: String,
+    first_write: Option<String>,
+    last_write: Option<String>,
+    notes: Option<String>,
+    unit_count: i64,
+    unit_total_bytes: i64,
+    tenants: Vec<String>,
+    units_first_seen: Option<String>,
+    units_last_seen: Option<String>,
+    /// The largest few units by bytes carried (top 5), shown regardless of
+    /// `--units` so the summary is never empty just because the full list
+    /// was not requested.
+    largest_units: Vec<UnitOnVolume>,
+    /// Every unit carried, only when `--units` was passed.
+    units: Option<Vec<UnitOnVolume>>,
+    writes: Vec<WriteReceipt>,
+    verifications: Vec<VerificationRow>,
+    deposits: Vec<DepositRow>,
+}
+
+/// How many of a volume's largest units are named in the summary before
+/// `--units` is needed to see the rest.
+const VOLUME_INFO_SUMMARY_UNITS: usize = 5;
+
+/// Gather the `volume info` dossier for `label`. Catalog-only (rule #1): no
+/// tape device, no `Store`, no `media_detect` — every field comes from the
+/// database as it was last recorded (rule #8 in the issue: "last known,
+/// never live").
+fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<VolumeInfo> {
+    use crate::error::TapectlError;
+
+    #[allow(clippy::type_complexity)]
+    let (
+        vol_id,
+        status,
+        backend_type,
+        backend_name,
+        media_type,
+        capacity_bytes,
+        bytes_written,
+        created_at,
+        first_write,
+        last_write,
+        notes,
+        location,
+        cartridge_barcode,
+        cartridge_serial,
+    ): (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            // LEFT JOINs throughout: a freshly initialized volume has no
+            // cartridge_volumes/location row yet, and it must still be
+            // inspectable (mirrors `cartridge info`'s LEFT JOIN for the
+            // same reason).
+            "SELECT v.id, v.status, v.backend_type, v.backend_name, v.media_type,
+                    v.capacity_bytes, v.bytes_written, v.created_at, v.first_write,
+                    v.last_write, v.notes, l.name, c.barcode, c.serial_number
+             FROM volumes v
+             LEFT JOIN locations l ON l.id = v.location_id
+             LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
+             LEFT JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE v.label = ?1",
+            rusqlite::params![label],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Units carried: one row per unit, aggregated across every completed
+    // write of it that landed on THIS volume. Sorted largest-first so the
+    // summary's "top few" is just this list's head.
+    let mut units_stmt = conn.prepare(
+        "SELECT u.name, t.name, MAX(s.version),
+                COALESCE(SUM(ss.total_encrypted_size), 0),
+                MIN(s.created_at), MAX(s.created_at)
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         JOIN tenants t ON t.id = u.tenant_id
+         WHERE w.volume_id = ?1 AND w.status = 'completed'
+         GROUP BY u.id
+         ORDER BY 4 DESC, u.name",
+    )?;
+    #[allow(clippy::type_complexity)]
+    let unit_rows: Vec<(String, String, i64, i64, Option<String>, Option<String>)> = units_stmt
+        .query_map(rusqlite::params![vol_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let unit_count = unit_rows.len() as i64;
+    let unit_total_bytes = unit_rows.iter().map(|(_, _, _, bytes, _, _)| bytes).sum();
+    let mut tenants: Vec<String> = unit_rows
+        .iter()
+        .map(|(_, tenant, ..)| tenant.clone())
+        .collect();
+    tenants.sort();
+    tenants.dedup();
+    let units_first_seen = unit_rows
+        .iter()
+        .filter_map(|(_, _, _, _, first, _)| first.clone())
+        .min();
+    let units_last_seen = unit_rows
+        .iter()
+        .filter_map(|(_, _, _, _, _, last)| last.clone())
+        .max();
+    let all_units: Vec<UnitOnVolume> = unit_rows
+        .into_iter()
+        .map(|(unit, tenant, version, bytes, _, _)| UnitOnVolume {
+            unit,
+            tenant,
+            version,
+            bytes,
+        })
+        .collect();
+    let largest_units: Vec<UnitOnVolume> = all_units
+        .iter()
+        .take(VOLUME_INFO_SUMMARY_UNITS)
+        .cloned()
+        .collect();
+    let units = if include_units { Some(all_units) } else { None };
+
+    // Write receipts: every write of this volume, whatever its outcome —
+    // this is the history, not the coverage derivation.
+    let mut writes_stmt = conn.prepare(
+        "SELECT u.name, s.version, w.status, w.started_at, w.completed_at,
+                ss.num_slices, ss.total_encrypted_size
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE w.volume_id = ?1
+         ORDER BY w.completed_at DESC, w.id DESC",
+    )?;
+    let writes: Vec<WriteReceipt> = writes_stmt
+        .query_map(rusqlite::params![vol_id], |row| {
+            Ok(WriteReceipt {
+                unit: row.get(0)?,
+                version: row.get(1)?,
+                status: row.get(2)?,
+                started_at: row.get(3)?,
+                completed_at: row.get(4)?,
+                num_slices: row.get(5)?,
+                bytes: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Verification history: every session, every outcome (unlike
+    // `VolumeRow::verified`, which is the latest PASSED one only).
+    let mut verify_stmt = conn.prepare(
+        "SELECT started_at, completed_at, verify_type, outcome,
+                slices_checked, slices_passed, slices_failed
+         FROM verification_sessions
+         WHERE volume_id = ?1
+         ORDER BY started_at DESC, id DESC",
+    )?;
+    let verifications: Vec<VerificationRow> = verify_stmt
+        .query_map(rusqlite::params![vol_id], |row| {
+            Ok(VerificationRow {
+                started_at: row.get(0)?,
+                completed_at: row.get(1)?,
+                verify_type: row.get(2)?,
+                outcome: row.get(3)?,
+                slices_checked: row.get(4)?,
+                slices_passed: row.get(5)?,
+                slices_failed: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Warehouse deposits (ADR-0006): their own evidence class, listed by
+    // name, never folded into a copy count.
+    let mut deposit_stmt = conn.prepare(
+        "SELECT l.name, d.deposited_at, d.receipt, d.storage_class, d.notes
+         FROM volume_deposits d
+         JOIN locations l ON l.id = d.location_id
+         WHERE d.volume_id = ?1
+         ORDER BY d.deposited_at",
+    )?;
+    let deposits: Vec<DepositRow> = deposit_stmt
+        .query_map(rusqlite::params![vol_id], |row| {
+            Ok(DepositRow {
+                location: row.get(0)?,
+                deposited_at: row.get(1)?,
+                receipt: row.get(2)?,
+                storage_class: row.get(3)?,
+                notes: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(VolumeInfo {
+        label: label.to_string(),
+        status,
+        backend_type,
+        backend_name,
+        media_type,
+        capacity_bytes,
+        bytes_written,
+        location,
+        cartridge_barcode,
+        cartridge_serial,
+        created_at,
+        first_write,
+        last_write,
+        notes,
+        unit_count,
+        unit_total_bytes,
+        tenants,
+        units_first_seen,
+        units_last_seen,
+        largest_units,
+        units,
+        writes,
+        verifications,
+        deposits,
+    })
+}
+
+fn print_volume_info(info: &VolumeInfo) {
+    println!("Volume: {}", info.label);
+    println!("  Status:      {}", info.status);
+    println!(
+        "  Backend:     {} ({})",
+        info.backend_type, info.backend_name
+    );
+    println!(
+        "  Media:       {}",
+        info.media_type.as_deref().unwrap_or("(unknown)")
+    );
+    let pct = if info.capacity_bytes > 0 {
+        (info.bytes_written as f64 / info.capacity_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "  Capacity:    {} / {} GB ({pct:.1}%)",
+        info.bytes_written / (1024 * 1024 * 1024),
+        info.capacity_bytes / (1024 * 1024 * 1024),
+    );
+    println!(
+        "  Cartridge:   {}",
+        info.cartridge_barcode.as_deref().unwrap_or("(unbound)")
+    );
+    if let Some(serial) = &info.cartridge_serial {
+        println!("               serial {serial}");
+    }
+    println!(
+        "  Location:    {}",
+        info.location.as_deref().unwrap_or("(not placed)")
+    );
+    println!("  Created:     {}", info.created_at);
+    println!(
+        "  First write: {}",
+        info.first_write.as_deref().unwrap_or("(never written)")
+    );
+    println!(
+        "  Last write:  {}",
+        info.last_write.as_deref().unwrap_or("(never written)")
+    );
+    if let Some(notes) = &info.notes {
+        println!("  Notes:       {notes}");
+    }
+
+    println!();
+    if info.unit_count == 0 {
+        println!("Units carried: none");
+    } else {
+        println!(
+            "Units carried: {} ({} MB across {} tenant(s){})",
+            info.unit_count,
+            info.unit_total_bytes / (1024 * 1024),
+            info.tenants.len(),
+            match (&info.units_first_seen, &info.units_last_seen) {
+                (Some(a), Some(b)) if a != b => format!(", {a} .. {b}"),
+                (Some(a), _) => format!(", {a}"),
+                _ => String::new(),
+            },
+        );
+        let shown = info.units.as_deref().unwrap_or(&info.largest_units);
+        for u in shown {
+            println!(
+                "    {} v{} ({}) — {} MB",
+                u.unit,
+                u.version,
+                u.tenant,
+                u.bytes / (1024 * 1024),
+            );
+        }
+        if info.units.is_none() && info.unit_count as usize > shown.len() {
+            println!(
+                "    ... and {} more (use --units to list all of them)",
+                info.unit_count as usize - shown.len()
+            );
+        }
+    }
+
+    println!();
+    if info.writes.is_empty() {
+        println!("Write receipts: none");
+    } else {
+        println!("Write receipts:");
+        for w in &info.writes {
+            println!(
+                "    {} v{}: {} ({})",
+                w.unit,
+                w.version,
+                w.status,
+                w.completed_at.as_deref().unwrap_or("not completed"),
+            );
+        }
+    }
+
+    println!();
+    if info.verifications.is_empty() {
+        println!("Verification history: never verified");
+    } else {
+        println!("Verification history:");
+        for v in &info.verifications {
+            println!(
+                "    {} [{}]: {} ({}/{} slices passed)",
+                v.started_at, v.verify_type, v.outcome, v.slices_passed, v.slices_checked,
+            );
+        }
+    }
+
+    println!();
+    if info.deposits.is_empty() {
+        println!("Warehouse deposits: none");
+    } else {
+        println!("Warehouse deposits:");
+        for d in &info.deposits {
+            println!(
+                "    {} ({}){}",
+                d.location,
+                d.deposited_at,
+                d.receipt
+                    .as_deref()
+                    .map(|r| format!(", receipt {r}"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1346,5 +2015,439 @@ mod tests {
         // failure) must not be reported as a violation.
         let report = write::VerifyReport::default();
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
+    }
+
+    /// `volume list` / `volume info` (issue #195).
+    mod list_and_info {
+        use super::*;
+        use rusqlite::params;
+
+        /// Fixture matching the ratified `volume list` design's own example
+        /// table: five volumes across five statuses (initialized, sealed
+        /// x2, retired, erased). `docs` is bin-packed onto BOTH the retired
+        /// `L6-0000` and the sealed `L6-0002`, so `L6-0000`'s row proves
+        /// `copies` is the unit's INCLUSIVE current coverage, not "other
+        /// copies excluding this volume" — a lone eligible volume elsewhere
+        /// must read as the real total, not zero.
+        fn seed() -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO locations (name, kind) VALUES ('home-rack','shelf'), ('bank','shelf');
+
+                 INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status) VALUES
+                    ('E01001L8_17757944','LTO-6',2500000000000,'E01001L8_17757944','available'),
+                    ('HUJ808A5L4','LTO-6',2500000000000,'HUJ808A5L4','in_use'),
+                    ('E01001L8_17757943','LTO-6',2500000000000,'E01001L8_17757943','in_use'),
+                    ('E01001L8_17757941','LTO-6',2500000000000,'E01001L8_17757941','retired_permanent');
+
+                 INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                       bytes_written, status, location_id, created_at, first_write) VALUES
+                    ('L6-0003','lto','lto0','LTO-6',2500000000000,0,'initialized',
+                        (SELECT id FROM locations WHERE name='home-rack'),'2026-09-10 00:00:00',NULL),
+                    ('L6-0002','lto','lto0','LTO-6',2500000000000,100000000000,'sealed',
+                        (SELECT id FROM locations WHERE name='bank'),'2026-09-05 00:00:00','2026-09-06 00:00:00'),
+                    ('L6-0001','lto','lto0','LTO-6',2500000000000,200000000000,'sealed',
+                        (SELECT id FROM locations WHERE name='home-rack'),'2026-09-01 00:00:00','2026-09-01 12:00:00'),
+                    ('L6-0000','lto','lto0','LTO-6',2500000000000,150000000000,'retired',
+                        NULL,'2026-08-01 00:00:00','2026-08-01 12:00:00'),
+                    ('L6-0004','lto','lto0','LTO-6',2500000000000,0,'erased',
+                        NULL,'2026-07-01 00:00:00',NULL);
+
+                 INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES
+                    ((SELECT id FROM cartridges WHERE barcode='E01001L8_17757944'),
+                     (SELECT id FROM volumes WHERE label='L6-0003')),
+                    ((SELECT id FROM cartridges WHERE barcode='HUJ808A5L4'),
+                     (SELECT id FROM volumes WHERE label='L6-0002')),
+                    ((SELECT id FROM cartridges WHERE barcode='E01001L8_17757943'),
+                     (SELECT id FROM volumes WHERE label='L6-0001')),
+                    ((SELECT id FROM cartridges WHERE barcode='E01001L8_17757941'),
+                     (SELECT id FROM volumes WHERE label='L6-0000'));
+
+                 INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active');
+
+                 INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status) VALUES
+                    ('u-photos','photos',(SELECT id FROM tenants WHERE name='t1'),'mtime_size',1,'active'),
+                    ('u-docs','docs',(SELECT id FROM tenants WHERE name='t1'),'mtime_size',1,'active');
+
+                 INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path) VALUES
+                    ((SELECT id FROM units WHERE name='photos'), 1, 'full', 'current', '/data/photos'),
+                    ((SELECT id FROM units WHERE name='docs'), 1, 'full', 'current', '/data/docs');
+
+                 INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices, total_encrypted_size) VALUES
+                    ((SELECT id FROM snapshots WHERE unit_id=(SELECT id FROM units WHERE name='photos')),
+                     'staged', 104857600, 2, 209715200),
+                    ((SELECT id FROM snapshots WHERE unit_id=(SELECT id FROM units WHERE name='docs')),
+                     'staged', 104857600, 1, 52428800),
+                    ((SELECT id FROM snapshots WHERE unit_id=(SELECT id FROM units WHERE name='docs')),
+                     'staged', 104857600, 1, 52428800);",
+            )
+            .unwrap();
+
+            let photos_ss: i64 = conn
+                .query_row(
+                    "SELECT ss.id FROM stage_sets ss
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     JOIN units u ON u.id = s.unit_id
+                     WHERE u.name = 'photos'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let docs_ss: Vec<i64> = {
+                let mut docs_ss_stmt = conn
+                    .prepare(
+                        "SELECT ss.id FROM stage_sets ss
+                         JOIN snapshots s ON s.id = ss.snapshot_id
+                         JOIN units u ON u.id = s.unit_id
+                         WHERE u.name = 'docs' ORDER BY ss.id",
+                    )
+                    .unwrap();
+                docs_ss_stmt
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            let photos_snap: i64 = conn
+                .query_row(
+                    "SELECT id FROM snapshots WHERE unit_id = (SELECT id FROM units WHERE name='photos')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let docs_snap: i64 = conn
+                .query_row(
+                    "SELECT id FROM snapshots WHERE unit_id = (SELECT id FROM units WHERE name='docs')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let vol = |label: &str| -> i64 {
+                conn.query_row(
+                    "SELECT id FROM volumes WHERE label = ?1",
+                    params![label],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            let (l6_0001, l6_0002, l6_0000) = (vol("L6-0001"), vol("L6-0002"), vol("L6-0000"));
+
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, completed_at)
+                 VALUES (?1, ?2, ?3, 'completed', '2026-09-01 13:00:00')",
+                params![photos_ss, photos_snap, l6_0001],
+            )
+            .unwrap();
+            // `docs`'s first copy: the volume that is later retired.
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, completed_at)
+                 VALUES (?1, ?2, ?3, 'completed', '2026-08-01 13:00:00')",
+                params![docs_ss[0], docs_snap, l6_0000],
+            )
+            .unwrap();
+            // `docs`'s second copy: sealed and eligible, so the unit's
+            // current coverage is 1 even though the volume it was FIRST
+            // written to is now retired.
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, completed_at)
+                 VALUES (?1, ?2, ?3, 'completed', '2026-09-05 13:00:00')",
+                params![docs_ss[1], docs_snap, l6_0002],
+            )
+            .unwrap();
+
+            let now = chrono::Utc::now().naive_utc();
+            let d14 = (now - chrono::Duration::days(14))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            let d92 = (now - chrono::Duration::days(92))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                    (volume_id, started_at, completed_at, verify_type, outcome,
+                     slices_checked, slices_passed, slices_failed)
+                 VALUES (?1, ?2, ?2, 'full', 'passed', 2, 2, 0)",
+                params![l6_0001, d14],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                    (volume_id, started_at, completed_at, verify_type, outcome,
+                     slices_checked, slices_passed, slices_failed)
+                 VALUES (?1, ?2, ?2, 'full', 'passed', 1, 1, 0)",
+                params![l6_0000, d92],
+            )
+            .unwrap();
+
+            conn
+        }
+
+        /// Acceptance: a retired, an erased and an unplaced volume all
+        /// appear in the same `volume list` — nothing hidden by default
+        /// (rule #2), and ordering is most-recently-written first.
+        #[test]
+        fn list_shows_every_status_most_recently_written_first() {
+            let conn = seed();
+            let rows = volume_rows(&conn, None).unwrap();
+            let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec!["L6-0003", "L6-0002", "L6-0001", "L6-0000", "L6-0004"],
+                "COALESCE(first_write, created_at) DESC, id DESC"
+            );
+
+            let retired = rows.iter().find(|r| r.label == "L6-0000").unwrap();
+            assert_eq!(retired.status, "retired");
+            assert_eq!(
+                retired.location, None,
+                "an unplaced volume must still appear, not vanish behind an inner join"
+            );
+
+            let erased = rows.iter().find(|r| r.label == "L6-0004").unwrap();
+            assert_eq!(erased.status, "erased");
+            assert_eq!(
+                erased.cartridge, None,
+                "an unbound volume must still appear"
+            );
+        }
+
+        /// Rule: `--status` narrows but is never the default filter, and it
+        /// is bound rather than interpolated (issue #110's precedent).
+        #[test]
+        fn status_filter_narrows_and_is_bound_not_interpolated() {
+            let conn = seed();
+            let rows = volume_rows(&conn, Some("sealed")).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|r| r.status == "sealed"));
+
+            let rows = volume_rows(&conn, Some("sealed' OR '1'='1")).unwrap();
+            assert!(
+                rows.is_empty(),
+                "a quoted payload must match no rows, not inject"
+            );
+        }
+
+        /// Rule #7 (C2b): every table column is a JSON key, and the JSON
+        /// value is the RAW fact, not the table's rendered "—"/"(unbound)"
+        /// text.
+        #[test]
+        fn json_shape_has_every_table_column_as_a_raw_valued_key() {
+            let conn = seed();
+            let rows = volume_rows(&conn, None).unwrap();
+            let value = volume_rows_to_json(&rows);
+            let full = serde_json::to_string(&value).unwrap();
+            let reparsed: serde_json::Value =
+                serde_json::from_str(&full).expect("the whole of stdout must parse as JSON");
+            let arr = reparsed.as_array().unwrap();
+            assert_eq!(arr.len(), rows.len());
+
+            for row in arr {
+                let obj = row.as_object().unwrap();
+                for key in [
+                    "label",
+                    "status",
+                    "cartridge",
+                    "location",
+                    "copies",
+                    "verified",
+                ] {
+                    assert!(obj.contains_key(key), "missing key {key}: {row}");
+                }
+            }
+
+            let initialized = arr.iter().find(|r| r["label"] == "L6-0003").unwrap();
+            assert_eq!(
+                initialized["copies"],
+                serde_json::Value::Null,
+                "raw value, not the table's \"—\""
+            );
+            assert_eq!(initialized["cartridge"], "E01001L8_17757944");
+            assert_eq!(initialized["location"], "home-rack");
+        }
+
+        /// Acceptance: copies must agree with `report copies` on the same
+        /// fixture, since both route through `policy::coverage` — a
+        /// divergence is a bug. `L6-0000` (retired) is the interesting
+        /// case: its own write no longer counts, so its row's `copies`
+        /// must equal `docs`'s coverage from the OTHER sealed volume,
+        /// proving the column is inclusive rather than "other copies".
+        #[test]
+        fn copies_agree_with_report_copies_on_the_same_fixture() {
+            let conn = seed();
+            let vol_rows = volume_rows(&conn, None).unwrap();
+            let unit_rows = crate::cli::report::copies_rows(&conn, None).unwrap();
+            let docs_copies = unit_rows
+                .iter()
+                .find(|(name, ..)| name.as_str() == "docs")
+                .unwrap()
+                .1;
+            let photos_copies = unit_rows
+                .iter()
+                .find(|(name, ..)| name.as_str() == "photos")
+                .unwrap()
+                .1;
+            assert_eq!(docs_copies, 1);
+            assert_eq!(photos_copies, 1);
+
+            let by_label =
+                |label: &str| -> &VolumeRow { vol_rows.iter().find(|r| r.label == label).unwrap() };
+            assert_eq!(by_label("L6-0002").copies, Some(docs_copies));
+            assert_eq!(by_label("L6-0001").copies, Some(photos_copies));
+            assert_eq!(
+                by_label("L6-0000").copies,
+                Some(docs_copies),
+                "a retired volume's row must show the unit's real current \
+                 coverage (from elsewhere), not 0 and not \"other copies\""
+            );
+            assert_eq!(
+                by_label("L6-0003").copies,
+                None,
+                "an initialized volume with no writes carries no unit at all"
+            );
+        }
+
+        /// Rule #6: never-verified must render distinctly from a
+        /// long-ago verification, and distinctly again from a volume that
+        /// has never carried any data at all (the pure half, matching
+        /// `policy::evidence::describe`'s deterministic-`now` split).
+        #[test]
+        fn never_verified_renders_distinctly_from_an_aged_verification() {
+            let now =
+                chrono::NaiveDateTime::parse_from_str("2026-09-15 00:00:00", "%Y-%m-%d %H:%M:%S")
+                    .unwrap();
+            assert_eq!(verified_display(None, now), "never");
+            assert_eq!(
+                verified_display(Some("2026-09-01 00:00:00"), now),
+                "14d ago"
+            );
+            assert_ne!(
+                verified_display(None, now),
+                verified_display(Some("2026-09-01 00:00:00"), now)
+            );
+            // An unparseable stamp renders raw rather than as "never" —
+            // matches `policy::evidence`'s honesty rule.
+            assert_eq!(
+                verified_display(Some("not-a-timestamp"), now),
+                "not-a-timestamp"
+            );
+        }
+
+        /// The table cell goes a step further than the pure formatter: a
+        /// volume that has never carried any data (`copies: None`) must
+        /// render "—", visibly different again from "never" — a volume
+        /// WITH data nobody has checked.
+        #[test]
+        fn no_data_volume_renders_dash_never_verified_volume_renders_never() {
+            let no_data = VolumeRow {
+                label: "L6-BLANK".into(),
+                status: "initialized".into(),
+                cartridge: None,
+                location: None,
+                copies: None,
+                verified: None,
+            };
+            let has_data_never_verified = VolumeRow {
+                label: "L6-DATA".into(),
+                status: "sealed".into(),
+                cartridge: None,
+                location: None,
+                copies: Some(1),
+                verified: None,
+            };
+            assert_eq!(no_data.display_verified(), "—");
+            assert_eq!(has_data_never_verified.display_verified(), "never");
+            assert_ne!(
+                no_data.display_verified(),
+                has_data_never_verified.display_verified()
+            );
+        }
+
+        /// Rule #5 / ADR-0006: a warehouse deposit is its own evidence
+        /// class in `volume info`'s dossier, never folded into a copy
+        /// count.
+        #[test]
+        fn info_shows_deposits_as_their_own_field() {
+            let (conn, _unit_id, _vol_id) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            let info = volume_info(&conn, "L6-0003", false).unwrap();
+            assert_eq!(info.deposits.len(), 1);
+            assert_eq!(info.deposits[0].location, "glacier");
+        }
+
+        /// Rule #8: `volume info` summarises by default (the design probes
+        /// ~280 units per cartridge) and `--units` expands to the full
+        /// list.
+        #[test]
+        fn info_summarises_by_default_and_units_flag_expands() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+                 INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                       capacity_bytes, status)
+                     VALUES ('L6-BIG', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed');",
+            )
+            .unwrap();
+            let vol_id: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'L6-BIG'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let tenant_id: i64 = conn
+                .query_row("SELECT id FROM tenants WHERE name = 't'", [], |r| r.get(0))
+                .unwrap();
+            for i in 0..7 {
+                conn.execute(
+                    "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                    params![format!("uuid-{i}"), format!("unit{i}"), tenant_id],
+                )
+                .unwrap();
+                let unit_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, 1, 'full', 'current', '/x')",
+                    params![unit_id],
+                )
+                .unwrap();
+                let snap_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, total_encrypted_size)
+                     VALUES (?1, 'staged', 524288, ?2)",
+                    params![snap_id, (i + 1) * 1000],
+                )
+                .unwrap();
+                let ss_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, completed_at)
+                     VALUES (?1, ?2, ?3, 'completed', '2026-01-01 00:00:00')",
+                    params![ss_id, snap_id, vol_id],
+                )
+                .unwrap();
+            }
+
+            let summary = volume_info(&conn, "L6-BIG", false).unwrap();
+            assert_eq!(summary.unit_count, 7);
+            assert_eq!(
+                summary.largest_units.len(),
+                VOLUME_INFO_SUMMARY_UNITS,
+                "summarised to the top few, not all 7"
+            );
+            assert!(summary.units.is_none());
+
+            let full = volume_info(&conn, "L6-BIG", true).unwrap();
+            assert_eq!(
+                full.units.as_ref().unwrap().len(),
+                7,
+                "--units lists every unit carried"
+            );
+        }
+
+        /// Acceptance: `volume info` on a nonexistent label errors by name.
+        #[test]
+        fn info_on_a_nonexistent_label_errors_by_name() {
+            let conn = crate::db::open_memory().unwrap();
+            let err = volume_info(&conn, "NOPE", false).unwrap_err();
+            assert!(err.to_string().contains("NOPE"), "{err}");
+        }
     }
 }
