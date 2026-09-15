@@ -53,7 +53,9 @@ CARGO_TARGET_DIR=/scratch/tapectl-target-<branch> \
 
 This VM has 9 GB of RAM and 16 cores, so the bottleneck is memory during
 linking, not CPU: two concurrent cargo builds OOM-kill each other and
-whatever else is running (2026-07-30, and again during the v2 regear). A
+whatever else is running (recorded undated in the project memory checkpoint,
+from the v2 regear; not to be confused with 2026-07-30, which was the
+/scratch disk-fill incident described above). A
 per-worker target dir alone does not prevent that — it makes it *more* likely,
 because nothing serializes the builds. A *shared* target dir would serialize
 them via cargo's own lock but forces a cold rebuild on every switch between

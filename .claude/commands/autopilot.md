@@ -44,7 +44,7 @@ the normative design set named in the Policy block below.
      queue** — whenever the CTO's week allows, not after the queue drains. It
      measures hardware facts (ENOSPC, the #182 MAM unit), which no queued defect
      can distort, and it is the only step that can invalidate an assumption
-     before 40 issues of work are built on it. The *final* pre-write rehearsal
+     before the whole queue of work is built on it. The *final* pre-write rehearsal
      still happens as ratified. Autopilot never starts a rehearsal itself: the
      drive is not on this VM.
   6. **Run the loop; accept the interruptions.** The account's session limit will
@@ -58,7 +58,9 @@ the normative design set named in the Policy block below.
   cargo builds OOM-kill each other. The rule is therefore **per-worker
   `CARGO_TARGET_DIR` plus a shared `flock /scratch/tapectl-build.lock` around
   every cargo invocation** (`worktree-agent.md`, Build lock). Reading, editing
-  and thinking run in parallel; only linking serializes. Choose concurrent items
+  and thinking run in parallel; only linking serializes. **The coordinator takes
+  the same lock**: your own gate and the mhvtl gate both build, and a bare one
+  beside a worker's link is the failure this prevents. Choose concurrent items
   so **no two touch the same file** — `src/volume/write.rs` is the hot one, named
   by #154, #160, #192, #193, #155 and #147, so at most one of those runs at a
   time. Pure-Markdown items (#180, #181) and pure-`scripts/` items (#156, #179)
@@ -90,8 +92,8 @@ the normative design set named in the Policy block below.
   #187) and restore items (#158, #165) both depend on the identity set, so they
   come after H4.
 
-- **THE PRE-PRODUCTION QUEUE 2026-09-14 — GitHub label `review-2026-09-13`, 40
-  issues. Nothing ships to a production tape until it is empty, documentation
+- **THE PRE-PRODUCTION QUEUE — GitHub label `review-2026-09-13`, 42 issues
+  (40 filed 2026-09-14; #160 split three ways on 2026-09-15). Nothing ships to a production tape until it is empty, documentation
   included.** The 2026-09-13 adversarial review
   (`docs/audits/2026-09-13-post-redesign-review.md`, 59 confirmed, ~44 distinct)
   was grilled question by question and **every ruling was ratified on
@@ -102,18 +104,17 @@ the normative design set named in the Policy block below.
   process rulings are in `docs/handoff.md` "Decisions already ratified". Every
   issue states its ruling as **the** fix.
   1. **Work the label in severity order**, and inside a severity in the
-     dependency order the issues state. The high tier, in order:
-     **#153** (copy count per Version — removes the over-count, the one that can
-     lose data) → **#159** (a Version is minted only when content changed, which
-     is what makes #153 exact) → **#154** (bind after the contact check; small
-     and independent) → **#160** (the cartridge identity model — defines what
-     #155, #161–#165, #179 and #180 depend on) → **#155** (the no-serial
-     displacement refusal, #160's step 4 seen from the other side) → **#147**
-     (the consent tiers, inverted in the shipped code; needs #153's per-version
-     count for "zero" to mean zero).
-     The `consent-path` label marks the ten issues that touch ADR-0008 tiers or
-     cartridge identity (#147, #154, #155, #158, #160, #161, #162, #163, #164,
-     #165): sequence those together and gate them together.
+     dependency order the issues state. **The high tier is now eight issues and
+     runs in waves — see the PARALLELISM entry above, which supersedes the
+     serial order this rule originally gave.** In short: #153 (copy count per
+     Version — the one that can lose data), #159 (a Version is minted only when
+     content changed) and #154 (bind after the contact check) run together;
+     then the identity set #160 → #192 → #155 → #193; then #147 (the inverted
+     consent tiers, which needs #153 merged for "zero" to mean zero per
+     version).
+     The `consent-path` label marks the twelve issues that touch ADR-0008 tiers
+     or cartridge identity (#147, #154, #155, #158, #160, #161, #162, #163,
+     #164, #165, #192, #193): sequence those together and gate them together.
   2. **Correct facts, never decisions.** A ratified ruling is not re-opened by
      autopilot, even where the audit's own "Fix:" bullet disagrees with it —
      several do, and the issues say so. If implementing exposes a genuine new
@@ -132,8 +133,12 @@ the normative design set named in the Policy block below.
   3. **Gate per item only for write-path and restore-path changes** (`src/volume`,
      `src/tape`, `src/store.rs`, RESTORE.sh — every issue's Acceptance section
      says which it is). For those, run
-     `TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`
-     after integrating that item. Everything else is gated in batches: the
+     `TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 flock /scratch/tapectl-build.lock bash scripts/mhvtl-verify-gate.sh`
+     after integrating that item. **That `flock` is not optional and it is yours
+     as much as the workers'** — the gate script builds and links, so running it
+     bare while a worker holds the lock mid-link is exactly the double build the
+     lock exists to prevent. Wrap your own fmt/clippy/test gate the same way
+     whenever any worker is live. Everything else is gated in batches: the
      fmt/clippy/test gate after **every** integration as always, the mhvtl gate
      after each batch of non-tape items lands and before push. The lifecycle
      suite (`scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
