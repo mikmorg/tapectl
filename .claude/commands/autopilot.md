@@ -1,7 +1,10 @@
 # Autopilot — drive the tapectl build queue, escalating only real decisions
 
 You are running tapectl's build queue on autopilot: land ONE task end-to-end
-per iteration, or escalate it, then continue. Invoked as `/loop /autopilot`
+per iteration, or escalate it, then continue. **Since 2026-09-15 a "task" may
+be a WAVE of up to three file-disjoint items run concurrently** — see the
+PARALLELISM entry, which governs; the unit of completion is the wave, run to
+landed-or-escalated, never left half-integrated. Invoked as `/loop /autopilot`
 (self-paced) or `/loop <interval> /autopilot`. The loop — not this iteration —
 decides when work stops; your job each firing is one task, run to *landed* or
 *escalated*, never to half-done.
@@ -66,13 +69,37 @@ the normative design set named in the Policy block below.
   time. Pure-Markdown items (#180, #181) and pure-`scripts/` items (#156, #179)
   need no build at all and can always ride alongside.
 
+  **Choosing concurrent items: grep the call sites, don't trust the module.**
+  A wave is disjoint only if no two items touch the same FILE. H1 was planned
+  as disjoint and was not: #159's ruling reached `quick_archive`, which lives
+  in `src/cli/operations.rs` beside #153's `mark-tape-only`. Before
+  dispatching, grep each symbol an item must change (`grep -rn "<symbol>("
+  src/`) and fence on the answer. Where an overlap is real, give the file to
+  one worker and have the other REPORT the edit for the coordinator to apply
+  at integration — that is what kept H1 running three-wide.
+
   **The high tier, in waves** (→ means the next wave waits):
-  - **H1: #153 ∥ #159 ∥ #154.** File-disjoint — `policy/coverage.rs` +
+  - ~~**H1: #153 ∥ #159 ∥ #154**~~ — **LANDED 2026-09-15, all three closed.**
+    Master `e346a5d`, 1107 tests, mhvtl gate 26/26 GREEN. #153 went to the
+    CTO review gate and was merged on their word after a display fix. Three
+    corrections worth carrying: #153's stated fix was unimplementable (the
+    count expressions return SQL strings, not values); a second untested
+    multi-`'current'` fixture lurked in `audit.rs` pinning the bug as
+    expected behaviour; and #154 had a FIFTH refusal it did not name —
+    `into_validated` re-checks capacity against the open drive, so
+    `bind_late` now sits immediately before `plan()`. **#154's line numbers
+    moved:** `bind_late` is at ~883, not ~748. Any issue body citing the old
+    position is stale, not wrong — tell the worker so it does not stop on
+    `DEFECT NOT PRESENT` over a line number.
+  - *(original H1 plan, for reference)* **#153 ∥ #159 ∥ #154.** File-disjoint — `policy/coverage.rs` +
     `operations.rs`; `staging/` + `unit/` + `collection/`; `volume/write.rs`
     ordering. #153 goes to the CTO review queue when done and **must not block
     the wave** — that is the main reason to run three here.
   - → **H2: #160** alone (`binding.rs`, `cartridge.rs`, and `write.rs`'s serial
-    guard, which needs #154 merged first). Ride #180 and #181 alongside.
+    guard). **#154 is merged, so this is unblocked.** Ride #180 alongside —
+    but #180 names `cartridge relabel`, so it can only be written once #160
+    creates that command. (#181 is already landed and closed, as are #189 and
+    #191, which rode H1.)
   - → **H3: #192** alone (on-tape bytes; `layout.rs`, `format.rs`,
     `tests/format_v2.rs`, `docs/design/volume-format-v2.md`). Ride #156/#179
     alongside. Stop and report if `tests/on_tape_golden.rs` turns out to pin
