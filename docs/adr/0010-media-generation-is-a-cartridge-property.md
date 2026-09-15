@@ -62,6 +62,18 @@ second override for the same act is the ceremony ADR-0008 warns about, and it wo
 made a physical `mt erase` followed by `volume init` — the most ordinary reuse there is —
 into a two-command catalog dance that teaches operators to reach for `--force` by reflex.
 
+*Correction 2026-09-14 (ADR-0012, issue #155): this rule holds only when the cartridge was
+matched by MAM serial.* The reasoning above rests on two facts, not one — File 0 has already
+decided consent, **and** the serial proves the blank tape in the drive is the same cartridge
+whose volume is being displaced. When no serial is readable and the operator names the row by
+typed barcode, the second fact is missing: the medium that consented via File 0 is a
+different physical object from the row being erased, and a blank tape plus `--cartridge B`,
+where B is bound to a live volume, is either B erased or a different tape wearing B's
+sticker. tapectl cannot tell which. **That case is refused** — not gated, not `--force`-able,
+because it is incoherence rather than risk. The way past is `volume retire` or
+`cartridge mark-erased` first: the operator saying the bytes are gone. Where the serial does
+match, the displacement is recorded exactly as this paragraph says.
+
 So init *records* the displacement instead of relitigating it: the open
 `cartridge_volumes` mount is closed, the displaced volume moves to `erased`, an events row
 says why, and a warning names it together with any unit that just lost its last copy
