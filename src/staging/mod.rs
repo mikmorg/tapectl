@@ -16,7 +16,39 @@ use crate::db::{events, models, queries};
 use crate::error::{Result, TapectlError};
 use crate::util::{HashingReader, HashingWriter};
 
-/// Create a snapshot: fast directory walk, manifest, files table.
+/// Outcome of `snapshot_create_detailed` (issue #159 / ADR-0012): whether a
+/// new version was actually minted, and which row — new or reused — the
+/// caller should report or act on.
+#[derive(Debug, Clone)]
+pub struct SnapshotOutcome {
+    pub snapshot_id: i64,
+    pub version: i64,
+    /// `false` when the walk matched an existing snapshot's recorded
+    /// content and nothing new was created — `snapshot_id`/`version`/
+    /// `status` then describe that existing row, not a fresh one.
+    pub minted: bool,
+    /// The snapshot row's status (`created`, `staged`, or `current`) —
+    /// lets a caller like `collection::batch::execute_batch` tell "exists
+    /// but never staged" from "already staged" from "already on tape"
+    /// apart on the `minted: false` path, where none of that is obvious
+    /// from `snapshot_id`/`version` alone.
+    pub status: String,
+}
+
+/// Create a snapshot: fast directory walk, manifest, files table — unless
+/// the walk already matches the unit's most recent snapshot (ADR-0012,
+/// issue #159): "a version is minted only when content changed." A version
+/// number names content, so two versions of a unit never hold identical
+/// content; on a match this reports the existing version and creates
+/// nothing (`minted: false`) rather than mint a byte-identical sibling.
+///
+/// The comparison reuses `unit::content_match::matches_snapshot` — the
+/// exact predicate `unit status --dirty`/`report dirty`/`audit` already use
+/// to decide *Dirty* (`collection::fingerprint::classify`) — against the
+/// walk this function has *already* performed (`manifest_entries`, below).
+/// It is never re-walked: a second `walk_directory`/`WalkDir` pass here
+/// would silently double every snapshot's wall-clock time, which is the
+/// exact regression issue #159 warns against.
 ///
 /// `config.defaults.global_excludes` (issue #49 item 5) is passed through
 /// to `walk_directory` so the recorded `files`/manifest rows never include
@@ -24,7 +56,11 @@ use crate::util::{HashingReader, HashingWriter};
 /// excludes are read internally by `walk_directory`, keyed off
 /// `source_path`). `config` also supplies `defaults.large_file_warn_threshold`
 /// for the large-file warning (issue #52, design line 203).
-pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> Result<i64> {
+pub fn snapshot_create_detailed(
+    conn: &Connection,
+    unit_name: &str,
+    config: &Config,
+) -> Result<SnapshotOutcome> {
     let global_excludes = &config.defaults.global_excludes;
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
@@ -45,15 +81,71 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> R
     // fast, before doing expensive work.
     crate::unit::nesting::check_nesting_excluding(conn, source_path, Some(unit.id))?;
 
+    // Walk directory and build manifest — the ONLY walk this function
+    // performs. Both the content-match short-circuit immediately below and
+    // the mint path that follows it reuse `manifest_entries` (issue #159).
+    let (total_size, file_count, manifest_entries) = walk_directory(source_path, global_excludes)?;
+
+    // ADR-0012 / issue #159: does this walk already match the unit's most
+    // recent snapshot? `content_match::latest_snapshot` is the exact same
+    // "latest" lookup `collection::fingerprint::classify` uses, so the two
+    // can never pick different rows and disagree about what "latest" means
+    // (the drift this predicate exists to prevent).
+    if let Some((latest_id, latest_version, latest_status)) =
+        crate::unit::content_match::latest_snapshot(conn, unit.id)?
+    {
+        let mut fresh_stamps: Vec<crate::unit::content_match::FileStamp> = manifest_entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| crate::unit::content_match::FileStamp {
+                path: e.path.clone(),
+                size_bytes: e.size,
+                modified_at: e.mtime.clone(),
+            })
+            .collect();
+        fresh_stamps.sort();
+
+        let diff = crate::unit::content_match::matches_snapshot(
+            conn,
+            latest_id,
+            &unit.checksum_mode,
+            Path::new(source_path),
+            &fresh_stamps,
+            crate::staging::validate::hash_source_file,
+        )?;
+
+        if diff.is_empty() {
+            match latest_status.as_str() {
+                // Change 2: the live, on-tape version already IS this
+                // content — report it, mint nothing.
+                //
+                // Change 3: an unwritten snapshot (never staged, or staged
+                // but never written) already holds this exact content —
+                // reuse that row rather than mint a byte-identical sibling
+                // beside it. Either way the caller gets `minted: false`
+                // and reads `status` to tell which case it was.
+                "current" | "created" | "staged" => {
+                    return Ok(SnapshotOutcome {
+                        snapshot_id: latest_id,
+                        version: latest_version,
+                        minted: false,
+                        status: latest_status,
+                    });
+                }
+                // superseded/reclaimable/purged/failed: a dead row. Content
+                // happening to match it is coincidence, not identity —
+                // mint fresh rather than resurrect it.
+                _ => {}
+            }
+        }
+    }
+
     // Determine next version number
     let next_version: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM snapshots WHERE unit_id = ?1",
         params![unit.id],
         |row| row.get(0),
     )?;
-
-    // Walk directory and build manifest
-    let (total_size, file_count, manifest_entries) = walk_directory(source_path, global_excludes)?;
 
     // Empty units: warn but allow (design line 185). Gated on `file_count`,
     // not `total_size` — a unit full of zero-byte files is not empty.
@@ -146,7 +238,23 @@ pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> R
         Some(unit.tenant_id),
     )?;
 
-    Ok(snapshot_id)
+    Ok(SnapshotOutcome {
+        snapshot_id,
+        version: next_version,
+        minted: true,
+        status: "created".to_string(),
+    })
+}
+
+/// Thin wrapper over `snapshot_create_detailed`, kept at its original
+/// signature and return type for the ~40 existing call sites across the
+/// tree (issue #159) that only ever wanted the new snapshot's id and must
+/// keep compiling untouched. A caller that needs to tell "created" from
+/// "unchanged, nothing minted" apart — the `snapshot` CLI command,
+/// `collection::batch::execute_batch` — calls `snapshot_create_detailed`
+/// directly instead.
+pub fn snapshot_create(conn: &Connection, unit_name: &str, config: &Config) -> Result<i64> {
+    Ok(snapshot_create_detailed(conn, unit_name, config)?.snapshot_id)
 }
 
 /// Stage set statuses that mean "live slices already exist for this
@@ -2957,6 +3065,221 @@ mod tests {
         assert!(
             kept_sha.is_some(),
             "the non-excluded file must still get its baseline established"
+        );
+    }
+
+    // ── issue #159 / ADR-0012: a version is minted only when content changed ──
+
+    /// Bare-bones tenant + active unit for the acceptance tests below — no
+    /// escrow key, no staging directory, no dotfile: only `snapshot_create`/
+    /// `snapshot_create_detailed` is under test here, and neither needs any
+    /// of that (only `stage_create` requires a registered escrow
+    /// recipient). Each call gets its own unique unit name so a test that
+    /// seeds two units in one `conn` never collides.
+    fn seed_snapshot_test_unit(conn: &Connection, path: &Path, checksum_mode: &str) -> String {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t159', 0, 'active')",
+            [],
+        )
+        .ok(); // may already exist across two seeds in one test; ignore
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 't159'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let name = format!("unit-{}", uuid::Uuid::new_v4());
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                name,
+                tenant_id,
+                path.to_string_lossy().to_string(),
+                checksum_mode,
+            ],
+        )
+        .unwrap();
+        name
+    }
+
+    /// Sets a file's mtime back to `mtime` after its content has already
+    /// been rewritten — constructs the one case `mtime_size` cannot see:
+    /// identical size, identical mtime, different bytes. Mirrors
+    /// `collection::fingerprint`'s test helper of the same shape.
+    fn restore_mtime_for_snapshot_test(path: &Path, mtime: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_create_detailed_reports_the_existing_version_when_content_is_unchanged() {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let unit_name = seed_snapshot_test_unit(&conn, tmp.path(), "mtime_size");
+
+        let first = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(first.minted);
+        assert_eq!(first.version, 1);
+
+        let second = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(
+            !second.minted,
+            "unchanged content must not mint a new version"
+        );
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+        assert_eq!(second.version, 1);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE unit_id = \
+                 (SELECT id FROM units WHERE name = ?1)",
+                params![unit_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "no second snapshot row must be created");
+    }
+
+    #[test]
+    fn snapshot_create_detailed_mints_a_new_version_when_a_file_changes() {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let unit_name = seed_snapshot_test_unit(&conn, tmp.path(), "mtime_size");
+
+        let first = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(first.minted);
+
+        std::fs::write(&file, b"hello, world! now a different size").unwrap();
+        let second = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(second.minted, "changed content must mint a new version");
+        assert_eq!(second.version, 2);
+        assert_ne!(second.snapshot_id, first.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_create_detailed_mints_a_new_version_when_a_file_is_removed() {
+        // ADR-0012: removal counts as change, not just add/modify.
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), b"keep").unwrap();
+        let unit_name = seed_snapshot_test_unit(&conn, tmp.path(), "mtime_size");
+
+        let first = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(first.minted);
+
+        std::fs::remove_file(&file).unwrap();
+        let second = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(
+            second.minted,
+            "a removed file is a content change and must mint a new version"
+        );
+        assert_eq!(second.version, 2);
+    }
+
+    #[test]
+    fn snapshot_create_detailed_reuses_an_unwritten_matching_snapshot_instead_of_minting_beside_it()
+    {
+        // Change 3: the latest snapshot is 'created' (never staged), not
+        // 'current' — a match must reuse that row, not mint a
+        // byte-identical sibling beside it.
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let unit_name = seed_snapshot_test_unit(&conn, tmp.path(), "mtime_size");
+
+        let first = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(first.minted);
+        assert_eq!(first.status, "created");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM snapshots WHERE id = ?1",
+                params![first.snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "created", "never staged — status stays 'created'");
+
+        let second = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(!second.minted);
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+        assert_eq!(second.status, "created");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE unit_id = \
+                 (SELECT id FROM units WHERE name = ?1)",
+                params![unit_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "reuse must not leave a second row beside the unwritten one"
+        );
+    }
+
+    #[test]
+    fn snapshot_create_detailed_honors_checksum_mode_on_a_same_size_same_mtime_content_change() {
+        // The one edit `mtime_size` cannot catch (issue #36, reused here
+        // for #159): same path, same size, same mtime, different bytes.
+        // `mtime_size` and `sha256` must disagree about it — each unit
+        // follows its own `checksum_mode`, not a global rule.
+        let conn = crate::db::open_memory().unwrap();
+
+        let mtime_tmp = TempDir::new().unwrap();
+        let mtime_file = mtime_tmp.path().join("f.txt");
+        std::fs::write(&mtime_file, b"original content!").unwrap();
+        let mtime_unit = seed_snapshot_test_unit(&conn, mtime_tmp.path(), "mtime_size");
+
+        let sha_tmp = TempDir::new().unwrap();
+        let sha_file = sha_tmp.path().join("f.txt");
+        std::fs::write(&sha_file, b"original content!").unwrap();
+        let sha_unit = seed_snapshot_test_unit(&conn, sha_tmp.path(), "sha256");
+
+        let m1 = snapshot_create_detailed(&conn, &mtime_unit, &Config::default()).unwrap();
+        let s1 = snapshot_create_detailed(&conn, &sha_unit, &Config::default()).unwrap();
+        assert!(m1.minted && s1.minted);
+
+        // Establish the sha256 baseline for the sha-mode unit — what a
+        // real `stage_create` would have backfilled via the same
+        // `hash_source_file` this scan reuses.
+        let (hash, _) = crate::staging::validate::hash_source_file(&sha_file, "f.txt").unwrap();
+        conn.execute(
+            "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = 'f.txt'",
+            params![hash, s1.snapshot_id],
+        )
+        .unwrap();
+
+        // Same-size, same-mtime content swap on both units.
+        let mtime_before = std::fs::metadata(&mtime_file).unwrap().modified().unwrap();
+        std::fs::write(&mtime_file, b"REPLACED content!").unwrap();
+        restore_mtime_for_snapshot_test(&mtime_file, mtime_before);
+
+        let sha_before = std::fs::metadata(&sha_file).unwrap().modified().unwrap();
+        std::fs::write(&sha_file, b"REPLACED content!").unwrap();
+        restore_mtime_for_snapshot_test(&sha_file, sha_before);
+
+        let m2 = snapshot_create_detailed(&conn, &mtime_unit, &Config::default()).unwrap();
+        let s2 = snapshot_create_detailed(&conn, &sha_unit, &Config::default()).unwrap();
+
+        assert!(
+            !m2.minted,
+            "mtime_size mode must stay blind to a same-size-same-mtime content \
+             change — that tradeoff is documented, not a bug"
+        );
+        assert!(
+            s2.minted,
+            "sha256 mode must catch a content change mtime_size cannot see"
         );
     }
 
