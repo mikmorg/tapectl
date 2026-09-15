@@ -507,4 +507,290 @@ pub(crate) mod tests {
         assert_ne!(eligible("v"), in_service("v"));
         assert!(!in_service("v").contains("= 'sealed'"));
     }
+
+    // ── Issue #153: a unit's coverage is its LEAST-covered current
+    // version, not the union of volumes across versions ──
+    //
+    // `session.rs` promotes each sealed snapshot to `'current'` and never
+    // demotes its predecessor (`'superseded'` has zero production
+    // writers — CONTEXT.md:106 calls it vestigial), so a unit can have
+    // MULTIPLE `'current'` snapshots at once. The pre-fix expressions
+    // UNIONed eligible volumes across every current snapshot, which
+    // counts "how many volumes hold ANY version of this unit" rather
+    // than "how many copies does the unit's thinnest version have."
+    // ADR-0012: "a unit is as covered as its least-covered live version."
+
+    /// Regression fixture: TWO `'current'` snapshots of one unit, each
+    /// with its own completed write to its own SEALED volume — the shape
+    /// the write path actually produces. `vol_a_location`/`vol_b_location`
+    /// optionally shelve each volume at a named location, for the
+    /// location-count variant of the same regression. Returns
+    /// `(conn, unit_id)`.
+    fn setup_unit_with_two_current_snapshots(
+        unit_name: &str,
+        vol_a_location: Option<&str>,
+        vol_b_location: Option<&str>,
+    ) -> (Connection, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+            params![format!("uuid-{unit_name}"), unit_name, tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+
+        fn insert_location(conn: &Connection, name: Option<&str>) -> Option<i64> {
+            name.map(|n| {
+                conn.execute(
+                    "INSERT INTO locations (name, kind) VALUES (?1, 'shelf')",
+                    params![n],
+                )
+                .unwrap();
+                conn.last_insert_rowid()
+            })
+        }
+        let a_loc = insert_location(&conn, vol_a_location);
+        let b_loc = insert_location(&conn, vol_b_location);
+
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap1_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap1_id],
+        )
+        .unwrap();
+        let ss1_id = conn.last_insert_rowid();
+        conn.execute(
+            &format!(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                 VALUES ('{unit_name}-A', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', ?1)"
+            ),
+            params![a_loc],
+        )
+        .unwrap();
+        let vol_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss1_id, snap1_id, vol_a],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 2, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap2_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap2_id],
+        )
+        .unwrap();
+        let ss2_id = conn.last_insert_rowid();
+        conn.execute(
+            &format!(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                 VALUES ('{unit_name}-B', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', ?1)"
+            ),
+            params![b_loc],
+        )
+        .unwrap();
+        let vol_b = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss2_id, snap2_id, vol_b],
+        )
+        .unwrap();
+
+        (conn, unit_id)
+    }
+
+    /// Regression fixture: ONE `'current'` snapshot written to TWO
+    /// distinct sealed volumes — the common case the per-version MIN fix
+    /// must NOT change (no deposit, no second version). Returns
+    /// `(conn, unit_id)`.
+    fn setup_unit_with_one_snapshot_two_volumes(unit_name: &str) -> (Connection, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+            params![format!("uuid-{unit_name}"), unit_name, tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+
+        for label in [format!("{unit_name}-A"), format!("{unit_name}-B")] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES ('{label}', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                ),
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss_id, snap_id, vol_id],
+            )
+            .unwrap();
+        }
+
+        (conn, unit_id)
+    }
+
+    #[test]
+    fn current_unit_copy_count_is_min_across_current_snapshots_not_union() {
+        let (conn, unit_id) = setup_unit_with_two_current_snapshots("mv-photos", None, None);
+        let q = CoverageQuery::current_unit("?1");
+        let sql = copy_count_expr(&q);
+        eprintln!("copy_count_expr(current_unit) SQL:\n{sql}");
+        assert_eq!(
+            scalar(&conn, &sql, unit_id),
+            1,
+            "each version has exactly 1 copy on its own volume; the unit's \
+             coverage is its least-covered version (ADR-0012), not the \
+             union of volumes across versions"
+        );
+    }
+
+    #[test]
+    fn current_unit_location_count_is_min_across_current_snapshots_not_union() {
+        let (conn, unit_id) =
+            setup_unit_with_two_current_snapshots("mv-photos-loc", Some("home"), Some("bank"));
+        let q = CoverageQuery::current_unit("?1");
+        assert_eq!(
+            scalar(&conn, &location_count_expr(&q), unit_id),
+            1,
+            "each version is at exactly 1 location (v1 at home, v2 at \
+             bank); the unit's location coverage is its least-covered \
+             version, not the union across versions"
+        );
+    }
+
+    /// Regression pin: a unit with ONE current snapshot on two volumes
+    /// must still read 2 copies -- the per-version MIN fix must not
+    /// change the common, non-multi-version case.
+    #[test]
+    fn one_current_snapshot_on_two_volumes_still_counts_two_copies() {
+        let (conn, unit_id) = setup_unit_with_one_snapshot_two_volumes("mv-single-version");
+        let q = CoverageQuery::current_unit("?1");
+        assert_eq!(scalar(&conn, &copy_count_expr(&q), unit_id), 2);
+    }
+
+    /// Regression pin: a unit with ZERO current snapshots must still
+    /// read 0, not NULL -- `MIN` over an empty set of per-version counts
+    /// is NULL, so `COALESCE(..., 0)` is load-bearing here.
+    #[test]
+    fn zero_current_snapshots_counts_zero_not_null() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('uuid-mv-none', 'mv-none', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        let q = CoverageQuery::current_unit("?1");
+        assert_eq!(scalar(&conn, &copy_count_expr(&q), unit_id), 0);
+        assert_eq!(scalar(&conn, &location_count_expr(&q), unit_id), 0);
+    }
+
+    /// Regression pin: `CoverageScope::Snapshot` names one exact snapshot
+    /// already, so it must not be touched by the per-version MIN fix,
+    /// which is scoped to `CoverageScope::Unit { current_only: true }`
+    /// only.
+    #[test]
+    fn snapshot_scope_is_unaffected_by_the_per_version_min_fix() {
+        let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
+        let snap_id: i64 = conn
+            .query_row("SELECT id FROM snapshots LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let q = CoverageQuery {
+            scope: CoverageScope::Snapshot { id_expr: "?1" },
+            exclude_volume: None,
+        };
+        let sql = copy_count_expr(&q);
+        assert!(
+            !sql.contains("MIN("),
+            "Snapshot scope must not gain the per-version MIN wrapper: {sql}"
+        );
+        assert_eq!(
+            scalar(&conn, &sql, snap_id),
+            2,
+            "unchanged: one sealed tape plus its warehouse deposit"
+        );
+    }
+
+    /// Regression pin: `CoverageScope::Unit { current_only: false }` is
+    /// `volume retire`'s impact analysis, which deliberately asks about
+    /// ANY snapshot -- it must keep counting the union across every
+    /// snapshot, current or not, unaffected by the per-version MIN fix.
+    #[test]
+    fn unit_scope_with_current_only_false_is_unaffected_by_the_per_version_min_fix() {
+        let (conn, unit_id) = setup_unit_with_two_current_snapshots("mv-any-snapshot", None, None);
+        let q = CoverageQuery {
+            scope: CoverageScope::Unit {
+                id_expr: "?1",
+                current_only: false,
+            },
+            exclude_volume: None,
+        };
+        let sql = copy_count_expr(&q);
+        assert!(
+            !sql.contains("MIN("),
+            "current_only: false must not gain the per-version MIN wrapper: {sql}"
+        );
+        assert_eq!(
+            scalar(&conn, &sql, unit_id),
+            2,
+            "volume retire deliberately asks about ANY snapshot, not just \
+             the unit's least-covered current one"
+        );
+    }
 }
