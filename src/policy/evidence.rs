@@ -6,9 +6,9 @@
 //! (`cli::consent::confirm`), Tier 1 facts never reach a consent gate at
 //! all, they are printed unconditionally alongside the impact analysis.
 //!
-//! This module is split into a query half ([`remaining_coverage_evidence`])
-//! and a pure formatter half ([`describe`]) so the wording can be unit
-//! tested without a database.
+//! This module is split into a query half ([`remaining_coverage_evidence`],
+//! [`per_volume_verification`]) and a pure formatter half ([`describe`],
+//! [`compact_age`]) so the wording can be unit tested without a database.
 
 use rusqlite::{params, Connection};
 
@@ -53,6 +53,107 @@ pub struct CoverageEvidence {
     pub location: Option<String>,
 }
 
+/// The shared query behind [`remaining_coverage_evidence`] and
+/// [`per_volume_verification`]: one row per volume holding a completed
+/// write for `unit_id`, with that volume's most recent PASSED verification
+/// timestamp (`None` = never verified).
+///
+/// `only_eligible` selects which of the two callers' questions this
+/// answers:
+/// - `true` — "what coverage still counts toward ADR-0004?"
+///   ([`remaining_coverage_evidence`]) — gated through
+///   [`crate::policy::coverage::eligible`], per that module's doc for
+///   plain inner joins with no `GROUP BY`.
+/// - `false` — "when was every volume holding a copy last checked,
+///   regardless of whether it still counts?" ([`per_volume_verification`])
+///   — no eligibility gate, so a retired/quarantined/erased volume still
+///   gets a row instead of silently losing its evidence.
+///
+/// `exclude_volume_id` matches [`remaining_coverage_evidence`]'s own
+/// parameter (`Some` excludes the volume being retired/consumed by
+/// identity; `None` excludes nothing).
+///
+/// `outcome = 'passed'` lives in the `LEFT JOIN`'s `ON` clause, not a
+/// `WHERE` — a `WHERE` filter on a LEFT-JOINed column would silently turn
+/// this back into an inner join and a volume with zero passed sessions
+/// would vanish instead of rendering as "never verified". This is the
+/// exact trap `cli::audit`'s `verify_age` query falls into (issue #91).
+fn tape_rows(
+    conn: &Connection,
+    unit_id: i64,
+    only_eligible: bool,
+    exclude_volume_id: Option<i64>,
+) -> Result<Vec<CoverageEvidence>> {
+    let exclude_clause = match exclude_volume_id {
+        Some(_) => "AND w.volume_id != ?2",
+        None => "",
+    };
+    let eligible_clause = if only_eligible {
+        format!("AND {}", crate::policy::coverage::eligible("v"))
+    } else {
+        String::new()
+    };
+    let sql = format!(
+        "SELECT v.label, MAX(vs.completed_at) as last_verified
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN volumes v ON v.id = w.volume_id
+         LEFT JOIN verification_sessions vs
+                ON vs.volume_id = v.id AND vs.outcome = 'passed'
+         WHERE s.unit_id = ?1 AND w.status = 'completed'
+           {exclude_clause}
+           {eligible_clause}
+         GROUP BY v.id, v.label
+         ORDER BY v.label"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let tape_row = |row: &rusqlite::Row| -> rusqlite::Result<CoverageEvidence> {
+        Ok(CoverageEvidence {
+            kind: EvidenceKind::Tape,
+            volume_label: row.get(0)?,
+            last_verified: row.get(1)?,
+            deposited_at: None,
+            location: None,
+        })
+    };
+    match exclude_volume_id {
+        Some(exclude_id) => Ok(stmt
+            .query_map(params![unit_id, exclude_id], tape_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?),
+        None => Ok(stmt
+            .query_map(params![unit_id], tape_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?),
+    }
+}
+
+/// Per-volume verification evidence for EVERY volume holding a completed
+/// write for `unit_id`, regardless of the volume's CURRENT lifecycle
+/// status — `catalog locate`'s source (issue #196).
+///
+/// Deliberately NOT [`remaining_coverage_evidence`]: that function answers
+/// "what coverage still counts toward ADR-0004 right now", and gates every
+/// row through [`crate::policy::coverage::eligible`] (`status = 'sealed'`)
+/// accordingly. `catalog locate` shows every volume that physically holds
+/// a copy on purpose — retired/quarantined/erased included (issue #57,
+/// `cli::catalog::LocationRow`) — and evidence age is a historical fact
+/// about the MEDIUM ("when was this tape last checked"), not a claim about
+/// whether it still counts as a copy today; `locate`'s own Status and
+/// Serviceable columns already say that. Applying `coverage::eligible`
+/// here would make exactly the volumes `locate` most needs to explain — a
+/// quarantined tape an operator might still be about to walk to the shelf
+/// for — silently lose their evidence instead of showing it.
+///
+/// Only tape rows: every row `locate` shows comes from a completed
+/// `writes` row, so it is always `EvidenceKind::Tape`. A volume's
+/// warehouse deposits (ADR-0006) are a different evidence class with their
+/// own column in `locate` already — see that module's doc — and must
+/// never be folded into a verification age here, so this function does not
+/// query them.
+pub fn per_volume_verification(conn: &Connection, unit_id: i64) -> Result<Vec<CoverageEvidence>> {
+    tape_rows(conn, unit_id, false, None)
+}
+
 /// Per-volume remaining-coverage evidence for `unit_id`, optionally
 /// excluding `exclude_volume_id` (the volume being retired/consumed) by
 /// identity.
@@ -81,48 +182,18 @@ pub struct CoverageEvidence {
 ///   inner joins with no `GROUP BY`;
 /// - the volume being excluded, when present, is excluded by identity
 ///   (`w.volume_id != ?`), matching `retire_impacts`.
+///
+/// The eligibility gate and the query shape itself now live in the shared
+/// [`tape_rows`] helper (issue #196 added a second caller,
+/// [`per_volume_verification`], that needs the same LEFT JOIN shape
+/// without the eligibility gate) — this function is a thin wrapper that
+/// keeps its exact prior behavior: `only_eligible: true`.
 pub fn remaining_coverage_evidence(
     conn: &Connection,
     unit_id: i64,
     exclude_volume_id: Option<i64>,
 ) -> Result<Vec<CoverageEvidence>> {
-    let exclude_clause = match exclude_volume_id {
-        Some(_) => "AND w.volume_id != ?2",
-        None => "",
-    };
-    let sql = format!(
-        "SELECT v.label, MAX(vs.completed_at) as last_verified
-         FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         JOIN volumes v ON v.id = w.volume_id
-         LEFT JOIN verification_sessions vs
-                ON vs.volume_id = v.id AND vs.outcome = 'passed'
-         WHERE s.unit_id = ?1 AND w.status = 'completed'
-           {exclude_clause}
-           AND {}
-         GROUP BY v.id, v.label
-         ORDER BY v.label",
-        crate::policy::coverage::eligible("v")
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let tape_row = |row: &rusqlite::Row| -> rusqlite::Result<CoverageEvidence> {
-        Ok(CoverageEvidence {
-            kind: EvidenceKind::Tape,
-            volume_label: row.get(0)?,
-            last_verified: row.get(1)?,
-            deposited_at: None,
-            location: None,
-        })
-    };
-    let mut rows: Vec<CoverageEvidence> = match exclude_volume_id {
-        Some(exclude_id) => stmt
-            .query_map(params![unit_id, exclude_id], tape_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-        None => stmt
-            .query_map(params![unit_id], tape_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-    };
+    let mut rows: Vec<CoverageEvidence> = tape_rows(conn, unit_id, true, exclude_volume_id)?;
 
     // ADR-0006 warehouse deposits (issue #73). A separate query rather than
     // a UNION with the query above: the two halves select different
@@ -185,14 +256,25 @@ enum Weakness {
     Age(i64),
 }
 
-fn weakness(evidence: &CoverageEvidence, now: chrono::NaiveDateTime) -> Weakness {
-    match &evidence.last_verified {
+/// The age computation itself, shared by [`weakness`] (which reads it off a
+/// [`CoverageEvidence`]) and [`compact_age`] (which takes the raw stamp
+/// directly, for a per-copy display column that has no `CoverageEvidence`
+/// to hand). One parser, one place: a second copy of the
+/// `%Y-%m-%d %H:%M:%S` format string is exactly how a display surface and
+/// the weakest-evidence selection could someday disagree about what "old"
+/// means.
+fn weakness_of(last_verified: Option<&str>, now: chrono::NaiveDateTime) -> Weakness {
+    match last_verified {
         None => Weakness::Never,
         Some(raw) => match chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
             Ok(dt) => Weakness::Age((now - dt).num_days()),
             Err(_) => Weakness::Unparseable,
         },
     }
+}
+
+fn weakness(evidence: &CoverageEvidence, now: chrono::NaiveDateTime) -> Weakness {
+    weakness_of(evidence.last_verified.as_deref(), now)
 }
 
 fn weakness_rank(w: &Weakness) -> i64 {
@@ -337,6 +419,26 @@ fn tape_detail(e: &CoverageEvidence, now: chrono::NaiveDateTime) -> String {
             "last verified at {} (unparseable timestamp)",
             e.last_verified.as_deref().unwrap_or("?")
         ),
+    }
+}
+
+/// A per-copy evidence-age string short enough for a table column
+/// (`catalog locate`, issue #196) — `tape_detail`'s sentence-level wording
+/// ("last verified 92 days ago") is right for a standalone line but too
+/// wide to repeat once per row. Built from the exact same [`weakness_of`]
+/// computation `tape_detail`/[`describe`] use, so the column can never
+/// disagree with the sentence forms about what counts as "old" or "never".
+///
+/// Never-verified and long-ago-verified are made to LOOK different, not
+/// just differ under the hood: `"never"` has no digits or unit at all,
+/// where every real age reads `"<n>d ago"` — the whole point of the
+/// LEFT JOIN in [`per_volume_verification`] is that a never-verified
+/// volume still gets a row here instead of silently having none.
+pub fn compact_age(last_verified: Option<&str>, now: chrono::NaiveDateTime) -> String {
+    match weakness_of(last_verified, now) {
+        Weakness::Never => "never".to_string(),
+        Weakness::Age(days) => format!("{days}d ago"),
+        Weakness::Unparseable => "unparseable".to_string(),
     }
 }
 
@@ -580,6 +682,90 @@ mod tests {
             vec!["V1", "V2"],
             "None must exclude nothing: {labels:?}"
         );
+    }
+
+    // --- issue #196: `per_volume_verification` (catalog locate's source) ---
+
+    /// The property `remaining_coverage_evidence` and `per_volume_verification`
+    /// MUST disagree on: once a volume is quarantined (no longer
+    /// `coverage::eligible`), `remaining_coverage_evidence` correctly drops
+    /// it -- it no longer counts as coverage -- but `catalog locate` still
+    /// lists that volume (issue #57) and must not lose its verification
+    /// evidence just because the tape stopped counting as a copy.
+    #[test]
+    fn per_volume_verification_keeps_an_ineligible_volume_that_remaining_coverage_drops() {
+        let (conn, unit_id, v1_id, _v2_id) = setup_two_volume_unit();
+        conn.execute(
+            "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+            params![v1_id],
+        )
+        .unwrap();
+
+        let remaining = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        let mut remaining_labels: Vec<&str> =
+            remaining.iter().map(|e| e.volume_label.as_str()).collect();
+        remaining_labels.sort();
+        assert_eq!(
+            remaining_labels,
+            vec!["V2"],
+            "a quarantined volume must not count toward remaining coverage: {remaining_labels:?}"
+        );
+
+        let all = per_volume_verification(&conn, unit_id).unwrap();
+        let mut all_labels: Vec<&str> = all.iter().map(|e| e.volume_label.as_str()).collect();
+        all_labels.sort();
+        assert_eq!(
+            all_labels,
+            vec!["V1", "V2"],
+            "locate's source must keep the quarantined volume's evidence, not drop it: {all_labels:?}"
+        );
+
+        let v1_row = all.iter().find(|e| e.volume_label == "V1").unwrap();
+        assert_eq!(
+            v1_row.last_verified, None,
+            "V1 has zero passed verification sessions -- it must render as never-verified, not vanish"
+        );
+        assert_eq!(v1_row.kind, EvidenceKind::Tape);
+
+        let v2_row = all.iter().find(|e| e.volume_label == "V2").unwrap();
+        assert_eq!(v2_row.last_verified.as_deref(), Some("2020-01-01 00:00:00"));
+    }
+
+    /// The never-verified/aged distinction must survive even with no
+    /// eligibility gate at all -- the LEFT JOIN's `ON`-clause placement of
+    /// `outcome = 'passed'` is what keeps V1 from vanishing here, exactly
+    /// as it does in `remaining_coverage_evidence`.
+    #[test]
+    fn per_volume_verification_never_verified_and_aged_both_appear() {
+        let (conn, unit_id, _v1_id, _v2_id) = setup_two_volume_unit();
+        let all = per_volume_verification(&conn, unit_id).unwrap();
+        assert_eq!(all.len(), 2, "both volumes must appear: {all:?}");
+        assert!(
+            all.iter()
+                .any(|e| e.volume_label == "V1" && e.last_verified.is_none()),
+            "V1 (never verified) must appear with last_verified = None: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|e| e.volume_label == "V2" && e.last_verified.is_some()),
+            "V2 (verified) must appear with last_verified = Some(..): {all:?}"
+        );
+    }
+
+    #[test]
+    fn compact_age_renders_never_and_aged_distinctly() {
+        assert_eq!(compact_age(None, now()), "never");
+        // 2026-04-29 12:00:00 -> 2026-07-30 12:00:00 is 92 days.
+        assert_eq!(compact_age(Some("2026-04-29 12:00:00"), now()), "92d ago");
+        assert_ne!(
+            compact_age(None, now()),
+            compact_age(Some("2026-04-29 12:00:00"), now())
+        );
+    }
+
+    #[test]
+    fn compact_age_reports_an_unparseable_stamp_honestly() {
+        assert_eq!(compact_age(Some("not-a-timestamp"), now()), "unparseable");
     }
 
     /// ADR-0006's evidence class, rendered so that the line is TRUE READ
