@@ -603,9 +603,21 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         for (name, copies, locs, vols, deposits) in &rows {
+            // The COUNT and the LIST answer different questions, and since
+            // issue #153 they can legitimately disagree: `copies` is how
+            // many copies the unit's THINNEST current version has (ADR-0012
+            // — a unit is as covered as its least-covered live version),
+            // while the list is every tape carrying any version of it, i.e.
+            // what an operator would go and fetch. Printing a bare `[...]`
+            // beside the number read as an enumeration OF that number, so a
+            // unit with two singly-copied versions rendered as
+            // "1 copies ... [L6-0001,L6-0002]" — self-contradicting at a
+            // glance. The list is labelled for what it is.
             println!(
-                "  {name}: {copies} copies{}, {locs} locations [{}]",
+                "  {name}: {copies} {}{}, {locs} {} [tapes holding any version: {}]",
+                if *copies == 1 { "copy" } else { "copies" },
                 warehouse_note(*deposits),
+                if *locs == 1 { "location" } else { "locations" },
                 vols.as_deref().unwrap_or("-")
             );
             // A copy the current escrow key cannot open still counts as a
