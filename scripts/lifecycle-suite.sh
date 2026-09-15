@@ -302,27 +302,39 @@ check() { # check <name> <fn> [args...]
 
 # ---------- audit_passes: an audit exit code the scenario tolerates ----------
 # `audit` exit 0/1 is always fine (clean / advisory warnings). Exit 2 is a
-# VIOLATION and normally a failure — EXCEPT in --single-cartridge mode, where
-# every unit is legitimately under-copied ("1 copy, needs 2": policy min_copies
-# is coupled to min_copies_for_tape_only=2, and one cartridge cannot hold two
-# copies). There, exit 2 is acceptable ONLY when every violation is copy_count;
-# any other violation still fails. Reads the audit --json the caller captured.
-# $1 = audit exit code, $2 = path to the captured audit --json.
+# VIOLATION and normally a failure — EXCEPT where the SCENARIO itself creates a
+# state policy is right to complain about. The scenario declares which checks
+# those are; this helper never infers them (issue #156).
+#
+# It used to gate exit 2 on --single-cartridge, which conflated two unrelated
+# reasons for a legitimate copy_count violation: cartridge REUSE (one cartridge
+# cannot hold two copies) and simply writing ONE volume. `first-year` writes a
+# single volume, so it under-copies in EVERY mode — which made
+# `--scenario first-year` without --single-cartridge red at fy.audit by
+# construction, on any drive (observed 2026-09-13: 44/45, then 45/45 with only
+# --single-cartridge added).
+#
+# $1 = audit exit code, $2 = path to the captured audit --json,
+# $3.. = check names whose violations this scenario expects. Exit 2 with no
+# declared check is a failure, so silence is never an allowance.
 audit_passes() {
-    local rc="$1" jf="$2"
+    local rc="$1" jf="$2"; shift 2
     { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && return 0
     [ "$rc" -eq 2 ] || return 1
-    [ "$SINGLE_CARTRIDGE" = 1 ] || return 1
-    # exit 2 in single-cartridge mode: pass iff the ONLY violations are copy_count.
-    python3 - "$jf" <<'PY2'
+    [ "$#" -gt 0 ] || return 1
+    # exit 2: pass iff there IS at least one violation and every one of them is
+    # a check the caller declared. A declared-but-absent check is not a pass —
+    # that would let a scenario silently stop exercising what it claims to.
+    python3 - "$jf" "$*" <<'PY2'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
+allowed = set(sys.argv[2].split())
 findings = d.get("findings") or d.get("results") or []
 viols = [f for f in findings if f.get("severity") == "violation"]
-sys.exit(0 if viols and all(f.get("check") == "copy_count" for f in viols) else 1)
+sys.exit(0 if viols and all(f.get("check") in allowed for f in viols) else 1)
 PY2
 }
 
@@ -336,6 +348,14 @@ PY2
 # refusal itself and the ADR-0003 sealed-tape rule), so they must not use this.
 REUSE_FORCE=""
 [ "$SINGLE_CARTRIDGE" = 1 ] && REUSE_FORCE="--force"
+
+# The permutation matrix is the one caller whose tolerated violations really do
+# depend on the cartridge mode: reusing a single cartridge under-counts copies,
+# while a multi-cartridge run must reach full coverage and any copy_count
+# violation there is a real regression. Declared here rather than inferred
+# inside audit_passes (issue #156).
+PM_ALLOWED_VIOLATIONS=()
+[ "$SINGLE_CARTRIDGE" = 1 ] && PM_ALLOWED_VIOLATIONS=(copy_count)
 vinit() { TCTL volume init "$1" --device "$TAPE_DEV" $REUSE_FORCE; }
 
 # ---------- erase_tape: the ONE place scenarios reuse a tape ----------
@@ -1124,8 +1144,11 @@ fy_audit() {
     local fy_audit_json="$RUN/fy.audit.json"
     TCTL audit --json >"$fy_audit_json" 2>&1
     local rc=$?
-    audit_passes "$rc" "$fy_audit_json" || {
-        echo "audit exited $rc with non-copy_count violations:"; cat "$fy_audit_json"; return 1; }
+    # first-year writes exactly one volume (fy.write), so every unit is
+    # legitimately one copy short of min_copies in EVERY cartridge mode. That
+    # is the scenario's own doing, not a defect, and not a reuse artefact.
+    audit_passes "$rc" "$fy_audit_json" copy_count || {
+        echo "audit exited $rc with violations other than copy_count:"; cat "$fy_audit_json"; return 1; }
     return 0
 }
 fy_fsck()      { TCTL db fsck; }
@@ -2654,13 +2677,13 @@ assert d.get("integrity_ok"), d
     # only surviving json was the LAST step's, so a failing step's evidence was
     # gone by the time anyone read the report. And stderr must NOT be folded in
     # (`2>&1`) — one stray line makes the file unparseable, which audit_passes
-    # reports as "non-copy_count violations", blaming the policy for a plumbing
+    # reports as an undeclared violation, blaming the policy for a plumbing
     # problem.
     local audit_rc pm_audit_json="$RUN/log-pm.${PM_STEP_TAG:-step}.audit.json"
     TCTL audit --json >"$pm_audit_json" 2>"$RUN/log-pm.${PM_STEP_TAG:-step}.audit.stderr"; audit_rc=$?
     case "$op" in
-        mutate:*) audit_passes "$audit_rc" "$pm_audit_json" || [ "$audit_rc" -le 2 ] || { echo "audit exited $audit_rc (>2) after \"$op\""; return 1; } ;;
-        *)        audit_passes "$audit_rc" "$pm_audit_json" || {
+        mutate:*) audit_passes "$audit_rc" "$pm_audit_json" "${PM_ALLOWED_VIOLATIONS[@]}" || [ "$audit_rc" -le 2 ] || { echo "audit exited $audit_rc (>2) after \"$op\""; return 1; } ;;
+        *)        audit_passes "$audit_rc" "$pm_audit_json" "${PM_ALLOWED_VIOLATIONS[@]}" || {
                       echo "audit exited $audit_rc after \"$op\"; audit_passes rejected it. json:"
                       cat "$pm_audit_json"
                       echo "--- stderr ---"; cat "$RUN/log-pm.${PM_STEP_TAG:-step}.audit.stderr"
