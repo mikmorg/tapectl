@@ -267,6 +267,33 @@ pub(crate) fn bind_cartridge(
             // wants a human barcode registers the cartridge first and passes
             // --cartridge.
             Some(s) => {
+                // The MAM serial matched no row by `serial_number` (else
+                // `lookup_cartridge` would have returned it here already),
+                // but `barcode` is `TEXT NOT NULL UNIQUE` and this INSERT is
+                // about to bind `s` to BOTH columns. If a row already
+                // carries `s` as its BARCODE -- exactly what an operator
+                // gets by hand-registering a cartridge using the serial
+                // printed on its shell, before it was ever loaded -- the
+                // INSERT below collides. Refuse by name instead of
+                // surfacing the raw UNIQUE constraint failure: silently
+                // adopting that row would rewrite its identity on a guess,
+                // the same mistake `lookup_cartridge` already refuses for
+                // the sibling case above (a `--cartridge` naming a row with
+                // a DIFFERENT recorded serial). This takes no `force` --
+                // it is a fact tapectl cannot resolve on its own, not a
+                // risk to accept.
+                if let Some(conflict) = select_cartridge(conn, "barcode", s)? {
+                    return Err(TapectlError::Other(format!(
+                        "medium serial {s} matches no registered cartridge by serial, \
+                         but cartridge id {} is already registered with barcode \"{s}\". \
+                         tapectl cannot tell whether that is this same physical \
+                         cartridge or a different one that happens to share the label, \
+                         so it will not auto-register a duplicate. Give the existing \
+                         cartridge a barcode of its own with `tapectl cartridge relabel \
+                         {s} <new-barcode>`, then retry.",
+                        conflict.id
+                    )));
+                }
                 conn.execute(
                     "INSERT INTO cartridges
                         (barcode, media_type, manufacturer, serial_number,
@@ -887,6 +914,117 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cartridge_status(&conn, cart_id), "in_use");
+    }
+
+    // ---- #160: the barcode collision auto-register can reach -------------
+
+    /// The reachable defect from #160: an operator hand-registers a
+    /// cartridge using the serial printed on its shell as the barcode, with
+    /// no `--serial` given (the operator guide used to teach exactly this).
+    /// When that tape is loaded, `lookup_cartridge` finds nothing by serial
+    /// (the row's `serial_number` is NULL), so `bind_cartridge` reaches its
+    /// auto-register arm and would collide on the `barcode` UNIQUE
+    /// constraint. This must be refused BY NAME, naming both the medium
+    /// serial and the conflicting barcode, and must not adopt the existing
+    /// row (that would rewrite its identity on a guess) or write anything.
+    #[test]
+    fn auto_register_refuses_a_barcode_collision_with_no_serial_match() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "E01001L8_1775794348", "LTO-8", None, "available");
+        let vol = new_volume(&conn, "L6-0001");
+        let mam = MamInfo {
+            manufacturer: Some("HP".into()),
+            ..MamInfo::default()
+        };
+
+        // No row matched by serial -- `lookup_cartridge` would have found
+        // nothing, exactly like a fresh tape.
+        let err = match bind_cartridge(
+            &conn,
+            vol,
+            None,
+            Some("E01001L8_1775794348"),
+            Generation::Lto8,
+            12_000_000_000_000,
+            &mam,
+        ) {
+            Ok(_) => panic!("a barcode collision must be refused, not silently bound"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            err.contains("E01001L8_1775794348"),
+            "must name the colliding serial/barcode: {err}"
+        );
+        assert!(err.contains("relabel"), "must point at the remedy: {err}");
+
+        let cartridge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cartridges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            cartridge_count, 1,
+            "the refusal must not have written a second row"
+        );
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count, 0,
+            "the refusal is read-only and must log nothing (the test's `register` \
+             helper writes straight SQL, unlike the CLI, so there is no prior event)"
+        );
+    }
+
+    /// #160 defect bullet 1 claimed `serial_number` could be written more
+    /// than once. The coordinator's verification found two independent
+    /// guards already prevent it: `lookup_cartridge` refuses a `--cartridge`
+    /// naming a row with a DIFFERENT recorded serial
+    /// (`cartridge_flag_naming_a_row_with_a_different_serial_is_an_error`,
+    /// above), and `bind_cartridge`'s own UPDATE only fires
+    /// `if r.serial_number.is_none()` (binding.rs). This pins the SECOND,
+    /// deeper guard directly against `bind_cartridge` -- bypassing
+    /// `lookup_cartridge`'s refusal on purpose -- so a future change that
+    /// reaches `bind_cartridge` by any other path cannot silently start
+    /// overwriting a recorded serial. Documents shipped behaviour; fixes
+    /// nothing.
+    #[test]
+    fn bind_cartridge_never_overwrites_an_existing_serial() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let row = lookup_cartridge(&conn, None, Some("BC001"))
+            .unwrap()
+            .row
+            .unwrap();
+        let cart_id = row.id;
+        let vol = new_volume(&conn, "L6-0001");
+
+        let out = bind_cartridge(
+            &conn,
+            vol,
+            Some(&row),
+            Some("SER-2"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo::default(),
+        )
+        .unwrap();
+
+        assert!(
+            !out.serial_recorded,
+            "a row that already has a serial must not report one as newly recorded"
+        );
+        let serial: Option<String> = conn
+            .query_row(
+                "SELECT serial_number FROM cartridges WHERE id = ?1",
+                params![cart_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serial.as_deref(),
+            Some("SER-1"),
+            "bind_cartridge must never overwrite a recorded serial with a different one"
+        );
     }
 
     /// The displacement warning must be able to name the units that just
