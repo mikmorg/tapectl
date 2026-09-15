@@ -281,6 +281,10 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
         mam_capacity: 2_400_000_000,
         mam_manufacturer: "TAPECTL-TEST".to_string(),
         mam_serial: "T7SERIAL".to_string(),
+        // A chip-reported serial (issue #192): the sealed harness stands in
+        // for a volume bound from MAM, so File 0 must attest "mam" and an
+        // heir reading the recorded bytes alone must be able to see that.
+        cartridge_identity_source: Some("mam".to_string()),
         mam_length: 0,
         mam_loads: 0,
         units: build_units.clone(),
@@ -431,6 +435,7 @@ fn build_layout_only(volume_uuid: &str, created_at: &str) -> BuiltLayout {
         mam_capacity: 0,
         mam_manufacturer: String::new(),
         mam_serial: String::new(),
+        cartridge_identity_source: None,
         mam_length: 0,
         mam_loads: 0,
         units,

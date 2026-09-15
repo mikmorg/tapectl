@@ -563,6 +563,101 @@ fn check_loaded_cartridge(
     Ok(())
 }
 
+/// What File 0's `[media]` says about the cartridge's identity: the serial
+/// string, and how it was established (`docs/design/volume-format-v2.md`
+/// §1.1). `None` for the source means UNKNOWN, and the line is then omitted
+/// from the thunk entirely.
+#[derive(Debug)]
+struct CartridgeIdentity {
+    serial: String,
+    source: Option<String>,
+}
+
+/// Resolve the identity File 0 will attest, FROM THE BINDING — never from a
+/// fresh MAM read (ADR-0012, issue #192).
+///
+/// The catalog already knows which cartridge this volume is bound to and,
+/// since migration 014, under which identity that binding was established.
+/// Taking the string from there rather than from whatever the drive reports
+/// at this contact is what keeps the tape and the catalog in agreement: a
+/// volume bound by barcode because no serial was readable at `volume init`
+/// must record THAT barcode, even if a later drive reads its MAM cleanly —
+/// `bind_late` early-returns on an already-bound volume, so the catalog would
+/// never learn that serial, and the same physical tape would otherwise attest
+/// different provenance depending on which drive wrote it.
+///
+/// MAM corroborates the medium at each contact ([`check_loaded_cartridge`],
+/// a few lines above this call); it does not supply this.
+///
+/// The legacy path is deliberately byte-for-byte what it always was: an
+/// unbound volume, or one bound before 014 existed, takes the live MAM serial
+/// (or `""`) and omits the source line — because absent means unknown.
+fn resolve_cartridge_identity(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    mam_serial: Option<&str>,
+) -> Result<CartridgeIdentity> {
+    // `.optional()?`, never `.ok()`: a locked or malformed database must
+    // surface as an error rather than silently read as "unbound" and seal a
+    // tape with the wrong identity on it.
+    let bound: Option<(Option<String>, String, Option<String>)> = conn
+        .query_row(
+            "SELECT c.serial_number, c.barcode, cv.identity_source
+             FROM cartridge_volumes cv
+             JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![volume_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+
+    let legacy = || CartridgeIdentity {
+        serial: mam_serial.unwrap_or_default().to_string(),
+        source: None,
+    };
+
+    let Some((serial_number, barcode, identity_source)) = bound else {
+        return Ok(legacy());
+    };
+
+    match identity_source.as_deref() {
+        Some("mam") => {
+            // 'mam' means a chip serial was recorded onto this binding, so a
+            // NULL `serial_number` is an inconsistent catalog. Refuse rather
+            // than write `cartridge_serial = ""` beside a claim that a chip
+            // reported it — a provenance assertion with no identity behind it
+            // is exactly the wrong bytes this change exists to prevent, and
+            // tape bytes are forever.
+            let Some(serial) = serial_number else {
+                return Err(TapectlError::Other(format!(
+                    "volume \"{label}\" is bound to cartridge \"{barcode}\" with identity \
+                     source \"mam\", but that cartridge row records no medium serial. \
+                     tapectl will not seal a tape claiming a chip-reported identity it \
+                     cannot name. The catalog is inconsistent — this binding was recorded \
+                     with a serial that has since been cleared. Restore the database from \
+                     a `db backup`, or `volume init` a new label on this cartridge."
+                )));
+            };
+            Ok(CartridgeIdentity {
+                serial,
+                source: Some("mam".to_string()),
+            })
+        }
+        // No serial was readable when this volume was bound, so the operator
+        // named the cartridge and the identity IS that barcode (ADR-0012: a
+        // barcode is a relabelable sticker, verifiable only against the
+        // catalog).
+        Some("operator") => Ok(CartridgeIdentity {
+            serial: barcode,
+            source: Some("operator".to_string()),
+        }),
+        // NULL: bound before migration 014. Unknown, and unknown is said by
+        // saying nothing.
+        _ => Ok(legacy()),
+    }
+}
+
 /// Refuse a medium whose detected generation is not the one this volume was
 /// initialised on (ADR-0010). Silent when nothing is detected or the row
 /// predates ADR-0010 and records no parseable generation — the same
@@ -748,6 +843,20 @@ pub fn volume_write(
     check_loaded_cartridge(conn, volume_id, label, mam.serial.as_deref())?;
     check_loaded_generation(label, &det, volume_media_type.as_deref())?;
 
+    // File 0's `[media]` identity, taken from the BINDING (ADR-0012, issue
+    // #192) now that the loaded medium has been corroborated against it just
+    // above. Resolved here, where `conn` is in scope; `build()` stays
+    // `Connection`-free and receives it as plain data on `BuildInputs`.
+    //
+    // Note on ordering: `bind_late` runs AFTER `build()` (issue #154 moved it
+    // there so a refused write displaces nothing), so a legacy unbound volume
+    // is still unbound at this point and the field is absent. That is
+    // correct, and deliberately not "predicted" from what `bind_late` is
+    // about to do — absent means unknown, and coupling File 0's bytes to a
+    // step that has not run yet would be the worse bug.
+    let cartridge_identity =
+        resolve_cartridge_identity(conn, volume_id, label, mam.serial.as_deref())?;
+
     let volume_uuid = volume_uuid(conn, volume_id)?;
     let created_at = chrono::Utc::now().to_rfc3339();
     // Session directory: materialize-to-staging (`v2-open-questions.md`
@@ -787,7 +896,8 @@ pub fn volume_write(
         nominal_capacity,
         mam_capacity: mam.max_capacity_bytes.unwrap_or(0),
         mam_manufacturer: mam.manufacturer.clone().unwrap_or_default(),
-        mam_serial: mam.serial.clone().unwrap_or_default(),
+        mam_serial: cartridge_identity.serial,
+        cartridge_identity_source: cartridge_identity.source,
         mam_length: mam.length_meters.unwrap_or(0),
         mam_loads: mam.load_count.unwrap_or(0),
         units,
@@ -4759,6 +4869,115 @@ mod tests {
     // Both are pure enough to drill without a drive: one takes a
     // `Connection` and a serial string, the other a `Detected` and a row's
     // recorded generation.
+    // --- ADR-0012 / #192: what File 0 attests about the cartridge identity --
+    //
+    // The whole point of the change is that this comes from the BINDING, not
+    // from whatever MAM says at this contact, so every case below hands the
+    // resolver a *contradicting* live serial and asserts the binding wins.
+    mod file_0_cartridge_identity {
+        use super::*;
+
+        /// A volume bound to `barcode`, whose cartridge row records
+        /// `serial_number = serial`, with the binding's `identity_source` set
+        /// to `source`.
+        fn bound(barcode: &str, serial: Option<&str>, source: Option<&str>) -> (Connection, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES (?1, 'LTO-6', 2500000000000, ?2, 'in_use')",
+                params![barcode, serial],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, ?3)",
+                params![cart_id, vol_id, source],
+            )
+            .unwrap();
+            (conn, vol_id)
+        }
+
+        #[test]
+        fn a_mam_binding_attests_the_rows_chip_serial_not_this_contacts() {
+            let (conn, vol) = bound("BC001", Some("SER-1"), Some("mam"));
+            // A different live serial is deliberately supplied: the binding,
+            // not the contact, decides what goes on tape.
+            let id = resolve_cartridge_identity(&conn, vol, "L6-0001", Some("SER-LIVE")).unwrap();
+            assert_eq!(id.serial, "SER-1");
+            assert_eq!(id.source.as_deref(), Some("mam"));
+        }
+
+        /// The case the whole redesign exists for: bound by barcode because
+        /// no serial was readable at init. A drive that CAN read MAM later
+        /// must not change what this tape says — `bind_late` early-returns on
+        /// an already-bound volume, so the catalog would never learn that
+        /// serial, and the tape and the catalog would disagree forever.
+        #[test]
+        fn an_operator_binding_attests_the_barcode_even_when_mam_reads_now() {
+            let (conn, vol) = bound("HOME-007", None, Some("operator"));
+            let id = resolve_cartridge_identity(&conn, vol, "L6-0001", Some("SER-LIVE")).unwrap();
+            assert_eq!(id.serial, "HOME-007");
+            assert_eq!(id.source.as_deref(), Some("operator"));
+        }
+
+        /// 'mam' with no recorded serial is an inconsistent catalog, and
+        /// sealing `cartridge_serial = ""` beside `= "mam"` would be a
+        /// provenance claim with no identity behind it. Tape bytes are
+        /// forever; refuse instead.
+        #[test]
+        fn a_mam_binding_with_no_recorded_serial_is_refused_by_name() {
+            let (conn, vol) = bound("BC001", None, Some("mam"));
+            let err = resolve_cartridge_identity(&conn, vol, "L6-0001", Some("SER-LIVE"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("L6-0001"), "{err}");
+            assert!(err.contains("BC001"), "{err}");
+            assert!(err.contains("records no medium serial"), "{err}");
+        }
+
+        /// A binding made before migration 014: unknown, and unknown is said
+        /// by saying NOTHING. Absent must never read as "mam" — every tape
+        /// written before #192 omits the key.
+        #[test]
+        fn a_pre_migration_binding_falls_back_to_the_live_mam_serial_and_says_nothing() {
+            let (conn, vol) = bound("BC001", Some("SER-1"), None);
+            let id = resolve_cartridge_identity(&conn, vol, "L6-0001", Some("SER-LIVE")).unwrap();
+            assert_eq!(id.serial, "SER-LIVE", "legacy behaviour is unchanged");
+            assert!(id.source.is_none());
+        }
+
+        /// An unbound volume (pre-ADR-0010, or a drive exposing no serial)
+        /// keeps exactly the behaviour it always had, down to the empty
+        /// string when nothing is readable.
+        #[test]
+        fn an_unbound_volume_keeps_the_legacy_shape_exactly() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let vol = conn.last_insert_rowid();
+
+            let seen = resolve_cartridge_identity(&conn, vol, "L6-0001", Some("SER-LIVE")).unwrap();
+            assert_eq!(seen.serial, "SER-LIVE");
+            assert!(seen.source.is_none());
+
+            let blind = resolve_cartridge_identity(&conn, vol, "L6-0001", None).unwrap();
+            assert_eq!(blind.serial, "");
+            assert!(blind.source.is_none());
+        }
+    }
+
     mod loaded_medium_checks {
         use super::*;
         use crate::media::Generation;

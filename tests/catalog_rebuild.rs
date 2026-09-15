@@ -293,6 +293,7 @@ fn build_sealed_volume_with(catalog_db: CatalogDb) -> SealedVolume {
         mam_capacity: 2_400_000_000,
         mam_manufacturer: "TAPECTL-TEST".to_string(),
         mam_serial: "REBUILDSERIAL".to_string(),
+        cartridge_identity_source: None,
         mam_length: 0,
         mam_loads: 0,
         units: build_units.clone(),

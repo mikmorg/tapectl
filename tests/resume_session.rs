@@ -200,6 +200,7 @@ fn make_fixture() -> Fixture {
         mam_capacity: 0,
         mam_manufacturer: String::new(),
         mam_serial: String::new(),
+        cartridge_identity_source: None,
         mam_length: 0,
         // Likewise: `read_mam`'s load_count increments on every cartridge
         // load, so a resume that reloaded the tape could never reproduce it.

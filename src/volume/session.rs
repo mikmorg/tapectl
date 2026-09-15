@@ -1448,6 +1448,7 @@ mod tests {
             mam_capacity: 0,
             mam_manufacturer: String::new(),
             mam_serial: String::new(),
+            cartridge_identity_source: None,
             mam_length: 0,
             mam_loads: 0,
             units: vec![build_unit.clone()],

@@ -116,7 +116,19 @@ pub struct BuildInputs {
     pub nominal_capacity: i64,
     pub mam_capacity: i64,
     pub mam_manufacturer: String,
+    /// The cartridge's identity string, as the BINDING established it —
+    /// `cartridges.serial_number` for a chip-reported one, `.barcode` for one
+    /// the operator named (ADR-0012). Named `mam_serial` for continuity with
+    /// the on-tape key `cartridge_serial`; `cartridge_identity_source` below
+    /// is what says which it is.
     pub mam_serial: String,
+    /// How `mam_serial` was established: `Some("mam")`, `Some("operator")`,
+    /// or `None` for unknown — read back from
+    /// `cartridge_volumes.identity_source` by the caller (which has a
+    /// `Connection`; `build()` deliberately does not). `None` OMITS the key
+    /// from File 0 entirely: absent means unknown and never "mam"
+    /// (`docs/design/volume-format-v2.md` §1.1).
+    pub cartridge_identity_source: Option<String>,
     pub mam_length: i64,
     pub mam_loads: i64,
 
@@ -222,7 +234,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         mam_length: inputs.mam_length,
         mam_loads: inputs.mam_loads,
         created_at: &inputs.created_at,
-        cartridge_identity_source: None,
+        cartridge_identity_source: inputs.cartridge_identity_source.as_deref(),
     };
     let id_thunk_bytes = layout::generate_id_thunk_v2(&id_thunk_params);
     let (id_thunk_path, id_thunk_size, id_thunk_hash) =
@@ -1105,6 +1117,7 @@ mod tests {
             mam_capacity: 0,
             mam_manufacturer: String::new(),
             mam_serial: String::new(),
+            cartridge_identity_source: None,
             mam_length: 0,
             mam_loads: 0,
             units,
@@ -1660,6 +1673,7 @@ mod tests {
             mam_capacity: 0,
             mam_manufacturer: String::new(),
             mam_serial: String::new(),
+            cartridge_identity_source: None,
             mam_length: 0,
             mam_loads: 0,
             units: vec![unit],
@@ -1747,6 +1761,7 @@ mod tests {
             mam_capacity: 0,
             mam_manufacturer: String::new(),
             mam_serial: String::new(),
+            cartridge_identity_source: None,
             mam_length: 0,
             mam_loads: 0,
             units: vec![unit],
