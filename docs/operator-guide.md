@@ -925,46 +925,61 @@ notably not `tapectl`.
 
 ### If you hold the operator or escrow key: rebuild the catalog
 
-There are two sources, and the procedure is to use both, in this order:
+There are two sources — the heir kit's catalog bundle, and the tapes themselves
+— and the procedure uses both, **in this order**. The order is not a preference:
+`db import` replaces the *entire* live database, so importing the bundle after
+rebuilding tapes would silently discard everything you just rebuilt.
 
-1. **Restore the heir kit's database.** `key escrow-kit` bundled the **whole**
-   `tapectl.db` at generation time (ADR-0009) — every row, every escrow
-   receipt — as `catalog.db.age`, encrypted to the escrow key. That is the
-   catalog as of the last kit.
-2. **Rebuild every tape sealed since.** `audit`'s `escrow_kit_stale` names
-   exactly that set. `catalog rebuild --from-volume` reconstructs each one
-   from the tape's own envelope.
+Run these four steps in sequence on the rebuilt machine.
 
-Before either step, on a rebuilt machine:
+**1. Register the original escrow identity.**
 
 ```bash
 tapectl init --escrow-public-key age1…        # the ORIGINAL, from the kit's cover sheet
-```
-
-This registers the original escrow recipient directly — there is no wrong
-order to get into. The equivalent two-step form still works, if you prefer it:
-
-```bash
-tapectl init --no-escrow                      # do NOT let init mint a new escrow identity
-tapectl key import --escrow age1…             # the ORIGINAL escrow public key, from the kit's cover sheet
 ```
 
 Every escrow check compares against the escrow recipient this catalog has
 *registered*. A plain `init` registers a brand-new one, and every tape was
 encrypted to the old one — so until the original is registered, everything
 reads `NO: encrypted without the current escrow recipient`, `volume write`
-refuses to re-copy, and nothing can be attested. `audit` will tell you this
-happened (`escrow_identity_mismatch`, naming the key), but registering the
-original is step one regardless.
+refuses to re-copy, and nothing can be attested. `audit` reports this
+(`escrow_identity_mismatch`, naming the key). The equivalent two-step form
+still works, if you prefer it:
+
+```bash
+tapectl init --no-escrow                      # do NOT let init mint a new escrow identity
+tapectl key import --escrow age1…             # the ORIGINAL escrow public key, from the cover sheet
+```
 
 **If you already ran a plain `init`:** there is only ever one escrow identity
 (ADR-0005) and no command replaces it — neither `key import --escrow` nor
 `init --escrow-public-key` will adopt one while a (wrong) one is already
-registered. The new home holds nothing yet, so remove it and start again with
-`init --escrow-public-key age1…` (or the two-step form above). Do this
-*before* restoring or rebuilding anything into it.
+registered. The new home holds nothing yet, so remove it and start again. Do
+this *before* restoring or rebuilding anything into it.
 
-Then, for each tape newer than the kit:
+**2. Put the private keys back.** The database holds public keys and
+fingerprints only; every private half is a file under `~/.tapectl/keys/`
+(ADR-0009 — which is what makes the bundle safe to carry). `db import` restores
+rows, not secrets, so copy the key files from the kit's media into
+`~/.tapectl/keys/` now, or pass them explicitly with `--key` at each step
+below. Skipping this leaves a catalog that describes data you cannot decrypt.
+
+**3. Import the heir kit's database.** `key escrow-kit` bundled the **whole**
+`tapectl.db` at generation time (ADR-0009) — every row, every escrow receipt —
+as `catalog.db.age`, encrypted to the escrow key. Decrypt it, then import:
+
+```bash
+age -d -i escrow.age.key -o catalog.db catalog.db.age
+tapectl db import catalog.db
+```
+
+`db import` asks for confirmation first, because it **overwrites the entire
+live database** with the file you name. That is what you want here and exactly
+why this step precedes the rebuild. It prints `database imported from
+catalog.db`.
+
+**4. Rebuild every tape sealed since the kit was made.** `audit`'s
+`escrow_kit_stale` check names exactly that set.
 
 ```bash
 tapectl catalog rebuild --from-volume \
@@ -976,6 +991,12 @@ tapectl catalog rebuild --from-volume \
 Run it once per cartridge, in any order. It only ever **inserts what is
 missing** and never edits a row it finds, so running it twice — or over a
 catalog that is damaged rather than absent — is safe.
+
+**How to tell it worked.** A row reconstructed from tape rather than recorded
+at staging is marked `stage_sets.origin = 'rebuilt'` (the default is
+`'staged'`) — the receipt was demonstrated, not recorded at staging. What that
+means for escrow coverage, and the two ways to resolve it, is the
+*Escrow coverage on rebuilt rows* note below.
 
 What comes back, and from where:
 
@@ -1004,7 +1025,7 @@ policy asks for two, that is a violation it should be telling you about:
 
 ```bash
 tapectl audit                       # exit 2 on a one-copy rebuild is correct
-tapectl volume verify --label VOL0001 --device /dev/nst0 --full
+tapectl volume verify VOL0001 --device /dev/nst0 --full
 ```
 
 Two things the rebuild deliberately does not do:
