@@ -1,12 +1,14 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-cartridge 1  "tapectl-cartridge " 
+.TH tapectl-cartridge-relabel 1  "tapectl-cartridge-relabel " 
 .SH NAME
-tapectl\-cartridge \- Manage physical cartridges
+tapectl\-cartridge\-relabel \- Correct a cartridge\*(Aqs barcode label
 .SH SYNOPSIS
-\fBtapectl cartridge\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl cartridge relabel\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> <\fINEW_BARCODE\fR> 
 .SH DESCRIPTION
-Manage physical cartridges
+Correct a cartridge\*(Aqs barcode label
+.PP
+ADR\-0012: a cartridge\*(Aqs identity is its chip serial; the barcode is a relabelable sticker. This is a Tier 1 label correction under ADR\-0008, not a destructive act — no prompt, no `\-\-force`, no status gate — and it is the remedy `volume init`\*(Aqs auto\-register refuses with when the loaded medium\*(Aqs serial collides with an already\-registered barcode.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -33,28 +35,9 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
 .TP
-tapectl\-cartridge\-register(1)
-Register a physical cartridge
+<\fIBARCODE\fR>
+Current barcode
 .TP
-tapectl\-cartridge\-list(1)
-List cartridges
-.TP
-tapectl\-cartridge\-info(1)
-Show cartridge details
-.TP
-tapectl\-cartridge\-move(1)
-Move a cartridge to a location, taking its volumes with it
-.TP
-tapectl\-cartridge\-retire(1)
-Retire a cartridge permanently — it must never be written again
-.TP
-tapectl\-cartridge\-mark\-erased(1)
-Mark a cartridge as erased (available for reuse)
-.TP
-tapectl\-cartridge\-relabel(1)
-Correct a cartridge\*(Aqs barcode label
-.TP
-tapectl\-cartridge\-help(1)
-Print this message or the help of the given subcommand(s)
+<\fINEW_BARCODE\fR>
+New barcode
