@@ -282,16 +282,23 @@ pub(crate) fn bind_cartridge(
                 // a DIFFERENT recorded serial). This takes no `force` --
                 // it is a fact tapectl cannot resolve on its own, not a
                 // risk to accept.
-                if let Some(conflict) = select_cartridge(conn, "barcode", s)? {
+                if select_cartridge(conn, "barcode", s)?.is_some() {
                     return Err(TapectlError::Other(format!(
-                        "medium serial {s} matches no registered cartridge by serial, \
-                         but cartridge id {} is already registered with barcode \"{s}\". \
-                         tapectl cannot tell whether that is this same physical \
-                         cartridge or a different one that happens to share the label, \
-                         so it will not auto-register a duplicate. Give the existing \
-                         cartridge a barcode of its own with `tapectl cartridge relabel \
-                         {s} <new-barcode>`, then retry.",
-                        conflict.id
+                        "this medium reports serial {s}, which matches no registered \
+                         cartridge — but a cartridge is already registered under the \
+                         barcode \"{s}\". tapectl cannot tell whether that is this same \
+                         physical cartridge, registered by hand before it was ever \
+                         loaded, or a different one whose sticker happens to read the \
+                         same. It will not guess.\n\
+                         \n\
+                         If it IS this cartridge, name it so the serial is recorded \
+                         onto the existing row:\n    \
+                         tapectl volume init <label> --device <dev> --cartridge {s}\n\
+                         (`volume write` has no --cartridge, so do this at init.)\n\
+                         \n\
+                         If it is a DIFFERENT cartridge, give the registered one a \
+                         barcode of its own and retry:\n    \
+                         tapectl cartridge relabel {s} <new-barcode>"
                     )));
                 }
                 conn.execute(
