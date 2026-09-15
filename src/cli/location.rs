@@ -47,6 +47,15 @@ struct LocationRow {
     /// two are operationally nothing alike -- one you can drive to.
     #[tabled(rename = "Kind")]
     kind: String,
+    /// ADR-0011: `cartridges.location_id` is the single mechanism for
+    /// where a physical cartridge is, and until now the location side had
+    /// no reader for it at all (issue #157) -- a shelf could hold a
+    /// cartridge nothing here would ever mention. Counts every status
+    /// (retired cartridges still occupy the shelf); `move_together`
+    /// already refuses a warehouse destination for a cartridge, so this
+    /// is always 0 on a `warehouse`-kind location.
+    #[tabled(rename = "Cartridges")]
+    cartridges: i64,
     #[tabled(rename = "Volumes")]
     volumes: i64,
     #[tabled(rename = "Deposits")]
@@ -59,6 +68,70 @@ struct LocationRow {
 /// counterpart here.
 fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
+}
+
+/// Every location with its cartridge/volume/deposit counts, split out from
+/// the printing so it is assertable in tests without capturing stdout --
+/// the same discipline `cartridge_rows` uses in `src/cli/cartridge.rs`.
+fn location_rows(conn: &Connection) -> Result<Vec<LocationRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.name, l.description,
+                (SELECT COUNT(*) FROM volumes v WHERE v.location_id = l.id) as vol_count,
+                l.kind,
+                (SELECT COUNT(*) FROM volume_deposits d WHERE d.location_id = l.id),
+                (SELECT COUNT(*) FROM cartridges c WHERE c.location_id = l.id)
+         FROM locations l ORDER BY l.name",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LocationRow {
+                name: row.get(0)?,
+                description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                volumes: row.get(2)?,
+                kind: row.get(3)?,
+                deposits: row.get(4)?,
+                cartridges: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every cartridge currently parked at a location, barcode order --
+/// `location info`'s new Cartridges block (issue #157). Split out from the
+/// printing for the same testability reason as [`location_rows`].
+///
+/// `current_vol` is a correlated subquery, not a join, on purpose: a
+/// cartridge with nothing currently mounted on it (a blank spare, or one
+/// whose last volume was unmounted) must still appear rather than vanish
+/// the way an inner join would drop it. Mirrors `cartridge_rows`'s own
+/// current-volume subquery in `src/cli/cartridge.rs` exactly, so the two
+/// views of "what volume is on this cartridge" cannot drift apart.
+///
+/// Every cartridge status is included -- ADR-0011: a `retired_permanent`
+/// cartridge is still physically on the shelf and still occupies space,
+/// so a location audit that hid it would defeat its own purpose.
+#[allow(clippy::type_complexity)]
+fn cartridges_at(
+    conn: &Connection,
+    location_id: i64,
+) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.barcode, c.status, c.serial_number,
+                (SELECT v.label FROM cartridge_volumes cv
+                 JOIN volumes v ON v.id = cv.volume_id
+                 WHERE cv.cartridge_id = c.id AND cv.unmounted_at IS NULL
+                 LIMIT 1) as current_vol
+         FROM cartridges c
+         WHERE c.location_id = ?1
+         ORDER BY c.barcode",
+    )?;
+    let rows = stmt
+        .query_map(params![location_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> Result<()> {
@@ -84,24 +157,7 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
             }
         }
         LocationCommands::List => {
-            let mut stmt = conn.prepare(
-                "SELECT l.name, l.description,
-                        (SELECT COUNT(*) FROM volumes v WHERE v.location_id = l.id) as vol_count,
-                        l.kind,
-                        (SELECT COUNT(*) FROM volume_deposits d WHERE d.location_id = l.id)
-                 FROM locations l ORDER BY l.name",
-            )?;
-            let rows: Vec<LocationRow> = stmt
-                .query_map([], |row| {
-                    Ok(LocationRow {
-                        name: row.get(0)?,
-                        description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                        volumes: row.get(2)?,
-                        kind: row.get(3)?,
-                        deposits: row.get(4)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let rows = location_rows(conn)?;
             if json_output {
                 // `description` is included because the table shows it and,
                 // since #72, it is where a warehouse's `s3://bucket/prefix`
@@ -127,6 +183,15 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                 )
                 .map_err(|_| TapectlError::Other(format!("location \"{name}\" not found")))?;
 
+            // Issue #157: the ADR-0011 half of this view that never got
+            // built. A cartridge can sit here with nothing currently
+            // mounted on it (a blank spare, or a `cartridge move` that
+            // moved zero volumes because none were mounted), so this must
+            // report cartridges independently of the Volumes block below
+            // rather than only ever showing volumes and inferring the
+            // cartridge from them.
+            let cartridges = cartridges_at(conn, id)?;
+
             let mut stmt = conn.prepare(
                 "SELECT label, status FROM volumes WHERE location_id = ?1 ORDER BY label",
             )?;
@@ -150,6 +215,11 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                 println!(
                     "{}",
                     serde_json::json!({"name": name, "kind": kind, "description": desc,
+                                       "cartridges": cartridges.iter().map(|(barcode, status, serial, vol)|
+                                           serde_json::json!({"barcode": barcode, "status": status,
+                                                              "serial_number": serial,
+                                                              "volume": vol}))
+                                           .collect::<Vec<_>>(),
                                        "volumes": volumes,
                                        "deposits": deposits.iter().map(|(label, at, receipt, class)|
                                            serde_json::json!({"volume": label, "deposited_at": at,
@@ -164,6 +234,17 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                     println!("  Description: {d}");
                 }
                 println!("  Created:     {created}");
+                // ADR-0012: barcode is the label an operator reads off the
+                // shelf; the chip serial (the cartridge's actual identity)
+                // stays available in --json above rather than cluttering
+                // this line.
+                println!("  Cartridges:  {}", cartridges.len());
+                for (barcode, status, _serial, vol) in &cartridges {
+                    println!(
+                        "    {barcode} [{status}] volume={}",
+                        vol.as_deref().unwrap_or("(none)")
+                    );
+                }
                 println!("  Volumes:     {}", volumes.len());
                 for (label, status) in &volumes {
                     println!("    {label} [{status}]");
@@ -469,12 +550,16 @@ mod tests {
     use super::*;
 
     /// `location list --json` shape (issue: C2 row-listing drift).
+    /// `cartridges` is additive since issue #157 (ADR-0011's location-side
+    /// reader), following the C2b discipline: raw count, same key on the
+    /// table and in `--json`.
     #[test]
     fn pin_location_rows_json_shape() {
         let rows = vec![
             LocationRow {
                 name: "home".to_string(),
                 kind: "shelf".to_string(),
+                cartridges: 2,
                 volumes: 3,
                 deposits: 0,
                 description: "offsite".to_string(),
@@ -482,6 +567,7 @@ mod tests {
             LocationRow {
                 name: "glacier".to_string(),
                 kind: "warehouse".to_string(),
+                cartridges: 0,
                 volumes: 0,
                 deposits: 5,
                 description: String::new(),
@@ -490,7 +576,7 @@ mod tests {
         let value = location_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"deposits":0,"description":"offsite","kind":"shelf","name":"home","volumes":3},{"deposits":5,"description":"","kind":"warehouse","name":"glacier","volumes":0}]"#
+            r#"[{"cartridges":2,"deposits":0,"description":"offsite","kind":"shelf","name":"home","volumes":3},{"cartridges":0,"deposits":5,"description":"","kind":"warehouse","name":"glacier","volumes":0}]"#
         );
     }
 
@@ -758,5 +844,117 @@ mod tests {
         let conn = setup();
         let err = move_volume(&conn, "L6-0001", "nowhere").expect_err("no such location");
         assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    // ---- issue #157: location-side cartridge visibility (ADR-0011) -------
+
+    /// Reproduces the issue's failure mode directly: after `cartridge move
+    /// <bc> --to <location>`, the cartridge must be visible from the
+    /// location side even though nothing is currently mounted on it — the
+    /// "Volumes: 0, no mention of the cartridge" defect the issue
+    /// described.
+    #[test]
+    fn cartridges_at_shows_a_cartridge_with_no_mounted_volume() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status, serial_number)
+             VALUES ('BC001', 'LTO-6', 2500000000000, 'available', 'SER-BC001')",
+            [],
+        )
+        .unwrap();
+        move_cartridge(&conn, "BC001", "home").unwrap();
+
+        let loc_id: i64 = conn
+            .query_row("SELECT id FROM locations WHERE name = 'home'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let cartridges = cartridges_at(&conn, loc_id).unwrap();
+        assert_eq!(
+            cartridges.len(),
+            1,
+            "the cartridge must be visible from the location side"
+        );
+        assert_eq!(cartridges[0].0, "BC001");
+        assert_eq!(cartridges[0].1, "available");
+        assert_eq!(cartridges[0].2.as_deref(), Some("SER-BC001"));
+        assert_eq!(cartridges[0].3, None, "nothing is currently mounted on it");
+    }
+
+    /// The other half: a cartridge WITH a currently mounted volume reports
+    /// it, and an unmounted (displaced) volume never shows as current —
+    /// the same `unmounted_at IS NULL` discriminator `cartridge_rows` uses.
+    #[test]
+    fn cartridges_at_reports_the_current_volume_and_ignores_unmounted_ones() {
+        let conn = setup_bound();
+        move_cartridge(&conn, "A001L6", "home").unwrap();
+        conn.execute(
+            "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
+             WHERE volume_id = (SELECT id FROM volumes WHERE label = 'L6-0002')",
+            [],
+        )
+        .unwrap();
+
+        let loc_id: i64 = conn
+            .query_row("SELECT id FROM locations WHERE name = 'home'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let cartridges = cartridges_at(&conn, loc_id).unwrap();
+        assert_eq!(cartridges.len(), 1);
+        assert_eq!(
+            cartridges[0].3.as_deref(),
+            Some("L6-0001"),
+            "L6-0002 was unmounted; L6-0001 is the current volume"
+        );
+    }
+
+    /// ADR-0011: a retired cartridge is still physically on the shelf and
+    /// must not be hidden from a location audit — the reader must not
+    /// filter by status.
+    #[test]
+    fn cartridges_at_includes_a_retired_cartridge() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+             VALUES ('RETIRED1', 'LTO-6', 2500000000000, 'retired_permanent')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cartridges SET location_id = (SELECT id FROM locations WHERE name = 'home')
+             WHERE barcode = 'RETIRED1'",
+            [],
+        )
+        .unwrap();
+
+        let loc_id: i64 = conn
+            .query_row("SELECT id FROM locations WHERE name = 'home'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let cartridges = cartridges_at(&conn, loc_id).unwrap();
+        assert_eq!(cartridges.len(), 1);
+        assert_eq!(cartridges[0].1, "retired_permanent");
+    }
+
+    /// The acceptance case from the issue: a location can hold cartridges
+    /// while reporting zero volumes, and `location_rows` must show the
+    /// cartridge count rather than implying nothing is there.
+    #[test]
+    fn location_rows_counts_cartridges_independently_of_volumes() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+             VALUES ('BC001', 'LTO-6', 2500000000000, 'available')",
+            [],
+        )
+        .unwrap();
+        move_cartridge(&conn, "BC001", "home").unwrap();
+
+        let rows = location_rows(&conn).unwrap();
+        let home = rows.iter().find(|r| r.name == "home").unwrap();
+        assert_eq!(home.cartridges, 1);
+        assert_eq!(home.volumes, 0, "the cartridge has no mounted volume");
     }
 }
