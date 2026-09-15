@@ -128,33 +128,48 @@ pub fn run(
 ) -> Result<()> {
     match command {
         SnapshotCommands::Create { name } => {
-            let snapshot_id = staging::snapshot_create(conn, name, config)?;
+            // ADR-0012 / issue #159: `snapshot_create_detailed` may report
+            // an existing version instead of minting one — `outcome.minted`
+            // says which. Exit 0 either way; this is success, not a
+            // refusal. `outcome.snapshot_id` names the row (new or reused)
+            // to look up below regardless.
+            let outcome = staging::snapshot_create_detailed(conn, name, config)?;
 
-            let (version, total_size, file_count): (i64, Option<i64>, Option<i64>) = conn
-                .query_row(
-                    "SELECT version, total_size, file_count FROM snapshots WHERE id = ?1",
-                    params![snapshot_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )?;
+            let (total_size, file_count): (Option<i64>, Option<i64>) = conn.query_row(
+                "SELECT total_size, file_count FROM snapshots WHERE id = ?1",
+                params![outcome.snapshot_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
 
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "snapshot_id": snapshot_id,
+                        "snapshot_id": outcome.snapshot_id,
                         "unit": name,
-                        "version": version,
+                        "version": outcome.version,
                         "total_size": total_size,
                         "file_count": file_count,
+                        // Same shape whether minted or not (issue #159):
+                        // one key, `true` on the created path, `false`
+                        // when an existing version was reported instead —
+                        // never two different JSON shapes for the same
+                        // command.
+                        "minted": outcome.minted,
                     })
                 );
-            } else {
+            } else if outcome.minted {
                 println!(
                     "snapshot created: {} v{} ({} files, {} MB)",
                     name,
-                    version,
+                    outcome.version,
                     file_count.unwrap_or(0),
                     total_size.unwrap_or(0) / (1024 * 1024),
+                );
+            } else {
+                println!(
+                    "unit \"{name}\" is unchanged since v{}; no snapshot created",
+                    outcome.version,
                 );
             }
         }
