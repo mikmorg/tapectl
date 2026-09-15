@@ -124,13 +124,29 @@ fn find_dar() -> String {
 /// learned to unload a mismatched tape and pick a matching slot; that logic
 /// now lives in `scripts/mhvtl-device.sh` and this calls it.
 fn mhvtl_load() {
-    if let Some(d) = discover_devices(true) {
-        if d.loaded_tag.is_empty() {
-            eprintln!("warning: no generation-matched cartridge could be loaded");
-        }
-    } else {
-        eprintln!("warning: mhvtl device discovery failed");
-    }
+    // Discovery failure is FATAL, not a warning (issue #192). The config
+    // builder below falls back to a literal `/dev/sg1` when discovery fails,
+    // and on this VM device numbering is not stable across boots
+    // (`CLAUDE.md`): that node can be a non-tape device, or the REAL LTO-6.
+    // Either way the gate stops testing what it claims to test -- at best the
+    // medium serial reads as `None` and every `volume init` refuses for want
+    // of `--cartridge` (ADR-0012), at worst the run binds these volumes to the
+    // real cartridge's serial. Both are far more confusing downstream than
+    // stopping here, which is what this function's caller-facing comment has
+    // always promised it did.
+    let Some(d) = discover_devices(true) else {
+        panic!(
+            "mhvtl device discovery failed. The gate will not fall back to a \
+             hardcoded device node: `ls -l /dev/tape/by-id/` and check that \
+             scsi-XYZZY_A*-nst (mhvtl) is present. scsi-HUJ808A5L4-nst is the \
+             REAL LTO-6 and must never be a target here."
+        );
+    };
+    assert!(
+        !d.loaded_tag.is_empty(),
+        "no generation-matched cartridge could be loaded into the mhvtl drive; \
+         the gate cannot run without one"
+    );
     // Bulk-erase the scratch cartridge — the test equivalent of the production
     // reuse procedure (#27: retire, bulk-erase, `cartridge mark-erased`). The
     // gated suite reuses ONE cartridge across many writes, so from the second
@@ -206,7 +222,9 @@ fn setup_mhvtl(name: &str) -> Harness {
         // Discovered, never hardcoded (issue #111). Falls back to the
         // historical literal only so a machine without the discovery script
         // still builds a config; every gated test calls mhvtl_load() first,
-        // which fails loudly when discovery does not work.
+        // which PANICS when discovery does not work, so no gated test ever
+        // reaches this fallback (issue #192 -- it used to warn and continue,
+        // and this comment used to describe a loudness it did not have).
         device_sg: discover_devices(false)
             .map(|d| d.drive_sg)
             .unwrap_or_else(|| "/dev/sg1".into()),
