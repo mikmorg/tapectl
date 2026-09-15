@@ -361,12 +361,20 @@ next_tape() { # next_tape <intended-label>
         return 0
     fi
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
-        # The DB has no other way to learn the previous volume's cartridge is
-        # gone: `volumes.status` stays 'sealed' forever unless something
-        # retires it, and ADR-0004's copy derivation is DB-status-only. Retire
-        # it here so copy-count/mark-tape-only/audit see the truth a real
-        # single-cartridge operator lives with, instead of crediting a
-        # cartridge that no longer physically exists.
+        # Retire the previous volume before its cartridge is reused, so
+        # copy-count/mark-tape-only/audit see the truth a real single-cartridge
+        # operator lives with instead of crediting a cartridge that no longer
+        # physically holds those bytes.
+        #
+        # This is no longer the catalog's ONLY route to that truth: since
+        # ADR-0010, `volume init` binds the cartridge by its MAM serial and
+        # RECORDS the displacement — it closes the open mount, marks the
+        # displaced volume 'erased' and warns about any unit left without a
+        # copy. That happens at the next init, i.e. after the erase below.
+        # Retiring here is still the honest order: it makes the catalog
+        # truthful at the moment the copy is physically lost, rather than
+        # leaving a window in which the DB credits a copy that is already
+        # gone. Keep both.
         if [ -n "${PREV_LABEL:-}" ]; then
             TCTL volume retire "$PREV_LABEL" --yes \
                 || echo "next_tape: warning — could not retire \"$PREV_LABEL\" before reusing its cartridge (continuing; single-cartridge copy counts may over-credit it)" >&2

@@ -152,11 +152,21 @@ pub struct LtoBackendConfig {
     /// `crate::media::Generation::parse` — `config check` (and every
     /// `Config::load`, via `validate_sizes`) errors if it does not parse.
     pub generation: String,
-    /// Capacity override for a drive that lies about its media (mhvtl) or a
-    /// cartridge whose real capacity differs from its generation's marketed
-    /// figure. Checked ahead of the bound cartridge row and the generation
-    /// table in every capacity resolution (ADR-0010); `config check` warns
-    /// when this is set, since a real drive should never need it.
+    /// Capacity override for a DRIVE that lies about its media — virtual
+    /// drives (mhvtl) and the microcosm harnesses, and nothing else.
+    ///
+    /// It is drive-wide, so it applies to every cartridge this drive ever
+    /// touches. A cartridge whose real capacity differs from its generation's
+    /// marketed figure is a fact about that CARTRIDGE and belongs on the
+    /// cartridge row via `cartridge register --capacity` (ADR-0010: capacity
+    /// is a function of generation, overridden by the drive's
+    /// `capacity_override`, then by the bound cartridge's `nominal_capacity`).
+    /// Reaching for this knob to describe one tape silently mis-sizes all of
+    /// them.
+    ///
+    /// Checked ahead of the bound cartridge row and the generation table in
+    /// every capacity resolution (ADR-0010); `config check` warns when this is
+    /// set, since a real drive should never need it.
     #[serde(default)]
     pub capacity_override: Option<String>,
     #[serde(default = "default_usable_capacity_factor")]

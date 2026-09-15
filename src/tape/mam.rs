@@ -3,8 +3,16 @@
 //! Shells out to `sg_read_attr` and parses its human-readable output. All
 //! fields are best-effort (`Option`) — sg_read_attr's exact labels vary across
 //! sg3-utils versions and virtual/real drives, and mhvtl reports non-physical
-//! capacity values, so callers treat MAM as informational and never gate the
-//! write on it (the write gate uses the configured nominal capacity).
+//! capacity values, so callers treat MAM's CAPACITY figures as informational
+//! and never gate the write on them. The write gate reads
+//! `volumes.capacity_bytes`, decided once at `volume init` from the medium's
+//! detected generation (ADR-0010 decision 3: "no path reads capacity from
+//! config after init").
+//!
+//! MAM is not merely informational everywhere, though: the medium SERIAL read
+//! here is the cartridge's identity (ADR-0012) and the density codes are
+//! ADR-0010's first two detection sources, so both genuinely decide
+//! behaviour.
 
 use std::process::Command;
 
@@ -186,9 +194,15 @@ mod tests {
     }
 
     // Shaped after mhvtl's actual `sg_read_attr` output (ADR-0010 detection
-    // source 2): mhvtl reports only the format density code, never a medium
-    // serial number, and its manufacturer string is the fixed "linuxVTL"
-    // rather than a real vendor.
+    // source 2): mhvtl reports only the format density code, and its
+    // manufacturer string is the fixed "linuxVTL" rather than a real vendor.
+    //
+    // This particular sample carries no "Medium serial number" line, which is
+    // what the test below pins. Do NOT read that as "mhvtl exposes no serial"
+    // — it does, and stably: ADR-0010's 2026-09-14 correction records
+    // `E01001L8_1775794348` from this repo's own recording, and
+    // `volume::binding`'s tests bind against it. An unbound volume is a copy
+    // the catalog cannot place, so that distinction matters.
     const MHVTL_SHAPED_SAMPLE: &str = "Attribute values:
   Remaining capacity in partition [MiB]: 2400000
   Maximum capacity in partition [MiB]: 2400000
