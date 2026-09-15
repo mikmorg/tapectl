@@ -121,7 +121,11 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// before the tape device is opened, so a wrong-tape or wrong-flag run costs
 /// nothing. Every catalog MUTATION runs after `check_fresh_write_contact`
 /// passes and inside one transaction, so a refused init never displaces a
-/// volume in the catalog.
+/// volume in the catalog. `volume_write`'s own late-binding call
+/// ([`bind_late`]) honours the same rule for the same reason: it runs after
+/// `check_fresh_write_contact` + `reposition_for_resume(0)`, not before
+/// `build`/`validate`/`TapeStore::open`, so a write refused at any of those
+/// stages cannot leave a committed displacement behind either (issue #154).
 #[allow(clippy::too_many_arguments)] // conn/config + label/device/block_size + force + the two ADR-0010 declarations
 pub fn volume_init(
     conn: &Connection,
@@ -743,18 +747,6 @@ pub fn volume_write(
     check_loaded_cartridge(conn, volume_id, label, mam.serial.as_deref())?;
     check_loaded_generation(label, &det, volume_media_type.as_deref())?;
 
-    // ADR-0010's binding ladder, one stage later, for the volume `volume
-    // init` could not bind (W3 Change 8).
-    bind_late(
-        conn,
-        volume_id,
-        label,
-        &det,
-        volume_media_type.as_deref(),
-        &backend.generation,
-        nominal_capacity,
-    )?;
-
     let volume_uuid = volume_uuid(conn, volume_id)?;
     let created_at = chrono::Utc::now().to_rfc3339();
     // Session directory: materialize-to-staging (`v2-open-questions.md`
@@ -860,6 +852,24 @@ pub fn volume_write(
     // read_file rewinds+forward-spaces internally) — the write below must
     // start at BOT exactly like an untouched fresh session would.
     store.reposition_for_resume(0)?;
+
+    // ADR-0010's binding ladder, one stage later, for the volume `volume
+    // init` could not bind (W3 Change 8) — moved here, below the File 0
+    // contact check, so a refused write cannot displace a volume in the
+    // catalog (issue #154: this used to run before `build`/`validate`/
+    // `TapeStore::open`/`check_fresh_write_contact`, so any of those four
+    // refusals left a committed displacement with nothing to roll it back).
+    // Mirrors `volume_init`'s ordering exactly (see the invariant comment
+    // above `volume_init`).
+    bind_late(
+        conn,
+        volume_id,
+        label,
+        &det,
+        volume_media_type.as_deref(),
+        &backend.generation,
+        nominal_capacity,
+    )?;
 
     let validated = built.into_validated(&keys, &mut store).map_err(|errs| {
         TapectlError::Other(format!(
@@ -4454,6 +4464,280 @@ mod tests {
                 .expect_err("a retired_permanent cartridge must never be written");
             assert!(err.to_string().contains("mark-erased"), "got: {err}");
             assert_eq!(bound_barcode(&conn, vol_id), None);
+        }
+
+        /// Issue #154's negative control: prove the displacement `bind_late`
+        /// performs is real and observable, independent of where the call
+        /// site sits inside `volume_write`. Without this, "no displacement
+        /// is observable" in an ordering test would pass vacuously for the
+        /// wrong reason (nothing was ever at risk of being displaced).
+        ///
+        /// V1 is a live, sealed volume already mounted (open, `unmounted_at
+        /// IS NULL`) on a cartridge whose serial is "SER-1". Binding V2 to
+        /// that same serial must mark V1 `erased`, close V1's mount, and
+        /// log one `displaced` event naming it — exactly `binding::
+        /// bind_cartridge`'s documented behaviour (ADR-0010: "never refuse
+        /// it, only record it").
+        #[test]
+        fn bind_late_displaces_a_live_open_mounted_volume_on_the_matched_cartridge() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A001L6', 'LTO-6', 2500000000000, 'SER-1', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('V1-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let v1_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, v1_id],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('V2-NEW', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let v2_id = conn.last_insert_rowid();
+
+            bind_late(
+                &conn,
+                v2_id,
+                "V2-NEW",
+                &det_with_serial(Some("SER-1")),
+                Some("LTO-6"),
+                "LTO-6",
+                2_500_000_000_000,
+            )
+            .unwrap();
+
+            let v1_status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![v1_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                v1_status, "erased",
+                "the displaced volume must be marked erased"
+            );
+
+            let v1_mount_closed: bool = conn
+                .query_row(
+                    "SELECT unmounted_at IS NOT NULL FROM cartridge_volumes WHERE volume_id = ?1",
+                    params![v1_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                v1_mount_closed,
+                "the displaced volume's mount must be closed"
+            );
+
+            let displaced_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = 'displaced'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                displaced_events, 1,
+                "exactly one displaced event must be logged"
+            );
+
+            // V2 now holds the live mount on the cartridge V1 was displaced
+            // from.
+            assert_eq!(bound_barcode(&conn, v2_id).as_deref(), Some("A001L6"));
+        }
+
+        /// Issue #154, the ordering fix: a `volume_write` refused before the
+        /// device is ever opened must leave the catalog exactly as it found
+        /// it — no displaced volume, no closed mount, no `displaced` event —
+        /// for a volume that has nothing to do with the one being written.
+        ///
+        /// HONESTY NOTE, read before trusting this test: `bind_late` returns
+        /// `Ok(())` the instant `det.mam.serial` is `None` (this module's
+        /// own `no_serial_leaves_the_volume_unbound_without_erroring` pins
+        /// that), and every in-process harness for `volume_write` — this one
+        /// included — has to drive it with a device path
+        /// `media_detect::detect` cannot actually read, because there is no
+        /// injectable seam into `detect` (deliberately: adding one here
+        /// would be scope creep on the write path, see issue #154's
+        /// discussion). So in THIS test `bind_late` never has a serial to
+        /// act on, at either the old call site or the new one, and this
+        /// test is expected to pass identically before and after the
+        /// ordering fix — it does not, and cannot, reproduce the bug. Test 1
+        /// above (`bind_late_displaces_a_live_open_mounted_volume_on_the_
+        /// matched_cartridge`) is the actual reproduction, driving
+        /// `bind_late` directly with a serial that matches. This test's
+        /// value is as a regression guard: if some future change moved
+        /// `bind_late` back above the pre-write checks AND also made a
+        /// serial reachable from a harness like this one, this is the
+        /// assertion that would catch it.
+        #[test]
+        fn a_refused_write_leaves_an_unrelated_mounted_volume_untouched() {
+            let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+
+            // V1: a live, sealed volume already mounted on a cartridge that
+            // has nothing to do with the volume this write targets —
+            // standing in for "the wrong tape is loaded" from issue #154's
+            // failure narrative.
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A001L6', 'LTO-6', 2500000000000, 'SER-1', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('V1-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let v1_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cart_id, v1_id],
+            )
+            .unwrap();
+
+            // Staged before escrow existed: an escrow gap, exactly like
+            // `force_does_not_bypass_the_escrow_check_and_never_reaches_the_
+            // device` above, so `validate` refuses before the tape device
+            // is ever opened.
+            let other = crate::crypto::keys::generate_keypair();
+            set_key_fingerprints(
+                &conn,
+                stage_set_id,
+                Some(&serde_json::to_string(&vec![other.public_key]).unwrap()),
+            );
+            register_escrow(&conn);
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let slices_dir = tmp.path().join("slices");
+            fs::create_dir_all(&slices_dir).unwrap();
+            let content = b"encrypted slice bytes for the ordering test".repeat(8);
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (?1, 1, ?2, ?2, ?3, ?4)",
+                params![
+                    stage_set_id,
+                    content.len() as i64,
+                    direct_hash(b"plaintext hash is not exercised here"),
+                    direct_hash(&content),
+                ],
+            )
+            .unwrap();
+            let slice_id = conn.last_insert_rowid();
+            let slice_path = slices_dir.join(format!("slice_{slice_id}.age"));
+            fs::write(&slice_path, &content).unwrap();
+            conn.execute(
+                "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+                params![slice_path.to_string_lossy(), slice_id],
+            )
+            .unwrap();
+
+            // V2: the volume this write actually targets — unbound, and
+            // unrelated to V1's cartridge.
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('ORDERTEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            let paths = TapectlPaths::new(home);
+            paths.ensure_dirs().unwrap();
+
+            let staging_dir = tmp.path().join("staging");
+            fs::create_dir_all(&staging_dir).unwrap();
+            let mut config = Config::default();
+            config.staging.directory = staging_dir.to_string_lossy().into_owned();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "no-such-drive".into(),
+                device_tape: "/nonexistent/tapectl-order-test-nst".into(),
+                device_sg: "/nonexistent/tapectl-order-test-sg".into(),
+                generation: "LTO-8".into(),
+                capacity_override: Some("2400G".into()),
+                usable_capacity_factor: 0.92,
+                enospc_buffer: "50M".into(),
+            });
+
+            let err = volume_write(
+                &conn,
+                &paths,
+                &config,
+                "ORDERTEST",
+                "/nonexistent/tapectl-order-test-nst",
+                512 * 1024,
+                false, // --force
+                false, // --allow-missing-escrow
+            )
+            .expect_err("the escrow gap must refuse before the device is touched");
+            assert!(
+                err.to_string().contains("failed pre-write validation"),
+                "expected the pre-flight refusal, got: {err}"
+            );
+
+            // The assertion that matters: V1, unrelated to this write, is
+            // exactly as it was before the refused write ran.
+            let v1_status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![v1_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                v1_status, "sealed",
+                "a refused write must not touch an unrelated volume's status"
+            );
+
+            let v1_mount_open: bool = conn
+                .query_row(
+                    "SELECT unmounted_at IS NULL FROM cartridge_volumes WHERE volume_id = ?1",
+                    params![v1_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                v1_mount_open,
+                "a refused write must not close an unrelated volume's mount"
+            );
+
+            let displaced_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = 'displaced'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                displaced_events, 0,
+                "a refused write must log no displacement"
+            );
         }
     }
 
