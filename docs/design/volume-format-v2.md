@@ -27,7 +27,9 @@ filemark), in this fixed order:
 ┌──── FRONT: plaintext navigation (all known pre-write, no key needed) ─────────┐
 │ File 0  ID thunk        plaintext   identity: label, uuid, layout_version,    │
 │                                     total_files, and the positions of the     │
-│                                     front index (File 3) and the seal marker. │
+│                                     front index (File 3) and the seal marker; │
+│                                     plus a [media] block describing the        │
+│                                     cartridge it was written on (ADR-0010).   │
 │                                     "The full map is File 3."                  │
 │ File 1  System guide    plaintext   heir manual (mt/dd/age/dar/sha256sum).    │
 │ File 2  RESTORE.sh      plaintext   heir tool; --info reads File 3.           │

@@ -142,6 +142,16 @@ File 0 = **identity + pointers, nothing per-file**:
   `total_files`. **Everything else** (`data_start/end`, `first_envelope`,
   `num_envelopes`, `mini_index`, operator positions) is deleted — those facts
   live only in File 3 now, as `[[files]]` entries typed by kind.
+- `[media]`: `cartridge_manufacturer`, `cartridge_serial`, `tape_length_meters`,
+  `load_count_at_write` — what the drive's MAM reported about the cartridge at
+  the moment this File 0 was written. *Correction 2026-09-15: this table was
+  added by ADR-0010 and has been written by shipped code since, but was recorded
+  in neither normative doc — §2.3 said "identity + pointers, nothing per-file"
+  and `volume-format-v2.md` §1 did not mention it. The rule it does not break:
+  these are facts about the MEDIUM, not per-file facts, so "nothing per-file"
+  still holds. It is the LAST table in the document, and must stay last —
+  RESTORE.sh's `toml_val` reader is table-blind and first-match-wins across the
+  concatenated tables, so only a trailing table can be appended to safely.*
 - The human-readable header keeps the "guide is File 1, map is File 3" text.
 `volume_init`'s thunk remains a **provisional identity stamp** (positions
 unknown at init); the write session rewrites File 0 from BOT with the real one —
