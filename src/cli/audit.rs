@@ -1383,6 +1383,58 @@ mod tests {
             }
         }
 
+        /// A second COPY of what `source_label` already carries: the same
+        /// stage sets, written to a new volume.
+        ///
+        /// That is what a copy IS — identical content on another medium
+        /// (ADR-0012) — and it is what the write path actually produces when
+        /// an operator writes one stage set to two tapes. Calling
+        /// [`seed_written_volume`] twice does NOT produce this: it mints a
+        /// fresh snapshot per volume, so the unit ends up with two distinct
+        /// `'current'` VERSIONS holding one copy each, which is a unit with
+        /// no redundancy at all (issue #153).
+        fn seed_second_copy_of(
+            conn: &Connection,
+            source_label: &str,
+            label: &str,
+            status: &str,
+            bytes_written: i64,
+        ) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, bytes_written, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000000, ?2, ?3)",
+                params![label, bytes_written, status],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT w.stage_set_id, w.snapshot_id FROM writes w
+                     JOIN volumes v ON v.id = w.volume_id
+                     WHERE v.label = ?1",
+                )
+                .unwrap();
+            let carried: Vec<(i64, i64)> = stmt
+                .query_map(params![source_label], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                !carried.is_empty(),
+                "fixture: volume {source_label} has no completed writes to copy"
+            );
+            for (stage_set_id, snapshot_id) in carried {
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![stage_set_id, snapshot_id, vol_id],
+                )
+                .unwrap();
+            }
+        }
+
         /// The severity case: a `sealed` volume 10% utilized must produce a
         /// real `compaction_candidate` finding. Asserted on the finding
         /// itself, not on an exit code — an exit code of 1 could come from
@@ -1628,13 +1680,17 @@ mod tests {
         fn run_surfaces_the_compaction_warning_for_a_sealed_volume() {
             let (conn, unit_id) = setup();
             seed_written_volume(&conn, unit_id, "SEAL03", "sealed", 1000, 100, 900);
-            seed_written_volume(&conn, unit_id, "SEAL04", "sealed", 1000, 100, 900);
+            // A real second copy, not a second version — see the guard below.
+            seed_second_copy_of(&conn, "SEAL03", "SEAL04", "sealed", 1000);
 
             let config = Config::default();
             assert_eq!(
                 copy_count_for_unit(&conn, unit_id).unwrap(),
                 2,
-                "fixture guard: copy_count must clear min_copies so no violation masks the result"
+                "fixture guard: copy_count must clear min_copies so no violation masks \
+                 the result. Two calls to seed_written_volume would NOT do this — that \
+                 mints a version each, giving one copy per version (issue #153) — so the \
+                 second volume must carry the same stage sets as the first"
             );
 
             let exit_code = run(&conn, &config, None, false, false).unwrap();
