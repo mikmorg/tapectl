@@ -171,10 +171,37 @@ struct LocationRow {
     /// registered. `?` is a rebuilt row the tape could not vouch for (#137).
     #[tabled(rename = "Escrow")]
     escrow: String,
+    /// Per-copy evidence age (issue #196, closing #14's deferred amendment
+    /// to #57): when this specific TAPE was last PASSED-verified, not a
+    /// claim about the tape's state right now (ADR-0001: the catalog is a
+    /// ledger of claims; the tape is authoritative only at contact). `None`
+    /// means no passed `volume verify` is on record at all -- rendered as
+    /// `"never"` in the table, distinctly from an aged `"<n>d ago"`, so a
+    /// never-checked copy cannot be mistaken for a recently-checked one
+    /// (git-annex-`whereis` shape: report last-known state, say so).
+    ///
+    /// Sourced from `policy::evidence::per_volume_verification`, NOT
+    /// `remaining_coverage_evidence`: that function gates every row through
+    /// `coverage::eligible`, which would silently drop the evidence for
+    /// exactly the retired/quarantined/erased volumes `locate` shows on
+    /// purpose (#57). This column answers "when was this medium last
+    /// checked", independent of whether it still counts as a copy -- the
+    /// Status/Serviceable columns already answer that question.
+    ///
+    /// A warehouse deposit (ADR-0006) is a different evidence class with
+    /// its own `Warehouse` column above; it never populates this field,
+    /// because a deposit has never been verified by tapectl and never will
+    /// be -- every row here comes from a completed tape `write` only.
+    #[tabled(rename = "Verified", display_with = "display_verification_age")]
+    last_verified: Option<String>,
 }
 
 fn display_serviceable(v: &bool) -> String {
     if *v { "yes" } else { "NO" }.to_string()
+}
+
+fn display_verification_age(v: &Option<String>) -> String {
+    crate::policy::evidence::compact_age(v.as_deref(), chrono::Utc::now().naive_utc())
 }
 
 fn display_warehouse(v: &[String]) -> String {
@@ -241,13 +268,27 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
         None => std::collections::HashMap::new(),
     };
 
+    // Per-copy evidence age (issue #196): one call to
+    // `policy::evidence::per_volume_verification`, indexed by volume label
+    // (`volumes.label` is `UNIQUE`, migration 001). Deliberately NOT
+    // `remaining_coverage_evidence` -- see that field's doc comment on
+    // `LocationRow` for why the eligibility-gated function would silently
+    // drop evidence for exactly the retired/quarantined/erased volumes
+    // this listing shows on purpose.
+    let verification: std::collections::HashMap<String, Option<String>> =
+        crate::policy::evidence::per_volume_verification(conn, unit_id)?
+            .into_iter()
+            .map(|e| (e.volume_label, e.last_verified))
+            .collect();
+
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![unit_id], |row| {
+            let volume: String = row.get(0)?;
             let serviceable: i64 = row.get(6)?;
             let stage_set_id: i64 = row.get(8)?;
+            let last_verified = verification.get(&volume).cloned().flatten();
             Ok(LocationRow {
-                volume: row.get(0)?,
                 status: row.get(1)?,
                 location: row.get(2)?,
                 version: row.get(3)?,
@@ -264,6 +305,8 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                     Some(crate::policy::escrow::Coverage::Unknown) => "?".to_string(),
                     Some(crate::policy::escrow::Coverage::Gap(_)) => "NO".to_string(),
                 },
+                last_verified,
+                volume,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -419,6 +462,21 @@ pub fn run(
                         unserviceable.join(", ")
                     );
                 }
+                // ADR-0004 Tier 1 / ADR-0001: the caveat itself has to reach
+                // this output, not just a doc comment (issue #196, #14's
+                // deferred amendment to #57) -- git-annex's `whereis` is
+                // explicit that it does not contact remotes to verify, and
+                // this command is the same shape: "Verified" is the
+                // catalog's last-known claim, never a live check performed
+                // just now.
+                println!(
+                    "\nnote: \"Verified\" is this catalog's last-known record of each \
+                     copy's most recent PASSED `volume verify` — not a check of the tape \
+                     performed just now. \"never\" means no passed verification is on \
+                     record, not that the copy is bad; an aged value does not mean the \
+                     tape has since failed. Re-run `tapectl volume verify <label>` to \
+                     refresh it."
+                );
             }
         }
 
@@ -690,6 +748,13 @@ mod tests {
         );
     }
 
+    /// Pins the WHOLE `--json` shape, including `last_verified` (issue
+    /// #196). Every key present before this change keeps its exact prior
+    /// value and position (`serde_json::Value`'s map is a `BTreeMap`, so
+    /// keys sort alphabetically) -- `last_verified` is the only addition,
+    /// per the C2b additive-JSON discipline. One row is aged, the other
+    /// `null` (never verified), so the pin also proves the two render as
+    /// different JSON values, not just different table text.
     #[test]
     fn pin_location_rows_json_shape() {
         let rows = vec![
@@ -703,6 +768,7 @@ mod tests {
                 serviceable: true,
                 warehouse: vec![],
                 escrow: "-".to_string(),
+                last_verified: Some("2026-06-01 00:00:00".to_string()),
             },
             LocationRow {
                 volume: "L6-0002".to_string(),
@@ -714,13 +780,51 @@ mod tests {
                 serviceable: false,
                 warehouse: vec!["glacier".to_string(), "vault2".to_string()],
                 escrow: "?".to_string(),
+                last_verified: None,
             },
         ];
         let value = location_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"escrow":"-","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"escrow":"?","location":"parents-house","serviceable":false,"slices":0,"status":"quarantined","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
+            r#"[{"escrow":"-","last_verified":"2026-06-01 00:00:00","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"escrow":"?","last_verified":null,"location":"parents-house","serviceable":false,"slices":0,"status":"quarantined","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
         );
+    }
+
+    /// Rule #6's discipline made concrete: every key that existed BEFORE
+    /// this change is still present with its old meaning, and the new key
+    /// is additive alongside them -- not a replacement for any of them.
+    #[test]
+    fn json_gains_last_verified_additively_without_disturbing_existing_keys() {
+        let rows = vec![LocationRow {
+            volume: "L6-0001".to_string(),
+            status: "sealed".to_string(),
+            location: "unknown".to_string(),
+            version: 1,
+            slices: 3,
+            written: "2026-07-01T00:00:00Z".to_string(),
+            serviceable: true,
+            warehouse: vec![],
+            escrow: "-".to_string(),
+            last_verified: Some("2026-06-01 00:00:00".to_string()),
+        }];
+        let value = location_rows_to_json(&rows);
+        let obj = value[0].as_object().unwrap();
+        assert_eq!(obj.get("volume").unwrap(), "L6-0001");
+        assert_eq!(obj.get("status").unwrap(), "sealed");
+        assert_eq!(obj.get("location").unwrap(), "unknown");
+        assert_eq!(obj.get("version").unwrap(), 1);
+        assert_eq!(obj.get("slices").unwrap(), 3);
+        assert_eq!(obj.get("written").unwrap(), "2026-07-01T00:00:00Z");
+        assert_eq!(obj.get("serviceable").unwrap(), true);
+        assert!(obj
+            .get("warehouse_deposits")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(obj.get("escrow").unwrap(), "-");
+        // The new key.
+        assert_eq!(obj.get("last_verified").unwrap(), "2026-06-01 00:00:00");
     }
 
     /// A unit with completed writes to two volumes: one `sealed`, one in
