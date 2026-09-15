@@ -70,6 +70,46 @@ filemark), in this fixed order:
   price of front-loading the index (a front index alone would make a truncated tape
   look sealed).
 
+### 1.1 File 0's `[media]` table (normative)
+
+`[media]` is the last table in File 0 and **must stay last**: RESTORE.sh's
+`toml_val` reader is table-blind and first-match-wins across the tables its
+`sed` concatenates, so only a trailing table can gain a key without risking a
+name that shadows one an earlier table owns.
+
+| Key | Meaning |
+|---|---|
+| `cartridge_manufacturer` | MAM manufacturer string at write time, `""` if unknown |
+| `cartridge_serial` | the cartridge's identity — see `cartridge_identity_source` |
+| `cartridge_identity_source` | **how `cartridge_serial` was established**: `"mam"` or `"operator"` |
+| `tape_length_meters` | MAM length, `0` if unknown |
+| `load_count_at_write` | MAM load count at write time, `0` if unknown |
+
+**`cartridge_identity_source` (ADR-0010, ADR-0012).** A reader — the heir path
+included — cannot otherwise tell a chip-reported serial from a barcode somebody
+typed, and so cannot tell whether `cartridge_serial` is verifiable against the
+medium itself or only against the catalog.
+
+- `"mam"` — `cartridge_serial` is the serial the cartridge's own chip reported
+  when this volume was bound to it. Verifiable against the medium: load the
+  tape, read the MAM, compare.
+- `"operator"` — no serial was readable when this volume was bound, so the
+  operator named the cartridge (`volume init --cartridge <barcode>`) and
+  `cartridge_serial` carries **that barcode**. A barcode is a relabelable
+  sticker (ADR-0012), so this string is verifiable only against the catalog,
+  and only for as long as nobody re-labels the cartridge.
+- **Absent means unknown, and never means `"mam"`.** Every tape written before
+  the field existed omits it, and those tapes stay readable forever; a reader
+  that defaulted the absent case to `"mam"` would make all of them falsely
+  attest a chip-verified serial. A reader that cannot tell must say so.
+
+The value records how the identity was established **at the binding**, not what
+the drive happens to report at this contact: a cartridge whose chip could not be
+read at `volume init` is `"operator"` on every volume of that binding, even if a
+later drive reads its MAM cleanly. Corroborating the loaded medium against that
+record at each contact is a separate concern, and belongs to the catalog rather
+than to these bytes.
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |

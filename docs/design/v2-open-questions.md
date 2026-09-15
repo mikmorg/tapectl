@@ -142,9 +142,15 @@ File 0 = **identity + pointers, nothing per-file**:
   `total_files`. **Everything else** (`data_start/end`, `first_envelope`,
   `num_envelopes`, `mini_index`, operator positions) is deleted — those facts
   live only in File 3 now, as `[[files]]` entries typed by kind.
-- `[media]`: `cartridge_manufacturer`, `cartridge_serial`, `tape_length_meters`,
-  `load_count_at_write` — what the drive's MAM reported about the cartridge at
-  the moment this File 0 was written. *Correction 2026-09-15: this table was
+- `[media]`: `cartridge_manufacturer`, `cartridge_serial`,
+  `cartridge_identity_source`, `tape_length_meters`, `load_count_at_write` —
+  what the drive's MAM reported about the cartridge at the moment this File 0
+  was written, plus how the cartridge's identity was established.
+  `cartridge_identity_source` is `"mam"` (a chip-reported serial) or
+  `"operator"` (a barcode the operator typed because no serial was readable at
+  init); **absent means unknown and never means `"mam"`**, because every tape
+  written before the field existed omits it. The full field list is normative in
+  `volume-format-v2.md` §1.1. *Correction 2026-09-15: this table was
   added by ADR-0010 and has been written by shipped code since, but was recorded
   in neither normative doc — §2.3 said "identity + pointers, nothing per-file"
   and `volume-format-v2.md` §1 did not mention it. The rule it does not break:
