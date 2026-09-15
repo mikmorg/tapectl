@@ -38,6 +38,10 @@ pub enum CartridgeCommands {
         /// Filter by status
         #[arg(long)]
         status: Option<String>,
+        /// Filter by physical location name (issue #157) -- the sibling
+        /// of `--status`, same bound-parameter discipline (issue #110).
+        #[arg(long)]
+        location: Option<String>,
     },
     /// Show cartridge details
     Info {
@@ -237,8 +241,8 @@ pub fn run(
                 );
             }
         }
-        CartridgeCommands::List { status } => {
-            let rows = cartridge_rows(conn, status.as_deref())?;
+        CartridgeCommands::List { status, location } => {
+            let rows = cartridge_rows(conn, status.as_deref(), location.as_deref())?;
             if json_output {
                 println!(
                     "{}",
@@ -469,8 +473,14 @@ pub fn run(
 /// (`WHERE c.status = '{st}'`). It arrives from a clap arg on a
 /// single-operator tool, so it was hygiene rather than a live exploit — but
 /// every other query in this file binds, and one interpolated string is how
-/// the habit erodes.
-fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<CartridgeRow>> {
+/// the habit erodes. `location` (issue #157) is bound the same way, by
+/// name against the already-present `LEFT JOIN locations`, never by
+/// resolving to an id first — one fewer query, and nothing to interpolate.
+fn cartridge_rows(
+    conn: &Connection,
+    status: Option<&str>,
+    location: Option<&str>,
+) -> Result<Vec<CartridgeRow>> {
     // LEFT JOIN, not JOIN: `location_id` is nullable and a cartridge that
     // has never been placed must still appear in the list. The same
     // reasoning as `catalog.rs`'s volume listing.
@@ -482,14 +492,20 @@ fn cartridge_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<Cartrid
                 l.name as location
          FROM cartridges c
          LEFT JOIN locations l ON l.id = c.location_id";
-    let sql = match status {
-        Some(_) => format!("{SELECT} WHERE c.status = ?1 ORDER BY c.barcode"),
-        None => format!("{SELECT} ORDER BY c.barcode"),
+    let sql = match (status, location) {
+        (None, None) => format!("{SELECT} ORDER BY c.barcode"),
+        (Some(_), None) => format!("{SELECT} WHERE c.status = ?1 ORDER BY c.barcode"),
+        (None, Some(_)) => format!("{SELECT} WHERE l.name = ?1 ORDER BY c.barcode"),
+        (Some(_), Some(_)) => {
+            format!("{SELECT} WHERE c.status = ?1 AND l.name = ?2 ORDER BY c.barcode")
+        }
     };
     let mut stmt = conn.prepare(&sql)?;
-    let bound: Vec<&dyn rusqlite::types::ToSql> = match &status {
-        Some(st) => vec![st],
-        None => vec![],
+    let bound: Vec<&dyn rusqlite::types::ToSql> = match (&status, &location) {
+        (None, None) => vec![],
+        (Some(st), None) => vec![st],
+        (None, Some(loc)) => vec![loc],
+        (Some(st), Some(loc)) => vec![st, loc],
     };
     let rows = stmt
         .query_map(bound.as_slice(), |row| {
@@ -569,7 +585,7 @@ mod tests {
     #[test]
     fn status_filter_is_applied_and_bound() {
         let conn = seed();
-        let rows = cartridge_rows(&conn, Some("available")).unwrap();
+        let rows = cartridge_rows(&conn, Some("available"), None).unwrap();
         assert_eq!(rows.len(), 2, "only the two available cartridges");
         assert!(rows.iter().all(|r| r.status == "available"));
     }
@@ -593,7 +609,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = cartridge_rows(&conn, None).unwrap();
+        let rows = cartridge_rows(&conn, None, None).unwrap();
         assert_eq!(rows.len(), 3, "an unplaced cartridge must not vanish");
         let placed = rows.iter().find(|r| r.barcode == "A001L6").unwrap();
         assert_eq!(placed.location.as_deref(), Some("home-rack"));
@@ -604,7 +620,7 @@ mod tests {
     #[test]
     fn no_filter_lists_everything() {
         let conn = seed();
-        assert_eq!(cartridge_rows(&conn, None).unwrap().len(), 3);
+        assert_eq!(cartridge_rows(&conn, None, None).unwrap().len(), 3);
     }
 
     /// A value containing a quote must be treated as data, not SQL. Under the
@@ -613,12 +629,84 @@ mod tests {
     #[test]
     fn a_quote_in_the_status_is_data_not_sql() {
         let conn = seed();
-        let rows = cartridge_rows(&conn, Some("available' OR '1'='1")).unwrap();
+        let rows = cartridge_rows(&conn, Some("available' OR '1'='1"), None).unwrap();
         assert!(
             rows.is_empty(),
             "a quoted payload must match no rows, not inject (got {} rows)",
             rows.len()
         );
+    }
+
+    // ---- issue #157: `cartridge list --location` ----------------------
+
+    /// The sibling of `--status` (issue #157's cheap half). Filters to
+    /// exactly the cartridges parked at the named location.
+    #[test]
+    fn location_filter_is_applied_and_bound() {
+        let conn = seed();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home-rack', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cartridges SET location_id = (SELECT id FROM locations WHERE name = 'home-rack')
+             WHERE barcode IN ('A001L6', 'A002L6')",
+            [],
+        )
+        .unwrap();
+
+        let rows = cartridge_rows(&conn, None, Some("home-rack")).unwrap();
+        assert_eq!(rows.len(), 2, "only the two cartridges parked there");
+        assert!(rows
+            .iter()
+            .all(|r| r.location.as_deref() == Some("home-rack")));
+    }
+
+    /// `--location` and `--status` combine (AND), matching how the two
+    /// filters are meant to be used together.
+    #[test]
+    fn location_and_status_filters_combine() {
+        let conn = seed();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home-rack', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE cartridges SET location_id = (SELECT id FROM locations WHERE name = 'home-rack')
+             WHERE barcode IN ('A001L6', 'A002L6')",
+            [],
+        )
+        .unwrap();
+
+        let rows = cartridge_rows(&conn, Some("retired_permanent"), Some("home-rack")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].barcode, "A002L6");
+    }
+
+    /// Issue #110's precedent, restated for the new filter: a quoted
+    /// injection payload must be treated as data and match no rows, never
+    /// interpolated into the query.
+    #[test]
+    fn a_quote_in_the_location_is_data_not_sql() {
+        let conn = seed();
+        let rows = cartridge_rows(&conn, None, Some("home-rack' OR '1'='1")).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a quoted payload must match no rows, not inject (got {} rows)",
+            rows.len()
+        );
+    }
+
+    /// An unknown location name is simply a filter that matches nothing —
+    /// the same behaviour as an unrecognised `--status` value, not a
+    /// separate "location not found" error path.
+    #[test]
+    fn an_unknown_location_filter_matches_nothing() {
+        let conn = seed();
+        let rows = cartridge_rows(&conn, None, Some("nowhere")).unwrap();
+        assert!(rows.is_empty());
     }
 
     // ---- ADR-0010: `cartridge register` ----
