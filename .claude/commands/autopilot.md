@@ -16,6 +16,81 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
+- **THE PRE-PRODUCTION QUEUE 2026-09-14 — GitHub label `review-2026-09-13`, 40
+  issues. Nothing ships to a production tape until it is empty, documentation
+  included.** The 2026-09-13 adversarial review
+  (`docs/audits/2026-09-13-post-redesign-review.md`, 59 confirmed, ~44 distinct)
+  was grilled question by question and **every ruling was ratified on
+  2026-09-14**. The decisions are in
+  `docs/adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md`;
+  ADR-0010 and ADR-0011 carry dated corrections to their own text; `CONTEXT.md`
+  has the vocabulary (*Copy*, *Version*, *Cartridge Identity*, *Barcode*); the
+  process rulings are in `docs/handoff.md` "Decisions already ratified". Every
+  issue states its ruling as **the** fix.
+  1. **Work the label in severity order**, and inside a severity in the
+     dependency order the issues state. The high tier, in order:
+     **#153** (copy count per Version — removes the over-count, the one that can
+     lose data) → **#159** (a Version is minted only when content changed, which
+     is what makes #153 exact) → **#154** (bind after the contact check; small
+     and independent) → **#160** (the cartridge identity model — defines what
+     #155, #161–#165, #179 and #180 depend on) → **#155** (the no-serial
+     displacement refusal, #160's step 4 seen from the other side) → **#147**
+     (the consent tiers, inverted in the shipped code; needs #153's per-version
+     count for "zero" to mean zero).
+     The `consent-path` label marks the ten issues that touch ADR-0008 tiers or
+     cartridge identity (#147, #154, #155, #158, #160, #161, #162, #163, #164,
+     #165): sequence those together and gate them together.
+  2. **Correct facts, never decisions.** A ratified ruling is not re-opened by
+     autopilot, even where the audit's own "Fix:" bullet disagrees with it —
+     several do, and the issues say so. If implementing exposes a genuine new
+     fork that no ruling answers, park it (rule 4). If an issue's *facts* are
+     wrong (a drifted line number, a claim the code no longer supports), correct
+     the record in the issue and carry on.
+  3. **Gate per item only for write-path and restore-path changes** (`src/volume`,
+     `src/tape`, `src/store.rs`, RESTORE.sh — every issue's Acceptance section
+     says which it is). For those, run
+     `TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`
+     after integrating that item. Everything else is gated in batches: the
+     fmt/clippy/test gate after **every** integration as always, the mhvtl gate
+     after each batch of non-tape items lands and before push. The lifecycle
+     suite (`scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
+     --erase short --single-cartridge --i-will-lose-the-cartridge <barcode>`)
+     runs once after the `consent-path` set has landed and once when the queue is
+     empty. **Check `ls -l /dev/tape/by-id/` first**: `scsi-XYZZY_A*-nst` is
+     mhvtl (nst1–nst4 at last check), `scsi-HUJ808A5L4-nst` is the REAL LTO-6 and
+     is currently detached from this VM, physically on home2. **Never nst0.**
+  4. **Park decisions and keep working; never report the queue empty while
+     anything is parked.** A parked item keeps its label and gains a comment
+     headed "PARKED — needs CTO" with the options and your recommendation; the
+     batch goes to the CTO per "Talking to the CTO". "Queue empty" means: zero
+     open issues under the label, none parked, gate green, mhvtl gate 26/26,
+     lifecycle 45/45.
+  5. **Excluded by ruling:** #143 (`config set/add/remove`) and #144
+     (`--policy-aware` packing) stay open, unlabelled, and are not this queue.
+     #145 (`volume calibrate`) is closed as rejected. **#182** — the MAM
+     MiB-vs-MB question — is `needs:cto`, not queue work: it is settled by the
+     operator's real-drive rehearsal, and the code fix follows the measurement.
+  6. **Docs are in scope**, and so are `scripts/` (first-run.sh and the
+     harnesses). The coordinator edits those and the normative docs itself
+     (`docs/design/`, `docs/adr/`, `CONTEXT.md`, `docs/design-errata.md`,
+     `docs/operator-guide.md`, `README.md`, `CLAUDE.md`); workers still never do.
+     When a clap definition changes, `cargo run --example gen_man` and commit
+     `docs/man`. `--generation` is the only spelling (#170); no aliases.
+  7. **After the queue is empty, two things remain before the first write, and
+     neither is autopilot's to skip:** re-run the adversarial review on the full
+     diff since `5d4cc43` (same shape as the 2026-09-13 one; record it under
+     `docs/audits/`) and work what it finds under the same label; then STOP for
+     the CTO's real-drive rehearsal on an expendable cartridge on home2, which
+     also settles #182. Do not attempt the rehearsal yourself — the drive is not
+     on this VM.
+  8. Standing constraints, unchanged: no new dependencies; never weaken a gate,
+     test, clippy setting or `EXPECTED_FAIL`; `tests/on_tape_golden.rs` is never
+     re-pinned (a byte change is a CTO decision); `git stash` is banned in every
+     form; cargo synchronous, never backgrounded; no GitHub closing keywords in
+     commit messages; workers never touch `/dev/nst*` or `/dev/sg*`; the real
+     `~/.tapectl` is never touched from this VM; migrations are forward-only and
+     the next free number is **014**.
+
 - **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed; real-drive pass #4 45/45 on 2026-09-12.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
   queue is the seven candidates of the architecture review — not in the repo
@@ -826,9 +901,11 @@ the normative design set named in the Policy block below.
 
 ## Iteration — one task, run to done
 
-1. **Survey.** Feature branch, clean tree (dirty → stash and say so). Confirm
-   the branch gate is green BEFORE dispatching — never build on a red base.
-   Pick the next playbook task whose DAG predecessors have landed.
+1. **Survey.** Feature branch, clean tree. A dirty tree is a STOP: say what is
+   dirty and commit it or `git checkout -- .` it deliberately — **never `git
+   stash`** (`refs/stash` is shared across every worktree; banned 2026-09-11).
+   Confirm the branch gate is green BEFORE dispatching — never build on a red
+   base. Pick the next queue item whose stated dependencies have landed.
 2. **Viability gate.** Read the task entry fully plus the design sections it
    cites. Confirm it is decidable without the CTO. A design fork with one
    clearly-defensible option is viable — take it and record the reasoning in
@@ -861,11 +938,15 @@ re-litigated), then implement.
 
 ## Stopping the loop
 
-Stop (end the /loop, not just the iteration) when: the phase-2 queue is empty
-AND the gate's EXPECTED_FAIL manifest is empty; or every remaining task is blocked on a CTO decision and the
+Stop (end the /loop, not just the iteration) when: the current queue (the
+Policy block names it — since 2026-09-14 the GitHub label `review-2026-09-13`)
+is empty with nothing parked AND the gate's EXPECTED_FAIL manifest is empty
+AND the post-queue re-review the Policy block requires has been run and its
+findings worked; or every remaining task is blocked on a CTO decision and the
 batch has been surfaced; or two consecutive iterations ended in escalation
-with nothing landed. **Stop before any first production write** — that, the LTO-6 hardware session,
-and #69's physical Heir Kit step are CTO calls, not autopilot's.
+with nothing landed. **Stop before any first production write** — that, the
+real-drive rehearsal on home2, and #69's physical Heir Kit step are CTO
+calls, not autopilot's.
 
 Before stopping: post a summary (landed with SHAs, decisions pending with
 their options, residuals accepted and why), update the memory checkpoint, send
