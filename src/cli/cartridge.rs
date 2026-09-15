@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tabled::{Table, Tabled};
 
@@ -88,6 +88,20 @@ pub enum CartridgeCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Correct a cartridge's barcode label
+    ///
+    /// ADR-0012: a cartridge's identity is its chip serial; the barcode is a
+    /// relabelable sticker. This is a Tier 1 label correction under
+    /// ADR-0008, not a destructive act — no prompt, no `--force`, no status
+    /// gate — and it is the remedy `volume init`'s auto-register refuses
+    /// with when the loaded medium's serial collides with an
+    /// already-registered barcode.
+    Relabel {
+        /// Current barcode
+        barcode: String,
+        /// New barcode
+        new_barcode: String,
+    },
 }
 
 #[derive(Tabled, Serialize)]
@@ -149,6 +163,45 @@ pub fn run(
             serial,
             notes,
         } => {
+            // MAM serials are trimmed at parse (src/tape/mam.rs); this flag
+            // is typed by a human and was stored raw, so a trailing space
+            // used to produce a second row the unique index cannot catch
+            // and that would never match the medium.
+            let barcode = barcode.trim();
+            let serial = serial.as_deref().map(str::trim);
+
+            // Pre-check both UNIQUE columns and refuse by name — the
+            // established idiom in this crate (see
+            // src/volume/write.rs's volume-label check) is pre-check-then-
+            // named-error, never matching the raw SQLite constraint
+            // failure.
+            let barcode_taken: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM cartridges WHERE barcode = ?1",
+                    params![barcode],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if barcode_taken.is_some() {
+                return Err(TapectlError::Other(format!(
+                    "cartridge \"{barcode}\" already exists"
+                )));
+            }
+            if let Some(s) = serial {
+                let serial_taken: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM cartridges WHERE serial_number = ?1",
+                        params![s],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if serial_taken.is_some() {
+                    return Err(TapectlError::Other(format!(
+                        "medium serial \"{s}\" is already registered to another cartridge"
+                    )));
+                }
+            }
+
             // ADR-0010: stored canonical, not the operator's raw spelling,
             // so a later comparison against a detected generation
             // (`volume init`) is a plain string match.
@@ -326,6 +379,83 @@ pub fn run(
                 dry_run,
                 json_output,
             )?;
+        }
+        CartridgeCommands::Relabel {
+            barcode,
+            new_barcode,
+        } => {
+            // Same reasoning as `Register` above: a typed barcode is stored
+            // trimmed everywhere else, so `relabel` must not become the one
+            // remaining writer that leaves a trailing space the unique index
+            // cannot catch and that `register`/`info`/`move` would never
+            // match again.
+            let barcode = barcode.trim();
+            let new_barcode = new_barcode.trim();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM cartridges WHERE barcode = ?1",
+                    params![barcode],
+                    |row| row.get(0),
+                )
+                .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+            // `barcode` is `TEXT NOT NULL UNIQUE` (012_cartridge_lifecycle.sql).
+            // Refuse a taken destination by name rather than surface the raw
+            // constraint failure — same discipline as the auto-register
+            // collision this command exists to remedy.
+            let taken: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM cartridges WHERE barcode = ?1",
+                    params![new_barcode],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if taken.is_some() {
+                return Err(TapectlError::Other(format!(
+                    "cartridge \"{new_barcode}\" already exists; choose a different barcode"
+                )));
+            }
+            // Tier 1 (ADR-0008): no consent gate, but still honours
+            // --dry-run like its peers (Retire, MarkErased).
+            if dry_run {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"old": barcode, "new": new_barcode, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "cartridge \"{barcode}\" would be relabelled to \"{new_barcode}\" \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE cartridges SET barcode = ?1 WHERE id = ?2",
+                params![new_barcode, id],
+            )?;
+            // Convention: matches `location rename` (src/cli/location.rs) —
+            // action "renamed", entity_label the NEW label, old/new value in
+            // old_value/new_value.
+            events::log_field_change(
+                conn,
+                "cartridge",
+                id,
+                new_barcode,
+                "renamed",
+                "barcode",
+                Some(barcode),
+                new_barcode,
+                None,
+            )?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"old": barcode, "new": new_barcode})
+                );
+            } else {
+                println!("cartridge \"{barcode}\" relabelled to \"{new_barcode}\"");
+            }
         }
     }
     Ok(())
@@ -575,5 +705,190 @@ mod tests {
         register(&conn, "B001", "LTO-6", None, None).unwrap();
         let (_, _, serial) = stored_row(&conn, "B001");
         assert_eq!(serial, None);
+    }
+
+    // ---- #160: named refusals on the UNIQUE columns, and trimming --------
+
+    #[test]
+    fn register_onto_a_taken_barcode_is_refused_by_name() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let err = register(&conn, "B001", "LTO-6", None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("B001"), "got: {msg}");
+        assert!(msg.contains("already exists"), "got: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("constraint"),
+            "must be a named refusal, not a raw SQLite error: {msg}"
+        );
+    }
+
+    #[test]
+    fn register_onto_a_taken_serial_is_refused_by_name() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, Some("SER-1")).unwrap();
+        let err = register(&conn, "B002", "LTO-6", None, Some("SER-1")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SER-1"), "got: {msg}");
+        assert!(msg.contains("already registered"), "got: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("constraint"),
+            "must be a named refusal, not a raw SQLite error: {msg}"
+        );
+    }
+
+    /// MAM serials are trimmed at parse (src/tape/mam.rs); this flag is
+    /// typed by a human and used to be stored raw, so a trailing space
+    /// produced a second row the unique index could not catch and that
+    /// would never match the medium.
+    #[test]
+    fn register_trims_barcode_and_serial() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "  B001  ", "LTO-6", None, Some("  SER-1  ")).unwrap();
+        let (_, _, serial) = stored_row(&conn, "B001");
+        assert_eq!(
+            serial.as_deref(),
+            Some("SER-1"),
+            "both the barcode lookup and the stored serial must be trimmed"
+        );
+    }
+
+    // ---- #160: `cartridge relabel` ----------------------------------------
+
+    fn relabel(conn: &Connection, barcode: &str, new_barcode: &str, dry_run: bool) -> Result<()> {
+        run(
+            conn,
+            &CartridgeCommands::Relabel {
+                barcode: barcode.to_string(),
+                new_barcode: new_barcode.to_string(),
+            },
+            false,
+            true,
+            dry_run,
+        )
+    }
+
+    #[test]
+    fn relabel_renames_and_logs_an_event() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "OLD001", "LTO-6", None, None).unwrap();
+        relabel(&conn, "OLD001", "NEW001", false).unwrap();
+
+        let barcode: String = conn
+            .query_row(
+                "SELECT barcode FROM cartridges WHERE barcode = 'NEW001'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the row must now be findable under its new barcode");
+        assert_eq!(barcode, "NEW001");
+
+        let found_old: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM cartridges WHERE barcode = 'OLD001'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(found_old.is_none(), "the old barcode must no longer exist");
+
+        let (action, field, old_value, new_value, entity_label): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT action, field, old_value, new_value, entity_label
+                 FROM events WHERE entity_type = 'cartridge' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "renamed");
+        assert_eq!(field, "barcode");
+        assert_eq!(old_value.as_deref(), Some("OLD001"));
+        assert_eq!(new_value.as_deref(), Some("NEW001"));
+        assert_eq!(
+            entity_label, "NEW001",
+            "matches the `location rename` convention: entity_label is the NEW label"
+        );
+    }
+
+    #[test]
+    fn relabel_onto_a_taken_barcode_is_refused_by_name() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "A001", "LTO-6", None, None).unwrap();
+        register(&conn, "A002", "LTO-6", None, None).unwrap();
+        let err = relabel(&conn, "A001", "A002", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("A002"), "got: {msg}");
+        assert!(msg.contains("already exists"), "got: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("constraint"),
+            "must be a named refusal, not a raw SQLite error: {msg}"
+        );
+
+        // Refused, so nothing changed.
+        let still_a001: String = conn
+            .query_row(
+                "SELECT barcode FROM cartridges WHERE barcode = 'A001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_a001, "A001");
+    }
+
+    #[test]
+    fn relabel_trims_both_barcodes() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "OLD001", "LTO-6", None, None).unwrap();
+        relabel(&conn, "  OLD001  ", "  NEW001  ", false).unwrap();
+        let barcode: String = conn
+            .query_row(
+                "SELECT barcode FROM cartridges WHERE id = (SELECT id FROM cartridges LIMIT 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            barcode, "NEW001",
+            "the stored barcode must be trimmed, matching `register`"
+        );
+    }
+
+    #[test]
+    fn relabel_of_an_unregistered_barcode_is_an_error() {
+        let conn = crate::db::open_memory().unwrap();
+        let err = relabel(&conn, "NOPE", "NEW001", false).unwrap_err();
+        assert!(err.to_string().contains("\"NOPE\" not found"));
+    }
+
+    /// Tier 1 (ADR-0008): no consent gate, but --dry-run must still be
+    /// honoured, like its `Retire`/`MarkErased` peers.
+    #[test]
+    fn relabel_dry_run_changes_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "OLD001", "LTO-6", None, None).unwrap();
+        relabel(&conn, "OLD001", "NEW001", true).unwrap();
+
+        let still_old: String = conn
+            .query_row(
+                "SELECT barcode FROM cartridges WHERE barcode = 'OLD001'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("dry-run must not have renamed the row");
+        assert_eq!(still_old, "OLD001");
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count, 1,
+            "only the original registration event -- dry-run logs nothing"
+        );
     }
 }
