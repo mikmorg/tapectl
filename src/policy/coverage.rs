@@ -211,7 +211,44 @@ fn scoped_deposits(q: &CoverageQuery, projection: &str) -> String {
 /// is why [`eligible`] exists as a function at all. A seventh hand-written
 /// copy will under-count warehouse deposits silently — nothing fails, the
 /// operator is simply told to buy a tape they already have a copy on.
+///
+/// **Per-version rule (issue #153, ADR-0012).** `snapshots.status`
+/// permits more than one `'current'` row per unit at once — each sealed
+/// write promotes its snapshot to `'current'` and never demotes its
+/// predecessor (`'superseded'` has zero production writers). A newer
+/// Version is not a copy of an older one, so when `q.scope` is
+/// [`CoverageScope::Unit`] with `current_only: true`, this is NOT the
+/// union of eligible volumes across every current snapshot (that would
+/// count "how many volumes hold ANY version," not how covered the unit
+/// actually is). It is instead the MINIMUM, over the unit's current
+/// snapshots, of each one's own copy count — ADR-0012: "a unit is as
+/// covered as its least-covered live version." Every other scope
+/// ([`CoverageScope::Snapshot`], and [`CoverageScope::Unit`] with
+/// `current_only: false` — `volume retire`'s impact analysis, which
+/// deliberately asks about ANY snapshot) is untouched and still the plain
+/// union.
 pub fn copy_count_expr(q: &CoverageQuery) -> String {
+    if let CoverageScope::Unit {
+        id_expr,
+        current_only: true,
+    } = q.scope
+    {
+        let per_snapshot = CoverageQuery {
+            scope: CoverageScope::Snapshot { id_expr: "pcur.id" },
+            exclude_volume: q.exclude_volume,
+        };
+        // COALESCE matters: MIN() over zero current snapshots is NULL,
+        // and a unit with no current snapshot must still read 0 (same as
+        // today), not NULL.
+        return format!(
+            "(SELECT COALESCE(MIN(per.c), 0) FROM (
+                SELECT ({}) AS c
+                FROM snapshots pcur
+                WHERE pcur.unit_id = {id_expr} AND pcur.status = 'current'
+             ) per)",
+            copy_count_expr(&per_snapshot)
+        );
+    }
     format!(
         "(SELECT COUNT(*) FROM (
             {}
@@ -234,7 +271,32 @@ pub fn copy_count_expr(q: &CoverageQuery) -> String {
 /// as a location.
 ///
 /// Same warning as [`copy_count_expr`]: one expression, N call sites.
+///
+/// **Same per-version rule as [`copy_count_expr`] (issue #153, ADR-0012),
+/// same reason:** for [`CoverageScope::Unit`] with `current_only: true`,
+/// this is the MINIMUM over the unit's current snapshots of each one's
+/// own location count, not their union — a unit is as covered as its
+/// least-covered live version, and that applies to locations exactly as
+/// it does to copies. Every other scope is untouched.
 pub fn location_count_expr(q: &CoverageQuery) -> String {
+    if let CoverageScope::Unit {
+        id_expr,
+        current_only: true,
+    } = q.scope
+    {
+        let per_snapshot = CoverageQuery {
+            scope: CoverageScope::Snapshot { id_expr: "pcur.id" },
+            exclude_volume: q.exclude_volume,
+        };
+        return format!(
+            "(SELECT COALESCE(MIN(per.c), 0) FROM (
+                SELECT ({}) AS c
+                FROM snapshots pcur
+                WHERE pcur.unit_id = {id_expr} AND pcur.status = 'current'
+             ) per)",
+            location_count_expr(&per_snapshot)
+        );
+    }
     format!(
         "(SELECT COUNT(*) FROM (
             {} AND cv.location_id IS NOT NULL
