@@ -1103,12 +1103,20 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
 /// node, which is only known from a configured backend. A rebuilt machine
 /// with keys and no `backend add` gets `None` — an absence, so every read
 /// path still works, which is exactly ADR-0005's DR path.
+///
+/// Resolved through [`crate::config::resolve_device`], NOT by comparing
+/// `device_tape` to `device` as strings. That raw comparison is issue #187's
+/// defect, and this was a second instance of it the issue did not name: the
+/// device-numbering hazard makes a `/dev/tape/by-id/...` path the RECOMMENDED
+/// form, and a by-id path never string-matches the `/dev/nstN` a backend
+/// records. The failure was silent and pointed the wrong way — no serial
+/// reads as an ABSENCE, and corroboration treats absence as "cannot see,
+/// cannot contradict" and proceeds. So following the recommended practice
+/// quietly switched off the cartridge-identity check on every read path.
 pub(crate) fn loaded_medium_serial(config: &crate::config::Config, device: &str) -> Option<String> {
-    let backend = config
-        .backends
-        .lto
-        .iter()
-        .find(|b| b.device_tape == device)?;
+    let backend = crate::config::resolve_device(config, Some(device))
+        .ok()
+        .and_then(|(_, b)| b)?;
     crate::tape::media_detect::detect(device, &backend.device_sg)
         .mam
         .serial
