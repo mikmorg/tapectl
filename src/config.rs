@@ -565,45 +565,65 @@ impl Config {
     /// check` and an operator staring at more than one config file can tell
     /// which one is wrong without re-deriving it from context.
     fn validate_sizes(&self, path: &Path) -> Result<()> {
-        crate::staging::parse_size_to_bytes(&self.defaults.slice_size).map_err(|e| {
-            TapectlError::Config(format!("{}: defaults.slice_size = {e}", path.display()))
-        })?;
-        crate::staging::parse_size_to_bytes(&self.defaults.large_file_warn_threshold).map_err(
-            |e| {
-                TapectlError::Config(format!(
-                    "{}: defaults.large_file_warn_threshold = {e}",
-                    path.display()
-                ))
-            },
-        )?;
+        match self.size_problems(path).into_iter().next() {
+            None => Ok(()),
+            Some(msg) => Err(TapectlError::Config(msg)),
+        }
+    }
+
+    /// Every size/generation problem [`Config::validate_sizes`] would reject,
+    /// collected instead of short-circuited at the first — issue #173's
+    /// lenient path for `config check` (`policy::lenient_config`) needs to
+    /// report every one of these in a single run, not just whichever
+    /// `Config::load` happened to hit first. `validate_sizes` above is now a
+    /// thin wrapper over this so the two can never disagree about what a
+    /// valid size/generation looks like: this is the single place either
+    /// path reads.
+    ///
+    /// Message text is byte-identical to what `validate_sizes` used to build
+    /// inline, so `Config::load`'s own error strings (and every test that
+    /// pins a substring of one) are unaffected by this refactor.
+    pub(crate) fn size_problems(&self, path: &Path) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Err(e) = crate::staging::parse_size_to_bytes(&self.defaults.slice_size) {
+            problems.push(format!("{}: defaults.slice_size = {e}", path.display()));
+        }
+        if let Err(e) =
+            crate::staging::parse_size_to_bytes(&self.defaults.large_file_warn_threshold)
+        {
+            problems.push(format!(
+                "{}: defaults.large_file_warn_threshold = {e}",
+                path.display()
+            ));
+        }
         for (i, backend) in self.backends.lto.iter().enumerate() {
             if crate::media::Generation::parse(&backend.generation).is_none() {
-                return Err(TapectlError::Config(format!(
+                problems.push(format!(
                     "{}: backends.lto[{i}] (\"{}\").generation = {:?} is not a recognised LTO \
                      generation (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)",
                     path.display(),
                     backend.name,
                     backend.generation
-                )));
+                ));
             }
             if let Some(cap) = &backend.capacity_override {
-                crate::staging::parse_size_to_bytes(cap).map_err(|e| {
-                    TapectlError::Config(format!(
+                if let Err(e) = crate::staging::parse_size_to_bytes(cap) {
+                    problems.push(format!(
                         "{}: backends.lto[{i}] (\"{}\").capacity_override = {e}",
                         path.display(),
                         backend.name
-                    ))
-                })?;
+                    ));
+                }
             }
-            crate::staging::parse_size_to_bytes(&backend.enospc_buffer).map_err(|e| {
-                TapectlError::Config(format!(
+            if let Err(e) = crate::staging::parse_size_to_bytes(&backend.enospc_buffer) {
+                problems.push(format!(
                     "{}: backends.lto[{i}] (\"{}\").enospc_buffer = {e}",
                     path.display(),
                     backend.name
-                ))
-            })?;
+                ));
+            }
         }
-        Ok(())
+        problems
     }
 
     /// ADR-0012 "closed-set values are validated at load" (issue #171):
@@ -625,18 +645,46 @@ impl Config {
     /// `main.rs`'s tracing subscriber — so a bad value is a real, actionable
     /// mistake worth catching at load, not a decorative one worth deleting.
     fn validate_closed_sets(&self, path: &Path) -> Result<()> {
-        validate_compression(&self.defaults.compression).map_err(|e| {
-            TapectlError::Config(format!("{}: defaults.compression: {e}", path.display()))
-        })?;
-        validate_checksum_mode(&self.defaults.checksum_mode).map_err(|e| {
-            TapectlError::Config(format!("{}: defaults.checksum_mode: {e}", path.display()))
-        })?;
-        validate_log_level(&self.logging.level)
-            .map_err(|e| TapectlError::Config(format!("{}: logging.level: {e}", path.display())))?;
-        validate_log_format(&self.logging.format).map_err(|e| {
-            TapectlError::Config(format!("{}: logging.format: {e}", path.display()))
-        })?;
-        Ok(())
+        match self.closed_set_problems(path).into_iter().next() {
+            None => Ok(()),
+            Some(msg) => Err(TapectlError::Config(msg)),
+        }
+    }
+
+    /// Every closed-set problem [`Config::validate_closed_sets`] would
+    /// reject, collected instead of short-circuited at the first — the same
+    /// anti-drift wrapper relationship as [`Config::size_problems`], for the
+    /// same reason (issue #173).
+    pub(crate) fn closed_set_problems(&self, path: &Path) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Err(e) = validate_compression(&self.defaults.compression) {
+            problems.push(format!("{}: defaults.compression: {e}", path.display()));
+        }
+        if let Err(e) = validate_checksum_mode(&self.defaults.checksum_mode) {
+            problems.push(format!("{}: defaults.checksum_mode: {e}", path.display()));
+        }
+        if let Err(e) = validate_log_level(&self.logging.level) {
+            problems.push(format!("{}: logging.level: {e}", path.display()));
+        }
+        if let Err(e) = validate_log_format(&self.logging.format) {
+            problems.push(format!("{}: logging.format: {e}", path.display()));
+        }
+        problems
+    }
+
+    /// Every semantic problem `Config::load` would reject on an otherwise
+    /// structurally-parseable config — [`Config::size_problems`] then
+    /// [`Config::closed_set_problems`], in the same relative order
+    /// `Config::load` checks them in, so the FIRST entry here is always
+    /// identical to the error `Config::load` itself would raise.
+    ///
+    /// This is the shared source issue #173's lenient `config check` path
+    /// (`policy::lenient_config`) reads for "is this value legal" — it must
+    /// never grow a second opinion of its own on that question.
+    pub(crate) fn semantic_problems(&self, path: &Path) -> Vec<String> {
+        let mut problems = self.size_problems(path);
+        problems.extend(self.closed_set_problems(path));
+        problems
     }
 
     /// Write config to file.
