@@ -171,7 +171,11 @@ the normative design set named in the Policy block below.
      suite (`scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
      --erase short --single-cartridge --i-will-lose-the-cartridge <barcode>`)
      runs once after the `consent-path` set has landed and once when the queue is
-     empty. **Check `ls -l /dev/tape/by-id/` first**: `scsi-XYZZY_A*-nst` is
+     empty. Both harness scripts now take `flock /scratch/tapectl-build.lock`
+     around their own `cargo build` internally (2026-09-16), so the outer flock
+     in the gate command above is belt-and-braces rather than the only guard.
+     `--scenario compaction` needs FOUR distinct cartridges and so cannot run
+     under `--single-cartridge`; run it multi-slot on mhvtl. **Check `ls -l /dev/tape/by-id/` first**: `scsi-XYZZY_A*-nst` is
      mhvtl (nst1–nst4 at last check), `scsi-HUJ808A5L4-nst` is the REAL LTO-6 and
      is currently detached from this VM, physically on home2. **Never nst0.**
   4. **Park decisions and keep working; never report the queue empty while
@@ -179,7 +183,16 @@ the normative design set named in the Policy block below.
      headed "PARKED — needs CTO" with the options and your recommendation; the
      batch goes to the CTO per "Talking to the CTO". "Queue empty" means: zero
      open issues under the label, none parked, gate green, mhvtl gate 26/26,
-     lifecycle 45/45.
+     and the lifecycle suite green — which as of 2026-09-16 means **a full
+     `--all` pass, not just `first-year` 45/45**. "lifecycle 45/45" named only
+     the `first-year` scenario, and issue #198 found `compaction` RED on master
+     precisely because nothing routine ran the rest. Worse, working #198 showed
+     the suite's own "second copy" idiom (`stage create <unit> --version N`
+     after a write) is refused by `stage create` and so **cannot ever have run
+     green** — `retire-and-reuse` uses it too. Treat the unrun scenarios as
+     unknown, not as passing: **a full `--all` pass is its own queue item, not
+     something to defer to the queue-empty run.** Only `first-year` 45/45 is
+     measured-green as of this writing.
   5. **Excluded by ruling:** #143 (`config set/add/remove`) and #144
      (`--policy-aware` packing) stay open, unlabelled, and are not this queue.
      #145 (`volume calibrate`) is closed as rejected. **#182** — the MAM

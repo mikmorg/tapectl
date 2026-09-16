@@ -59,7 +59,13 @@ echo "gate: drive=$TAPE_DEV ($DRIVE_MODEL, sg=$DRIVE_SG) changer=$CHG_SG dte=$DT
 RUN="$SCRATCH/run-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN"
 echo "gate: workspace $RUN"
-cargo build --quiet || die "cargo build failed"
+# The build lock is shared with every other cargo invocation on this VM
+# (worktree-agent.md, "Build lock"): the box is 9 GB, and two concurrent
+# links OOM-kill each other. This script gets its own CARGO_TARGET_DIR
+# above, which keeps cargo's own per-directory lock from serializing it
+# against a worker — but that is exactly what makes the memory collision
+# possible, so the flock is not optional here either.
+flock /scratch/tapectl-build.lock cargo build --quiet || die "cargo build failed"
 BIN="${CARGO_TARGET_DIR:-target}/debug/tapectl"
 [ -x "$BIN" ] || die "built binary not found at $BIN"
 

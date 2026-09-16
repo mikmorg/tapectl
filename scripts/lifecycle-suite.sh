@@ -236,7 +236,13 @@ else
     echo "lifecycle-suite: workspace $RUN"
 
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/scratch/tapectl-target-pm-lifecycle}"
-    cargo build --quiet || die "cargo build failed"
+    # The build lock is shared with every other cargo invocation on this VM
+    # (worktree-agent.md, "Build lock"): the box is 9 GB, and two concurrent
+    # links OOM-kill each other. This script gets its own CARGO_TARGET_DIR
+    # above, which keeps cargo's own per-directory lock from serializing it
+    # against a worker — but that is exactly what makes the memory collision
+    # possible, so the flock is not optional here either.
+    flock /scratch/tapectl-build.lock cargo build --quiet || die "cargo build failed"
     BIN="$CARGO_TARGET_DIR/debug/tapectl"
     [ -x "$BIN" ] || die "built binary not found at $BIN"
 
@@ -1642,22 +1648,27 @@ scenario_tape_only_and_reclaim() {
 # ============================================================
 # Scenario: compaction (mhvtl-only)
 # ============================================================
-# Needs THREE simultaneously-distinct volumes (VOL-E, VOL-F, VOL-G) to mean
-# anything — impossible under --single-cartridge, which destroys each
+# Needs FOUR simultaneously-distinct volumes (VOL-E, VOL-F, VOL-H, VOL-G) to
+# mean anything — impossible under --single-cartridge, which destroys each
 # previous volume's cartridge on next_tape (see tape-only-and-reclaim's
 # next_tape fix). The whole scenario SKIPs there, visibly, rather than
 # faking a single-cartridge shape that wouldn't test compaction at all.
 #
-# Sequence: VOL-E starts with photos/docs/big v1. photos v2 goes to VOL-F,
-# which makes photos v1 on VOL-E supersedable; mark it reclaimable and
-# purge it, leaving docs v1 and big v1 as VOL-E's only live content — under
+# Sequence: VOL-E starts with photos/docs/big v1. `staging clean` then
+# RELEASES those three stage sets — without it they stay 'staged' and every
+# later `volume write` writes them again (see cp_release_staging; this is
+# what made VOL-F a full second copy of everything, issue #198). photos v2
+# goes to VOL-F, and a second COPY of that same v2 to VOL-H; release again,
+# so the compaction destination carries compaction slices and nothing else.
+# photos v1 on VOL-E is then supersedable; mark it reclaimable and purge it,
+# leaving docs v1 and big v1 as VOL-E's only live content — under
 # bootstrap_config's utilization_threshold=0.95 that is enough for
 # `report compaction-candidates` to flag VOL-E. compact-read pulls those
 # live slices to staging; compact-finish is asserted to REFUSE before
 # compact-write has given docs/big a copy anywhere else, then to SUCCEED
 # once VOL-G holds one.
 cp_skip_single_cartridge() {
-    skip "cp.scenario" "compaction needs 3 simultaneously-distinct volumes (VOL-E/F/G) — impossible under --single-cartridge"
+    skip "cp.scenario" "compaction needs 4 simultaneously-distinct volumes (VOL-E/F/H/G) — impossible under --single-cartridge"
     return $?
 }
 
@@ -1667,6 +1678,56 @@ cp_write_photos_v2_on_volf() {
     TCTL stage create photos || return 1
     next_tape VOL-F || return 1
     vinit VOL-F && TCTL volume write VOL-F --device "$TAPE_DEV"
+}
+
+# `staging clean` is the RELEASE half of tapectl's stage-once / write-N-
+# copies / release design (CLAUDE.md, Collection layer). `volume write`
+# writes every stage set that is still 'staged' and deliberately leaves it
+# 'staged' (src/volume/write.rs `find_staged_data`), so until something
+# releases them, each later write writes them AGAIN.
+#
+# This scenario never did that, which is why issue #198's diagnosis was
+# incomplete: VOL-F was not "photos v2" as the comment claimed, it was
+# photos v1 + docs v1 + big v1 + photos v2 — verified from the run DB.
+# That also made cp.compact_finish_refused fail on its own merits rather
+# than as a cascade: docs/big DID have a copy off VOL-E, so compact-finish
+# had nothing to refuse.
+#
+# No coverage gate is involved: `clean_staging` (src/staging/clean.rs)
+# releases a 'staged' set once it has at least one `writes` row and every
+# one of them is 'completed'. That is true of v1 here the moment VOL-E is
+# written.
+cp_release_staging() { TCTL staging clean; }
+
+# A second COPY of photos v2 — not a new version, and the reason this
+# scenario was RED on master (issue #198).
+#
+# `snapshot mark-reclaimable` refuses to release v1 while the version that
+# SUPERSEDES it is itself below `defaults.min_copies`
+# (`policy::reclaimable`'s precondition 2 — ADR-0004's rule, and the point
+# of issue #89's eligibility JOIN):
+#
+#     error: superseding v2 has 1 copies, needs 2 (use --force to override)
+#
+# tapectl is CORRECT there; the scenario was stale. It is fixed by giving
+# v2 the copy the policy asks for, not by passing --force: `--force` on
+# mark-reclaimable means "the operator is giving this version up on
+# purpose" (ADR-0012 names it as the deliberate escape), so forcing here
+# would make the scenario stop exercising the precondition altogether —
+# and this scenario is called `compaction` precisely because compaction
+# happens on adequately-covered data.
+#
+# The copy is a SECOND WRITE of the still-live stage set, not a re-stage.
+# A re-stage is refused outright while the set is live ("unit \"photos\" v2
+# already has a stage set with live slices"), so the `stage create` idiom
+# in `rr_write_second_copy_volb` cannot ever have run green either. Writing
+# the same staged slices twice is also the more faithful shape: it yields
+# BYTE-IDENTICAL content, which is what ADR-0012 defines a Copy to be,
+# where a re-stage would produce fresh bytes (dar timestamps, randomized
+# age) for the same version.
+cp_write_photos_v2_second_copy() {
+    next_tape VOL-H || return 1
+    vinit VOL-H && TCTL volume write VOL-H --device "$TAPE_DEV"
 }
 
 cp_reclaim_v1_photos() {
@@ -1701,8 +1762,16 @@ cp_compact_finish_refused_first() {
     echo "$out" | grep -qi "have no copy on another volume" || { echo "unexpected refusal text: $out"; return 1; }
 }
 
+# `vinit` is not optional here, and its absence was a third latent defect
+# (issue #198): `compact-write --destination VOL-G` resolves VOL-G as an
+# existing volume row, so without `volume init` it fails with a bare
+# "volume not found: VOL-G". Nothing caught it because the scenario had
+# never reached this step — cp.reclaim_v1_photos died six checks earlier.
+# Every other destination in this suite is `next_tape` + `vinit` + write;
+# this one had dropped the middle term.
 cp_write_volg() {
     next_tape VOL-G || return 1
+    vinit VOL-G || return 1
     TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV"
 }
 
@@ -1715,7 +1784,10 @@ scenario_compaction() {
     fi
 
     check cp.setup                     bootstrap_archive_v1 VOL-E
+    check cp.release_v1_staging        cp_release_staging
     check cp.write_photos_v2_on_volf   cp_write_photos_v2_on_volf
+    check cp.photos_v2_second_copy     cp_write_photos_v2_second_copy
+    check cp.release_v2_staging        cp_release_staging
     check cp.reclaim_v1_photos         cp_reclaim_v1_photos
     check cp.compaction_candidates     cp_compaction_candidates_lists_vole
     check cp.compact_read_vole         cp_compact_read_vole
@@ -1927,7 +1999,7 @@ dl_scenario_a_db_import() {
 
 # (b) NEW empty home, NO backup at all: `restore raw-volume` is DB-less by
 # design and must verify every file from the tape's own front index alone.
-# Then top-level `tapectl import` (src/cli/operations.rs:1494 volume_import)
+# Then top-level `tapectl import` (`volume_import` in src/cli/operations.rs)
 # — decided by reading it: it inserts ONLY a bare `volumes` row (label,
 # backend, media type, capacity; status 'active') with NO units, snapshots,
 # stage_sets or writes. `restore unit --unit photos` resolves the unit by
