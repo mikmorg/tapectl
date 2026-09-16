@@ -2184,6 +2184,104 @@ mod tests {
     }
 
     #[test]
+    fn auto_register_records_the_generation_tables_capacity_not_a_drive_override(
+    ) {
+        // ADR-0010 decision 3's precedence ladder puts a drive
+        // `capacity_override` ABOVE the cartridge row — "the drive lies, as
+        // mhvtl does" — precisely so `resolve_capacity` can hand `volume
+        // init` a fiction for THAT VOLUME. `capacity_bytes` here is exactly
+        // what `volume_write` passes to `bind_cartridge`: the RESOLVED
+        // figure, which with an override in force is the override, not the
+        // generation table. Auto-registering a brand-new cartridge row must
+        // not copy that resolved figure into `nominal_capacity` — the row
+        // describes the plastic, and the next init on a drive with no
+        // override at all must not read the first drive's lie back as an
+        // operator declaration (issue #183).
+        let conn = db::open_memory().unwrap();
+        let vol = new_volume(&conn, "L8-0001");
+        let mam = MamInfo {
+            manufacturer: Some("HP".into()),
+            length_meters: Some(846),
+            ..MamInfo::default()
+        };
+        let override_bytes: i64 = 2_400_000_000; // mhvtl's 2400 MB fiction
+        let out = bind_cartridge(
+            &conn,
+            vol,
+            None,
+            Some("E01001L8_1775794348"),
+            Generation::Lto8,
+            override_bytes,
+            &mam,
+        )
+        .unwrap();
+
+        let cap: i64 = conn
+            .query_row(
+                "SELECT nominal_capacity FROM cartridges WHERE id = ?1",
+                params![out.cartridge_id.unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cap,
+            Generation::Lto8.native_capacity_bytes() as i64,
+            "the new cartridge row must record the generation table's native \
+             capacity for the detected medium, never the drive's resolved \
+             (possibly overridden) figure"
+        );
+        assert_ne!(
+            cap, override_bytes,
+            "a drive capacity_override must not leak onto the cartridge row"
+        );
+    }
+
+    #[test]
+    fn binding_never_touches_the_volumes_own_resolved_capacity() {
+        // The other half of issue #183's acceptance: the fix above must not
+        // stop the override reaching the VOLUME. `volumes.capacity_bytes` is
+        // written by `volume_write` before `bind_cartridge` is ever called
+        // (ADR-0010 decision 3 — decided once at init, from the same
+        // resolved figure); this asserts binding leaves that column alone,
+        // whatever it auto-registers onto the cartridge row.
+        let conn = db::open_memory().unwrap();
+        let override_bytes: i64 = 2_400_000_000; // mhvtl's 2400 MB fiction
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L8-0001', 'lto', 'lto0', 'LTO-8', ?1, 'initialized')",
+            params![override_bytes],
+        )
+        .unwrap();
+        let vol = conn.last_insert_rowid();
+
+        bind_cartridge(
+            &conn,
+            vol,
+            None,
+            Some("E01001L8_1775794348"),
+            Generation::Lto8,
+            override_bytes,
+            &MamInfo::default(),
+        )
+        .unwrap();
+
+        let vol_cap: i64 = conn
+            .query_row(
+                "SELECT capacity_bytes FROM volumes WHERE id = ?1",
+                params![vol],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vol_cap, override_bytes,
+            "the override must still determine the volume's own capacity_bytes \
+             (ADR-0010 decision 3) — only what auto-registration persists onto \
+             the cartridge row changes for issue #183"
+        );
+    }
+
+    #[test]
     fn a_hand_registered_cartridge_learns_its_serial_on_first_bind() {
         let conn = db::open_memory().unwrap();
         register(&conn, "BC001", "LTO-6", None, "available");
