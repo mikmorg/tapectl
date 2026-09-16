@@ -34,10 +34,19 @@ use crate::error::{Result, TapectlError};
 /// - `assume_yes`: proceeds without touching stdin at all.
 /// - stdin is a terminal: prints `facts`, then prompts; proceeds only on
 ///   an explicit "y"/"yes".
-/// - stdin is NOT a terminal and `!assume_yes`: refuses immediately. This
-///   is the half of the contract that matters most (issue #33's class of
-///   bug: a read that blocks forever on a handle that will never produce
-///   input) — this branch must never attempt to read stdin.
+/// - stdin is NOT a terminal and `!assume_yes`: refuses immediately, with
+///   `facts` folded into the refusal message. This is the half of the
+///   contract that matters most (issue #33's class of bug: a read that
+///   blocks forever on a handle that will never produce input) — this
+///   branch must never attempt to read stdin.
+///
+/// Carrying `facts` in the non-TTY refusal is ADR-0004's own requirement
+/// ("display coverage at the irreversible moment") honoured in the one
+/// session shape that has no prompt to display them at. It used to refuse
+/// with the reason it could not ask, and none of the reasons it would have
+/// asked ABOUT — which reads as an arbitrary block the moment a gate turns
+/// on something less obvious than zero copies (issue #147 added exactly
+/// such a gate: "left with 1 copy, below its policy of 2").
 pub fn confirm(action: &str, facts: &[String], assume_yes: bool) -> Result<()> {
     confirm_with(
         action,
@@ -69,9 +78,14 @@ fn confirm_with(
     }
 
     if !is_tty {
+        let why = if facts.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", facts.join("\n"))
+        };
         return Err(TapectlError::Other(format!(
             "{action} refused: non-interactive session with no confirmation given — \
-             refusing rather than assuming consent (re-run with --yes to proceed)"
+             refusing rather than assuming consent (re-run with --yes to proceed){why}"
         )));
     }
 
@@ -119,6 +133,24 @@ mod tests {
         assert!(
             err.to_string().contains("--yes"),
             "refusal message must name the override: {err}"
+        );
+    }
+
+    /// ADR-0004 in the one session shape with no prompt: the refusal has
+    /// to carry the facts it would otherwise have shown, or a gate that
+    /// turns on anything subtler than zero copies reads as arbitrary.
+    #[test]
+    fn non_tty_refusal_carries_the_facts_it_could_not_display() {
+        let facts = vec![
+            "unit \"docs\" v1 would be left with 1 copy/copies, below its policy of 2".to_string(),
+        ];
+        let err = confirm_with("retire volume \"L6-SRC\"", &facts, false, false, || {
+            panic!("must never read stdin")
+        })
+        .expect_err("non-TTY without consent must refuse");
+        assert!(
+            err.to_string().contains("below its policy of 2"),
+            "the refusal must say WHY, not only that it could not ask: {err}"
         );
     }
 
