@@ -362,6 +362,93 @@ fn run_tapectl(home: &std::path::Path, args: &[&str]) -> std::process::Output {
         .expect("failed to spawn tapectl binary")
 }
 
+/// Issue #172's single most important check: `init` must not write a config
+/// `tapectl` itself then refuses to load. Before this issue, `init` wrote six
+/// keys (`logging.level`, `logging.format`, `labels.format`,
+/// `packing.strategy`, `packing.fill_threshold`, `defaults.hash`) that
+/// nothing read — harmless only because nothing validated them either. Now
+/// that four of the six are deleted and `#[serde(deny_unknown_fields)]`
+/// (issue #171) rejects any leftover, a fresh `init` writing even one of them
+/// would make `tapectl` unable to read back its own freshly written config —
+/// broken on first run. Both commands must exit 0, and the generated file
+/// must carry `[logging]` (wired, so it stays) but none of the four deleted
+/// sections/keys.
+#[test]
+fn init_config_show_roundtrip_exits_zero_with_no_deleted_keys() {
+    let home = TempDir::new().expect("tempdir");
+
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init_out.status.success(),
+        "tapectl init failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&init_out.stdout),
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let show_out = run_tapectl(home.path(), &["config", "show"]);
+    assert!(
+        show_out.status.success(),
+        "tapectl config show failed on init's own config: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&show_out.stdout),
+        String::from_utf8_lossy(&show_out.stderr)
+    );
+
+    let shown = String::from_utf8_lossy(&show_out.stdout);
+    assert!(shown.contains("[logging]"), "{shown}");
+    assert!(shown.contains("level = \"warn\""), "{shown}");
+    assert!(shown.contains("format = \"full\""), "{shown}");
+    for dead in ["[packing]", "[labels]", "strategy", "fill_threshold", "hash"] {
+        assert!(
+            !shown.contains(dead),
+            "init's config still writes deleted key/section {dead:?}:\n{shown}"
+        );
+    }
+}
+
+/// Acceptance criterion (issue #172): "`logging.level = \"debug\"` actually
+/// changes the emitted level". Exercised against the real binary rather than
+/// only the pure `LoggingConfig::tracing_level` unit test in `config.rs`, to
+/// prove the wiring reaches an installed subscriber end to end — via
+/// `config show`, so nothing here touches a write/restore/tape path.
+#[test]
+fn logging_level_debug_surfaces_the_wiring_debug_line() {
+    let home = TempDir::new().expect("tempdir");
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(init_out.status.success());
+
+    let config_path = home.path().join(".tapectl").join("config.toml");
+    let default_config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        default_config.contains("level = \"warn\""),
+        "fixture assumption broken — init no longer writes level = \"warn\":\n{default_config}"
+    );
+
+    // Default level (warn): the DEBUG "loaded config" line from main.rs must
+    // not appear.
+    let quiet = run_tapectl(home.path(), &["config", "show"]);
+    assert!(quiet.status.success());
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("loaded config"),
+        "default logging.level = \"warn\" should not surface the debug line: {:?}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    // Raise logging.level to "debug" in the config init just wrote.
+    std::fs::write(
+        &config_path,
+        default_config.replace("level = \"warn\"", "level = \"debug\""),
+    )
+    .unwrap();
+
+    let debug_run = run_tapectl(home.path(), &["config", "show"]);
+    assert!(debug_run.status.success());
+    assert!(
+        String::from_utf8_lossy(&debug_run.stderr).contains("loaded config"),
+        "logging.level = \"debug\" should surface the debug line: {:?}",
+        String::from_utf8_lossy(&debug_run.stderr)
+    );
+}
+
 /// End-to-end process smoke: init -> audit --json -> config check --json
 /// -> db fsck, entirely inside a throwaway HOME.
 ///
