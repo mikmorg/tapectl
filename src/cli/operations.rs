@@ -1003,6 +1003,222 @@ pub fn cartridge_mark_erased(
     Ok(())
 }
 
+/// Reverse a `cartridge retire` (issue #163 / ADR-0012's consequences
+/// bullet).
+///
+/// Tier 1 under ADR-0008: a correction of a claim about the *medium*, not
+/// a destructive act — no prompt, no `--force`, no `--yes`. Refuses when
+/// the cartridge is not `retired_permanent`, naming its actual status.
+///
+/// The prior status of the cartridge, and of each volume retired with it,
+/// is recovered from the `events` audit trail rather than a new column:
+/// `cartridge_retire` already logs each change (`action = "retired"`,
+/// `field = "status"`, `old_value` = the status just before), so the most
+/// recent such event per entity IS the fact this command needs.
+/// `ORDER BY id DESC` — not `timestamp`, which is only second-resolution —
+/// makes "most recent" exact even when two events land in the same
+/// second. Read per entity, independently: a volume that was already
+/// `retired` (via `volume retire`) before the cartridge retirement has its
+/// own `retired -> retired` event and is correctly restored to `retired`,
+/// not resurrected into something it never was.
+///
+/// If an entity's own retirement event is missing (a catalog rebuilt from
+/// tape mints no `events` history), that entity's status is NOT guessed:
+/// the cartridge falls back to `available` — its ordinary pre-retirement
+/// state — and a volume with no recoverable event is left exactly as it
+/// is, `retired`. Both cases are named in the output; an honest partial
+/// restore beats a guessed one.
+///
+/// `cartridge mark-erased` is untouched by this command and remains the
+/// separate, irreversible statement that the bytes are gone (ADR-0011,
+/// corrected 2026-09-14).
+pub fn cartridge_unretire(
+    conn: &Connection,
+    barcode: &str,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    let (id, status): (i64, String) = conn
+        .query_row(
+            "SELECT id, status FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    if status != "retired_permanent" {
+        return Err(TapectlError::Other(format!(
+            "cartridge \"{barcode}\" is not retired_permanent (status: \"{status}\"); \
+             nothing to unretire"
+        )));
+    }
+
+    let prior_cartridge_status: Option<String> = conn
+        .query_row(
+            "SELECT old_value FROM events
+             WHERE entity_type = 'cartridge' AND entity_id = ?1
+               AND action = 'retired' AND field = 'status'
+             ORDER BY id DESC LIMIT 1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let cartridge_event_found = prior_cartridge_status.is_some();
+    let restored_cartridge_status =
+        prior_cartridge_status.unwrap_or_else(|| "available".to_string());
+
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.label, v.status FROM cartridge_volumes cv
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL
+         ORDER BY v.label",
+    )?;
+    let mounted: Vec<(i64, String, String)> = stmt
+        .query_map(params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    // Only volumes still `retired` are this command's business: anything
+    // else (already erased, or moved on some other route since) is not
+    // this retirement's doing to undo.
+    let mut restorable: Vec<(i64, String, Option<String>)> = Vec::new();
+    for (vol_id, label, vol_status) in &mounted {
+        if vol_status != "retired" {
+            continue;
+        }
+        let prior: Option<String> = conn
+            .query_row(
+                "SELECT old_value FROM events
+                 WHERE entity_type = 'volume' AND entity_id = ?1
+                   AND action = 'retired' AND field = 'status'
+                 ORDER BY id DESC LIMIT 1",
+                params![vol_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        restorable.push((*vol_id, label.clone(), prior));
+    }
+    let volumes_restored: Vec<(String, String)> = restorable
+        .iter()
+        .filter_map(|(_, label, prior)| prior.as_ref().map(|p| (label.clone(), p.clone())))
+        .collect();
+    let volumes_not_restored: Vec<String> = restorable
+        .iter()
+        .filter(|(_, _, prior)| prior.is_none())
+        .map(|(_, label, _)| label.clone())
+        .collect();
+
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "barcode": barcode,
+                    "status": status,
+                    "restored_status": restored_cartridge_status,
+                    "cartridge_event_found": cartridge_event_found,
+                    "volumes_restored": volumes_restored,
+                    "volumes_not_restored": volumes_not_restored,
+                    "dry_run": true,
+                })
+            );
+        } else {
+            println!("cartridge \"{barcode}\" would be unretired");
+            println!("  status: retired_permanent -> {restored_cartridge_status}");
+            if !cartridge_event_found {
+                println!(
+                    "  (no retirement event found -- falling back to \"available\" rather \
+                     than a guessed status)"
+                );
+            }
+            for (label, prior) in &volumes_restored {
+                println!("  volume \"{label}\" would be restored to \"{prior}\"");
+            }
+            for label in &volumes_not_restored {
+                println!(
+                    "  volume \"{label}\" would be LEFT AS \"retired\" -- no retirement \
+                     event found to recover its prior status"
+                );
+            }
+            println!("\n  DRY RUN — no changes made.");
+        }
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE cartridges SET status = ?1 WHERE id = ?2",
+        params![restored_cartridge_status, id],
+    )?;
+    events::log_field_change(
+        &tx,
+        "cartridge",
+        id,
+        barcode,
+        "unretired",
+        "status",
+        Some(&status),
+        &restored_cartridge_status,
+        None,
+    )?;
+    for (vol_id, label, prior) in &restorable {
+        if let Some(prior_status) = prior {
+            tx.execute(
+                "UPDATE volumes SET status = ?1 WHERE id = ?2",
+                params![prior_status, vol_id],
+            )?;
+            events::log_field_change(
+                &tx,
+                "volume",
+                *vol_id,
+                label,
+                "unretired",
+                "status",
+                Some("retired"),
+                prior_status,
+                None,
+            )?;
+        }
+    }
+    tx.commit()?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "barcode": barcode,
+                "status": restored_cartridge_status,
+                "cartridge_event_found": cartridge_event_found,
+                "volumes_restored": volumes_restored,
+                "volumes_not_restored": volumes_not_restored,
+                "changed": true,
+            })
+        );
+    } else {
+        println!(
+            "cartridge \"{barcode}\" unretired: retired_permanent -> {restored_cartridge_status}"
+        );
+        if !cartridge_event_found {
+            println!(
+                "  no retirement event found for this cartridge -- restored to \"available\" \
+                 rather than a guessed status"
+            );
+        }
+        for (label, prior) in &volumes_restored {
+            println!("  volume \"{label}\" restored to \"{prior}\"");
+        }
+        for label in &volumes_not_restored {
+            println!(
+                "  volume \"{label}\" left as \"retired\" -- no retirement event found to \
+                 recover its prior status"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Issue #153 / ADR-0012: which of a unit's `'current'` versions has the
 /// FEWEST copies, and how many. `copy_count_expr` under
 /// `CoverageScope::Unit { current_only: true }` already returns exactly

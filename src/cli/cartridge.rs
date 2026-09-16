@@ -71,7 +71,9 @@ pub enum CartridgeCommands {
     /// no longer fit to hold data. This is NOT an erasure and NOT a location
     /// change: the bytes may still be readable, but nothing will ever write
     /// to this cartridge again, and `volume init` refuses to bind it.
-    /// `cartridge mark-erased` is the only way back.
+    /// `cartridge unretire` is the way back — the operator saying they were
+    /// wrong about the medium; `cartridge mark-erased` is a different
+    /// statement, that the bytes are gone (ADR-0011, corrected 2026-09-14).
     ///
     /// ADR-0008 Tier 2: the coverage impact is displayed first, and
     /// `--force`/`--yes` is required when a unit is left below its policy.
@@ -108,6 +110,27 @@ pub enum CartridgeCommands {
         barcode: String,
         /// New barcode
         new_barcode: String,
+    },
+    /// Reverse a `cartridge retire` — the operator saying they were wrong
+    /// about the *medium*, not that its bytes are gone
+    ///
+    /// ADR-0012's consequences bullet: restores the cartridge, and any
+    /// volumes retired with it, to the status recorded in the `events`
+    /// audit trail from that retirement (`cartridge retire` already logs
+    /// `old_value` there — no schema change needed). If that history is
+    /// gone (a catalog rebuilt from tape since), the cartridge falls back
+    /// to `available` and any volumes are left untouched — an honest
+    /// partial restore beats a guessed status, and the command says so.
+    ///
+    /// Tier 1 under ADR-0008: a correction of a claim, not a destructive
+    /// act — no prompt, no `--force`, no `--yes`. Refuses when the
+    /// cartridge is not `retired_permanent`, naming its actual status.
+    /// `cartridge mark-erased` is untouched by this command and remains
+    /// the separate, irreversible statement that the bytes are gone
+    /// (ADR-0011, corrected 2026-09-14).
+    Unretire {
+        /// Barcode
+        barcode: String,
     },
 }
 
@@ -504,6 +527,9 @@ pub fn run(
             } else {
                 println!("cartridge \"{barcode}\" relabelled to \"{new_barcode}\"");
             }
+        }
+        CartridgeCommands::Unretire { barcode } => {
+            crate::cli::operations::cartridge_unretire(conn, barcode, dry_run, json_output)?;
         }
     }
     Ok(())
