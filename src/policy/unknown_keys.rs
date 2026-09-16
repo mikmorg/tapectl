@@ -87,16 +87,22 @@ pub fn scan(toml_text: &str) -> Vec<UnknownKeyHit> {
 /// The advisory line for one hit. Pure, so `config check`'s text and `--json`
 /// arms cannot drift apart.
 pub fn describe(hit: &UnknownKeyHit) -> String {
+    // NOT "silently ignored" — that was true before #171 made unknown keys a
+    // hard load error. Saying it now contradicts the refusal printed inches
+    // above this line in the same `config check` output, and would send an
+    // operator looking for a subtle behaviour change when the config simply
+    // will not load. What this adds over the generic refusal is the
+    // REMEDIATION, which is the only reason the scan survives #173.
     if hit.key == "defaults.min_copies" {
-        "warning: [defaults].min_copies is not a setting and is silently ignored (#129). \
-         The copy requirement comes from [defaults].min_copies_for_tape_only; a per-set \
-         override goes on an [[archive_sets]] entry as min_copies. Setting it here has \
-         no effect on what `audit` reports."
+        "[defaults].min_copies is not a setting (#129) — the config will not load while \
+         it is present. The copy requirement comes from \
+         [defaults].min_copies_for_tape_only; a per-set override goes on an \
+         [[archive_sets]] entry as min_copies."
             .to_string()
     } else {
         format!(
-            "warning: [defaults].{} is not a recognised setting and is silently ignored — \
-             check the spelling, or remove it.",
+            "[defaults].{} is not a recognised setting — the config will not load while \
+             it is present; check the spelling, or remove it.",
             hit.key.trim_start_matches("defaults."),
         )
     }
