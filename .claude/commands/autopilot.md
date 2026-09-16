@@ -160,20 +160,27 @@ the normative design set named in the Policy block below.
   3. **Gate per item only for write-path and restore-path changes** (`src/volume`,
      `src/tape`, `src/store.rs`, RESTORE.sh — every issue's Acceptance section
      says which it is). For those, run
-     `TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 flock /scratch/tapectl-build.lock bash scripts/mhvtl-verify-gate.sh`
-     after integrating that item. **That `flock` is not optional and it is yours
-     as much as the workers'** — the gate script builds and links, so running it
-     bare while a worker holds the lock mid-link is exactly the double build the
-     lock exists to prevent. Wrap your own fmt/clippy/test gate the same way
-     whenever any worker is live. Everything else is gated in batches: the
+     `TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`
+     after integrating that item. **Do NOT wrap that command in an outer
+     `flock /scratch/tapectl-build.lock` — it deadlocks.** This block told you
+     to until 2026-09-16, and doing so hung for 13 minutes before the tree was
+     read: `flock` locks are per-open-file-description, not per-process-tree,
+     so there is no reentrancy, and the script's own internal
+     `flock … cargo build` waits forever on the lock its own ancestor holds.
+     The script takes the lock itself, scoped to `cargo build` alone and
+     released before the tape legs — which is strictly better than an outer
+     wrap, since the tape legs link nothing and must not block a worker for
+     two minutes. The rule generalises: **take the build lock around cargo
+     invocations, never around a script that takes it for you.** Wrap your own
+     bare `cargo fmt/clippy/test` that way whenever a worker is live — those
+     are cargo invocations, so the lock is yours to take. Everything else is gated in batches: the
      fmt/clippy/test gate after **every** integration as always, the mhvtl gate
      after each batch of non-tape items lands and before push. The lifecycle
      suite (`scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
      --erase short --single-cartridge --i-will-lose-the-cartridge <barcode>`)
      runs once after the `consent-path` set has landed and once when the queue is
-     empty. Both harness scripts now take `flock /scratch/tapectl-build.lock`
-     around their own `cargo build` internally (2026-09-16), so the outer flock
-     in the gate command above is belt-and-braces rather than the only guard.
+     empty — and it takes the build lock internally too, so it is run bare for
+     the same reason the mhvtl gate is.
      `--scenario compaction` needs FOUR distinct cartridges and so cannot run
      under `--single-cartridge`; run it multi-slot on mhvtl. **Check `ls -l /dev/tape/by-id/` first**: `scsi-XYZZY_A*-nst` is
      mhvtl (nst1–nst4 at last check), `scsi-HUJ808A5L4-nst` is the REAL LTO-6 and

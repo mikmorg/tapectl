@@ -242,7 +242,23 @@ else
     # above, which keeps cargo's own per-directory lock from serializing it
     # against a worker — but that is exactly what makes the memory collision
     # possible, so the flock is not optional here either.
-    flock /scratch/tapectl-build.lock cargo build --quiet || die "cargo build failed"
+    #
+    # -w/-E, not a bare wait: if a CALLER already wrapped this script in
+    # `flock /scratch/tapectl-build.lock`, this line would wait forever on a
+    # lock its own ancestor holds — flock locks are per-open-file-description,
+    # with no reentrancy for a child. That happened to the mhvtl gate on
+    # 2026-09-16 and hung for 13 minutes looking exactly like a slow build.
+    # 99 gives the conflict its own exit code so it is never read as a compile
+    # failure (cargo exits 101, and a bare -w reports 1, which cargo also uses).
+    flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo build --quiet
+    build_rc=$?
+    if [ "$build_rc" -eq 99 ]; then
+        die "timed out waiting for /scratch/tapectl-build.lock.
+   If you ran this script inside an outer 'flock /scratch/tapectl-build.lock',
+   that is the cause: run it bare — the script takes the lock itself."
+    elif [ "$build_rc" -ne 0 ]; then
+        die "cargo build failed"
+    fi
     BIN="$CARGO_TARGET_DIR/debug/tapectl"
     [ -x "$BIN" ] || die "built binary not found at $BIN"
 
