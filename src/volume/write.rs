@@ -173,6 +173,22 @@ pub fn volume_init(
     })?;
 
     // ---- ADR-0010 fact-finding, all before the tape device is opened ----
+    //
+    // A fast, non-blocking pre-check (issue #152): `detect`'s driver-density
+    // fallback opens the tape node with a plain blocking `open()`, which on a
+    // drive with no cartridge loaded stalls until the st driver's no-medium
+    // timeout expires (~2m05s observed against an empty mhvtl drive) before
+    // reporting exactly the "nothing here" that this check reports in well
+    // under a second. Loading no cartridge, or loading the wrong drive, is an
+    // ordinary operator slip and should be refused immediately, by name,
+    // rather than after a silent multi-minute hang. This does not change
+    // `detect`'s own ladder for a LOADED medium at all — it only short-
+    // circuits the empty-drive case before `detect` is even called.
+    if crate::tape::media_detect::probe_no_medium(device) {
+        return Err(TapectlError::Other(format!(
+            "no cartridge loaded in {device}"
+        )));
+    }
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
