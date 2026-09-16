@@ -448,7 +448,8 @@ fn test_cartridge_edit_generation_round_trip() {
         &conn,
         &CartridgeCommands::Edit {
             barcode: "L6-0001".to_string(),
-            generation: "LTO-5".to_string(),
+            generation: Some("LTO-5".to_string()),
+            serial: None,
         },
         false,
         true,
@@ -456,12 +457,17 @@ fn test_cartridge_edit_generation_round_trip() {
     )
     .unwrap();
 
-    let (media_type, nominal_capacity, serial_number): (String, i64, Option<String>) = conn
+    let (media_type, nominal_capacity, serial_number, operator_serial): (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT media_type, nominal_capacity, serial_number FROM cartridges
+            "SELECT media_type, nominal_capacity, serial_number, operator_serial FROM cartridges
              WHERE barcode = 'L6-0001'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     assert_eq!(media_type, "LTO-5");
@@ -470,10 +476,19 @@ fn test_cartridge_edit_generation_round_trip() {
         tapectl::media::Generation::Lto5.native_capacity_bytes() as i64,
         "an unset capacity re-defaults to the corrected generation's table figure"
     );
+    // ADR-0012 amendment, 2026-09-16 (issue #197): `register --serial` is an
+    // unconfirmed operator CLAIM, stored in `operator_serial` -- never the
+    // chip-confirmed `serial_number`. Editing the generation must touch
+    // NEITHER.
     assert_eq!(
-        serial_number.as_deref(),
+        serial_number, None,
+        "register --serial must never write the chip-confirmed column, and \
+         editing the generation must not either"
+    );
+    assert_eq!(
+        operator_serial.as_deref(),
         Some("EW7VWMVKF6"),
-        "editing the generation must never touch the serial"
+        "editing the generation must never touch the claimed serial"
     );
 
     let events: Vec<(String, String, Option<String>, Option<String>)> = {
@@ -500,6 +515,92 @@ fn test_cartridge_edit_generation_round_trip() {
     assert_eq!(events[0].2.as_deref(), Some("LTO-6"));
     assert_eq!(events[0].3.as_deref(), Some("LTO-5"));
     assert_eq!(events[1].1, "nominal_capacity");
+}
+
+/// ADR-0012 amendment, 2026-09-16 (issue #197): `cartridge edit --serial` is
+/// Tier 2 (gated on consent) while `--generation` stays Tier 1 -- gating is
+/// per-flag, not per-command. Driven through the public CLI surface
+/// (`tapectl::cli::cartridge::run`) exactly like the generation round-trip
+/// above, since `--yes` is what actually exercises the gate.
+#[test]
+fn test_cartridge_edit_serial_round_trip() {
+    use tapectl::cli::cartridge::CartridgeCommands;
+
+    let (_tmp, conn, _home) = setup();
+
+    tapectl::cli::cartridge::run(
+        &conn,
+        &CartridgeCommands::Register {
+            barcode: "L6-0002".to_string(),
+            generation: "LTO-6".to_string(),
+            capacity: None,
+            serial: None,
+            notes: None,
+        },
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+
+    // Without --yes, under `cargo test` stdin is never a terminal: the Tier
+    // 2 gate refuses rather than silently proceeding, and the row is
+    // untouched.
+    let refused = tapectl::cli::cartridge::run(
+        &conn,
+        &CartridgeCommands::Edit {
+            barcode: "L6-0002".to_string(),
+            generation: None,
+            serial: Some("EW7VWMVKF6".to_string()),
+        },
+        false,
+        false,
+        false,
+    );
+    assert!(
+        refused.is_err(),
+        "the Tier 2 gate must refuse without consent"
+    );
+
+    // With --yes, the claim is written.
+    tapectl::cli::cartridge::run(
+        &conn,
+        &CartridgeCommands::Edit {
+            barcode: "L6-0002".to_string(),
+            generation: None,
+            serial: Some("EW7VWMVKF6".to_string()),
+        },
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let (serial_number, operator_serial): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT serial_number, operator_serial FROM cartridges WHERE barcode = 'L6-0002'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        serial_number, None,
+        "cartridge edit --serial must never write the chip-confirmed column"
+    );
+    assert_eq!(operator_serial.as_deref(), Some("EW7VWMVKF6"));
+
+    let updated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE entity_type = 'cartridge' AND action = 'updated' AND field = 'operator_serial'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        updated, 1,
+        "the refused attempt must not have logged anything"
+    );
 }
 
 // ── Event Audit Trail Tests ──

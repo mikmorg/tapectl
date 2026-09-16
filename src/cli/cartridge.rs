@@ -24,10 +24,15 @@ pub enum CartridgeCommands {
         /// declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...).
         #[arg(long)]
         capacity: Option<String>,
-        /// Medium serial number (MAM), if already known — `volume init`
-        /// records this itself when it auto-registers or matches a
-        /// cartridge from a loaded tape's MAM; set it by hand only when
-        /// pre-registering a cartridge that has not been loaded yet.
+        /// The medium serial you BELIEVE this cartridge carries, for
+        /// pre-registering one that has not been loaded yet.
+        ///
+        /// ADR-0012 amendment (2026-09-16, issue #197): this is an
+        /// unconfirmed CLAIM, stored in `operator_serial` — never the chip's
+        /// own report. `volume init` writes the confirmed identity
+        /// (`serial_number`) itself, from a real MAM read, the first time
+        /// this cartridge is loaded; no operator command ever writes that
+        /// column. Correct a wrong claim with `cartridge edit --serial`.
         #[arg(long)]
         serial: Option<String>,
         /// Notes
@@ -97,7 +102,7 @@ pub enum CartridgeCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Correct a registered cartridge's generation
+    /// Correct a registered cartridge's generation and/or its claimed serial
     ///
     /// ADR-0012, *Rulings recorded as consequences*: "`cartridge edit
     /// --generation` corrects a wrong generation (Tier 1: it is a fact
@@ -107,12 +112,26 @@ pub enum CartridgeCommands {
     /// included. This edits only the `cartridges` row: it never rewrites
     /// `volumes.media_type` or `volumes.capacity_bytes` (ADR-0010 decision
     /// 3 — capacity is decided once at init and stored on the volume).
+    ///
+    /// `--serial` is a SEPARATE, independently gated correction (ADR-0012
+    /// amendment, 2026-09-16; issue #197): gating is per-flag, not
+    /// per-command, because `--generation` is a fact correction (Tier 1)
+    /// while `--serial` is a claim about IDENTITY (Tier 2 — see
+    /// `cli::consent`). It writes only `operator_serial`, never
+    /// `serial_number`, which no operator command may ever touch. At least
+    /// one of `--generation`/`--serial` must be given; both may be given in
+    /// one call, and each is gated independently.
     Edit {
         /// Barcode
         barcode: String,
         /// The cartridge's corrected generation (e.g. LTO-5, LTO-6, LTO-7-M8)
         #[arg(long)]
-        generation: String,
+        generation: Option<String>,
+        /// Correct the OPERATOR-claimed serial (never the chip-confirmed
+        /// one). Tier 2 under ADR-0008 — gated on consent
+        /// (`cli::consent::confirm`), unlike `--generation` above.
+        #[arg(long)]
+        serial: Option<String>,
     },
     /// Correct a cartridge's barcode label
     ///
@@ -200,6 +219,30 @@ fn display_opt_string(v: &Option<String>) -> String {
     v.clone().unwrap_or_default()
 }
 
+/// `cartridge info`'s two serial lines, split out so the exact rendered text
+/// is assertable without capturing stdout (the `EditOutcome` pattern below).
+///
+/// ADR-0012 amendment, 2026-09-16 (issue #197): "`cartridge info` shows
+/// both, labelled" — a chip-confirmed identity (`serial_number`) and an
+/// operator's unconfirmed claim (`operator_serial`) are different facts, and
+/// an operator reading this output must be able to tell which is which at a
+/// glance, never inferring confirmation from mere presence.
+fn serial_info_lines(
+    serial_number: &Option<String>,
+    operator_serial: &Option<String>,
+) -> (String, String) {
+    (
+        format!(
+            "  Serial (chip-confirmed):   {}",
+            serial_number.as_deref().unwrap_or("(none)")
+        ),
+        format!(
+            "  Serial (operator-claimed): {}",
+            operator_serial.as_deref().unwrap_or("(none)")
+        ),
+    )
+}
+
 /// `cartridge list --json` shape. `media_type`/`loads`/`volume` were
 /// table-only until CTO decision 2026-09-11 (architecture review C2
 /// follow-up, C2b); `location` is additive since ADR-0011.
@@ -269,17 +312,36 @@ pub fn run(
                     "cartridge \"{barcode}\" already exists"
                 )));
             }
+            // ADR-0012 amendment, 2026-09-16 (issue #197): `serial` here is
+            // an unconfirmed operator CLAIM, stored in `operator_serial`
+            // below -- never `serial_number`, which is written only from a
+            // real MAM read. So this checks only against OTHER rows'
+            // `serial_number`: a chip cannot report two different
+            // cartridges' identity, so typing a value that is already
+            // someone else's CONFIRMED serial is almost certainly a typo,
+            // worth catching by name. It deliberately does NOT check other
+            // rows' `operator_serial` -- two operators can mistype the same
+            // wrong value for two different cartridges, and refusing that
+            // at registration would be a UNIQUE constraint by another name,
+            // which is exactly what `operator_serial` (migration 016)
+            // declines to be. A duplicate, unconfirmed claim is tolerated;
+            // it resolves itself the first time either cartridge is loaded.
             if let Some(s) = serial {
-                let serial_taken: Option<i64> = conn
+                let confirmed_elsewhere: Option<String> = conn
                     .query_row(
-                        "SELECT id FROM cartridges WHERE serial_number = ?1",
+                        "SELECT barcode FROM cartridges WHERE serial_number = ?1",
                         params![s],
                         |row| row.get(0),
                     )
                     .optional()?;
-                if serial_taken.is_some() {
+                if let Some(other_barcode) = confirmed_elsewhere {
                     return Err(TapectlError::Other(format!(
-                        "medium serial \"{s}\" is already registered to another cartridge"
+                        "medium serial \"{s}\" is already the CHIP-CONFIRMED serial of \
+                         cartridge \"{other_barcode}\" (a real MAM read put it there). \
+                         Registering it as \"{barcode}\"'s claimed serial would name a \
+                         cartridge that already has a different, verified identity -- almost \
+                         certainly a typo. If \"{barcode}\" and \"{other_barcode}\" are the \
+                         same physical cartridge, it is already registered; use that barcode."
                     )));
                 }
             }
@@ -306,9 +368,13 @@ pub fn run(
             // false "zero loads" that a later bind with no readable load
             // count (`bind_cartridge`'s `COALESCE`) would otherwise make
             // permanent.
+            // `operator_serial`, never `serial_number` (ADR-0012 amendment,
+            // 2026-09-16; issue #197): this command records only the
+            // operator's claim. `serial_number` is left NULL and is written
+            // only from a real MAM read (`volume::binding::record_medium_serial`).
             conn.execute(
                 "INSERT INTO cartridges
-                    (barcode, media_type, nominal_capacity, serial_number, notes, total_load_count)
+                    (barcode, media_type, nominal_capacity, operator_serial, notes, total_load_count)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
                 params![barcode, canonical_generation, cap, serial, notes],
             )?;
@@ -340,7 +406,18 @@ pub fn run(
         }
         CartridgeCommands::Info { barcode } => {
             #[allow(clippy::type_complexity)]
-            let (id, media, status, loads, cap, created, notes, location): (
+            let (
+                id,
+                media,
+                status,
+                loads,
+                cap,
+                created,
+                notes,
+                location,
+                serial_number,
+                operator_serial,
+            ): (
                 i64,
                 String,
                 String,
@@ -349,12 +426,14 @@ pub fn run(
                 String,
                 Option<String>,
                 Option<String>,
+                Option<String>,
+                Option<String>,
             ) = conn
                 .query_row(
                     // LEFT JOIN: a cartridge that has never been placed must
                     // still be inspectable (ADR-0011).
                     "SELECT c.id, c.media_type, c.status, c.total_load_count, c.nominal_capacity,
-                            c.created_at, c.notes, l.name
+                            c.created_at, c.notes, l.name, c.serial_number, c.operator_serial
                      FROM cartridges c
                      LEFT JOIN locations l ON l.id = c.location_id
                      WHERE c.barcode = ?1",
@@ -369,6 +448,8 @@ pub fn run(
                             row.get(5)?,
                             row.get(6)?,
                             row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
                         ))
                     },
                 )
@@ -391,13 +472,23 @@ pub fn run(
             if json_output {
                 println!(
                     "{}",
-                    // `location` is ADDITIVE (ADR-0011).
-                    serde_json::json!({"barcode": barcode, "media_type": media, "status": status, "loads": loads, "location": location, "volumes": volumes.len()})
+                    // `location` is ADDITIVE (ADR-0011); `serial_number` /
+                    // `operator_serial` likewise (ADR-0012 amendment,
+                    // 2026-09-16; issue #197).
+                    serde_json::json!({
+                        "barcode": barcode, "media_type": media, "status": status,
+                        "loads": loads, "location": location, "volumes": volumes.len(),
+                        "serial_number": serial_number, "operator_serial": operator_serial,
+                    })
                 );
             } else {
                 println!("Cartridge: {barcode}");
                 println!("  Type:     {media}");
                 println!("  Status:   {status}");
+                let (chip_line, operator_line) =
+                    serial_info_lines(&serial_number, &operator_serial);
+                println!("{chip_line}");
+                println!("{operator_line}");
                 println!(
                     "  Location: {}",
                     location.as_deref().unwrap_or("(not placed)")
@@ -471,59 +562,119 @@ pub fn run(
         CartridgeCommands::Edit {
             barcode,
             generation,
+            serial,
         } => {
             let barcode = barcode.trim();
-            let outcome = cartridge_edit(conn, barcode, generation, dry_run)?;
+            // ADR-0012 amendment, 2026-09-16 (issue #197): gating is
+            // PER-FLAG, not per-command -- `--generation` stays Tier 1
+            // (ungated), `--serial` is Tier 2 (gated via
+            // `cli::consent::confirm`, using the global `--yes` exactly as
+            // `db import` does: a plain identity-claim change with no
+            // computed coverage risk to show). Each is independently
+            // optional, but at least one must be given.
+            if generation.is_none() && serial.is_none() {
+                return Err(TapectlError::Other(
+                    "cartridge edit: nothing to do -- give --generation, --serial, or both"
+                        .to_string(),
+                ));
+            }
+
+            let generation_outcome = generation
+                .as_deref()
+                .map(|g| cartridge_edit(conn, barcode, g, dry_run))
+                .transpose()?;
+            let serial_outcome = serial
+                .as_deref()
+                .map(|s| cartridge_edit_serial(conn, barcode, s, yes, dry_run))
+                .transpose()?;
+
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "barcode": barcode,
-                        "media_type": {
+                let mut obj = serde_json::json!({ "barcode": barcode, "dry_run": dry_run });
+                let map = obj.as_object_mut().unwrap();
+                if let Some(outcome) = &generation_outcome {
+                    map.insert(
+                        "media_type".to_string(),
+                        serde_json::json!({
                             "old": outcome.old_media_type,
                             "new": outcome.new_media_type,
-                        },
-                        "nominal_capacity": {
+                        }),
+                    );
+                    map.insert(
+                        "nominal_capacity".to_string(),
+                        serde_json::json!({
                             "old": outcome.old_capacity,
                             "new": outcome.new_capacity,
                             "redefaulted": outcome.redefaulted,
-                        },
-                        "changed": outcome.changed,
-                        // Plain `dry_run`, not `dry_run && changed`. The field
-                        // answers "was this invocation a dry run?", and a
-                        // consumer asking "did anything mutate?" reads
-                        // `changed`. Conflating them made `--dry-run` on a
-                        // same-value no-op report `dry_run: false`, which reads
-                        // alone as "this was a real run" — the opposite of the
-                        // truth. `Relabel` (below) already reports a plain
-                        // `true`; this matches it.
-                        "dry_run": dry_run,
-                    })
-                );
-            } else if !outcome.changed {
-                println!(
-                    "cartridge \"{barcode}\" is already {}; nothing changed",
-                    outcome.new_media_type
-                );
-            } else {
-                let suffix = if dry_run {
-                    " (DRY RUN — no changes made)"
-                } else {
-                    ""
-                };
-                println!(
-                    "cartridge \"{barcode}\" media_type: {} -> {}{suffix}",
-                    outcome.old_media_type, outcome.new_media_type
-                );
-                println!("{}", outcome.capacity_note);
-                for (label, vol_media) in &outcome.mismatched_volumes {
-                    println!(
-                        "warning: volume \"{label}\" has an open mount on this cartridge and \
-                         was planned as {vol_media}, which now differs from the corrected \
-                         generation {} -- display only, nothing about the volume is changed \
-                         (ADR-0010 decision 3)",
-                        outcome.new_media_type
+                        }),
                     );
+                    // Plain `dry_run`, not `dry_run && changed`. The field
+                    // answers "was this invocation a dry run?", and a
+                    // consumer asking "did anything mutate?" reads
+                    // `changed`. Conflating them made `--dry-run` on a
+                    // same-value no-op report `dry_run: false`, which reads
+                    // alone as "this was a real run" — the opposite of the
+                    // truth. `Relabel` already reports a plain `true`; this
+                    // matches it.
+                    map.insert("changed".to_string(), serde_json::json!(outcome.changed));
+                }
+                if let Some(outcome) = &serial_outcome {
+                    map.insert(
+                        "operator_serial".to_string(),
+                        serde_json::json!({
+                            "old": outcome.old,
+                            "new": outcome.new,
+                            "changed": outcome.changed,
+                        }),
+                    );
+                }
+                println!("{obj}");
+            } else {
+                if let Some(outcome) = &generation_outcome {
+                    if !outcome.changed {
+                        println!(
+                            "cartridge \"{barcode}\" is already {}; nothing changed",
+                            outcome.new_media_type
+                        );
+                    } else {
+                        let suffix = if dry_run {
+                            " (DRY RUN — no changes made)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "cartridge \"{barcode}\" media_type: {} -> {}{suffix}",
+                            outcome.old_media_type, outcome.new_media_type
+                        );
+                        println!("{}", outcome.capacity_note);
+                        for (label, vol_media) in &outcome.mismatched_volumes {
+                            println!(
+                                "warning: volume \"{label}\" has an open mount on this \
+                                 cartridge and was planned as {vol_media}, which now differs \
+                                 from the corrected generation {} -- display only, nothing \
+                                 about the volume is changed (ADR-0010 decision 3)",
+                                outcome.new_media_type
+                            );
+                        }
+                    }
+                }
+                if let Some(outcome) = &serial_outcome {
+                    if !outcome.changed {
+                        println!(
+                            "cartridge \"{barcode}\"'s claimed serial is already {}; nothing changed",
+                            outcome.new
+                        );
+                    } else {
+                        let suffix = if dry_run {
+                            " (DRY RUN — no changes made)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "cartridge \"{barcode}\" operator_serial: {} -> {}{suffix}",
+                            outcome.old.as_deref().unwrap_or("(none)"),
+                            outcome.new
+                        );
+                    }
                 }
             }
         }
@@ -789,6 +940,104 @@ fn cartridge_edit(
         redefaulted,
         capacity_note,
         mismatched_volumes,
+    })
+}
+
+/// The result of `cartridge edit --serial` (ADR-0012 amendment, 2026-09-16;
+/// issue #197), split out from printing for the same reason as
+/// [`EditOutcome`].
+struct SerialEditOutcome {
+    /// `false` for the same-value no-op: nothing was written, no event was
+    /// logged, no consent was asked (there is nothing to confirm).
+    changed: bool,
+    old: Option<String>,
+    new: String,
+}
+
+/// `cartridge edit --serial`: corrects the OPERATOR's claim about a
+/// cartridge's medium serial (ADR-0012 amendment, 2026-09-16; issue #197).
+///
+/// Writes ONLY `cartridges.operator_serial` — never `serial_number`, which is
+/// written only from a real MAM read
+/// (`crate::volume::binding::record_medium_serial`). That is the entire
+/// structural point of the ruling: no operator command may ever touch the
+/// chip-read column, so "never overwrite a chip-read serial" is true by
+/// construction rather than a rule this function has to remember.
+///
+/// Tier 2 under ADR-0008, unlike `cartridge_edit`'s `--generation` (Tier 1):
+/// this is a claim about IDENTITY, gated on consent via
+/// `cli::consent::confirm` — the crate's one mechanic for exactly this,
+/// used here the same way `db import` uses it: a plain identity-claim
+/// change with no COMPUTED coverage risk to show, so `facts` carries at most
+/// one informational line (naming a chip-confirmed serial already on the
+/// row, if any) rather than ADR-0004 evidence.
+///
+/// `dry_run` follows the same convention as every other mutating command in
+/// this file: the outcome is computed and returned for display, but neither
+/// the consent prompt nor the transaction runs.
+fn cartridge_edit_serial(
+    conn: &Connection,
+    barcode: &str,
+    serial: &str,
+    assume_yes: bool,
+    dry_run: bool,
+) -> Result<SerialEditOutcome> {
+    let serial = serial.trim();
+    let (id, old_operator_serial, chip_confirmed): (i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT id, operator_serial, serial_number FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    // Same-value no-op: nothing to confirm, nothing to write.
+    if old_operator_serial.as_deref() == Some(serial) {
+        return Ok(SerialEditOutcome {
+            changed: false,
+            old: old_operator_serial,
+            new: serial.to_string(),
+        });
+    }
+
+    if dry_run {
+        return Ok(SerialEditOutcome {
+            changed: true,
+            old: old_operator_serial,
+            new: serial.to_string(),
+        });
+    }
+
+    let action = format!("correct cartridge \"{barcode}\"'s claimed serial to \"{serial}\"");
+    let mut facts = Vec::new();
+    if let Some(chip) = &chip_confirmed {
+        facts.push(format!(
+            "cartridge \"{barcode}\" already has a CHIP-CONFIRMED serial ({chip}); this edit \
+             changes only the operator's claim and never touches that value"
+        ));
+    }
+    crate::cli::consent::confirm(&action, &facts, assume_yes)?;
+
+    conn.execute(
+        "UPDATE cartridges SET operator_serial = ?1 WHERE id = ?2",
+        params![serial, id],
+    )?;
+    events::log_field_change(
+        conn,
+        "cartridge",
+        id,
+        barcode,
+        "updated",
+        "operator_serial",
+        old_operator_serial.as_deref(),
+        serial,
+        None,
+    )?;
+
+    Ok(SerialEditOutcome {
+        changed: true,
+        old: old_operator_serial,
+        new: serial.to_string(),
     })
 }
 
@@ -1123,11 +1372,19 @@ mod tests {
         )
     }
 
-    fn stored_row(conn: &Connection, barcode: &str) -> (String, i64, Option<String>) {
+    /// `(media_type, nominal_capacity, serial_number, operator_serial)`.
+    /// The last two are DIFFERENT columns since migration 016 (ADR-0012
+    /// amendment, 2026-09-16; issue #197): `serial_number` is chip-confirmed
+    /// only, `operator_serial` is `cartridge register --serial`'s claim.
+    fn stored_row(
+        conn: &Connection,
+        barcode: &str,
+    ) -> (String, i64, Option<String>, Option<String>) {
         conn.query_row(
-            "SELECT media_type, nominal_capacity, serial_number FROM cartridges WHERE barcode = ?1",
+            "SELECT media_type, nominal_capacity, serial_number, operator_serial
+             FROM cartridges WHERE barcode = ?1",
             rusqlite::params![barcode],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap()
     }
@@ -1151,7 +1408,7 @@ mod tests {
     fn register_without_capacity_defaults_from_the_generation_table() {
         let conn = crate::db::open_memory().unwrap();
         register(&conn, "B001", "LTO-6", None, None).unwrap();
-        let (_, cap, _) = stored_row(&conn, "B001");
+        let (_, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(
             cap,
             crate::media::Generation::Lto6.native_capacity_bytes() as i64
@@ -1167,7 +1424,7 @@ mod tests {
         // issue #168): "40000G" means 40000 * 10^9 = the marketed 40 TB,
         // not the binary parser's ~43.95 TB.
         register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
-        let (_, cap, _) = stored_row(&conn, "B001");
+        let (_, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(cap, 40_000_000_000_000);
     }
 
@@ -1179,7 +1436,7 @@ mod tests {
     fn register_with_explicit_capacity_matches_the_generation_tables_decimal_unit() {
         let conn = crate::db::open_memory().unwrap();
         register(&conn, "B001", "LTO-6", Some("2.5T"), None).unwrap();
-        let (_, cap, _) = stored_row(&conn, "B001");
+        let (_, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(cap, 2_500_000_000_000);
         assert_eq!(
             cap,
@@ -1187,20 +1444,30 @@ mod tests {
         );
     }
 
+    /// ADR-0012 amendment, 2026-09-16 (issue #197): `--serial` is an
+    /// unconfirmed operator CLAIM, so it lands in `operator_serial` — and
+    /// `serial_number`, the chip-confirmed identity, must stay `NULL`. That
+    /// second assertion is the whole point of the fix: before #197,
+    /// `register --serial` wrote the SAME column a real MAM read writes.
     #[test]
-    fn register_persists_an_explicit_serial() {
+    fn register_persists_an_explicit_serial_as_the_operators_claim() {
         let conn = crate::db::open_memory().unwrap();
         register(&conn, "B001", "LTO-6", None, Some("EW7VWMVKF6")).unwrap();
-        let (_, _, serial) = stored_row(&conn, "B001");
-        assert_eq!(serial.as_deref(), Some("EW7VWMVKF6"));
+        let (_, _, serial_number, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(operator_serial.as_deref(), Some("EW7VWMVKF6"));
+        assert_eq!(
+            serial_number, None,
+            "register --serial must never write the chip-confirmed column"
+        );
     }
 
     #[test]
-    fn register_without_serial_leaves_it_null() {
+    fn register_without_serial_leaves_both_columns_null() {
         let conn = crate::db::open_memory().unwrap();
         register(&conn, "B001", "LTO-6", None, None).unwrap();
-        let (_, _, serial) = stored_row(&conn, "B001");
-        assert_eq!(serial, None);
+        let (_, _, serial_number, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(serial_number, None);
+        assert_eq!(operator_serial, None);
     }
 
     /// Issue #184: a hand-registered cartridge has never had its MAM load
@@ -1239,14 +1506,43 @@ mod tests {
         );
     }
 
+    /// ADR-0012 amendment, 2026-09-16 (issue #197), migration 016's own
+    /// header: `operator_serial` carries NO uniqueness check, deliberately
+    /// -- two operators typing the same wrong serial for two different
+    /// cartridges is a duplicate, UNCONFIRMED claim, not a schema violation.
+    /// A pre-check refusal here would be a UNIQUE constraint by another
+    /// name, which is exactly what the ruling declines to add.
     #[test]
-    fn register_onto_a_taken_serial_is_refused_by_name() {
+    fn register_allows_a_duplicate_operator_serial_claim() {
         let conn = crate::db::open_memory().unwrap();
         register(&conn, "B001", "LTO-6", None, Some("SER-1")).unwrap();
+        register(&conn, "B002", "LTO-6", None, Some("SER-1"))
+            .expect("two unconfirmed claims of the same serial must not be refused");
+        let (_, _, _, op1) = stored_row(&conn, "B001");
+        let (_, _, _, op2) = stored_row(&conn, "B002");
+        assert_eq!(op1.as_deref(), Some("SER-1"));
+        assert_eq!(op2.as_deref(), Some("SER-1"));
+    }
+
+    /// ...but typing a serial that is already another row's CHIP-CONFIRMED
+    /// `serial_number` is still refused by name: a real MAM read cannot
+    /// report two different cartridges' identity, so this is almost
+    /// certainly a typo, and the register-time check catches it.
+    #[test]
+    fn register_onto_a_chip_confirmed_serial_is_refused_by_name() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        conn.execute(
+            "UPDATE cartridges SET serial_number = 'SER-1' WHERE barcode = 'B001'",
+            [],
+        )
+        .unwrap();
+
         let err = register(&conn, "B002", "LTO-6", None, Some("SER-1")).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("SER-1"), "got: {msg}");
-        assert!(msg.contains("already registered"), "got: {msg}");
+        assert!(msg.contains("CHIP-CONFIRMED"), "got: {msg}");
+        assert!(msg.contains("B001"), "got: {msg}");
         assert!(
             !msg.to_lowercase().contains("constraint"),
             "must be a named refusal, not a raw SQLite error: {msg}"
@@ -1261,9 +1557,9 @@ mod tests {
     fn register_trims_barcode_and_serial() {
         let conn = crate::db::open_memory().unwrap();
         register(&conn, "  B001  ", "LTO-6", None, Some("  SER-1  ")).unwrap();
-        let (_, _, serial) = stored_row(&conn, "B001");
+        let (_, _, _, operator_serial) = stored_row(&conn, "B001");
         assert_eq!(
-            serial.as_deref(),
+            operator_serial.as_deref(),
             Some("SER-1"),
             "both the barcode lookup and the stored serial must be trimmed"
         );
@@ -1415,10 +1711,28 @@ mod tests {
             conn,
             &CartridgeCommands::Edit {
                 barcode: barcode.to_string(),
-                generation: generation.to_string(),
+                generation: Some(generation.to_string()),
+                serial: None,
             },
             false,
             true,
+            false,
+        )
+    }
+
+    /// `run()` with the global `--yes` NOT assumed, so `--serial`'s Tier 2
+    /// gate (`cli::consent::confirm`) is actually exercised rather than
+    /// bypassed.
+    fn edit_serial(conn: &Connection, barcode: &str, serial: &str, yes: bool) -> Result<()> {
+        run(
+            conn,
+            &CartridgeCommands::Edit {
+                barcode: barcode.to_string(),
+                generation: None,
+                serial: Some(serial.to_string()),
+            },
+            false,
+            yes,
             false,
         )
     }
@@ -1441,7 +1755,8 @@ mod tests {
             &conn,
             &CartridgeCommands::Edit {
                 barcode: "B001".to_string(),
-                generation: "LTO-5".to_string(),
+                generation: Some("LTO-5".to_string()),
+                serial: None,
             },
             false,
             true,
@@ -1449,7 +1764,7 @@ mod tests {
         )
         .unwrap();
 
-        let (media_type, cap, _) = stored_row(&conn, "B001");
+        let (media_type, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(media_type, "LTO-6", "dry-run must not rewrite media_type");
         assert_eq!(
             cap,
@@ -1479,7 +1794,7 @@ mod tests {
         register(&conn, "B001", "LTO-6", None, None).unwrap();
         let outcome = cartridge_edit(&conn, "B001", "LTO-5", false).unwrap();
         assert!(outcome.redefaulted, "JSON redefaulted must be true");
-        let (_, cap, _) = stored_row(&conn, "B001");
+        let (_, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(
             cap,
             crate::media::Generation::Lto5.native_capacity_bytes() as i64
@@ -1494,7 +1809,7 @@ mod tests {
         register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
         let outcome = cartridge_edit(&conn, "B001", "LTO-9", false).unwrap();
         assert!(!outcome.redefaulted, "JSON redefaulted must be false");
-        let (_, cap, _) = stored_row(&conn, "B001");
+        let (_, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(cap, 40_000_000_000_000);
     }
 
@@ -1512,7 +1827,7 @@ mod tests {
         )
         .unwrap();
         edit(&conn, "B001", "LTO-6").unwrap();
-        let (media_type, cap, _) = stored_row(&conn, "B001");
+        let (media_type, cap, _, _) = stored_row(&conn, "B001");
         assert_eq!(media_type, "LTO-6");
         assert_eq!(cap, 2_500_000_000_000, "capacity must be left untouched");
     }
@@ -1648,5 +1963,179 @@ mod tests {
         .unwrap();
         assert_eq!(gen, Generation::Lto5);
         assert!(source.is_detected());
+    }
+
+    // ---- ADR-0012 amendment, 2026-09-16: `cartridge edit --serial` (Tier 2,
+    // gated per-flag — issue #197) ------------------------------------------
+
+    #[test]
+    fn edit_requires_at_least_one_of_generation_or_serial() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let err = run(
+            &conn,
+            &CartridgeCommands::Edit {
+                barcode: "B001".to_string(),
+                generation: None,
+                serial: None,
+            },
+            false,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nothing to do"));
+    }
+
+    /// The Tier 2 gate is REAL, not decorative: under `cargo test` stdin is
+    /// never a terminal, so `run()` with the global `--yes` NOT set must hit
+    /// `cli::consent::confirm`'s non-interactive refusal exactly like every
+    /// other Tier-2 command in this crate — and the row must be untouched.
+    #[test]
+    fn edit_serial_without_yes_is_refused_and_writes_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let err = edit_serial(&conn, "B001", "SER-1", false).unwrap_err();
+        assert!(
+            err.to_string().contains("non-interactive session"),
+            "got: {err}"
+        );
+        let (_, _, serial_number, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(serial_number, None);
+        assert_eq!(operator_serial, None, "a refused edit must write nothing");
+    }
+
+    #[test]
+    fn edit_serial_with_yes_writes_the_claim_and_logs_an_event() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        edit_serial(&conn, "B001", "SER-1", true).unwrap();
+
+        let (_, _, serial_number, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(
+            serial_number, None,
+            "cartridge edit --serial must never write the chip-confirmed column"
+        );
+        assert_eq!(operator_serial.as_deref(), Some("SER-1"));
+
+        let (field, old_value, new_value): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT field, old_value, new_value FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'updated' AND field = 'operator_serial'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(field, "operator_serial");
+        assert_eq!(old_value, None);
+        assert_eq!(new_value.as_deref(), Some("SER-1"));
+    }
+
+    /// `cartridge edit --serial` NEVER touches `serial_number`, even when
+    /// one is already chip-confirmed — it corrects only the assertion.
+    #[test]
+    fn edit_serial_on_a_chip_confirmed_row_changes_only_the_claim() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        conn.execute(
+            "UPDATE cartridges SET serial_number = 'SER-CHIP' WHERE barcode = 'B001'",
+            [],
+        )
+        .unwrap();
+
+        edit_serial(&conn, "B001", "SER-CLAIMED", true).unwrap();
+
+        let (_, _, serial_number, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(
+            serial_number.as_deref(),
+            Some("SER-CHIP"),
+            "the chip-confirmed serial must never be touched by this command"
+        );
+        assert_eq!(operator_serial.as_deref(), Some("SER-CLAIMED"));
+    }
+
+    #[test]
+    fn edit_serial_same_value_writes_no_event_and_asks_no_consent() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, Some("SER-1")).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        // yes=false: if this reached the consent gate at all it would be
+        // refused (non-interactive), so success here proves the no-op path
+        // short-circuits before ever asking.
+        edit_serial(&conn, "B001", "SER-1", false).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn edit_serial_dry_run_changes_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        run(
+            &conn,
+            &CartridgeCommands::Edit {
+                barcode: "B001".to_string(),
+                generation: None,
+                serial: Some("SER-1".to_string()),
+            },
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let (_, _, _, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(
+            operator_serial, None,
+            "dry-run must write nothing, and must not even ask for consent"
+        );
+    }
+
+    /// Both flags in one call, each gated independently: `--generation` (Tier
+    /// 1) applies unconditionally, `--serial` (Tier 2) still needs consent.
+    #[test]
+    fn edit_generation_and_serial_together_gate_only_the_serial_half() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        run(
+            &conn,
+            &CartridgeCommands::Edit {
+                barcode: "B001".to_string(),
+                generation: Some("LTO-5".to_string()),
+                serial: Some("SER-1".to_string()),
+            },
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let (media_type, _, _, operator_serial) = stored_row(&conn, "B001");
+        assert_eq!(media_type, "LTO-5");
+        assert_eq!(operator_serial.as_deref(), Some("SER-1"));
+    }
+
+    // ---- `cartridge info`: both serial fields, clearly labelled -----------
+
+    #[test]
+    fn info_renders_both_serial_fields_distinguishably() {
+        // Pins the exact text (ADR-0012 amendment's "clearly labelled so an
+        // operator can tell a confirmed serial from an unconfirmed claim").
+        let (chip_line, operator_line) = serial_info_lines(
+            &Some("SER-CHIP".to_string()),
+            &Some("SER-CLAIMED".to_string()),
+        );
+        assert_eq!(chip_line, "  Serial (chip-confirmed):   SER-CHIP");
+        assert_eq!(operator_line, "  Serial (operator-claimed): SER-CLAIMED");
+    }
+
+    #[test]
+    fn info_renders_absent_serials_as_none_not_blank() {
+        let (chip_line, operator_line) = serial_info_lines(&None, &None);
+        assert_eq!(chip_line, "  Serial (chip-confirmed):   (none)");
+        assert_eq!(operator_line, "  Serial (operator-claimed): (none)");
     }
 }
