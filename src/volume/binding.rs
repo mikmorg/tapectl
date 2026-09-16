@@ -2640,6 +2640,79 @@ mod tests {
         assert_eq!(open_mounts(&conn, cart_id), vec![new_vol]);
     }
 
+    // ---- issue #162: a re-bind to a DIFFERENT cartridge refuses loudly ---
+
+    /// `cartridge_volumes` carries `UNIQUE(volume_id)`, and ADR-0012's
+    /// closing sentence rules "a binding is permanent once its mount is
+    /// closed." Today's `INSERT OR IGNORE` silently drops a second mount for
+    /// the same volume naming a different cartridge — the catalog keeps the
+    /// FIRST binding, but the caller still gets `Ok` back and reports the
+    /// SECOND cartridge as if the write went there. This test is written
+    /// BEFORE the fix and must fail against current code: the second call
+    /// below returns `Ok`, not `Err`.
+    #[test]
+    fn a_rebind_to_a_different_cartridge_is_refused_naming_both() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        register(&conn, "BC002", "LTO-6", Some("SER-2"), "available");
+        let cart_a = lookup_cartridge(&conn, Some("SER-1"), None)
+            .unwrap()
+            .row
+            .unwrap()
+            .id;
+        let cart_b = lookup_cartridge(&conn, Some("SER-2"), None)
+            .unwrap()
+            .row
+            .unwrap()
+            .id;
+        let vol = new_volume(&conn, "L6-0001");
+
+        // First bind: succeeds, leaves the mount open (never closed).
+        mount_and_record(
+            &conn,
+            vol,
+            cart_a,
+            "BC001",
+            "available",
+            Some("SER-1"),
+            &MamInfo::default(),
+            "volume init",
+            true,
+        )
+        .unwrap();
+
+        // Second bind, same volume, a DIFFERENT cartridge, mount still open.
+        // (`BindOutcome` has no `Debug`, so match rather than `expect_err`.)
+        let result = mount_and_record(
+            &conn,
+            vol,
+            cart_b,
+            "BC002",
+            "available",
+            Some("SER-2"),
+            &MamInfo::default(),
+            "volume init",
+            true,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a re-bind to a different cartridge while the first mount is open must refuse"
+            ),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("BC001"), "must name the existing cartridge: {msg}");
+        assert!(msg.contains("BC002"), "must name the requested cartridge: {msg}");
+        assert!(
+            msg.contains("permanent once its mount is closed"),
+            "must cite ADR-0012's closing ruling: {msg}"
+        );
+        // And the catalog must still show exactly the FIRST binding, since
+        // the refused call must not touch it.
+        assert_eq!(open_mounts(&conn, cart_a), vec![vol]);
+        assert!(open_mounts(&conn, cart_b).is_empty());
+    }
+
     /// ── ADR-0012 corroboration, one test per branch (issue #193) ────────
     ///
     /// These drill [`corroborate_contact`] itself. The per-call-site tests
