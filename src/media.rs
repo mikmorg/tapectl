@@ -218,6 +218,25 @@ impl fmt::Display for Generation {
     }
 }
 
+/// Parse an operator-facing `--generation` string, or fail with the one
+/// error text every such caller shares.
+///
+/// [`Generation::parse`] returns `Option` because it is also used where "not
+/// a generation" is not necessarily an error (e.g. probing a config value
+/// before deciding how to report it); this wraps it for the two CLI call
+/// sites that need a `Result` and must not let their wording drift apart —
+/// `cartridge register --generation` ([`crate::cli::cartridge`]) and `import
+/// --generation` ([`crate::cli::operations::volume_import`]), per ADR-0012's
+/// "`import` requires `--generation`" ruling (issue #169).
+pub fn parse_generation_or_error(s: &str) -> Result<Generation> {
+    Generation::parse(s).ok_or_else(|| {
+        TapectlError::Other(format!(
+            "{s:?} is not a recognised LTO generation \
+             (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
+        ))
+    })
+}
+
 /// Which of the three sources in [`resolve_capacity`]'s precedence produced
 /// the figure. Carried so the caller can SAY where the number came from —
 /// a 2400 MB "LTO-8" volume is alarming until you are told a drive

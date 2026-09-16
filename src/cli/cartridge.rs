@@ -247,12 +247,7 @@ pub fn run(
             // ADR-0010: stored canonical, not the operator's raw spelling,
             // so a later comparison against a detected generation
             // (`volume init`) is a plain string match.
-            let parsed = crate::media::Generation::parse(generation).ok_or_else(|| {
-                TapectlError::Other(format!(
-                    "{generation:?} is not a recognised LTO generation \
-                     (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
-                ))
-            })?;
+            let parsed = crate::media::parse_generation_or_error(generation)?;
             let canonical_generation = parsed.as_str();
             let (cap, capacity_display) = match capacity {
                 Some(c) => (crate::media::parse_capacity_to_bytes(c)?, c.clone()),
