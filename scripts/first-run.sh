@@ -44,7 +44,7 @@ FROM=0
 TO=99
 TAPECTL=""             # binary; resolved in step 0 unless given
 AUTO=0                 # accept defaults for non-destructive prompts
-DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; BARCODE=""; DGEN=""
+DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; TEST_BARCODE=""; DGEN=""
 SKIP_BUILD=0; SKIP_TESTS=0
 SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
 usage() {
@@ -90,7 +90,7 @@ while [ $# -gt 0 ]; do
     --unit-path) UNIT_PATH="$2"; shift 2 ;;
     --location) LOCATION="$2"; shift 2 ;;
     --kit-out) KIT_OUT="$2"; shift 2 ;;
-    --barcode) BARCODE="$2"; shift 2 ;;
+    --barcode) TEST_BARCODE="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --user) SVC_USER="$2"; shift 2 ;;
@@ -147,6 +147,16 @@ confirm_destructive() {
 run() {
   printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $*"
   "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+# run_capture FILE cmd...: `run`, plus a copy of the output in FILE for the
+# script itself to read back (issue #179 — step 13 needs the bound cartridge's
+# placeholder barcode, and needs to tell one refusal from another).
+run_capture() {
+  local f="$1"; shift
+  printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $*"
+  mkdir -p "$(dirname "$f")"
+  "$@" 2>&1 | tee "$f" | tee -a "$LOG"
   return "${PIPESTATUS[0]}"
 }
 # run_nolog: for the one command whose output must never be written to disk
@@ -354,7 +364,7 @@ run as_svc mt -f "$DEVICE" status || note "mt status failed — is a cartridge l
 ok "drive: $DEVICE ($NST), sg: $SG$( [ "$SVC_MODE" = 1 ] && echo " — openable by $SVC_USER" )"
 }
 
-# ================================================================ step 6
+# ================================================================ step 7
 hdr 7 "Initialise the tapectl home"
 skip_if || {
 if as_svc test -e "$EFFECTIVE_HOME/tapectl.db"; then
@@ -404,7 +414,7 @@ ok "staging at $SD_NEW"
 ok "home ready at $EFFECTIVE_HOME"
 }
 
-# ================================================================ step 7
+# ================================================================ step 8
 hdr 8 "Register the drive as a backend"
 skip_if || {
 CFG="$EFFECTIVE_HOME/config.toml"
@@ -426,7 +436,7 @@ EOF
 fi
 }
 
-# ================================================================ step 8
+# ================================================================ step 9
 hdr 9 "The Heir Kit"
 skip_if || {
 explain <<'EOF'
@@ -442,7 +452,7 @@ note "Print: $KIT_OUT/COVER.txt   (and/or open $KIT_OUT/escrow-kit.html and prin
 note "Seal in tamper-evident envelopes; two failure domains; refresh after each write session."
 }
 
-# ================================================================ step 9
+# ================================================================ step 10
 hdr 10 "A shelf location"
 skip_if || {
 explain <<'EOF'
@@ -459,7 +469,7 @@ case " $EXISTING " in
 esac
 }
 
-# ================================================================ step 10
+# ================================================================ step 11
 hdr 11 "Tenants and units — who owns which paths"
 skip_if || {
 explain <<'EOF'
@@ -538,7 +548,7 @@ Folder-per-unit alternative — add to config.toml, then `tapectl collection syn
 EOF
 }
 
-# ================================================================ step 11
+# ================================================================ step 12
 hdr 12 "OPTIONAL rehearsal on a TEST cartridge (erases it)"
 skip_if || {
 explain <<'EOF'
@@ -547,7 +557,7 @@ Before real data, the lifecycle suite can run a whole simulated first year — w
 This step runs as YOU, not the service user: the suite builds its own debug binary with your toolchain and uses throwaway homes under /scratch. It only needs your login to be able to open the drive.
 EOF
 if ! command -v age >/dev/null 2>&1; then note "skipped: the rehearsal runs RESTORE.sh off the tape, which needs the age CLI (step 2 explains how to install it)"
-elif [ "$AUTO" = 1 ] && [ -z "$BARCODE" ]; then note "skipped under --auto: no --barcode given (erasing a cartridge is never a default)"
+elif [ "$AUTO" = 1 ] && [ -z "$TEST_BARCODE" ]; then note "skipped under --auto: no --barcode given (erasing a cartridge is never a default)"
 elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
   NST="$(readlink -f "$DEVICE")"; DEVGRP="$(stat -c %G "$NST")"; WRAP=()
   if ! { [ -r "$NST" ] && [ -w "$NST" ]; }; then
@@ -557,10 +567,10 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     WRAP=(sg "$DEVGRP" -c)   # this login predates the membership; sg opens a shell with it now
   fi
   if [ -n "$SG" ]; then run sudo sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true; fi
-  ask BARCODE "barcode/serial of the TEST cartridge in the drive (it will be erased)" "$BARCODE"
-  [ -n "$BARCODE" ] || die "no barcode given"
-  if confirm_destructive "ERASE $BARCODE and run the rehearsal" "$BARCODE"; then
-    CMD="cd '$REPO' && bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$BARCODE'"
+  ask TEST_BARCODE "barcode/serial of the TEST cartridge in the drive (it will be erased)" "$TEST_BARCODE"
+  [ -n "$TEST_BARCODE" ] || die "no barcode given"
+  if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE"; then
+    CMD="cd '$REPO' && bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
     if [ "${#WRAP[@]}" -gt 0 ]; then run "${WRAP[@]}" "$CMD"; else run bash -c "$CMD"; fi || die "rehearsal RED — do not write real data until this is understood"
     ok "rehearsal green"
     note "Eject the test cartridge (mt -f $DEVICE offline) and load the production one before step 13."
@@ -568,7 +578,7 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
 else note "skipped"; fi
 }
 
-# ================================================================ step 12
+# ================================================================ step 13
 hdr 13 "The first production tape"
 skip_if || {
 NV="$(tc catalog stats --json 2>/dev/null | python3 -c 'import json,sys
@@ -587,26 +597,9 @@ EOF
   run as_svc mt -f "$DEVICE" status || true
   if as_svc mt -f "$DEVICE" status 2>/dev/null | grep -q DR_OPEN; then die "no cartridge loaded in $DEVICE"; fi
   ask LABEL "volume label" "${LABEL:-L6-0001}"
-  CART_ARG=()
   explain <<'EOF'
-THE CARTRIDGE. You do not have to register this tape: `volume init` reads its medium serial from MAM and registers and binds a cartridge itself, so the catalog can answer "which physical tape is this volume on" without your typing anything. Register it by hand only if you want the catalog to use the barcode YOU write on the sticker instead of the medium's serial — worth it if you label tapes, because that label is what you will read off a shelf years from now.
+THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and wears the serial as a placeholder barcode until you replace it. Put the sticker on whenever you like, before or after this write, with `cartridge relabel`; the command is printed below once the cartridge is registered. Registering by hand FIRST is the one thing not to do: init matches on the serial, finds no row carrying it, and registers a second cartridge — two rows for one tape, with your label on the one the catalog is not using.
 EOF
-  if confirm "Label this cartridge with your own barcode instead of its medium serial?"; then
-    ask BARCODE "barcode you will write on the cartridge" "${BARCODE:-${LABEL}}"
-    if [ -n "$BARCODE" ]; then
-      if tc cartridge list --json 2>/dev/null | grep -q "\"$BARCODE\""; then ok "cartridge $BARCODE already registered"
-      else
-        # Do NOT make the operator guess the generation: the drive already
-        # reports the loaded medium's density code, and a wrong guess is a hard
-        # stop at `volume init` ("registered as X, the loaded medium is Y").
-        CGEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
-        if [ -n "$CGEN" ]; then note "the loaded medium reports $CGEN"; else note "could not read the medium's density from the drive"; fi
-        ask CGEN "generation of THIS cartridge" "${CGEN:-${DGEN:-LTO-6}}"
-        run tc cartridge register --barcode "$BARCODE" --media-type "$CGEN" || die "cartridge register failed"
-      fi
-      CART_ARG=(--cartridge "$BARCODE")
-    fi
-  else note "volume init will register this cartridge from its medium serial"; fi
   UNITS="$(tc unit list --json 2>/dev/null | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("units",[]); print("\n".join(r.get("name","") for r in rows))
@@ -621,13 +614,43 @@ except Exception: pass' 2>/dev/null || true)"
   done <<< "$UNITS"
   run tc staging status || true
   confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" || die "stopped before writing"
-  if ! run tc volume init "$LABEL" --device "$DEVICE" "${CART_ARG[@]}"; then
-    explain <<'EOF'
+  # Capture init's output as well as logging it: two later steps read it back
+  # -- the placeholder barcode it reports, and which refusal it gave.
+  INIT_OUT="$(dirname "$LOG")/volume-init-$LABEL.out"
+  if ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
+    if grep -q "no medium serial" "$INIT_OUT"; then
+      # ADR-0012: with no readable serial the operator must name the cartridge,
+      # and that is their word -- there is no default to fall back on and no
+      # flag that could supply one, so --auto stops here rather than guessing.
+      explain <<'EOF'
+This drive reports no medium serial, so tapectl cannot tell which physical cartridge is loaded and will not guess (ADR-0012). Name it: the barcode you give becomes the recorded identity, and the tape itself will say so — File 0 records `cartridge_identity_source = "operator"` rather than "mam", so anyone reading this tape later can tell a chip-verified serial from a label somebody typed.
+EOF
+      [ "$AUTO" = 1 ] && die "volume init could read no medium serial; naming a cartridge is your word, re-run scripts/first-run.sh --from 13 interactively"
+      ask CARTRIDGE "no serial readable — name this cartridge (the barcode on its sticker)"
+      [ -n "$CARTRIDGE" ] || die "no cartridge named"
+      if ! tc cartridge list --json 2>/dev/null | grep -q "\"$CARTRIDGE\""; then
+        CGEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
+        if [ -n "$CGEN" ]; then note "the loaded medium reports $CGEN"; else note "could not read the medium's density from the drive"; fi
+        ask CGEN "generation of THIS cartridge" "${CGEN:-${DGEN:-LTO-6}}"
+        run tc cartridge register --barcode "$CARTRIDGE" --media-type "$CGEN" || die "cartridge register failed"
+      fi
+      run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --cartridge "$CARTRIDGE" || die "volume init failed"
+    else
+      explain <<'EOF'
 volume init refused. The usual reason: the cartridge's File 0 already identifies a DIFFERENT sealed volume, and sealed volumes are immutable (ADR-0003) — tapectl will not overwrite one by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first.
 EOF
-    [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
-    confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" || die "stopped"
-    run tc volume init "$LABEL" --device "$DEVICE" "${CART_ARG[@]}" --force || die "volume init failed"
+      [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
+      confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" || die "stopped"
+      run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --force || die "volume init failed"
+    fi
+  fi
+  # The cartridge this volume is now bound to, from init's own report lines
+  # (src/volume/write.rs `report_binding`). Best-effort: a missing line costs
+  # the operator a printed hint, never the write.
+  CART_BOUND="$(sed -n 's/^cartridge \(.*\) auto-registered from MAM.*/\1/p; s/^volume "[^"]*" bound to cartridge \(.*\)$/\1/p' "$INIT_OUT" | head -1)"
+  if [ -n "$CART_BOUND" ]; then
+    ok "cartridge $CART_BOUND registered from its chip; that serial is its placeholder barcode"
+    note "When you put a sticker on it:  tapectl cartridge relabel $CART_BOUND <your-barcode>"
   fi
   run tc volume write "$LABEL" --device "$DEVICE" || die "write did not seal — read the output; the catalog knows exactly why"
   run tc volume verify "$LABEL" --device "$DEVICE" --full || die "verify FAILED — do not trust this tape"
@@ -644,13 +667,15 @@ EOF
 fi
 }
 
-# ================================================================ step 13
+# ================================================================ step 14
 hdr 14 "Next"
 SUDO_PREFIX="$( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )"
 cat <<EOF
    • Every tapectl command from now on: ${SUDO_PREFIX}tapectl <command>   (alias it). Its home: $EFFECTIVE_HOME
    • A restore destination must be writable by ${SVC_USER}; new unit trees need the same ACL grant as step 11.
    • Eject with: ${SUDO_PREFIX}mt -f ${DEVICE:-<device>} offline. Write the label on the cartridge.
+     Then tell the catalog what the sticker says (ADR-0012 — the serial stays its identity):
+     ${SUDO_PREFIX}tapectl cartridge relabel ${CART_BOUND:-<medium-serial>} <the-barcode-you-wrote>
    • Second copy, other location: load a fresh cartridge, \`tapectl volume read-slices --from ${LABEL:-<label>} --unit <unit>\`
      for each unit (or stage again), then \`volume write\` a new label and \`volume move --to <other shelf>\`.
    • \`tapectl audit\` weekly — contrib/systemd/ has a timer; its User=/HOME= default to the service user.
