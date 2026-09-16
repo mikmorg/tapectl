@@ -203,9 +203,8 @@ pub fn destination_budget(
     // Unreachable given the empty check above (the loop runs at least
     // once), kept rather than `.unwrap()` so a future refactor that drops
     // that guard fails loudly instead of panicking.
-    let (binding_label, binding_capacity_bytes) = smallest.ok_or_else(|| {
-        TapectlError::Other("collection run: no destination labels given".into())
-    })?;
+    let (binding_label, binding_capacity_bytes) = smallest
+        .ok_or_else(|| TapectlError::Other("collection run: no destination labels given".into()))?;
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
     let usable = (binding_capacity_bytes as f64 * backend.usable_capacity_factor) as u64;
@@ -513,8 +512,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
             .unwrap();
 
-        let err = plan_for_run(&conn, &config, &lib, "/dev/null", &["nonexistent".to_string()])
-            .unwrap_err();
+        let err = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["nonexistent".to_string()],
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, TapectlError::VolumeNotFound(l) if l == "nonexistent"),
             "{err}"

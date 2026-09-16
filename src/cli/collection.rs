@@ -345,7 +345,11 @@ fn cmd_run(
             budget.binding_label,
             format_bytes(budget.binding_capacity_bytes.max(0) as u64),
             budget.num_destinations,
-            if budget.num_destinations == 1 { "" } else { "s" },
+            if budget.num_destinations == 1 {
+                ""
+            } else {
+                "s"
+            },
         );
     }
 
