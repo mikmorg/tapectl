@@ -10,6 +10,28 @@ use crate::error::{Result, TapectlError};
 /// constant (`docs/design/v2-open-questions.md` §8).
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 
+/// Human-readable byte count for `cmd_run`'s budget line (issue #175) — a
+/// tiny local formatter rather than reaching into `cli::catalog`'s private
+/// `format_size`, which this module has no business depending on.
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    let b = bytes as f64;
+    if b >= TB {
+        format!("{:.2} TB", b / TB)
+    } else if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum CollectionCommands {
     /// Sync every configured collection: register new unit folders, resolve
@@ -54,8 +76,13 @@ pub enum CollectionCommands {
         /// Collection name.
         #[arg(long)]
         collection: String,
-        /// Which batch from `collection plan`'s ordering to execute (0 =
-        /// first).
+        /// Which batch to execute (0 = first). Numbered against THIS run's
+        /// own budget — the destination `--label` volumes' recorded
+        /// capacity (issue #175), not the drive's generation. This matches
+        /// `collection plan`'s ordering only when `plan` was run
+        /// (`--generation <GEN>`) for the generation those volumes were
+        /// actually initialised as; otherwise the batch reviewed in `plan`
+        /// is not necessarily batch N here.
         #[arg(long, default_value = "0")]
         batch: usize,
         /// Destination volume label — already `volume init`'d on its own
@@ -299,12 +326,29 @@ fn cmd_run(
     json_output: bool,
 ) -> Result<()> {
     let lib = collection::find_collection(config, collection_name)?;
-    // No `--generation` here: `collection run` writes to volumes that are already
-    // `volume init`-ed, so each destination's real capacity is on its own row.
-    // The device IS given though: `run` already resolved the drive it is
-    // writing to, and batching against a different one would size the batch
-    // for a tape that is not in the drive.
-    let batches = collection::plan::plan_for_collection(conn, config, lib, None, Some(device))?;
+    // No `--generation` here: `collection run` writes to volumes that are
+    // already `volume init`-ed, so each destination's real capacity is on
+    // its own `volumes.capacity_bytes` row (ADR-0010) — `plan_for_run`
+    // resolves that budget from every `--label` FIRST (`destination_budget`,
+    // never `planning_capacity_bytes`) before planning a single batch, so an
+    // unknown label or an empty `--label` list fails here, before
+    // `execute_batch` stages anything (issue #175). The device IS given
+    // though: `run` already resolved the drive it is writing to, and its
+    // usable-capacity factor / ENOSPC buffer still come from that drive.
+    let (batches, budget) = collection::plan::plan_for_run(conn, config, lib, device, labels)?;
+
+    if !json_output {
+        println!(
+            "collection \"{collection_name}\": budget {} from volume \"{}\" (capacity {}, \
+             smallest of {} destination{})",
+            format_bytes(budget.bytes),
+            budget.binding_label,
+            format_bytes(budget.binding_capacity_bytes.max(0) as u64),
+            budget.num_destinations,
+            if budget.num_destinations == 1 { "" } else { "s" },
+        );
+    }
+
     let batch = batches.get(batch_idx).ok_or_else(|| {
         TapectlError::Other(format!(
             "collection \"{collection_name}\": batch {batch_idx} does not exist \
@@ -329,6 +373,8 @@ fn cmd_run(
             serde_json::json!({
                 "collection": collection_name,
                 "batch": batch_idx,
+                "budget_bytes": budget.bytes,
+                "budget_from": budget.binding_label,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
                 "stage_sets_released": report.cleaned.sets_cleaned,
