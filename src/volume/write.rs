@@ -129,36 +129,10 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// `build`/`validate`/`TapeStore::open`, so a write refused at any of those
 /// stages cannot leave a committed displacement behind either (issue #154).
 /// The refusal when this drive cannot write the medium that is loaded
-/// (ADR-0010 decision 2; ADR-0008 Tier 3 — `--force` is not consulted).
-///
-/// Two halves, and the second is the one issue #178 adds. The physics is only
-/// half an answer: the *other* reason this fires is that `generation` in the
-/// `[[backends.lto]]` block is wrong — which is exactly what happened when
-/// `first-run.sh` defaulted the DRIVE's generation from whatever cartridge was
-/// loaded during setup. An operator reading only the physics sentence goes
-/// looking for the wrong cartridge, when the cartridge is fine and the config
-/// is not.
-///
-/// Names the block, the drive it claims to be and the device path, because
-/// there is no `backend edit` (ADR-0012, #143): the repair is editing
-/// config.toml by hand, and the operator needs to know which block.
-fn cannot_write_message(
-    drive_gen: crate::media::Generation,
-    medium_gen: crate::media::Generation,
-    backend: &crate::config::LtoBackendConfig,
-) -> String {
-    format!(
-        "an {drive_gen} drive cannot write {medium_gen} media. This is a physical \
-         limit of the drive, not a policy — --force does not override it. Load a \
-         {drive_gen}-writable cartridge, or write this one in a drive that can.\n\n\
-         If this drive is not really an {drive_gen}, `generation` in the \
-         [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
-         (`tapectl config show` prints it; there is no `backend edit`, by decision: \
-         ADR-0012, #143) and run `tapectl config check`.",
-        backend.name, backend.device_tape,
-    )
-}
-
+/// (ADR-0010 decision 2; ADR-0008 Tier 3 — `--force` is not consulted) is
+/// [`media_detect::check_drive_can_write`] — moved there (issue #166) so
+/// `volume_init`, `volume_write` and `volume_resume` all reach the exact
+/// same message rather than three copies that could drift.
 #[allow(clippy::too_many_arguments)] // conn/config + label/device/block_size + force + the two ADR-0010 declarations
 pub fn volume_init(
     conn: &Connection,
@@ -302,12 +276,10 @@ pub fn volume_init(
     }
 
     // A physical fact, not a risk judgement: `--force` is deliberately NOT
-    // consulted (ADR-0010 decision 2, ADR-0008's tiers).
-    if !crate::media::Generation::can_write(drive_gen, generation) {
-        return Err(TapectlError::Other(cannot_write_message(
-            drive_gen, generation, backend,
-        )));
-    }
+    // consulted (ADR-0010 decision 2, ADR-0008's tiers). One refusal,
+    // written once (issue #166) — `volume_write` and `volume_resume` call
+    // the same helper.
+    crate::tape::media_detect::check_drive_can_write(backend, generation)?;
 
     let capacity_override = match &backend.capacity_override {
         Some(v) => Some(staging::parse_size_to_bytes(v)? as u64),
@@ -947,6 +919,21 @@ pub fn volume_write(
     )?;
     check_loaded_generation(label, &det, volume_media_type.as_deref())?;
 
+    // ADR-0010 decision 2, issue #166: the drive/medium refusal is checked
+    // at every write contact, not only at `volume_init` — a volume
+    // initialised on one drive can be written (or resumed) from a different
+    // one. Same cannot-see-cannot-refuse rule as `check_loaded_generation`
+    // just above: detection wins, and only when NOTHING is detected does the
+    // volume's own recorded generation stand in. Before `bind_late` (issue
+    // #154: a refused write must displace nothing) and before the session
+    // directory / `build()`.
+    let medium_for_write_check = det
+        .generation
+        .or_else(|| volume_media_type.as_deref().and_then(crate::media::Generation::parse));
+    if let Some(m) = medium_for_write_check {
+        crate::tape::media_detect::check_drive_can_write(backend, m)?;
+    }
+
     // File 0's `[media]` identity, taken from the BINDING (ADR-0012, issue
     // #192) now that the loaded medium has been corroborated against it just
     // above. Resolved here, where `conn` is in scope; `build()` stays
@@ -1215,7 +1202,7 @@ pub fn volume_resume(
     // ADR-0010 decision 3: the volume's own row, never config. Resume must
     // in any case reuse the figure the interrupted session planned against —
     // a capacity that moved mid-session would be a different plan.
-    let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
+    let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
 
     // Corroborate at contact (ADR-0012, issue #193). Resume is a contact
@@ -1238,6 +1225,20 @@ pub fn volume_resume(
         label,
         &binding::MediumFacts::from_serial(det.mam.serial.clone()),
     )?;
+
+    // ADR-0010 decision 2, issue #166: resume never checked the drive
+    // against the medium at all — this is the gap that let an interrupted
+    // session be continued on a drive that cannot write the loaded medium,
+    // failing loudly on the first physical write instead of refusing here,
+    // free, before the store is opened. Must call `detect` itself (just
+    // above) rather than reuse one from elsewhere — resume's `det` is
+    // this contact's own reading of the tape, exactly like `volume_write`'s.
+    let medium_for_write_check = det
+        .generation
+        .or_else(|| volume_media_type.as_deref().and_then(crate::media::Generation::parse));
+    if let Some(m) = medium_for_write_check {
+        crate::tape::media_detect::check_drive_can_write(backend, m)?;
+    }
 
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
@@ -2031,14 +2032,27 @@ pub fn volume_verify(
     // no backend configured for this device (`crate::config::resolve_device`
     // never errors when `device` is given) — the same `None => 0` fallback
     // as before covers that case, and costs nothing, since verify only reads.
+    //
+    // Resolved ONCE (issue #187): a second, raw-string lookup used to find
+    // the sg node for `sg_logs` health collection below, and a by-id
+    // `--device` — the RECOMMENDED form, per the device-numbering hazard —
+    // matched the canonicalising resolver here but missed that one, so
+    // health collection was silently skipped with no word said. Both the
+    // capacity factor and the sg node now come from this one resolution.
     let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
-    let usable_bytes = match crate::config::resolve_device(config, Some(device))
-        .ok()
-        .and_then(|(_, b)| b)
-    {
+    let (_, backend) = crate::config::resolve_device(config, Some(device))?;
+    let usable_bytes = match backend {
         Some(b) => (nominal_capacity as f64 * b.usable_capacity_factor) as u64,
         None => 0,
     };
+
+    // Issue #166: refuse before the store is opened if this drive cannot
+    // read the loaded medium — the same fact check every other read path
+    // now applies. LENIENT the same way the rest of this function is: no
+    // backend, or nothing detected, and this proceeds (ADR-0010's read-path
+    // leniency / the DR path, ADR-0005).
+    crate::tape::media_detect::check_read_contact(config, device)?;
+
     // Before `TapeStore::open`: reading the MAM opens the device read-only
     // and drops the fd, and the st driver refuses a second concurrent open.
     // LENIENT — an unconfigured backend yields `None`, which is an absence
@@ -2046,7 +2060,7 @@ pub fn volume_verify(
     let medium_serial = binding::loaded_medium_serial(config, device);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    let report = volume_verify_with_store(
+    let mut report = volume_verify_with_store(
         conn,
         &mut store,
         label,
@@ -2059,11 +2073,23 @@ pub fn volume_verify(
     // Best-effort sg_logs health collection. Advisory only, and deliberately
     // OUTSIDE the store-injectable half: it needs the drive's sg node, which
     // a `MemStore` does not have.
-    if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
-        if let Ok((counters, raw)) = health::collect(&bk.device_sg) {
-            if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
-                warn!(err = %e, "health_logs insert failed");
+    //
+    // Issue #187: the SAME resolved `backend` as above, not a second
+    // raw-string lookup — and when none resolves, SAY so rather than
+    // silently recording nothing.
+    match backend {
+        Some(bk) => {
+            if let Ok((counters, raw)) = health::collect(&bk.device_sg) {
+                if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
+                    warn!(err = %e, "health_logs insert failed");
+                }
             }
+        }
+        None => {
+            report.drive_health_note = Some(format!(
+                "no [[backends.lto]] entry configured for device {device}; drive health \
+                 (sg_logs) was not collected. The verification above is unaffected."
+            ));
         }
     }
 
@@ -2221,6 +2247,9 @@ pub(crate) fn volume_verify_with_store(
         passed: (evidence.files_checked as usize).saturating_sub(evidence.mismatches.len()),
         failed: evidence.mismatches.len(),
         mismatches: evidence.mismatches,
+        // Set by `volume_verify`, which is the only caller with a device and
+        // a backend to resolve; this store-injectable half has neither.
+        drive_health_note: None,
     })
 }
 
@@ -2902,6 +2931,14 @@ pub struct VerifyReport {
     /// so it is reportable here and not storable there. See
     /// [`record_verification_results`].
     pub mismatches: Vec<crate::store::Mismatch>,
+    /// Set when drive-health (`sg_logs`) collection was SKIPPED rather than
+    /// attempted (issue #187): no backend resolves for the device verify was
+    /// given, so there is no sg node to read. `None` means collection was
+    /// attempted (it may still have failed silently, as it always could —
+    /// this field is only about the "skipped, and said nothing" defect).
+    /// Verify still runs and still verifies either way; this is advisory
+    /// only, never a reason to fail the command.
+    pub drive_health_note: Option<String>,
 }
 
 /// Gather the staged batch as `BuildUnit`s, ready for `build::build`.
@@ -2988,47 +3025,6 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
 
 #[cfg(test)]
 mod tests {
-
-    /// Issue #178: the drive/medium refusal must name the config key, not only
-    /// the physics.
-    ///
-    /// Both halves matter. The physics sentence alone sends an operator hunting
-    /// for the wrong cartridge when the cartridge is fine and
-    /// `[[backends.lto]].generation` is wrong — which is precisely what
-    /// `first-run.sh` used to produce by defaulting the DRIVE's generation from
-    /// whatever tape happened to be loaded during setup. There is no
-    /// `backend edit` (ADR-0012, #143), so the message has to say which block
-    /// to edit by hand.
-    #[test]
-    fn cannot_write_message_names_the_backend_block_and_keeps_the_physics() {
-        let backend = crate::config::LtoBackendConfig {
-            name: "lto6".into(),
-            device_tape: "/dev/tape/by-id/scsi-EXAMPLE-nst".into(),
-            device_sg: "/dev/sg9".into(),
-            generation: "LTO-5".into(),
-            capacity_override: None,
-            usable_capacity_factor: 0.92,
-            enospc_buffer: "50M".into(),
-        };
-        let msg = cannot_write_message(
-            crate::media::Generation::Lto5,
-            crate::media::Generation::Lto6,
-            &backend,
-        );
-
-        // The physics half survives unchanged — this is ADR-0008 Tier 3 and
-        // `--force` must still be documented as not applying.
-        assert!(msg.contains("physical"), "{msg}");
-        assert!(msg.contains("--force does not override it"), "{msg}");
-
-        // The recoverable half: which block, which drive it claims to be,
-        // which device, and what to run afterwards.
-        assert!(msg.contains("[[backends.lto]]"), "{msg}");
-        assert!(msg.contains("generation"), "{msg}");
-        assert!(msg.contains("\"lto6\""), "{msg}");
-        assert!(msg.contains("/dev/tape/by-id/scsi-EXAMPLE-nst"), "{msg}");
-        assert!(msg.contains("config check"), "{msg}");
-    }
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
     use sha2::{Digest, Sha256};
