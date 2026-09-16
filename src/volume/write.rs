@@ -846,6 +846,10 @@ pub fn volume_write(
             "no staged data to write — run `tapectl stage create` first".into(),
         ));
     }
+    // Issue #201: say what is about to happen before anything below touches
+    // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
+    // comment for why this is stderr and why it changes no selection logic.
+    announce_staged_selection(label, &units);
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
     // ADR-0010 decision 3: capacity was decided ONCE, at `volume init`, from
@@ -3026,6 +3030,60 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
     Ok(units)
 }
 
+/// Render the selection `volume write` is about to put on tape (issue #201):
+/// one line per unit and version, plus a total. This is write-once media, so
+/// an operator who did not mean to write everything still `stage create`-d
+/// needs to be told BEFORE contact, not after — but announcing is display,
+/// never a gate (ADR-0004 Tier 1: displayed, never blocks; ADR-0006 owns the
+/// stage-once / write-N-copies / release design this is a window onto, and
+/// that design is not changed here).
+///
+/// Deliberately follows `volume plan`'s existing wording
+/// (`cli::volume::VolumeCommands::Plan`, the "`{name} v{ver}: N slices, N MB`"
+/// row and the "`total: N slices, N MB`" summary) rather than inventing a
+/// second vocabulary. It drops Plan's trailing "x {copies}" term: `volume
+/// write` always writes exactly the one physical volume already named on the
+/// command line, never a copy count. Matches Plan's row shape exactly,
+/// including printing "N slices" for N == 1 — Plan does not pluralize either
+/// (`src/cli/volume.rs`'s `Plan` arm), and inventing agreement here alone
+/// would be exactly the second vocabulary this is meant to avoid.
+///
+/// A pure function on purpose (issue #201's second trap): its exact text is
+/// pinned by a test without a tape, a database, or capturing this process's
+/// own stderr.
+fn render_staged_selection(label: &str, units: &[BuildUnit]) -> String {
+    let mut out = format!("about to write to volume \"{label}\":\n");
+    let mut total_slices: i64 = 0;
+    let mut total_bytes: i64 = 0;
+    for u in units {
+        let slices = u.slices.len() as i64;
+        let bytes: i64 = u.slices.iter().map(|s| s.encrypted_bytes).sum();
+        total_slices += slices;
+        total_bytes += bytes;
+        out.push_str(&format!(
+            "  {} v{}: {slices} slices, {} MB\n",
+            u.unit_name,
+            u.snapshot_version,
+            bytes / (1024 * 1024),
+        ));
+    }
+    out.push_str(&format!(
+        "\ntotal: {total_slices} slices, {} MB\n",
+        total_bytes / (1024 * 1024),
+    ));
+    out
+}
+
+/// Print the announcement to stderr, so `--json` stdout stays parseable —
+/// the same rule `report_binding` states just above `volume_init`
+/// (`src/volume/write.rs:414`), not a new one. Called from `volume_write`
+/// right after the staged selection is gathered and confirmed non-empty:
+/// before backend resolution, before any MAM read, before `TapeStore::open`
+/// — before anything that touches tape or even names a drive.
+fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
+    eprint!("{}", render_staged_selection(label, units));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4581,6 +4639,227 @@ mod tests {
         assert!(
             msg.contains("no staged data to write"),
             "expected the existing no-staged-data refusal, got: {msg}"
+        );
+    }
+
+    // ── issue #201: `volume write` announces the staged sets it is about
+    // to write ──
+
+    /// Exact text, multi-unit multi-version — issue #201's first acceptance
+    /// property. Pinned, not `contains`-checked: a silently reworded
+    /// announcement is exactly the kind of drift a substring match would
+    /// miss. Matches `volume plan`'s row shape (`src/cli/volume.rs`'s `Plan`
+    /// arm) verbatim, minus the "x {copies}" term that does not apply to a
+    /// single physical write.
+    #[test]
+    fn render_staged_selection_pins_exact_text_for_multi_unit_multi_version() {
+        let units = vec![
+            BuildUnit {
+                stage_set_id: 1,
+                snapshot_id: 1,
+                unit_name: "alpha-collection".to_string(),
+                unit_uuid: "u1".to_string(),
+                tenant_id: 1,
+                dar_version: None,
+                dar_command: None,
+                catalog_path: None,
+                snapshot_version: 3,
+                slices: vec![
+                    BuildSlice {
+                        slice_id: 1,
+                        slice_number: 1,
+                        size_bytes: 50 * 1024 * 1024,
+                        encrypted_bytes: 50 * 1024 * 1024,
+                        sha256_plain: "a".to_string(),
+                        sha256_encrypted: "b".to_string(),
+                        staging_path: PathBuf::from("/tmp/a1"),
+                    },
+                    BuildSlice {
+                        slice_id: 2,
+                        slice_number: 2,
+                        size_bytes: 30 * 1024 * 1024,
+                        encrypted_bytes: 30 * 1024 * 1024,
+                        sha256_plain: "c".to_string(),
+                        sha256_encrypted: "d".to_string(),
+                        staging_path: PathBuf::from("/tmp/a2"),
+                    },
+                ],
+            },
+            BuildUnit {
+                stage_set_id: 2,
+                snapshot_id: 2,
+                unit_name: "zeta-notes".to_string(),
+                unit_uuid: "u2".to_string(),
+                tenant_id: 1,
+                dar_version: None,
+                dar_command: None,
+                catalog_path: None,
+                snapshot_version: 1,
+                slices: vec![BuildSlice {
+                    slice_id: 3,
+                    slice_number: 1,
+                    size_bytes: 5 * 1024 * 1024,
+                    encrypted_bytes: 5 * 1024 * 1024,
+                    sha256_plain: "e".to_string(),
+                    sha256_encrypted: "f".to_string(),
+                    staging_path: PathBuf::from("/tmp/z1"),
+                }],
+            },
+        ];
+
+        let rendered = render_staged_selection("VOL-F", &units);
+        assert_eq!(
+            rendered,
+            "about to write to volume \"VOL-F\":\n\
+             \x20\x20alpha-collection v3: 2 slices, 80 MB\n\
+             \x20\x20zeta-notes v1: 1 slices, 5 MB\n\
+             \n\
+             total: 3 slices, 85 MB\n"
+        );
+    }
+
+    /// Single-unit selection — issue #201's second acceptance property: no
+    /// plural/grammar bug. The header names the volume, never a unit count,
+    /// so there is no "1 units" to get wrong; the per-row and total lines
+    /// keep `volume plan`'s own "N slices" wording unconditionally (Plan
+    /// does not pluralize for N == 1 either — `src/cli/volume.rs`'s `Plan`
+    /// arm prints "1 slices" the same way), so a single unit with a single
+    /// slice is not special-cased into a second vocabulary.
+    #[test]
+    fn render_staged_selection_reads_sensibly_for_a_single_unit() {
+        let units = vec![BuildUnit {
+            stage_set_id: 1,
+            snapshot_id: 1,
+            unit_name: "solo".to_string(),
+            unit_uuid: "u1".to_string(),
+            tenant_id: 1,
+            dar_version: None,
+            dar_command: None,
+            catalog_path: None,
+            snapshot_version: 1,
+            slices: vec![BuildSlice {
+                slice_id: 1,
+                slice_number: 1,
+                size_bytes: 1024 * 1024,
+                encrypted_bytes: 1024 * 1024,
+                sha256_plain: "a".to_string(),
+                sha256_encrypted: "b".to_string(),
+                staging_path: PathBuf::from("/tmp/solo1"),
+            }],
+        }];
+
+        let rendered = render_staged_selection("VOL-SOLO", &units);
+        assert_eq!(
+            rendered,
+            "about to write to volume \"VOL-SOLO\":\n\
+             \x20\x20solo v1: 1 slices, 1 MB\n\
+             \n\
+             total: 1 slices, 1 MB\n"
+        );
+        assert!(
+            !rendered.contains("1 units"),
+            "header must never carry a unit-count phrase to get wrong: {rendered}"
+        );
+    }
+
+    /// Ordering proof (issue #201), the closest this suite can get without a
+    /// drive: `volume_write` has no store injection (`TapeStore::open` runs
+    /// unconditionally later on), so the full function cannot be exercised
+    /// end-to-end here, and capturing this process's own stderr to observe
+    /// `eprint!` output would need OS-level fd redirection this suite does
+    /// not otherwise use. What this test DOES prove: given a non-empty
+    /// staged selection, `volume_write` does not error at (or before) the
+    /// announcement call site — it proceeds past `find_staged_data` and
+    /// `announce_staged_selection` and fails at the NEXT step,
+    /// `resolve_lto_backend` (issue #201's call site sits between those two,
+    /// see the comment above `announce_staged_selection`'s call in
+    /// `volume_write`). Modelled on
+    /// `volume_write_accepts_initialized_and_proceeds_to_the_next_check`
+    /// just above, which proves the analogous thing one check earlier.
+    #[test]
+    fn volume_write_with_staged_data_passes_the_announcement_and_reaches_backend_resolution() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-ANNOUNCE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('announce-unit', 'announce-unit', ?1, 'mtime_size', 1, 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'a', 'b', '/tmp/x')",
+            params![ss_id],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        // No `[[backends.lto]]` configured, so `resolve_lto_backend` is the
+        // very next thing that can fail — and it fails without ever naming
+        // or touching a device, exactly like the fast-refusal tests above.
+        let config = Config::default();
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &config,
+            "L6-ANNOUNCE",
+            "/nonexistent/tapectl-announce-test-nst",
+            512 * 1024,
+            false,
+            false,
+        )
+        .expect_err("no backend is configured, so this must fail at backend resolution");
+
+        assert!(
+            matches!(err, TapectlError::Config(_)),
+            "expected a Config error from resolve_lto_backend, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no [[backends.lto]] entry"),
+            "expected resolve_lto_backend's message, got: {msg}"
+        );
+        assert!(
+            !msg.contains("no staged data"),
+            "staged data was present, so the earlier refusal must not fire: {msg}"
+        );
+
+        let writes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            writes, 0,
+            "a write refused this early must still plan nothing"
         );
     }
 
