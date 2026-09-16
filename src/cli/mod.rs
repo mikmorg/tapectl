@@ -392,3 +392,46 @@ pub(crate) fn read_device(
 ) -> crate::error::Result<String> {
     Ok(crate::config::resolve_device(config, device)?.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #169: `import --generation` lost its `"LTO-6"` default and is
+    /// now a plain required `clap` field, so omitting it is a usage error
+    /// clap itself enforces — never a value tapectl silently makes up. This
+    /// is asserted at the `clap` layer (`Cli::try_parse_from`) rather than
+    /// via `tests/cli_smoke.rs`'s process harness, since that file is
+    /// outside this change's scope fence.
+    #[test]
+    fn import_without_generation_is_a_usage_error() {
+        let result = Cli::try_parse_from(["tapectl", "import", "--label", "L1"]);
+        let err = result.expect_err("missing --generation must be a clap usage error");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "unexpected error kind: {err}"
+        );
+        assert!(
+            err.to_string().contains("generation"),
+            "usage error should name the missing --generation flag: {err}"
+        );
+    }
+
+    /// `--capacity` has no default any more either (it resolves from the
+    /// generation table instead), but unlike `--generation` it is optional,
+    /// not required — this is the negative case proving the two flags
+    /// diverged correctly.
+    #[test]
+    fn import_without_capacity_still_parses() {
+        let result = Cli::try_parse_from([
+            "tapectl",
+            "import",
+            "--label",
+            "L1",
+            "--generation",
+            "LTO-6",
+        ]);
+        result.expect("omitting --capacity must still parse");
+    }
+}

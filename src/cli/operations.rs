@@ -2993,6 +2993,133 @@ mod tests {
         }
     }
 
+    /// Issue #169: `import --generation` is validated exactly as
+    /// `cartridge register --generation` is (`media::parse_generation_or_error`),
+    /// and `media_type` is stored as the CANONICAL spelling — ADR-0010's
+    /// "What this does not change" promise that `volumes.media_type` "now
+    /// always hold[s] a generation string tapectl can parse", which
+    /// `import`'s old unvalidated pass-through broke. `--capacity`, when
+    /// omitted, resolves from the generation table (ADR-0010 decision 3),
+    /// not a fixed "2500G" default that lied for anything but LTO-6
+    /// (ADR-0012: "the LTO-6 default that wrote unvalidated rows is gone").
+    mod import_generation {
+        use super::*;
+
+        fn media_type_of(conn: &Connection, label: &str) -> String {
+            conn.query_row(
+                "SELECT media_type FROM volumes WHERE label = ?1",
+                rusqlite::params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn capacity_bytes_of(conn: &Connection, label: &str) -> i64 {
+            conn.query_row(
+                "SELECT capacity_bytes FROM volumes WHERE label = ?1",
+                rusqlite::params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn an_unparseable_generation_is_rejected_naming_the_accepted_set() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+            let err = volume_import(
+                &conn,
+                &config,
+                "BAD-GEN",
+                "lto",
+                "not-a-generation",
+                Some("2500G"),
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("not-a-generation"), "{msg}");
+            assert!(
+                msg.contains("LTO-6") && msg.contains("LTO-7") && msg.contains("LTO-8"),
+                "error should name the accepted generation set, the same text \
+                 `cartridge register` uses: {msg}"
+            );
+        }
+
+        /// A non-canonical spelling ("lto6") is accepted but stored
+        /// canonically, so a later comparison against a detected generation
+        /// (`volume init`) is a plain string match (ADR-0010).
+        #[test]
+        fn a_non_canonical_spelling_records_the_canonical_string() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+            volume_import(
+                &conn,
+                &config,
+                "LC-IMP",
+                "lto",
+                "lto6",
+                Some("2500G"),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(media_type_of(&conn, "LC-IMP"), "LTO-6");
+        }
+
+        /// Checked against two different generations so a wrong table
+        /// lookup (e.g. always returning LTO-6's figure) cannot pass.
+        #[test]
+        fn omitted_capacity_records_lto6_table_figure() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+            volume_import(
+                &conn, &config, "L6-DEF", "lto", "LTO-6", None, None, None, false,
+            )
+            .unwrap();
+            assert_eq!(capacity_bytes_of(&conn, "L6-DEF"), 2_500_000_000_000);
+        }
+
+        #[test]
+        fn omitted_capacity_records_lto7_table_figure() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+            volume_import(
+                &conn, &config, "L7-DEF", "lto", "LTO-7", None, None, None, false,
+            )
+            .unwrap();
+            assert_eq!(capacity_bytes_of(&conn, "L7-DEF"), 6_000_000_000_000);
+        }
+
+        /// The ADR-0010 invariant, directly: every row `import` can write
+        /// has a `volumes.media_type` that `Generation::parse` accepts —
+        /// canonical, bare, and short spellings alike.
+        #[test]
+        fn every_row_import_writes_has_a_parseable_media_type() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+            for (i, spelling) in ["LTO-5", "lto6", "L7", "LTO-7-M8", "LTO8"]
+                .into_iter()
+                .enumerate()
+            {
+                let label = format!("INV-{i}");
+                volume_import(
+                    &conn, &config, &label, "lto", spelling, None, None, None, false,
+                )
+                .unwrap();
+                let stored = media_type_of(&conn, &label);
+                assert!(
+                    crate::media::Generation::parse(&stored).is_some(),
+                    "media_type {stored:?} written for --generation {spelling:?} \
+                     must be parseable back (ADR-0010)"
+                );
+            }
+        }
+    }
+
     mod volume_retire_consent {
         use super::*;
 
