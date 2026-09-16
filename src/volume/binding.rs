@@ -401,9 +401,11 @@ pub(crate) fn refuse_unwitnessed_displacement(
 ///
 /// So this takes no `force` parameter AT ALL, structurally like
 /// `session.rs`'s `check_tape_contact`/`AlreadySealed`: a caller cannot
-/// defeat it even by mistake. The escape is `cartridge mark-erased`, the
-/// operator saying they were wrong — which is a different statement from
-/// "proceed anyway".
+/// defeat it even by mistake. The escape is `cartridge unretire`, the
+/// operator saying they were wrong about the MEDIUM — which is a different
+/// statement both from "proceed anyway" and from `cartridge mark-erased`,
+/// which says the bytes are gone (ADR-0012, issue #163; ADR-0011's lifecycle
+/// diagram carries the dated correction).
 ///
 /// Every other status still binds silently: `in_use`, `pending_erase` and
 /// `available` are all ordinary reuse, and refusing them would be exactly
@@ -414,7 +416,7 @@ pub(crate) fn refuse_retired(row: &CartridgeRow) -> Result<()> {
             "cartridge \"{}\" is retired_permanent and must never be written again \
              (ADR-0011). This is a fact about the medium, not a risk judgement — \
              --force does not override it. If the cartridge is in fact usable, say so \
-             with `tapectl cartridge mark-erased {}`, which is the only way back.",
+             with `tapectl cartridge unretire {}`, which is the way back.",
             row.barcode, row.barcode
         )));
     }
@@ -1560,8 +1562,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("retired_permanent"), "got: {msg}");
         assert!(
-            msg.contains("mark-erased"),
-            "the refusal must name the only way back; got: {msg}"
+            msg.contains("unretire"),
+            "the refusal must name the way back; got: {msg}"
         );
     }
 
