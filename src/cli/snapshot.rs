@@ -4,7 +4,7 @@ use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
-use crate::error::Result;
+use crate::error::{Result, TapectlError};
 use crate::staging;
 
 #[derive(Subcommand, Debug)]
@@ -20,7 +20,8 @@ pub enum SnapshotCommands {
         /// Filter by unit name
         #[arg(long)]
         unit: Option<String>,
-        /// Filter by status
+        /// Filter by status (created, staged, current, superseded,
+        /// reclaimable, purged, failed)
         #[arg(long)]
         status: Option<String>,
     },
@@ -119,6 +120,24 @@ fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
+/// `snapshots.status`'s CHECK constraint (`src/db/migrations/001_initial.sql`).
+const SNAPSHOT_STATUSES: &[&str] = &[
+    "created",
+    "staged",
+    "current",
+    "superseded",
+    "reclaimable",
+    "purged",
+    "failed",
+];
+
+/// `snapshot list --status` is a usage error when it names anything other
+/// than one of `SNAPSHOT_STATUSES` (issue #171, ADR-0012).
+fn validate_snapshot_status(value: &str) -> Result<()> {
+    crate::config::validate_closed_set("--status", value, SNAPSHOT_STATUSES)
+        .map_err(TapectlError::Other)
+}
+
 pub fn run(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -206,6 +225,9 @@ pub fn run(
         }
 
         SnapshotCommands::List { unit, status } => {
+            if let Some(st) = status {
+                validate_snapshot_status(st)?;
+            }
             let mut sql = String::from(
                 "SELECT s.id, u.name, s.version, s.status, s.file_count,
                         s.total_size, s.created_at
@@ -259,6 +281,28 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #171 / ADR-0012: `snapshot list --status` must be a usage
+    /// error naming the accepted set for anything outside
+    /// `snapshots.status`'s CHECK constraint.
+    #[test]
+    fn validate_snapshot_status_rejects_a_typo_naming_accepted_values() {
+        let err = validate_snapshot_status("curent").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("curent"), "{msg}");
+        assert!(msg.contains("current"), "{msg}");
+        assert!(msg.contains("reclaimable"), "{msg}");
+    }
+
+    #[test]
+    fn validate_snapshot_status_accepts_every_real_status() {
+        for s in SNAPSHOT_STATUSES {
+            assert!(
+                validate_snapshot_status(s).is_ok(),
+                "{s} should be accepted"
+            );
+        }
+    }
 
     /// `snapshot list --json` shape (issue: C2 row-listing drift).
     /// `files`/`size`/`created` are additive since CTO decision 2026-09-11

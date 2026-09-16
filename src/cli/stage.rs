@@ -81,6 +81,16 @@ fn stage_rows_to_json(rows: &[StageRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
+/// `stage_sets.status`'s CHECK constraint (`src/db/migrations/001_initial.sql`).
+const STAGE_SET_STATUSES: &[&str] = &["staging", "staged", "failed", "cleaned"];
+
+/// `stage list --status` is a usage error when it names anything other than
+/// one of `STAGE_SET_STATUSES` (issue #171, ADR-0012).
+fn validate_stage_status(value: &str) -> Result<()> {
+    crate::config::validate_closed_set("--status", value, STAGE_SET_STATUSES)
+        .map_err(TapectlError::Other)
+}
+
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -90,6 +100,9 @@ pub fn run(
 ) -> Result<()> {
     match command {
         StageCommands::List { status } => {
+            if let Some(st) = status {
+                validate_stage_status(st)?;
+            }
             let mut sql = String::from(
                 "SELECT ss.id, u.name, s.version, ss.status, ss.num_slices,
                         ss.total_encrypted_size, ss.staged_at
@@ -360,6 +373,25 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Issue #171 / ADR-0012: `stage list --status` must be a usage error
+    /// naming the accepted set for anything outside `stage_sets.status`'s
+    /// CHECK constraint.
+    #[test]
+    fn validate_stage_status_rejects_a_typo_naming_accepted_values() {
+        let err = validate_stage_status("stagng").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stagng"), "{msg}");
+        assert!(msg.contains("staging"), "{msg}");
+        assert!(msg.contains("cleaned"), "{msg}");
+    }
+
+    #[test]
+    fn validate_stage_status_accepts_every_real_status() {
+        for s in STAGE_SET_STATUSES {
+            assert!(validate_stage_status(s).is_ok(), "{s} should be accepted");
+        }
+    }
 
     /// `stage list --json` shape (issue: C2 row-listing drift).
     /// `encrypted_size`/`staged_at` are additive since CTO decision

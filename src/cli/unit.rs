@@ -44,7 +44,7 @@ pub enum UnitCommands {
         /// Filter by tenant name
         #[arg(long)]
         tenant: Option<String>,
-        /// Filter by status
+        /// Filter by status (active, tape_only, missing, retired)
         #[arg(long)]
         status: Option<String>,
         /// Filter by tag
@@ -124,6 +124,17 @@ struct UnitRow {
     tags: String,
 }
 
+/// `units.status`'s CHECK constraint (`src/db/migrations/001_initial.sql`).
+const UNIT_STATUSES: &[&str] = &["active", "tape_only", "missing", "retired"];
+
+/// `unit list --status` is a usage error when it names anything other than
+/// one of `UNIT_STATUSES` (issue #171, ADR-0012) — an unrecognised value
+/// used to answer with an empty (or unfiltered) list rather than refusing.
+fn validate_unit_status(value: &str) -> Result<()> {
+    crate::config::validate_closed_set("--status", value, UNIT_STATUSES)
+        .map_err(TapectlError::Other)
+}
+
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -193,6 +204,9 @@ pub fn run(
             status,
             tag,
         } => {
+            if let Some(s) = status {
+                validate_unit_status(s)?;
+            }
             let tenant_id = if let Some(name) = tenant {
                 Some(crate::tenant::require_tenant(conn, name)?.id)
             } else {
@@ -471,6 +485,25 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use tempfile::TempDir;
+
+    /// Issue #171 / ADR-0012: `unit list --status` must be a usage error
+    /// naming the accepted set for anything outside `units.status`'s CHECK
+    /// constraint, not a silently empty (or unfiltered) result.
+    #[test]
+    fn validate_unit_status_rejects_a_typo_naming_accepted_values() {
+        let err = validate_unit_status("actve").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("actve"), "{msg}");
+        assert!(msg.contains("active"), "{msg}");
+        assert!(msg.contains("tape_only"), "{msg}");
+    }
+
+    #[test]
+    fn validate_unit_status_accepts_every_real_status() {
+        for s in UNIT_STATUSES {
+            assert!(validate_unit_status(s).is_ok(), "{s} should be accepted");
+        }
+    }
 
     /// `UnitRow`'s own `Serialize` shape (issue: C2 row-listing drift). Not
     /// wired into `unit list --json`, which already serializes

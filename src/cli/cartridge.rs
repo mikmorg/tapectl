@@ -35,7 +35,9 @@ pub enum CartridgeCommands {
     },
     /// List cartridges
     List {
-        /// Filter by status
+        /// Filter by status (available, in_use, pending_erase,
+        /// retired_permanent). `offsite` was removed by ADR-0011 -- a
+        /// cartridge's place is a location now; use --location.
         #[arg(long)]
         status: Option<String>,
         /// Filter by physical location name (issue #157) -- the sibling
@@ -152,6 +154,29 @@ fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
+/// `cartridges.status`'s CHECK constraint as of migration 012
+/// (`src/db/migrations/012_cartridge_lifecycle.sql`) — ADR-0011 dropped
+/// `offsite` from this set: a cartridge's place is a location now, not a
+/// status.
+const CARTRIDGE_STATUSES: &[&str] = &["available", "in_use", "pending_erase", "retired_permanent"];
+
+/// `cartridge list --status` is a usage error when it names anything other
+/// than one of `CARTRIDGE_STATUSES` (issue #171, ADR-0012) — silently
+/// answering "no cartridges registered" for a typo, or for a status
+/// ADR-0011 removed, is worse than refusing.
+fn validate_cartridge_status(value: &str) -> Result<()> {
+    if value == "offsite" {
+        return Err(TapectlError::Other(format!(
+            "--status \"offsite\" was removed by ADR-0011 -- a cartridge's place is a \
+             location now, not a status. Use `cartridge list --location <NAME>` (see \
+             `location list` for the names), or one of: {}",
+            CARTRIDGE_STATUSES.join(", ")
+        )));
+    }
+    crate::config::validate_closed_set("--status", value, CARTRIDGE_STATUSES)
+        .map_err(TapectlError::Other)
+}
+
 pub fn run(
     conn: &Connection,
     command: &CartridgeCommands,
@@ -242,6 +267,9 @@ pub fn run(
             }
         }
         CartridgeCommands::List { status, location } => {
+            if let Some(s) = status {
+                validate_cartridge_status(s)?;
+            }
             let rows = cartridge_rows(conn, status.as_deref(), location.as_deref())?;
             if json_output {
                 println!(
@@ -590,6 +618,55 @@ mod tests {
         assert!(rows.iter().all(|r| r.status == "available"));
     }
 
+    /// Issue #171 / ADR-0012: `cartridge list --status offsite` must name
+    /// ADR-0011 and point at locations, not silently answer "no cartridges
+    /// registered". Exercised through `run()`, not the helper, because the
+    /// acceptance criterion names the COMMAND.
+    #[test]
+    fn list_status_offsite_names_adr_0011_and_points_at_locations() {
+        let conn = seed();
+        let err = run(
+            &conn,
+            &CartridgeCommands::List {
+                status: Some("offsite".to_string()),
+                location: None,
+            },
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ADR-0011"), "{msg}");
+        assert!(msg.contains("location"), "{msg}");
+        assert!(
+            msg.contains("available"),
+            "must still list the current statuses: {msg}"
+        );
+    }
+
+    /// A typo (not the retired `offsite`) is a plain usage error naming the
+    /// accepted set, not a silent empty list.
+    #[test]
+    fn list_status_typo_is_a_usage_error_naming_accepted_values() {
+        let conn = seed();
+        let err = run(
+            &conn,
+            &CartridgeCommands::List {
+                status: Some("avilable".to_string()),
+                location: None,
+            },
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("avilable"), "{msg}");
+        assert!(msg.contains("available"), "{msg}");
+        assert!(msg.contains("retired_permanent"), "{msg}");
+    }
+
     /// ADR-0011: `cartridges.location_id` finally has a reader. The LEFT
     /// JOIN matters — a cartridge that has never been placed must still be
     /// listed, not silently dropped, which is exactly what an inner join
@@ -700,8 +777,10 @@ mod tests {
     }
 
     /// An unknown location name is simply a filter that matches nothing —
-    /// the same behaviour as an unrecognised `--status` value, not a
-    /// separate "location not found" error path.
+    /// `cartridge_rows` itself (below the `run()`-level usage-error guard
+    /// issue #171 added for `--status`) still has no equivalent "location
+    /// not found" error path, and none is wanted: locations are not a
+    /// closed set the way `cartridges.status` is.
     #[test]
     fn an_unknown_location_filter_matches_nothing() {
         let conn = seed();

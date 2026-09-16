@@ -274,8 +274,9 @@ pub enum VolumeCommands {
     /// inventory is a tape you forgot you had. `--status` narrows; nothing is
     /// hidden without it.
     List {
-        /// Only volumes in this status (e.g. sealed, retired, initialized,
-        /// erased). Every status is shown when omitted.
+        /// Only volumes in this status (blank, initialized, active, full,
+        /// retired, missing, erased, sealed, quarantined). Every status is
+        /// shown when omitted.
         #[arg(long)]
         status: Option<String>,
     },
@@ -340,6 +341,30 @@ pub enum DepositCommands {
         #[arg(long)]
         from: String,
     },
+}
+
+/// `volumes.status`'s CHECK constraint (`src/db/migrations/003_v2_lifecycle.sql`,
+/// which extended 001's original set and is the schema's current word on it).
+const VOLUME_STATUSES: &[&str] = &[
+    "blank",
+    "initialized",
+    "active",
+    "full",
+    "retired",
+    "missing",
+    "erased",
+    "sealed",
+    "quarantined",
+];
+
+/// `volume list --status` is a usage error when it names anything other
+/// than one of `VOLUME_STATUSES` (issue #171, ADR-0012) — `volumes.status`
+/// never had an `offsite` value (a volume's place has always been
+/// `location_id`, since `007_warehouse_locations.sql`), so this needs no
+/// ADR-0011 special case the way `cartridge list --status` does.
+fn validate_volume_status(value: &str) -> Result<()> {
+    crate::config::validate_closed_set("--status", value, VOLUME_STATUSES)
+        .map_err(TapectlError::Other)
 }
 
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
@@ -841,6 +866,9 @@ pub fn run(
         VolumeCommands::Deposit { command } => run_deposit(conn, command, json_output)?,
 
         VolumeCommands::List { status } => {
+            if let Some(s) = status {
+                validate_volume_status(s)?;
+            }
             let rows = volume_rows(conn, status.as_deref())?;
             if json_output {
                 println!(
@@ -2317,6 +2345,27 @@ mod tests {
                 rows.is_empty(),
                 "a quoted payload must match no rows, not inject"
             );
+        }
+
+        /// Issue #171 / ADR-0012: `volume list --status` must be a usage
+        /// error naming the accepted set for anything outside
+        /// `volumes.status`'s CHECK constraint -- `volume_rows` itself (the
+        /// function above) still just filters to nothing for a raw string;
+        /// the usage-error guard lives in `run()`, one layer up.
+        #[test]
+        fn validate_volume_status_rejects_a_typo_naming_accepted_values() {
+            let err = validate_volume_status("seald").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("seald"), "{msg}");
+            assert!(msg.contains("sealed"), "{msg}");
+            assert!(msg.contains("quarantined"), "{msg}");
+        }
+
+        #[test]
+        fn validate_volume_status_accepts_every_real_status() {
+            for s in VOLUME_STATUSES {
+                assert!(validate_volume_status(s).is_ok(), "{s} should be accepted");
+            }
         }
 
         /// Rule #7 (C2b): every table column is a JSON key, and the JSON
