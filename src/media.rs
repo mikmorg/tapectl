@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use crate::error::{Result, TapectlError};
+
 /// One LTO tape generation, in the order the format was released.
 ///
 /// `Lto7M8` ("LTO-7 Type M") is a distinct *media* format that sits between
@@ -268,6 +270,64 @@ pub fn resolve_capacity(
         generation.native_capacity_bytes(),
         CapacitySource::GenerationTable,
     )
+}
+
+/// Parse an operator-facing CARTRIDGE CAPACITY string (e.g. `"2.5T"`,
+/// `"2500G"`, or a bare byte count) into a byte count, in the DECIMAL
+/// (marketed) unit: `K`=10^3, `M`=10^6, `G`=10^9, `T`=10^12.
+///
+/// This is deliberately the sibling of [`crate::staging::parse_size_to_bytes`]
+/// (data sizes: `slice_size`, `large_file_warn_threshold`, `enospc_buffer` —
+/// binary, `K`=1024 etc., because dar and the block layer count bytes that
+/// way), not a replacement for it. ADR-0010's "Facts encoded" paragraph
+/// states native capacities as the marketed decimal figures, and
+/// [`Generation::native_capacity_bytes`] above encodes exactly that
+/// (`Lto6 => 2_500_000_000_000`, not a power of two). ADR-0012 ratified that
+/// a CARTRIDGE's declared capacity must mean the same thing the table
+/// means: "cartridge capacities are decimal; data sizes are binary; the two
+/// are named apart... One parser cannot serve both, so there are two, and
+/// each flag's help says which it is" — and explicitly rejected a unit flag
+/// on either parser, since `2.5T` must not mean two things depending on a
+/// switch (issue #168).
+///
+/// The three callers that resolve a CARTRIDGE's capacity use this parser:
+/// `cartridge register --capacity` ([`crate::cli::cartridge`]), `import
+/// --capacity` ([`crate::cli::operations::volume_import`]), and a drive's
+/// `capacity_override` ([`crate::config::LtoBackendConfig::planning_capacity_bytes`]).
+/// Everything else that parses an operator size string stays on the binary
+/// parser.
+pub fn parse_capacity_to_bytes(s: &str) -> Result<i64> {
+    let trimmed = s.trim();
+    let invalid = || {
+        TapectlError::Config(format!(
+            "{trimmed:?} is not a valid capacity (expected e.g. 2.5T, 2500G, or a bare byte count)"
+        ))
+    };
+
+    let (num_str, suffix) = trimmed
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| (&trimmed[..i], &trimmed[i..]))
+        .unwrap_or((trimmed, ""));
+
+    let num: f64 = num_str.parse().map_err(|_| invalid())?;
+    if num.is_nan() || num < 0.0 {
+        return Err(invalid());
+    }
+
+    let multiplier: f64 = match suffix.to_uppercase().as_str() {
+        "" => 1.0,
+        "K" | "KB" => 1_000.0,
+        "M" | "MB" => 1_000_000.0,
+        "G" | "GB" => 1_000_000_000.0,
+        "T" | "TB" => 1_000_000_000_000.0,
+        _ => return Err(invalid()),
+    };
+
+    let bytes = num * multiplier;
+    if !bytes.is_finite() || bytes > i64::MAX as f64 {
+        return Err(invalid());
+    }
+    Ok(bytes as i64)
 }
 
 #[cfg(test)]
@@ -616,5 +676,118 @@ mod tests {
         let (bytes, _) = resolve_capacity(None, None, Generation::Lto5);
         assert_eq!(bytes, 1_500_000_000_000);
         assert_ne!(bytes, Generation::Lto6.native_capacity_bytes());
+    }
+
+    // ---- parse_capacity_to_bytes (issue #168, ADR-0012: decimal, the
+    // cartridge-capacity sibling of staging::parse_size_to_bytes) ----
+
+    #[test]
+    fn capacity_bare_number_means_bytes() {
+        assert_eq!(parse_capacity_to_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_capacity_to_bytes("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn capacity_every_known_suffix_is_decimal_case_insensitive() {
+        assert_eq!(parse_capacity_to_bytes("2K").unwrap(), 2_000);
+        assert_eq!(parse_capacity_to_bytes("2k").unwrap(), 2_000);
+        assert_eq!(parse_capacity_to_bytes("2KB").unwrap(), 2_000);
+        assert_eq!(parse_capacity_to_bytes("2M").unwrap(), 2_000_000);
+        assert_eq!(parse_capacity_to_bytes("2MB").unwrap(), 2_000_000);
+        assert_eq!(parse_capacity_to_bytes("2G").unwrap(), 2_000_000_000);
+        assert_eq!(parse_capacity_to_bytes("2GB").unwrap(), 2_000_000_000);
+        assert_eq!(parse_capacity_to_bytes("2T").unwrap(), 2_000_000_000_000);
+        assert_eq!(parse_capacity_to_bytes("2TB").unwrap(), 2_000_000_000_000);
+    }
+
+    #[test]
+    fn capacity_rejects_an_unknown_suffix_rather_than_silently_defaulting() {
+        assert!(parse_capacity_to_bytes("2500GG").is_err());
+        assert!(parse_capacity_to_bytes("5X").is_err());
+    }
+
+    #[test]
+    fn capacity_rejects_garbage_and_negative_values() {
+        assert!(parse_capacity_to_bytes("").is_err());
+        assert!(parse_capacity_to_bytes("abc").is_err());
+        assert!(parse_capacity_to_bytes("-5G").is_err());
+    }
+
+    #[test]
+    fn capacity_trims_whitespace() {
+        assert_eq!(parse_capacity_to_bytes("  10G  ").unwrap(), 10_000_000_000);
+    }
+
+    /// The acceptance test issue #168 names directly: a declared `2.5T` on
+    /// an LTO-6 cartridge must equal the generation table's own figure
+    /// exactly, so the declared and defaulted paths (`cartridge register
+    /// --capacity` given vs. omitted) finally agree.
+    #[test]
+    fn capacity_2_5t_equals_the_lto6_generation_tables_figure_exactly() {
+        assert_eq!(
+            parse_capacity_to_bytes("2.5T").unwrap() as u64,
+            Generation::Lto6.native_capacity_bytes()
+        );
+    }
+
+    /// Pin both parsers at the same suffix, side by side: they must differ
+    /// by exactly the binary/decimal ratio, not merely "give some other
+    /// number" — the ratio is what makes the 9.95% over-statement in issue
+    /// #168 an over-statement rather than an arbitrary discrepancy.
+    #[test]
+    fn capacity_and_size_parsers_differ_by_exactly_the_binary_decimal_ratio() {
+        assert_eq!(
+            crate::staging::parse_size_to_bytes("2.5T").unwrap(),
+            2_748_779_069_440
+        );
+        assert_eq!(parse_capacity_to_bytes("2.5T").unwrap(), 2_500_000_000_000);
+
+        assert_eq!(
+            crate::staging::parse_size_to_bytes("40000G").unwrap(),
+            42_949_672_960_000
+        );
+        assert_eq!(
+            parse_capacity_to_bytes("40000G").unwrap(),
+            40_000_000_000_000
+        );
+    }
+
+    /// Whatever the *value*, the two parsers accept and reject the same
+    /// STRINGS — same grammar, different multiplier table — so a validator
+    /// that only checks parseability (e.g. `backend add`'s pre-check of
+    /// `capacity_override` before it is written to config) is unaffected by
+    /// which of the two backs it.
+    #[test]
+    fn capacity_and_size_parsers_agree_on_which_strings_are_valid() {
+        for s in [
+            "0",
+            "1024",
+            "2K",
+            "2k",
+            "2KB",
+            "2M",
+            "2MB",
+            "2G",
+            "2GB",
+            "2T",
+            "2TB",
+            "2.5T",
+            "40000G",
+            "  10G  ",
+            "",
+            "abc",
+            "1.2.3",
+            "-5G",
+            "-1",
+            "5X",
+            "2500GG",
+            "99999999999999999999G",
+        ] {
+            assert_eq!(
+                crate::staging::parse_size_to_bytes(s).is_ok(),
+                parse_capacity_to_bytes(s).is_ok(),
+                "parsers disagree on validity of {s:?}"
+            );
+        }
     }
 }

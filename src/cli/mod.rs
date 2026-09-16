@@ -205,7 +205,9 @@ pub enum Commands {
         /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
         #[arg(long, default_value = "LTO-6")]
         generation: String,
-        /// Capacity (e.g., "2500G")
+        /// Capacity (e.g., "2500G"). Decimal, as printed on the cartridge
+        /// (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
+        /// `slice_size`/`enospc_buffer` use.
         #[arg(long, default_value = "2500G")]
         capacity: String,
         /// Which configured drive this volume belongs to, by its device path
@@ -299,6 +301,8 @@ pub enum BackendCommands {
         /// Capacity override — for virtual drives (mhvtl) and test
         /// harnesses only. A real drive's capacity follows the loaded
         /// cartridge's detected generation (ADR-0010); leave this unset.
+        /// Decimal, as printed on the cartridge (K=10^3 ... T=10^12;
+        /// ADR-0012) — not the binary unit `enospc_buffer` uses.
         #[arg(long)]
         capacity_override: Option<String>,
         /// Headroom reserved before end-of-tape, e.g. 50M

@@ -164,6 +164,19 @@ pub struct LtoBackendConfig {
     /// Checked ahead of the bound cartridge row and the generation table in
     /// every capacity resolution (ADR-0010); `config check` warns when this is
     /// set, since a real drive should never need it.
+    ///
+    /// Decimal, as printed on the cartridge (`K`=10^3 ... `T`=10^12;
+    /// ADR-0012), parsed by [`crate::media::parse_capacity_to_bytes`] — not
+    /// the binary unit `enospc_buffer` uses. **Known gap (issue #168):**
+    /// only [`LtoBackendConfig::planning_capacity_bytes`] (the `volume
+    /// plan`/`collection plan`/`run` planning path, and
+    /// `policy::depth_check`) reads this field decimally; `volume init`
+    /// (`volume::write::volume_init`, the path that actually decides and
+    /// stores `volumes.capacity_bytes`) still parses it with the binary
+    /// `staging::parse_size_to_bytes` — out of #168's scope ("no write-path
+    /// source changes"). Until that is fixed too, the SAME string means two
+    /// different byte counts depending on which of those two paths reads
+    /// it.
     #[serde(default)]
     pub capacity_override: Option<String>,
     #[serde(default = "default_usable_capacity_factor")]
@@ -209,6 +222,11 @@ impl LtoBackendConfig {
     /// nothing is bound yet, because nothing has been initialised. Once a
     /// volume exists, its own `volumes.capacity_bytes` is the authoritative
     /// figure and config is never consulted again.
+    ///
+    /// `capacity_override` is parsed decimally
+    /// ([`crate::media::parse_capacity_to_bytes`], ADR-0012, issue #168), to
+    /// agree with [`crate::media::Generation::native_capacity_bytes`] — the
+    /// other input to the same [`crate::media::resolve_capacity`] call.
     pub fn planning_capacity_bytes(&self, media: Option<&str>) -> Result<u64> {
         let generation = match media {
             Some(m) => crate::media::Generation::parse(m).ok_or_else(|| {
@@ -220,7 +238,7 @@ impl LtoBackendConfig {
             None => self.native_generation()?,
         };
         let override_bytes = match &self.capacity_override {
-            Some(cap) => Some(crate::staging::parse_size_to_bytes(cap)? as u64),
+            Some(cap) => Some(crate::media::parse_capacity_to_bytes(cap)? as u64),
             None => None,
         };
         Ok(crate::media::resolve_capacity(override_bytes, None, generation).0)
@@ -607,7 +625,7 @@ impl Config {
                 ));
             }
             if let Some(cap) = &backend.capacity_override {
-                if let Err(e) = crate::staging::parse_size_to_bytes(cap) {
+                if let Err(e) = crate::media::parse_capacity_to_bytes(cap) {
                     problems.push(format!(
                         "{}: backends.lto[{i}] (\"{}\").capacity_override = {e}",
                         path.display(),

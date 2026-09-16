@@ -2243,7 +2243,7 @@ pub fn volume_import(
     notes: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    let cap_bytes = crate::staging::parse_size_to_bytes(capacity)?;
+    let cap_bytes = crate::media::parse_capacity_to_bytes(capacity)?;
     // Resolve backend_name from the configured backend this device names,
     // else fall back to the type string so the row remains self-consistent.
     let backend_name = match backend {

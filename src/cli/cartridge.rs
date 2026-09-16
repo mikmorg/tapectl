@@ -5,7 +5,6 @@ use tabled::{Table, Tabled};
 
 use crate::db::events;
 use crate::error::{Result, TapectlError};
-use crate::staging;
 
 #[derive(Subcommand, Debug)]
 pub enum CartridgeCommands {
@@ -17,7 +16,9 @@ pub enum CartridgeCommands {
         /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
         #[arg(long)]
         generation: String,
-        /// Nominal capacity, e.g. "2500G". Defaults to the generation
+        /// Nominal capacity, e.g. "2500G". Decimal, as printed on the
+        /// cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
+        /// `slice_size`/`enospc_buffer` use. Defaults to the generation
         /// table's marketed figure (ADR-0010) when omitted — give this
         /// explicitly only when the physical cartridge really differs (a
         /// declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...).
@@ -254,7 +255,7 @@ pub fn run(
             })?;
             let canonical_generation = parsed.as_str();
             let (cap, capacity_display) = match capacity {
-                Some(c) => (staging::parse_size_to_bytes(c)?, c.clone()),
+                Some(c) => (crate::media::parse_capacity_to_bytes(c)?, c.clone()),
                 None => {
                     let bytes = parsed.native_capacity_bytes();
                     (
