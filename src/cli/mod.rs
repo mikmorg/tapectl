@@ -203,7 +203,7 @@ pub enum Commands {
         #[arg(long, default_value = "lto")]
         backend: String,
         /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
-        #[arg(long, default_value = "LTO-6")]
+        #[arg(long)]
         generation: String,
         /// Capacity (e.g., "2500G"). Decimal, as printed on the cartridge
         /// (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
