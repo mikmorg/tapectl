@@ -197,14 +197,31 @@ the normative design set named in the Policy block below.
      the suite's own "second copy" idiom (`stage create <unit> --version N`
      after a write) is refused by `stage create` and so **cannot ever have run
      green** — `retire-and-reuse` uses it too. Treat the unrun scenarios as
-     unknown, not as passing: **a full `--all` pass is its own queue item, not
-     something to defer to the queue-empty run.** That item is now filed as
-     **#203** and carries the label — three of thirteen scenarios are
-     measured-green (`first-year` 45/45, `compaction` 31/31,
-     `retire-and-reuse` 10/10), ten have never been run. One verified piece of
-     good news recorded there: the re-stage idiom is gone from the executable
-     body of every scenario (the single surviving `grep` hit is a comment), so
-     the ten unmeasured ones are not known-red *for that reason*.
+     unknown, not as passing. That item was #203 and it is **CLOSED**: the
+     first-ever `--all` run happened on 2026-09-16 and, after two harness
+     fixes, is **GREEN — 338 checks, 329 passed, 0 failed, 9 skipped**, on
+     master `b865764`, multi-slot on mhvtl with `--erase short`. All thirteen
+     scenarios pass.
+
+     **State the MODE or the number means nothing.** `--single-cartridge` — the
+     invocation this block used to name as routine — is *weaker* than the full
+     one: it sets a `copy_count` allowance that hid a `permute` failure
+     completely. That is the same shape as #198's finding that
+     `retire-and-reuse` passes under `--erase long` and fails under
+     `--erase short`. The measured-green invocation is:
+     `TAPECTL_MHVTL=1 bash scripts/lifecycle-suite.sh --all --device /dev/nst1 --erase short`
+     (no `--single-cartridge`; `compaction` needs four cartridges). Both
+     harnesses take the build lock internally, so run them BARE.
+
+     Two lessons from fixing those scenarios, worth carrying to any future
+     harness work: **a red can be propping up a green** (fixing
+     `tape-only-and-reclaim`'s placement bug turned two passing checks red —
+     they had only passed because an earlier failure meant the unit never
+     became tape-only, so `mark-reclaimable` got the 1x rule instead of the
+     tape-only 2x); and **a randomised scenario's per-step assertions can be
+     seed-dependent** (`permute`'s copy_count check passed or failed according
+     to where the RNG placed `write-next-volume`, so a green run proved nothing
+     about another seed — the assertion had to move to the end of the walk).
 
      **NOTHING IS PARKED as of 2026-09-16.** #197 and #199 were parked and both
      were **RULED the same day**; the rulings are in ADR-0012 as a dated
