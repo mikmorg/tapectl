@@ -24,6 +24,8 @@
 //! advisory surfaces (`report copies`/`fire-risk`/`tape-only`, `audit`)
 //! from ever disagreeing about what a copy is again.
 
+use rusqlite::Connection;
+
 /// The ADR-0004 eligibility predicate, rendered as a SQL boolean
 /// expression against `{volume_alias}.status`.
 ///
@@ -111,7 +113,9 @@ pub enum CoverageScope<'a> {
     /// want that (`audit`, `unit mark-tape-only`, the reports);
     /// `volume retire`'s impact analysis deliberately does not, because it
     /// asks what coverage a unit has on ANY snapshot the retired cartridge
-    /// participates in.
+    /// participates in — which is what it DISPLAYS. What it GATES on is a
+    /// third thing again: [`versions_at_stake`], one row per current
+    /// version the retirement actually removes coverage from (issue #147).
     Unit {
         id_expr: &'a str,
         current_only: bool,
@@ -322,6 +326,101 @@ pub fn location_count_expr(q: &CoverageQuery) -> String {
 /// union it has always been.
 pub fn deposit_count_expr(q: &CoverageQuery) -> String {
     format!("(SELECT COUNT(*) FROM ({}))", scoped_deposits(q, "cd.id"))
+}
+
+// ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
+
+/// One CURRENT version of a unit whose coverage a retirement is about to
+/// consume, and what would be left of that version afterwards.
+///
+/// The rows exist only for versions the act ACTUALLY REMOVES coverage from
+/// — see [`versions_at_stake`] for the three conditions — so the counts
+/// here are always strictly "one fewer than before", never a restatement of
+/// a shortfall that already existed.
+#[derive(Debug, Clone)]
+pub struct VersionAtStake {
+    /// `snapshots.version` of the current snapshot.
+    pub version: i64,
+    /// Copies this VERSION would still have, [`copy_count_expr`] with the
+    /// volume excluded. `0` is ADR-0008's absolute floor.
+    pub copies_after: i64,
+    /// Distinct locations this VERSION would still be in,
+    /// [`location_count_expr`] with the volume excluded.
+    pub locations_after: i64,
+}
+
+/// The versions of `unit_id` whose coverage retiring `volume_id` consumes,
+/// with what each would have left — the ONE derivation behind the retire
+/// family's ADR-0008 tiers (`volume retire`, `cartridge retire`,
+/// `volume compact-finish`; issue #147).
+///
+/// **Three conditions decide whether a version is at stake, and together
+/// they are ADR-0012's "defined by what the act REMOVES".**
+///
+/// 1. The snapshot is `'current'`. A `reclaimable` or `purged` version has
+///    been released by the operator (`snapshot mark-reclaimable`, whose own
+///    `--force` is that statement in so many words) and the floor does not
+///    protect what has been given up.
+/// 2. The volume carries a COMPLETED write of that snapshot. Coverage it
+///    never held cannot be coverage it removes.
+/// 3. The volume itself passes [`eligible`] RIGHT NOW. A quarantined,
+///    unsealed or already-retired volume counts as nothing in every
+///    derivation in this module, so retiring it removes nothing — ADR-0012
+///    says so in as many words, and it is the escape the hard case needs: a
+///    tape with read errors is quarantined by a failed `volume verify`, and
+///    retiring it is then Tier 2 at most. Getting this wrong in the "safe"
+///    direction would make the command useless exactly when an operator
+///    needs it most.
+///
+/// Those three together mean excluding the volume reduces each returned
+/// version's count by exactly one, so `copies_after == 0` is precisely "this
+/// was the last eligible copy of a live version" — ADR-0012's per-version
+/// reading of "last one" (issue #153: a unit with v1 elsewhere and v2 only
+/// here has ZERO remaining for v2, and that is the case the floor exists
+/// for), not a question about the unit as a whole.
+///
+/// Counted through [`copy_count_expr`] and [`location_count_expr`] at
+/// `Snapshot` scope, never hand-written: a warehouse deposit of some other
+/// eligible volume is a copy here exactly as it is in `audit` and the
+/// reports (ADR-0006, issue #73), and issue #96 is the record of what a
+/// seventh hand-written copy of this SQL costs.
+pub fn versions_at_stake(
+    conn: &Connection,
+    unit_id: i64,
+    volume_id: i64,
+) -> crate::error::Result<Vec<VersionAtStake>> {
+    let after = |q: &CoverageQuery| (copy_count_expr(q), location_count_expr(q));
+    let q = CoverageQuery {
+        scope: CoverageScope::Snapshot { id_expr: "s.id" },
+        exclude_volume: Some("?2"),
+    };
+    let (copies_after, locations_after) = after(&q);
+    // `DISTINCT` because a snapshot can have several stage_sets written to
+    // the same volume; the two scalar subqueries depend only on `s.id`, so
+    // the duplicate rows they would produce are identical.
+    let sql = format!(
+        "SELECT DISTINCT s.version, {copies_after} AS copies_after,
+                {locations_after} AS locations_after
+         FROM snapshots s
+         JOIN stage_sets ss ON ss.snapshot_id = s.id
+         JOIN writes w ON w.stage_set_id = ss.id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE s.unit_id = ?1 AND s.status = 'current'
+           AND w.volume_id = ?2 AND w.status = 'completed' AND {}
+         ORDER BY s.version",
+        eligible("v")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![unit_id, volume_id], |row| {
+            Ok(VersionAtStake {
+                version: row.get(0)?,
+                copies_after: row.get(1)?,
+                locations_after: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// `{alias}.status IN ('a','b',...)`. The single place a status list is
@@ -862,5 +961,272 @@ pub(crate) mod tests {
             "volume retire deliberately asks about ANY snapshot, not just \
              the unit's least-covered current one"
         );
+    }
+
+    // ── versions_at_stake (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
+    //
+    // The derivation both consent tiers of the retire family read. Every
+    // test here asks the same question in a different shape: what does
+    // retiring THIS volume actually REMOVE?
+
+    /// A unit `photos` with one CURRENT v1 written to the sealed volume
+    /// `HERE`. `elsewhere` adds a second sealed volume `AWAY` carrying the
+    /// same snapshot, so v1 survives HERE's retirement.
+    /// Returns `(conn, unit_id, here_id)`.
+    fn setup_at_stake(elsewhere: bool) -> (Connection, i64, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-stake', 'photos', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+            [],
+        )
+        .unwrap();
+        let home = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, location_id)
+             VALUES ('HERE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', ?1)",
+            params![home],
+        )
+        .unwrap();
+        let here = conn.last_insert_rowid();
+        add_version(&conn, unit_id, here, 1, "current", elsewhere);
+        (conn, unit_id, here)
+    }
+
+    /// Add one version of `unit_id` written to `vol_id`, plus (when
+    /// `elsewhere`) a second sealed volume carrying the same snapshot.
+    fn add_version(
+        conn: &Connection,
+        unit_id: i64,
+        vol_id: i64,
+        version: i64,
+        status: &str,
+        elsewhere: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, ?2, 'full', ?3, '/src')",
+            params![unit_id, version, status],
+        )
+        .unwrap();
+        let snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             VALUES (?1, 'staged', 524288)",
+            params![snap],
+        )
+        .unwrap();
+        let ss = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss, snap, vol_id],
+        )
+        .unwrap();
+        if elsewhere {
+            conn.execute(
+                &format!(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES ('AWAY-v{version}', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                ),
+                [],
+            )
+            .unwrap();
+            let away = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'staged', 524288)",
+                params![snap],
+            )
+            .unwrap();
+            let ss2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss2, snap, away],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn at_stake_reports_zero_when_the_volume_is_the_last_eligible_copy() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(rows.len(), 1, "one current version is at stake: {rows:?}");
+        assert_eq!(rows[0].version, 1);
+        assert_eq!(
+            rows[0].copies_after, 0,
+            "nothing else carries v1, so retiring HERE takes it to zero"
+        );
+    }
+
+    #[test]
+    fn at_stake_reports_the_survivor_when_another_volume_carries_the_version() {
+        let (conn, unit_id, here) = setup_at_stake(true);
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].copies_after, 1,
+            "AWAY-v1 is sealed and carries the same snapshot"
+        );
+    }
+
+    /// ADR-0012's per-version reading of "last one" (issue #153): a unit
+    /// with v1 elsewhere and v2 only here has ZERO remaining for v2, and
+    /// that is exactly the case the floor exists for. A per-UNIT count
+    /// would read this unit as covered and wave the retirement through.
+    #[test]
+    fn at_stake_is_per_version_not_per_unit() {
+        let (conn, unit_id, here) = setup_at_stake(true);
+        add_version(&conn, unit_id, here, 2, "current", false);
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both current versions are at stake: {rows:?}"
+        );
+        assert_eq!(rows[0].version, 1);
+        assert_eq!(rows[0].copies_after, 1);
+        assert_eq!(rows[1].version, 2);
+        assert_eq!(
+            rows[1].copies_after, 0,
+            "v2 is only here; the unit having v1 elsewhere does not cover it"
+        );
+    }
+
+    /// The other half of ADR-0012's rule, and the one that matters for the
+    /// read-error tape: the floor is defined by what the act REMOVES. A
+    /// volume that counts for nothing removes nothing, so NO version is at
+    /// stake and the retirement is Tier 2 at most. Refusing here would make
+    /// the command useless exactly when an operator needs it most.
+    fn at_stake_is_empty_for_volume_status(status: &str) {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        conn.execute(
+            "UPDATE volumes SET status = ?1 WHERE id = ?2",
+            params![status, here],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a {status} volume counts for nothing, so it removes nothing: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn at_stake_is_empty_for_a_quarantined_volume() {
+        at_stake_is_empty_for_volume_status("quarantined");
+    }
+
+    #[test]
+    fn at_stake_is_empty_for_an_unsealed_volume() {
+        at_stake_is_empty_for_volume_status("active");
+    }
+
+    #[test]
+    fn at_stake_is_empty_for_an_already_retired_volume() {
+        at_stake_is_empty_for_volume_status("retired");
+    }
+
+    /// A RELEASED version is one the operator has already given up
+    /// (`snapshot mark-reclaimable`, whose own `--force` is that statement
+    /// in so many words). The floor does not protect it.
+    #[test]
+    fn at_stake_skips_a_released_version() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        conn.execute(
+            "UPDATE snapshots SET status = 'reclaimable' WHERE unit_id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a released version is not at stake: {rows:?}"
+        );
+    }
+
+    /// ADR-0006 / issue #73: the count runs through `copy_count_expr`, so a
+    /// recorded warehouse deposit of some OTHER eligible volume is a
+    /// remaining copy here exactly as it is in `audit` and the reports.
+    /// A hand-written version of this SQL would under-count it and refuse a
+    /// retirement that is perfectly safe.
+    #[test]
+    fn at_stake_counts_a_warehouse_deposit_of_another_volume() {
+        let (conn, unit_id, here) = setup_at_stake(true);
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+            [],
+        )
+        .unwrap();
+        let glacier = conn.last_insert_rowid();
+        let away: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'AWAY-v1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volume_deposits (volume_id, location_id) VALUES (?1, ?2)",
+            params![away, glacier],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(
+            rows[0].copies_after, 2,
+            "the tape AND its deposit: {rows:?}"
+        );
+    }
+
+    /// The location half, for ADR-0008's `min_locations` limb of Tier 2.
+    #[test]
+    fn at_stake_reports_remaining_locations() {
+        let (conn, unit_id, here) = setup_at_stake(true);
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf')",
+            [],
+        )
+        .unwrap();
+        let offsite = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE volumes SET location_id = ?1 WHERE label = 'AWAY-v1'",
+            params![offsite],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(
+            rows[0].locations_after, 1,
+            "only AWAY-v1's location survives HERE's retirement: {rows:?}"
+        );
+    }
+
+    /// A completed write to a volume the unit never had is not coverage the
+    /// act removes: an unrelated volume yields no rows at all.
+    #[test]
+    fn at_stake_is_empty_for_a_volume_the_unit_was_never_written_to() {
+        let (conn, unit_id, _here) = setup_at_stake(true);
+        let away: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'AWAY-v1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM writes WHERE volume_id = ?1", params![away])
+            .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, away).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
     }
 }
