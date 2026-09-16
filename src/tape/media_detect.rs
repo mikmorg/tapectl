@@ -480,7 +480,7 @@ pub fn check_drive_can_read(backend: &LtoBackendConfig, medium: Generation) -> R
 ///   and no `backend add` yet);
 /// - a backend resolves, but nothing on the medium yields a recognised
 ///   generation (the same cannot-see-cannot-refuse rule
-///   [`super::write::check_loaded_generation`] already follows — a check
+///   `volume::write::check_loaded_generation` already follows — a check
 ///   that cannot see a fact cannot refuse on it).
 ///
 /// **Must run before the caller opens its store for real** (`TapeStore::open`
