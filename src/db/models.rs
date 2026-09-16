@@ -155,6 +155,12 @@ pub struct Cartridge {
     pub media_type: String,
     pub manufacturer: Option<String>,
     pub serial_number: Option<String>,
+    /// The operator's typed claim (`cartridge register --serial` /
+    /// `cartridge edit --serial`), distinct from `serial_number` (a MAM
+    /// read) since migration 016 (ADR-0012 amendment, 2026-09-16; issue
+    /// #197). Never written by any code path that also writes
+    /// `serial_number`.
+    pub operator_serial: Option<String>,
     pub tape_length_meters: Option<i64>,
     pub nominal_capacity: i64,
     pub status: String,

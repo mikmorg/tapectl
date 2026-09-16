@@ -162,6 +162,16 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!(
             "migrations/015_cartridge_load_count_unknown.sql"
         )),
+        // 016 adds `cartridges.operator_serial` (ADR-0012's 2026-09-16
+        // amendment, issue #197): `serial_number` is the chip-read identity
+        // and after this migration is written ONLY from a MAM read;
+        // `operator_serial` is the operator's typed claim, written only by
+        // `cartridge register --serial` and `cartridge edit --serial`.
+        // `lookup_cartridge` falls back to it only while `serial_number IS
+        // NULL`. Plain ADD COLUMN, no rebuild, no backfill -- see the
+        // migration header for why existing `serial_number` values are left
+        // exactly where they are.
+        M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
     ])
 }
 
@@ -1090,7 +1100,13 @@ mod tests {
         let before = open_memory_at_011();
         let cols_011 = table_info(&before, "cartridges");
 
-        let after = open_memory().unwrap();
+        // Exactly the 012 schema, NOT `open_memory()` (latest): migration
+        // 016 (ADR-0012 amendment, 2026-09-16; issue #197) adds
+        // `cartridges.operator_serial`, a legitimate later change this test
+        // must not see -- it exists to prove 012's REBUILD didn't alter any
+        // column that already existed in 011, nothing about the schema's
+        // current, total shape.
+        let after = open_memory_at_012();
         let cols_012 = table_info(&after, "cartridges");
 
         assert_eq!(

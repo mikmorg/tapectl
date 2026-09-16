@@ -1,0 +1,60 @@
+-- 016: a chip-read serial and an operator-typed one are different facts and
+-- live in different columns.
+--
+-- ADR-0012, "Amendment, 2026-09-16 -- a typed serial and a chip-read serial
+-- are different facts and live in different columns (#197)".
+--
+-- `cartridge register --serial` let an operator type a medium serial by
+-- hand, for pre-registering a cartridge that has not been loaded yet, and it
+-- landed in `cartridges.serial_number` -- the SAME column a real MAM read
+-- writes. The schema could not distinguish an operator's ASSERTION about a
+-- chip from what the chip actually SAID, and no code could either. A typo
+-- was then permanent: write-once means a real MAM read will never overwrite
+-- a recorded serial, `--cartridge` naming the real medium is refused as a
+-- different cartridge, and no command edited the field. Every escape
+-- produced a duplicate row or a refusal. Migration 014's own header already
+-- named this defect as a known follow-up.
+--
+-- The ruling declined both a `serial_source` provenance flag on the one
+-- column and a bare correction command, in favour of a third shape: store
+-- the two facts in different fields.
+--
+--   * `serial_number` remains the identity, and after this migration it is
+--     written ONLY from a MAM read (`bind_cartridge`, `corroborate_contact`'s
+--     learn branch, `catalog rebuild`'s resolve step -- all three funnel
+--     through the one writer, `binding::record_medium_serial`). No operator
+--     command may ever write it again. That is what makes "never overwrite a
+--     chip-read serial" structurally true rather than a rule the code has to
+--     remember.
+--   * `operator_serial` holds the operator's claim. `cartridge register
+--     --serial` writes this and leaves `serial_number` NULL;
+--     `cartridge edit --serial` is the only other writer, and it never
+--     touches `serial_number` either.
+--
+-- `lookup_cartridge` matches `serial_number` first and falls back to
+-- `operator_serial` only while `serial_number IS NULL` -- the fallback that
+-- makes pre-registration actually work when the cartridge is first loaded.
+-- Once `serial_number` is set, `operator_serial` is never consulted again;
+-- it simply stands as the historical record of what was claimed.
+--
+-- NOT UNIQUE, deliberately. `barcode` is `TEXT NOT NULL UNIQUE` because two
+-- cartridges truly cannot share a barcode, but two OPERATORS can mistype the
+-- same wrong serial for two different cartridges, and a constraint violation
+-- at registration time is a worse failure than tolerating that duplicate,
+-- unconfirmed claim. `register`'s own collision check still refuses typing a
+-- serial that is already another row's CONFIRMED `serial_number` -- a real
+-- chip cannot report two different cartridges' identity, so that collision
+-- is a near-certain typo -- but two `operator_serial` claims are allowed to
+-- collide.
+--
+-- NO BACKFILL. Do not migrate existing `serial_number` values into
+-- `operator_serial`: for a row written before this migration there is no way
+-- to tell whether `cartridge register --serial` or a real MAM read put that
+-- value there, so guessing either way would misrepresent the row's history.
+-- Existing rows are left exactly as they are -- `serial_number` keeps
+-- whatever it holds (chip-confirmed or not), `operator_serial` starts NULL
+-- for every row, and nobody must ever "unify" the two columns back into one.
+--
+-- Plain ADD COLUMN, nullable, no table rebuild -- no `.foreign_key_check()`
+-- needed.
+ALTER TABLE cartridges ADD COLUMN operator_serial TEXT;
