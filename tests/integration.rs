@@ -1964,7 +1964,7 @@ fn test_volume_write_refuses_when_an_unresolved_write_session_already_exists() {
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES ('L6-BUSY', 'lto', 'p', 'LTO-6', 2_500_000_000_000, 'active')",
+         VALUES ('L6-BUSY', 'lto', 'p', 'LTO-6', 2_500_000_000_000, 'initialized')",
         [],
     )
     .unwrap();
@@ -2077,7 +2077,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES ('L6-NOKEY', 'lto', 'p', 'LTO-6', 2_500_000_000_000, 'active')",
+         VALUES ('L6-NOKEY', 'lto', 'p', 'LTO-6', 2_500_000_000_000, 'initialized')",
         [],
     )
     .unwrap();
