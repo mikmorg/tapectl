@@ -54,6 +54,10 @@ pub enum VolumeCommands {
     },
 
     /// Write staged data to volume
+    ///
+    /// Refuses any volume not left `initialized` by `volume init` — a
+    /// sealed, retired, erased or quarantined volume is not a write target
+    /// (ADR-0012); no flag overrides it.
     Write {
         /// Volume label
         label: String,
@@ -80,6 +84,10 @@ pub enum VolumeCommands {
     /// sealed. There is no --force: `volume write --force` overrides a
     /// wrong-cartridge finding before anything is written, which has no
     /// meaning for a tape this session has already partly written.
+    ///
+    /// Refuses any volume not left `initialized` by `volume init` — a
+    /// sealed, retired, erased or quarantined volume is not a write target
+    /// (ADR-0012); no flag overrides it.
     Resume {
         /// Volume label
         label: String,

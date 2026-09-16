@@ -7,6 +7,8 @@ tapectl\-volume\-write \- Write staged data to volume
 \fBtapectl volume write\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Write staged data to volume
+.PP
+Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR\-0012); no flag overrides it.
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
