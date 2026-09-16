@@ -201,6 +201,183 @@ mod tests {
         assert_eq!(small.len(), 2, "4 MiB tape cannot hold both 3 MiB units");
     }
 
+    /// Issue #175: `collection run` must budget against the destination
+    /// volume's own `capacity_bytes` (ADR-0010), never the drive's
+    /// generation. Same fixture as `config_with_tiny_backend` (10 MiB
+    /// generation-planned capacity), but the destination volume itself is a
+    /// 4 MiB row — a real cartridge smaller than what the drive would plan
+    /// for. Two 3 MiB units: fit one 10 MiB (generation) tape, but not one
+    /// 4 MiB (destination) tape. The batch COUNT is the assertion, so
+    /// budgeting from the wrong source cannot pass by coincidence.
+    #[test]
+    fn run_budgets_against_the_destination_volume_not_the_drive() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', ?1, 'initialized')",
+            [4 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+
+        let (volume_batches, _budget) =
+            plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        assert_eq!(
+            volume_batches.len(),
+            2,
+            "a 4 MiB destination volume cannot hold both 3 MiB units in one batch"
+        );
+
+        let generation_batches = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+        assert_eq!(
+            generation_batches.len(),
+            1,
+            "the drive's 10 MiB generation-planned capacity fits both units in one batch — \
+             proving the two budgets really do disagree here"
+        );
+    }
+
+    /// Issue #175: `--label` repeats once per planned copy and `batch::
+    /// execute_batch` stages once and writes to every label, so the batch
+    /// must be sized to the SMALLEST destination, not the largest or the
+    /// first one named.
+    #[test]
+    fn run_budgets_against_the_smallest_of_several_destinations() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('big', 'lto', 'p', ?1, 'initialized')",
+            [10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('small', 'lto', 'p', ?1, 'initialized')",
+            [4 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+
+        let (batches, budget) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["big".to_string(), "small".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            batches.len(),
+            2,
+            "the 4 MiB \"small\" destination is the binding constraint, not the 10 MiB \"big\" one"
+        );
+        assert_eq!(budget.binding_label, "small");
+        assert_eq!(budget.binding_capacity_bytes, 4 * 1024 * 1024);
+        assert_eq!(budget.num_destinations, 2);
+    }
+
+    /// Issue #175: an unknown `--label` must fail before any unit is staged
+    /// — `plan_for_run` resolves the destination budget FIRST, so this
+    /// never reaches `pending_units_for_collection`, let alone
+    /// `batch::execute_batch`'s staging loop. Asserting `snapshots` is
+    /// untouched is the check that actually proves it, since a
+    /// `VolumeNotFound` returned only after staging would still look like a
+    /// correct error to a test that just matched on the error variant.
+    #[test]
+    fn run_refuses_an_unknown_destination_label_before_staging() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+
+        let err = plan_for_run(&conn, &config, &lib, "/dev/null", &["nonexistent".to_string()])
+            .unwrap_err();
+        assert!(
+            matches!(&err, TapectlError::VolumeNotFound(l) if l == "nonexistent"),
+            "{err}"
+        );
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "an unknown label must fail before staging ever touches snapshots"
+        );
+    }
+
     #[test]
     fn plan_refuses_a_unit_larger_than_the_whole_tape() {
         let conn = db::open_memory().unwrap();
