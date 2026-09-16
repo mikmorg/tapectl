@@ -490,6 +490,68 @@ fn a_rebuilt_catalog_satisfies_the_query_restore_actually_uses() {
     }
 }
 
+/// Issue #158: a label that already exists in the catalog with a non-sealed
+/// status (an imported `active` row, or a `quarantined` one a failed
+/// `volume verify` produced deliberately) must not be silently reused as if
+/// it were `sealed`, and must not be silently rewritten to `sealed` either.
+/// The rebuild still has to attach every row it can — the mismatch is
+/// reported, not treated as a reason to stop short.
+#[test]
+fn rebuild_onto_a_quarantined_row_reports_the_mismatch_and_leaves_the_status_alone() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    // The destination catalog already knows this label, and quarantined it —
+    // a fact an operator established on purpose (e.g. a prior failed
+    // `volume verify`), before the database that recorded WHY was lost.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'quarantined')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+
+    let report =
+        rebuild(&conn, &mut vol, &secret, scratch.path()).expect("rebuild onto an existing row");
+
+    assert!(
+        !report.volume_inserted,
+        "the row already existed — rebuild must not insert a second one"
+    );
+    assert_eq!(
+        report.volume_status_mismatch,
+        Some("quarantined".to_string()),
+        "the pre-existing non-sealed status must be surfaced on the report"
+    );
+
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM volumes WHERE label = ?1",
+            rusqlite::params![LABEL],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status, "quarantined",
+        "the ratified minimum is report-only: rebuild must never overwrite an \
+         operator-established status on the strength of its own evidence"
+    );
+
+    // The mismatch is reported, but the rebuild still did its job: every
+    // unit's slices resolve through the exact join `restore_unit` uses.
+    for (unit_name, expected) in &vol.expected_positions {
+        let rows = restore_resolution_query(&conn, unit_name);
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "unit {unit_name}: a status mismatch must not stop the rebuild short"
+        );
+    }
+}
+
 /// The trap the #72 retrieval guide names: slice number is not tape position,
 /// and slices do not start at 0. A rebuild that stored the slice number in
 /// `write_positions.position` would restore the wrong files, and every other
@@ -671,6 +733,11 @@ fn rebuilding_the_same_volume_twice_changes_nothing_the_second_time() {
         counts_after_first,
         row_counts(&conn),
         "a second rebuild changed the catalog"
+    );
+    assert!(
+        second.volume_status_mismatch.is_none(),
+        "the first rebuild's row is already sealed — a second run must not \
+         report a mismatch against itself: {second:?}"
     );
 }
 
