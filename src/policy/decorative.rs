@@ -68,7 +68,13 @@ pub struct DecorativeHit {
     pub key: String,
 }
 
-/// Every decorative-key occurrence in a loaded config.
+/// Every decorative-key occurrence someone has already added an arm for —
+/// NOT, despite how an earlier version of this doc comment put it, every
+/// decorative-key occurrence in a loaded config. That stronger claim is
+/// exactly what the 2026-09-13 post-redesign audit caught false (see the
+/// module doc): this function cannot discover an unwired key by inspecting
+/// `Config`, only report one a human has already noticed and hand-coded a
+/// check for.
 ///
 /// Empty today: every key this scan was built for has been deleted from
 /// `Config` (see the module doc). A future key with no reader is added here,
