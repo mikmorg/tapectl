@@ -145,9 +145,10 @@ pub struct LtoBackendConfig {
     pub name: String,
     pub device_tape: String,
     pub device_sg: String,
-    /// The generation this drive natively writes, e.g. `"LTO-6"`. Parsed via
-    /// `crate::media::Generation::parse` — `config check` (and every
-    /// `Config::load`, via `validate_sizes`) errors if it does not parse.
+    /// The generation this drive natively writes, e.g. `"LTO-6"`. Checked via
+    /// [`validate_drive_generation`] — `config check` (and every
+    /// `Config::load`, via `validate_sizes`) errors if it does not parse, or
+    /// names a real medium format no drive IS (`"LTO-7-M8"`, issue #186).
     pub generation: String,
     /// Capacity override for a DRIVE that lies about its media — virtual
     /// drives (mhvtl) and the microcosm harnesses, and nothing else.

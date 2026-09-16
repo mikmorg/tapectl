@@ -28,7 +28,7 @@
 //! - "Is this value legal?" is decided by [`Config::semantic_problems`] —
 //!   the exact validators (`validate_compression`, `validate_checksum_mode`,
 //!   `validate_log_level`, `validate_log_format`,
-//!   `media::Generation::parse`, `staging::parse_size_to_bytes`)
+//!   `validate_drive_generation`, `staging::parse_size_to_bytes`)
 //!   `Config::load` itself calls, just collected instead of
 //!   short-circuited at the first hit.
 //!
