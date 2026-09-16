@@ -218,10 +218,12 @@ pub enum VolumeCommands {
     CompactFinish {
         /// Source volume label to retire
         label: String,
-        /// Proceed even when a unit is left with no other copy (ADR-0008
-        /// Tier 2, issue #147 — see cli::consent). It does NOT defeat the
-        /// Tier-3 refusal: a live slice with no copy anywhere still stops
-        /// the retirement outright, and nothing waives that.
+        /// Waive the ADR-0008 Tier-2 prompt: proceed when the retirement
+        /// leaves a live version below its policy but above zero. It
+        /// defeats NEITHER Tier-3 refusal (issue #147) — a live slice with
+        /// no copy on another volume, and the last eligible copy of a live
+        /// version, each stop the retirement outright and no flag reaches
+        /// them. See cli::consent.
         #[arg(long)]
         force: bool,
     },
