@@ -106,13 +106,17 @@ fn add(
     // caused it (#59's boundary-validation rule). The canonical spelling
     // (not the operator's raw one) is what gets written to the file, so
     // `LTO6`/`l6`/`LTO-6` all land the same way.
+    //
+    // `crate::config::validate_drive_generation` is the same check
+    // `Config::load`/`config check` applies to an already-written backend
+    // (issue #186) — reused here rather than re-stated, so the two boundaries
+    // cannot drift into two different refusal messages. It also refuses
+    // `"LTO-7-M8"` specifically: that string parses as a real medium
+    // generation, but no drive IS an LTO-7-M8 (ADR-0010 decision 1), so a
+    // backend declared that way could never write a single tape.
+    crate::config::validate_drive_generation(generation).map_err(TapectlError::Other)?;
     let generation = crate::media::Generation::parse(generation)
-        .ok_or_else(|| {
-            TapectlError::Other(format!(
-                "{generation:?} is not a recognised LTO generation \
-                 (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
-            ))
-        })?
+        .expect("validate_drive_generation already confirmed this parses")
         .as_str();
     if let Some(cap) = capacity_override {
         crate::staging::parse_size_to_bytes(cap)?;

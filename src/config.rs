@@ -512,6 +512,40 @@ pub fn validate_log_format(value: &str) -> std::result::Result<(), String> {
     validate_closed_set("format", value, VALID_LOG_FORMATS)
 }
 
+/// LTO generations a `[[backends.lto]]` entry may declare — the boundary
+/// `backend add` and `config check`/`Config::load` (via
+/// [`Config::size_problems`]) both police (issue #186, ADR-0010 decision 1: a
+/// drive declares only the one generation it IS).
+///
+/// Narrower than raw [`crate::media::Generation::parse`], which the
+/// cartridge/medium side (`cartridge register --generation`, and the
+/// medium-declaring `--generation` on `volume init`/`volume plan`) still
+/// calls directly and keeps accepting `"LTO-7-M8"`: LTO-7 Type M is a real
+/// medium format — an LTO-7 cartridge written at M8 density — not a drive
+/// model; no drive IS an LTO-7-M8. A `[[backends.lto]]` entry declared that
+/// way parses fine but then `crate::media::Generation::can_write(Lto7M8, _)`
+/// is `false` for every medium (see `media.rs`), so the backend could never
+/// write a single tape and every `volume init` on it would refuse. The drive
+/// that writes Type M cartridges declares `LTO-8`
+/// (`can_write(Lto8, Lto7M8)` is `true`).
+///
+/// One function so `backend add` and the config load/check path state this
+/// refusal once, not as two messages that can drift.
+pub fn validate_drive_generation(value: &str) -> std::result::Result<(), String> {
+    let generation = crate::media::Generation::parse(value).ok_or_else(|| {
+        format!("{value:?} is not a recognised LTO generation (e.g. LTO-6, LTO-7, LTO-8)")
+    })?;
+    if generation == crate::media::Generation::Lto7M8 {
+        return Err(format!(
+            "{value:?} is a cartridge format, not a drive generation: LTO-7 Type M is an \
+             LTO-7 cartridge written at M8 density, and the drive that writes it declares \
+             \"LTO-8\", not \"LTO-7-M8\". Use LTO-8 for the drive; LTO-7-M8 remains a valid \
+             medium generation elsewhere (e.g. `cartridge register --generation LTO-7-M8`)."
+        ));
+    }
+    Ok(())
+}
+
 impl LoggingConfig {
     /// Translate the validated `level` string into a `tracing::Level`
     /// (issue #172 — `main.rs` builds the actual subscriber from this).
@@ -568,10 +602,13 @@ impl Config {
     /// `defaults.large_file_warn_threshold`, and each configured LTO
     /// backend's `enospc_buffer`/`capacity_override`.
     ///
-    /// Also rejects an unparseable `backends.lto[].generation` (ADR-0010):
-    /// every capacity and compatibility decision downstream reads this via
+    /// Also rejects an unparseable, or drive-illegal, `backends.lto[].generation`
+    /// (ADR-0010) via [`validate_drive_generation`] — every capacity and
+    /// compatibility decision downstream reads this via
     /// `crate::media::Generation::parse`, so a bad value should fail loudly
-    /// here rather than downstream as a confusing `None`.
+    /// here rather than downstream as a confusing `None`, and `"LTO-7-M8"`
+    /// (a real medium format, never a drive) is refused by name rather than
+    /// producing a backend on which every `volume init` refuses (issue #186).
     ///
     /// `backends.lto[].block_size`, `.hardware_compression` and
     /// `packing.min_free_for_append` used to be size/bool-typed strings here
@@ -615,13 +652,11 @@ impl Config {
             ));
         }
         for (i, backend) in self.backends.lto.iter().enumerate() {
-            if crate::media::Generation::parse(&backend.generation).is_none() {
+            if let Err(e) = validate_drive_generation(&backend.generation) {
                 problems.push(format!(
-                    "{}: backends.lto[{i}] (\"{}\").generation = {:?} is not a recognised LTO \
-                     generation (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)",
+                    "{}: backends.lto[{i}] (\"{}\").generation: {e}",
                     path.display(),
-                    backend.name,
-                    backend.generation
+                    backend.name
                 ));
             }
             if let Some(cap) = &backend.capacity_override {
