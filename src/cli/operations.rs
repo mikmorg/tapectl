@@ -1854,6 +1854,22 @@ pub fn db_import(
 /// 3. A repair deletes records of what is on tape and logged nothing. It
 ///    now writes an `events` row — **inside** the transaction, so an event
 ///    can never outlive a rolled-back repair.
+/// 4. Issue #177: reporting covered 2 of 35 declared FK edges via two
+///    hand-rolled `writes`/`stage_slices` scans, and `--repair`'s DELETEs
+///    ran under immediate FK enforcement, so any orphan with children of
+///    its own (a `writes` row with `write_positions`, a `stage_slices` row
+///    with `write_positions`/`sacrificed_slice_id`/`verification_results`)
+///    tripped the very constraint it was trying to close and rolled the
+///    whole repair back. Reporting now runs `pragma_foreign_key_check`,
+///    which is schema-derived and covers every edge without hand-keeping
+///    a table list. Repair sets `PRAGMA defer_foreign_keys = ON` for the
+///    transaction and loops (check → delete each distinct offending row →
+///    check again) until the graph is closed, then commits — deferred
+///    checks mean deletion order inside the loop does not matter, only
+///    that nothing dangling is left by COMMIT. A **static leaf-first
+///    table list was considered and rejected**: it is the same defect
+///    (two scans vs. 35 edges) waiting for the next migration to add a
+///    36th edge nobody remembers to add to the list.
 ///
 /// `repaired` counts deleted **rows**, not categories (it is rendered as
 /// "repaired=N", where a category count is close to meaningless).
@@ -1873,44 +1889,137 @@ pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
         }
     }
 
-    // Check for orphaned records
-    let orphan_writes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM writes WHERE volume_id NOT IN (SELECT id FROM volumes)",
-        [],
-        |row| row.get(0),
-    )?;
-    if orphan_writes > 0 {
-        report
-            .issues
-            .push(format!("{orphan_writes} orphaned write records"));
+    // Foreign-key check — schema-derived, covers every declared edge (issue
+    // #177). Run regardless of the integrity_check outcome above.
+    report.issues.extend(foreign_key_check_issues(conn)?);
+
+    if repair {
+        match repair_foreign_key_violations(conn) {
+            Ok((repaired, _by_table)) => report.repaired = repaired,
+            Err(e) => {
+                // The pre-repair findings are already in `report.issues` —
+                // attach them so a failed repair never surfaces a bare
+                // "FOREIGN KEY constraint failed" with no context (issue
+                // #177 Defect 3). After the fix above this path should be
+                // unreachable for FK reasons; it stays as the belt.
+                let issues_text = if report.issues.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    report.issues.join("; ")
+                };
+                return Err(TapectlError::Other(format!(
+                    "db fsck --repair failed: {e}. pre-repair issues: {issues_text}"
+                )));
+            }
+        }
     }
 
-    let orphan_slices: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id NOT IN (SELECT id FROM stage_sets)",
-        [],
-        |row| row.get(0),
-    )?;
-    if orphan_slices > 0 {
-        report
-            .issues
-            .push(format!("{orphan_slices} orphaned stage slices"));
+    Ok(report)
+}
+
+/// Read `pragma_foreign_key_check` and render one `issues` line per
+/// (child table, parent table, constraint index) group — issue #177.
+/// Grouping by constraint index (not just child+parent) keeps two
+/// different columns on the same child that both reference the same
+/// parent table (e.g. `volume_movements.from_location` and
+/// `.to_location`, both -> `locations`) as separate findings, while a
+/// single row with several dangling columns still contributes to
+/// several groups without inflating the reported row COUNT within any
+/// one group beyond that row's single appearance in it.
+fn foreign_key_check_issues(conn: &Connection) -> Result<Vec<String>> {
+    let rows: Vec<(String, i64, String, i64)> = {
+        let mut stmt =
+            conn.prepare("SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check")?;
+        let mapped = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        mapped
+    };
+
+    let mut groups: std::collections::BTreeMap<(String, String, i64), Vec<i64>> =
+        std::collections::BTreeMap::new();
+    for (table, rowid, parent, fkid) in rows {
+        groups.entry((table, parent, fkid)).or_default().push(rowid);
     }
 
-    if repair && (orphan_writes > 0 || orphan_slices > 0) {
-        let tx = conn.unchecked_transaction()?;
-        let mut deleted = 0usize;
-        if orphan_writes > 0 {
-            deleted += tx.execute(
-                "DELETE FROM writes WHERE volume_id NOT IN (SELECT id FROM volumes)",
-                [],
-            )?;
+    let mut issues = Vec::with_capacity(groups.len());
+    for ((table, parent, _fkid), mut rowids) in groups {
+        rowids.sort_unstable();
+        rowids.dedup();
+        let shown: Vec<String> = rowids.iter().take(5).map(i64::to_string).collect();
+        let more = if rowids.len() > shown.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        let (noun, verb) = if rowids.len() == 1 {
+            ("row", "references")
+        } else {
+            ("rows", "reference")
+        };
+        issues.push(format!(
+            "foreign_key_check: {} {noun} in {table} {verb} missing {parent} (rowids {}{more})",
+            rowids.len(),
+            shown.join(", "),
+        ));
+    }
+    Ok(issues)
+}
+
+/// Delete every row `pragma_foreign_key_check` names, children first in
+/// effect (not by a hand-kept order — see `db_fsck`'s issue #177 note),
+/// inside one transaction with `PRAGMA defer_foreign_keys = ON` so
+/// deleting a row that is still referenced does not itself trip
+/// immediate FK enforcement mid-transaction. Loops: check -> delete each
+/// distinct (table, rowid) it named -> check again -> until empty, then
+/// commits. A row named for three dangling columns is one row, deleted
+/// once. Returns the total distinct rows deleted and a per-table
+/// breakdown for the audit event; on any failure the transaction is
+/// dropped (rolled back) and the error is returned to the caller, who
+/// attaches the pre-repair findings.
+fn repair_foreign_key_violations(
+    conn: &Connection,
+) -> Result<(usize, std::collections::BTreeMap<String, usize>)> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+
+    let mut deleted_by_table: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    loop {
+        let violations: Vec<(String, i64)> = {
+            let mut stmt =
+                tx.prepare("SELECT DISTINCT \"table\", rowid FROM pragma_foreign_key_check")?;
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            mapped
+        };
+        if violations.is_empty() {
+            break;
         }
-        if orphan_slices > 0 {
-            deleted += tx.execute(
-                "DELETE FROM stage_slices WHERE stage_set_id NOT IN (SELECT id FROM stage_sets)",
-                [],
+        for (table, rowid) in violations {
+            let n = tx.execute(
+                &format!("DELETE FROM \"{table}\" WHERE rowid = ?1"),
+                params![rowid],
             )?;
+            *deleted_by_table.entry(table).or_insert(0) += n;
         }
+    }
+
+    let repaired: usize = deleted_by_table.values().sum();
+    if repaired > 0 {
+        let detail = deleted_by_table
+            .iter()
+            .map(|(table, count)| format!("{table}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         events::log_event(
             &tx,
             "system",
@@ -1920,17 +2029,12 @@ pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
             None,
             None,
             None,
-            Some(&format!(
-                "deleted {orphan_writes} orphaned write records, \
-                 {orphan_slices} orphaned stage slices"
-            )),
+            Some(&format!("deleted {detail}")),
             None,
         )?;
-        tx.commit()?;
-        report.repaired = deleted;
     }
-
-    Ok(report)
+    tx.commit()?;
+    Ok((repaired, deleted_by_table))
 }
 
 #[derive(Debug, Default)]
@@ -4580,7 +4684,7 @@ mod tests {
         // Without --repair: reported, not touched.
         let dry = db_fsck(&conn, false).unwrap();
         assert!(dry.integrity_ok, "in-memory db must pass integrity_check");
-        assert_eq!(dry.issues.len(), 2, "issues: {:?}", dry.issues);
+        assert_eq!(dry.issues.len(), 4, "issues: {:?}", dry.issues);
         assert_eq!(dry.repaired, 0, "a dry run must delete nothing");
 
         let report = db_fsck(&conn, true).unwrap();
