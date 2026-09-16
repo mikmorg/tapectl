@@ -543,6 +543,16 @@ pub fn run(
                         "units_without_tenant_envelope": report.units_without_tenant_envelope,
                         "no_changes": report.is_noop(),
                         "volume_status_mismatch": report.volume_status_mismatch,
+                        // Issue #165: additive, every key above unchanged.
+                        "cartridge_barcode": report.cartridge_barcode,
+                        "cartridge_registered": report.cartridge_registered,
+                        "cartridge_bound": report.cartridge_bound,
+                        "serial_learned": report.serial_learned,
+                        "serial_checked": report.serial_checked,
+                        "cartridge_barcode_superseded": report.cartridge_barcode_superseded,
+                        "displaced": report.displaced,
+                        "cartridge_retired": report.cartridge_retired,
+                        "unbound_reason": report.unbound_reason,
                     })
                 );
             } else {
@@ -568,6 +578,49 @@ pub fn run(
                         } else {
                             ""
                         }
+                    );
+                }
+                // Issue #165, outside the is_noop() branch for the same
+                // reason as the volume_status_mismatch warning below: an
+                // idempotent second run still has a cartridge to name (or a
+                // reason it has none), even when nothing new was written.
+                match (&report.cartridge_barcode, &report.unbound_reason) {
+                    (Some(barcode), _) if report.cartridge_registered => {
+                        println!(
+                            "  cartridge \"{barcode}\" registered from this tape's own \
+                             identity and bound"
+                        );
+                    }
+                    (Some(barcode), _) if report.cartridge_bound => {
+                        println!("  bound to cartridge \"{barcode}\"");
+                        if report.serial_learned {
+                            println!("    medium serial learned onto cartridge \"{barcode}\"");
+                        }
+                    }
+                    (Some(barcode), _) => {
+                        println!("  already on cartridge \"{barcode}\" (unchanged)");
+                    }
+                    (None, Some(reason)) => {
+                        println!("  warning: rebuilt unbound — {reason}");
+                    }
+                    (None, None) => {}
+                }
+                if let Some(superseded) = &report.cartridge_barcode_superseded {
+                    println!(
+                        "  note: --cartridge \"{superseded}\" was superseded by a live medium \
+                         serial matching a different registered cartridge"
+                    );
+                }
+                if !report.displaced.is_empty() {
+                    println!(
+                        "  warning: displaced from that cartridge (now erased): {}",
+                        report.displaced.join(", ")
+                    );
+                }
+                if report.cartridge_retired {
+                    println!(
+                        "  note: that cartridge is retired_permanent — the mount is recorded \
+                         but its status was left alone (ADR-0011)"
                     );
                 }
                 // Outside the is_noop() branch on purpose: a second rebuild
