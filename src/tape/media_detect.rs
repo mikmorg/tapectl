@@ -12,6 +12,11 @@
 //! (`--generation`, a bound cartridge row, or the drive's own `generation`) —
 //! that fallback is `volume_init`'s job, not this module's.
 
+use std::fs::OpenOptions;
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+
 use tracing::warn;
 
 use crate::error::{Result, TapectlError};
@@ -115,6 +120,113 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
             }
         }
     }
+}
+
+/// Cheap, NON-BLOCKING pre-check for "is any medium loaded at all", run by a
+/// caller BEFORE [`detect`] (issue #152).
+///
+/// `detect`'s driver-density fallback ([`ioctl::density_code`]) opens the
+/// tape node with a plain blocking `open()`. On a drive with no cartridge
+/// loaded, the `st` driver's `open()` blocks until its own no-medium timeout
+/// expires — observed as a ~2m05s stall between the MAM failure and the
+/// driver-density failure on an empty mhvtl drive. That is not a correctness
+/// bug (the code falls back to a declared generation and the write later
+/// fails safely), but a bare drive is an ordinary operator slip and should be
+/// reported in under a second, not after a multi-minute silent hang.
+///
+/// This does NOT open the tape node the way `ioctl::density_code` or
+/// `ioctl::TapeDevice` do. It opens with `O_NONBLOCK` — which is the entire
+/// point, since the st driver's no-medium wait is a property of a *blocking*
+/// open and an `O_NONBLOCK` open returns immediately regardless of whether a
+/// medium is present — and then reads `MTIOCGET`'s `mt_gstat` register for
+/// the `GMT_DR_OPEN` bit (`<linux/mtio.h>`: "door open (no tape)"). That is
+/// exactly the bit `mt status` reports as `DR_OPEN`, and exactly what
+/// `scripts/first-run.sh` already greps `mt status` output for before its own
+/// write step — this is an in-process version of the same check, not a new
+/// idea.
+///
+/// The `MTIOCGET` request number and `mtget` layout are duplicated here from
+/// `tape::ioctl` (private there) rather than exposed from that module: this
+/// probe's entire reason to exist is a DIFFERENT open mode than every
+/// `tape::ioctl` caller uses, so sharing code would mean either splitting
+/// `tape::ioctl`'s open from its ioctl calls (a real refactor, out of scope
+/// for this fix) or making its blocking-open internals `pub` for a caller
+/// that specifically must not use them. Duplicating ~10 lines of ioctl
+/// plumbing seemed the smaller risk; see the issue #152 report for the
+/// alternative considered.
+///
+/// Best-effort like every other source in this module: `detect` itself never
+/// returns an `Err`, and neither does this. If the device can't even be
+/// opened non-blockingly, or the ioctl fails outright (wrong path,
+/// permissions, a driver that answers `MTIOCGET` oddly), that is a DIFFERENT
+/// problem than "no medium" and is logged at `warn` and treated as
+/// "couldn't tell" — returning `false` (proceed) so the caller falls through
+/// to `detect`'s own slower-but-authoritative sources rather than refusing
+/// for a reason that has nothing to do with a missing cartridge.
+///
+/// Returns `true` only when the drive *positively* reports `DR_OPEN` — no
+/// cartridge loaded.
+pub fn probe_no_medium(device_tape: &str) -> bool {
+    match read_gstat_nonblocking(device_tape) {
+        Some(gstat) => gstat_reports_no_medium(gstat),
+        None => false,
+    }
+}
+
+/// `GMT_DR_OPEN(x)`, `<linux/mtio.h>`: `(x) & 0x00040000`, "door open (no
+/// tape)". Split out from [`probe_no_medium`] purely so the bit-test logic is
+/// callable with a literal `i64` in tests, with no device involved at all.
+fn gstat_reports_no_medium(gstat: i64) -> bool {
+    gstat & 0x0004_0000 != 0
+}
+
+// Duplicated from `tape::ioctl` (private there — see `probe_no_medium`'s doc
+// comment for why). `MTIOCGET` from <linux/mtio.h>: `_IOR('m', 2, struct
+// mtget)`.
+const MTIOCGET: u64 = 0x80306d02;
+
+// Duplicated from `tape::ioctl` (private there): the `mtget` struct shape
+// from <linux/mtio.h>. Only `mt_gstat` is read; the rest exist so the ioctl
+// writes into a correctly-sized buffer.
+#[repr(C)]
+#[derive(Default)]
+struct MtGet {
+    mt_type: i64,
+    mt_resid: i64,
+    mt_dsreg: i64,
+    mt_gstat: i64,
+    mt_erreg: i64,
+    mt_fileno: i32,
+    mt_blkno: i32,
+}
+
+/// Open `device_tape` with `O_NONBLOCK` and read `MTIOCGET`'s `mt_gstat`
+/// register. `None` on any failure (open or ioctl) — logged at `warn` and
+/// otherwise swallowed; see `probe_no_medium`'s doc comment for why a failure
+/// here must never look like a positive "no medium" answer.
+fn read_gstat_nonblocking(device_tape: &str) -> Option<i64> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(device_tape)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(device_tape = %device_tape, err = %e, "non-blocking open failed during no-medium probe (continuing)");
+            return None;
+        }
+    };
+    let mut mtget = MtGet::default();
+    let rc = unsafe { nix::libc::ioctl(file.as_raw_fd(), MTIOCGET, &mut mtget as *mut MtGet) };
+    if rc != 0 {
+        warn!(
+            device_tape = %device_tape,
+            err = %io::Error::last_os_error(),
+            "MTIOCGET failed during no-medium probe (continuing)"
+        );
+        return None;
+    }
+    Some(mtget.mt_gstat)
 }
 
 /// Where [`resolve_media`]'s generation came from — detected off the medium,
@@ -265,6 +377,46 @@ mod tests {
         assert_eq!(d.code, None);
         assert_eq!(d.source, DetectSource::None);
         assert_eq!(d.mam, MamInfo::default());
+    }
+
+    // ---- issue #152: the no-medium pre-check ----
+
+    /// Real LTO-6 `mt_gstat` shapes carry other bits (BOT, ONLINE, ...)
+    /// alongside DR_OPEN; the test data mirrors that rather than testing
+    /// the bit in isolation.
+    #[test]
+    fn gstat_reports_no_medium_detects_the_dr_open_bit() {
+        // GMT_DR_OPEN alone.
+        assert!(gstat_reports_no_medium(0x0004_0000));
+        // GMT_DR_OPEN alongside GMT_ONLINE (0x0100_0000) — an empty drive
+        // that is otherwise online and ready still reports DR_OPEN.
+        assert!(gstat_reports_no_medium(0x0104_0000));
+    }
+
+    #[test]
+    fn gstat_reports_no_medium_is_false_when_the_bit_is_clear() {
+        // A loaded, rewound, online tape: GMT_BOT | GMT_ONLINE, no DR_OPEN.
+        assert!(!gstat_reports_no_medium(0x4100_0000));
+        assert!(!gstat_reports_no_medium(0));
+    }
+
+    #[test]
+    fn gstat_reports_no_medium_does_not_confuse_a_neighboring_bit() {
+        // GMT_IM_REP_EN (0x0001_0000) is adjacent to DR_OPEN
+        // (0x0004_0000) — must not be mistaken for it.
+        assert!(!gstat_reports_no_medium(0x0001_0000));
+    }
+
+    /// The probe must never look like "no medium" (`true`) when it simply
+    /// couldn't read the device at all — a nonexistent path is answered by
+    /// `open()` failing outright (ENOENT), instantly, never by blocking; this
+    /// pins that `probe_no_medium` treats that as "couldn't tell" (`false`),
+    /// not as a positive refusal.
+    #[test]
+    fn probe_no_medium_on_a_nonexistent_device_is_false_not_a_refusal() {
+        assert!(!probe_no_medium(
+            "/nonexistent/tapectl-media-detect-probe-device"
+        ));
     }
 
     fn detected(generation: Generation, code: u8) -> Detected {
