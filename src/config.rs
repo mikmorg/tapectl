@@ -502,11 +502,23 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
+/// Issue #172: `main.rs`'s tracing subscriber ran at a hardcoded WARN
+/// threshold (see its own doc comment on why — a fresh install must not
+/// bury a command's own `--json` output under routine info-level noise)
+/// while these keys sat in every `init`-written config doing nothing. Now
+/// that they are wired, the default has to reproduce that pre-#172
+/// behaviour exactly, or shipping the wiring is itself a silent verbosity
+/// change for every existing and future install.
 fn default_log_level() -> String {
-    "info".to_string()
+    "warn".to_string()
 }
+/// `tracing_subscriber::fmt`'s own default formatter is called "full" (its
+/// type is `tracing_subscriber::fmt::format::Full`) — matching that name
+/// here, rather than picking a new default like the pre-#172 "json", is
+/// what makes an unwired-to-wired upgrade a no-op for anyone not already
+/// setting this key.
 fn default_log_format() -> String {
-    "json".to_string()
+    "full".to_string()
 }
 
 impl Default for LoggingConfig {
@@ -514,6 +526,47 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             format: default_log_format(),
+        }
+    }
+}
+
+/// `logging.level` values `main.rs`'s tracing subscriber accepts — every
+/// variant `tracing::Level` has. Validated at config load (ADR-0012 "closed-
+/// set values are validated at load", issue #171/#172) rather than left to
+/// silently fall back to a default inside [`LoggingConfig::tracing_level`].
+pub const VALID_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+
+pub fn validate_log_level(value: &str) -> std::result::Result<(), String> {
+    validate_closed_set("level", value, VALID_LOG_LEVELS)
+}
+
+/// `logging.format` values `main.rs`'s tracing subscriber accepts — the
+/// four formatter names `tracing_subscriber::fmt::SubscriberBuilder`
+/// exposes as builder methods (`.compact()`, `.pretty()`, `.json()`, and
+/// "full" for none of the three — its own default).
+pub const VALID_LOG_FORMATS: &[&str] = &["full", "compact", "pretty", "json"];
+
+pub fn validate_log_format(value: &str) -> std::result::Result<(), String> {
+    validate_closed_set("format", value, VALID_LOG_FORMATS)
+}
+
+impl LoggingConfig {
+    /// Translate the validated `level` string into a `tracing::Level`
+    /// (issue #172 — `main.rs` builds the actual subscriber from this).
+    ///
+    /// `Config::load`'s `validate_closed_sets` already rejects any value
+    /// outside [`VALID_LOG_LEVELS`] before this is ever called on a loaded
+    /// config, so the wildcard arm is not a second, silent gate on bad user
+    /// input — it exists only for a `LoggingConfig` built directly (e.g.
+    /// `Config::default()`, which `main.rs` uses to bootstrap tracing before
+    /// any config file has been read).
+    pub fn tracing_level(&self) -> tracing::Level {
+        match self.level.as_str() {
+            "trace" => tracing::Level::TRACE,
+            "debug" => tracing::Level::DEBUG,
+            "info" => tracing::Level::INFO,
+            "error" => tracing::Level::ERROR,
+            _ => tracing::Level::WARN,
         }
     }
 }
@@ -617,17 +670,28 @@ impl Config {
     /// hours later, or an opaque SQLite CHECK-constraint failure when a
     /// unit was finally written with a bad `checksum_mode`.
     ///
-    /// `defaults.hash` is deliberately NOT checked here even though the
-    /// issue's own Defect prose names it alongside these two: ADR-0012's
-    /// ruling text and issue #172 (landing with or after this one) instead
-    /// DELETE `defaults.hash` outright as decorative rather than validate
-    /// it, and adding a validator here would fight that deletion.
+    /// `defaults.hash` is NOT checked here, and never will be: issue #172
+    /// deletes it from `Config` outright (nothing ever read it) rather than
+    /// validating a value nothing acts on — a stale config that still sets
+    /// it is rejected earlier, by name, in [`stale_defaults_fields_message`].
+    ///
+    /// `logging.level`/`logging.format` get the same closed-set treatment
+    /// here as `compression`/`checksum_mode` (issue #172, landing with or
+    /// after #171): unlike `defaults.hash`, these two ARE wired — into
+    /// `main.rs`'s tracing subscriber — so a bad value is a real, actionable
+    /// mistake worth catching at load, not a decorative one worth deleting.
     fn validate_closed_sets(&self, path: &Path) -> Result<()> {
         validate_compression(&self.defaults.compression).map_err(|e| {
             TapectlError::Config(format!("{}: defaults.compression: {e}", path.display()))
         })?;
         validate_checksum_mode(&self.defaults.checksum_mode).map_err(|e| {
             TapectlError::Config(format!("{}: defaults.checksum_mode: {e}", path.display()))
+        })?;
+        validate_log_level(&self.logging.level).map_err(|e| {
+            TapectlError::Config(format!("{}: logging.level: {e}", path.display()))
+        })?;
+        validate_log_format(&self.logging.format).map_err(|e| {
+            TapectlError::Config(format!("{}: logging.format: {e}", path.display()))
         })?;
         Ok(())
     }
@@ -1512,5 +1576,105 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains('a') && msg.contains('b'), "{msg}");
         assert!(msg.contains("--device"), "{msg}");
+    }
+
+    // ---- issue #172: logging.level / logging.format wired into tracing ----
+
+    /// This is the acceptance test for "`logging.level = \"debug\"` actually
+    /// changes the emitted level": the pure function `main.rs`'s subscriber
+    /// setup calls to pick a `tracing::Level` must actually return DEBUG for
+    /// `level = "debug"`, not silently fall back to the default. Every
+    /// `VALID_LOG_LEVELS` entry is checked, not just one, since a
+    /// hand-written match arm is exactly the kind of code that gets one
+    /// variant wrong.
+    #[test]
+    fn tracing_level_maps_every_valid_level_string() {
+        let cases = [
+            ("trace", tracing::Level::TRACE),
+            ("debug", tracing::Level::DEBUG),
+            ("info", tracing::Level::INFO),
+            ("warn", tracing::Level::WARN),
+            ("error", tracing::Level::ERROR),
+        ];
+        for (value, expected) in cases {
+            let cfg = LoggingConfig {
+                level: value.to_string(),
+                format: default_log_format(),
+            };
+            assert_eq!(cfg.tracing_level(), expected, "level = {value:?}");
+        }
+    }
+
+    #[test]
+    fn default_logging_config_reproduces_the_pre_172_hardcoded_behaviour() {
+        // Before #172, main.rs's subscriber ran at a hardcoded WARN
+        // threshold with tracing_subscriber's own default ("full") text
+        // formatter. Wiring the keys must not silently change that for
+        // every install that has not touched [logging] — a fresh `init`'s
+        // config carries exactly these defaults.
+        let cfg = LoggingConfig::default();
+        assert_eq!(cfg.tracing_level(), tracing::Level::WARN);
+        assert_eq!(cfg.format, "full");
+    }
+
+    #[test]
+    fn validate_log_level_accepts_every_valid_level() {
+        for level in VALID_LOG_LEVELS {
+            assert!(validate_log_level(level).is_ok(), "{level}");
+        }
+    }
+
+    #[test]
+    fn validate_log_level_rejects_garbage() {
+        let err = validate_log_level("verbose").unwrap_err();
+        assert!(err.contains("verbose"), "{err}");
+    }
+
+    #[test]
+    fn validate_log_format_accepts_every_valid_format() {
+        for format in VALID_LOG_FORMATS {
+            assert!(validate_log_format(format).is_ok(), "{format}");
+        }
+    }
+
+    #[test]
+    fn validate_log_format_rejects_garbage() {
+        let err = validate_log_format("xml").unwrap_err();
+        assert!(err.contains("xml"), "{err}");
+    }
+
+    #[test]
+    fn config_load_rejects_a_bad_logging_level_naming_the_file_and_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[logging]\nlevel = \"verbose\"\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("logging.level"), "{msg}");
+        assert!(msg.contains("verbose"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_a_bad_logging_format_naming_the_file_and_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[logging]\nformat = \"xml\"\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("logging.format"), "{msg}");
+        assert!(msg.contains("xml"), "{msg}");
+    }
+
+    /// A config that only sets the two wired keys, and nothing else, must
+    /// load cleanly — proving the wiring did not accidentally make
+    /// `[logging]` a required section or change any other field's default.
+    #[test]
+    fn a_config_with_only_valid_logging_keys_loads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[logging]\nlevel = \"debug\"\nformat = \"json\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.logging.tracing_level(), tracing::Level::DEBUG);
+        assert_eq!(cfg.logging.format, "json");
     }
 }
