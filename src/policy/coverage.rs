@@ -87,6 +87,26 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
     status_in(volume_alias, &["active", "full", "sealed", "initialized"])
 }
 
+/// ADR-0012: the one status `volume write`/`volume resume` may target.
+///
+/// Deliberately narrower than [`in_service_or_provisioned`], which folds in
+/// `active`/`full`/`sealed` for inventory/capacity accounting — none of
+/// those are write targets. `active` is written only by `tapectl import`
+/// (a tape written elsewhere, not a v2 write session); `full` is the
+/// pre-renovation sealed-equivalent; `blank`/`missing` have no writer at
+/// all. A `sealed` volume is never written again (ADR-0003), and
+/// `retired`/`erased`/`quarantined` are catalog facts that make writing
+/// wrong regardless of what the loaded tape looks like.
+///
+/// The "interrupted, ready to resume" state is NOT a `volumes.status`
+/// value — it lives in `writes.status` (`planned → in_progress →
+/// interrupted`), so `volume_resume` targets exactly the same status as
+/// `volume_write`: the row never leaves `initialized` between `plan` and
+/// `confirm`.
+pub fn is_write_target(status: &str) -> bool {
+    status == "initialized"
+}
+
 // ── Deposit-aware copy / location derivations (issue #73, ADR-0006) ──
 
 /// Which slice of a unit's coverage a derivation is asking about.
@@ -862,5 +882,42 @@ pub(crate) mod tests {
             "volume retire deliberately asks about ANY snapshot, not just \
              the unit's least-covered current one"
         );
+    }
+
+    /// ADR-0012 (issue #161): `is_write_target` must admit exactly
+    /// `initialized`, and this must be re-checked against the schema's own
+    /// status set every time it changes — a status added later to the
+    /// CHECK constraint without a corresponding classification here would
+    /// otherwise silently fall through as "not a write target" (or worse,
+    /// silently become one) with nothing failing to say so.
+    #[test]
+    fn is_write_target_admits_exactly_initialized() {
+        const LIFECYCLE_SQL: &str = include_str!("../db/migrations/003_v2_lifecycle.sql");
+        let statuses = [
+            "blank",
+            "initialized",
+            "active",
+            "full",
+            "retired",
+            "missing",
+            "erased",
+            "sealed",
+            "quarantined",
+        ];
+        for status in statuses {
+            assert!(
+                LIFECYCLE_SQL.contains(&format!("'{status}'")),
+                "status {status:?} is pinned here as part of the classified set but no \
+                 longer appears in the `volumes.status` CHECK constraint \
+                 (db/migrations/003_v2_lifecycle.sql) — the status set moved and this \
+                 pin must be updated with it"
+            );
+            let expected = status == "initialized";
+            assert_eq!(
+                is_write_target(status),
+                expected,
+                "is_write_target({status:?}) should be {expected}"
+            );
+        }
     }
 }
