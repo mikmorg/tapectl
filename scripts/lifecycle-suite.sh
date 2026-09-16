@@ -1706,7 +1706,13 @@ cp_write_volg() {
     TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV"
 }
 
-cp_compact_finish_succeeds() { TCTL volume compact-finish VOL-E; }
+# --yes because this is now a Tier-2 act (issue #147). After compact-write to
+# VOL-G, `docs` and `big` sit at one copy against this suite's min_copies = 2,
+# and ADR-0008 puts a below-policy retirement behind consent. The suite is a
+# non-interactive operator who has decided to proceed, so it says so. It is NOT
+# a way past the Tier-3 floor -- nothing waives that, and rr.retire_refused_sole_copy
+# below still proves it.
+cp_compact_finish_succeeds() { TCTL volume compact-finish VOL-E --yes; }
 
 scenario_compaction() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
@@ -1784,8 +1790,13 @@ rr_retire_vola_succeeds_with_coverage() {
         skip "rr.retire_vola_succeeds_with_coverage" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
         return $?
     fi
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A (now safe: every unit has a second copy on VOL-B, so no consent is needed)"; return 0; }
-    TCTL volume retire VOL-A
+    # Every unit has a second copy on VOL-B, so this is not the Tier-3 floor --
+    # but it drops each from 2 copies to 1, below this suite's min_copies = 2,
+    # which IS Tier 2 since issue #147. Consent given explicitly; the docstring
+    # above used to say "no consent is needed", which encoded the old inverted
+    # tiers rather than the ADR.
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A --yes (safe: every unit has a second copy on VOL-B; --yes for the below-policy Tier-2 gate)"; return 0; }
+    TCTL volume retire VOL-A --yes
 }
 
 # ADR-0003 negative, run BEFORE the physical erase: VOL-A's cartridge is
