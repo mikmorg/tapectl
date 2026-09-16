@@ -76,7 +76,10 @@ fn an_unrecognised_model_yields_nothing_and_fails() {
     // string with rc 0 would be guessed at by the caller's `${VAR:-default}`.
     for model in ["VTL-FOO", "Ultrium-HH", "", "QUANTUM SuperLoader"] {
         let (got, ok) = generation_for(model);
-        assert!(got.is_empty(), "model {model:?} must print nothing, got {got:?}");
+        assert!(
+            got.is_empty(),
+            "model {model:?} must print nothing, got {got:?}"
+        );
         assert!(!ok, "model {model:?} must exit non-zero");
     }
 }
@@ -88,7 +91,10 @@ fn type_m_is_never_a_drive_generation() {
     // so a backend declared that way refuses every `volume init` (issue #186).
     for model in ["ULT3580-TD7-M8", "Ultrium 7-M8-SCSI"] {
         let (got, ok) = generation_for(model);
-        assert!(got.is_empty(), "model {model:?} must not yield a generation");
+        assert!(
+            got.is_empty(),
+            "model {model:?} must not yield a generation"
+        );
         assert!(!ok);
     }
 }
