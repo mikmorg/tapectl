@@ -4518,7 +4518,25 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
 
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, || {
+            // `tracing`'s per-callsite `Interest` (always/never/sometimes)
+            // is cached the first time any thread in the process reaches a
+            // given `tracing::warn!`/etc. call site, and that cache is
+            // process-global, not thread-local. Under `cargo test`'s
+            // default parallelism, some OTHER test's thread can reach
+            // `snapshot_delete`'s interrupted-write warning first with NO
+            // subscriber installed, permanently caching it "never
+            // interesting" and silently defeating this scope's
+            // `with_default` — exactly the flakiness `rebuild_interest_cache`
+            // exists to clear: force every callsite to re-register against
+            // *this* thread's now-current subscriber before running `f`.
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
+        // Rebuild once more on the way out so the cache does not keep
+        // favoring this scope's subscriber for other tests running
+        // concurrently on other threads once it is gone.
+        tracing::callsite::rebuild_interest_cache();
 
         let bytes = buf.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
@@ -4789,6 +4807,19 @@ mod tests {
         assert_eq!(
             snap2_writes, 1,
             "sibling snapshot's writes row must survive"
+        );
+        let snap2_write_positions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions wp
+                 JOIN writes w ON w.id = wp.write_id
+                 WHERE w.snapshot_id = ?1",
+                params![snap2_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            snap2_write_positions, 1,
+            "sibling snapshot's write_positions row must survive"
         );
         for f in &slices2 {
             assert!(f.exists(), "sibling's staged slice files must survive");
