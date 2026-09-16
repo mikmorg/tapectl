@@ -1011,6 +1011,118 @@ fn mhvtl_health_logs_populated() {
     assert!(raw_len > 0, "raw_log empty");
 }
 
+/// Issue #187: `volume_verify` used to resolve its backend TWICE — once
+/// through the canonicalising `config::resolve_device` (for the
+/// usable-capacity factor), once by raw string equality against
+/// `device_tape` (to find the sg node for `sg_logs` health collection). A
+/// by-id `--device` — the RECOMMENDED form, per the device-numbering hazard
+/// (CLAUDE.md) — matched the first lookup but missed the second, so verify
+/// silently recorded no drive health at all. Both now come from one
+/// resolution.
+#[test]
+#[ignore]
+fn mhvtl_verify_by_id_device_records_drive_health() {
+    if !mhvtl_enabled() {
+        return;
+    }
+    let _g = tape_lock();
+    let label = "MHVTLBYID";
+    let h = write_volume("verify-byid-health", label, &[("alice", "alice-u", 2)]);
+
+    // Resolve a by-id symlink for the SAME physical/virtual device this
+    // harness's backend names by its raw `/dev/nstN` path — dynamically,
+    // since which by-id name exists is environment-specific (mhvtl vs a
+    // real drive) and must never be hardcoded (device-numbering hazard).
+    let canon = fs::canonicalize(tape_dev()).expect("tape_dev canonicalizes");
+    let by_id = fs::read_dir("/dev/tape/by-id")
+        .expect("a /dev/tape/by-id directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.to_string_lossy().ends_with("-nst")
+                && fs::canonicalize(p).map(|c| c == canon).unwrap_or(false)
+        })
+        .expect("a by-id symlink resolving to the mhvtl tape device");
+
+    let before: i64 = h
+        .conn
+        .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+        .unwrap();
+
+    let report = volume::write::volume_verify(
+        &h.conn,
+        &h.config,
+        label,
+        &by_id.to_string_lossy(),
+        BLOCK_SIZE,
+        Tier::default(),
+    )
+    .unwrap();
+
+    assert!(
+        report.drive_health_note.is_none(),
+        "a backend that resolves for this device must not report health as skipped: {:?}",
+        report.drive_health_note
+    );
+
+    let after: i64 = h
+        .conn
+        .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        after > before,
+        "verify via a by-id --device must still record drive health (issue #187)"
+    );
+}
+
+/// Issue #187, the other half: with NO backend configured at all — the
+/// rebuilt/DR machine with keys and no `backend add` yet (ADR-0005) — verify
+/// must still succeed, and must SAY that drive health was not collected
+/// rather than silently recording nothing.
+#[test]
+#[ignore]
+fn mhvtl_verify_with_no_backend_says_health_not_collected() {
+    if !mhvtl_enabled() {
+        return;
+    }
+    let _g = tape_lock();
+    let label = "MHVTLNOBK";
+    let h = write_volume("verify-no-backend-health", label, &[("alice", "alice-u", 2)]);
+
+    let mut config_no_backend = h.config.clone();
+    config_no_backend.backends.lto.clear();
+
+    let before: i64 = h
+        .conn
+        .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+        .unwrap();
+
+    let report = volume::write::volume_verify(
+        &h.conn,
+        &config_no_backend,
+        label,
+        &tape_dev(),
+        BLOCK_SIZE,
+        Tier::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.failed, 0,
+        "verify must still succeed with no backend configured"
+    );
+    let note = report
+        .drive_health_note
+        .expect("no configured backend must say health was not collected, not stay silent");
+    assert!(note.contains("not collected"), "{note}");
+
+    let after: i64 = h
+        .conn
+        .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, before, "no backend means no health_logs row is added");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Leg 3/4 (v2-implementation-plan.md T9, `v2-open-questions.md` sec 10):
 // "one chain walk, three consumers." Session confirm and `volume verify` are
