@@ -1273,16 +1273,17 @@ fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Re
             }).collect();
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
+            // Issue #204: `cap` (`volumes.capacity_bytes`) is decimal by
+            // ADR-0012 ruling and stored decimal — dividing it by 1024^3
+            // and calling the result GB, as this line used to, understated
+            // it by ~7%, the same wrong-number class `cartridge info` had.
+            // `format_capacity_progress` keeps `written` (a measured data
+            // size) binary and `cap` (a marketed capacity) decimal, per the
+            // shared, tested helper.
             for (label, cap, written, status) in &rows {
-                let pct = if *cap > 0 {
-                    (*written as f64 / *cap as f64) * 100.0
-                } else {
-                    0.0
-                };
                 println!(
-                    "  {label} [{status}]: {} / {} GB ({pct:.1}%)",
-                    written / (1024 * 1024 * 1024),
-                    cap / (1024 * 1024 * 1024),
+                    "  {label} [{status}]: {}",
+                    crate::util::format_capacity_progress(*written, *cap)
                 );
             }
         }
@@ -1297,16 +1298,10 @@ fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Re
                 })
             );
         } else {
-            let pct = if total_cap > 0 {
-                (total_written as f64 / total_cap as f64) * 100.0
-            } else {
-                0.0
-            };
             println!(
-                "capacity: {} volumes, {} / {} GB ({pct:.1}%)",
+                "capacity: {} volumes, {}",
                 vol_count,
-                total_written / (1024 * 1024 * 1024),
-                total_cap / (1024 * 1024 * 1024),
+                crate::util::format_capacity_progress(total_written, total_cap)
             );
         }
     }

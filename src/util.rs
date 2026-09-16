@@ -164,6 +164,104 @@ impl<W: Write> Write for TruncatingWriter<W> {
     }
 }
 
+// --- Byte-count humanisers (issue #204) ------------------------------------
+//
+// ADR-0012: "Cartridge capacities are decimal; data sizes are binary; the two
+// are named apart." Before this, `cli::catalog::format_size` and
+// `cli::collection::format_bytes` were two separately-maintained humanisers
+// (one binary, one decimal, both labeled ad hoc), and several other call
+// sites divided a decimal-stored `capacity_bytes`/`nominal_capacity` by a
+// binary 1024^n and called the result "GB" — not a mislabeling, a wrong
+// number (a 2.5 TB LTO-6 cartridge reads back as "2328 GB", `cartridge.rs`
+// pre-existing bug; `cli::volume::print_volume_info` and
+// `cli::report::report_capacity` had the identical bug, fixed alongside
+// this). One pair of functions, not N call sites: every DATA size goes
+// through `format_bytes_binary`, every CAPACITY goes through
+// `format_bytes_decimal`, and nothing else in the crate re-derives either.
+
+/// Human-readable byte count in BINARY units (KiB/MiB/GiB/TiB, 1024-based).
+///
+/// For **data sizes**: slice bytes, staged/encrypted bytes, bytes read or
+/// written, reclaimable/freed bytes — anything `dar` or the block layer
+/// actually measured. ADR-0012: "data sizes are binary, as dar and the
+/// block layer count."
+///
+/// Never call this on a stored capacity (`cartridges.nominal_capacity`,
+/// `volumes.capacity_bytes`, `mam_capacity_bytes`) — those are decimal by
+/// the same ruling; use [`format_bytes_decimal`]. Dividing a decimal-stored
+/// capacity by a binary power understates it by up to ~7% at GB scale
+/// (issue #204).
+pub fn format_bytes_binary(bytes: i64) -> String {
+    const KI: f64 = 1024.0;
+    let b = bytes as f64;
+    if bytes >= (KI * KI * KI * KI) as i64 {
+        format!("{:.2} TiB", b / (KI * KI * KI * KI))
+    } else if bytes >= (KI * KI * KI) as i64 {
+        format!("{:.1} GiB", b / (KI * KI * KI))
+    } else if bytes >= (KI * KI) as i64 {
+        format!("{:.1} MiB", b / (KI * KI))
+    } else if bytes >= KI as i64 {
+        format!("{:.1} KiB", b / KI)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Human-readable byte count in DECIMAL units (KB/MB/GB/TB, 1000-based).
+///
+/// For **capacities**: `cartridges.nominal_capacity`, `volumes.capacity_bytes`,
+/// `mam_capacity_bytes` — decimal by ADR-0012 ruling and stored decimal (the
+/// generation table holds LTO-6 as `2_500_000_000_000`). Marketed capacity
+/// figures are decimal; rendering one through [`format_bytes_binary`]
+/// instead reprints the box's own number wrong, not just under a different
+/// label.
+///
+/// Never call this on a measured data size — `stage create` output, slice
+/// bytes, tape reads/writes — those are binary by the same ruling; use
+/// [`format_bytes_binary`].
+pub fn format_bytes_decimal(bytes: i64) -> String {
+    const K: f64 = 1_000.0;
+    let b = bytes as f64;
+    if bytes >= (K * K * K * K) as i64 {
+        format!("{:.2} TB", b / (K * K * K * K))
+    } else if bytes >= (K * K * K) as i64 {
+        format!("{:.1} GB", b / (K * K * K))
+    } else if bytes >= (K * K) as i64 {
+        format!("{:.1} MB", b / (K * K))
+    } else if bytes >= K as i64 {
+        format!("{:.1} KB", b / K)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Render a "written / capacity (pct%)" progress figure the way `volume
+/// info` and every `report capacity` view show it. `bytes_written` is a
+/// DATA size (binary, [`format_bytes_binary`]); `capacity_bytes` is a
+/// CAPACITY (decimal, [`format_bytes_decimal`]) — ADR-0012 requires the two
+/// stay "named apart" rather than sharing one unit, so this deliberately
+/// prints two different unit families on one line (e.g. "2.1 GiB / 2.5 GB").
+/// That is not a bug: it is the whole point of the ruling — an operator who
+/// sees matching units here would be seeing a number that was quietly
+/// coerced to agree, exactly the failure issue #204 found live in both
+/// `volume info` and `report capacity`, which each divided the decimal
+/// `capacity_bytes` by a binary 1024^3 and printed the wrong figure as "GB".
+///
+/// The percentage itself is computed from the raw byte counts, so it is
+/// unaffected by which unit either side is displayed in.
+pub fn format_capacity_progress(bytes_written: i64, capacity_bytes: i64) -> String {
+    let pct = if capacity_bytes > 0 {
+        (bytes_written as f64 / capacity_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "{} / {} ({pct:.1}%)",
+        format_bytes_binary(bytes_written),
+        format_bytes_decimal(capacity_bytes),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +421,84 @@ mod tests {
                 .expect("write_all must not error once the limit is exhausted");
         }
         assert_eq!(w.into_inner(), Vec::<u8>::new());
+    }
+
+    // --- format_bytes_binary / format_bytes_decimal / format_capacity_progress
+    // (issue #204) --------------------------------------------------------
+
+    #[test]
+    fn binary_formatter_stays_in_bytes_below_one_kib() {
+        assert_eq!(format_bytes_binary(0), "0 B");
+        assert_eq!(format_bytes_binary(1023), "1023 B");
+    }
+
+    #[test]
+    fn binary_formatter_boundary_just_under_and_over_one_mib() {
+        assert_eq!(format_bytes_binary(1024 * 1024 - 1), "1024.0 KiB");
+        assert_eq!(format_bytes_binary(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes_binary(1024 * 1024 + 1), "1.0 MiB");
+    }
+
+    #[test]
+    fn binary_formatter_boundary_just_under_and_over_one_gib() {
+        assert_eq!(format_bytes_binary(1024 * 1024 * 1024 - 1), "1024.0 MiB");
+        assert_eq!(format_bytes_binary(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_bytes_binary(1024 * 1024 * 1024 + 1), "1.0 GiB");
+    }
+
+    #[test]
+    fn binary_formatter_reaches_tib() {
+        assert_eq!(
+            format_bytes_binary(2 * 1024 * 1024 * 1024 * 1024),
+            "2.00 TiB"
+        );
+    }
+
+    /// The class-2 regression this issue exists to prevent: a cartridge
+    /// capacity is stored DECIMAL (the generation table holds LTO-6 as
+    /// 2_500_000_000_000). Rendered through the binary formatter it would
+    /// read "2328 GiB"-scale (~7% low); through the decimal formatter it
+    /// must read back the marketed figure, "2.5 TB" — see
+    /// `cli::cartridge::run`'s `CartridgeCommands::Info` arm, whose
+    /// pre-existing `cap / (1024*1024*1024)` (line ~406, issue #204) is the
+    /// bug this helper is meant to make impossible to repeat.
+    #[test]
+    fn decimal_formatter_renders_a_stored_lto6_capacity_as_the_marketed_figure() {
+        assert_eq!(format_bytes_decimal(2_500_000_000_000), "2.50 TB");
+    }
+
+    #[test]
+    fn decimal_formatter_boundary_just_under_and_over_one_mb() {
+        assert_eq!(format_bytes_decimal(1_000_000 - 1), "1000.0 KB");
+        assert_eq!(format_bytes_decimal(1_000_000), "1.0 MB");
+        assert_eq!(format_bytes_decimal(1_000_000 + 1), "1.0 MB");
+    }
+
+    #[test]
+    fn decimal_formatter_boundary_just_under_and_over_one_gb() {
+        assert_eq!(format_bytes_decimal(1_000_000_000 - 1), "1000.0 MB");
+        assert_eq!(format_bytes_decimal(1_000_000_000), "1.0 GB");
+        assert_eq!(format_bytes_decimal(1_000_000_000 + 1), "1.0 GB");
+    }
+
+    /// The exact shape `volume info`/`report capacity` print: binary data
+    /// size on the left, decimal capacity on the right, deliberately
+    /// different unit families on one line (ADR-0012, "named apart").
+    #[test]
+    fn capacity_progress_names_the_two_sides_apart() {
+        // A near-full LTO-6: ~2.4 TiB of real bytes written against a
+        // 2.5 TB (decimal) nominal capacity.
+        let written = 2_400_000_000_000_i64; // binary side
+        let capacity = 2_500_000_000_000_i64; // decimal side, LTO-6
+        let line = format_capacity_progress(written, capacity);
+        assert!(line.contains("TiB"), "{line}");
+        assert!(line.contains("2.50 TB"), "{line}");
+        assert!(line.contains("96.0%"), "{line}");
+    }
+
+    #[test]
+    fn capacity_progress_handles_zero_capacity_without_dividing_by_zero() {
+        let line = format_capacity_progress(0, 0);
+        assert!(line.contains("0.0%"), "{line}");
     }
 }

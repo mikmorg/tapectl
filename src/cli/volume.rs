@@ -1717,15 +1717,17 @@ fn print_volume_info(info: &VolumeInfo) {
         "  Media:       {}",
         info.media_type.as_deref().unwrap_or("(unknown)")
     );
-    let pct = if info.capacity_bytes > 0 {
-        (info.bytes_written as f64 / info.capacity_bytes as f64) * 100.0
-    } else {
-        0.0
-    };
+    // Issue #204: `capacity_bytes` is decimal by ADR-0012 ruling and stored
+    // decimal (the generation table's LTO-6 = 2_500_000_000_000) — dividing
+    // it by 1024^3 and calling the result GB, as this line used to, was the
+    // same class of wrong number `cartridge info` had (an ~7% understate),
+    // not just a mislabeling. `format_capacity_progress` renders the
+    // written side binary (a measured data size) and the capacity side
+    // decimal (a marketed figure) from the shared, tested helper, so the
+    // two cannot silently converge on one wrong unit again.
     println!(
-        "  Capacity:    {} / {} GB ({pct:.1}%)",
-        info.bytes_written / (1024 * 1024 * 1024),
-        info.capacity_bytes / (1024 * 1024 * 1024),
+        "  Capacity:    {}",
+        crate::util::format_capacity_progress(info.bytes_written, info.capacity_bytes)
     );
     println!(
         "  Cartridge:   {}",
