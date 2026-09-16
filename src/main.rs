@@ -9,7 +9,17 @@ use config::{Config, TapectlPaths};
 fn main() {
     let cli = Cli::parse();
 
-    init_tracing(cli.verbose);
+    // Issue #172: peek `[logging]` before installing the subscriber, so
+    // `logging.level`/`logging.format` actually govern it instead of only
+    // ever seeing the `--verbose`-driven bootstrap default. This calls
+    // `resolve_paths` a second time (`run` below resolves it again,
+    // authoritatively) rather than threading paths through — cheap, pure,
+    // and it keeps this peek from having to also reproduce `run`'s
+    // ambiguous-`--config`-without-`--home` warning, which cannot fire yet
+    // anyway: there is no subscriber for it to reach.
+    let (paths, _) = resolve_paths(&cli);
+    let logging = peek_logging_config(&paths);
+    init_tracing(cli.verbose, &logging);
     signal::install_handler();
 
     if let Err(err) = run(cli) {
@@ -28,24 +38,104 @@ fn main() {
 /// `pipefail` — a log line on stdout would corrupt that stream for every
 /// consumer.
 ///
-/// Default level is WARN, so the existing warn!-only fixes surface without
-/// burying a command's own output; `--verbose` raises it to DEBUG (closes
-/// #3's "`--verbose` parsed but ignored").
+/// Level and format come from `logging` (issue #172: `[logging]` in
+/// config.toml, previously parsed and never read) — `--verbose` still
+/// raises the floor to DEBUG (closes #3's "`--verbose` parsed but
+/// ignored"), but never LOWERS it: `.max()` against the configured level so
+/// `logging.level = "trace"` plus `-v` stays TRACE rather than being
+/// demoted to DEBUG. `logging`'s own default reproduces the pre-#172
+/// hardcoded behaviour (WARN, tracing_subscriber's plain "full" formatter),
+/// so an install that has never touched `[logging]` sees no change here.
 ///
 /// Non-fatal by design: `try_init` (not `init`) so a failed or repeated
 /// install — e.g. this binary embedded in a future test harness that
 /// already set a subscriber — is silently ignored rather than panicking a
 /// command that would otherwise work fine.
-fn init_tracing(verbose: bool) {
+fn init_tracing(verbose: bool, logging: &config::LoggingConfig) {
+    let configured = logging.tracing_level();
     let level = if verbose {
-        tracing::Level::DEBUG
+        configured.max(tracing::Level::DEBUG)
     } else {
-        tracing::Level::WARN
+        configured
     };
-    let _ = tracing_subscriber::fmt()
+
+    let builder = tracing_subscriber::fmt()
         .with_max_level(level)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(std::io::stderr);
+
+    // Each `tracing_subscriber::fmt` formatter method returns a distinct
+    // builder type, so the four `logging.format` values each need their own
+    // `try_init()` call rather than one shared one — there is no common
+    // supertype to build once and format last. `Config::load`'s
+    // `validate_closed_sets` already rejects anything outside
+    // `config::VALID_LOG_FORMATS`, so the wildcard arm is "full" (the
+    // default) plus the bootstrap-before-any-config-file case, never a
+    // silent fallback for a typo that should have failed at load.
+    let _ = match logging.format.as_str() {
+        "compact" => builder.compact().try_init(),
+        "pretty" => builder.pretty().try_init(),
+        "json" => builder.json().try_init(),
+        _ => builder.try_init(),
+    };
+}
+
+/// Resolve `~/.tapectl` (or wherever `--home`/`--config`/`TAPECTL_HOME`
+/// point) — the precedence `run()` has always used, extracted (issue #172)
+/// so `main()` can peek `[logging]` before a tracing subscriber exists.
+///
+/// The second return value is the ambiguous "`--config` given without
+/// `--home`" warning's subject (the home it derived), for the caller that
+/// actually has a subscriber to emit it through — telling the operator
+/// where `--config` implies `--home` sits **is** this resolution, so the
+/// warning cannot itself wait for `init_tracing` to run first.
+fn resolve_paths(cli: &Cli) -> (TapectlPaths, Option<std::path::PathBuf>) {
+    if let Some(home) = cli
+        .home
+        .clone()
+        .or_else(|| std::env::var("TAPECTL_HOME").ok())
+    {
+        let mut p = TapectlPaths::new(std::path::PathBuf::from(home));
+        if let Some(ref config_path) = cli.config {
+            // Both given: --home selects the archive, --config selects the
+            // file within it. No warning — this combination is unambiguous.
+            p.config_file = std::path::PathBuf::from(config_path);
+        }
+        (p, None)
+    } else if let Some(ref config_path) = cli.config {
+        let config_file = std::path::Path::new(config_path);
+        let home = config_file
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        (TapectlPaths::new(home.clone()), Some(home))
+    } else {
+        (TapectlPaths::default_paths(), None)
+    }
+}
+
+/// Best-effort peek at `[logging]` before a subscriber exists (issue #172).
+///
+/// Reads just the `logging` table, not the full `Config` — deserializing
+/// the whole file here would mean a stale key ANYWHERE else in it (which
+/// `run()`'s `Config::load` still rejects, loudly, as the one authoritative
+/// parse) also swallows the very `logging.level = "debug"` an operator set
+/// to go diagnose that failure.
+///
+/// Never fails: a missing home, unreadable file, unparseable TOML, absent
+/// `[logging]` table, or a `[logging]` table that itself fails to
+/// deserialize all fall back to `LoggingConfig::default()` silently. That
+/// silence is intentional — this is a convenience for picking the right
+/// verbosity/format, not a second validation pass; the authoritative error
+/// for a genuinely broken config still surfaces once `run()` loads it for
+/// real.
+fn peek_logging_config(paths: &TapectlPaths) -> config::LoggingConfig {
+    std::fs::read_to_string(&paths.config_file)
+        .ok()
+        .and_then(|content| content.parse::<toml::Value>().ok())
+        .and_then(|value| value.get("logging").cloned())
+        .and_then(|logging_value| toml::to_string(&logging_value).ok())
+        .and_then(|logging_str| toml::from_str(&logging_str).ok())
+        .unwrap_or_default()
 }
 
 /// Flush stdout, then exit with `code` if it is non-zero (issue #45/H10).
@@ -76,34 +166,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // used `--config` for isolation silently starts operating on the REAL
     // ~/.tapectl, which is far worse than the surprise being fixed. So it
     // still works, and now says so; `--home` is the explicit way to mean it.
-    let paths = if let Some(home) = cli
-        .home
-        .clone()
-        .or_else(|| std::env::var("TAPECTL_HOME").ok())
-    {
-        let mut p = TapectlPaths::new(std::path::PathBuf::from(home));
-        if let Some(ref config_path) = cli.config {
-            // Both given: --home selects the archive, --config selects the
-            // file within it. No warning — this combination is unambiguous.
-            p.config_file = std::path::PathBuf::from(config_path);
-        }
-        p
-    } else if let Some(ref config_path) = cli.config {
-        let config_file = std::path::Path::new(config_path);
-        let home = config_file
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
+    //
+    // The precedence itself lives in `resolve_paths` (issue #172), shared
+    // with `main()`'s pre-subscriber `[logging]` peek; this call is what
+    // actually emits the ambiguous-`--config` warning, now that a
+    // subscriber is guaranteed to exist to receive it.
+    let (paths, ambiguous_config_home) = resolve_paths(&cli);
+    if let Some(home) = ambiguous_config_home {
         tracing::warn!(
             home = %home.display(),
             "--config given without --home: the tapectl home (database, keys, \
              catalogs, receipts) is being taken from the config file's parent \
              directory. Pass --home to say that explicitly."
         );
-        TapectlPaths::new(home)
-    } else {
-        TapectlPaths::default_paths()
-    };
+    }
 
     // Init is special — it creates everything from scratch
     if let Commands::Init {
@@ -145,6 +221,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         .context("failed to secure tapectl home directories")?;
 
     let cfg = Config::load(&paths.config_file).context("failed to load config")?;
+    // Issue #172: a real, generically useful DEBUG-level log line — proof,
+    // observable from `logging.level = "debug"` alone with no tape/write
+    // path involved, that the wired keys actually reach the subscriber
+    // `main()` built from them. See `tests/cli_smoke.rs`'s
+    // `logging_level_debug_surfaces_this_line`.
+    tracing::debug!(config = %paths.config_file.display(), "loaded config");
     let conn = db::open(&paths.db_file).context("failed to open database")?;
 
     match cli.command {
