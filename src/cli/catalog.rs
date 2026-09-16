@@ -499,6 +499,11 @@ pub fn run(
             // `backend add` yet, so the backend is optional and only names
             // the resulting volume row's `backend_name`.
             let (device, backend) = crate::config::resolve_device(config, device.as_deref())?;
+            // Issue #166: refuse before the store is opened if this drive
+            // cannot read the loaded medium. Proceeds silently with no
+            // configured backend — this is the disaster-recovery path this
+            // command exists for (ADR-0005).
+            crate::tape::media_detect::check_read_contact(config, &device)?;
             let scratch =
                 std::env::temp_dir().join(format!("tapectl-rebuild-{}", std::process::id()));
             let report = crate::volume::rebuild::rebuild_from_volume(

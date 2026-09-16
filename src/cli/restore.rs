@@ -152,6 +152,10 @@ pub fn run(
         RestoreCommands::RawVolume { device, to, from } => {
             let dest = std::path::Path::new(to);
             let device = crate::cli::read_device(config, device.as_deref())?;
+            // Issue #166: refuse before the store is opened if this drive
+            // cannot read the loaded medium. Proceeds silently with no
+            // configured backend — this is the heir/DR path, ADR-0005.
+            crate::tape::media_detect::check_read_contact(config, &device)?;
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = volume::raw::restore_raw(&mut store, dest, from.as_deref())?;
 

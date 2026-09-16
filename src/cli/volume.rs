@@ -518,6 +518,7 @@ pub fn run(
                         "passed": report.passed,
                         "failed": report.failed,
                         "mismatches": mismatches,
+                        "drive_health_note": report.drive_health_note,
                     })
                 );
             } else {
@@ -534,6 +535,10 @@ pub fn run(
                         m.actual
                     );
                 }
+                // Issue #187: said out loud, not silently omitted.
+                if let Some(note) = &report.drive_health_note {
+                    println!("note: {note}");
+                }
             }
             // issue #45/H10: a failing verify must not exit 0 — a
             // cron-scheduled integrity check that finds corruption but
@@ -543,6 +548,10 @@ pub fn run(
 
         VolumeCommands::Identify { device } => {
             let device = read_device(config, device.as_deref())?;
+            // Issue #166: refuse before the store is opened if this drive
+            // cannot read the loaded medium. Proceeds silently with no
+            // configured backend (ADR-0010's DR-path leniency).
+            crate::tape::media_detect::check_read_contact(config, &device)?;
             // Before the store open: reading the MAM opens the device
             // read-only and drops the fd, and the st driver refuses a second
             // concurrent open.
@@ -610,6 +619,9 @@ pub fn run(
 
         VolumeCommands::ReadSlices { from, unit, device } => {
             let device = read_device(config, device.as_deref())?;
+            // Issue #166: same fact check as `Identify`, before the store
+            // is opened.
+            crate::tape::media_detect::check_read_contact(config, &device)?;
             let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = write::read_slices(
@@ -716,6 +728,9 @@ pub fn run(
 
         VolumeCommands::CompactRead { label, device } => {
             let device = read_device(config, device.as_deref())?;
+            // Issue #166: same fact check as `Identify`, before the store
+            // is opened.
+            crate::tape::media_detect::check_read_contact(config, &device)?;
             let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report =
@@ -787,6 +802,9 @@ pub fn run(
             // step 2 writes, so this needs a real backend even though step 1
             // only reads.
             let device = write_device(config, device.as_deref())?;
+            // Issue #166: step 1 only reads, so it gets the same fact check
+            // as every other read path, before its store is opened.
+            crate::tape::media_detect::check_read_contact(config, &device)?;
             println!("=== Step 1: Reading live slices from \"{label}\" ===");
             // Scoped so the read-only store (and its device fd) closes
             // before step 2 opens the same device for writing — the st
@@ -2058,6 +2076,7 @@ mod tests {
             passed: 10,
             failed: 0,
             mismatches: Vec::new(),
+            drive_health_note: None,
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
     }
@@ -2069,6 +2088,7 @@ mod tests {
             passed: 9,
             failed: 1,
             mismatches: Vec::new(),
+            drive_health_note: None,
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
     }
@@ -2080,6 +2100,7 @@ mod tests {
             passed: 0,
             failed: 3,
             mismatches: Vec::new(),
+            drive_health_note: None,
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
     }

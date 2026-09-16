@@ -103,6 +103,12 @@ pub fn restore_unit(
         });
     }
 
+    // Issue #166: refuse before the store is opened if this drive cannot
+    // read the loaded medium. Proceeds silently with no configured backend
+    // or nothing detected — the DR machine with keys and no `backend add`
+    // yet (ADR-0005), same leniency as the MAM read just below.
+    crate::tape::media_detect::check_read_contact(config, device)?;
+
     // Before `TapeStore::open_read`: reading the MAM opens the device
     // read-only and drops the fd, and the st driver refuses a second
     // concurrent open. LENIENT — no configured backend yields `None`, an
