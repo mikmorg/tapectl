@@ -4951,6 +4951,197 @@ mod tests {
         );
     }
 
+    // ---- issue #199: the resumable states must keep working ----
+    //
+    // ADR-0012's dated amendment ("The write target") warns that the
+    // attached-rows check this issue adds must NOT disqualify a volume
+    // whose `writes` rows are `planned`/`in_progress`/`interrupted` --
+    // that is exactly the set `volume resume` exists to continue. Each
+    // state gets its own test, per the ruling's own instruction ("it wants
+    // a test per state rather than one aggregate test"), asserting the
+    // SPECIFIC downstream behavior for that state rather than merely "not
+    // VolumeNotWriteTarget" -- a bare negative could also pass because of
+    // an unrelated early failure.
+    //
+    // Run on UNMODIFIED code first (before #199's fix lands) to prove these
+    // three states already reach past the status guard today; they must
+    // still pass unchanged once the attached-rows check is added.
+
+    /// A `planned` row (layout validated, nothing on tape yet) must not be
+    /// treated as "this volume already holds bytes" -- `nothing_to_resume`
+    /// names it by its own specific message ("not an interrupted one"),
+    /// which only fires if `is_write_target`'s guard let the call through.
+    #[test]
+    fn volume_resume_still_targets_a_volume_with_a_planned_write() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-PLANNED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'planned')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_resume(
+            &conn,
+            &paths,
+            &config,
+            "L6-PLANNED",
+            "/nonexistent/tapectl-resume-planned-test-nst",
+            512 * 1024,
+        )
+        .unwrap_err();
+
+        assert!(
+            !matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "a `planned` row must not be refused as a non-write-target: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("planned") && msg.contains("not an interrupted one"),
+            "must reach nothing_to_resume's planned-specific message, proving it passed \
+             the write-target guard: {msg}"
+        );
+    }
+
+    /// An `in_progress` row means a live writer in another process
+    /// (`db::open`'s startup sweep is what would otherwise convert it to
+    /// `interrupted`; this test uses `open_memory`, which does not sweep,
+    /// so the row stays `in_progress` on purpose). It must still reach
+    /// `nothing_to_resume`'s own refusal for that state, not be caught by
+    /// the write-target guard.
+    #[test]
+    fn volume_resume_still_targets_a_volume_with_an_in_progress_write() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-INPROG', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'in_progress')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_resume(
+            &conn,
+            &paths,
+            &config,
+            "L6-INPROG",
+            "/nonexistent/tapectl-resume-inprogress-test-nst",
+            512 * 1024,
+        )
+        .unwrap_err();
+
+        assert!(
+            !matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "an `in_progress` row must not be refused as a non-write-target: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ANOTHER PROCESS IS WRITING THIS TAPE RIGHT NOW"),
+            "must reach nothing_to_resume's in_progress-specific message, proving it \
+             passed the write-target guard: {msg}"
+        );
+    }
+
+    /// An `interrupted` row is the one `rehydrate` actually adopts. Without
+    /// a real frozen session directory on disk this cannot rehydrate all
+    /// the way through, but it must get FAR ENOUGH to fail on the missing
+    /// `session_dir` (a `rehydrate`-internal error), not be turned away at
+    /// the write-target guard.
+    #[test]
+    fn volume_resume_still_targets_a_volume_with_an_interrupted_write() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-INTR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        // `session_dir` left NULL on purpose: `rehydrate` treats that as
+        // "predates migration 006 / cannot be resumed", which is a
+        // downstream failure distinct from the write-target guard -- the
+        // point of this test is which check reaches it first.
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_resume(
+            &conn,
+            &paths,
+            &config,
+            "L6-INTR",
+            "/nonexistent/tapectl-resume-interrupted-test-nst",
+            512 * 1024,
+        )
+        .unwrap_err();
+
+        assert!(
+            !matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "an `interrupted` row must not be refused as a non-write-target: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no recorded session directory"),
+            "must reach rehydrate's own missing-session_dir failure, proving it passed \
+             the write-target guard: {msg}"
+        );
+    }
+
     // ---- issue #166: the drive/medium refusal at every write contact ----
 
     /// `volume_write` never re-checked the drive against the medium after
