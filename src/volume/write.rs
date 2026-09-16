@@ -3075,11 +3075,12 @@ fn render_staged_selection(label: &str, units: &[BuildUnit]) -> String {
 }
 
 /// Print the announcement to stderr, so `--json` stdout stays parseable —
-/// the same rule `report_binding` states just above `volume_init`
-/// (`src/volume/write.rs:414`), not a new one. Called from `volume_write`
-/// right after the staged selection is gathered and confirmed non-empty:
-/// before backend resolution, before any MAM read, before `TapeStore::open`
-/// — before anything that touches tape or even names a drive.
+/// the same rule `report_binding`'s doc comment already states (it is
+/// `volume_init`'s post-bind reporting helper, defined just after it), not
+/// a new one. Called from `volume_write` right after the staged selection
+/// is gathered and confirmed non-empty: before backend resolution, before
+/// any MAM read, before `TapeStore::open` — before anything that touches
+/// tape or even names a drive.
 fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
     eprint!("{}", render_staged_selection(label, units));
 }
