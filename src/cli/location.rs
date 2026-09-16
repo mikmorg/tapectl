@@ -465,8 +465,10 @@ fn move_together(
 ///
 /// Takes `&Connection` so it can be called with `&tx` (a `Transaction`
 /// derefs to `Connection`) — callers must resolve the name from inside the
-/// same transaction the move runs in, never a separate `conn` read, or a
-/// concurrent rename could be read mid-move.
+/// same transaction the move runs in (ADR-0011's one-transaction property:
+/// a cartridge recorded in a new place while its volumes still claim the
+/// old one is exactly the disagreement it exists to prevent), never on a
+/// separate `conn`.
 fn resolve_location_name(conn: &Connection, location_id: Option<i64>) -> Result<Option<String>> {
     let Some(id) = location_id else {
         return Ok(None);
