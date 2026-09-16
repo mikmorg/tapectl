@@ -303,8 +303,10 @@ pub fn volume_retire(
                     retire_refusal_json(label, &impacts, &at_risk, &reason)
                 );
             } else {
+                // Impact analysis only, same as the Tier-3 path above: the
+                // refusal now carries its facts (`cli::consent`), and
+                // `main` prints it to stderr on the way out. One copy.
                 print_retire_impact(label, &status, &impacts, &at_risk);
-                println!("\n  REFUSED: {reason}");
             }
             return Err(e);
         }
@@ -1049,8 +1051,8 @@ pub fn cartridge_retire(
                 })
             );
         } else {
+            // Impact analysis only; see `volume_retire`.
             print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
-            println!("\n  REFUSED: {reason_text}");
         }
         return Err(e);
     }
