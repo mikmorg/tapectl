@@ -28,7 +28,9 @@ Nominal capacity, e.g. "2500G". Decimal, as printed on the cartridge (K=10^3 ...
 Enable verbose output
 .TP
 \fB\-\-serial\fR \fI<SERIAL>\fR
-Medium serial number (MAM), if already known — `volume init` records this itself when it auto\-registers or matches a cartridge from a loaded tape\*(Aqs MAM; set it by hand only when pre\-registering a cartridge that has not been loaded yet
+The medium serial you BELIEVE this cartridge carries, for pre\-registering one that has not been loaded yet.
+
+ADR\-0012 amendment (2026\-09\-16, issue #197): this is an unconfirmed CLAIM, stored in `operator_serial` — never the chip\*(Aqs own report. `volume init` writes the confirmed identity (`serial_number`) itself, from a real MAM read, the first time this cartridge is loaded; no operator command ever writes that column. Correct a wrong claim with `cartridge edit \-\-serial`.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip confirmation prompts

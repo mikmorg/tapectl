@@ -2,13 +2,15 @@
 .el .ds Aq '
 .TH tapectl-cartridge-edit 1  "tapectl-cartridge-edit " 
 .SH NAME
-tapectl\-cartridge\-edit \- Correct a registered cartridge\*(Aqs generation
+tapectl\-cartridge\-edit \- Correct a registered cartridge\*(Aqs generation and/or its claimed serial
 .SH SYNOPSIS
-\fBtapectl cartridge edit\fR <\fB\-\-generation\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
+\fBtapectl cartridge edit\fR [\fB\-\-generation\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-serial\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
 .SH DESCRIPTION
-Correct a registered cartridge\*(Aqs generation
+Correct a registered cartridge\*(Aqs generation and/or its claimed serial
 .PP
 ADR\-0012, *Rulings recorded as consequences*: "`cartridge edit \-\-generation` corrects a wrong generation (Tier 1: it is a fact correction, and the wrong\-medium check at the next init still applies)." Tier 1 under ADR\-0008 — no prompt, no `\-\-force`, no `\-\-yes`, and it applies to every status, `retired_permanent` included. This edits only the `cartridges` row: it never rewrites `volumes.media_type` or `volumes.capacity_bytes` (ADR\-0010 decision 3 — capacity is decided once at init and stored on the volume).
+.PP
+`\-\-serial` is a SEPARATE, independently gated correction (ADR\-0012 amendment, 2026\-09\-16; issue #197): gating is per\-flag, not per\-command, because `\-\-generation` is a fact correction (Tier 1) while `\-\-serial` is a claim about IDENTITY (Tier 2 — see `cli::consent`). It writes only `operator_serial`, never `serial_number`, which no operator command may ever touch. At least one of `\-\-generation`/`\-\-serial` must be given; both may be given in one call, and each is gated independently.
 .SH OPTIONS
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
@@ -19,6 +21,9 @@ Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
+.TP
+\fB\-\-serial\fR \fI<SERIAL>\fR
+Correct the OPERATOR\-claimed serial (never the chip\-confirmed one). Tier 2 under ADR\-0008 — gated on consent (`cli::consent::confirm`), unlike `\-\-generation` above
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
