@@ -1430,7 +1430,8 @@ mod tests {
         // Registered with no --capacity: the table figure
         // (2,500,000,000,000), never operator-set.
         register(&conn, "B001", "LTO-6", None, None).unwrap();
-        edit(&conn, "B001", "LTO-5").unwrap();
+        let outcome = cartridge_edit(&conn, "B001", "LTO-5", false).unwrap();
+        assert!(outcome.redefaulted, "JSON redefaulted must be true");
         let (_, cap, _) = stored_row(&conn, "B001");
         assert_eq!(
             cap,
@@ -1444,7 +1445,8 @@ mod tests {
         // 40000G is never the LTO-10 table figure (30 TB), so it was set
         // deliberately and must survive the edit untouched.
         register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
-        edit(&conn, "B001", "LTO-9").unwrap();
+        let outcome = cartridge_edit(&conn, "B001", "LTO-9", false).unwrap();
+        assert!(!outcome.redefaulted, "JSON redefaulted must be false");
         let (_, cap, _) = stored_row(&conn, "B001");
         assert_eq!(cap, 40_000_000_000_000);
     }
