@@ -2202,8 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_register_records_the_generation_tables_capacity_not_a_drive_override(
-    ) {
+    fn auto_register_records_the_generation_tables_capacity_not_a_drive_override() {
         // ADR-0010 decision 3's precedence ladder puts a drive
         // `capacity_override` ABOVE the cartridge row — "the drive lies, as
         // mhvtl does" — precisely so `resolve_capacity` can hand `volume
