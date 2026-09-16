@@ -15,8 +15,23 @@
 //! (`docs/design/v2-implementation-plan.md` T5b) — this is advisory, for
 //! review before committing to a stage/write run ("Emit batch manifests for
 //! review").
+//!
+//! Two different callers need two different per-tape budgets (issue #175,
+//! ADR-0012's ruling on it): `collection plan` sizes ahead of a cartridge —
+//! nothing is loaded yet, so a media generation (the drive's own, or an
+//! explicit `--generation`) is the only figure there IS
+//! (`config::LtoBackendConfig::planning_capacity_bytes`). `collection run`
+//! writes to volumes that are already `volume init`-ed, so each
+//! destination's real capacity is on its own `volumes.capacity_bytes` row
+//! (ADR-0010 decision 3: decided once at init, config never consulted for
+//! it again) — using the drive's generation there is exactly issue #175
+//! (an LTO-5 cartridge in an LTO-6 drive gets planned as a 2.5 TB batch).
+//! [`plan_for_collection`] is the first (unchanged); [`plan_for_run`] +
+//! [`destination_budget`] are the second. Both funnel through the same
+//! budget-agnostic core, [`batches_for_budget`], so the packing logic itself
+//! never has to know which kind of budget it was handed.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::{CollectionConfig, Config};
 use crate::error::{Result, TapectlError};
@@ -33,7 +48,50 @@ use super::selector::{self, Batch};
 /// `cli::volume::DEFAULT_BLOCK_SIZE`); this mirrors that.
 const BLOCK_SIZE: u64 = 512 * 1024;
 
-/// Compute one collection's batches against its resolved LTO backend capacity.
+/// The budget-agnostic core: pack one collection's pending units against an
+/// already-resolved per-tape budget in bytes. Neither the pending-unit
+/// lookup nor `selector::plan_batches`' first-fit packing cares where the
+/// budget came from — that seam is exactly what lets [`plan_for_collection`]
+/// (a media generation) and [`plan_for_run`] (a destination volume's own
+/// row) share one implementation instead of two copies that could drift.
+fn batches_for_budget(
+    conn: &Connection,
+    config: &Config,
+    lib: &CollectionConfig,
+    budget: u64,
+) -> Result<Vec<Batch>> {
+    let pending = super::fingerprint::pending_units_for_collection(
+        conn,
+        lib,
+        &config.defaults.global_excludes,
+    )?;
+    let synthetic: Vec<selector::PendingUnit> = pending
+        .iter()
+        .map(|p| selector::PendingUnit {
+            name: p.unit.name.clone(),
+            size_bytes: p.estimated_bytes,
+        })
+        .collect();
+
+    selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
+        TapectlError::Other(format!(
+            "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
+             batched (units are never split across tapes): {}",
+            lib.name,
+            oversized.len(),
+            oversized
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ))
+    })
+}
+
+/// Compute one collection's batches against its resolved LTO backend
+/// capacity — `collection plan`'s budget: a media generation, since no
+/// cartridge need be loaded to plan ahead of one. Behaviour unchanged by
+/// issue #175; `collection run` no longer calls this (see [`plan_for_run`]).
 pub fn plan_for_collection(
     conn: &Connection,
     config: &Config,
@@ -49,19 +107,6 @@ pub fn plan_for_collection(
     // asking which one was meant.
     device: Option<&str>,
 ) -> Result<Vec<Batch>> {
-    let pending = super::fingerprint::pending_units_for_collection(
-        conn,
-        lib,
-        &config.defaults.global_excludes,
-    )?;
-    let synthetic: Vec<selector::PendingUnit> = pending
-        .iter()
-        .map(|p| selector::PendingUnit {
-            name: p.unit.name.clone(),
-            size_bytes: p.estimated_bytes,
-        })
-        .collect();
-
     let backend = crate::config::resolve_lto_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
@@ -72,19 +117,125 @@ pub fn plan_for_collection(
     let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
     let budget = usable.saturating_sub(enospc_buffer);
 
-    selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
-        TapectlError::Other(format!(
-            "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
-             batched (units are never split across tapes): {}",
-            lib.name,
-            oversized.len(),
-            oversized
-                .iter()
-                .map(|o| o.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
-        ))
+    batches_for_budget(conn, config, lib, budget)
+}
+
+/// `collection run`'s per-tape budget (issue #175): resolved from the
+/// destination volumes it will actually write to, never the drive's
+/// generation — the type that replaces threading `None` through
+/// `plan_for_collection`'s `media` parameter and landing on
+/// `planning_capacity_bytes` by default.
+///
+/// `bytes` is the number `batches_for_budget` packs against. The rest is
+/// purely for `cmd_run` to explain the number to the operator (the printed
+/// line + `budget_bytes`/`budget_from` in its JSON) — it plays no part in
+/// the arithmetic.
+#[derive(Debug)]
+pub struct DestinationBudget {
+    pub bytes: u64,
+    /// The `--label` whose `capacity_bytes` is the minimum across every
+    /// label given — the binding constraint on the whole batch (see
+    /// [`destination_budget`]'s doc comment for why the minimum).
+    pub binding_label: String,
+    /// That label's own recorded `capacity_bytes`, before the
+    /// usable-capacity-factor / ENOSPC-buffer arithmetic.
+    pub binding_capacity_bytes: i64,
+    /// How many `--label` destinations were given.
+    pub num_destinations: usize,
+}
+
+/// Resolve `collection run`'s budget from the destination volumes' own
+/// `capacity_bytes` rows — the ADR-0010 authority, decided once at `volume
+/// init` from the medium actually loaded and never re-derived from config
+/// after. This must never call `planning_capacity_bytes`, which documents
+/// itself as off-limits to every write path (`config.rs`: "No write path
+/// may call this").
+///
+/// The budget is the MINIMUM `capacity_bytes` across every `--label`:
+/// `--label` repeats once per planned copy and `batch::execute_batch`
+/// stages the batch once and writes it to every label, so the only batch
+/// size that fits every copy is one sized to the smallest destination — the
+/// largest or the first-named would silently overflow a smaller one.
+///
+/// The usable-capacity factor and ENOSPC buffer still come from the DRIVE
+/// (ADR-0010, "Read paths stay usable without a configured drive": write
+/// paths "genuinely need the drive's factor, ENOSPC buffer" — only the
+/// nominal figure moves to the row), and no capacity override is re-applied
+/// here — the row already absorbed `capacity_override` at init, and
+/// re-applying it would double-count. This mirrors
+/// `volume::write::volume_write`'s own gate exactly: the same
+/// `volume_media` capacity lookup, the same `usable_bytes = nominal *
+/// usable_capacity_factor`, the same `enospc_buffer =
+/// parse_size_to_bytes(...)` (`src/volume/write.rs`, right after
+/// `resolve_lto_backend`).
+pub fn destination_budget(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    labels: &[String],
+) -> Result<DestinationBudget> {
+    if labels.is_empty() {
+        return Err(TapectlError::Other(
+            "collection run: at least one destination volume label is required \
+             (one per planned copy, via --label)"
+                .into(),
+        ));
+    }
+
+    let mut smallest: Option<(String, i64)> = None;
+    for label in labels {
+        let capacity_bytes: i64 = conn
+            .query_row(
+                "SELECT capacity_bytes FROM volumes WHERE label = ?1",
+                [label.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| TapectlError::VolumeNotFound(label.clone()))?;
+        let replace = match &smallest {
+            None => true,
+            Some((_, current)) => capacity_bytes < *current,
+        };
+        if replace {
+            smallest = Some((label.clone(), capacity_bytes));
+        }
+    }
+    // Unreachable given the empty check above (the loop runs at least
+    // once), kept rather than `.unwrap()` so a future refactor that drops
+    // that guard fails loudly instead of panicking.
+    let (binding_label, binding_capacity_bytes) = smallest.ok_or_else(|| {
+        TapectlError::Other("collection run: no destination labels given".into())
+    })?;
+
+    let backend = crate::config::resolve_lto_backend(config, Some(device))?;
+    let usable = (binding_capacity_bytes as f64 * backend.usable_capacity_factor) as u64;
+    let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
+    let bytes = usable.saturating_sub(enospc_buffer);
+
+    Ok(DestinationBudget {
+        bytes,
+        binding_label,
+        binding_capacity_bytes,
+        num_destinations: labels.len(),
     })
+}
+
+/// `collection run`'s planning entry point (issue #175). Resolves the
+/// destination-volume budget FIRST — before `batches_for_budget` ever runs
+/// `pending_units_for_collection`'s filesystem walk — so an unknown
+/// `--label` or an empty `--label` list fails immediately, long before
+/// `batch::execute_batch` stages a single unit (hours of dar + age, a
+/// tape's worth of staging disk).
+pub fn plan_for_run(
+    conn: &Connection,
+    config: &Config,
+    lib: &CollectionConfig,
+    device: &str,
+    labels: &[String],
+) -> Result<(Vec<Batch>, DestinationBudget)> {
+    let budget = destination_budget(conn, config, device, labels)?;
+    let batches = batches_for_budget(conn, config, lib, budget.bytes)?;
+    Ok((batches, budget))
 }
 
 #[cfg(test)]
