@@ -310,4 +310,156 @@ mod tests {
         assert!(after.contains("# operator note: the drive lives in the basement"));
         assert!(toml::from_str::<Config>(&after).is_ok());
     }
+
+    // ---- issue #174: `add` must refuse a second backend on the same device ----
+
+    /// Writes a starter config with one `[[backends.lto]]` entry, returning
+    /// the `TapectlPaths` `add()` needs. Not `Config::default()` serialized —
+    /// `add()` reads the file back as text (to preserve comments), so the
+    /// fixture must be a real file on disk, same as `an_empty_lto_stub_...`
+    /// above builds its TOML by hand rather than through `Config::save`.
+    fn config_with_one_backend(
+        dir: &std::path::Path,
+        existing_name: &str,
+        existing_device_tape: &str,
+    ) -> TapectlPaths {
+        let paths = TapectlPaths::new(dir.to_path_buf());
+        std::fs::write(
+            &paths.config_file,
+            format!(
+                "[dar]\nbinary = \"dar\"\n\n[[backends.lto]]\n\
+                 name = \"{existing_name}\"\ndevice_tape = \"{existing_device_tape}\"\n\
+                 device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n"
+            ),
+        )
+        .unwrap();
+        paths
+    }
+
+    /// The exact-string case: two backends configured with the identical
+    /// literal `device_tape`, no filesystem canonicalization required at
+    /// all. The plainest instance of the defect and the floor the
+    /// canonicalizing cases must still clear.
+    #[test]
+    fn add_refuses_a_second_backend_on_the_identical_device_tape_string() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = config_with_one_backend(tmp.path(), "drive-a", "/dev/nst0");
+
+        let err = add(
+            &paths, "drive-b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None, false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("drive-a"), "{msg}");
+        assert!(msg.contains("/dev/nst0"), "{msg}");
+
+        // And the file must be untouched — a rejected add is not a partial one.
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert_eq!(reloaded.backends.lto.len(), 1);
+    }
+
+    /// The case the issue is actually about: an existing backend registered
+    /// by its `/dev/nstN` target, a second `add` naming the same drive by a
+    /// by-id symlink to that target. A pure string compare would miss this
+    /// — CLAUDE.md tells operators to use by-id paths while `lsscsi`/`mt`
+    /// print `/dev/nstN`, so this exact mismatch is the one they will hit.
+    #[test]
+    fn add_refuses_a_by_id_alias_of_an_already_configured_nst_device() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("nst0");
+        std::fs::File::create(&real).unwrap();
+        let by_id = tmp.path().join("scsi-XYZZY-nst");
+        std::os::unix::fs::symlink(&real, &by_id).unwrap();
+
+        let paths = config_with_one_backend(tmp.path(), "drive-a", real.to_str().unwrap());
+
+        let err = add(
+            &paths,
+            "drive-b",
+            by_id.to_str().unwrap(),
+            "/dev/sg1",
+            "LTO-6",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("drive-a"), "{err}");
+    }
+
+    /// The reverse direction: the existing backend is registered by the
+    /// by-id symlink, and the new `add` is attempted with the `/dev/nstN`
+    /// target it resolves to.
+    #[test]
+    fn add_refuses_the_nst_target_of_an_already_configured_by_id_device() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("nst0");
+        std::fs::File::create(&real).unwrap();
+        let by_id = tmp.path().join("scsi-XYZZY-nst");
+        std::os::unix::fs::symlink(&real, &by_id).unwrap();
+
+        let paths = config_with_one_backend(tmp.path(), "drive-a", by_id.to_str().unwrap());
+
+        let err = add(
+            &paths,
+            "drive-b",
+            real.to_str().unwrap(),
+            "/dev/sg1",
+            "LTO-6",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("drive-a"), "{err}");
+    }
+
+    /// A genuinely different device must still be addable — this is a
+    /// uniqueness check, not a one-backend-only limiter.
+    #[test]
+    fn add_still_accepts_a_second_backend_on_a_distinct_device() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let other = tmp.path().join("nst1");
+        std::fs::File::create(&other).unwrap();
+        let paths = config_with_one_backend(tmp.path(), "drive-a", "/dev/nst0");
+
+        add(
+            &paths,
+            "drive-b",
+            other.to_str().unwrap(),
+            "/dev/sg1",
+            "LTO-6",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert_eq!(reloaded.backends.lto.len(), 2);
+    }
+
+    /// A backend for a device that does not exist yet (a detached drive) is
+    /// legitimate and must not be rejected by canonicalization failing —
+    /// only an actual match against an existing entry refuses.
+    #[test]
+    fn add_accepts_a_nonexistent_device_distinct_from_the_existing_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = config_with_one_backend(tmp.path(), "drive-a", "/dev/nst0");
+
+        add(
+            &paths,
+            "drive-b",
+            "/dev/this-drive-is-not-plugged-in",
+            "/dev/sg1",
+            "LTO-6",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert_eq!(reloaded.backends.lto.len(), 2);
+    }
 }
