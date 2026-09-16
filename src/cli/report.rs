@@ -1385,7 +1385,11 @@ fn event_line(
         // "(none)" is the rendering for an absent side — an entity that was
         // in no location before this move reads as a real transition rather
         // than as a missing word.
-        (o, n) => format!(": {} \u{2192} {}", o.unwrap_or("(none)"), n.unwrap_or("(none)")),
+        (o, n) => format!(
+            ": {} \u{2192} {}",
+            o.unwrap_or("(none)"),
+            n.unwrap_or("(none)")
+        ),
     };
     format!("{ts} {etype}/{label_str} {action}{field_str}{change}")
 }
@@ -1447,7 +1451,15 @@ fn report_events(
         for (ts, etype, label, action, field, old, new) in &rows {
             println!(
                 "  {}",
-                event_line(ts, etype, label.as_deref(), action, field.as_deref(), old.as_deref(), new.as_deref())
+                event_line(
+                    ts,
+                    etype,
+                    label.as_deref(),
+                    action,
+                    field.as_deref(),
+                    old.as_deref(),
+                    new.as_deref()
+                )
             );
         }
     }
@@ -2564,8 +2576,7 @@ Write error counter page [0x2]
             Some("bank"),
         );
         assert_eq!(
-            line,
-            "2026-09-16 12:00:00 cartridge/A001L6 moved.location: home \u{2192} bank",
+            line, "2026-09-16 12:00:00 cartridge/A001L6 moved.location: home \u{2192} bank",
             "a reader must be able to see what the location changed from, \
              which is the whole point of ADR-0012's names-on-both-sides rule"
         );
