@@ -951,6 +951,13 @@ and plans that tape against that generation's capacity — 1.5 TB for LTO-5,
 remember. If you load media the drive cannot write, `volume init` refuses
 before touching the tape, and no `--force` overrides it.
 
+`first-run.sh` fills `generation` in from the drive's own INQUIRY product
+identification — never from whatever cartridge happens to be loaded, which is a
+fact about that tape and not about the drive. If it is ever wrong (you moved
+the config to a different drive, or declared it by hand), the refusal above
+names the `[[backends.lto]]` block to fix: there is no `backend edit`, so edit
+`generation` in config.toml and run `tapectl config check`.
+
 ## Key Management
 
 ```bash
@@ -1091,6 +1098,17 @@ What comes back, and from where:
 | volume identity, media, capacity | the ID thunk (tape file 0) |
 | units, snapshots, slice map, plaintext hashes | each envelope's `MANIFEST.toml` |
 | tenant ownership, escrow receipts, the per-file index | the operator envelope's `catalog.db` (tapes written after 2026-09-11); older tapes give ownership from the tenant envelopes and no receipt |
+| which cartridge this is, and the volume bound to it | File 0's `[media]` table — the chip serial when `cartridge_identity_source = "mam"`, the barcode you typed when `"operator"` |
+
+**Cartridge identity comes back too, but only as far as the tape can prove it.**
+A rebuild registers the cartridge and records the mount, so `cartridge list`,
+`cartridge move` and `cartridge retire` work on a recovered tape instead of
+reporting "not found". What it will *not* do is guess: a File 0 that names a
+barcode rather than a chip serial proves only that somebody typed that label,
+so a rebuild refuses to displace a live volume on that evidence — retire the
+volume, or `cartridge mark-erased` it, and run the rebuild again. A tape older
+than this field binds nothing and says so in the report; a later run that can
+read the drive's serial finishes the job.
 
 **Escrow coverage on rebuilt rows.** A tape written after 2026-09-11 carries
 each stage set's recipient list, so its rebuilt rows are covered like any
