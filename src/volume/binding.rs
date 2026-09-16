@@ -55,10 +55,18 @@
 //! - [`corroborate_contact`]: at every LATER contact, two KNOWN identities
 //!   that disagree — the medium's, the bound row's, File 0's, the volume
 //!   named on the command line — mean the wrong tape is loaded (ADR-0012,
-//!   issue #193). This is the only one of the five that also WRITES: a bound
+//!   issue #193). This is the only one of the six that also WRITES: a bound
 //!   row with no serial learns one, once.
+//! - [`refuse_rebind`]: `cartridge_volumes` carries `UNIQUE(volume_id)`, so a
+//!   binding is permanent once its mount is closed (ADR-0012's closing
+//!   ruling) — a later contact whose medium resolves to a DIFFERENT,
+//!   already-registered cartridge is refused, naming both. Called from
+//!   [`mount_and_record`] ITSELF, immediately before its `INSERT`, so it
+//!   guards every writer of `cartridge_volumes` — `volume init`, `volume
+//!   write`'s late binding, `catalog rebuild` — from one place rather than
+//!   one call site (issue #162).
 //!
-//! None of the five takes a `force`, structurally.
+//! None of the six takes a `force`, structurally.
 //!
 //! The last one is where this module stops being only about `volume init`.
 //! Everything above `corroborate_contact` ESTABLISHES a binding; everything
