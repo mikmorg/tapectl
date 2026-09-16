@@ -793,6 +793,13 @@ mod tests {
     /// JSON — that quirk is part of the pinned contract, not a bug this
     /// task fixes.
     #[test]
+    /// This pins the JSON SHAPE — key names, key ordering, null handling —
+    /// and nothing else. It feeds `size` in as a literal, so the humaniser is
+    /// never called and this test cannot catch a unit change; the formatter
+    /// itself is pinned in `crate::util`. The literal moved `KB` -> `KiB` with
+    /// issue #204 only so the fixture stops modelling output the code no
+    /// longer produces. Do not add a unit assertion here: put it on the
+    /// formatter, where it can actually fail.
     fn pin_file_rows_json_shape() {
         let rows = vec![
             FileRow {
@@ -803,7 +810,7 @@ mod tests {
             },
             FileRow {
                 path: "  some/file.txt".to_string(),
-                size: "1.2 KB".to_string(),
+                size: "1.2 KiB".to_string(),
                 modified: None,
                 sha256: "0123456789ab...".to_string(),
             },
@@ -811,7 +818,7 @@ mod tests {
         let value = file_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"modified":"2026-01-01T00:00:00Z","path":"d subdir","sha256":"(unstaged)","size":"-"},{"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KB"}]"#
+            r#"[{"modified":"2026-01-01T00:00:00Z","path":"d subdir","sha256":"(unstaged)","size":"-"},{"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KiB"}]"#
         );
     }
 
