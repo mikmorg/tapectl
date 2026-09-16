@@ -570,6 +570,71 @@ fn resolve_or_register_cartridge(
     }
 }
 
+/// Refuse to (re-)bind `volume_id` to `cartridge_id` when it is already,
+/// permanently, bound to a DIFFERENT cartridge (ADR-0012, issue #162).
+///
+/// `cartridge_volumes` carries `UNIQUE(volume_id)`: a volume gets at most one
+/// row for its whole life, open or closed. ADR-0012's closing sentence —
+/// "a binding is permanent once its mount is closed" — makes that row's
+/// cartridge a FACT once the mount exists, not a risk to accept. So,
+/// structurally like [`refuse_retired`], [`require_named_cartridge`] and
+/// [`refuse_unwitnessed_displacement`], this takes **no `force` parameter at
+/// all**:
+///
+/// - no open mount for `volume_id` → `Ok(())`: nothing to conflict with, the
+///   ordinary first bind.
+/// - an open mount naming `cartridge_id` itself → `Ok(())`: a genuine
+///   no-op — the same pair, re-asserted, which every caller below relies on
+///   for an idempotent re-run.
+/// - an open mount naming a DIFFERENT cartridge → `Err`, naming both
+///   barcodes and the volume's label.
+///
+/// Compares `cartridge_id`s, never barcodes — a barcode is a relabelable
+/// sticker (ADR-0012), the row id is the identity.
+///
+/// Called from [`mount_and_record`] immediately before its `INSERT`, so
+/// every writer of `cartridge_volumes` — `volume init` (via
+/// [`bind_cartridge`]), `volume write`'s late binding, and `catalog
+/// rebuild` — gets the same refusal from the same place.
+pub(crate) fn refuse_rebind(conn: &Connection, volume_id: i64, cartridge_id: i64) -> Result<()> {
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT c.id, c.barcode
+             FROM cartridge_volumes cv
+             JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![volume_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((existing_id, existing_barcode)) = existing else {
+        return Ok(());
+    };
+    if existing_id == cartridge_id {
+        return Ok(());
+    }
+    let new_barcode: String = conn.query_row(
+        "SELECT barcode FROM cartridges WHERE id = ?1",
+        params![cartridge_id],
+        |r| r.get(0),
+    )?;
+    let label: String = conn.query_row(
+        "SELECT label FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    Err(TapectlError::Other(format!(
+        "volume \"{label}\" is already bound to cartridge \"{existing_barcode}\", but this \
+         contact resolves to cartridge \"{new_barcode}\". A binding is permanent once its \
+         mount is closed (ADR-0012) — there is no --force for this; it is a fact tapectl \
+         cannot resolve on its own, not a risk to accept. If \"{new_barcode}\" and \
+         \"{existing_barcode}\" are the same physical cartridge registered twice, resolve \
+         that by hand; if \"{existing_barcode}\"'s data is in fact gone, say so first \
+         (`tapectl volume retire {label}` or `tapectl cartridge mark-erased \
+         {existing_barcode}`)."
+    )))
+}
+
 /// Mount `volume_id` onto `cartridge_id` and record everything that follows
 /// from that: recording (never refusing) whatever it displaces, the
 /// `cartridge_volumes` mount itself, ADR-0011 location inheritance, and the
@@ -697,15 +762,32 @@ pub(crate) fn mount_and_record(
     // serial is readable), so a late binding is always 'mam' — which is
     // exactly right: it exists only because a serial became readable.
     //
-    // The `OR IGNORE` is left alone deliberately. That a re-bind of the same
-    // pair is silently dropped is a real defect, but it is issue #162's, not
-    // this change's.
+    // `refuse_rebind` (issue #162) runs BEFORE the insert: a volume already
+    // bound to a DIFFERENT cartridge is refused loudly rather than silently
+    // dropped. Once that check stands, the only way an open mount for
+    // `volume_id` can still exist here is a re-assertion of THIS SAME
+    // cartridge — a genuine no-op, skipped below rather than re-inserted
+    // (inserting it again would still violate `UNIQUE(volume_id)`). With
+    // both cases handled above the `INSERT`, a UNIQUE violation on it is a
+    // bug, not an expected outcome, so it is a plain `INSERT` — no
+    // `OR IGNORE`.
+    refuse_rebind(conn, volume_id, cartridge_id)?;
+    let already_mounted: bool = conn
+        .query_row(
+            "SELECT 1 FROM cartridge_volumes WHERE volume_id = ?1 AND unmounted_at IS NULL",
+            params![volume_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
     let identity_source = if serial.is_some() { "mam" } else { "operator" };
-    conn.execute(
-        "INSERT OR IGNORE INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
-         VALUES (?1, ?2, ?3)",
-        params![cartridge_id, volume_id, identity_source],
-    )?;
+    if !already_mounted {
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+             VALUES (?1, ?2, ?3)",
+            params![cartridge_id, volume_id, identity_source],
+        )?;
+    }
 
     // ADR-0011 promises that a cartridge's place and its volumes' places
     // "cannot disagree", and reasons about `cartridge move` and `volume move`
@@ -2711,6 +2793,58 @@ mod tests {
         // the refused call must not touch it.
         assert_eq!(open_mounts(&conn, cart_a), vec![vol]);
         assert!(open_mounts(&conn, cart_b).is_empty());
+    }
+
+    /// The benign twin of the test above: re-asserting the SAME cartridge
+    /// must still succeed (every caller below relies on this for an
+    /// idempotent re-run) and must leave exactly one open mount row — not a
+    /// second one, which `UNIQUE(volume_id)` would refuse anyway.
+    #[test]
+    fn a_rebind_to_the_same_cartridge_succeeds_and_stays_one_row() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let cart_a = lookup_cartridge(&conn, Some("SER-1"), None)
+            .unwrap()
+            .row
+            .unwrap()
+            .id;
+        let vol = new_volume(&conn, "L6-0001");
+
+        mount_and_record(
+            &conn,
+            vol,
+            cart_a,
+            "BC001",
+            "available",
+            Some("SER-1"),
+            &MamInfo::default(),
+            "volume init",
+            true,
+        )
+        .unwrap();
+
+        mount_and_record(
+            &conn,
+            vol,
+            cart_a,
+            "BC001",
+            "in_use",
+            Some("SER-1"),
+            &MamInfo::default(),
+            "volume init",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(open_mounts(&conn, cart_a), vec![vol]);
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cartridge_volumes WHERE volume_id = ?1",
+                params![vol],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "a same-cartridge re-bind must not add a second row");
     }
 
     /// ── ADR-0012 corroboration, one test per branch (issue #193) ────────
