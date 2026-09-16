@@ -580,9 +580,20 @@ step_resume_restore() {
 echo "gate: leg 4 — interrupt + resume (volume resume, issue #93)"
 check resume_bot        step_resume_bot
 check resume_midwrite   step_resume_midwrite
-check resume_after_crash step_resume_after_crash
+# ORDER MATTERS, and it did not used to (issue #164/#193). resume_verify and
+# resume_restore both target RLABEL2, but step_resume_after_crash ERASES the
+# cartridge and writes RLABEL3 over it -- so when the crash arm ran first,
+# these two were pointed at a volume whose bytes were no longer on the tape.
+# They passed anyway, for a reason that flatters nobody: the gate stages once
+# and writes the same staged slices to every arm, so RLABEL2 and RLABEL3 hold
+# BYTE-IDENTICAL ciphertext at identical positions, and a verify that never
+# checked which tape was loaded could not tell them apart. That is precisely
+# the defect issue #164 describes -- "records a passed verification for the
+# wrong volume" -- and the gate was depending on it. Corroboration at contact
+# now refuses, correctly, so these run while RLABEL2 is still the loaded tape.
 check resume_verify     step_resume_verify
 check resume_restore    step_resume_restore
+check resume_after_crash step_resume_after_crash
 
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
