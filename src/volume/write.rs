@@ -5303,7 +5303,14 @@ mod tests {
             .unwrap();
             let err = call(&conn, vol_id, &det_with_serial(Some("SER-1")))
                 .expect_err("a retired_permanent cartridge must never be written");
-            assert!(err.to_string().contains("mark-erased"), "got: {err}");
+            // `unretire`, not `mark-erased` (issue #163): the way back from
+            // retired_permanent is the operator correcting a claim about the
+            // MEDIUM, not declaring the bytes gone. This assertion is the
+            // reason the string matters — it is the late-binding twin of
+            // `binding::tests::a_retired_permanent_cartridge_is_refused`, and
+            // both must name the same escape or the two contact points would
+            // tell an operator different things.
+            assert!(err.to_string().contains("unretire"), "got: {err}");
             assert_eq!(bound_barcode(&conn, vol_id), None);
         }
 
