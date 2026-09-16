@@ -904,14 +904,38 @@ pub(crate) mod tests {
             "sealed",
             "quarantined",
         ];
+
+        // Pull the literal set out of `CHECK(status IN (...))` and pin it
+        // against `statuses` by SET EQUALITY, not mere containment -- a
+        // one-directional "does each of my nine appear somewhere in the
+        // file" check would keep passing after a tenth status was added to
+        // the CHECK and never classified here, which is exactly the drift
+        // this pin exists to catch.
+        let marker = "CHECK(status IN (";
+        let start = LIFECYCLE_SQL
+            .find(marker)
+            .expect("003_v2_lifecycle.sql must still define the status CHECK")
+            + marker.len();
+        let end = LIFECYCLE_SQL[start..]
+            .find(')')
+            .expect("the status CHECK must close its IN (...) list")
+            + start;
+        let mut schema_statuses: Vec<&str> = LIFECYCLE_SQL[start..end]
+            .split(',')
+            .map(|s| s.trim().trim_matches('\''))
+            .collect();
+        schema_statuses.sort_unstable();
+        let mut pinned_statuses: Vec<&str> = statuses.to_vec();
+        pinned_statuses.sort_unstable();
+        assert_eq!(
+            schema_statuses, pinned_statuses,
+            "the `volumes.status` CHECK in db/migrations/003_v2_lifecycle.sql no \
+             longer matches the set `is_write_target_admits_exactly_initialized` \
+             classifies -- a status was added or removed without updating \
+             is_write_target (and this test) to account for it"
+        );
+
         for status in statuses {
-            assert!(
-                LIFECYCLE_SQL.contains(&format!("'{status}'")),
-                "status {status:?} is pinned here as part of the classified set but no \
-                 longer appears in the `volumes.status` CHECK constraint \
-                 (db/migrations/003_v2_lifecycle.sql) — the status set moved and this \
-                 pin must be updated with it"
-            );
             let expected = status == "initialized";
             assert_eq!(
                 is_write_target(status),
