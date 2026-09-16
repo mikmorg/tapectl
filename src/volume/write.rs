@@ -4373,9 +4373,7 @@ mod tests {
                     assert_eq!(label, "L6-STATUS", "status {status}");
                     assert_eq!(got_status, status, "status {status}");
                 }
-                other => panic!(
-                    "status {status}: expected VolumeNotWriteTarget, got: {other:?}"
-                ),
+                other => panic!("status {status}: expected VolumeNotWriteTarget, got: {other:?}"),
             }
             let msg = err.to_string();
             assert!(
@@ -4525,7 +4523,10 @@ mod tests {
             !msg.contains("nothing to resume"),
             "must be refused by status, not fall through to nothing_to_resume: {msg}"
         );
-        assert!(msg.contains("ADR-0012"), "message must cite ADR-0012: {msg}");
+        assert!(
+            msg.contains("ADR-0012"),
+            "message must cite ADR-0012: {msg}"
+        );
 
         let write_status: String = conn
             .query_row(
