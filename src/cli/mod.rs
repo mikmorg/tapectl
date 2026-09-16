@@ -208,8 +208,11 @@ pub enum Commands {
         /// Capacity (e.g., "2500G"). Decimal, as printed on the cartridge
         /// (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
         /// `slice_size`/`enospc_buffer` use.
-        #[arg(long, default_value = "2500G")]
-        capacity: String,
+        ///
+        /// Defaults to the generation table's native capacity for
+        /// `--generation` when omitted (ADR-0010, decision 3).
+        #[arg(long)]
+        capacity: Option<String>,
         /// Which configured drive this volume belongs to, by its device path
         /// (ADR-0010). Only needed when more than one `[[backends.lto]]` is
         /// configured — with one drive, or none, the behaviour is unchanged.

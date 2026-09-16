@@ -327,7 +327,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 label,
                 backend,
                 generation,
-                capacity,
+                capacity.as_deref(),
                 device.as_deref(),
                 notes.as_deref(),
                 cli.json,
