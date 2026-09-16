@@ -10,6 +10,7 @@ pub mod decorative;
 pub mod depth_check;
 pub mod escrow;
 pub mod evidence;
+pub mod lenient_config;
 pub mod reclaimable;
 pub mod shadowing;
 pub mod subsumed;
