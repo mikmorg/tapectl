@@ -77,11 +77,23 @@ volume + started_at, driven as a unit; `write_positions` rows are the cursor):
 | Failed | `failed` | Store error other than EOT/interrupt (device gone, I/O error) with no transition available. Terminal unless operator retries → new validation → resume semantics. |
 
 Volume status: migration 003 adds **`sealed`** and **`quarantined`** to
-`volumes.status`. Lifecycle: `blank → initialized → active` (unsealed, a
-session has written bytes) `→ sealed` (confirm passed; ADR-0003: never written
-again) or `→ quarantined` (divergence at contact, ADR-0001). Legacy `full` is
-read as sealed-equivalent for pre-renovation test volumes; new code writes
-`sealed`. Only `sealed` volumes contribute copies (ADR-0004).
+`volumes.status`. Lifecycle as the code actually walks it: `volume init`
+inserts `initialized`, and the row stays there for the whole write session —
+**no code makes an `initialized → active` transition.** Session progress lives
+entirely in `writes.status` (the table above), never in `volumes.status`. From
+`initialized` the row moves `→ sealed` (confirm passed; ADR-0003: never written
+again), `→ quarantined` (divergence at contact, ADR-0001), or `→ erased` when a
+re-initialised cartridge displaces it (ADR-0010).
+
+`active` and `full` are read-only holdovers: `active` is written only by
+`tapectl import`, describing a tape written elsewhere, and `full` is the
+pre-renovation sealed-equivalent for legacy volumes. This write path produces
+neither. `blank` and `missing` are schema-legal with no writer at all.
+
+ADR-0012: `initialized` is the only status `volume write` and `volume resume`
+may target. Every other status is refused by status, before either command does
+anything else, and no flag overrides it. Only `sealed` volumes contribute
+copies (ADR-0004).
 
 The retry-vs-UNIQUE fact: `writes` has `UNIQUE(stage_set_id, volume_id)` —
 **resume reuses the existing rows**; it never inserts. (This is the H3 raw
