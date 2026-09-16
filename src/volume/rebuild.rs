@@ -105,6 +105,18 @@ pub struct RebuildReport {
     /// Units whose tenant could not be read from any tenant envelope on this
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
+    /// Set (to the status found) when this label already had a `volumes` row
+    /// and that row's status was not `sealed` — an imported `active` row, or
+    /// a `quarantined` one a failed `volume verify` produced on purpose.
+    /// `None` when the row was freshly inserted here (always `sealed`, see
+    /// `insert_all`) or was already `sealed`.
+    ///
+    /// This is report-only (issue #158): the rebuild proved the tape
+    /// readable and complete, but it never edits a row it merely finds — see
+    /// this module's "What it deliberately does not do". Overwriting a
+    /// status an operator established on purpose would destroy a fact,
+    /// not a mistake, so the fix is to surface the mismatch, not repair it.
+    pub volume_status_mismatch: Option<String>,
 }
 
 impl RebuildReport {
@@ -648,12 +660,27 @@ fn insert_all(
     // back to the type string — never an invented name like "rebuilt", which
     // would put a backend in the catalog that no config declares.
     let backend_name = backend_name.unwrap_or("lto");
-    let volume_id = match existing_id(
-        tx,
-        "SELECT id FROM volumes WHERE label = ?1",
-        params![label],
-    )? {
-        Some(id) => id,
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, status FROM volumes WHERE label = ?1",
+            params![label],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let volume_id = match existing {
+        Some((id, status)) => {
+            // Same tape, same evidence — but a row this rebuild merely
+            // FOUND is never edited (issue #158). `sealed` is what the
+            // `None` arm below would have inserted, so anything else is a
+            // fact worth surfacing: an imported `active` row, or a
+            // `quarantined` one a failed `volume verify` produced on
+            // purpose. Reported, not repaired — see `RebuildReport::
+            // volume_status_mismatch`.
+            if status != "sealed" {
+                report.volume_status_mismatch = Some(status);
+            }
+            id
+        }
         None => {
             tx.execute(
                 "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
