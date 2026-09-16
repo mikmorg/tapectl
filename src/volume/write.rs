@@ -3076,8 +3076,8 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
 /// that design is not changed here).
 ///
 /// Deliberately follows `volume plan`'s existing wording
-/// (`cli::volume::VolumeCommands::Plan`, the "`{name} v{ver}: N slices, N MB`"
-/// row and the "`total: N slices, N MB`" summary) rather than inventing a
+/// (`cli::volume::VolumeCommands::Plan`, the "`{name} v{ver}: N slices, <size>`"
+/// row and the "`total: N slices, <size>`" summary) rather than inventing a
 /// second vocabulary. It drops Plan's trailing "x {copies}" term: `volume
 /// write` always writes exactly the one physical volume already named on the
 /// command line, never a copy count. Matches Plan's row shape exactly,
@@ -3098,15 +3098,15 @@ fn render_staged_selection(label: &str, units: &[BuildUnit]) -> String {
         total_slices += slices;
         total_bytes += bytes;
         out.push_str(&format!(
-            "  {} v{}: {slices} slices, {} MB\n",
+            "  {} v{}: {slices} slices, {}\n",
             u.unit_name,
             u.snapshot_version,
-            bytes / (1024 * 1024),
+            crate::util::format_bytes_binary(bytes),
         ));
     }
     out.push_str(&format!(
-        "\ntotal: {total_slices} slices, {} MB\n",
-        total_bytes / (1024 * 1024),
+        "\ntotal: {total_slices} slices, {}\n",
+        crate::util::format_bytes_binary(total_bytes),
     ));
     out
 }
@@ -4948,10 +4948,10 @@ mod tests {
         assert_eq!(
             rendered,
             "about to write to volume \"VOL-F\":\n\
-             \x20\x20alpha-collection v3: 2 slices, 80 MB\n\
-             \x20\x20zeta-notes v1: 1 slices, 5 MB\n\
+             \x20\x20alpha-collection v3: 2 slices, 80.0 MiB\n\
+             \x20\x20zeta-notes v1: 1 slices, 5.0 MiB\n\
              \n\
-             total: 3 slices, 85 MB\n"
+             total: 3 slices, 85.0 MiB\n"
         );
     }
 
@@ -4989,9 +4989,9 @@ mod tests {
         assert_eq!(
             rendered,
             "about to write to volume \"VOL-SOLO\":\n\
-             \x20\x20solo v1: 1 slices, 1 MB\n\
+             \x20\x20solo v1: 1 slices, 1.0 MiB\n\
              \n\
-             total: 1 slices, 1 MB\n"
+             total: 1 slices, 1.0 MiB\n"
         );
         assert!(
             !rendered.contains("1 units"),

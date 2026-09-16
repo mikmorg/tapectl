@@ -494,7 +494,11 @@ pub fn run(
                     location.as_deref().unwrap_or("(not placed)")
                 );
                 println!("  Loads:    {}", display_opt_i64(&loads));
-                println!("  Capacity: {} GB", cap / (1024 * 1024 * 1024));
+                // Decimal: a cartridge capacity is what the box says (ADR-0012).
+                // This divided by 1024^3 and called it GB, so `cartridge info`
+                // reported a 2.5 TB cartridge as 2328 GB — a wrong number, not
+                // just a wrong label (issue #204, class 2).
+                println!("  Capacity: {}", crate::util::format_bytes_decimal(cap));
                 println!("  Created:  {created}");
                 if let Some(n) = &notes {
                     println!("  Notes:    {n}");

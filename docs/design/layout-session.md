@@ -95,6 +95,21 @@ may target. Every other status is refused by status, before either command does
 anything else, and no flag overrides it. Only `sealed` volumes contribute
 copies (ADR-0004).
 
+**Status is necessary but no longer sufficient** (ADR-0012 amendment
+2026-09-16, issue #199). An `initialized` volume that already carries a
+`completed` `writes` row is also refused, because the real question is *does
+this volume hold bytes we know about?* and status only approximates it. The two
+coexist only where a `catalog rebuild` attached a tape's contents to a
+pre-existing `initialized` row — #158 deliberately leaves an existing row's
+status alone, so without this second guard the catalog would call a rebuilt
+tape a write target. The refusal names the volume rather than its status, since
+the status is genuinely still `initialized` and saying so would read as a
+contradiction.
+
+This does not change what resume may target: `planned`, `in_progress` and
+`interrupted` rows are the resumable set and still pass, which is the whole
+distinction the guard has to get right.
+
 The retry-vs-UNIQUE fact: `writes` has `UNIQUE(stage_set_id, volume_id)` —
 **resume reuses the existing rows**; it never inserts. (This is the H3 raw
 constraint error, fixed structurally.)
