@@ -16,7 +16,7 @@ Collection name
 Output in JSON format
 .TP
 \fB\-\-batch\fR \fI<BATCH>\fR [default: 0]
-Which batch from `collection plan`\*(Aqs ordering to execute (0 = first)
+Which batch to execute (0 = first). Numbered against THIS run\*(Aqs own budget — the destination `\-\-label` volumes\*(Aq recorded capacity (issue #175), not the drive\*(Aqs generation. This matches `collection plan`\*(Aqs ordering only when `plan` was run (`\-\-generation <GEN>`) for the generation those volumes were actually initialised as; otherwise the batch reviewed in `plan` is not necessarily batch N here
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
