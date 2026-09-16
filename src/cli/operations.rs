@@ -329,10 +329,10 @@ pub fn volume_retire(
 ///   is provisioned and holds no bytes, and `volume init` binds a
 ///   `pending_erase` cartridge without consent anyway, so this costs nothing
 ///   and reopening the tape for reuse is the point).
-/// - **The cartridge is `retired_permanent`.** ADR-0011 is explicit that
-///   `cartridge mark-erased` is its only exit — "the operator saying they
-///   were wrong". Retiring a volume is not that statement, and must not
-///   quietly undo a condemnation.
+/// - **The cartridge is `retired_permanent`.** `cartridge unretire` is its
+///   only exit (ADR-0011, corrected 2026-09-14) — "the operator saying they
+///   were wrong about the medium". Retiring a volume is not that statement,
+///   and must not quietly undo a condemnation.
 /// - **The cartridge is already `available` or `pending_erase`.** Nothing to
 ///   do; both already mean "not holding live data".
 ///
@@ -4273,10 +4273,10 @@ mod tests {
             assert_eq!(cartridge_status(&conn, cart_id), "pending_erase");
         }
 
-        /// ADR-0011 is explicit that `cartridge mark-erased` is the ONLY
-        /// exit from `retired_permanent` — "the operator saying they were
-        /// wrong". Retiring a volume is not that statement and must not
-        /// quietly undo a condemnation.
+        /// `cartridge unretire` is the ONLY exit from `retired_permanent`
+        /// (ADR-0011, corrected 2026-09-14) — "the operator saying they
+        /// were wrong about the medium". Retiring a volume is not that
+        /// statement and must not quietly undo a condemnation.
         #[test]
         fn a_retired_permanent_cartridge_is_never_reopened() {
             let (conn, cart_id, _) = setup();
@@ -4869,11 +4869,14 @@ mod tests {
             assert_eq!(facts.len(), 1);
         }
 
-        /// End-to-end through the real gate: `cartridge_mark_erased`'s
-        /// non-interactive refusal (no `--force`/`--yes`) must still carry
-        /// the volume label in ITS message, since `cli::consent::confirm`
-        /// echoes `action`, not `facts`, into the refusal text it returns
-        /// -- proving the wiring, not just the pure builder above.
+        /// End-to-end through the real gate, not just the pure builder
+        /// above: a non-interactive refusal (no `--force`/`--yes`) still
+        /// names the cartridge in its message. `cli::consent::confirm`
+        /// echoes `action` (which names the cartridge), not `facts` (which
+        /// names the volumes), into the refusal text it returns -- the
+        /// volume-naming fix lives in what an interactive operator is
+        /// shown before answering, proven by
+        /// `mark_erased_consent_facts_name_each_volume_by_label` above.
         #[test]
         fn refusal_message_names_the_cartridge_being_marked_erased() {
             let (conn, _cart_id, _vol_id) = setup_cartridge("in_use", true);
