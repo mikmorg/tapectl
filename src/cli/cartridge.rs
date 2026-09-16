@@ -489,7 +489,15 @@ pub fn run(
                             "redefaulted": outcome.redefaulted,
                         },
                         "changed": outcome.changed,
-                        "dry_run": dry_run && outcome.changed,
+                        // Plain `dry_run`, not `dry_run && changed`. The field
+                        // answers "was this invocation a dry run?", and a
+                        // consumer asking "did anything mutate?" reads
+                        // `changed`. Conflating them made `--dry-run` on a
+                        // same-value no-op report `dry_run: false`, which reads
+                        // alone as "this was a real run" — the opposite of the
+                        // truth. `Relabel` (below) already reports a plain
+                        // `true`; this matches it.
+                        "dry_run": dry_run,
                     })
                 );
             } else if !outcome.changed {
@@ -1413,6 +1421,45 @@ mod tests {
             true,
             false,
         )
+    }
+
+    /// `--dry-run` was not in issue #167's twelve steps; it was added because
+    /// every other mutating cartridge command honours it, and an `Edit` that
+    /// silently ignored it would mean `tapectl --dry-run cartridge edit ...`
+    /// writes to the catalog. That makes this the one behaviour here with no
+    /// acceptance test of its own, so it gets one: a write-prevention path
+    /// nothing exercises is a path that regresses quietly.
+    #[test]
+    fn edit_generation_dry_run_changes_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+
+        run(
+            &conn,
+            &CartridgeCommands::Edit {
+                barcode: "B001".to_string(),
+                generation: "LTO-5".to_string(),
+            },
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+
+        let (media_type, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(media_type, "LTO-6", "dry-run must not rewrite media_type");
+        assert_eq!(
+            cap,
+            crate::media::Generation::Lto6.native_capacity_bytes() as i64,
+            "dry-run must not re-default the capacity"
+        );
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "dry-run logs no event");
     }
 
     #[test]
