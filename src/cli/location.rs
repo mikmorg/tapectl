@@ -400,6 +400,7 @@ fn move_together(
             "UPDATE cartridges SET location_id = ?1 WHERE id = ?2",
             params![loc_id, cart_id],
         )?;
+        let old_loc_name = resolve_location_name(&tx, old_loc)?;
         events::log_field_change(
             &tx,
             "cartridge",
@@ -407,7 +408,7 @@ fn move_together(
             barcode,
             "moved",
             "location",
-            old_loc.map(|id| id.to_string()).as_deref(),
+            old_loc_name.as_deref(),
             location_name,
             None,
         )?;
@@ -428,6 +429,7 @@ fn move_together(
             "UPDATE volumes SET location_id = ?1 WHERE id = ?2",
             params![loc_id, vol_id],
         )?;
+        let old_loc_name = resolve_location_name(&tx, old_loc)?;
         events::log_field_change(
             &tx,
             "volume",
@@ -435,7 +437,7 @@ fn move_together(
             label,
             "moved",
             "location",
-            old_loc.map(|id| id.to_string()).as_deref(),
+            old_loc_name.as_deref(),
             location_name,
             None,
         )?;
@@ -447,6 +449,35 @@ fn move_together(
         cartridge: cartridge.map(|(_, barcode)| barcode),
         volumes: volumes.iter().map(|(_, label)| label.clone()).collect(),
     })
+}
+
+/// Resolves a location id to its current name, for logging into an audit
+/// event's `old_value`/`new_value` (ADR-0012's consequences bullet: "Move
+/// events carry location *names* on both sides, never an id on one and a
+/// name on the other").
+///
+/// `.optional()` makes this tolerant of a stale id whose row is gone: a
+/// move must never fail because history points at a location that no
+/// longer exists. When the id is present but the name cannot be resolved,
+/// this returns `None` rather than falling back to the id itself — the
+/// ruling is that an id must never appear in these fields, not even as a
+/// fallback.
+///
+/// Takes `&Connection` so it can be called with `&tx` (a `Transaction`
+/// derefs to `Connection`) — callers must resolve the name from inside the
+/// same transaction the move runs in, never a separate `conn` read, or a
+/// concurrent rename could be read mid-move.
+fn resolve_location_name(conn: &Connection, location_id: Option<i64>) -> Result<Option<String>> {
+    let Some(id) = location_id else {
+        return Ok(None);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT name FROM locations WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 fn known_location_names(conn: &Connection) -> Result<Vec<String>> {
