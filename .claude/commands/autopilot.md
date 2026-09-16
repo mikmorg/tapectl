@@ -191,8 +191,28 @@ the normative design set named in the Policy block below.
      after a write) is refused by `stage create` and so **cannot ever have run
      green** — `retire-and-reuse` uses it too. Treat the unrun scenarios as
      unknown, not as passing: **a full `--all` pass is its own queue item, not
-     something to defer to the queue-empty run.** Only `first-year` 45/45 is
-     measured-green as of this writing.
+     something to defer to the queue-empty run.** That item is now filed as
+     **#203** and carries the label — three of thirteen scenarios are
+     measured-green (`first-year` 45/45, `compaction` 31/31,
+     `retire-and-reuse` 10/10), ten have never been run. One verified piece of
+     good news recorded there: the re-stage idiom is gone from the executable
+     body of every scenario (the single surviving `grep` hit is a comment), so
+     the ten unmeasured ones are not known-red *for that reason*.
+
+     **PARKED AS OF 2026-09-16 — the CTO batch, do not count these as
+     workable:** **#197** (a typed cartridge serial is indistinguishable from a
+     chip-read one; the fork is whether a MAM read may silently promote an
+     `operator` serial past `lookup_cartridge`'s "that is a different physical
+     cartridge" refusal — recommendation: Option C, provenance column *and* an
+     explicit gated correction, no silent promotion) and **#199** (what status a
+     rebuilt row carries; recommendation differs from the issue author's —
+     Option 2, stop using status as a proxy, because Option 1 can brick a blank
+     tape on a label collision). Both have "PARKED — needs CTO" comments with
+     full options. **#147** is not parked — it is the second CTO *review gate*
+     (branch `pm-147`, 9 commits at `88ed22a`), and needs the diff **and**
+     before/after fixture output shown before merge. **#200 is NOT parked** —
+     re-verified as a plain one-line bug fix (see its scoping comment); it is
+     queue work blocked only on #201 freeing `src/volume/write.rs`.
   5. **Excluded by ruling:** #143 (`config set/add/remove`) and #144
      (`--policy-aware` packing) stay open, unlabelled, and are not this queue.
      #145 (`volume calibrate`) is closed as rejected. **#182** — the MAM
@@ -249,11 +269,13 @@ the normative design set named in the Policy block below.
      form; cargo synchronous, never backgrounded; no GitHub closing keywords in
      commit messages; workers never touch `/dev/nst*` or `/dev/sg*`; the real
      `~/.tapectl` is never touched from this VM; migrations are forward-only and
-     the next free number is **015** (014 is taken by
-     `014_cartridge_binding_identity_source.sql`, landed with #192 — this line
-     said 014 until 2026-09-16, when the #184 worker caught it and reported the
-     stale number instead of quietly claiming it; verify with `ls
-     src/db/migrations/ | tail -1` before writing one, do not trust this line).
+     the next free number is **016** (014 is
+     `014_cartridge_binding_identity_source.sql` from #192, 015 is
+     `015_cartridge_load_count_unknown.sql` from #184). This line has now been
+     stale TWICE — it said 014 until the #184 worker caught it on 2026-09-16,
+     and 015 until the coordinator caught it later the same day. It will go
+     stale again: **verify with `ls src/db/migrations/ | tail -1` before writing
+     one, and do not trust this line.**
 
 - **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed; real-drive pass #4 45/45 on 2026-09-12.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
