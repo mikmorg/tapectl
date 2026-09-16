@@ -280,8 +280,18 @@ pub fn volume_init(
     // the same helper.
     crate::tape::media_detect::check_drive_can_write(backend, generation)?;
 
+    // Decimal, not binary (ADR-0012: "Cartridge capacities are decimal; data
+    // sizes are binary; the two are named apart"). This is a capacity, so it
+    // means what the box says. It parsed BINARY until issue #200 — which made
+    // it the last site disagreeing with `Config::validate_sizes` and
+    // `LtoBackendConfig::planning_capacity_bytes`, both decimal since #168.
+    // The consequence was not a rounding difference: a config that LOADED
+    // cleanly, validated as 2 500 000 000 000, was re-read here as
+    // 2 748 779 069 440 and stored on the volume row that ADR-0010 decision 3
+    // makes authoritative for every later capacity gate — a value reinterpreted
+    // after its own validation passed, over-crediting the tape by ~10%.
     let capacity_override = match &backend.capacity_override {
-        Some(v) => Some(staging::parse_size_to_bytes(v)? as u64),
+        Some(v) => Some(crate::media::parse_capacity_to_bytes(v)? as u64),
         None => None,
     };
     let (nominal_capacity, capacity_source) = crate::media::resolve_capacity(
@@ -6634,6 +6644,51 @@ mod tests {
                      delete it."
                 );
             }
+        }
+
+        /// Issue #200. `volume_init` needs a drive, so the parser it picks for
+        /// `capacity_override` cannot be pinned by calling it — and the whole
+        /// suite passed both before and after the fix, which is exactly why
+        /// this guard exists rather than a behavioural one. Same source-scan
+        /// shape, same false-pass guard, as the corroboration test above.
+        ///
+        /// ADR-0012: capacities are DECIMAL. Reaching for
+        /// `staging::parse_size_to_bytes` here (binary — right for slice sizes
+        /// and the ENOSPC buffer, wrong for a capacity) over-credits the tape
+        /// by ~10% and, worse, disagrees with the decimal parser
+        /// `Config::validate_sizes` already validated the same string with.
+        #[test]
+        fn volume_init_parses_capacity_override_decimally() {
+            const SRC: &str = include_str!("write.rs");
+            let f = "pub fn volume_init(";
+            let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+            let end = SRC[start..].find("\n}\n").unwrap() + start;
+            let body = &SRC[start..end];
+            assert!(
+                !body[f.len()..].contains("\npub fn "),
+                "body extraction overran into another function; fix this test's scan \
+                 before trusting its verdict"
+            );
+
+            let parse_site = body
+                .find("backend.capacity_override")
+                .expect("volume_init no longer reads backend.capacity_override");
+            let tail = &body[parse_site..];
+            let stmt_end = tail.find("};").map(|i| i + 2).unwrap_or(tail.len());
+            let stmt = &tail[..stmt_end];
+
+            assert!(
+                stmt.contains("media::parse_capacity_to_bytes("),
+                "volume_init must parse capacity_override with the DECIMAL parser \
+                 (ADR-0012; issue #200). Found instead:\n{stmt}"
+            );
+            assert!(
+                !stmt.contains("parse_size_to_bytes("),
+                "volume_init is parsing capacity_override with the BINARY parser again \
+                 (issue #200). That over-credits the tape by ~10% and contradicts the \
+                 decimal parse Config::validate_sizes already applied to the same \
+                 string.\n{stmt}"
+            );
         }
     }
 }

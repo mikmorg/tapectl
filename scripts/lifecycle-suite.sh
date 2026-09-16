@@ -995,7 +995,14 @@ name = "lifecycle"
 device_tape = "{tape}"
 device_sg = "{sg}"
 generation = "LTO-8"
-capacity_override = "2.5T"
+# 2 748 779 069 440 = 2.5 TiB exactly, written as a bare byte count on
+# purpose (issue #200). This string used to be "2.5T", parsed BINARY by
+# volume init and DECIMAL by config validation; #200 made init decimal
+# too, which would have shrunk this microcosm by 9.95%. Fixing a parser
+# drift and resizing the test microcosm are two different changes, and
+# doing both at once means a red gate cannot be attributed to either.
+# A bare integer is the one literal both parsers read identically.
+capacity_override = "2748779069440"
 usable_capacity_factor = 0.95
 enospc_buffer = "2G"
 '''
