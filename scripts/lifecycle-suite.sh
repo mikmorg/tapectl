@@ -376,13 +376,28 @@ PY2
 REUSE_FORCE=""
 [ "$SINGLE_CARTRIDGE" = 1 ] && REUSE_FORCE="--force"
 
-# The permutation matrix is the one caller whose tolerated violations really do
-# depend on the cartridge mode: reusing a single cartridge under-counts copies,
+# The permutation matrix tolerates copy_count in EVERY mode, and the reasoning
+# that said otherwise was wrong in a way worth recording (issue #203, found by
+# the first `--all` run, 2026-09-16).
+#
+# The old comment here read: "reusing a single cartridge under-counts copies,
 # while a multi-cartridge run must reach full coverage and any copy_count
-# violation there is a real regression. Declared here rather than inferred
-# inside audit_passes (issue #156).
-PM_ALLOWED_VIOLATIONS=()
-[ "$SINGLE_CARTRIDGE" = 1 ] && PM_ALLOWED_VIOLATIONS=(copy_count)
+# violation there is a real regression." The second half does not hold. A copy
+# comes from writing another VOLUME, not from having another CARTRIDGE, and
+# `write-next-volume` is drawn at random from pm_generate_sequence's op pool —
+# so how many copies exist at step N is decided by the RNG, not by the mode.
+# With seed=1 the two writes landed at steps 7 and 8, so steps 2, 3 and 6 had
+# one copy and failed; with another seed they could land at step 11 and fail
+# ten checks, or at step 1 and fail none. The check was not merely too strict,
+# it was SEED-DEPENDENT — a green permute run proved nothing about any other
+# seed, which is the worst property a gate can have.
+#
+# So copy_count cannot be a per-step invariant here. It is allowed per-step and
+# the real assertion moved to pm_final_copy_count_is_honest (end of the walk),
+# which compares tapectl's count against the volumes this walk actually wrote —
+# seed-independent, and a stronger statement than "audit is quiet" ever was.
+# Declared here rather than inferred inside audit_passes (issue #156).
+PM_ALLOWED_VIOLATIONS=(copy_count)
 vinit() { TCTL volume init "$1" --device "$TAPE_DEV" $REUSE_FORCE; }
 
 # ---------- erase_tape: the ONE place scenarios reuse a tape ----------
@@ -1599,7 +1614,21 @@ tor_solo_unit() {
     TCTL snapshot create solo || return 1
     TCTL stage create solo || return 1
     next_tape VOL-SOLO || return 1
-    vinit VOL-SOLO && TCTL volume write VOL-SOLO --device "$TAPE_DEV"
+    vinit VOL-SOLO || return 1
+    TCTL volume write VOL-SOLO --device "$TAPE_DEV" || return 1
+    # VOL-SOLO must be PLACED, or the next check fails for a reason this
+    # scenario does not intend (issue #203, first `--all` run 2026-09-16).
+    #
+    # `volume write` writes every still-staged set (ADR-0006 stage-once /
+    # write-N-copies), so VOL-SOLO carries photos v1 AND v2 as well as solo.
+    # That left photos v2 on VOL-B (offsite) and VOL-SOLO (nowhere), i.e. two
+    # copies across ONE named location — and since #153 a unit is as covered as
+    # its least-covered live version, so `mark-tape-only photos` refused with
+    # "insufficient locations: 1 < 2". The refusal was correct; the scenario
+    # simply never gave the second copy a home. Placing VOL-SOLO supplies the
+    # location without adding a copy of `solo`, so tor.mark_tape_only_solo_refused
+    # still refuses — for insufficient COPIES, which is what it asserts.
+    TCTL volume move VOL-SOLO --to vault || return 1
 }
 
 tor_mark_tape_only_photos_passes() {
@@ -1657,13 +1686,27 @@ tor_restore_latest() {
 }
 
 scenario_tape_only_and_reclaim() {
+    # ORDER MATTERS, and it did not used to (issue #203, 2026-09-16).
+    #
+    # Reclaim runs BEFORE mark-tape-only. `snapshot mark-reclaimable` applies a
+    # 2x copy multiplier once a unit is tape-only — delete the source and you
+    # need more tape before discarding an older version — so with photos marked
+    # tape-only first, reclaiming v1 demands FOUR copies of the superseding v2
+    # and this scenario writes two. Correct behaviour; wrong order.
+    #
+    # It was hidden because the two failures cancelled: mark-tape-only was
+    # itself failing (VOL-SOLO was never placed, so photos v2 had two copies in
+    # one location), photos therefore never became tape-only, and reclaim got
+    # the 1x rule and passed. Fixing the placement made the real conflict
+    # visible. Both of the later checks had been GREEN FOR THE WRONG REASON —
+    # they were passing because an earlier check was red.
     check tor.setup                        bootstrap_two_volumes
     check tor.solo_unit                    tor_solo_unit
+    check tor.mark_reclaimable_v1_photos   tor_mark_reclaimable_v1_photos
+    check tor.purge_v1_photos              tor_purge_v1_photos
     check tor.mark_tape_only_photos_passes tor_mark_tape_only_photos_passes
     check tor.mark_tape_only_solo_refused  tor_mark_tape_only_solo_refused
     check tor.report_tape_only             tor_report_tape_only
-    check tor.mark_reclaimable_v1_photos   tor_mark_reclaimable_v1_photos
-    check tor.purge_v1_photos              tor_purge_v1_photos
     check tor.staging_clean                tor_staging_clean
     check tor.report_copies                tor_report_copies
     check tor.restore_latest               tor_restore_latest
@@ -2840,6 +2883,62 @@ assert d.get("integrity_ok"), d
     esac
 }
 
+# ---------- pm_final_copy_count_is_honest (issue #203) ----------
+# The end-of-walk assertion that per-step copy_count checking was never able to
+# be. It does NOT ask "is audit quiet" — the walk cannot control how many copies
+# the RNG gave it. It asks the stronger question: does tapectl's copy count
+# AGREE with the volumes this walk actually wrote?
+#
+# For each unit, the expected count is |PM_WRITTEN ∩ volumes `catalog locate`
+# reports for that unit| — the walk's own record intersected with the catalog's,
+# which is not a re-derivation of tapectl's SQL and so can actually disagree
+# with it. audit's copy_count finding (when there is one) must name that same
+# number. A miscount in either direction fails, in every mode and at every seed.
+pm_final_copy_count_is_honest() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: audit's copy_count must match the volumes this walk wrote"; return 0; }
+    local af="$RUN/log-pm.final.audit.json"
+    TCTL audit --json >"$af" 2>"$RUN/log-pm.final.audit.stderr"
+    local u rc=0
+    for u in photos docs big; do
+        local locate_json expected
+        locate_json="$(TCTL catalog locate "$u" --json 2>/dev/null)" || continue
+        expected="$(printf '%s\n' "$locate_json" | PM_W="${PM_WRITTEN[*]}" python3 -c '
+import json, os, sys
+written = set(os.environ.get("PM_W", "").split())
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(-1); raise SystemExit
+vols = d if isinstance(d, list) else d.get("volumes", [])
+labels = {(v.get("label") if isinstance(v, dict) else v) for v in vols}
+print(len(labels & written))
+')"
+        [ "$expected" = "-1" ] && { echo "catalog locate --json unparseable for $u"; rc=1; continue; }
+        local claimed
+        claimed="$(U="$u" python3 -c '
+import json, os, re, sys
+d = json.load(open(sys.argv[1]))
+for f in (d.get("findings") or []):
+    if f.get("check") == "copy_count" and f.get("unit") == os.environ["U"]:
+        m = re.search(r"has (\d+) copies", f.get("message", ""))
+        print(m.group(1) if m else "unparsed"); break
+else:
+    print("none")
+' "$af")"
+        # "none" means audit raised no copy_count finding for this unit, which
+        # is only consistent with the walk if policy is already satisfied. We
+        # cannot read min_copies from here, so a silent audit is accepted; the
+        # assertion is about the number audit DOES state.
+        if [ "$claimed" = "unparsed" ]; then
+            echo "copy_count message for $u did not carry a count"; rc=1
+        elif [ "$claimed" != "none" ] && [ "$claimed" != "$expected" ]; then
+            echo "copy_count disagreement for $u: audit says $claimed, this walk wrote $expected volume(s) carrying it"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
 scenario_permute() {
     check pm.setup bootstrap_archive_v1 VOL-A
     # bootstrap_archive_v1 stages every unit itself, so seed the staged baseline
@@ -2907,6 +3006,9 @@ for v in vols:
             check "pm-final-$u.unit" pm_skip_never_written "$u"
         fi
     done
+
+    # Runs last, after every write this walk is going to do (issue #203).
+    check pm.final_copy_count_is_honest pm_final_copy_count_is_honest
 }
 
 # ---------- REPORT.md ----------
