@@ -206,20 +206,31 @@ the normative design set named in the Policy block below.
      body of every scenario (the single surviving `grep` hit is a comment), so
      the ten unmeasured ones are not known-red *for that reason*.
 
-     **PARKED AS OF 2026-09-16 — the CTO batch, do not count these as
-     workable:** **#197** (a typed cartridge serial is indistinguishable from a
-     chip-read one; the fork is whether a MAM read may silently promote an
-     `operator` serial past `lookup_cartridge`'s "that is a different physical
-     cartridge" refusal — recommendation: Option C, provenance column *and* an
-     explicit gated correction, no silent promotion) and **#199** (what status a
-     rebuilt row carries; recommendation differs from the issue author's —
-     Option 2, stop using status as a proxy, because Option 1 can brick a blank
-     tape on a label collision). Both have "PARKED — needs CTO" comments with
-     full options. **#147** is not parked — it is the second CTO *review gate*
-     (branch `pm-147`, 9 commits at `88ed22a`), and needs the diff **and**
-     before/after fixture output shown before merge. **#200 is NOT parked** —
-     re-verified as a plain one-line bug fix (see its scoping comment); it is
-     queue work blocked only on #201 freeing `src/volume/write.rs`.
+     **NOTHING IS PARKED as of 2026-09-16.** #197 and #199 were parked and both
+     were **RULED the same day**; the rulings are in ADR-0012 as a dated
+     amendment (`42ef30c`) and repeated as "RULED 2026-09-16" comments on each
+     issue, which supersede the "PARKED" comments above them.
+     - **#199 — Option 2, as recommended:** `is_write_target` stops answering
+       "does this volume hold bytes?" with a status and consults attached
+       write/slice rows. Option 1 (rebuild marks the row `sealed`) was
+       explicitly rejected: on a label collision it seals a *blank* tape, which
+       ADR-0003 then makes unwritable without a real erase. **The trap is
+       `volume resume`**, which exists to continue a volume that already has
+       `writes` rows — the resumable states must be distinguished from
+       `completed` or resume breaks quietly.
+     - **#197 — neither option I offered.** The CTO ruled **two columns**:
+       `serial_number` written only from a MAM read, a new `operator_serial`
+       for the operator's claim. Worth remembering as a pattern: it *dissolved*
+       the fork I raised (promote-or-refuse) instead of deciding it, because
+       two values that never share a slot never need a precedence rule. When a
+       question is "which of these two things wins", check whether they can
+       simply stop competing.
+     **#147 remains the second CTO *review gate*** — branch `pm-147`, 9 commits
+     at `88ed22a`. **It is 125 commits behind master and touches
+     `operations.rs` (+990), `coverage.rs` (+368) and `write.rs` (+205)** — the
+     three most-churned files of waves 1–4 — so it needs a rebase through the
+     consent path *before* the diff and before/after fixture output can be put
+     in front of the CTO. Budget that as a task of its own, not as a step.
   5. **Excluded by ruling:** #143 (`config set/add/remove`) and #144
      (`--policy-aware` packing) stay open, unlabelled, and are not this queue.
      #145 (`volume calibrate`) is closed as rejected. **#182** — the MAM
