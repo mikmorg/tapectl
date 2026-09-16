@@ -2696,6 +2696,8 @@ fn volume_retire_tier3_refuses_the_last_eligible_copy() {
         "LAST eligible copy",
         "unit \"photos\" v3",
         "tapectl volume read-slices --from L6-SOLE --unit photos",
+        "tapectl volume init <OTHER-LABEL>",
+        "tapectl stage create photos --version 3",
         "tapectl snapshot mark-reclaimable photos --version 3",
         "tapectl volume verify L6-SOLE",
         "no --force for this",

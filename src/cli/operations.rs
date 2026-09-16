@@ -613,6 +613,18 @@ pub(crate) fn refuse_last_eligible_copy(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Per (unit, VERSION), not per unit: the doomed version need not be the
+    // newest — v2 only here while v3 sits elsewhere is a perfectly legal
+    // at-stake row — and `stage create` without `--version` takes the
+    // latest unstaged one, which would re-copy the version that was never
+    // in danger. `snapshot create` is deliberately NOT offered as the first
+    // step: under ADR-0012 it mints nothing when content is unchanged, so
+    // it cannot reproduce a version the operator still has on disk.
+    let restage = doomed
+        .iter()
+        .map(|(unit, version)| format!("    tapectl stage create {unit} --version {version}"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     Err(TapectlError::Other(format!(
         "cannot {act}: \"{volume_label}\" holds the LAST eligible copy of {count} \
@@ -626,9 +638,13 @@ pub(crate) fn refuse_last_eligible_copy(
          \n\
          Make another copy first, then re-run this:\n\
          {copy_out}\n    \
+         tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
          tapectl volume write <OTHER-LABEL>\n\
-         or re-stage the unit from a source that still exists (`tapectl snapshot create` \
-         then `tapectl stage create`).\n\
+         or, if the content is still on disk, stage it again — one line per version at \
+         stake — and write that:\n\
+         {restage}\n    \
+         tapectl volume init <OTHER-LABEL>\n    \
+         tapectl volume write <OTHER-LABEL>\n\
          \n\
          Or give the version up on purpose — a different statement, with its own command \
          and its own preconditions:\n\
@@ -3433,7 +3449,9 @@ mod tests {
                 .to_string();
             for needle in [
                 "tapectl volume read-slices --from L6-TEXT --unit unitA",
+                "tapectl volume init <OTHER-LABEL>",
                 "tapectl volume write <OTHER-LABEL>",
+                "tapectl stage create unitA --version 1",
                 "tapectl snapshot mark-reclaimable unitA --version 1",
                 "tapectl volume verify L6-TEXT",
                 "quarantines the volume when it fails",
