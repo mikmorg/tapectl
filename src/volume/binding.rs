@@ -52,8 +52,20 @@
 //!   naming a row still bound to a LIVE volume is undecidable — that
 //!   cartridge erased, or a different tape wearing its sticker (ADR-0012,
 //!   issue #155).
+//! - [`corroborate_contact`]: at every LATER contact, two KNOWN identities
+//!   that disagree — the medium's, the bound row's, File 0's, the volume
+//!   named on the command line — mean the wrong tape is loaded (ADR-0012,
+//!   issue #193). This is the only one of the five that also WRITES: a bound
+//!   row with no serial learns one, once.
 //!
-//! None of the four takes a `force`, structurally.
+//! None of the five takes a `force`, structurally.
+//!
+//! The last one is where this module stops being only about `volume init`.
+//! Everything above `corroborate_contact` ESTABLISHES a binding; everything
+//! from it down CHECKS one, at `volume write`, `volume resume`, `volume
+//! verify`, `volume read-slices`, `volume compact-read`, `restore`, `catalog
+//! rebuild` and `volume identify` alike — one implementation, because six
+//! copies of a four-branch rule is how they drift.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -456,21 +468,11 @@ pub(crate) fn bind_cartridge(
             // has now been seen in a drive for the first time.
             if r.serial_number.is_none() {
                 if let Some(s) = serial {
-                    conn.execute(
-                        "UPDATE cartridges SET serial_number = ?1 WHERE id = ?2",
-                        params![s, r.id],
-                    )?;
-                    events::log_field_change(
-                        conn,
-                        "cartridge",
-                        r.id,
-                        &r.barcode,
-                        "updated",
-                        "serial_number",
-                        None,
-                        s,
-                        None,
-                    )?;
+                    // One writer, shared with `corroborate_contact`'s learn
+                    // branch (ADR-0012, issue #193): write-once is the
+                    // caller's `serial_number IS NULL` guard, here and
+                    // there, rather than a rule spelled twice.
+                    record_medium_serial(conn, r.id, &r.barcode, s)?;
                     outcome.serial_recorded = true;
                 }
             }
@@ -696,6 +698,460 @@ pub(crate) fn bind_cartridge(
     }
 
     Ok(outcome)
+}
+
+// ── Corroboration at contact (ADR-0012, issue #193) ─────────────────────
+//
+// Everything above this line is about ESTABLISHING a binding at `volume
+// init`. Everything below is about CHECKING it at every later contact —
+// the other half of the same ADR-0012 ruling, and deliberately one
+// implementation rather than one per call site.
+
+/// What the catalog claims about the volume a contact names.
+///
+/// Built by [`claim_for_volume`]. The absence of the whole struct (the
+/// caller passing `None`) is the DR case: a tape whose volume row does not
+/// exist yet, which corroborates against nothing and proceeds.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogClaim {
+    pub volume_label: String,
+    /// `volumes.uuid`, read PLAINLY. Never via `volume::write::volume_uuid`,
+    /// which self-heals a NULL by WRITING one — corroboration on a read path
+    /// must not mutate the catalog just to have something to compare.
+    pub volume_uuid: Option<String>,
+    /// The open `cartridge_volumes` mount, when the volume has one. `None`
+    /// is an absence (an unbound volume), never a contradiction.
+    pub bound: Option<BoundCartridge>,
+}
+
+/// The cartridge a volume is currently mounted on, as the catalog has it.
+#[derive(Debug, Clone)]
+pub(crate) struct BoundCartridge {
+    pub cartridge_id: i64,
+    pub barcode: String,
+    pub serial_number: Option<String>,
+    /// The BINDING's identity source (migration 014): `"mam"`, `"operator"`,
+    /// or `None` for a binding predating #192. Recorded for completeness —
+    /// the `operator` case is corroborated by the EXISTENCE of this binding,
+    /// not by anything compared against this field.
+    pub identity_source: Option<String>,
+}
+
+/// What File 0 says, when File 0 was readable and parseable.
+///
+/// Every field is independently optional because every one of them is an
+/// ABSENCE when missing: a tape that could not be read, a legacy thunk with
+/// no `[media]` table, a pre-#192 `[media]` with no identity source. None of
+/// those is a contradiction (issue #193: "Corroboration refuses a
+/// contradiction, never an absence").
+#[derive(Debug, Clone, Default)]
+pub(crate) struct File0Facts {
+    pub label: Option<String>,
+    pub uuid: Option<String>,
+    pub media: Option<crate::volume::format::IdThunkMedia>,
+}
+
+impl File0Facts {
+    /// File 0's `cartridge_serial` **if and only if it is a chip serial**.
+    ///
+    /// `Some("operator")` means the string is a BARCODE, and ADR-0012 says
+    /// in terms that it is "corroborated through the catalog binding, not by
+    /// comparing its recorded barcode to the row's — the row may since have
+    /// been relabelled" (`cartridge relabel`, issue #160, is a legitimate
+    /// act). So it contributes nothing here, and the corroboration for that
+    /// case is the binding itself.
+    ///
+    /// `None` means UNKNOWN and MUST NOT be read as `"mam"`: every tape
+    /// written before the field existed omits it, and defaulting would make
+    /// all of them falsely attest a chip-verified serial
+    /// (`volume-format-v2.md` §1.1).
+    fn chip_serial(&self) -> Option<&str> {
+        let media = self.media.as_ref()?;
+        match media.cartridge_identity_source.as_deref() {
+            Some("mam") => Some(media.cartridge_serial.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Everything this contact can see about the medium in the drive.
+///
+/// `serial` is the MAM chip read (`None` = the drive cannot see one, as on
+/// some virtual drives); `file0` is what the tape's own File 0 attests
+/// (`File0Facts::default()` = not read, or unparseable).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MediumFacts {
+    pub serial: Option<String>,
+    pub file0: File0Facts,
+}
+
+impl MediumFacts {
+    /// The MAM read alone — the shape the two WRITE contacts use.
+    ///
+    /// `volume write` and `volume resume` deliberately offer no File 0 here:
+    /// their File-0 discipline is the ADR-0003 CONSENT gate
+    /// (`check_fresh_write_contact` for a fresh write, `check_tape_contact`
+    /// → divergence → quarantine for a resume), and a fact refusal running
+    /// first would pre-empt both — including the quarantine that is how a
+    /// resume is supposed to record a divergent tape.
+    pub(crate) fn from_serial(serial: Option<String>) -> Self {
+        Self {
+            serial,
+            file0: File0Facts::default(),
+        }
+    }
+
+    /// The MAM read plus File 0 — the shape every READ contact uses.
+    pub(crate) fn new(serial: Option<String>, file0: File0Facts) -> Self {
+        Self { serial, file0 }
+    }
+}
+
+/// What [`corroborate_contact`] concluded. There is no "refused" variant:
+/// a contradiction is an `Err`, like every other fact refusal in this
+/// module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Corroboration {
+    /// Every fact both sides know agrees, or one side does not know it.
+    Agreed,
+    /// The bound row had no serial recorded and the medium reported one, so
+    /// the row has now learnt it — once.
+    SerialLearned { barcode: String, serial: String },
+}
+
+/// Read File 0 off `store` and parse what it says about identity, LENIENTLY.
+///
+/// Never errors. A tape read failure, a File 0 that is not v2, a missing
+/// `[media]` table — all are absences, and an absence proceeds (ADR-0010's
+/// read-path leniency, issue #193's constraint 1). The refusals this feeds
+/// are for two KNOWN facts that disagree.
+pub(crate) fn read_file0_facts(store: &mut dyn crate::store::Store) -> File0Facts {
+    use crate::volume::format;
+    let mut raw = Vec::new();
+    if let Err(e) = store.read_file(0, &mut raw) {
+        tracing::warn!(err = %e, "could not read File 0 at contact; corroborating without it");
+        return File0Facts::default();
+    }
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let identity = format::parse_id_thunk_identity(&text).ok();
+    File0Facts {
+        label: identity.as_ref().map(|i| i.label.clone()),
+        uuid: identity.as_ref().map(|i| i.uuid.clone()),
+        media: format::parse_id_thunk_media(&text).ok(),
+    }
+}
+
+/// The MAM medium serial the drive can report for `device`, or `None`.
+///
+/// LENIENT by construction (ADR-0010, "Read paths stay usable without a
+/// configured drive"): the serial lives behind the drive's SCSI generic
+/// node, which is only known from a configured backend. A rebuilt machine
+/// with keys and no `backend add` gets `None` — an absence, so every read
+/// path still works, which is exactly ADR-0005's DR path.
+pub(crate) fn loaded_medium_serial(config: &crate::config::Config, device: &str) -> Option<String> {
+    let backend = config
+        .backends
+        .lto
+        .iter()
+        .find(|b| b.device_tape == device)?;
+    crate::tape::media_detect::detect(device, &backend.device_sg)
+        .mam
+        .serial
+}
+
+/// The catalog's claim about one volume, for [`corroborate_contact`].
+pub(crate) fn claim_for_volume(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+) -> Result<CatalogClaim> {
+    let volume_uuid: Option<String> = conn
+        .query_row(
+            "SELECT uuid FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    // `.optional()?`, never `.ok()` — the same rule `select_cartridge`
+    // states: a locked or malformed database must surface, not silently read
+    // as "unbound" and wave a wrong cartridge through.
+    let bound = conn
+        .query_row(
+            "SELECT c.id, c.barcode, c.serial_number, cv.identity_source
+             FROM cartridge_volumes cv
+             JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![volume_id],
+            |r| {
+                Ok(BoundCartridge {
+                    cartridge_id: r.get(0)?,
+                    barcode: r.get(1)?,
+                    serial_number: r.get(2)?,
+                    identity_source: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(CatalogClaim {
+        volume_label: label.to_string(),
+        volume_uuid,
+        bound,
+    })
+}
+
+/// Corroborate the loaded medium against the catalog, at ANY contact
+/// (ADR-0012, issue #193). **The one implementation; never re-write it per
+/// call site.**
+///
+/// ADR-0012, the corroboration half of "A cartridge is known by the serial
+/// its chip reports; a barcode is a label":
+///
+/// > when the medium and the bound row both have a serial they must agree,
+/// > and a different serial is a different cartridge, refused; a bound row
+/// > that has no serial yet learns it at that contact, once (`NULL` → value,
+/// > never value → value) — unless another row already holds that serial, in
+/// > which case the loaded tape *is* that other cartridge and the write is
+/// > refused; when the medium reports no serial, `--cartridge` must name the
+/// > bound row. A File 0 whose identity source is `operator` is corroborated
+/// > through the catalog binding, not by comparing its recorded barcode to
+/// > the row's — the row may since have been relabelled.
+///
+/// CONTEXT.md **Contact**: "the only moment the tape is authoritative, and
+/// therefore the reconciliation event".
+///
+/// **Absence is not contradiction.** This is the rule the call sites get
+/// wrong and the one to re-read before adding any refusal here. A drive that
+/// reports no serial, a row with none recorded, a volume with no binding, a
+/// missing or unparseable File 0, a `cartridge_identity_source` that is not
+/// there — every one of those is a fact this contact cannot see, and a check
+/// that cannot see cannot refuse (the rule [`check_loaded_cartridge`]'s doc
+/// comment introduced, preserved verbatim here). Only two KNOWN facts that
+/// differ are a contradiction. `claim = None` — the rebuilt machine, the DR
+/// path, a `catalog rebuild` on a tape whose row does not exist yet —
+/// proceeds unconditionally.
+///
+/// [`check_loaded_cartridge`]: crate::volume::write
+///
+/// **`identity_source = "operator"` is corroborated THROUGH THE BINDING.**
+/// File 0 names the volume; the volume's open `cartridge_volumes` mount
+/// names the cartridge. That chain IS the corroboration. File 0's recorded
+/// barcode is never string-matched against `cartridges.barcode`, because
+/// `cartridge relabel` (issue #160) is a legitimate act and the sticker may
+/// since have changed — see [`File0Facts::chip_serial`].
+///
+/// Like [`refuse_retired`], [`require_named_cartridge`] and
+/// [`refuse_unwitnessed_displacement`], this takes **no `force` parameter at
+/// all**, structurally, so no caller can defeat it by mistake. Its refusals
+/// are facts tapectl cannot resolve on its own, not risks to accept
+/// (ADR-0008).
+///
+/// `requested_barcode` is the ruling's `--cartridge` clause. Today only
+/// `volume init` has that flag, and init is the ESTABLISHING event
+/// ([`lookup_cartridge`] + [`require_named_cartridge`] +
+/// [`refuse_unwitnessed_displacement`]), so every production contact passes
+/// `None`. The branch lives here anyway: the whole point of this function is
+/// that the rule exists once, so a contact that later gains the flag wires
+/// it in rather than writing a fifth copy.
+pub(crate) fn corroborate_contact(
+    conn: &Connection,
+    claim: Option<&CatalogClaim>,
+    medium: &MediumFacts,
+    requested_barcode: Option<&str>,
+) -> Result<Corroboration> {
+    // ABSENCE: no catalog claim at all. The DR path — a tape whose volume
+    // row does not exist yet — has nothing to contradict, so it proceeds.
+    let Some(claim) = claim else {
+        return Ok(Corroboration::Agreed);
+    };
+    let label = &claim.volume_label;
+
+    // CONTRADICTION: File 0 names a DIFFERENT volume than the one asked
+    // about (issue #164). Checked before the cartridge, because it is the
+    // cheaper and more legible statement of the same wrong-tape fact.
+    if let Some(found) = &claim_mismatch_label(claim, medium) {
+        return Err(TapectlError::Other(format!(
+            "wrong tape: this command names volume \"{label}\", but the loaded cartridge's \
+             File 0 identifies volume \"{found}\". Load \"{label}\"'s cartridge, or re-run \
+             naming \"{found}\". There is no --force for this — it is a fact tapectl cannot \
+             resolve on its own, not a risk to accept."
+        )));
+    }
+    if let (Some(found), Some(expected)) = (&medium.file0.uuid, &claim.volume_uuid) {
+        if !found.is_empty() && !expected.is_empty() && found != expected {
+            return Err(TapectlError::Other(format!(
+                "wrong tape: volume \"{label}\" is uuid {expected} in this catalog, but the \
+                 loaded cartridge's File 0 carries uuid {found} under the same label. A label \
+                 can be reused after a retire; the uuid cannot, so this is a different volume \
+                 (`layout-session.md`). There is no --force for this."
+            )));
+        }
+    }
+
+    // ABSENCE: the volume has no open binding, so there is no cartridge
+    // claim to corroborate. `bind_late` exists precisely for volumes
+    // initialised before ADR-0010 and must keep working.
+    let Some(bound) = &claim.bound else {
+        return Ok(Corroboration::Agreed);
+    };
+    let barcode = &bound.barcode;
+
+    // The ruling's first clause: the medium and the bound row both have a
+    // serial, so they must agree. Wording preserved from the
+    // `check_loaded_cartridge` this replaces, so an operator who has seen
+    // this refusal before still recognises it.
+    if let (Some(recorded), Some(loaded)) = (&bound.serial_number, &medium.serial) {
+        if recorded != loaded {
+            return Err(TapectlError::Other(format!(
+                "wrong cartridge: volume \"{label}\" was initialised on {recorded} \
+                 (cartridge {barcode}), the drive holds {loaded}. Load that cartridge, or \
+                 `volume init` a new label on this one."
+            )));
+        }
+    }
+
+    // File 0's own claim, but ONLY where it says the string is a chip serial
+    // — see `File0Facts::chip_serial` for why `operator` and `None` are not.
+    if let Some(file0_chip) = medium.file0.chip_serial() {
+        if let Some(loaded) = &medium.serial {
+            if file0_chip != loaded {
+                return Err(TapectlError::Other(format!(
+                    "wrong cartridge: the tape's own File 0 records that volume \"{label}\" was \
+                     written to medium serial {file0_chip}, but the drive reports {loaded}. \
+                     Those are two different cartridges. There is no --force for this."
+                )));
+            }
+        }
+        if let Some(recorded) = &bound.serial_number {
+            if file0_chip != recorded {
+                return Err(TapectlError::Other(format!(
+                    "wrong cartridge: the tape's own File 0 records that volume \"{label}\" was \
+                     written to medium serial {file0_chip}, but this catalog binds it to \
+                     cartridge {barcode} (serial {recorded}). There is no --force for this."
+                )));
+            }
+        }
+    }
+
+    // The ruling's third clause: with no serial off the medium, the bound
+    // row is the only thing identifying the cartridge, so an explicit
+    // `--cartridge` naming a different row is a contradiction.
+    if medium.serial.is_none() {
+        if let Some(requested) = requested_barcode {
+            if requested != barcode {
+                return Err(TapectlError::Other(format!(
+                    "wrong cartridge: --cartridge names \"{requested}\", but volume \"{label}\" \
+                     is bound to cartridge \"{barcode}\" — and this drive reports no medium \
+                     serial, so tapectl cannot tell which tape is actually loaded. Name \
+                     \"{barcode}\", or load the cartridge you did name. There is no --force \
+                     for this."
+                )));
+            }
+        }
+        return Ok(Corroboration::Agreed);
+    }
+
+    // The ruling's second clause: a bound row that has no serial yet LEARNS
+    // it at this contact, once. `value -> value` is impossible by
+    // construction — this arm is only reached when `serial_number IS NULL`.
+    let Some(loaded) = medium.serial.as_deref() else {
+        return Ok(Corroboration::Agreed);
+    };
+    if bound.serial_number.is_some() {
+        return Ok(Corroboration::Agreed);
+    }
+
+    // ...unless another row already holds that serial, in which case the
+    // loaded tape IS that other cartridge. Refused BEFORE the UPDATE and by
+    // name: `idx_cartridges_serial_number` would otherwise surface this as a
+    // bare UNIQUE constraint error, which names neither cartridge.
+    if let Some(other) = row_holding_serial(conn, loaded, bound.cartridge_id)? {
+        return Err(TapectlError::Other(format!(
+            "wrong cartridge: the drive reports medium serial {loaded}, which this catalog \
+             already records for cartridge \"{other}\" — so the loaded tape IS \"{other}\", \
+             not \"{barcode}\", which volume \"{label}\" is bound to. Load \"{barcode}\", or \
+             if \"{other}\" and \"{barcode}\" are the same physical cartridge registered \
+             twice, resolve that first. There is no --force for this — it is a fact tapectl \
+             cannot resolve on its own, not a risk to accept."
+        )));
+    }
+
+    // BEST-EFFORT, deliberately (issue #193's judgement point). The serial is
+    // a fact the chip reported; it is true whether or not this contact's
+    // operation succeeds, so it is recorded rather than discarded. But
+    // learning is BOOKKEEPING, not consent: every refusal above has already
+    // run, and nothing downstream reads this row again. So a catalog that
+    // cannot be written — read-only media, a locked database, the DR machine
+    // — warns and proceeds, because an unwritable catalog must never turn a
+    // working READ into a failure (ADR-0010's read-path leniency). On a
+    // write path a locked database fails at the next statement anyway.
+    if let Err(e) = record_medium_serial(conn, bound.cartridge_id, barcode, loaded) {
+        tracing::warn!(
+            err = %e,
+            cartridge = %barcode,
+            serial = %loaded,
+            "could not record the medium serial learnt at this contact (continuing)"
+        );
+        return Ok(Corroboration::Agreed);
+    }
+    Ok(Corroboration::SerialLearned {
+        barcode: barcode.clone(),
+        serial: loaded.to_string(),
+    })
+}
+
+/// File 0's label when it DISAGREES with the claim's, else `None`.
+///
+/// Split out so the absence rule is legible at the call site: an
+/// unparseable File 0 has no label, and no label is no contradiction.
+fn claim_mismatch_label(claim: &CatalogClaim, medium: &MediumFacts) -> Option<String> {
+    let found = medium.file0.label.as_ref()?;
+    (found != &claim.volume_label).then(|| found.clone())
+}
+
+/// The barcode of a DIFFERENT cartridge row already recording `serial`.
+fn row_holding_serial(conn: &Connection, serial: &str, excluding: i64) -> Result<Option<String>> {
+    let found = conn
+        .query_row(
+            "SELECT barcode FROM cartridges WHERE serial_number = ?1 AND id != ?2",
+            params![serial, excluding],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
+/// Record a medium serial onto a cartridge row that has none, with the
+/// events row that says where it came from.
+///
+/// The ONE writer of `cartridges.serial_number` on the binding paths, shared
+/// by [`bind_cartridge`] (establishing) and [`corroborate_contact`]
+/// (learning at a later contact). Write-once is the CALLER's guarantee —
+/// both call it only under `serial_number IS NULL` — which is what makes
+/// ADR-0012's "`NULL` → value, never value → value" structural rather than a
+/// rule repeated in two places.
+fn record_medium_serial(
+    conn: &Connection,
+    cartridge_id: i64,
+    barcode: &str,
+    serial: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE cartridges SET serial_number = ?1 WHERE id = ?2",
+        params![serial, cartridge_id],
+    )?;
+    events::log_field_change(
+        conn,
+        "cartridge",
+        cartridge_id,
+        barcode,
+        "updated",
+        "serial_number",
+        None,
+        serial,
+        None,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1712,5 +2168,382 @@ mod tests {
             impacts[0].other_copies, 0,
             "photos has no other copy — the warning must be able to say so"
         );
+    }
+
+    /// ── ADR-0012 corroboration, one test per branch (issue #193) ────────
+    ///
+    /// These drill [`corroborate_contact`] itself. The per-call-site tests
+    /// live with their call sites and prove only that the contact CALLS
+    /// this — "a contact that skips corroboration is the defect returning".
+    mod corroboration {
+        use super::*;
+        use crate::volume::format::IdThunkMedia;
+
+        /// A volume bound to one cartridge, with `serial` recorded on the
+        /// row (or not) and `source` on the binding.
+        fn bound(
+            barcode: &str,
+            serial: Option<&str>,
+            source: Option<&str>,
+        ) -> (Connection, i64, i64) {
+            let conn = db::open_memory().unwrap();
+            register(&conn, barcode, "LTO-6", serial, "in_use");
+            let cart_id = conn.last_insert_rowid();
+            let vol_id = new_volume(&conn, "L6-0001");
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, ?3)",
+                params![cart_id, vol_id, source],
+            )
+            .unwrap();
+            (conn, vol_id, cart_id)
+        }
+
+        fn claim(conn: &Connection, vol_id: i64) -> CatalogClaim {
+            claim_for_volume(conn, vol_id, "L6-0001").unwrap()
+        }
+
+        fn row_serial(conn: &Connection, cart_id: i64) -> Option<String> {
+            conn.query_row(
+                "SELECT serial_number FROM cartridges WHERE id = ?1",
+                params![cart_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// File 0 attesting `serial` with the given identity source.
+        fn file0(label: &str, serial: &str, source: Option<&str>) -> File0Facts {
+            File0Facts {
+                label: Some(label.to_string()),
+                uuid: None,
+                media: Some(IdThunkMedia {
+                    cartridge_serial: serial.to_string(),
+                    cartridge_identity_source: source.map(str::to_string),
+                }),
+            }
+        }
+
+        // ── Branch 1: both sides have a serial ──
+
+        #[test]
+        fn serials_that_agree_proceed() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            let c = claim(&conn, vol);
+            let out = corroborate_contact(
+                &conn,
+                Some(&c),
+                &MediumFacts::from_serial(Some("SER-1".into())),
+                None,
+            )
+            .unwrap();
+            assert_eq!(out, Corroboration::Agreed);
+        }
+
+        #[test]
+        fn serials_that_differ_are_refused_naming_both() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            let c = claim(&conn, vol);
+            let err = corroborate_contact(
+                &conn,
+                Some(&c),
+                &MediumFacts::from_serial(Some("SER-2".into())),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("wrong cartridge"), "{err}");
+            assert!(
+                err.contains("SER-1"),
+                "must name what the catalog claims: {err}"
+            );
+            assert!(
+                err.contains("SER-2"),
+                "must name what the drive holds: {err}"
+            );
+            assert!(err.contains("BC001"), "must name the cartridge: {err}");
+        }
+
+        // ── Branch 2: the row learns a serial, ONCE ──
+
+        #[test]
+        fn a_row_with_no_serial_learns_it_once() {
+            let (conn, vol, cart) = bound("BC001", None, Some("operator"));
+            let out = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(Some("SER-1".into())),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                Corroboration::SerialLearned {
+                    barcode: "BC001".into(),
+                    serial: "SER-1".into()
+                }
+            );
+            assert_eq!(row_serial(&conn, cart).as_deref(), Some("SER-1"));
+
+            // NULL -> value happened; value -> value must not. A second
+            // contact with the SAME serial is a plain agreement, and the
+            // row is not rewritten (nothing to rewrite it to).
+            let out2 = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(Some("SER-1".into())),
+                None,
+            )
+            .unwrap();
+            assert_eq!(out2, Corroboration::Agreed, "learning must happen once");
+            assert_eq!(row_serial(&conn, cart).as_deref(), Some("SER-1"));
+
+            // And a second contact with a DIFFERENT serial is now branch 1:
+            // refused, never a silent value -> value rewrite.
+            let err = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(Some("SER-9".into())),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("wrong cartridge"), "{err}");
+            assert_eq!(
+                row_serial(&conn, cart).as_deref(),
+                Some("SER-1"),
+                "a refused contact must not have rewritten the serial"
+            );
+        }
+
+        // ── Branch 3: another row already holds that serial ──
+
+        #[test]
+        fn a_serial_another_row_already_holds_is_refused() {
+            let (conn, vol, cart) = bound("BC001", None, Some("operator"));
+            register(&conn, "BC002", "LTO-6", Some("SER-1"), "in_use");
+            let err = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(Some("SER-1".into())),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("BC002"),
+                "must name the cartridge it really is: {err}"
+            );
+            assert!(
+                err.contains("BC001"),
+                "must name the one it was expected to be: {err}"
+            );
+            assert!(err.contains("SER-1"), "{err}");
+            assert!(
+                row_serial(&conn, cart).is_none(),
+                "a refused contact must learn nothing"
+            );
+        }
+
+        // ── Branch 4: the medium reports no serial ──
+
+        #[test]
+        fn no_medium_serial_with_a_cartridge_naming_the_bound_row_proceeds() {
+            let (conn, vol, _) = bound("BC001", None, Some("operator"));
+            let out = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(None),
+                Some("BC001"),
+            )
+            .unwrap();
+            assert_eq!(out, Corroboration::Agreed);
+        }
+
+        #[test]
+        fn no_medium_serial_with_a_cartridge_naming_another_row_is_refused() {
+            let (conn, vol, _) = bound("BC001", None, Some("operator"));
+            let err = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(None),
+                Some("BC002"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("BC002"), "{err}");
+            assert!(err.contains("BC001"), "{err}");
+        }
+
+        // ── The branch most likely to be got wrong ──
+
+        /// ADR-0012: "A File 0 whose identity source is `operator` is
+        /// corroborated through the catalog binding, not by comparing its
+        /// recorded barcode to the row's — the row may since have been
+        /// relabelled." `cartridge relabel` (issue #160) is legitimate, so a
+        /// File 0 recording the OLD sticker must still corroborate.
+        #[test]
+        fn an_operator_file0_corroborates_through_the_binding_after_a_relabel() {
+            let (conn, vol, cart) = bound("OLD-STICKER", None, Some("operator"));
+            conn.execute(
+                "UPDATE cartridges SET barcode = 'NEW-STICKER' WHERE id = ?1",
+                params![cart],
+            )
+            .unwrap();
+
+            // File 0 still records the barcode it was sealed with.
+            let medium = MediumFacts::new(None, file0("L6-0001", "OLD-STICKER", Some("operator")));
+            let out = corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None).unwrap();
+            assert_eq!(
+                out,
+                Corroboration::Agreed,
+                "a relabelled cartridge must still corroborate: File 0 names the volume, \
+                 the volume's binding names the cartridge"
+            );
+        }
+
+        /// The same rule stated from the other side: an `operator` File 0 is
+        /// never string-matched against anything, so even a barcode that
+        /// matches NOTHING in the catalog is not a contradiction.
+        #[test]
+        fn an_operator_file0_barcode_is_never_string_matched() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            let medium = MediumFacts::new(
+                Some("SER-1".into()),
+                file0("L6-0001", "SOME-OTHER-STICKER", Some("operator")),
+            );
+            corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None)
+                .expect("an operator-sourced barcode is corroborated through the binding");
+        }
+
+        /// A `mam` File 0 IS a chip serial, and contradicts a drive that
+        /// reports a different one.
+        #[test]
+        fn a_mam_file0_contradicting_the_drive_is_refused() {
+            let (conn, vol, _) = bound("BC001", None, None);
+            let medium =
+                MediumFacts::new(Some("SER-2".into()), file0("L6-0001", "SER-1", Some("mam")));
+            let err = corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("SER-1"), "{err}");
+            assert!(err.contains("SER-2"), "{err}");
+        }
+
+        /// `volume-format-v2.md` §1.1: an absent `cartridge_identity_source`
+        /// means UNKNOWN and must never be read as `"mam"`. Every tape
+        /// written before #192 omits it, and defaulting would make all of
+        /// them falsely attest a chip-verified serial — and here, refuse.
+        #[test]
+        fn a_file0_with_no_identity_source_is_unknown_not_mam() {
+            let (conn, vol, _) = bound("BC001", None, None);
+            let medium = MediumFacts::new(Some("SER-2".into()), file0("L6-0001", "SER-1", None));
+            corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None)
+                .expect("an unknown identity source contributes nothing, and proceeds");
+        }
+
+        // ── Absence is not contradiction ──
+
+        /// The DR path: a tape whose volume row does not exist at all. This
+        /// is `catalog rebuild` on a rebuilt machine, and it must proceed.
+        #[test]
+        fn no_catalog_claim_at_all_proceeds() {
+            let conn = db::open_memory().unwrap();
+            let medium = MediumFacts::new(
+                Some("SER-1".into()),
+                file0("SOME-TAPE", "SER-9", Some("mam")),
+            );
+            let out = corroborate_contact(&conn, None, &medium, Some("BC-ANY")).unwrap();
+            assert_eq!(out, Corroboration::Agreed);
+        }
+
+        /// A check that cannot see cannot refuse — the rule
+        /// `check_loaded_cartridge` introduced, preserved. Virtual drives
+        /// that expose no medium serial keep working unchanged.
+        #[test]
+        fn an_unreadable_medium_serial_is_silent_rather_than_a_refusal() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(None),
+                None,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn an_unbound_volume_is_silent() {
+            let conn = db::open_memory().unwrap();
+            let vol = new_volume(&conn, "L6-0001");
+            let c = claim_for_volume(&conn, vol, "L6-0001").unwrap();
+            assert!(c.bound.is_none());
+            corroborate_contact(
+                &conn,
+                Some(&c),
+                &MediumFacts::from_serial(Some("SER-2".into())),
+                None,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn an_unparseable_file0_is_an_absence() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            let medium = MediumFacts::new(Some("SER-1".into()), File0Facts::default());
+            corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None).unwrap();
+        }
+
+        // ── File 0 names a different volume (issue #164) ──
+
+        #[test]
+        fn a_file0_naming_a_different_volume_is_refused() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            let medium =
+                MediumFacts::new(Some("SER-1".into()), file0("L6-0002", "SER-1", Some("mam")));
+            let err = corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("wrong tape"), "{err}");
+            assert!(
+                err.contains("L6-0001"),
+                "must name what was asked for: {err}"
+            );
+            assert!(err.contains("L6-0002"), "must name what was found: {err}");
+        }
+
+        /// `layout-session.md`: label AND uuid must match, so a label reused
+        /// after a retire reads as a different volume.
+        #[test]
+        fn a_file0_with_the_same_label_but_a_different_uuid_is_refused() {
+            let (conn, vol, _) = bound("BC001", Some("SER-1"), Some("mam"));
+            conn.execute(
+                "UPDATE volumes SET uuid = 'uuid-catalog' WHERE id = ?1",
+                params![vol],
+            )
+            .unwrap();
+            let mut f = file0("L6-0001", "SER-1", Some("mam"));
+            f.uuid = Some("uuid-on-tape".into());
+            let medium = MediumFacts::new(Some("SER-1".into()), f);
+            let err = corroborate_contact(&conn, Some(&claim(&conn, vol)), &medium, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("uuid-catalog"), "{err}");
+            assert!(err.contains("uuid-on-tape"), "{err}");
+        }
+
+        /// Structural, not asserted at runtime: the refusal takes no `force`
+        /// of any kind, like its four siblings. Adding one fails to compile
+        /// here first.
+        #[test]
+        fn corroboration_takes_no_force() {
+            let f: fn(
+                &Connection,
+                Option<&CatalogClaim>,
+                &MediumFacts,
+                Option<&str>,
+            ) -> Result<Corroboration> = corroborate_contact;
+            let _ = f;
+        }
     }
 }
