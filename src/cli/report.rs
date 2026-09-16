@@ -1352,6 +1352,44 @@ fn report_age(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -
     Ok(())
 }
 
+/// One `report events` line, as a pure string so the whole rendering can be
+/// asserted (the #56 lesson: a formatter that only exists inline gets tested
+/// by proxy, or not at all).
+///
+/// The old/new values used to be destructured as `_old, _new` and dropped on
+/// the floor, so the default output named the FIELD that changed and never
+/// what it changed from or to. That made issue #185 unobservable from the
+/// command an operator actually runs: #185 fixed move events to carry
+/// location NAMES on both sides (ADR-0012), and the whole point of that
+/// ruling is that "a reader cannot tell what `3` was without querying a table
+/// the event was supposed to spare them" — but a reader of `report events`
+/// could not tell what ANY value was. `--json` carried both all along, which
+/// is why the gap survived; the human view is the one an operator reaches for
+/// first.
+///
+/// A creation or deletion event carries neither value and renders exactly as
+/// before, so the added clause appears only where there is something to say.
+fn event_line(
+    ts: &str,
+    etype: &str,
+    label: Option<&str>,
+    action: &str,
+    field: Option<&str>,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> String {
+    let label_str = label.unwrap_or("?");
+    let field_str = field.map(|f| format!(".{f}")).unwrap_or_default();
+    let change = match (old, new) {
+        (None, None) => String::new(),
+        // "(none)" is the rendering for an absent side — an entity that was
+        // in no location before this move reads as a real transition rather
+        // than as a missing word.
+        (o, n) => format!(": {} \u{2192} {}", o.unwrap_or("(none)"), n.unwrap_or("(none)")),
+    };
+    format!("{ts} {etype}/{label_str} {action}{field_str}{change}")
+}
+
 fn report_events(
     conn: &Connection,
     entity_filter: Option<&str>,
@@ -1406,10 +1444,11 @@ fn report_events(
     } else if rows.is_empty() {
         println!("no events found");
     } else {
-        for (ts, etype, label, action, field, _old, _new) in &rows {
-            let label_str = label.as_deref().unwrap_or("?");
-            let field_str = field.as_ref().map(|f| format!(".{f}")).unwrap_or_default();
-            println!("  {ts} {etype}/{label_str} {action}{field_str}");
+        for (ts, etype, label, action, field, old, new) in &rows {
+            println!(
+                "  {}",
+                event_line(ts, etype, label.as_deref(), action, field.as_deref(), old.as_deref(), new.as_deref())
+            );
         }
     }
     Ok(())
@@ -2505,5 +2544,66 @@ Write error counter page [0x2]
             assert!(line.contains("alerts=2"));
             assert!(line.contains("TAPE ALERT"));
         }
+    }
+
+    // ---- issue #185: the move a reader can actually read ----
+
+    /// #185 made move events carry location NAMES on both sides (ADR-0012).
+    /// This pins that the default output shows them, which it did not: the
+    /// renderer dropped both values, so the fix was observable only through
+    /// `--json`.
+    #[test]
+    fn a_move_event_renders_both_location_names() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "cartridge",
+            Some("A001L6"),
+            "moved",
+            Some("location"),
+            Some("home"),
+            Some("bank"),
+        );
+        assert_eq!(
+            line,
+            "2026-09-16 12:00:00 cartridge/A001L6 moved.location: home \u{2192} bank",
+            "a reader must be able to see what the location changed from, \
+             which is the whole point of ADR-0012's names-on-both-sides rule"
+        );
+    }
+
+    /// A cartridge that was in no location before the move: the old side is
+    /// NULL and must read as a real transition, not as a missing word.
+    #[test]
+    fn an_unlocated_move_renders_none_on_the_old_side() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "volume",
+            Some("VOL-A"),
+            "moved",
+            Some("location"),
+            None,
+            Some("vault"),
+        );
+        assert!(
+            line.ends_with("moved.location: (none) \u{2192} vault"),
+            "got: {line}"
+        );
+    }
+
+    /// An event carrying neither value (a creation, a deletion) renders
+    /// exactly as it always did — the new clause appears only where there is
+    /// something to say.
+    #[test]
+    fn an_event_with_no_values_renders_unchanged() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "volume",
+            Some("VOL-A"),
+            "created",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(line, "2026-09-16 12:00:00 volume/VOL-A created");
     }
 }

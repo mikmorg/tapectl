@@ -1835,18 +1835,31 @@ rr_retire_refused_sole_copy() {
     echo "$out" | grep -qi "ZERO copies remaining" || { echo "impact analysis did not name a zero-copy unit ('ZERO copies remaining'): $out"; return 1; }
 }
 
-# A second COPY of the same v1 content (re-stage the same version, write
-# again) — not a new version, and not `volume read-slices` (which MOVES
-# slices into staging for a follow-on write, self-describing invariant
-# preserved, rather than duplicating them).
+# A second COPY of the same v1 content — not a new version, and not
+# `volume read-slices` (which MOVES slices into staging for a follow-on
+# write, self-describing invariant preserved, rather than duplicating them).
+#
+# This used to re-stage each unit (`stage create <unit> --version 1`) before
+# writing, and that CANNOT WORK — it is the same defect issue #198 found in
+# the compaction scenario, and it made this scenario red on master too
+# (measured 2026-09-16: 10 checks, 6 passed, 4 failed, first failure here).
+# `volume write` leaves every stage set it writes `'staged'`
+# (src/volume/write.rs `find_staged_data`; `staging clean` is the release
+# half of that design), and `stage create` refuses a version that still has
+# a live set:
+#
+#     error: unit "photos" v1 already has a stage set with live slices
+#
+# So the second copy is simply a SECOND WRITE of the sets that are still
+# live from `bootstrap_archive_v1`. That is also the more faithful shape:
+# it yields byte-identical content, which is what ADR-0012 defines a Copy to
+# be, where a re-stage would produce fresh bytes (dar timestamps, randomized
+# age) for the same version.
 rr_write_second_copy_volb() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
         skip "rr.write_second_copy_volb" "single-cartridge mode cannot hold a second, independent copy of VOL-A's content"
         return $?
     fi
-    TCTL stage create photos --version 1 || return 1
-    TCTL stage create docs --version 1 || return 1
-    TCTL stage create big --version 1 || return 1
     next_tape VOL-B || return 1
     vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV"
 }
