@@ -201,22 +201,11 @@ fn gstat_reports_no_medium(gstat: i64) -> bool {
 // Duplicated from `tape::ioctl` (private there — see `probe_no_medium`'s doc
 // comment for why). `MTIOCGET` from <linux/mtio.h>: `_IOR('m', 2, struct
 // mtget)`.
-const MTIOCGET: u64 = 0x80306d02;
+use crate::tape::ioctl::{MtGet, MTIOCGET};
 
 // Duplicated from `tape::ioctl` (private there): the `mtget` struct shape
 // from <linux/mtio.h>. Only `mt_gstat` is read; the rest exist so the ioctl
 // writes into a correctly-sized buffer.
-#[repr(C)]
-#[derive(Default)]
-struct MtGet {
-    mt_type: i64,
-    mt_resid: i64,
-    mt_dsreg: i64,
-    mt_gstat: i64,
-    mt_erreg: i64,
-    mt_fileno: i32,
-    mt_blkno: i32,
-}
 
 /// Open `device_tape` with `O_NONBLOCK` and read `MTIOCGET`'s `mt_gstat`
 /// register. `None` on any failure (open or ioctl) — logged at `warn` and

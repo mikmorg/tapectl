@@ -6,7 +6,14 @@ use crate::error::{Result, TapectlError};
 
 // Linux tape ioctl constants from <linux/mtio.h>
 const MTIOCTOP: u64 = 0x40086d01;
-const MTIOCGET: u64 = 0x80306d02;
+/// `_IOR('m', 2, struct mtget)` from `<linux/mtio.h>`.
+///
+/// `pub(crate)` so `tape::media_detect`'s no-medium probe (issue #152) reads
+/// the SAME kernel ABI this module does. It briefly had its own copy; two
+/// declarations of an ioctl number and a `#[repr(C)]` layout that `unsafe`
+/// code casts a raw pointer through is a drift hazard of a nastier kind than
+/// most — a divergence would not fail to compile, it would read garbage.
+pub(crate) const MTIOCGET: u64 = 0x80306d02;
 
 // mtop operation codes
 const MTREW: i16 = 6;
@@ -24,16 +31,18 @@ struct MtOp {
     mt_count: i32,
 }
 
+/// `struct mtget` from `<linux/mtio.h>`. `pub(crate)` for the same reason as
+/// [`MTIOCGET`] — one declaration of the layout, not two.
 #[repr(C)]
 #[derive(Debug, Default)]
-struct MtGet {
-    mt_type: i64,
-    mt_resid: i64,
-    mt_dsreg: i64,
-    mt_gstat: i64,
-    mt_erreg: i64,
-    mt_fileno: i32,
-    mt_blkno: i32,
+pub(crate) struct MtGet {
+    pub(crate) mt_type: i64,
+    pub(crate) mt_resid: i64,
+    pub(crate) mt_dsreg: i64,
+    pub(crate) mt_gstat: i64,
+    pub(crate) mt_erreg: i64,
+    pub(crate) mt_fileno: i32,
+    pub(crate) mt_blkno: i32,
 }
 
 /// Tape position info.
