@@ -325,7 +325,8 @@ pub enum DbCommands {
     },
     /// Check database integrity
     Fsck {
-        /// Attempt to repair issues
+        /// Delete rows whose foreign-key parent is missing, closing the
+        /// graph in one transaction (children first, in effect); logged
         #[arg(long)]
         repair: bool,
     },
