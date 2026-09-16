@@ -4654,6 +4654,226 @@ mod tests {
         );
     }
 
+    // ---- issue #166: the drive/medium refusal at every write contact ----
+
+    /// `volume_write` never re-checked the drive against the medium after
+    /// `volume_init` — a volume initialised on one drive could be written
+    /// from a different one, failing loudly on the drive's first physical
+    /// write instead of refusing here, free, before the store is ever
+    /// opened.
+    ///
+    /// The backend's generation (LTO-8) cannot write the volume's recorded
+    /// generation (LTO-6); the device is nonexistent, so `detect` finds
+    /// nothing and the check falls back to the volume's own row — the same
+    /// cannot-see-cannot-refuse rule `check_loaded_generation` already
+    /// follows. `force` changes nothing: `check_drive_can_write` has no
+    /// `force` parameter at all (ADR-0010 decision 2, ADR-0008 Tier 3). And
+    /// the refusal fires before `bind_late`, before the session directory,
+    /// before `build()` — nothing progresses at all (issue #154's
+    /// ordering).
+    #[test]
+    fn volume_write_refuses_a_drive_that_cannot_write_the_recorded_generation_before_bind_late() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                 sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'p', 'e', '/nonexistent/tapectl-gencheck-slice.dar.age')",
+            params![stage_set_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-GENCHK', 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().join("staging").to_string_lossy().into_owned();
+        config.backends.lto.push(crate::config::LtoBackendConfig {
+            name: "lto8".into(),
+            device_tape: "/nonexistent/tapectl-gencheck-nst".into(),
+            device_sg: "/nonexistent/tapectl-gencheck-sg".into(),
+            generation: "LTO-8".into(),
+            capacity_override: None,
+            usable_capacity_factor: 1.0,
+            enospc_buffer: "0".into(),
+        });
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+
+        for force in [false, true] {
+            let err = volume_write(
+                &conn,
+                &paths,
+                &config,
+                "L6-GENCHK",
+                "/nonexistent/tapectl-gencheck-nst",
+                512 * 1024,
+                force,
+                false,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("cannot write LTO-6"), "{msg}");
+            assert!(msg.contains("physical"), "{msg}");
+            assert!(msg.contains("--force does not override it"), "{msg}");
+            assert!(msg.contains("[[backends.lto]]"), "{msg}");
+        }
+
+        // Ordering (issue #154): the refusal ran before `bind_late`, before
+        // the session directory / `build()` — nothing progressed at all.
+        let writes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes, 0, "no write session may exist after a refused write");
+        let bindings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cartridge_volumes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bindings, 0, "a refused write must displace nothing");
+        assert!(
+            !tmp.path().join("staging").join("sessions").exists(),
+            "the session directory must never be created for a refused write"
+        );
+    }
+
+    /// `volume_resume` never checked the drive against the medium at all.
+    /// Same refusal as `volume_write`'s test above, reached via a manually
+    /// assembled interrupted session: `InterruptedSession::rehydrate` only
+    /// reads the `writes`/`write_positions` rows and the frozen
+    /// `layout.json` sidecar, never re-derives a Layout, so a hand-built
+    /// `Layout` (mirroring
+    /// `stage_set_ids_for_layout_maps_slice_entries_back_to_their_stage_sets`'s
+    /// fixture) is enough to reach `volume_resume`'s new check without a
+    /// real prior write.
+    #[test]
+    fn volume_resume_refuses_a_drive_that_cannot_write_the_recorded_generation() {
+        let (conn, tenant_id, stage_set_id) = escrow_check_fixture();
+
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                 sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'p', 'e',
+                     '/nonexistent/tapectl-resume-gencheck-slice.dar.age')",
+            params![stage_set_id],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-RESUMEGEN', 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+
+        let session_dir = tempfile::TempDir::new().unwrap();
+        let layout = Layout {
+            label: "L6-RESUMEGEN".into(),
+            volume_uuid: "u".into(),
+            media_type: "LTO-6".into(),
+            block_size: 512 * 1024,
+            budget: CapacityBudget {
+                available_bytes: 1_000_000_000,
+                reserve_bytes: 0,
+            },
+            entries: vec![
+                LayoutEntry {
+                    position: 0,
+                    kind: ZoneKind::IdThunk,
+                    size_bytes: Some(10),
+                    sha256: None,
+                    source: ContentSource::Generated,
+                },
+                LayoutEntry {
+                    position: 1,
+                    kind: ZoneKind::TenantEnvelope { tenant_id },
+                    size_bytes: Some(10),
+                    sha256: None,
+                    source: ContentSource::Generated,
+                },
+                LayoutEntry {
+                    position: 4,
+                    kind: ZoneKind::Slice {
+                        stage_slice_id: slice_id,
+                    },
+                    size_bytes: Some(10),
+                    sha256: Some("e".into()),
+                    source: ContentSource::Generated,
+                },
+            ],
+        };
+        let json = serde_json::to_vec_pretty(&layout).unwrap();
+        std::fs::write(
+            session_dir.path().join(crate::volume::build::LAYOUT_SIDECAR),
+            json,
+        )
+        .unwrap();
+
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, 'interrupted', ?4)",
+            params![
+                stage_set_id,
+                snapshot_id,
+                volume_id,
+                session_dir.path().to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let mut config = Config::default();
+        config.backends.lto.push(crate::config::LtoBackendConfig {
+            name: "lto8".into(),
+            device_tape: "/nonexistent/tapectl-resume-gencheck-nst".into(),
+            device_sg: "/nonexistent/tapectl-resume-gencheck-sg".into(),
+            generation: "LTO-8".into(),
+            capacity_override: None,
+            usable_capacity_factor: 1.0,
+            enospc_buffer: "0".into(),
+        });
+
+        let err = volume_resume(
+            &conn,
+            &paths,
+            &config,
+            "L6-RESUMEGEN",
+            "/nonexistent/tapectl-resume-gencheck-nst",
+            512 * 1024,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot write LTO-6"), "{msg}");
+        assert!(msg.contains("physical"), "{msg}");
+
+        // Nothing progressed: the interrupted session is untouched (never
+        // even reached `TapeStore::open`, let alone `session.resume`).
+        let write_status: String = conn
+            .query_row(
+                "SELECT status FROM writes WHERE id = ?1",
+                params![write_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_status, "interrupted");
+    }
+
     /// ADR-0012 / issue #161, fix item 3: the status guard runs BEFORE the
     /// unresolved-write-session check, and this pins that ORDER rather than
     /// merely the guard's existence.
