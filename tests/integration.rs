@@ -2517,12 +2517,19 @@ fn test_db_backup_json_reports_whether_keys_were_included() {
 ///
 /// Scenario: two units both have a copy on the volume being retired
 /// (`L6-RETIRE`).
-/// - `zero_copy_unit` has NO other copy anywhere -- this is the existing
-///   Tier-2 at-risk case and must still fire the consent gate.
+/// - `zero_copy_unit` has NO other copy anywhere, and its one version has
+///   been RELEASED (`snapshots.status = 'reclaimable'`) -- so the ADR-0008
+///   Tier-3 floor does not protect it (issue #147: the floor is defined by
+///   what the act removes, and a released version is one the operator has
+///   already given up). It is a Tier-2 at-risk unit and `--yes` waives it.
+///   That `reclaimable` is load-bearing: with a `current` version here this
+///   retirement would be REFUSED outright and no flag would reach it --
+///   which `volume_retire_tier3_refuses_the_last_eligible_copy` below
+///   proves against this same binary.
 /// - `covered_unit` ALSO has a copy on a second, already-sealed volume
 ///   (`L6-OTHER`) whose only passing verification is far in the past.
 ///
-/// This mixes the zero-copy (Tier 2) and evidence-bearing (Tier 1) cases in
+/// This mixes the at-risk (Tier 2) and evidence-bearing (Tier 1) cases in
 /// one retirement, which is deliberate: the evidence line must appear only
 /// for the unit that still has coverage, and the naive "forgot to exclude
 /// the retiring volume" bug would cite `L6-RETIRE` itself as the covered
@@ -2557,9 +2564,12 @@ fn test_volume_retire_shows_coverage_evidence_age() {
     let covered_unit_id = conn.last_insert_rowid();
 
     // Snapshots + stage sets, one per unit.
+    // 'reclaimable', not 'current': see this test's header. A released
+    // version is outside ADR-0008's Tier-3 floor, which is what keeps this
+    // retirement at Tier 2 where `--yes` can waive it.
     conn.execute(
         "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
-         VALUES (?1, 1, 'full', 'current', '/tmp/u1')",
+         VALUES (?1, 1, 'full', 'reclaimable', '/tmp/u1')",
         [zero_unit_id],
     )
     .unwrap();
@@ -2786,7 +2796,10 @@ fn test_volume_retire_shows_coverage_evidence_age() {
 
     // The zero-copy unit alone must NOT trigger the "unparseable" or
     // evidence machinery -- it has zero remaining copies, so no evidence at
-    // all, and it must still be flagged at_risk (Tier 2 unchanged).
+    // all, and it must still be flagged at_risk (Tier 2, which `--yes`
+    // waived). Its `last_copy_versions` must be EMPTY: the floor is defined
+    // by what the act removes, and this unit's version was already
+    // released.
     let zero = affected
         .iter()
         .find(|u| u["unit"] == "zero_copy_unit")
@@ -2803,6 +2816,11 @@ fn test_volume_retire_shows_coverage_evidence_age() {
         zero["evidence_summary"].is_null(),
         "a zero-copy unit's evidence_summary must be null, not a fabricated line: {zero:?}"
     );
+    assert_eq!(
+        zero["last_copy_versions"].as_array().map(Vec::len),
+        Some(0),
+        "a RELEASED version is not something the Tier-3 floor protects: {zero:?}"
+    );
 
     // The success-path JSON (this ran with --yes, so it succeeded, not
     // refused) doesn't carry a top-level at_risk_units array -- that's
@@ -2810,6 +2828,141 @@ fn test_volume_retire_shows_coverage_evidence_age() {
     // that only zero_copy_unit is at zero and the other two are not.
     assert_eq!(covered["remaining_copies"], 1);
     assert_eq!(never["remaining_copies"], 1);
+}
+
+/// ADR-0008 Tier 3 / ADR-0012, issue #147, proved against the real binary:
+/// the global `--yes` must not reach the retire family's floor.
+///
+/// The unit tests prove `refuse_last_eligible_copy` takes no `force`
+/// parameter, which is the structural half. This is the other half — clap's
+/// GLOBAL `--yes` flows into `volume_retire`'s `assume_yes`, so the only
+/// way to know the wiring did not quietly hand it to the floor is to run
+/// the binary with it and watch the command fail.
+///
+/// It doubles as the operator-facing record: this is the exact text and the
+/// exact exit status someone sees at the moment they would otherwise have
+/// destroyed the last copy of live data.
+#[test]
+fn volume_retire_tier3_refuses_the_last_eligible_copy() {
+    let (_tmp, conn, home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'photos', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let unit_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 3, 'full', 'current', '/tmp/photos')",
+        [unit_id],
+    )
+    .unwrap();
+    let snap_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap_id],
+    )
+    .unwrap();
+    let ss_id = conn.last_insert_rowid();
+    // SEALED: the only shape in which retiring it removes a copy.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-SOLE', 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let vol_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![ss_id, snap_id, vol_id],
+    )
+    .unwrap();
+
+    drop(conn);
+
+    let config_path = home.join("config.toml");
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--home".to_string(),
+            home.to_str().unwrap().to_string(),
+            "--config".to_string(),
+            config_path.to_str().unwrap().to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args.extend(
+            ["volume", "retire", "L6-SOLE"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args(&args)
+            .output()
+            .expect("failed to run the tapectl binary")
+    };
+
+    // `--yes` is the strongest waiver the CLI has, and it must get nowhere.
+    let output = run(&["--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !output.status.success(),
+        "`--yes volume retire` of the last eligible copy must FAIL; stdout: \
+         {stdout:?}, stderr: {stderr:?}"
+    );
+    for needle in [
+        "LAST eligible copy",
+        "unit \"photos\" v3",
+        "tapectl volume read-slices --from L6-SOLE --unit photos",
+        "tapectl snapshot mark-reclaimable photos --version 3",
+        "tapectl volume verify L6-SOLE",
+        "no --force for this",
+    ] {
+        assert!(
+            combined.contains(needle),
+            "the operator must be told {needle:?}: {combined}"
+        );
+    }
+
+    // And nothing moved.
+    let conn = rusqlite::Connection::open(home.join("tapectl.db")).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM volumes WHERE label = 'L6-SOLE'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "sealed", "a refused retirement must change nothing");
+
+    // `--json` must carry the reason too (issue #38's rule): a JSON consumer
+    // has to see WHY, not just a non-zero exit.
+    let output = run(&["--yes", "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON ({e}): {stdout:?}"));
+    assert_eq!(parsed["consent"], "refused");
+    assert!(
+        parsed["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("LAST eligible copy"),
+        "the JSON refusal must carry the floor's reason: {parsed}"
+    );
+    assert_eq!(
+        parsed["affected_units"][0]["last_copy_versions"][0], 3,
+        "the JSON must name the version the floor protects: {parsed}"
+    );
 }
 
 /// Issue #99: `unit mark-tape-only` surfaces ADR-0004 evidence for the
@@ -3141,6 +3294,14 @@ fn test_compact_finish_shows_coverage_evidence() {
             home.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
+            // `--yes` since issue #147: unit1 ends with ONE copy (L6-DST)
+            // against the shipped `min_copies = 2`, which is exactly the
+            // below-policy case ADR-0008 puts in Tier 2 and this command
+            // had no gate for at all. The Tier-2 waiver is what this flag
+            // is; the evidence assertions below are unchanged, and the
+            // Tier-3 floor is untouched because L6-DST still carries the
+            // version.
+            "--yes",
             "--json",
             "volume",
             "compact-finish",
