@@ -154,9 +154,9 @@ converts "use judgment" into "don't do X".}}
    #166 and #178 carry comments drawing that line explicitly.
 3. **Run every cargo command synchronously, in the foreground.** Issue ONE
    Bash call containing the cargo command. It will sit there for minutes and
-   then hand you the output. **That blocking IS how you wait.** A baseline
-   `cargo test` is run first, waited on, and its totals recorded; no file is
-   touched until it returns.
+   then hand you the output. **That blocking IS how you wait.** Your prompt
+   states the baseline test count — do NOT re-derive it with a full
+   `cargo test` before your first edit (see rule (a) below).
 
    - WRONG: `run_in_background: true`, then polling the output file; arming
      a Monitor or an `until` loop; waiting for a "completion notification".
@@ -165,9 +165,30 @@ converts "use judgment" into "don't do X".}}
 
    **No completion notification is coming — the coordinator sends none.**
    Every attempt to make this asynchronous costs a full turn and produces
-   nothing. Three workers stalled this way on 2026-09-11, and the #154
-   worker stalled three times on 2026-09-15 with this prohibition already
-   in its prompt — which is why it is now an example rather than a rule.
+   nothing. Three workers stalled this way on 2026-09-11; the #154 worker
+   stalled three times on 2026-09-15; and on 2026-09-16 the #171 and #177
+   workers both stalled again — #171 burned 263k tokens and 120 tool calls
+   and produced ZERO commits and ZERO file edits, its worktree byte-identical
+   to master. Every one of those had this prohibition in its prompt.
+
+   **Escalating this prose has now failed four times, so do not simply make
+   it louder again.** Two structural rules carry the weight instead, and
+   they are what actually changed on 2026-09-16:
+
+   a. **The coordinator supplies the baseline test count in the prompt; the
+      worker does NOT run a full `cargo test` before its first edit.** The
+      opening `cargo test` was the stall point in every 2026-09-16 case —
+      it is the longest block (3+ min, plus lock contention) and it arrives
+      when the agent has nothing invested yet, which is exactly when
+      backgrounding it feels free. Use `cargo check --all-targets` (~30 s)
+      while iterating, and run the one full `cargo test` at the final gate,
+      by which time there are commits banked.
+
+   b. **Commit after every logical change, not at the end.** A stall then
+      costs the remaining work, not all of it. #177 was resumable on
+      2026-09-16 because its tests were on disk; #171 was not, because
+      nothing was. If you are about to run something long, commit first.
+
    Sitting behind the shared `flock` for several minutes while another
    worker links is normal and expected; let it block.
 4. Apply changes in order; `cargo check --all-targets` after each.
