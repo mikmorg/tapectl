@@ -76,6 +76,21 @@ pub enum TapectlError {
     #[error("volume not found: {0}")]
     VolumeNotFound(String),
 
+    /// ADR-0012: `volume write`/`volume resume` refuse any volume whose
+    /// catalog status is not `initialized` (`policy::coverage::is_write_target`).
+    /// Not a Tier-2 risk judgement — `--force` never consults this, because
+    /// there is nothing to override: it is a fact about the catalog row, and
+    /// a sealed/retired/erased/quarantined volume is never a write target
+    /// regardless of what tape happens to be loaded.
+    #[error(
+        "volume \"{label}\" is {status} and is not a write target (ADR-0012): only a volume \
+         that `volume init` left `initialized` can be written, and a sealed volume is never \
+         written again (ADR-0003). `--force` does not apply — this is a fact about the catalog \
+         row, not a risk judgement. To write this cartridge again, run `tapectl volume init \
+         <new-label>` on it; the File 0 check is the consent point (ADR-0010)."
+    )]
+    VolumeNotWriteTarget { label: String, status: String },
+
     #[error("tape I/O error: {0}")]
     TapeIo(String),
 
