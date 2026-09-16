@@ -5434,8 +5434,17 @@ mod tests {
         /// volume `active` (see `cartridge_retire::setup`).
         fn setup_retired() -> (Connection, i64, i64) {
             let (conn, cart_id, vol_id) = super::cartridge_retire::setup(true);
-            cartridge_retire(&conn, &Config::default(), "BC-RET", None, false, true, false, false)
-                .expect("--yes must satisfy the gate");
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                true,
+                false,
+                false,
+            )
+            .expect("--yes must satisfy the gate");
             (conn, cart_id, vol_id)
         }
 
@@ -5581,7 +5590,17 @@ mod tests {
                 params![vol_id],
             )
             .unwrap();
-            cartridge_retire(&conn, &Config::default(), "BC-RET", None, false, true, false, false).unwrap();
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
             assert_eq!(status_of(&conn, "volumes", vol_id), "retired");
 
             cartridge_unretire(&conn, "BC-RET", false, false).unwrap();
