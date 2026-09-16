@@ -1094,6 +1094,30 @@ pub(crate) fn corroborate_contact(
         return Ok(Corroboration::Agreed);
     }
 
+    // ...but ONLY for a binding that never had one. `bind_cartridge` records
+    // `identity_source = 'mam'` exactly when its `serial` argument was
+    // `Some` (migration 014), so `'mam'` with a NULL `serial_number` is not
+    // ADR-0012's "a bound row that has no serial YET" — it is a row that HAD
+    // a chip serial and has since lost it. That is an inconsistent catalog,
+    // and `volume::write::resolve_cartridge_identity` already refuses it by
+    // name, pointing at `db backup`.
+    //
+    // Learning here would silently repair it from THIS CONTACT'S MAM read
+    // and make that guard unreachable — sealing File 0 with a serial taken
+    // from whichever drive happened to write the tape, which is precisely
+    // the source #192 rejected ("the identity comes from the binding, never
+    // from a fresh MAM read"). A damaged catalog is not a fact this contact
+    // can establish, so it is left exactly as it is: an ABSENCE on the read
+    // paths, and the write path's own refusal where it matters.
+    if bound.identity_source.as_deref() == Some("mam") {
+        tracing::warn!(
+            cartridge = %barcode,
+            "binding claims a chip-reported identity but the cartridge row records no \
+             serial; not learning one from this contact (inconsistent catalog)"
+        );
+        return Ok(Corroboration::Agreed);
+    }
+
     // ...unless another row already holds that serial, in which case the
     // loaded tape IS that other cartridge. Refused BEFORE the UPDATE and by
     // name: `idx_cartridges_serial_number` would otherwise surface this as a
@@ -2356,6 +2380,32 @@ mod tests {
                 row_serial(&conn, cart).as_deref(),
                 Some("SER-1"),
                 "a refused contact must not have rewritten the serial"
+            );
+        }
+
+        /// `bind_cartridge` writes `identity_source = 'mam'` exactly when
+        /// it had a serial to record (migration 014), so `'mam'` beside a
+        /// NULL `serial_number` is a row that HAD a chip serial and lost it
+        /// — an inconsistent catalog, which
+        /// `volume::write::resolve_cartridge_identity` refuses by name.
+        ///
+        /// Learning here would repair it from THIS contact's MAM read and
+        /// make that guard unreachable, sealing File 0 with a serial taken
+        /// from whichever drive wrote the tape — the source #192 rejected.
+        #[test]
+        fn a_mam_binding_that_lost_its_serial_is_not_repaired_from_the_drive() {
+            let (conn, vol, cart) = bound("BC001", None, Some("mam"));
+            let out = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol)),
+                &MediumFacts::from_serial(Some("SER-1".into())),
+                None,
+            )
+            .unwrap();
+            assert_eq!(out, Corroboration::Agreed, "an absence, not a repair");
+            assert!(
+                row_serial(&conn, cart).is_none(),
+                "the write path's inconsistent-catalog refusal must stay reachable"
             );
         }
 
