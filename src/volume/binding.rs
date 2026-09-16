@@ -412,7 +412,11 @@ pub(crate) fn refuse_retired(row: &CartridgeRow) -> Result<()> {
     Ok(())
 }
 
-fn select_cartridge(conn: &Connection, column: &str, value: &str) -> Result<Option<CartridgeRow>> {
+pub(crate) fn select_cartridge(
+    conn: &Connection,
+    column: &str,
+    value: &str,
+) -> Result<Option<CartridgeRow>> {
     // `column` is never operator input: both call sites pass a literal.
     let sql = format!(
         "SELECT id, barcode, media_type, nominal_capacity, status, serial_number
@@ -437,35 +441,40 @@ fn select_cartridge(conn: &Connection, column: &str, value: &str) -> Result<Opti
     Ok(row)
 }
 
-/// Bind `volume_id` to the cartridge in the drive, recording (never
-/// refusing) whatever it displaces — the one case ADR-0010's rule does not
-/// cover having already been refused upstream by
-/// [`refuse_unwitnessed_displacement`] (ADR-0012, issue #155).
+/// What [`resolve_or_register_cartridge`] found or created — the row
+/// [`mount_and_record`] mounts the volume onto, plus the two facts specific
+/// to RESOLUTION (`auto_registered`, `serial_recorded`) that mounting itself
+/// has no way to know.
+struct ResolvedCartridge {
+    id: i64,
+    barcode: String,
+    prior_status: String,
+    auto_registered: bool,
+    serial_recorded: bool,
+}
+
+/// Find or auto-register the cartridge a write is for, WITHOUT mounting
+/// anything — the resolve half of what [`bind_cartridge`] used to do in one
+/// function (issue #165 item 2, split so `catalog rebuild` can run its OWN
+/// resolution — a serial OR a barcode identity, neither of which this
+/// function knows about — and still share [`mount_and_record`]'s tail).
 ///
-/// Call inside the same transaction as the `volumes` INSERT: a volume that
-/// exists but is not bound, or a displacement recorded for a volume that was
-/// never created, are both worse than either change alone.
-///
-/// - `row` — the [`lookup_cartridge`] match, if there was one.
-/// - `serial` — the MAM medium serial, if readable. With no row AND no
-///   serial there is nothing to bind to and the volume is written unbound.
-/// - `generation`/`capacity_bytes` — already resolved by the caller; used
-///   only when auto-registering.
-pub(crate) fn bind_cartridge(
+/// `Ok(None)` is the `bind_late` no-op: no row and no serial, nothing to bind
+/// to. `volume_init` never sees it — [`require_named_cartridge`] refuses
+/// first.
+fn resolve_or_register_cartridge(
     conn: &Connection,
-    volume_id: i64,
     row: Option<&CartridgeRow>,
     serial: Option<&str>,
     generation: Generation,
     capacity_bytes: i64,
     mam: &MamInfo,
-) -> Result<BindOutcome> {
-    let mut outcome = BindOutcome::default();
-
-    let (cartridge_id, barcode, prior_status) = match row {
+) -> Result<Option<ResolvedCartridge>> {
+    match row {
         Some(r) => {
             // Record the serial on a row that was pre-registered by hand and
             // has now been seen in a drive for the first time.
+            let mut serial_recorded = false;
             if r.serial_number.is_none() {
                 if let Some(s) = serial {
                     // One writer, shared with `corroborate_contact`'s learn
@@ -473,10 +482,16 @@ pub(crate) fn bind_cartridge(
                     // caller's `serial_number IS NULL` guard, here and
                     // there, rather than a rule spelled twice.
                     record_medium_serial(conn, r.id, &r.barcode, s)?;
-                    outcome.serial_recorded = true;
+                    serial_recorded = true;
                 }
             }
-            (r.id, r.barcode.clone(), r.status.clone())
+            Ok(Some(ResolvedCartridge {
+                id: r.id,
+                barcode: r.barcode.clone(),
+                prior_status: r.status.clone(),
+                auto_registered: false,
+                serial_recorded,
+            }))
         }
         None => match serial {
             // Auto-register: the barcode IS the medium serial, because that
@@ -539,18 +554,67 @@ pub(crate) fn bind_cartridge(
                 )?;
                 let id = conn.last_insert_rowid();
                 events::log_created(conn, "cartridge", id, s, None)?;
-                outcome.auto_registered = true;
-                (id, s.to_string(), "in_use".to_string())
+                Ok(Some(ResolvedCartridge {
+                    id,
+                    barcode: s.to_string(),
+                    prior_status: "in_use".to_string(),
+                    auto_registered: true,
+                    serial_recorded: false,
+                }))
             }
             // No row, no serial: nothing to bind to. mhvtl drives that
             // expose no medium serial land here, and lose nothing but the
             // binding itself.
-            None => return Ok(outcome),
+            None => Ok(None),
         },
-    };
+    }
+}
 
-    outcome.cartridge_id = Some(cartridge_id);
-    outcome.barcode = Some(barcode.clone());
+/// Mount `volume_id` onto `cartridge_id` and record everything that follows
+/// from that: recording (never refusing) whatever it displaces, the
+/// `cartridge_volumes` mount itself, ADR-0011 location inheritance, and the
+/// `in_use` transition — the shared tail of every caller that has already
+/// resolved (or auto-registered) a cartridge row (issue #165 item 2).
+///
+/// Call inside the same transaction as the volume row it mounts: a volume
+/// that exists but is not bound, or a displacement recorded for a volume that
+/// was never created, are both worse than either change alone.
+///
+/// - `serial` — the MAM medium serial, if this contact read one. Decides
+///   `identity_source` (`Some` → `"mam"`, `None` → `"operator"`) exactly as
+///   [`bind_cartridge`] always has.
+/// - `mam` — used only for `total_load_count` bookkeeping here (the
+///   auto-register write already happened in [`resolve_or_register_cartridge`]).
+/// - `displaced_by` — names the ACT that is doing the displacing, for the
+///   `events` row's detail text: `` `volume init` `` for the original two
+///   callers, `` `catalog rebuild` `` for the new one (issue #165 item 3).
+///   [`bind_cartridge`] passes `"volume init"` unconditionally — including
+///   for `bind_late`'s late binding — which is pre-existing, byte-identical
+///   behaviour this refactor does not change.
+/// - `update_status` — `false` skips the final `in_use` transition entirely,
+///   leaving `cartridges.status` exactly as found. The one caller that needs
+///   this is `catalog rebuild` recording a mount onto a `retired_permanent`
+///   cartridge (ADR-0012, issue #165 item 3): the mount is a physical fact,
+///   but no amount of contact makes a medium declared permanently unfit fit
+///   again, and flipping it to `in_use` here would say otherwise. Every
+///   other caller passes `true`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mount_and_record(
+    conn: &Connection,
+    volume_id: i64,
+    cartridge_id: i64,
+    barcode: &str,
+    prior_status: &str,
+    serial: Option<&str>,
+    mam: &MamInfo,
+    displaced_by: &str,
+    update_status: bool,
+) -> Result<BindOutcome> {
+    let mut outcome = BindOutcome {
+        cartridge_id: Some(cartridge_id),
+        barcode: Some(barcode.to_string()),
+        ..BindOutcome::default()
+    };
 
     // --- record the displacement (ADR-0010: never refuse it) -------------
     // Still never refused HERE, and the one case ADR-0010's rule does not
@@ -595,13 +659,13 @@ pub(crate) fn bind_cartridge(
             conn,
             "cartridge",
             cartridge_id,
-            Some(&barcode),
+            Some(barcode),
             "displaced",
             None,
             Some(label),
             None,
             Some(&format!(
-                "volume \"{label}\" was displaced by `volume init` writing a new volume \
+                "volume \"{label}\" was displaced by `{displaced_by}` writing a new volume \
                  to this cartridge (ADR-0010); its bytes are gone from the medium"
             )),
             None,
@@ -676,6 +740,10 @@ pub(crate) fn bind_cartridge(
         }
     }
 
+    if !update_status {
+        return Ok(outcome);
+    }
+
     // `in_use` unconditionally, from ANY prior status. A precondition here
     // would be a consent gate in disguise: `pending_erase -> mt erase ->
     // volume init` is exactly the ordinary reuse ADR-0010 protects.
@@ -700,10 +768,10 @@ pub(crate) fn bind_cartridge(
             conn,
             "cartridge",
             cartridge_id,
-            &barcode,
+            barcode,
             "updated",
             "status",
-            Some(&prior_status),
+            Some(prior_status),
             "in_use",
             None,
         )?;
@@ -716,6 +784,58 @@ pub(crate) fn bind_cartridge(
         )?;
     }
 
+    Ok(outcome)
+}
+
+/// Bind `volume_id` to the cartridge in the drive, recording (never
+/// refusing) whatever it displaces — the one case ADR-0010's rule does not
+/// cover having already been refused upstream by
+/// [`refuse_unwitnessed_displacement`] (ADR-0012, issue #155).
+///
+/// Call inside the same transaction as the `volumes` INSERT: a volume that
+/// exists but is not bound, or a displacement recorded for a volume that was
+/// never created, are both worse than either change alone.
+///
+/// - `row` — the [`lookup_cartridge`] match, if there was one.
+/// - `serial` — the MAM medium serial, if readable. With no row AND no
+///   serial there is nothing to bind to and the volume is written unbound.
+/// - `generation`/`capacity_bytes` — already resolved by the caller; used
+///   only when auto-registering.
+///
+/// A thin composition of [`resolve_or_register_cartridge`] +
+/// [`mount_and_record`] (issue #165 item 2): resolve or auto-register, then
+/// mount with `displaced_by = "volume init"` and `update_status = true`,
+/// unconditionally — `bind_late` calls this too, so its own late binding also
+/// reports as `` `volume init` ``, exactly as it always has. Signature and
+/// behaviour are unchanged by the split; every test below still drives this
+/// one function.
+pub(crate) fn bind_cartridge(
+    conn: &Connection,
+    volume_id: i64,
+    row: Option<&CartridgeRow>,
+    serial: Option<&str>,
+    generation: Generation,
+    capacity_bytes: i64,
+    mam: &MamInfo,
+) -> Result<BindOutcome> {
+    let Some(resolved) =
+        resolve_or_register_cartridge(conn, row, serial, generation, capacity_bytes, mam)?
+    else {
+        return Ok(BindOutcome::default());
+    };
+    let mut outcome = mount_and_record(
+        conn,
+        volume_id,
+        resolved.id,
+        &resolved.barcode,
+        &resolved.prior_status,
+        serial,
+        mam,
+        "volume init",
+        true,
+    )?;
+    outcome.auto_registered = resolved.auto_registered;
+    outcome.serial_recorded = resolved.serial_recorded;
     Ok(outcome)
 }
 
@@ -1211,12 +1331,14 @@ fn row_holding_serial(conn: &Connection, serial: &str, excluding: i64) -> Result
 /// events row that says where it came from.
 ///
 /// The ONE writer of `cartridges.serial_number` on the binding paths, shared
-/// by [`bind_cartridge`] (establishing) and [`corroborate_contact`]
-/// (learning at a later contact). Write-once is the CALLER's guarantee —
-/// both call it only under `serial_number IS NULL` — which is what makes
-/// ADR-0012's "`NULL` → value, never value → value" structural rather than a
-/// rule repeated in two places.
-fn record_medium_serial(
+/// by [`bind_cartridge`] (establishing), [`corroborate_contact`] (learning at
+/// a later contact), and `catalog rebuild`'s own resolve step (issue #165
+/// item 3: an operator-identity File 0 whose bound row has no serial yet,
+/// learned from a serial this contact separately observed). Write-once is
+/// the CALLER's guarantee — every caller calls it only under `serial_number
+/// IS NULL` — which is what makes ADR-0012's "`NULL` → value, never value →
+/// value" structural rather than a rule repeated in three places.
+pub(crate) fn record_medium_serial(
     conn: &Connection,
     cartridge_id: i64,
     barcode: &str,
@@ -2450,6 +2572,72 @@ mod tests {
             impacts[0].other_copies, 0,
             "photos has no other copy — the warning must be able to say so"
         );
+    }
+
+    // ---- issue #165 item 2: mount_and_record is bind_cartridge's tail ----
+
+    /// `bind_cartridge` is now a thin composition of
+    /// `resolve_or_register_cartridge` + `mount_and_record`, calling the
+    /// latter with `displaced_by = "volume init"` unconditionally. This
+    /// drills `mount_and_record` DIRECTLY with that same literal and proves
+    /// the event text it writes is byte-identical to what `bind_cartridge`
+    /// itself has always produced — the refactor's whole promise: `volume
+    /// init`'s (and `bind_late`'s) behaviour did not move by one byte.
+    #[test]
+    fn mount_and_record_with_volume_init_reproduces_bind_cartridges_own_event_text() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let cart_id = lookup_cartridge(&conn, Some("SER-1"), None)
+            .unwrap()
+            .row
+            .unwrap()
+            .id;
+        let displaced_vol = new_volume(&conn, "L6-DISPLACED");
+        // Open a mount on BC001 the same way `bind_cartridge` would, so the
+        // displacement path below has something real to displace.
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+             VALUES (?1, ?2, 'mam')",
+            params![cart_id, displaced_vol],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+            params![displaced_vol],
+        )
+        .unwrap();
+
+        let new_vol = new_volume(&conn, "L6-NEW");
+        mount_and_record(
+            &conn,
+            new_vol,
+            cart_id,
+            "BC001",
+            "in_use",
+            Some("SER-1"),
+            &MamInfo::default(),
+            "volume init",
+            true,
+        )
+        .unwrap();
+
+        let detail: String = conn
+            .query_row(
+                "SELECT details FROM events WHERE entity_type = 'cartridge' \
+                 AND action = 'displaced' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            detail,
+            "volume \"L6-DISPLACED\" was displaced by `volume init` writing a new volume \
+             to this cartridge (ADR-0010); its bytes are gone from the medium",
+            "mount_and_record's event text for `displaced_by = \"volume init\"` must be \
+             byte-identical to what bind_cartridge always wrote"
+        );
+        assert_eq!(volume_status(&conn, displaced_vol), "erased");
+        assert_eq!(open_mounts(&conn, cart_id), vec![new_vol]);
     }
 
     /// ── ADR-0012 corroboration, one test per branch (issue #193) ────────
