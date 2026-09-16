@@ -136,14 +136,32 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
 ///
 /// This does NOT open the tape node the way `ioctl::density_code` or
 /// `ioctl::TapeDevice` do. It opens with `O_NONBLOCK` — which is the entire
-/// point, since the st driver's no-medium wait is a property of a *blocking*
-/// open and an `O_NONBLOCK` open returns immediately regardless of whether a
-/// medium is present — and then reads `MTIOCGET`'s `mt_gstat` register for
-/// the `GMT_DR_OPEN` bit (`<linux/mtio.h>`: "door open (no tape)"). That is
-/// exactly the bit `mt status` reports as `DR_OPEN`, and exactly what
+/// point: per the kernel's own `Documentation/scsi/st.txt`, "If the open
+/// option O_NONBLOCK is used, open succeeds even if the drive is not ready.
+/// If O_NONBLOCK is not used, the driver waits for the drive to become
+/// ready... If this does not happen in ST_BLOCK_SECONDS seconds, open fails
+/// with the errno value EIO" — that wait loop (`st_open` -> `test_ready`,
+/// gated on exactly `(filp->f_flags & O_NONBLOCK) == 0`) is the 2-minute
+/// stall this issue is about, and `O_NONBLOCK` is documented to skip it
+/// outright, not merely shorten it. `MTIOCGET`'s `mt_gstat` register is then
+/// read for the `GMT_DR_OPEN` bit, which both the kernel doc and `man 4 st`
+/// on this box define as "the drive does not have a tape in place" — exactly
+/// the bit `mt status` reports as `DR_OPEN`, and exactly what
 /// `scripts/first-run.sh` already greps `mt status` output for before its own
-/// write step — this is an in-process version of the same check, not a new
-/// idea.
+/// write step. This is an in-process version of the same check, not a new
+/// idea, and the ENOMEDIUM this issue's own report captured (the driver-
+/// density failure logged 2m05s after the MAM one) is itself evidence that
+/// mhvtl already drives the driver into exactly this state — it is the
+/// slow-path proof that the fast path below is asking the right question.
+///
+/// Residual: this only ever answers `true` for `GMT_DR_OPEN` specifically —
+/// "no tape in place". A drive stuck `NOT READY` for a different reason (no
+/// medium-absent sense code, e.g. still spinning up, or a genuine hardware
+/// fault) reports neither `DR_OPEN` nor `ONLINE`, this returns `false`, and
+/// `detect`'s blocking open still waits out its own `ST_BLOCK_SECONDS` for
+/// that case — a legitimate "still becoming ready" wait this fix does not
+/// touch, deliberately: distinguishing "briefly busy" from "truly stuck" is
+/// not this probe's job.
 ///
 /// The `MTIOCGET` request number and `mtget` layout are duplicated here from
 /// `tape::ioctl` (private there) rather than exposed from that module: this
@@ -417,6 +435,15 @@ mod tests {
         assert!(!probe_no_medium(
             "/nonexistent/tapectl-media-detect-probe-device"
         ));
+    }
+
+    /// The other way a device can fail to answer: it opens fine (`/dev/null`
+    /// takes `O_NONBLOCK` happily) but is not a tape node, so `MTIOCGET`
+    /// itself fails (ENOTTY). Same requirement as the nonexistent-path case:
+    /// a non-tape device is "couldn't tell", never a positive refusal.
+    #[test]
+    fn probe_no_medium_on_a_non_tape_device_is_false_not_a_refusal() {
+        assert!(!probe_no_medium("/dev/null"));
     }
 
     fn detected(generation: Generation, code: u8) -> Detected {

@@ -184,6 +184,10 @@ pub fn volume_init(
     // rather than after a silent multi-minute hang. This does not change
     // `detect`'s own ladder for a LOADED medium at all — it only short-
     // circuits the empty-drive case before `detect` is even called.
+    //
+    // A physical fact, not a risk judgement, same as `can_write` below:
+    // `--force` is deliberately NOT consulted. An empty drive has nothing
+    // for `--force` to override.
     if crate::tape::media_detect::probe_no_medium(device) {
         return Err(TapectlError::Other(format!(
             "no cartridge loaded in {device}"
