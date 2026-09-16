@@ -10,34 +10,24 @@ use crate::error::{Result, TapectlError};
 /// constant (`docs/design/v2-open-questions.md` §8).
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 
-/// Human-readable byte count for `cmd_run`'s budget line (issue #175) — a
-/// tiny local formatter rather than reaching into `cli::catalog`'s private
-/// `format_size`, which this module has no business depending on.
-///
-/// Decimal (1000-based), not binary: this prints a `volumes.capacity_bytes`
-/// figure and the budget derived from it, and ADR-0012 ratified "cartridge
-/// capacities are decimal, data sizes binary" specifically so a 2.5 TB
-/// LTO-6 cartridge (`media.rs`'s `2_500_000_000_000`) reads as "2.5 TB", not
-/// a binary-divided "2.27 TB" that would contradict the marketed figure the
-/// operator already knows.
-fn format_bytes(bytes: u64) -> String {
-    const KB: f64 = 1_000.0;
-    const MB: f64 = KB * 1_000.0;
-    const GB: f64 = MB * 1_000.0;
-    const TB: f64 = GB * 1_000.0;
-    let b = bytes as f64;
-    if b >= TB {
-        format!("{:.2} TB", b / TB)
-    } else if b >= GB {
-        format!("{:.2} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.1} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
+// `cmd_run`'s budget line (issue #175) used to carry its own local
+// `format_bytes`, decimal, duplicating (and diverging from)
+// `cli::catalog`'s binary `format_size` — issue #204's "two divergent
+// humanisers" finding. Both are gone now in favor of
+// `crate::util::format_bytes_decimal`/`format_bytes_binary`.
+//
+// This call site (`budget.bytes`, `budget.binding_capacity_bytes`) is
+// deliberately kept on the DECIMAL formatter, not moved to binary: both
+// values are capacity-derived — `binding_capacity_bytes` IS
+// `volumes.capacity_bytes` and `budget.bytes` is that same figure after the
+// backend's usable-capacity factor and ENOSPC buffer, never a measured data
+// size. ADR-0012 stores and markets capacity decimally (LTO-6 =
+// `2_500_000_000_000`); rendering either through the binary formatter would
+// understate them by ~7% at this scale — precisely the class-2 wrong-number
+// bug issue #204 found live in `cartridge info` and `volume info`. Printing
+// "budget X (capacity Y)" in matching decimal units also keeps the two
+// halves of that one sentence comparable, which a binary/decimal split on
+// the same line would not.
 
 #[derive(Subcommand, Debug)]
 pub enum CollectionCommands {
@@ -302,10 +292,10 @@ fn cmd_plan(
             println!("collection \"{name}\" plan ({copies} copy/copies):");
             for (i, b) in batches.iter().enumerate() {
                 println!(
-                    "  batch {i}: {} units, {} MB raw, {} MB on-tape (padded)",
+                    "  batch {i}: {} units, {} raw, {} on-tape (padded)",
                     b.units.len(),
-                    b.total_bytes / (1024 * 1024),
-                    b.padded_bytes / (1024 * 1024),
+                    crate::util::format_bytes_binary(b.total_bytes as i64),
+                    crate::util::format_bytes_binary(b.padded_bytes as i64),
                 );
                 for u in b.unit_names() {
                     println!("    {u}");
@@ -348,9 +338,9 @@ fn cmd_run(
         println!(
             "collection \"{collection_name}\": budget {} from volume \"{}\" (capacity {}, \
              smallest of {} destination{})",
-            format_bytes(budget.bytes),
+            crate::util::format_bytes_decimal(budget.bytes as i64),
             budget.binding_label,
-            format_bytes(budget.binding_capacity_bytes.max(0) as u64),
+            crate::util::format_bytes_decimal(budget.binding_capacity_bytes),
             budget.num_destinations,
             if budget.num_destinations == 1 {
                 ""
