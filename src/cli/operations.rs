@@ -247,15 +247,18 @@ pub fn volume_retire(
     // and structurally undefeatable -- `refuse_last_eligible_copy` takes no
     // `force`, so `assume_yes` is not even in scope for this decision.
     if let Err(e) = refuse_last_eligible_copy(&action, label, &impacts) {
-        let reason = e.to_string();
         if json_output {
             println!(
                 "{}",
-                retire_refusal_json(label, &impacts, &at_risk, &reason)
+                retire_refusal_json(label, &impacts, &at_risk, &e.to_string())
             );
         } else {
+            // Impact analysis only -- it already carries the per-version
+            // "REFUSED" line. The floor's own text is long, and `main`'s
+            // error handler prints it to stderr on the way out; echoing it
+            // here too would give the operator the same three paragraphs
+            // twice at the one moment they most need to read them once.
             print_retire_impact(label, &status, &impacts, &at_risk);
-            println!("\n  REFUSED: {reason}");
         }
         return Err(e);
     }
@@ -582,10 +585,13 @@ pub(crate) fn refuse_last_eligible_copy(
         .map(|(unit, version)| format!("unit \"{unit}\" v{version}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let (count, is_are) = if doomed.len() == 1 {
-        ("1 live version".to_string(), "it")
+    let (count, those) = if doomed.len() == 1 {
+        ("1 live version".to_string(), "that version with no copy")
     } else {
-        (format!("{} live versions", doomed.len()), "them")
+        (
+            format!("{} live versions", doomed.len()),
+            "those versions with no copies",
+        )
     };
 
     // One recovery line per DISTINCT unit, and one release line per
@@ -607,14 +613,14 @@ pub(crate) fn refuse_last_eligible_copy(
         .join("\n");
 
     Err(TapectlError::Other(format!(
-        "cannot {act}: volume \"{volume_label}\" holds the LAST eligible copy of {count} \
+        "cannot {act}: \"{volume_label}\" holds the LAST eligible copy of {count} \
          — {named}.\n\
          \n\
-         Retiring it takes {is_are} to zero copies. Nothing else sealed, unquarantined and \
-         unretired carries {is_are}, and no recorded warehouse deposit stands in either. \
-         That is not a thinner safety margin to accept — it is the data ceasing to exist, \
-         and ADR-0008 puts it in Tier 3. There is no --force for this, and --yes does not \
-         reach it.\n\
+         Retiring it leaves {those} at all: nothing else sealed, unquarantined and \
+         unretired carries the content, and no recorded warehouse deposit stands in for \
+         it. That is not a thinner safety margin to accept — it is the data ceasing to \
+         exist, and ADR-0008 puts it in Tier 3. There is no --force for this, and --yes \
+         does not reach it.\n\
          \n\
          Make another copy first, then re-run this:\n\
          {copy_out}\n    \
@@ -990,8 +996,9 @@ pub fn cartridge_retire(
                     })
                 );
             } else {
+                // Impact analysis only; `main` prints the floor's own text
+                // once, on stderr. See `volume_retire`.
                 print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
-                println!("\n  REFUSED: {reason_text}");
             }
             return Err(e);
         }
@@ -1160,6 +1167,15 @@ fn print_cartridge_retire_impact(
             "    {} [{}]: {} other copy/copies{warning}",
             impact.unit_name, impact.unit_status, impact.other_copies
         );
+        // ADR-0008 Tier 3 (issue #147): name the versions this cartridge
+        // carries the last eligible copy of, same as `volume retire`.
+        for version in impact.at_stake.iter().filter(|v| v.copies_after == 0) {
+            println!(
+                "      *** v{} — this cartridge holds its LAST eligible copy; retirement \
+                 is REFUSED (ADR-0008 Tier 3) ***",
+                version.version
+            );
+        }
         // ADR-0004 Tier 1: evidence age is displayed wherever a destructive
         // operation consumes coverage, and never gates.
         if impact.other_copies != 0 {
