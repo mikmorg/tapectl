@@ -4279,6 +4279,238 @@ mod tests {
         assert_eq!(writes, 0, "a refused write must plan nothing");
     }
 
+    /// ADR-0012 (issue #161): `volume write` must refuse every status other
+    /// than `initialized` BEFORE it touches anything else -- no session
+    /// check, no staged-data lookup, no MAM read/update, no binding, and
+    /// (like the escrow model test above) no device contact. Modelled
+    /// directly on `force_does_not_bypass_the_escrow_check_and_never_reaches_the_device`:
+    /// a nonexistent device path, so reaching it at all is itself the
+    /// failure this test looks for.
+    #[test]
+    fn volume_write_refuses_every_non_initialized_status_before_touching_the_device() {
+        let statuses = [
+            "sealed",
+            "quarantined",
+            "retired",
+            "erased",
+            "active",
+            "full",
+            "blank",
+            "missing",
+        ];
+        for status in statuses {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, mam_capacity_bytes)
+                 VALUES ('L6-STATUS', 'lto', 'lto0', 'LTO-6', 2500000000000, ?1, 123456)",
+                params![status],
+            )
+            .unwrap();
+            let volume_id = conn.last_insert_rowid();
+
+            let mam_before: Option<i64> = conn
+                .query_row(
+                    "SELECT mam_capacity_bytes FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let cartridge_volumes_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM cartridge_volumes", [], |r| r.get(0))
+                .unwrap();
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let config = Config::default();
+
+            let err = volume_write(
+                &conn,
+                &paths,
+                &config,
+                "L6-STATUS",
+                "/nonexistent/tapectl-write-target-test-nst",
+                512 * 1024,
+                false, // force
+                false, // allow_missing_escrow
+            )
+            .unwrap_err();
+
+            match &err {
+                TapectlError::VolumeNotWriteTarget {
+                    label,
+                    status: got_status,
+                } => {
+                    assert_eq!(label, "L6-STATUS", "status {status}");
+                    assert_eq!(got_status, status, "status {status}");
+                }
+                other => panic!(
+                    "status {status}: expected VolumeNotWriteTarget, got: {other:?}"
+                ),
+            }
+            let msg = err.to_string();
+            assert!(
+                msg.contains("L6-STATUS"),
+                "status {status}: message must name the label: {msg}"
+            );
+            assert!(
+                msg.contains(status),
+                "status {status}: message must name the status: {msg}"
+            );
+            assert!(
+                msg.contains("ADR-0012"),
+                "status {status}: message must cite ADR-0012: {msg}"
+            );
+            assert!(
+                !msg.contains("tapectl-write-target-test-nst"),
+                "status {status}: the device path must never be reached: {msg}"
+            );
+
+            let writes: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                writes, 0,
+                "status {status}: a refused write must plan nothing"
+            );
+
+            let mam_after: Option<i64> = conn
+                .query_row(
+                    "SELECT mam_capacity_bytes FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                mam_after, mam_before,
+                "status {status}: mam_capacity_bytes must be untouched"
+            );
+
+            let cartridge_volumes_after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM cartridge_volumes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                cartridge_volumes_after, cartridge_volumes_before,
+                "status {status}: cartridge_volumes must be untouched"
+            );
+        }
+    }
+
+    /// ADR-0012 (issue #161): an `initialized` volume must NOT be refused
+    /// by status -- the whitelist admits it, and the call must reach a
+    /// LATER, unrelated check (here, no staged data exists at all).
+    #[test]
+    fn volume_write_accepts_initialized_and_proceeds_to_the_next_check() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-INIT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &config,
+            "L6-INIT",
+            "/nonexistent/tapectl-init-proceeds-test-nst",
+            512 * 1024,
+            false,
+            false,
+        )
+        .expect_err("no staged data exists, so this must fail at a LATER check");
+
+        assert!(
+            !matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "an initialized volume must not be refused by status: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no staged data to write"),
+            "expected the existing no-staged-data refusal, got: {msg}"
+        );
+    }
+
+    /// ADR-0012 (issue #161): `volume resume` must refuse a non-target
+    /// status BEFORE `rehydrate` -- a `quarantined` volume must be named by
+    /// its status, not answered with `nothing_to_resume`'s message about
+    /// `writes` rows, and the seeded `interrupted` row must be left alone
+    /// (a refused resume attempts nothing).
+    #[test]
+    fn volume_resume_refuses_by_status_not_by_nothing_to_resume() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-QUAR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_resume(
+            &conn,
+            &paths,
+            &config,
+            "L6-QUAR",
+            "/nonexistent/tapectl-resume-status-test-nst",
+            512 * 1024,
+        )
+        .unwrap_err();
+
+        match &err {
+            TapectlError::VolumeNotWriteTarget { label, status } => {
+                assert_eq!(label, "L6-QUAR");
+                assert_eq!(status, "quarantined");
+            }
+            other => panic!("expected VolumeNotWriteTarget, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("nothing to resume"),
+            "must be refused by status, not fall through to nothing_to_resume: {msg}"
+        );
+        assert!(msg.contains("ADR-0012"), "message must cite ADR-0012: {msg}");
+
+        let write_status: String = conn
+            .query_row(
+                "SELECT status FROM writes WHERE id = ?1",
+                params![write_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            write_status, "interrupted",
+            "a refused resume must leave the writes row untouched"
+        );
+    }
+
     #[test]
     fn record_write_bookkeeping_sums_only_padded_slice_entries() {
         let conn = crate::db::open_memory().unwrap();
