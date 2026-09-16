@@ -519,12 +519,20 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
 ///
 /// Deliberately a no-op in every other case:
 ///
-/// - The volume already has an open mount — [`check_loaded_cartridge`] has
-///   just confirmed it is the right one, and rebinding would be a
-///   displacement nobody asked for.
+/// - The volume already has an open mount naming the SAME cartridge this
+///   contact resolves to — the ordinary, overwhelmingly common path
+///   (`volume init` already bound it), and rebinding would be a displacement
+///   nobody asked for.
 /// - No serial readable — exactly as at init, the volume stays unbound.
 /// - No generation resolvable — auto-registering a cartridge needs one, and
 ///   inventing it is how a row starts lying.
+///
+/// An open mount naming a DIFFERENT, already-registered cartridge is **not**
+/// a no-op (ADR-0012, issue #162): resolving BEFORE deciding, rather than
+/// deciding on `already_bound` alone, is what catches a write to the wrong
+/// cartridge instead of reporting it as bound to the right one. See
+/// [`binding::refuse_rebind`], which this calls — the same refusal every
+/// other writer of `cartridge_volumes` gets.
 ///
 /// There is no `--cartridge` on `volume write`, so this is the serial-only
 /// half of the ladder: match a registered row by serial, else auto-register
@@ -540,17 +548,6 @@ fn bind_late(
     drive_generation: &str,
     nominal_capacity: i64,
 ) -> Result<()> {
-    let already_bound: Option<i64> = conn
-        .query_row(
-            "SELECT cartridge_id FROM cartridge_volumes
-             WHERE volume_id = ?1 AND unmounted_at IS NULL",
-            params![volume_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if already_bound.is_some() {
-        return Ok(());
-    }
     let Some(serial) = det.mam.serial.as_deref() else {
         return Ok(());
     };
@@ -565,7 +562,37 @@ fn bind_late(
         return Ok(());
     };
 
+    // Resolve the cartridge this contact's medium identifies BEFORE
+    // deciding anything from `already_bound` (issue #162): the old order
+    // read `already_bound` first and returned on `is_some()` alone, so a
+    // write to the WRONG cartridge — one already registered under a
+    // different row — was silently reported as bound to the right one.
     let lookup = binding::lookup_cartridge(conn, Some(serial), None)?;
+
+    let already_bound: Option<i64> = conn
+        .query_row(
+            "SELECT cartridge_id FROM cartridge_volumes
+             WHERE volume_id = ?1 AND unmounted_at IS NULL",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(bound_id) = already_bound {
+        return match &lookup.row {
+            // Same cartridge: today's no-op, unchanged.
+            Some(row) if row.id == bound_id => Ok(()),
+            // A DIFFERENT, KNOWN cartridge: the Change-2 refusal, so the
+            // message is identical to every other writer of
+            // `cartridge_volumes`. Never duplicated here.
+            Some(row) => binding::refuse_rebind(conn, volume_id, row.id),
+            // The medium's serial matches no registered row at all. Absence
+            // is not contradiction (ADR-0012) — tapectl has no SPECIFIC
+            // other cartridge to name, so this stays the no-op it always
+            // was rather than a guess.
+            None => Ok(()),
+        };
+    }
+
     if let Some(row) = &lookup.row {
         binding::refuse_retired(row)?;
     }
@@ -5198,6 +5225,61 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(events, 0, "a no-op must write nothing at all");
+        }
+
+        /// Issue #162's realistic trigger: a volume `volume init --cartridge
+        /// <barcode>` bound with NO medium serial (`identity_source =
+        /// 'operator'`, cartridge A has no `serial_number` recorded) must
+        /// not be silently reported as bound to a DIFFERENT, already
+        /// registered cartridge (B) that THIS contact's medium resolves to.
+        ///
+        /// In the full `volume_write` pipeline `corroborate_volume` runs
+        /// before `bind_late` and would itself catch a serial already
+        /// recorded on another row — but `bind_late` gets its own
+        /// independent refusal too (issue #162's "every writer of
+        /// `cartridge_volumes` gets the refusal"), which is what this test,
+        /// driving `bind_late` directly, proves.
+        #[test]
+        fn an_operator_bound_volume_refuses_when_the_medium_resolves_elsewhere() {
+            let (conn, vol_id) = unbound_volume();
+            // Cartridge A: bound at init by barcode alone, no serial ever
+            // read — the `volume init --cartridge A` path.
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('BC-A', 'LTO-6', 2500000000000, NULL, 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart_a = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'operator')",
+                params![cart_a, vol_id],
+            )
+            .unwrap();
+
+            // Cartridge B: a DIFFERENT, already-registered cartridge whose
+            // serial this contact's medium reports.
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('BC-B', 'LTO-6', 2500000000000, 'SER-2', 'available')",
+                [],
+            )
+            .unwrap();
+
+            let err = call(&conn, vol_id, &det_with_serial(Some("SER-2")))
+                .expect_err("a write whose medium resolves to a DIFFERENT cartridge must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains("BC-A"), "must name the existing cartridge: {msg}");
+            assert!(msg.contains("BC-B"), "must name the resolved cartridge: {msg}");
+            assert!(
+                msg.contains("permanent once its mount is closed"),
+                "must cite ADR-0012's closing ruling: {msg}"
+            );
+            // The refusal must not have touched the existing binding.
+            assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("BC-A"));
         }
 
         /// ADR-0011 applies here for the same reason it applies at init: no
