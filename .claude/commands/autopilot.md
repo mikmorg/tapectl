@@ -236,7 +236,11 @@ the normative design set named in the Policy block below.
      form; cargo synchronous, never backgrounded; no GitHub closing keywords in
      commit messages; workers never touch `/dev/nst*` or `/dev/sg*`; the real
      `~/.tapectl` is never touched from this VM; migrations are forward-only and
-     the next free number is **014**.
+     the next free number is **015** (014 is taken by
+     `014_cartridge_binding_identity_source.sql`, landed with #192 — this line
+     said 014 until 2026-09-16, when the #184 worker caught it and reported the
+     stale number instead of quietly claiming it; verify with `ls
+     src/db/migrations/ | tail -1` before writing one, do not trust this line).
 
 - **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed; real-drive pass #4 45/45 on 2026-09-12.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
