@@ -1576,6 +1576,48 @@ mod tests {
         assert!(err.to_string().contains("generation"), "{err}");
     }
 
+    // ---- issue #186: LTO-7-M8 is a medium format, never a drive declaration ----
+
+    /// `Generation::parse` happily accepts `"LTO-7-M8"` — it is a real medium
+    /// generation — but `Generation::can_write(Lto7M8, _)` is `false` for
+    /// every medium, so a `[[backends.lto]]` entry declaring it can never
+    /// write a single tape (issue #186). `Config::load` (via `size_problems`)
+    /// must refuse it by name, the same as `backend add` does, rather than
+    /// silently accepting a backend that is unusable the moment it is used.
+    #[test]
+    fn config_load_refuses_lto7_type_m_as_a_drive_generation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-7-M8\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LTO-8"), "{msg}");
+        assert!(
+            msg.to_lowercase().contains("cartridge") || msg.contains("Type M"),
+            "{msg}"
+        );
+    }
+
+    /// The drive that writes Type M cartridges is a real, still-accepted
+    /// declaration — this must keep working.
+    #[test]
+    fn config_load_still_accepts_lto8_as_a_drive_generation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-8\"\n",
+        )
+        .unwrap();
+        Config::load(&path).expect("LTO-8 must still be accepted as a drive generation");
+    }
+
     // ---- ADR-0010: resolve_lto_backend (strict) ----
 
     fn backend_with(name: &str, device_tape: &str) -> LtoBackendConfig {

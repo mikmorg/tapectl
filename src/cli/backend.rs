@@ -495,4 +495,92 @@ mod tests {
         let reloaded = Config::load(&paths.config_file).unwrap();
         assert_eq!(reloaded.backends.lto.len(), 2);
     }
+
+    // ---- issue #186: LTO-7-M8 is a medium format, never a drive declaration ----
+
+    fn empty_config(dir: &std::path::Path) -> TapectlPaths {
+        let paths = TapectlPaths::new(dir.to_path_buf());
+        std::fs::write(&paths.config_file, "[dar]\nbinary = \"dar\"\n").unwrap();
+        paths
+    }
+
+    /// `Generation::parse` accepts `"LTO-7-M8"` — it is a real medium
+    /// generation the cartridge side still needs — but no drive IS an
+    /// LTO-7-M8 (ADR-0010 decision 1): `Generation::can_write(Lto7M8, _)` is
+    /// `false` for every medium, so a backend declared that way could never
+    /// write a single tape and every `volume init` on it would refuse. The
+    /// drive that writes Type M cartridges declares `LTO-8`.
+    #[test]
+    fn add_refuses_lto7_type_m_as_a_drive_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = empty_config(tmp.path());
+
+        let err = add(
+            &paths,
+            "drive-a",
+            "/dev/nst0",
+            "/dev/sg0",
+            "LTO-7-M8",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LTO-8"), "{msg}");
+        assert!(
+            msg.to_lowercase().contains("cartridge") || msg.contains("Type M"),
+            "{msg}"
+        );
+
+        // A refused add must not partially write the block.
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert!(reloaded.backends.lto.is_empty());
+    }
+
+    /// The drive that writes Type M cartridges is a real, still-accepted
+    /// declaration — this must keep working.
+    #[test]
+    fn add_still_accepts_lto8_as_a_drive_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = empty_config(tmp.path());
+
+        add(
+            &paths,
+            "drive-a",
+            "/dev/nst0",
+            "/dev/sg0",
+            "LTO-8",
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert_eq!(reloaded.backends.lto[0].generation, "LTO-8");
+    }
+
+    /// The example list in the "not a recognised generation" message must
+    /// not suggest a value that a drive can never legally declare — that
+    /// suggestion is exactly how an operator lands on the defect in the
+    /// first place.
+    #[test]
+    fn the_unrecognised_generation_message_does_not_suggest_lto7_type_m() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = empty_config(tmp.path());
+
+        let err = add(
+            &paths,
+            "drive-a",
+            "/dev/nst0",
+            "/dev/sg0",
+            "not-a-generation",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("LTO-7-M8"), "{err}");
+    }
 }
