@@ -2905,6 +2905,40 @@ mod tests {
         }
     }
 
+    /// Issue #168: `import --capacity` writes straight into
+    /// `volumes.capacity_bytes`, so it means the same decimal unit as
+    /// `cartridge register --capacity` and the generation table
+    /// (ADR-0012's "cartridge capacities are decimal" ruling) — not the
+    /// binary unit `slice_size`/`enospc_buffer` use.
+    mod import_capacity {
+        use super::*;
+
+        fn capacity_bytes_of(conn: &Connection, label: &str) -> i64 {
+            conn.query_row(
+                "SELECT capacity_bytes FROM volumes WHERE label = ?1",
+                rusqlite::params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn capacity_2_5t_records_the_generation_tables_decimal_figure() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = Config::default();
+            volume_import(
+                &conn, &config, "L6-CAP", "lto", "LTO-6", "2.5T", None, None, false,
+            )
+            .unwrap();
+            assert_eq!(
+                capacity_bytes_of(&conn, "L6-CAP"),
+                2_500_000_000_000,
+                "\"2.5T\" must mean the marketed 2.5 TB (10^12), not the \
+                 binary parser's 2,748,779,069,440"
+            );
+        }
+    }
+
     mod volume_retire_consent {
         use super::*;
 

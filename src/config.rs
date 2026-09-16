@@ -1616,6 +1616,36 @@ mod tests {
         assert!(msg.contains("--device"), "{msg}");
     }
 
+    // ---- issue #168: `capacity_override` is decimal, matching the
+    // generation table (ADR-0012 "cartridge capacities are decimal; data
+    // sizes are binary"). `planning_capacity_bytes` is the one place this
+    // config field turns into bytes for `volume plan` / `collection
+    // plan`/`run`'s planning path. ----
+
+    #[test]
+    fn planning_capacity_bytes_parses_the_override_as_decimal() {
+        let mut backend = backend_with("a", "/dev/null");
+        backend.capacity_override = Some("2.5T".to_string());
+        assert_eq!(
+            backend.planning_capacity_bytes(None).unwrap(),
+            2_500_000_000_000,
+            "\"2.5T\" must mean the marketed 2.5 TB (10^12), not the binary \
+             parser's 2,748,779,069,440"
+        );
+    }
+
+    #[test]
+    fn planning_capacity_bytes_override_matches_the_generation_tables_own_unit() {
+        let mut backend = backend_with("a", "/dev/null");
+        backend.capacity_override = Some("2.5T".to_string());
+        assert_eq!(
+            backend.planning_capacity_bytes(None).unwrap(),
+            crate::media::Generation::Lto6.native_capacity_bytes(),
+            "a declared 2.5T override on an LTO-6 backend must equal the \
+             table's own decimal figure exactly"
+        );
+    }
+
     // ---- ADR-0010: resolve_device (lenient) ----
 
     #[test]

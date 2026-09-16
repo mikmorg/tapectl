@@ -884,10 +884,28 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         // A declared 40 TB LTO-10 cartridge (ADR-0010 explicitly calls this
         // out: a single generation figure cannot express both LTO-10
-        // capacities, so the operator states it here).
+        // capacities, so the operator states it here). Decimal (ADR-0012,
+        // issue #168): "40000G" means 40000 * 10^9 = the marketed 40 TB,
+        // not the binary parser's ~43.95 TB.
         register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
         let (_, cap, _) = stored_row(&conn, "B001");
-        assert_eq!(cap, staging::parse_size_to_bytes("40000G").unwrap());
+        assert_eq!(cap, 40_000_000_000_000);
+    }
+
+    /// Issue #168: `--capacity` is decimal, the same unit the omitted-
+    /// capacity default reads from the generation table — so a declared
+    /// figure and the table's own figure must agree exactly for the
+    /// generation they both describe.
+    #[test]
+    fn register_with_explicit_capacity_matches_the_generation_tables_decimal_unit() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", Some("2.5T"), None).unwrap();
+        let (_, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(cap, 2_500_000_000_000);
+        assert_eq!(
+            cap,
+            crate::media::Generation::Lto6.native_capacity_bytes() as i64
+        );
     }
 
     #[test]
