@@ -4324,7 +4324,10 @@ mod tests {
         /// write, plus — when `with_other_copy` — a second sealed volume on
         /// no cartridge carrying the same stage set. Returns
         /// (conn, cartridge_id, volume_id).
-        fn setup(with_other_copy: bool) -> (Connection, i64, i64) {
+        /// `pub(super)` since issue #163: `cartridge_unretire`'s tests
+        /// reuse this exact shape (retire it for real, then unretire it),
+        /// rather than a second hand-seeded double that could drift.
+        pub(super) fn setup(with_other_copy: bool) -> (Connection, i64, i64) {
             let (conn, vol_id) = super::volume_retire_consent::setup_volume_with_one_unit(
                 "L6-CART",
                 with_other_copy,
@@ -4529,6 +4532,185 @@ mod tests {
         }
     }
 
+    /// Issue #163 / ADR-0012's consequences bullet: `cartridge unretire`
+    /// reverses `cartridge retire`, recovering the prior statuses from the
+    /// `events` audit trail that `cartridge_retire` already writes, rather
+    /// than a new column.
+    mod cartridge_unretire {
+        use super::*;
+
+        /// A retired cartridge `BC-RET` holding volume `L6-CART`, produced
+        /// by actually calling `cartridge_retire` first -- so the `events`
+        /// rows this command reads are the real ones that function writes,
+        /// not hand-seeded doubles. Before retirement: cartridge `in_use`,
+        /// volume `active` (see `cartridge_retire::setup`).
+        fn setup_retired() -> (Connection, i64, i64) {
+            let (conn, cart_id, vol_id) = super::cartridge_retire::setup(true);
+            cartridge_retire(&conn, "BC-RET", None, false, true, false, false)
+                .expect("--yes must satisfy the gate");
+            (conn, cart_id, vol_id)
+        }
+
+        fn status_of(conn: &Connection, table: &str, id: i64) -> String {
+            conn.query_row(
+                &format!("SELECT status FROM {table} WHERE id = ?1"),
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// The headline: both the cartridge and the volume retired with it
+        /// come back to exactly what they were before `cartridge retire`
+        /// touched them.
+        #[test]
+        fn unretire_restores_the_cartridge_and_volume_prior_statuses() {
+            let (conn, cart_id, vol_id) = setup_retired();
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+            assert_eq!(status_of(&conn, "volumes", vol_id), "retired");
+
+            cartridge_unretire(&conn, "BC-RET", false, false).unwrap();
+
+            assert_eq!(
+                status_of(&conn, "cartridges", cart_id),
+                "in_use",
+                "the cartridge was in_use before cartridge_retire touched it"
+            );
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "active",
+                "the volume was active before cartridge_retire touched it"
+            );
+        }
+
+        /// The reversal is itself auditable: `events` gains rows that read
+        /// forwards (`unretired`, old = retired-family value, new =
+        /// recovered value), not just a status that changed by itself.
+        #[test]
+        fn unretire_logs_reversal_events_for_the_cartridge_and_the_volume() {
+            let (conn, cart_id, vol_id) = setup_retired();
+            cartridge_unretire(&conn, "BC-RET", false, false).unwrap();
+
+            let (action, old_value, new_value): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT action, old_value, new_value FROM events
+                     WHERE entity_type = 'cartridge' AND entity_id = ?1
+                     ORDER BY id DESC LIMIT 1",
+                    params![cart_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(action, "unretired");
+            assert_eq!(old_value.as_deref(), Some("retired_permanent"));
+            assert_eq!(new_value.as_deref(), Some("in_use"));
+
+            let (v_action, v_old, v_new): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT action, old_value, new_value FROM events
+                     WHERE entity_type = 'volume' AND entity_id = ?1
+                     ORDER BY id DESC LIMIT 1",
+                    params![vol_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(v_action, "unretired");
+            assert_eq!(v_old.as_deref(), Some("retired"));
+            assert_eq!(v_new.as_deref(), Some("active"));
+        }
+
+        /// Tier 1 under ADR-0008: refuses outright, naming the cartridge's
+        /// ACTUAL status, rather than silently doing nothing or guessing.
+        #[test]
+        fn unretire_on_a_non_retired_cartridge_refuses_naming_the_status() {
+            let (conn, _cart_id, _vol_id) = super::cartridge_retire::setup(true);
+            let err = cartridge_unretire(&conn, "BC-RET", false, false).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("in_use"), "must name the actual status: {msg}");
+            assert!(msg.contains("BC-RET"));
+        }
+
+        /// The honest-partial-restore case (issue #163 item 3): a catalog
+        /// rebuilt from tape since the retirement has no `events` history
+        /// at all. The cartridge falls back to its ordinary pre-retirement
+        /// state (`available`) rather than a guessed one, and the volume
+        /// -- with no recoverable event either -- is left exactly as it
+        /// is, not resurrected on a guess.
+        #[test]
+        fn unretire_with_events_removed_restores_available_and_leaves_the_volume() {
+            let (conn, cart_id, vol_id) = setup_retired();
+            conn.execute("DELETE FROM events", []).unwrap();
+
+            cartridge_unretire(&conn, "BC-RET", false, false).expect(
+                "a missing history must not be an error -- it is an honest partial restore",
+            );
+
+            assert_eq!(
+                status_of(&conn, "cartridges", cart_id),
+                "available",
+                "no recoverable event -- falls back to the ordinary pre-retirement state"
+            );
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "retired",
+                "left alone: no recoverable event means no guessed status"
+            );
+        }
+
+        #[test]
+        fn dry_run_mutates_nothing() {
+            let (conn, cart_id, vol_id) = setup_retired();
+            cartridge_unretire(&conn, "BC-RET", true, false).expect("dry-run must succeed");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+            assert_eq!(status_of(&conn, "volumes", vol_id), "retired");
+            let unretired_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = 'unretired'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unretired_events, 0, "dry-run must not write an audit event");
+        }
+
+        #[test]
+        fn an_unknown_barcode_says_so() {
+            let conn = crate::db::open_memory().unwrap();
+            let err = cartridge_unretire(&conn, "NOPE", false, false).unwrap_err();
+            assert!(err.to_string().contains("NOPE"));
+        }
+
+        /// A volume that was independently `retired` (e.g. via `volume
+        /// retire`) BEFORE the cartridge was retired has its own
+        /// `retired -> retired` event from `cartridge_retire` (which does
+        /// not skip already-retired volumes). Unretiring the cartridge
+        /// must restore it to `retired`, not resurrect it into whatever
+        /// came before that independent retirement.
+        #[test]
+        fn a_volume_already_retired_before_the_cartridge_stays_retired() {
+            let (conn, cart_id, vol_id) = super::cartridge_retire::setup(true);
+            conn.execute(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                params![vol_id],
+            )
+            .unwrap();
+            cartridge_retire(&conn, "BC-RET", None, false, true, false, false).unwrap();
+            assert_eq!(status_of(&conn, "volumes", vol_id), "retired");
+
+            cartridge_unretire(&conn, "BC-RET", false, false).unwrap();
+
+            assert_eq!(
+                status_of(&conn, "cartridges", cart_id),
+                "in_use",
+                "the cartridge's own history is unaffected by the volume's"
+            );
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "retired",
+                "the volume's most recent 'retired' event says retired -> retired"
+            );
+        }
+    }
+
     /// Issue #38/H12: `cartridge_mark_erased`'s ADR-0008 Tier-2 lifecycle
     /// gate, plus the volume -> 'erased' transition (Change 5). Same
     /// no-real-stdin discipline as `volume_retire_consent` above: every
@@ -4640,6 +4822,64 @@ mod tests {
                 "full",
                 "dry-run must not change the mounted volume's status"
             );
+        }
+
+        /// Issue #163's merged audit finding: the Tier-2 consent facts must
+        /// NAME the volume(s) about to be recorded erased, not just the
+        /// cartridge's own status. Tests the exact function the gate
+        /// calls, so production and test share one code path -- no stdout
+        /// capture needed to prove the wording (the `retire_refusal_json`
+        /// pattern above).
+        #[test]
+        fn mark_erased_consent_facts_name_each_volume_by_label() {
+            let facts = mark_erased_consent_facts(
+                "BC001",
+                "retired_permanent",
+                &["L6-0001".to_string(), "L6-0002".to_string()],
+            );
+            assert_eq!(facts.len(), 3, "the status line plus one per volume");
+            assert!(facts[0].contains("retired_permanent"));
+            assert!(
+                facts
+                    .iter()
+                    .any(|f| f.contains("L6-0001") && f.contains("erased")),
+                "got: {facts:?}"
+            );
+            assert!(
+                facts
+                    .iter()
+                    .any(|f| f.contains("L6-0002") && f.contains("erased")),
+                "got: {facts:?}"
+            );
+            // #91: each fact must read true ALONE -- no bare label with no
+            // context about what is about to happen to it.
+            for f in &facts[1..] {
+                assert!(
+                    f.contains("cartridge \"BC001\""),
+                    "must not be a bare label: {f}"
+                );
+            }
+        }
+
+        /// No mounted volume -- e.g. a cartridge whose volume was already
+        /// moved on -- is just the status line, not a phantom entry.
+        #[test]
+        fn mark_erased_consent_facts_with_no_volumes_is_just_the_status_line() {
+            let facts = mark_erased_consent_facts("BC001", "in_use", &[]);
+            assert_eq!(facts.len(), 1);
+        }
+
+        /// End-to-end through the real gate: `cartridge_mark_erased`'s
+        /// non-interactive refusal (no `--force`/`--yes`) must still carry
+        /// the volume label in ITS message, since `cli::consent::confirm`
+        /// echoes `action`, not `facts`, into the refusal text it returns
+        /// -- proving the wiring, not just the pure builder above.
+        #[test]
+        fn refusal_message_names_the_cartridge_being_marked_erased() {
+            let (conn, _cart_id, _vol_id) = setup_cartridge("in_use", true);
+            let err = cartridge_mark_erased(&conn, "BC001", false, false, false, false)
+                .expect_err("non-interactive with no consent must refuse");
+            assert!(err.to_string().contains("BC001"));
         }
     }
 
