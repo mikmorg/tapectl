@@ -587,8 +587,10 @@ fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_r
 /// ADR-0008 Tier 2, not Tier 3: the data may still be readable (ADR-0011 is
 /// explicit that retirement is "not an erasure"), so `--force`/`--yes`
 /// overrides, and a non-interactive session with neither refuses rather
-/// than hanging. `cartridge mark-erased` is the only way back out of
-/// `retired_permanent` — the operator saying they were wrong.
+/// than hanging. `cartridge unretire` is the way back out of
+/// `retired_permanent` — the operator saying they were wrong about the
+/// *medium*; `cartridge mark-erased` is the separate, irreversible
+/// statement that the bytes are gone (ADR-0011, corrected 2026-09-14).
 pub fn cartridge_retire(
     conn: &Connection,
     barcode: &str,
@@ -707,7 +709,7 @@ pub fn cartridge_retire(
     }
     facts.push(format!(
         "cartridge \"{barcode}\" will never be written again; \
-         `tapectl cartridge mark-erased {barcode}` is the only way back"
+         `tapectl cartridge unretire {barcode}` is the way back if this is a mistake"
     ));
 
     if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
@@ -809,7 +811,7 @@ pub fn cartridge_retire(
         for label in &volume_labels {
             println!("  Volume \"{label}\" retired with it.");
         }
-        println!("  `tapectl cartridge mark-erased {barcode}` is the only way back.");
+        println!("  `tapectl cartridge unretire {barcode}` is the way back if this was a mistake.");
     }
     Ok(())
 }
@@ -861,6 +863,29 @@ fn print_cartridge_retire_impact(
     }
 }
 
+/// The ADR-0008 Tier-2 consent facts for `cartridge_mark_erased` when the
+/// cartridge is not already `pending_erase`.
+///
+/// Issue #163's merged audit finding: an operator consenting to "mark
+/// cartridge X erased" is consenting to "these volumes are recorded as
+/// having no bytes" just as much as to the cartridge's own status change,
+/// and the facts must say so BY NAME, not just by count -- each line reads
+/// true alone (the #91 lesson: `cli::consent::confirm` prints facts as
+/// standalone lines).
+fn mark_erased_consent_facts(barcode: &str, status: &str, volume_labels: &[String]) -> Vec<String> {
+    let mut facts = vec![format!(
+        "cartridge \"{barcode}\" is in status \"{status}\", not \"pending_erase\" -- \
+         marking it erased skips the normal bulk-erase lifecycle checkpoint"
+    )];
+    for label in volume_labels {
+        facts.push(format!(
+            "volume \"{label}\" is mounted on cartridge \"{barcode}\" and will be recorded \
+             as erased -- its bytes declared gone"
+        ));
+    }
+    facts
+}
+
 /// Mark a cartridge as erased (available for reuse), moving any
 /// currently-mounted volume to `erased`.
 ///
@@ -882,8 +907,18 @@ fn print_cartridge_retire_impact(
 /// for reuse); it is the volume(s) that were mounted on it that move to
 /// `'erased'`.
 ///
-/// ADR-0011 also makes this the ONLY way out of `retired_permanent`: the
-/// operator saying they were wrong about the medium being unfit.
+/// `cartridge unretire` — not this command — is the way out of
+/// `retired_permanent` (ADR-0011, corrected 2026-09-14): the operator
+/// saying they were wrong about the medium being unfit. This command's own
+/// job is unchanged either way: it is the separate statement that the
+/// bytes are gone.
+///
+/// Issue #163 audit finding: the ADR-0008 Tier-2 consent facts named only
+/// the cartridge's status, never the volumes about to be recorded erased —
+/// an operator consenting to "the bytes are gone" could not read which
+/// tapes that was about. [`mark_erased_consent_facts`] fixes that, split
+/// out so the exact wording is assertable without stdout capture (the
+/// `retire_refusal_json` pattern above).
 pub fn cartridge_mark_erased(
     conn: &Connection,
     barcode: &str,
@@ -939,10 +974,7 @@ pub fn cartridge_mark_erased(
     // precondition violation and needs an explicit override.
     if status != "pending_erase" {
         let action = format!("mark cartridge \"{barcode}\" erased");
-        let facts = vec![format!(
-            "cartridge \"{barcode}\" is in status \"{status}\", not \"pending_erase\" -- \
-             marking it erased skips the normal bulk-erase lifecycle checkpoint"
-        )];
+        let facts = mark_erased_consent_facts(barcode, &status, &volume_labels);
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
             let reason = e.to_string();
             if json_output {
