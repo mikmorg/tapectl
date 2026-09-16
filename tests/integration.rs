@@ -1829,7 +1829,15 @@ fn test_volume_write_refuses_over_capacity() {
     )
     .unwrap();
     let ss = conn.last_insert_rowid();
-    // One 5 MB encrypted slice — far larger than the 1 MB volume below.
+    // One 5 MB encrypted slice, block-padded (512 KiB blocks) to exactly
+    // 5,242,880 on-tape bytes. Combined with this fixture's fixed metadata
+    // zones (ID thunk, front index, envelope(s), seal marker, ...) the full
+    // Layout's real on-tape total for this exact fixture is 9,437,184 bytes
+    // (confirmed empirically by running this test with the error message
+    // printed — see the row/config figures below, chosen against that
+    // number). That total does not depend on which capacity figure the code
+    // reads, only on the entries themselves, so it stays a stable boundary
+    // even though this test never asserts it directly.
     conn.execute(
         "INSERT INTO stage_slices
             (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
@@ -1838,11 +1846,25 @@ fn test_volume_write_refuses_over_capacity() {
     )
     .unwrap();
 
-    // A 1 MB volume — the staged 5 MB cannot fit.
+    // ADR-0010 decision 3: the ROW is what must gate this write, and config's
+    // `capacity_override` must never be consulted after init. So the two
+    // figures below are deliberately far apart AND straddle the fixture's
+    // real on-tape total (9,437,184 bytes, see above) from opposite sides:
+    //   - the row's capacity_bytes (4 MiB = 4,194,304) is BELOW that total,
+    //     so reading the row correctly refuses the write.
+    //   - config's capacity_override (50 MiB = 52,428,800) is FAR ABOVE it,
+    //     so a regression that reads config instead would see the data as
+    //     comfortably fitting and would not refuse for capacity at all.
+    // A regression therefore cannot merely cite a different number in the
+    // same refusal — it silently accepts data that must be rejected, which
+    // is exactly the "no refusal at all" failure mode this test exists to
+    // catch (issue #188; the confirmed failure text from the negative-control
+    // experiment that proved this is in this change's commit message).
+    const ROW_CAPACITY_BYTES: i64 = 4_194_304;
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES ('L6-CAP', 'lto', 'p', 'LTO-6', 1048576, 'initialized')",
-        [],
+         VALUES ('L6-CAP', 'lto', 'p', 'LTO-6', ?1, 'initialized')",
+        [ROW_CAPACITY_BYTES],
     )
     .unwrap();
 
@@ -1852,7 +1874,7 @@ fn test_volume_write_refuses_over_capacity() {
         device_tape: "/dev/null".into(),
         device_sg: "/dev/null".into(),
         generation: "LTO-8".into(),
-        capacity_override: Some("1M".into()),
+        capacity_override: Some("50M".into()),
         usable_capacity_factor: 1.0,
         enospc_buffer: "0".into(),
     });
@@ -1878,8 +1900,21 @@ fn test_volume_write_refuses_over_capacity() {
     .unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("capacity"),
+        msg.contains("capacity exceeded"),
         "expected a capacity refusal, got: {msg}"
+    );
+    // Pin the actual boundary: the refusal must name the ROW's figure
+    // (usable_capacity_factor is 1.0 here, so `available` equals
+    // capacity_bytes exactly), never config's "50M"/52,428,800 — that is
+    // the whole point of this test (issue #188 / ADR-0010 decision 3).
+    let expected_available = format!("available {ROW_CAPACITY_BYTES}");
+    assert!(
+        msg.contains(&expected_available),
+        "expected the refusal to name the volume row's capacity ({expected_available}), got: {msg}"
+    );
+    assert!(
+        !msg.contains("52428800"),
+        "refusal must never name config's capacity_override figure, got: {msg}"
     );
 
     // Nothing was written: no write rows, volume still 'initialized'.
