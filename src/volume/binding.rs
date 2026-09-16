@@ -1978,6 +1978,202 @@ mod tests {
         assert_eq!(serial.as_deref(), Some("SER-1"));
     }
 
+    // ---- MAM load count recording (issue #184) ----------------------------
+    //
+    // `total_load_count` was SELECTed by `cartridge list`/`info` and written
+    // by nothing: every cartridge showed "Loads: 0" forever, a wrong number
+    // presented as a fact about wear. The MAM load count is already read at
+    // both contacts `bind_cartridge` serves (`volume init` and `volume
+    // write`'s late binding, both of which pass `&MamInfo` in), so the fix
+    // lives entirely inside `bind_cartridge`: no new MAM read.
+
+    #[test]
+    fn bind_cartridge_records_the_mam_load_count_on_an_existing_row() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        let cart_id = found.row.as_ref().unwrap().id;
+        let vol = new_volume(&conn, "L6-0001");
+        let mam = MamInfo {
+            load_count: Some(7),
+            ..MamInfo::default()
+        };
+
+        bind_cartridge(
+            &conn,
+            vol,
+            found.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &mam,
+        )
+        .unwrap();
+
+        let loads: Option<i64> = conn
+            .query_row(
+                "SELECT total_load_count FROM cartridges WHERE id = ?1",
+                params![cart_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            loads,
+            Some(7),
+            "a MAM-reported load count must be recorded onto the bound cartridge row"
+        );
+    }
+
+    #[test]
+    fn bind_cartridge_leaves_an_unreadable_load_count_null_on_auto_register() {
+        let conn = db::open_memory().unwrap();
+        let vol = new_volume(&conn, "L6-0001");
+
+        let out = bind_cartridge(
+            &conn,
+            vol,
+            None,
+            Some("E01001L8_1775794348"),
+            Generation::Lto8,
+            12_000_000_000_000,
+            &MamInfo::default(), // no load_count -- this drive/read did not report one
+        )
+        .unwrap();
+
+        let loads: Option<i64> = conn
+            .query_row(
+                "SELECT total_load_count FROM cartridges WHERE id = ?1",
+                params![out.cartridge_id.unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            loads, None,
+            "a newly auto-registered cartridge with no readable MAM load count must stay \
+             NULL (unknown), never fall back to the schema's DEFAULT 0"
+        );
+    }
+
+    /// It is a monotone counter the drive itself maintains -- `bind_cartridge`
+    /// must SET the latest observed value, never accumulate across contacts.
+    #[test]
+    fn bind_cartridge_writes_the_observed_load_count_not_an_increment() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let cart_id = lookup_cartridge(&conn, Some("SER-1"), None)
+            .unwrap()
+            .row
+            .unwrap()
+            .id;
+
+        let vol1 = new_volume(&conn, "L6-0001");
+        let row1 = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        bind_cartridge(
+            &conn,
+            vol1,
+            row1.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo {
+                load_count: Some(3),
+                ..MamInfo::default()
+            },
+        )
+        .unwrap();
+
+        // A later contact (e.g. re-initialising the same cartridge for a new
+        // volume, ADR-0010's displacement) sees the drive's counter having
+        // advanced.
+        let vol2 = new_volume(&conn, "L6-0002");
+        let row2 = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        bind_cartridge(
+            &conn,
+            vol2,
+            row2.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo {
+                load_count: Some(5),
+                ..MamInfo::default()
+            },
+        )
+        .unwrap();
+
+        let loads: Option<i64> = conn
+            .query_row(
+                "SELECT total_load_count FROM cartridges WHERE id = ?1",
+                params![cart_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            loads,
+            Some(5),
+            "the column must be SET to the drive's latest observed count, never incremented \
+             (3 + 5 must never appear)"
+        );
+    }
+
+    /// A contact whose MAM read has no load count (e.g. a drive that does not
+    /// expose the attribute) must not erase a value a PRIOR contact already
+    /// established -- "unknown" is for never-observed, not for
+    /// observed-then-forgotten.
+    #[test]
+    fn bind_cartridge_preserves_a_known_load_count_when_a_later_contact_reports_none() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
+        let cart_id = lookup_cartridge(&conn, Some("SER-1"), None)
+            .unwrap()
+            .row
+            .unwrap()
+            .id;
+
+        let vol1 = new_volume(&conn, "L6-0001");
+        let row1 = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        bind_cartridge(
+            &conn,
+            vol1,
+            row1.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo {
+                load_count: Some(9),
+                ..MamInfo::default()
+            },
+        )
+        .unwrap();
+
+        let vol2 = new_volume(&conn, "L6-0002");
+        let row2 = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        bind_cartridge(
+            &conn,
+            vol2,
+            row2.row.as_ref(),
+            Some("SER-1"),
+            Generation::Lto6,
+            2_500_000_000_000,
+            &MamInfo::default(), // this contact's read reported none
+        )
+        .unwrap();
+
+        let loads: Option<i64> = conn
+            .query_row(
+                "SELECT total_load_count FROM cartridges WHERE id = ?1",
+                params![cart_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            loads,
+            Some(9),
+            "a later contact with no readable load count must not erase a previously \
+             observed value"
+        );
+    }
+
     /// The rule ADR-0010's "Binding adds no second consent gate" paragraph
     /// exists for, and the shape `scripts/mhvtl-verify-gate.sh` depends on:
     /// four volumes initialised on ONE cartridge in a single run, each after

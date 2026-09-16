@@ -554,6 +554,18 @@ fn cartridge_rows(
 mod tests {
     use super::*;
 
+    /// Issue #184: the table (and `cartridge info`'s plain-text render,
+    /// which calls this same helper) must not tell a genuinely never-observed
+    /// load count apart from zero by rendering it blank -- that reads as "0
+    /// but the column was empty", indistinguishable at a glance from an
+    /// actual 0. Spelling it out as "unknown" is the one spelling used on
+    /// both surfaces.
+    #[test]
+    fn display_opt_i64_renders_none_as_unknown_not_zero_or_blank() {
+        assert_eq!(display_opt_i64(&Some(5)), "5");
+        assert_eq!(display_opt_i64(&None), "unknown");
+    }
+
     /// `cartridge list --json` shape (issue: C2 row-listing drift).
     /// `media_type`/`loads`/`volume` are additive since CTO decision
     /// 2026-09-11 (architecture review C2 follow-up, C2b); `location` is
