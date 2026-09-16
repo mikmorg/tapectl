@@ -827,6 +827,19 @@ pub fn volume_write(
         });
     }
 
+    // ADR-0012 amendment, issue #199: status alone is only a proxy for
+    // "does this volume hold bytes we know about?" -- `catalog rebuild
+    // --from-volume` can attach a rebuilt row's contents to a stale
+    // `initialized` row without ever moving its status (#158). Same
+    // ordering rule as the status check just above: this is a read-only
+    // query, still ahead of `find_staged_data`, the MAM `UPDATE`, and
+    // `TapeStore::open`.
+    if coverage::has_completed_write(conn, volume_id)? {
+        return Err(TapectlError::VolumeHasRecordedWrite {
+            label: label.to_string(),
+        });
+    }
+
     // Refuse fast, before any real work, if this volume already has an
     // unresolved write session. `ValidatedLayout::plan` would otherwise hit
     // `writes`' `UNIQUE(stage_set_id, volume_id)` with a raw constraint
@@ -1177,6 +1190,20 @@ pub fn volume_resume(
         return Err(TapectlError::VolumeNotWriteTarget {
             label: label.to_string(),
             status: volume_status,
+        });
+    }
+
+    // ADR-0012 amendment, issue #199: same additional fact refusal as
+    // `volume_write` -- an `initialized` row that a rebuild attached
+    // completed contents to must be named by that fact, not fall through
+    // to `nothing_to_resume`'s message about unresolved `writes` rows
+    // (there may be none at all in the rebuild case). Deliberately does
+    // NOT disqualify `planned`/`in_progress`/`interrupted` rows -- see
+    // `has_completed_write`'s doc comment; those are exactly what
+    // `rehydrate`, called next, exists to continue.
+    if coverage::has_completed_write(conn, volume_id)? {
+        return Err(TapectlError::VolumeHasRecordedWrite {
+            label: label.to_string(),
         });
     }
 
@@ -4610,6 +4637,205 @@ mod tests {
                 "status {status}: cartridge_volumes must be untouched"
             );
         }
+    }
+
+    /// ADR-0012 amendment, issue #199: the rebuild scenario the issue was
+    /// filed about. `catalog rebuild --from-volume` can attach a rebuilt
+    /// row's contents to a pre-existing `initialized` volume without ever
+    /// moving its status (#158 deliberately leaves an existing row's
+    /// status alone) -- `rebuild::ensure_write` always inserts its
+    /// `writes` row as `status = 'completed'`, which is reproduced here
+    /// directly rather than by running a real rebuild. `volume write` must
+    /// refuse this BEFORE touching anything else, exactly like every
+    /// non-`initialized` status in the loop above: no staged-data lookup,
+    /// no MAM read/update, no binding, no device contact, and (the whole
+    /// point of #161's ordering) no new `writes` row.
+    #[test]
+    fn volume_write_refuses_an_initialized_volume_with_a_completed_write_before_touching_the_device(
+    ) {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, mam_capacity_bytes)
+             VALUES ('L6-REBUILT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', 123456)",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
+                                 completed_at, notes)
+             VALUES (?1, ?2, ?3, 'completed', 0, datetime('now'),
+                     'rebuilt from the volume itself; never verified by a read-back')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+
+        let mam_before: Option<i64> = conn
+            .query_row(
+                "SELECT mam_capacity_bytes FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cartridge_volumes_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cartridge_volumes", [], |r| r.get(0))
+            .unwrap();
+        let writes_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes_before, 1, "the rebuilt row itself, seeded above");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &config,
+            "L6-REBUILT",
+            "/nonexistent/tapectl-rebuilt-write-target-test-nst",
+            512 * 1024,
+            false, // force
+            false, // allow_missing_escrow
+        )
+        .unwrap_err();
+
+        match &err {
+            TapectlError::VolumeHasRecordedWrite { label } => {
+                assert_eq!(label, "L6-REBUILT");
+            }
+            other => panic!("expected VolumeHasRecordedWrite, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("L6-REBUILT"),
+            "message must name the label: {msg}"
+        );
+        assert!(
+            msg.contains("ADR-0012"),
+            "message must cite ADR-0012: {msg}"
+        );
+        assert!(
+            !msg.contains("tapectl-rebuilt-write-target-test-nst"),
+            "the device path must never be reached: {msg}"
+        );
+
+        let mam_after: Option<i64> = conn
+            .query_row(
+                "SELECT mam_capacity_bytes FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mam_after, mam_before,
+            "mam_capacity_bytes must be untouched"
+        );
+
+        let cartridge_volumes_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cartridge_volumes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            cartridge_volumes_after, cartridge_volumes_before,
+            "cartridge_volumes must be untouched"
+        );
+
+        let writes_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            writes_after, writes_before,
+            "a refused write must plan nothing -- no new `writes` row"
+        );
+    }
+
+    /// ADR-0012 amendment, issue #199: the same rebuild scenario, but for
+    /// `volume resume` -- an `initialized` row with a completed write
+    /// attached must be named by that fact, not fall through to
+    /// `nothing_to_resume`'s message (which would be confusing here: the
+    /// completed row means there is nothing UNRESOLVED to resume, but the
+    /// volume still is not writable).
+    #[test]
+    fn volume_resume_refuses_an_initialized_volume_with_a_completed_write() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-REBUILT-R', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
+                                 completed_at, notes)
+             VALUES (?1, ?2, ?3, 'completed', 0, datetime('now'),
+                     'rebuilt from the volume itself; never verified by a read-back')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_resume(
+            &conn,
+            &paths,
+            &config,
+            "L6-REBUILT-R",
+            "/nonexistent/tapectl-resume-rebuilt-test-nst",
+            512 * 1024,
+        )
+        .unwrap_err();
+
+        match &err {
+            TapectlError::VolumeHasRecordedWrite { label } => {
+                assert_eq!(label, "L6-REBUILT-R");
+            }
+            other => panic!("expected VolumeHasRecordedWrite, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("nothing to resume"),
+            "must be refused by the recorded-write fact, not fall through to \
+             nothing_to_resume: {msg}"
+        );
+        assert!(
+            msg.contains("ADR-0012"),
+            "message must cite ADR-0012: {msg}"
+        );
+
+        let write_status: String = conn
+            .query_row(
+                "SELECT status FROM writes WHERE id = ?1",
+                params![write_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            write_status, "completed",
+            "a refused resume must leave the writes row untouched"
+        );
     }
 
     /// ADR-0012 (issue #161): an `initialized` volume must NOT be refused

@@ -24,6 +24,8 @@
 //! advisory surfaces (`report copies`/`fire-risk`/`tape-only`, `audit`)
 //! from ever disagreeing about what a copy is again.
 
+use rusqlite::{params, Connection};
+
 /// The ADR-0004 eligibility predicate, rendered as a SQL boolean
 /// expression against `{volume_alias}.status`.
 ///
@@ -103,8 +105,62 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
 /// interrupted`), so `volume_resume` targets exactly the same status as
 /// `volume_write`: the row never leaves `initialized` between `plan` and
 /// `confirm`.
+///
+/// This is HALF of the write-target check as of ADR-0012's 2026-09-16
+/// amendment (issue #199) — see [`has_completed_write`] for the other
+/// half, and why a status alone stopped being sufficient.
 pub fn is_write_target(status: &str) -> bool {
     status == "initialized"
+}
+
+/// ADR-0012, amendment 2026-09-16 (issue #199): the second half of the
+/// write-target check, alongside [`is_write_target`]'s status test.
+/// Answers a fact `volumes.status` cannot: whether this volume ALREADY
+/// has bytes tapectl knows about, regardless of what its status says. See
+/// the dated amendment in
+/// `docs/adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md`,
+/// "The write target."
+///
+/// `catalog rebuild --from-volume` can attach a rebuilt row's contents to
+/// a pre-existing `initialized` row — `rebuild::ensure_write` always
+/// inserts its `writes` row as `status = 'completed'` — without ever
+/// moving that row off `initialized`: #158 deliberately never overwrites
+/// an existing row's status, on the grounds that overwriting an
+/// operator's `quarantined` finding would destroy a fact a failed
+/// `volume verify` established. So a rebuilt-but-never-verified row could
+/// pass [`is_write_target`]'s status test alone while already holding a
+/// whole tape's worth of attached content — this closes that gap.
+///
+/// Only `'completed'` counts. `session::SealedPending::confirm` moves
+/// every `writes` row of a session to `completed` in the SAME transaction
+/// that flips `volumes.status` to `sealed`, so in NORMAL operation
+/// `completed` and `initialized` never coexist on one volume — only the
+/// rebuild path above (or direct DB tampering) produces it, which is
+/// exactly the gap this closes. `planned`/`in_progress`/`interrupted`
+/// rows do NOT count, on purpose: `volume resume` exists to continue
+/// exactly those, and `volume_write`'s own separate "unresolved write
+/// session" check (immediately after this one, in `write.rs`) already
+/// refuses them for a *fresh* write with a message that points at
+/// `volume resume` — counting them here too would only produce a worse
+/// message for that case, not a safer one. `aborted`/`failed` rows do not
+/// count either: `docs/design/layout-session.md` is explicit that an
+/// aborted session's tape "is not a copy".
+///
+/// `write_positions`/`stage_slices` rows are deliberately NOT consulted:
+/// they carry no signal beyond `writes` here. `write_positions` reaches a
+/// volume only through `writes.id` (it has no `volume_id` of its own), and
+/// `stage_slices` has no `volume_id` at all; `rebuild::ensure_write`
+/// inserts its `completed` `writes` row in the very same transaction as
+/// any slice/position row it attaches (`rebuild.rs`'s `insert_all`), so a
+/// `writes` row is never absent while a slice attributable to this volume
+/// is present. Joining either table would duplicate a fact this query
+/// already has, not add one.
+pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM writes WHERE volume_id = ?1 AND status = 'completed')",
+        params![volume_id],
+        |row| row.get(0),
+    )?)
 }
 
 // ── Deposit-aware copy / location derivations (issue #73, ADR-0006) ──
@@ -943,5 +999,92 @@ pub(crate) mod tests {
                 "is_write_target({status:?}) should be {expected}"
             );
         }
+    }
+
+    /// ADR-0012 amendment, issue #199: `has_completed_write` must
+    /// disqualify a volume with a `completed` `writes` row, and must NOT
+    /// disqualify one whose only row is `planned`/`in_progress`/
+    /// `interrupted`/`aborted`/`failed` -- exactly the resumable-or-
+    /// terminal-but-not-a-copy states `volume resume` and the retry paths
+    /// still need to work on. Checked one status at a time, per the same
+    /// "test per state" discipline the ruling asked for on the `write.rs`
+    /// resume tests, rather than folding them into one aggregate assert.
+    #[test]
+    fn has_completed_write_disqualifies_only_completed_rows() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-hcw', 'hcw', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'staged', '/tmp/hcw')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-HCW', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+
+        assert!(
+            !has_completed_write(&conn, volume_id).unwrap(),
+            "a freshly initialized volume with no writes rows must not be flagged"
+        );
+
+        for status in ["planned", "in_progress", "interrupted", "aborted", "failed"] {
+            conn.execute(
+                "DELETE FROM writes WHERE volume_id = ?1",
+                params![volume_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![stage_set_id, snap_id, volume_id, status],
+            )
+            .unwrap();
+            assert!(
+                !has_completed_write(&conn, volume_id).unwrap(),
+                "status {status:?} must not disqualify -- only `completed` does"
+            );
+        }
+
+        conn.execute(
+            "DELETE FROM writes WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, volume_id],
+        )
+        .unwrap();
+        assert!(
+            has_completed_write(&conn, volume_id).unwrap(),
+            "a `completed` writes row must disqualify"
+        );
     }
 }

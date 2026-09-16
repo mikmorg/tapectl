@@ -82,6 +82,15 @@ pub enum TapectlError {
     /// there is nothing to override: it is a fact about the catalog row, and
     /// a sealed/retired/erased/quarantined volume is never a write target
     /// regardless of what tape happens to be loaded.
+    ///
+    /// This is the STATUS half of the write-target check only. The other
+    /// half — a volume whose status still reads `initialized` but which
+    /// already has a completed write recorded (`policy::coverage::
+    /// has_completed_write`, ADR-0012's 2026-09-16 amendment, issue #199)
+    /// — is deliberately a DIFFERENT variant ([`TapectlError::
+    /// VolumeHasRecordedWrite`]): this variant's message asserts the
+    /// status itself is the problem, which would be actively misleading
+    /// for that case (the status genuinely IS `initialized`).
     #[error(
         "volume \"{label}\" is {status} and is not a write target (ADR-0012): only a volume \
          that `volume init` left `initialized` can be written, and a sealed volume is never \
@@ -90,6 +99,26 @@ pub enum TapectlError {
          <new-label>` on it; the File 0 check is the consent point (ADR-0010)."
     )]
     VolumeNotWriteTarget { label: String, status: String },
+
+    /// ADR-0012, amendment 2026-09-16 (issue #199): the sibling of
+    /// [`TapectlError::VolumeNotWriteTarget`] for a volume whose
+    /// `volumes.status` is `initialized` but which already has a
+    /// *completed* write recorded (`policy::coverage::
+    /// has_completed_write`) — most often `catalog rebuild --from-volume`
+    /// attaching a rebuilt tape's contents to a stale `initialized` row
+    /// without ever touching its status (#158 deliberately leaves an
+    /// existing row's status alone). Also not a Tier-2 judgement and not
+    /// `--force`-overridable, for the same reason as its sibling: this is
+    /// a fact about the catalog row, not a risk call.
+    #[error(
+        "volume \"{label}\" already has a completed write recorded and is not a write target \
+         (ADR-0012): its catalog row still reads `initialized`, but the `writes` table shows \
+         bytes were already written to it — most likely `catalog rebuild --from-volume` \
+         attached a rebuilt tape's contents to this row. `--force` does not apply. To write a \
+         real blank cartridge, run `tapectl volume init <new-label>` on it; the File 0 check is \
+         the consent point (ADR-0010)."
+    )]
+    VolumeHasRecordedWrite { label: String },
 
     #[error("tape I/O error: {0}")]
     TapeIo(String),
