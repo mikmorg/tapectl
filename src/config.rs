@@ -969,7 +969,11 @@ pub fn validate_checksum_mode(value: &str) -> std::result::Result<(), String> {
 /// `/dev/nstN` it resolves to are recognised as the same drive.
 /// Canonicalize errors (either side missing) are treated as "no match", not
 /// propagated — this is a best-effort convenience, not a filesystem check.
-fn device_matches(configured: &str, requested: &str) -> bool {
+///
+/// `pub(crate)` so `cli::backend::add` (issue #174) can reuse the exact same
+/// comparison for its device-uniqueness check rather than reimplementing the
+/// canonicalize-with-string-fallback dance a second time.
+pub(crate) fn device_matches(configured: &str, requested: &str) -> bool {
     if configured == requested {
         return true;
     }

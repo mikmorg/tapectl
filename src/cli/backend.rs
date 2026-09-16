@@ -131,6 +131,32 @@ fn add(
         )));
     }
 
+    // Issue #174: two backends on one device make `--device` resolution
+    // ambiguous (ADR-0010 resolves it by matching `device_tape`, and
+    // `resolve_lto_backend`/`resolve_device` both stop at the first hit).
+    // Canonicalize both sides via `device_matches` — the same
+    // string-equality-then-canonicalize comparison `resolve_lto_backend`
+    // already uses — so a `/dev/tape/by-id/...` symlink and the `/dev/nstN`
+    // it resolves to are caught as the same drive, not just a literal
+    // string match.
+    if let Some(existing) = config
+        .backends
+        .lto
+        .iter()
+        .find(|b| crate::config::device_matches(&b.device_tape, device_tape))
+    {
+        return Err(TapectlError::Other(format!(
+            "device_tape \"{device_tape}\" is already configured as backend \"{}\" \
+             (device_tape \"{}\") in {}\n\n\
+             --device resolves by device_tape, so two backends on the same drive \
+             make that resolution ambiguous. Use a different --device-tape, or edit \
+             the existing block.",
+            existing.name,
+            existing.device_tape,
+            paths.config_file.display()
+        )));
+    }
+
     // Devices are checked but never enforced: an operator may configure a
     // drive before plugging it in, and this box is not the only machine the
     // config may be carried to. Same fail-open rule as #97's dar probe —
@@ -346,7 +372,14 @@ mod tests {
         let paths = config_with_one_backend(tmp.path(), "drive-a", "/dev/nst0");
 
         let err = add(
-            &paths, "drive-b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None, false,
+            &paths,
+            "drive-b",
+            "/dev/nst0",
+            "/dev/sg1",
+            "LTO-6",
+            None,
+            None,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
