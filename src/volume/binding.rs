@@ -476,7 +476,6 @@ fn resolve_or_register_cartridge(
     row: Option<&CartridgeRow>,
     serial: Option<&str>,
     generation: Generation,
-    capacity_bytes: i64,
     mam: &MamInfo,
 ) -> Result<Option<ResolvedCartridge>> {
     match row {
@@ -546,6 +545,20 @@ fn resolve_or_register_cartridge(
                 // schema's `DEFAULT 0`) so a drive that reports no load
                 // count leaves this brand-new row NULL -- "never observed",
                 // not a false "zero loads" (issue #184).
+                //
+                // `nominal_capacity` is the GENERATION TABLE's native figure
+                // for the detected medium, never the caller's resolved
+                // capacity (ADR-0010 decision 3, issue #183). A drive
+                // `capacity_override` sits ABOVE the cartridge row in that
+                // decision's precedence ladder precisely so it can lie about
+                // ONE volume on ONE drive (mhvtl's 2400 MB fiction); writing
+                // that resolved figure onto a brand-new row would make the
+                // next `volume init` — on any drive, override or none — read
+                // the drive's lie back as an operator's declaration at
+                // `cartridge register --capacity`. The row describes the
+                // plastic; only `volumes.capacity_bytes` (written by the
+                // caller before this ever runs) is allowed to carry the
+                // override.
                 conn.execute(
                     "INSERT INTO cartridges
                         (barcode, media_type, manufacturer, serial_number,
@@ -557,7 +570,7 @@ fn resolve_or_register_cartridge(
                         mam.manufacturer.as_deref(),
                         s,
                         mam.length_meters,
-                        capacity_bytes,
+                        generation.native_capacity_bytes() as i64,
                         mam.load_count,
                     ],
                 )?;
@@ -890,8 +903,15 @@ pub(crate) fn mount_and_record(
 /// - `row` — the [`lookup_cartridge`] match, if there was one.
 /// - `serial` — the MAM medium serial, if readable. With no row AND no
 ///   serial there is nothing to bind to and the volume is written unbound.
-/// - `generation`/`capacity_bytes` — already resolved by the caller; used
-///   only when auto-registering.
+/// - `generation` — used only when auto-registering, and only to record the
+///   detected generation's OWN native capacity onto the new row's
+///   `nominal_capacity` (ADR-0010 decision 3, issue #183) — never the
+///   caller's resolved `capacity_bytes`, which is `volumes.capacity_bytes`'s
+///   value alone.
+/// - `capacity_bytes` — the caller's already-resolved capacity (the one
+///   [`crate::media::resolve_capacity`] returned, which may be a drive
+///   `capacity_override`). Kept as a parameter for call-site stability; it
+///   no longer feeds anything binding.rs writes.
 ///
 /// A thin composition of [`resolve_or_register_cartridge`] +
 /// [`mount_and_record`] (issue #165 item 2): resolve or auto-register, then
@@ -906,12 +926,10 @@ pub(crate) fn bind_cartridge(
     row: Option<&CartridgeRow>,
     serial: Option<&str>,
     generation: Generation,
-    capacity_bytes: i64,
+    _capacity_bytes: i64,
     mam: &MamInfo,
 ) -> Result<BindOutcome> {
-    let Some(resolved) =
-        resolve_or_register_cartridge(conn, row, serial, generation, capacity_bytes, mam)?
-    else {
+    let Some(resolved) = resolve_or_register_cartridge(conn, row, serial, generation, mam)? else {
         return Ok(BindOutcome::default());
     };
     let mut outcome = mount_and_record(
