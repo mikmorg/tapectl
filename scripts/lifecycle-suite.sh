@@ -1841,7 +1841,17 @@ cp_write_volg() {
     TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV"
 }
 
-cp_compact_finish_succeeds() { TCTL volume compact-finish VOL-E; }
+# --yes because this act is now ADR-0008 Tier 2 (issue #147): finishing the
+# compaction retires VOL-E, which leaves big v1 and docs v1 at one copy each,
+# below this suite's min_copies = 2. Degraded but non-zero is exactly what
+# Tier 2 gates, and the suite is a non-interactive operator who has decided to
+# proceed — every TCTL call already runs with </dev/null, so there is no
+# prompt to answer and saying so explicitly is the truthful form.
+#
+# This is NOT a way past the floor: --yes does not reach Tier 3, and
+# cp.compact_finish_refused_first still proves the unprotected-slice case is
+# refused outright.
+cp_compact_finish_succeeds() { TCTL volume compact-finish VOL-E --yes; }
 
 scenario_compaction() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
@@ -1935,8 +1945,13 @@ rr_retire_vola_succeeds_with_coverage() {
         skip "rr.retire_vola_succeeds_with_coverage" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
         return $?
     fi
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A (now safe: every unit has a second copy on VOL-B, so no consent is needed)"; return 0; }
-    TCTL volume retire VOL-A
+    # Tier 2, and --yes says so (issue #147). The old dry-run line claimed "no
+    # consent is needed" because every unit has a second copy on VOL-B — that
+    # encoded the INVERTED tiers, where only zero coverage was gated. Under
+    # ADR-0008 as ratified, dropping each unit from two copies to one is below
+    # this suite's min_copies = 2 and is precisely what Tier 2 exists for.
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A --yes (Tier 2: VOL-B carries a second copy, so this leaves every unit at 1, below min_copies=2)"; return 0; }
+    TCTL volume retire VOL-A --yes
 }
 
 # ADR-0003 negative, run BEFORE the physical erase: VOL-A's cartridge is
@@ -2005,9 +2020,14 @@ rr_mark_erased_after_retire_succeeds() {
         skip "rr.mark_erased_after_retire_succeeds" "depends on rr.physical_erase, itself SKIP under --single-cartridge"
         return $?
     fi
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge mark-erased \$barcode (pending_erase since the retire above -> succeeds, no consent needed)"; return 0; }
+    # Tier 2 as well (issue #147), and this one the original #147 harness
+    # commit did not predict — it was found by running --all against the
+    # rebased branch rather than by reasoning about which checks would move.
+    # mark-erased declares VOL-A's bytes gone, which is a Tier-2 statement
+    # whenever there is anything to warn about.
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge mark-erased \$barcode --yes (Tier 2: declares VOL-A's bytes gone)"; return 0; }
     [ -n "${RR_VOLA_BARCODE:-}" ] || { echo "no barcode captured for VOL-A's cartridge"; return 1; }
-    TCTL cartridge mark-erased "$RR_VOLA_BARCODE"
+    TCTL cartridge mark-erased "$RR_VOLA_BARCODE" --yes
 }
 
 rr_volinit_volh_on_reused_cartridge_succeeds() {
