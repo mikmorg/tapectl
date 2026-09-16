@@ -93,6 +93,11 @@ pub(crate) struct CartridgeRow {
     pub nominal_capacity: i64,
     pub status: String,
     pub serial_number: Option<String>,
+    /// The operator's typed claim (ADR-0012 amendment, 2026-09-16; issue
+    /// #197) — never the chip's own report. Consulted by [`lookup_cartridge`]
+    /// only while `serial_number` is `None`; once the chip has spoken this
+    /// field is never read again.
+    pub operator_serial: Option<String>,
 }
 
 /// The outcome of [`lookup_cartridge`]: which row (if any) this write will
@@ -155,6 +160,15 @@ pub(crate) struct BindOutcome {
 /// "the only new refusal"; its 2026-09-14 correction retracts that. There are
 /// now four, listed in this module's header — two of them this function's own
 /// (an unregistered barcode, and a row carrying a DIFFERENT serial).
+///
+/// **Matching order (ADR-0012 amendment, 2026-09-16; issue #197):**
+/// `serial_number` (chip-confirmed) outranks an explicit `--cartridge`
+/// (human-typed), which in turn outranks `operator_serial` (also
+/// human-typed, but not even named on this command line). That ordering is
+/// deliberate, not incidental — an unconfirmed claim must never outrank an
+/// operator's EXPLICIT instruction on THIS invocation, only stand in for a
+/// missing one. So the `operator_serial` fallback runs LAST, and only when
+/// no `--cartridge` was given at all.
 pub(crate) fn lookup_cartridge(
     conn: &Connection,
     serial: Option<&str>,
@@ -199,10 +213,64 @@ pub(crate) fn lookup_cartridge(
                 )));
             }
         }
+        // The sibling case for the OPERATOR's claim rather than a
+        // chip-confirmed serial (ADR-0012 amendment, 2026-09-16; issue
+        // #197). Only reachable while `serial_number` is still `None` —
+        // once the chip has spoken `operator_serial` is never consulted
+        // again, mirroring `resolve_media`'s contradicted-generation shape
+        // (`src/tape/media_detect.rs`): tapectl cannot tell whether the
+        // assertion is wrong or the wrong cartridge is loaded, so it refuses
+        // and names the correction rather than silently confirming a claim
+        // that disagrees with what is in the drive.
+        if row.serial_number.is_none() {
+            if let (Some(claimed), Some(loaded)) = (&row.operator_serial, serial) {
+                if claimed != loaded {
+                    return Err(TapectlError::Other(format!(
+                        "cartridge \"{barcode}\" asserts operator-claimed serial {claimed}, \
+                         but the drive holds {loaded}. Either the assertion is wrong or the \
+                         wrong cartridge is loaded, and tapectl cannot tell which. If the \
+                         assertion is wrong: `tapectl cartridge edit {barcode} --serial \
+                         {loaded}`. If the wrong cartridge is loaded: load the right one."
+                    )));
+                }
+            }
+        }
         return Ok(CartridgeLookup {
             row: Some(row),
             superseded_request: None,
         });
+    }
+
+    // Fallback: no `--cartridge` was given and no row's chip-confirmed
+    // `serial_number` matched, so try the operator's claim (ADR-0012
+    // amendment, 2026-09-16; issue #197) — restricted, by
+    // `select_cartridges_by_operator_serial`, to rows the chip has not yet
+    // confirmed. Without this a cartridge pre-registered with `cartridge
+    // register --serial` would never match when it is first loaded: its
+    // claim lives in `operator_serial`, not `serial_number`, and nothing
+    // else on this path looks there.
+    if let Some(s) = serial {
+        let candidates = select_cartridges_by_operator_serial(conn, s)?;
+        match candidates.len() {
+            0 => {}
+            1 => {
+                return Ok(CartridgeLookup {
+                    row: candidates.into_iter().next(),
+                    superseded_request: None,
+                });
+            }
+            _ => {
+                let barcodes: Vec<&str> = candidates.iter().map(|r| r.barcode.as_str()).collect();
+                return Err(TapectlError::Other(format!(
+                    "medium serial {s} matches the operator-claimed serial of {} \
+                     pre-registered cartridges ({}), none of them chip-confirmed yet. \
+                     tapectl cannot tell which one is in the drive. Name it: \
+                     `--cartridge <barcode>`.",
+                    candidates.len(),
+                    barcodes.join(", ")
+                )));
+            }
+        }
     }
 
     Ok(CartridgeLookup::default())
@@ -430,7 +498,7 @@ pub(crate) fn select_cartridge(
 ) -> Result<Option<CartridgeRow>> {
     // `column` is never operator input: both call sites pass a literal.
     let sql = format!(
-        "SELECT id, barcode, media_type, nominal_capacity, status, serial_number
+        "SELECT id, barcode, media_type, nominal_capacity, status, serial_number, operator_serial
          FROM cartridges WHERE {column} = ?1"
     );
     // `.optional()?`, never `.ok()`: a locked database or a malformed query
@@ -446,10 +514,45 @@ pub(crate) fn select_cartridge(
                 nominal_capacity: r.get(3)?,
                 status: r.get(4)?,
                 serial_number: r.get(5)?,
+                operator_serial: r.get(6)?,
             })
         })
         .optional()?;
     Ok(row)
+}
+
+/// Rows whose OPERATOR-typed claim matches `value`, restricted to
+/// `serial_number IS NULL` (ADR-0012 amendment, 2026-09-16; issue #197):
+/// once the chip has spoken, `operator_serial` is never consulted again, so a
+/// row the chip has already confirmed under a DIFFERENT serial must never
+/// match here.
+///
+/// Returns every match rather than assuming uniqueness — `operator_serial`
+/// carries no UNIQUE index (two operators can mistype the same wrong value;
+/// see the migration 016 header), so [`lookup_cartridge`] decides what to do
+/// with more than one.
+fn select_cartridges_by_operator_serial(
+    conn: &Connection,
+    value: &str,
+) -> Result<Vec<CartridgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, barcode, media_type, nominal_capacity, status, serial_number, operator_serial
+         FROM cartridges WHERE operator_serial = ?1 AND serial_number IS NULL",
+    )?;
+    let rows = stmt
+        .query_map(params![value], |r| {
+            Ok(CartridgeRow {
+                id: r.get(0)?,
+                barcode: r.get(1)?,
+                media_type: r.get(2)?,
+                nominal_capacity: r.get(3)?,
+                status: r.get(4)?,
+                serial_number: r.get(5)?,
+                operator_serial: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// What [`resolve_or_register_cartridge`] found or created — the row
@@ -1457,12 +1560,44 @@ fn row_holding_serial(conn: &Connection, serial: &str, excluding: i64) -> Result
 /// the CALLER's guarantee — every caller calls it only under `serial_number
 /// IS NULL` — which is what makes ADR-0012's "`NULL` → value, never value →
 /// value" structural rather than a rule repeated in three places.
+///
+/// **Also the ONE place that checks a MAM read against `operator_serial`**
+/// (ADR-0012 amendment, 2026-09-16; issue #197). `lookup_cartridge` already
+/// refuses this contradiction at `volume init`, before the tape is even
+/// opened, but its OTHER two callers — [`corroborate_contact`]'s learn
+/// branch (every later contact: `volume write`, `resume`, `verify`,
+/// `read-slices`, `compact-read`, `restore`, `volume identify`) and `catalog
+/// rebuild`'s resolve step — never go through `lookup_cartridge` at all. Since
+/// all three funnel through this one function to actually WRITE
+/// `serial_number`, the confirm/contradict rule is stated here once rather
+/// than duplicated (or, worse, missed) at each of them. A claim that AGREES
+/// is simply superseded by the chip's own reading, which is about to become
+/// the truth; a claim that DISAGREES means either the assertion was wrong or
+/// the wrong cartridge is loaded, and tapectl cannot tell which — the same
+/// shape `media_detect::resolve_media` uses for a contradicted generation.
 pub(crate) fn record_medium_serial(
     conn: &Connection,
     cartridge_id: i64,
     barcode: &str,
     serial: &str,
 ) -> Result<()> {
+    let operator_serial: Option<String> = conn.query_row(
+        "SELECT operator_serial FROM cartridges WHERE id = ?1",
+        params![cartridge_id],
+        |r| r.get(0),
+    )?;
+    if let Some(claimed) = &operator_serial {
+        if claimed != serial {
+            return Err(TapectlError::Other(format!(
+                "cartridge \"{barcode}\" asserts operator-claimed serial {claimed}, but the \
+                 loaded medium reports {serial}. Either the assertion is wrong or the wrong \
+                 cartridge is loaded, and tapectl cannot tell which. If the assertion is \
+                 wrong: `tapectl cartridge edit {barcode} --serial {serial}`. If the wrong \
+                 cartridge is loaded: load the right one."
+            )));
+        }
+    }
+
     conn.execute(
         "UPDATE cartridges SET serial_number = ?1 WHERE id = ?2",
         params![serial, cartridge_id],
@@ -1493,6 +1628,28 @@ mod tests {
             params![barcode, gen, serial, status],
         )
         .unwrap();
+    }
+
+    /// Like [`register`], but for a PRE-REGISTERED cartridge: the operator's
+    /// claim lives in `operator_serial`, `serial_number` stays `NULL`
+    /// (ADR-0012 amendment, 2026-09-16; issue #197) — the shape
+    /// `cartridge register --serial` actually produces since the fix.
+    fn register_claimed(conn: &Connection, barcode: &str, gen: &str, operator_serial: &str) {
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, operator_serial, status)
+             VALUES (?1, ?2, 2500000000000, ?3, 'available')",
+            params![barcode, gen, operator_serial],
+        )
+        .unwrap();
+    }
+
+    fn row_serial_columns(conn: &Connection, barcode: &str) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT serial_number, operator_serial FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
     }
 
     fn new_volume(conn: &Connection, label: &str) -> i64 {
@@ -1665,6 +1822,182 @@ mod tests {
                 .barcode,
             "BC002"
         );
+    }
+
+    // ---- ADR-0012 amendment, 2026-09-16: operator_serial (issue #197) ----
+
+    /// The whole point of pre-registration: a cartridge registered with
+    /// `cartridge register --serial` (operator_serial only, no
+    /// --cartridge on the command line) must still match when the medium is
+    /// first loaded, with NO `--cartridge` given.
+    #[test]
+    fn a_pre_registered_cartridge_matches_on_first_load_with_no_cartridge_flag() {
+        let conn = db::open_memory().unwrap();
+        register_claimed(&conn, "BC001", "LTO-6", "SER-1");
+        let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
+        assert_eq!(found.row.unwrap().barcode, "BC001");
+    }
+
+    /// Once `serial_number` is set, `operator_serial` is never consulted
+    /// again: a lookup by the CHIP-CONFIRMED value still finds the row, but
+    /// a lookup by the (now-irrelevant) OPERATOR-claimed value finds
+    /// nothing, because the fallback query excludes any row whose
+    /// `serial_number` is no longer NULL.
+    #[test]
+    fn once_chip_confirmed_the_operator_claim_is_never_consulted_again() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO cartridges
+                (barcode, media_type, nominal_capacity, serial_number, operator_serial, status)
+             VALUES ('BC001', 'LTO-6', 2500000000000, 'SER-CHIP', 'SER-CLAIMED', 'available')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            lookup_cartridge(&conn, Some("SER-CHIP"), None)
+                .unwrap()
+                .row
+                .unwrap()
+                .barcode,
+            "BC001",
+            "the chip-confirmed serial must still match"
+        );
+        assert!(
+            lookup_cartridge(&conn, Some("SER-CLAIMED"), None)
+                .unwrap()
+                .row
+                .is_none(),
+            "a differing operator claim must not affect lookup once the chip has spoken"
+        );
+    }
+
+    /// Ordering (ADR-0012 amendment, 2026-09-16; issue #197): an explicit
+    /// `--cartridge` outranks the `operator_serial` fallback. A human-typed
+    /// claim that happens to match the loaded medium must NEVER silently
+    /// beat an operator's EXPLICIT instruction on this very command line —
+    /// the fallback exists only to stand in for a MISSING `--cartridge`,
+    /// never to override one that was given.
+    #[test]
+    fn an_explicit_cartridge_flag_outranks_the_operator_serial_fallback() {
+        let conn = db::open_memory().unwrap();
+        // BC001's claim matches the loaded medium...
+        register_claimed(&conn, "BC001", "LTO-6", "SER-1");
+        // ...but the operator explicitly named BC002, which has no claim at
+        // all and no serial recorded either.
+        register(&conn, "BC002", "LTO-6", None, "available");
+
+        let found = lookup_cartridge(&conn, Some("SER-1"), Some("BC002")).unwrap();
+        assert_eq!(
+            found.row.unwrap().barcode,
+            "BC002",
+            "an explicit --cartridge must win over an operator_serial match on a \
+             DIFFERENT row"
+        );
+    }
+
+    /// A MAM read that CONTRADICTS a named row's claim is refused, naming
+    /// both values and the correction command — the same shape
+    /// `media_detect::resolve_media` uses for a contradicted generation.
+    #[test]
+    fn cartridge_flag_naming_a_row_whose_operator_claim_disagrees_is_an_error() {
+        let conn = db::open_memory().unwrap();
+        register_claimed(&conn, "BC001", "LTO-6", "SER-CLAIMED");
+        let err = lookup_cartridge(&conn, Some("SER-ACTUAL"), Some("BC001"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("asserts operator-claimed serial SER-CLAIMED"),
+            "{err}"
+        );
+        assert!(err.contains("the drive holds SER-ACTUAL"), "{err}");
+        assert!(
+            err.contains("cartridge edit BC001 --serial SER-ACTUAL"),
+            "must name the correction command: {err}"
+        );
+    }
+
+    /// ...but a MAM read that CONFIRMS the claim is accepted silently, same
+    /// as any other serial-less-row match.
+    #[test]
+    fn cartridge_flag_naming_a_row_whose_operator_claim_agrees_is_accepted() {
+        let conn = db::open_memory().unwrap();
+        register_claimed(&conn, "BC001", "LTO-6", "SER-1");
+        let found = lookup_cartridge(&conn, Some("SER-1"), Some("BC001")).unwrap();
+        assert_eq!(found.row.unwrap().barcode, "BC001");
+    }
+
+    /// Two operators can mistype the same wrong serial for two different
+    /// cartridges (migration 016's header) — `operator_serial` carries no
+    /// UNIQUE index, so both rows exist. When the medium is finally loaded
+    /// with no `--cartridge` given, tapectl cannot silently guess which one
+    /// it is; it refuses and names both, pointing at `--cartridge`.
+    #[test]
+    fn two_rows_claiming_the_same_serial_are_refused_as_ambiguous() {
+        let conn = db::open_memory().unwrap();
+        register_claimed(&conn, "BC001", "LTO-6", "SER-1");
+        register_claimed(&conn, "BC002", "LTO-6", "SER-1");
+        let err = lookup_cartridge(&conn, Some("SER-1"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BC001"), "{err}");
+        assert!(err.contains("BC002"), "{err}");
+        assert!(err.contains("--cartridge"), "{err}");
+    }
+
+    // ---- record_medium_serial: the confirm/contradict gate on the OTHER
+    // two writers (corroborate_contact's learn branch, catalog rebuild) that
+    // never go through lookup_cartridge at all (issue #197) -------------
+
+    #[test]
+    fn record_medium_serial_confirms_a_matching_operator_claim() {
+        let conn = db::open_memory().unwrap();
+        register_claimed(&conn, "BC001", "LTO-6", "SER-1");
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM cartridges WHERE barcode = 'BC001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        record_medium_serial(&conn, id, "BC001", "SER-1").unwrap();
+
+        let (serial_number, operator_serial) = row_serial_columns(&conn, "BC001");
+        assert_eq!(serial_number.as_deref(), Some("SER-1"));
+        assert_eq!(
+            operator_serial.as_deref(),
+            Some("SER-1"),
+            "the assertion stands as the historical record of what was claimed"
+        );
+    }
+
+    #[test]
+    fn record_medium_serial_refuses_a_contradicting_operator_claim() {
+        let conn = db::open_memory().unwrap();
+        register_claimed(&conn, "BC001", "LTO-6", "SER-CLAIMED");
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM cartridges WHERE barcode = 'BC001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let err = record_medium_serial(&conn, id, "BC001", "SER-ACTUAL")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SER-CLAIMED"), "{err}");
+        assert!(err.contains("SER-ACTUAL"), "{err}");
+        assert!(
+            err.contains("cartridge edit BC001 --serial SER-ACTUAL"),
+            "{err}"
+        );
+
+        // Refused BEFORE the write: neither column may have moved.
+        let (serial_number, operator_serial) = row_serial_columns(&conn, "BC001");
+        assert_eq!(serial_number, None);
+        assert_eq!(operator_serial.as_deref(), Some("SER-CLAIMED"));
     }
 
     // ---- bind_cartridge --------------------------------------------------
