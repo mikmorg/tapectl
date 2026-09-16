@@ -133,6 +133,11 @@ impl RebuildReport {
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild_from_volume(
     conn: &Connection,
+    // Only for resolving the drive's SCSI generic node, so the loaded
+    // medium's serial can be read and corroborated (issue #193). Optional by
+    // construction: no matching backend means no serial, which is an
+    // absence, which proceeds — the DR machine, exactly.
+    config: &crate::config::Config,
     device: &str,
     block_size: usize,
     key_path: &Path,
@@ -145,6 +150,12 @@ pub fn rebuild_from_volume(
     let identity: age::x25519::Identity = secret.parse().map_err(|e| {
         TapectlError::Encryption(format!("invalid key in {}: {e}", key_path.display()))
     })?;
+    // Before the store open: reading the MAM opens the device read-only and
+    // drops the fd, and the st driver refuses a second concurrent open.
+    // LENIENT (ADR-0010): rebuild is THE disaster-recovery read path, so a
+    // machine with keys and no `backend add` yields `None` — an absence,
+    // which corroborates against nothing and proceeds.
+    let medium_serial = crate::volume::binding::loaded_medium_serial(config, device);
     let mut store = TapeStore::open_read(device, block_size)?;
     rebuild_from_store(
         conn,
@@ -155,6 +166,7 @@ pub fn rebuild_from_volume(
         backend_name,
         scratch,
         device,
+        medium_serial.as_deref(),
     )
 }
 
@@ -177,6 +189,7 @@ pub fn rebuild_from_store(
     backend_name: Option<&str>,
     scratch: &Path,
     device_label: &str,
+    medium_serial: Option<&str>,
 ) -> Result<RebuildReport> {
     let mut thunk = Vec::new();
     store.read_file(0, &mut thunk)?;
@@ -192,6 +205,30 @@ pub fn rebuild_from_store(
                 ident.label, ident.uuid
             )));
         }
+    }
+
+    // Corroborate at contact (ADR-0012, issue #193), against the volume row
+    // this tape says it is — when there IS one.
+    //
+    // This is the contact where the absence rule matters most: rebuild
+    // exists for the catalog that does not know this tape, so `None` here is
+    // the NORMAL case, not a failure. It corroborates only a cartridge
+    // binding the catalog already holds, which is the one thing a rebuild
+    // can contradict: a row saying this volume lives on cartridge A while
+    // the drive reports B.
+    let claim_volume_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            rusqlite::params![&ident.label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(volume_id) = claim_volume_id {
+        let medium = crate::volume::binding::MediumFacts::new(
+            medium_serial.map(str::to_string),
+            crate::volume::binding::file0_facts_from_text(&thunk_text),
+        );
+        crate::volume::binding::corroborate_volume(conn, volume_id, &ident.label, &medium)?;
     }
 
     let mut fi = Vec::new();

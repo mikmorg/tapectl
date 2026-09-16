@@ -78,7 +78,10 @@ pub fn restore_unit(
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
-    let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
+    // Validated here as well as in `restore_unit_from_store`, so a dry run —
+    // which never reaches the store half — still refuses a unit whose tenant
+    // has gone.
+    queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
     // Find write positions for this unit on this volume
@@ -100,6 +103,77 @@ pub fn restore_unit(
         });
     }
 
+    // Before `TapeStore::open_read`: reading the MAM opens the device
+    // read-only and drops the fd, and the st driver refuses a second
+    // concurrent open. LENIENT — no configured backend yields `None`, an
+    // absence, which is the DR machine with keys and no `backend add`.
+    let medium_serial = crate::volume::binding::loaded_medium_serial(config, device);
+    // Open the store read-only, positioned at BOT.
+    let mut store = TapeStore::open_read(device, block_size)?;
+    restore_unit_from_store(
+        conn,
+        paths,
+        config,
+        unit_name,
+        volume_label,
+        dest_dir,
+        &mut store,
+        medium_serial.as_deref(),
+    )
+}
+
+/// [`restore_unit`] minus the tape device — everything from the contact
+/// corroboration through the `dar` extract.
+///
+/// Split at the store seam for the reason ADR-0006 gives generally and
+/// [`crate::volume::write::volume_verify_with_store`] already demonstrates:
+/// with a `&mut dyn Store` the contact discipline is exercisable against a
+/// `MemStore` with no hardware, which is the only way to prove that restore
+/// actually corroborates (issue #193: "a contact that skips corroboration is
+/// the defect returning"). `restore_unit` keeps the drive-only parts.
+///
+/// Re-runs the unit/tenant/position lookups rather than taking them as
+/// arguments: they are three indexed reads against an open connection, and a
+/// function that cannot be called on its own is not a seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_unit_from_store(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    volume_label: &str,
+    dest_dir: &str,
+    store: &mut dyn Store,
+    medium_serial: Option<&str>,
+) -> Result<RestoreReport> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+    let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
+        .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
+    let positions = get_write_positions(conn, unit.id, volume_label)?;
+    if positions.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "no data for unit \"{unit_name}\" on volume \"{volume_label}\""
+        )));
+    }
+
+    // Corroborate at contact (ADR-0012, issue #193), before a scratch
+    // directory is made, before a key is loaded and before a single slice is
+    // read. Restoring from the wrong tape used to surface as a per-slice
+    // sha256 failure with no word about why.
+    let volume_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            rusqlite::params![volume_label],
+            |r| r.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
+    let medium = crate::volume::binding::MediumFacts::new(
+        medium_serial.map(str::to_string),
+        crate::volume::binding::read_file0_facts(store),
+    );
+    crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
+
     // Scratch dir for decrypted slices. The guard removes it on EVERY path
     // out of this function, not just the happy one — see `RestoreScratch`.
     let restore_tmp = Path::new(dest_dir).join(".tapectl-restore-tmp");
@@ -120,9 +194,6 @@ pub fn restore_unit(
         )));
     }
 
-    // Open the store read-only, positioned at BOT.
-    let mut store = TapeStore::open_read(device, block_size)?;
-
     let mut dar_slices: Vec<PathBuf> = Vec::new();
 
     for (i, wp) in positions.iter().enumerate() {
@@ -141,7 +212,7 @@ pub fn restore_unit(
             restore_tmp.join(format!("restore.{}.dar.age.tmp", wp.slice_number));
 
         let plain_size = restore_one_slice(
-            &mut store,
+            store,
             position,
             wp,
             &identities,

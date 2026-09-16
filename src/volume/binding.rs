@@ -826,18 +826,23 @@ pub(crate) enum Corroboration {
 /// read-path leniency, issue #193's constraint 1). The refusals this feeds
 /// are for two KNOWN facts that disagree.
 pub(crate) fn read_file0_facts(store: &mut dyn crate::store::Store) -> File0Facts {
-    use crate::volume::format;
     let mut raw = Vec::new();
     if let Err(e) = store.read_file(0, &mut raw) {
         tracing::warn!(err = %e, "could not read File 0 at contact; corroborating without it");
         return File0Facts::default();
     }
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let identity = format::parse_id_thunk_identity(&text).ok();
+    file0_facts_from_text(&String::from_utf8_lossy(&raw))
+}
+
+/// [`read_file0_facts`] over File 0 text already in hand — the shape
+/// `volume identify` needs, having just read and printed those bytes.
+pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
+    use crate::volume::format;
+    let identity = format::parse_id_thunk_identity(text).ok();
     File0Facts {
         label: identity.as_ref().map(|i| i.label.clone()),
         uuid: identity.as_ref().map(|i| i.uuid.clone()),
-        media: format::parse_id_thunk_media(&text).ok(),
+        media: format::parse_id_thunk_media(text).ok(),
     }
 }
 
@@ -898,6 +903,34 @@ pub(crate) fn claim_for_volume(
         volume_uuid,
         bound,
     })
+}
+
+/// Corroborate one volume at contact: load the catalog's claim about it and
+/// run [`corroborate_contact`] against it.
+///
+/// **The entry point every contact uses** — `volume write`, `volume resume`,
+/// `volume verify`, `volume read-slices`, `volume compact-read`, `restore`,
+/// `catalog rebuild` and `volume identify`. It exists so a call site is one
+/// line and cannot get the claim wrong; the RULE is still the one function
+/// below.
+///
+/// A learnt serial is announced here rather than inside the rule, so every
+/// contact reports it identically and none has to remember to.
+pub(crate) fn corroborate_volume(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    medium: &MediumFacts,
+) -> Result<Corroboration> {
+    let claim = claim_for_volume(conn, volume_id, label)?;
+    let outcome = corroborate_contact(conn, Some(&claim), medium, None)?;
+    if let Corroboration::SerialLearned { barcode, serial } = &outcome {
+        eprintln!(
+            "note: cartridge \"{barcode}\" had no medium serial recorded; learnt {serial} \
+             from the tape in the drive at this contact."
+        );
+    }
+    Ok(outcome)
 }
 
 /// Corroborate the loaded medium against the catalog, at ANY contact
@@ -1085,6 +1118,16 @@ pub(crate) fn corroborate_contact(
     // — warns and proceeds, because an unwritable catalog must never turn a
     // working READ into a failure (ADR-0010's read-path leniency). On a
     // write path a locked database fails at the next statement anyway.
+    tracing::info!(
+        cartridge = %barcode,
+        serial = %loaded,
+        // How the binding was established (migration 014). Not compared
+        // against anything — an `operator` binding is corroborated by its own
+        // existence — but it is the fact that EXPLAINS the missing serial, so
+        // it belongs beside the repair in the log.
+        bound_as = bound.identity_source.as_deref().unwrap_or("unknown"),
+        "recording the medium serial for a binding that had none"
+    );
     if let Err(e) = record_medium_serial(conn, bound.cartridge_id, barcode, loaded) {
         tracing::warn!(
             err = %e,

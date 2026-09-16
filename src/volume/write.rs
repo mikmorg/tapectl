@@ -562,53 +562,6 @@ fn volume_media(conn: &Connection, volume_id: i64, label: &str) -> Result<(i64, 
     .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))
 }
 
-/// Refuse a cartridge that is not the one `volume init` bound (ADR-0010,
-/// "`volume write` re-reads the serial").
-///
-/// The same wrong-cartridge discipline as the File 0 check, one layer
-/// earlier and from a different witness: File 0 says what was written to
-/// this tape, the MAM serial says which tape it is. Silent — not an error —
-/// whenever either side is unknown: an unbound volume (no serial was
-/// readable at init, as on some virtual drives), a cartridge row with no
-/// recorded serial, or a drive that reports none now. A check that cannot
-/// see cannot refuse.
-///
-/// Unlike the File 0 check there is no `--force`: this compares two recorded
-/// serials, and disagreement means the operator loaded a different physical
-/// cartridge than the one this volume was planned for. Continuing would
-/// overwrite it while the catalog kept crediting the other one.
-fn check_loaded_cartridge(
-    conn: &Connection,
-    volume_id: i64,
-    label: &str,
-    loaded_serial: Option<&str>,
-) -> Result<()> {
-    let Some(loaded) = loaded_serial else {
-        return Ok(());
-    };
-    let bound: Option<(Option<String>, String)> = conn
-        .query_row(
-            "SELECT c.serial_number, c.barcode
-             FROM cartridge_volumes cv
-             JOIN cartridges c ON c.id = cv.cartridge_id
-             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
-            params![volume_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((Some(initialised_on), barcode)) = bound else {
-        return Ok(());
-    };
-    if initialised_on != loaded {
-        return Err(TapectlError::Other(format!(
-            "wrong cartridge: volume \"{label}\" was initialised on {initialised_on} \
-             (cartridge {barcode}), the drive holds {loaded}. Load that cartridge, or \
-             `volume init` a new label on this one."
-        )));
-    }
-    Ok(())
-}
-
 /// What File 0's `[media]` says about the cartridge's identity: the serial
 /// string, and how it was established (`docs/design/volume-format-v2.md`
 /// §1.1). `None` for the source means UNKNOWN, and the line is then omitted
@@ -882,11 +835,22 @@ pub fn volume_write(
         );
     }
 
-    // Wrong-cartridge discipline, one layer earlier than the File 0 check
-    // (ADR-0010): the volume knows which medium serial it was initialised
-    // on, so a swapped cartridge is caught before `build()` materialises a
-    // single slice — never mind before anything is written.
-    check_loaded_cartridge(conn, volume_id, label, mam.serial.as_deref())?;
+    // Corroborate at contact (ADR-0012, issue #193) — wrong-cartridge
+    // discipline one layer earlier than the File 0 check (ADR-0010): the
+    // volume knows which medium serial it was initialised on, so a swapped
+    // cartridge is caught before `build()` materialises a single slice —
+    // never mind before anything is written.
+    //
+    // MAM ONLY, deliberately: File 0's discipline on the write path is the
+    // ADR-0003 CONSENT gate below (`check_fresh_write_contact`, which
+    // `--force` may override and which must also handle a BLANK tape).
+    // Feeding File 0 to the fact refusal would pre-empt it.
+    binding::corroborate_volume(
+        conn,
+        volume_id,
+        label,
+        &binding::MediumFacts::from_serial(mam.serial.clone()),
+    )?;
     check_loaded_generation(label, &det, volume_media_type.as_deref())?;
 
     // File 0's `[media]` identity, taken from the BINDING (ADR-0012, issue
@@ -1148,6 +1112,28 @@ pub fn volume_resume(
     // a capacity that moved mid-session would be a different plan.
     let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+
+    // Corroborate at contact (ADR-0012, issue #193). Resume is a contact
+    // under CONTEXT.md's definition and corroborated nothing until now: an
+    // interrupted session could be continued onto a DIFFERENT cartridge.
+    //
+    // Before `TapeStore::open`, because `detect` opens the device read-only
+    // and drops the fd and the st driver refuses a second concurrent open —
+    // the same ordering `volume_write` states at its own MAM read.
+    //
+    // MAM ONLY, deliberately, and for a sharper reason than on the write
+    // path: `session.resume` runs `check_tape_contact`, which maps a File 0
+    // identity mismatch onto DIVERGENCE → quarantine (`layout-session.md`).
+    // A fact refusal on File 0 here would pre-empt the quarantine that is
+    // how a resume is supposed to record a divergent tape.
+    let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    binding::corroborate_volume(
+        conn,
+        volume_id,
+        label,
+        &binding::MediumFacts::from_serial(det.mam.serial.clone()),
+    )?;
+
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     info!(label, volume_id, "resuming interrupted volume write");
@@ -1948,9 +1934,22 @@ pub fn volume_verify(
         Some(b) => (nominal_capacity as f64 * b.usable_capacity_factor) as u64,
         None => 0,
     };
+    // Before `TapeStore::open`: reading the MAM opens the device read-only
+    // and drops the fd, and the st driver refuses a second concurrent open.
+    // LENIENT — an unconfigured backend yields `None`, which is an absence
+    // and proceeds (ADR-0010's read-path leniency).
+    let medium_serial = binding::loaded_medium_serial(config, device);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    let report = volume_verify_with_store(conn, &mut store, label, volume_id, block_size, tier)?;
+    let report = volume_verify_with_store(
+        conn,
+        &mut store,
+        label,
+        volume_id,
+        block_size,
+        tier,
+        medium_serial.as_deref(),
+    )?;
 
     // Best-effort sg_logs health collection. Advisory only, and deliberately
     // OUTSIDE the store-injectable half: it needs the drive's sg node, which
@@ -1982,7 +1981,31 @@ pub(crate) fn volume_verify_with_store(
     volume_id: i64,
     block_size: usize,
     tier: Tier,
+    medium_serial: Option<&str>,
 ) -> Result<VerifyReport> {
+    // CORROBORATE FIRST, before reading anything else (issue #164). A
+    // verification session is CONTEXT.md's *Evidence*, and evidence recorded
+    // against the wrong volume is worse than no evidence, because it
+    // refreshes a staleness clock that gates nothing else. This ran on
+    // whatever tape was in the drive and wrote a `passed` row for the volume
+    // whose label was typed.
+    //
+    // The refusal returns HERE — before the front-index read, before
+    // `confirm`, and long before the transaction below — so "no
+    // `verification_sessions` row" holds structurally rather than by a
+    // cleanup step that could be forgotten. Quarantine is for the volume
+    // whose claims were contradicted, never the innocent one whose label was
+    // typed, so nothing is recorded against either.
+    //
+    // Unlike the write path this DOES offer File 0: verify has no consent
+    // gate to pre-empt, and File 0's label/uuid is the cheapest statement
+    // there is of "this is not the tape you named".
+    let medium = binding::MediumFacts::new(
+        medium_serial.map(str::to_string),
+        binding::read_file0_facts(store),
+    );
+    binding::corroborate_volume(conn, volume_id, label, &medium)?;
+
     // Read File 3 (front index) raw; its true (pre-padding) length is
     // recovered by stripping trailing NUL padding — the same trick
     // `volume_identify` already uses for File 0, and the sanctioned
@@ -2114,6 +2137,47 @@ pub fn volume_identify(store: &mut dyn Store) -> Result<String> {
     Ok(text.trim_end_matches('\0').to_string())
 }
 
+/// [`volume_identify`], corroborated against the catalog **where there is a
+/// catalog row to compare against** (ADR-0012, issue #193).
+///
+/// A separate function rather than parameters on [`volume_identify`], for
+/// the reason that function's own doc gives: it is the DB-less File 0
+/// reader, mirrored by `volume::raw`, and an heir path that needs no
+/// `Connection` is the point of it. This wraps it for the ordinary operator,
+/// who does have a catalog and would rather be told the tape in the drive is
+/// bound to a different cartridge than read it off the screen themselves.
+///
+/// Absence-tolerant throughout, and more so than any other contact, since
+/// `identify` is what an operator runs precisely when they do not know what
+/// is loaded: a File 0 naming a volume this catalog has never heard of is
+/// not a contradiction — it is the answer — so it prints and returns `Ok`.
+pub fn volume_identify_corroborated(
+    conn: &Connection,
+    store: &mut dyn Store,
+    medium_serial: Option<&str>,
+) -> Result<String> {
+    let text = volume_identify(store)?;
+    let file0 = binding::file0_facts_from_text(&text);
+    // The volume this tape says it is — not one named on the command line,
+    // because `identify` takes no label. No File 0 label, or a label no row
+    // matches, is an absence: nothing to corroborate, so nothing refused.
+    let Some(label) = file0.label.clone() else {
+        return Ok(text);
+    };
+    let volume_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(volume_id) = volume_id {
+        let medium = binding::MediumFacts::new(medium_serial.map(str::to_string), file0);
+        binding::corroborate_volume(conn, volume_id, &label, &medium)?;
+    }
+    Ok(text)
+}
+
 /// Outcome of [`stream_verify_slice_to_staging`]. `write_positions.
 /// sha256_on_volume` and `stage_slices.sha256_encrypted` have historically
 /// been populated slightly differently across code paths, so a match
@@ -2195,6 +2259,7 @@ pub fn read_slices(
     from_label: &str,
     unit_name: &str,
     store: &mut dyn Store,
+    medium_serial: Option<&str>,
 ) -> Result<ReadSlicesReport> {
     // Look up source volume
     let from_vol_id: i64 = conn
@@ -2204,6 +2269,15 @@ pub fn read_slices(
             |row| row.get(0),
         )
         .map_err(|_| TapectlError::VolumeNotFound(from_label.to_string()))?;
+
+    // Corroborate at contact, before a single slice is read (ADR-0012,
+    // issue #193). Slices read off the wrong tape would fail their sha256
+    // one at a time with no word about WHY; this says it once, up front.
+    let medium = binding::MediumFacts::new(
+        medium_serial.map(str::to_string),
+        binding::read_file0_facts(store),
+    );
+    binding::corroborate_volume(conn, from_vol_id, from_label, &medium)?;
 
     // Look up unit
     let unit = queries::get_unit_by_name(conn, unit_name)?
@@ -2349,6 +2423,7 @@ pub fn compact_read(
     config: &Config,
     label: &str,
     store: &mut dyn Store,
+    medium_serial: Option<&str>,
 ) -> Result<CompactReadReport> {
     let volume_id: i64 = conn
         .query_row(
@@ -2357,6 +2432,15 @@ pub fn compact_read(
             |row| row.get(0),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Corroborate at contact (ADR-0012, issue #193). `compact-read` is a
+    // contact issue #193 did not name — it reads slices off a tape by
+    // position exactly as `read-slices` does, and is wired with it.
+    let medium = binding::MediumFacts::new(
+        medium_serial.map(str::to_string),
+        binding::read_file0_facts(store),
+    );
+    binding::corroborate_volume(conn, volume_id, label, &medium)?;
 
     // Find live slices (snapshots not reclaimable/purged)
     let mut stmt = conn.prepare(
@@ -3203,8 +3287,47 @@ mod tests {
     /// whole corruption mechanism, and it is exactly what a bit-rotted tape
     /// looks like to the keyless chain walk.
     fn mem_store_v2_tape(label: &str, slice_claimed: &[u8], slice_on_tape: &[u8]) -> MemStore {
+        mem_store_v2_tape_identified(label, MEM_TAPE_UUID, None, slice_claimed, slice_on_tape)
+    }
+
+    /// The uuid every `mem_store_v2_tape` fixture writes into File 0, so a
+    /// test that cares can put the same one on its `volumes` row.
+    const MEM_TAPE_UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// [`mem_store_v2_tape`] with File 0's cartridge identity spelled out:
+    /// `cartridge` is `[media].cartridge_serial` plus its identity source,
+    /// `None` meaning a pre-#192 thunk that omits both.
+    ///
+    /// File 0 is generated by `layout::generate_id_thunk_v2` — the SAME
+    /// producer the write path uses — rather than hand-rolled TOML, so what
+    /// the contact check parses here is the bytes a real tape carries. A
+    /// hand-rolled thunk with no uuid parsed as an absence, which silently
+    /// disabled the corroboration these fixtures exist to exercise.
+    fn mem_store_v2_tape_identified(
+        label: &str,
+        uuid: &str,
+        cartridge: Option<(&str, Option<&str>)>,
+        slice_claimed: &[u8],
+        slice_on_tape: &[u8],
+    ) -> MemStore {
         const BS: usize = 4096;
-        let id_thunk = format!("tapectl-volume-v2\n[volume]\nlabel = \"{label}\"\n").into_bytes();
+        let (mam_serial, identity_source) = cartridge.unwrap_or(("", None));
+        let id_thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label,
+            uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.0.0-test",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 6,
+            mam_manufacturer: "TESTCO",
+            mam_serial,
+            mam_length: 846,
+            mam_loads: 1,
+            created_at: "2026-09-16T00:00:00Z",
+            cartridge_identity_source: identity_source,
+        })
+        .into_bytes();
         let guide = b"SYSTEM GUIDE\n".to_vec();
         let restore_sh = b"#!/bin/sh\n".to_vec();
 
@@ -3327,6 +3450,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
+            None,
         )
         .unwrap();
 
@@ -3392,6 +3516,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
+            None,
         )
         .unwrap();
 
@@ -3433,6 +3558,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
+            None,
         )
         .unwrap();
 
@@ -3480,7 +3606,7 @@ mod tests {
 
         let mut store = mem_store_with_slice_at(4, &data);
 
-        let report = read_slices(&conn, &config, "RSLABEL", "rs-unit", &mut store).unwrap();
+        let report = read_slices(&conn, &config, "RSLABEL", "rs-unit", &mut store, None).unwrap();
         assert_eq!(report.slices_read, 1);
         assert_eq!(report.bytes_read, data.len() as i64);
 
@@ -3508,7 +3634,7 @@ mod tests {
 
         let mut store = mem_store_with_slice_at(4, &data);
 
-        let report = compact_read(&conn, &config, "CRLABEL", &mut store).unwrap();
+        let report = compact_read(&conn, &config, "CRLABEL", &mut store, None).unwrap();
         assert_eq!(report.slices_read, 1);
         assert_eq!(report.slices_skipped, 0);
         assert_eq!(report.bytes_read, data.len() as i64);
@@ -5068,16 +5194,23 @@ mod tests {
             }
         }
 
+        /// What `volume write`/`volume resume` hand the rule: the MAM read
+        /// alone, no File 0 (their File-0 discipline is the ADR-0003 consent
+        /// gate, which a fact refusal must not pre-empt).
+        fn mam(serial: Option<&str>) -> binding::MediumFacts {
+            binding::MediumFacts::from_serial(serial.map(str::to_string))
+        }
+
         #[test]
         fn the_same_cartridge_passes() {
             let (conn, vol) = bound_volume(Some("SER-1"));
-            check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-1")).unwrap();
+            binding::corroborate_volume(&conn, vol, "L6-0001", &mam(Some("SER-1"))).unwrap();
         }
 
         #[test]
         fn a_different_cartridge_is_refused_naming_both_serials() {
             let (conn, vol) = bound_volume(Some("SER-1"));
-            let err = check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-2"))
+            let err = binding::corroborate_volume(&conn, vol, "L6-0001", &mam(Some("SER-2")))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("wrong cartridge"), "{err}");
@@ -5091,13 +5224,27 @@ mod tests {
         #[test]
         fn an_unreadable_serial_is_silent_rather_than_a_refusal() {
             let (conn, vol) = bound_volume(Some("SER-1"));
-            check_loaded_cartridge(&conn, vol, "L6-0001", None).unwrap();
+            binding::corroborate_volume(&conn, vol, "L6-0001", &mam(None)).unwrap();
         }
 
+        /// REWRITTEN for ADR-0012 (issue #193). This test was
+        /// `a_cartridge_row_with_no_recorded_serial_is_silent` and asserted
+        /// that the contact did NOTHING — which was the defect: "a bound row
+        /// that has no serial yet learns it at that contact, once". Silence
+        /// left the row unable to be corroborated at any later contact,
+        /// forever.
         #[test]
-        fn a_cartridge_row_with_no_recorded_serial_is_silent() {
+        fn a_cartridge_row_with_no_recorded_serial_learns_it() {
             let (conn, vol) = bound_volume(None);
-            check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-2")).unwrap();
+            binding::corroborate_volume(&conn, vol, "L6-0001", &mam(Some("SER-2"))).unwrap();
+            let recorded: Option<String> = conn
+                .query_row(
+                    "SELECT serial_number FROM cartridges WHERE barcode = 'BC001'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded.as_deref(), Some("SER-2"));
         }
 
         #[test]
@@ -5110,7 +5257,7 @@ mod tests {
             )
             .unwrap();
             let vol = conn.last_insert_rowid();
-            check_loaded_cartridge(&conn, vol, "L6-0001", Some("SER-2")).unwrap();
+            binding::corroborate_volume(&conn, vol, "L6-0001", &mam(Some("SER-2"))).unwrap();
         }
 
         #[test]

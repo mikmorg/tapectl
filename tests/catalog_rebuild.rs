@@ -442,6 +442,10 @@ fn rebuild(
         Some("lto0"),
         scratch,
         "memstore",
+        // No medium serial: a `MemStore` has no MAM, and a drive that
+        // reports none is an absence, which corroborates against nothing
+        // (ADR-0012, issue #193) — the DR shape this suite is about.
+        None,
     )
 }
 

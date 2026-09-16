@@ -503,6 +503,7 @@ pub fn run(
                 std::env::temp_dir().join(format!("tapectl-rebuild-{}", std::process::id()));
             let report = crate::volume::rebuild::rebuild_from_volume(
                 conn,
+                config,
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 key,

@@ -510,8 +510,16 @@ pub fn run(
 
         VolumeCommands::Identify { device } => {
             let device = read_device(config, device.as_deref())?;
+            // Before the store open: reading the MAM opens the device
+            // read-only and drops the fd, and the st driver refuses a second
+            // concurrent open.
+            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-            let id = write::volume_identify(&mut store)?;
+            // Corroborated (ADR-0012, issue #193) where there is a catalog
+            // row to compare against; the bare `volume_identify` stays the
+            // DB-less File 0 reader the heir path mirrors.
+            let id =
+                write::volume_identify_corroborated(conn, &mut store, medium_serial.as_deref())?;
             println!("{id}");
         }
 
@@ -558,8 +566,16 @@ pub fn run(
 
         VolumeCommands::ReadSlices { from, unit, device } => {
             let device = read_device(config, device.as_deref())?;
+            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-            let report = write::read_slices(conn, config, from, unit, &mut store)?;
+            let report = write::read_slices(
+                conn,
+                config,
+                from,
+                unit,
+                &mut store,
+                medium_serial.as_deref(),
+            )?;
             if json_output {
                 println!(
                     "{}",
@@ -656,8 +672,10 @@ pub fn run(
 
         VolumeCommands::CompactRead { label, device } => {
             let device = read_device(config, device.as_deref())?;
+            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-            let report = write::compact_read(conn, config, label, &mut store)?;
+            let report =
+                write::compact_read(conn, config, label, &mut store, medium_serial.as_deref())?;
             if json_output {
                 println!(
                     "{}",
@@ -729,9 +747,10 @@ pub fn run(
             // Scoped so the read-only store (and its device fd) closes
             // before step 2 opens the same device for writing — the st
             // driver refuses a second concurrent open (EBUSY).
+            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
             let report = {
                 let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-                write::compact_read(conn, config, label, &mut store)?
+                write::compact_read(conn, config, label, &mut store, medium_serial.as_deref())?
             };
             println!(
                 "  Read {} slices ({} MB)",
