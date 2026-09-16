@@ -1,0 +1,25 @@
+-- Issue #184: a stored 0 in `cartridges.total_load_count` means "never
+-- observed", not "zero loads" — distinguish them.
+--
+-- The column has carried `DEFAULT 0` since 001_initial.sql, and until #184
+-- landed NO code path ever wrote it: not `bind_cartridge`'s auto-register
+-- INSERT, not its existing-row UPDATE, not `cartridge register`. Every row in
+-- every database therefore holds the default, and every one of those zeros is
+-- provably a value nobody ever read off a medium.
+--
+-- #184 makes new rows leave the column NULL when no MAM load count is
+-- readable, and `cartridge list`/`info` render NULL as "unknown". Without this
+-- backfill that fix reaches only cartridges registered after the upgrade:
+-- every cartridge already on the shelf would keep displaying a confident "0"
+-- — which is the precise half of the defect the ruling calls out as
+-- misleading an operator deciding whether a cartridge is worn.
+--
+-- Safe by construction, and only because it runs exactly once, at upgrade,
+-- before any command logic can execute: at this instant a genuinely observed
+-- load count of 0 cannot exist, because the code able to record one is newer
+-- than every row present. Real zeros recorded after this point are kept —
+-- migrations do not run again.
+--
+-- No schema change: the column is already nullable (`Option<i64>` in
+-- src/db/models.rs), so this is data only and needs no table rebuild.
+UPDATE cartridges SET total_load_count = NULL WHERE total_load_count = 0;

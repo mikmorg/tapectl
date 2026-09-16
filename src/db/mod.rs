@@ -154,6 +154,14 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!(
             "migrations/014_cartridge_binding_identity_source.sql"
         )),
+        // Issue #184: data-only backfill. Every stored 0 predates any writer
+        // of this column, so each one is "never observed" rather than "zero
+        // loads"; NULL is how the new code and the display say that. No
+        // `.foreign_key_check()` — this touches no key, only a nullable
+        // counter on rows that already exist.
+        M::up(include_str!(
+            "migrations/015_cartridge_load_count_unknown.sql"
+        )),
     ])
 }
 
