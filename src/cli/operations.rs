@@ -2231,19 +2231,40 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 /// command writes one catalog row and never opens the device: a path no
 /// backend claims, or no backend at all, falls back to the backend TYPE
 /// string so the row stays self-consistent, exactly as before.
+///
+/// `generation` is validated exactly as `cartridge register --generation`
+/// is (`media::parse_generation_or_error`) and the row's `media_type` stores
+/// the CANONICAL spelling, never the operator's raw one — ADR-0010 promises
+/// every `volumes.media_type` row "always hold[s] a generation string
+/// tapectl can parse", and this was the one writer that broke it (issue
+/// #169; there is no more unvalidated default). `capacity`, when omitted,
+/// follows ADR-0010 decision 3's plain form for a fresh row with no drive
+/// override and no cartridge row yet bound: the generation table's native
+/// capacity.
 #[allow(clippy::too_many_arguments)]
 pub fn volume_import(
     conn: &Connection,
     config: &Config,
     label: &str,
     backend: &str,
-    media_type: &str,
-    capacity: &str,
+    generation: &str,
+    capacity: Option<&str>,
     device: Option<&str>,
     notes: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    let cap_bytes = crate::media::parse_capacity_to_bytes(capacity)?;
+    let parsed = crate::media::parse_generation_or_error(generation)?;
+    let canonical_generation = parsed.as_str();
+    let (cap_bytes, capacity_display) = match capacity {
+        Some(c) => (crate::media::parse_capacity_to_bytes(c)?, c.to_string()),
+        None => {
+            let bytes = parsed.native_capacity_bytes();
+            (
+                bytes as i64,
+                format!("{bytes} bytes, the {canonical_generation} default"),
+            )
+        }
+    };
     // Resolve backend_name from the configured backend this device names,
     // else fall back to the type string so the row remains self-consistent.
     let backend_name = match backend {
@@ -2257,7 +2278,14 @@ pub fn volume_import(
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
          VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
-        rusqlite::params![label, backend, backend_name, media_type, cap_bytes, notes],
+        rusqlite::params![
+            label,
+            backend,
+            backend_name,
+            canonical_generation,
+            cap_bytes,
+            notes
+        ],
     )?;
     let vol_id = conn.last_insert_rowid();
     crate::db::events::log_created(conn, "volume", vol_id, label, None)?;
@@ -2267,7 +2295,9 @@ pub fn volume_import(
             serde_json::json!({"id": vol_id, "label": label, "status": "imported"})
         );
     } else {
-        println!("volume \"{label}\" imported (id={vol_id}, {media_type}, {capacity})");
+        println!(
+            "volume \"{label}\" imported (id={vol_id}, {canonical_generation}, {capacity_display})"
+        );
     }
     Ok(())
 }
@@ -2840,7 +2870,7 @@ mod tests {
                 "L6-IMP",
                 "lto",
                 "LTO-6",
-                "2500G",
+                Some("2500G"),
                 Some("/dev/zero"),
                 None,
                 false,
@@ -2857,7 +2887,15 @@ mod tests {
             config.backends.lto.push(backend("lto-a", "/dev/null"));
 
             volume_import(
-                &conn, &config, "L6-IMP", "lto", "LTO-6", "2500G", None, None, false,
+                &conn,
+                &config,
+                "L6-IMP",
+                "lto",
+                "LTO-6",
+                Some("2500G"),
+                None,
+                None,
+                false,
             )
             .unwrap();
             assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto-a");
@@ -2875,7 +2913,15 @@ mod tests {
             let config = Config::default();
 
             volume_import(
-                &conn, &config, "L6-IMP", "lto", "LTO-6", "2500G", None, None, false,
+                &conn,
+                &config,
+                "L6-IMP",
+                "lto",
+                "LTO-6",
+                Some("2500G"),
+                None,
+                None,
+                false,
             )
             .unwrap();
             assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto");
@@ -2895,7 +2941,7 @@ mod tests {
                 "L6-IMP",
                 "lto",
                 "LTO-6",
-                "2500G",
+                Some("2500G"),
                 Some("/dev/nst9"),
                 None,
                 false,
@@ -2927,7 +2973,15 @@ mod tests {
             let conn = crate::db::open_memory().unwrap();
             let config = Config::default();
             volume_import(
-                &conn, &config, "L6-CAP", "lto", "LTO-6", "2.5T", None, None, false,
+                &conn,
+                &config,
+                "L6-CAP",
+                "lto",
+                "LTO-6",
+                Some("2.5T"),
+                None,
+                None,
+                false,
             )
             .unwrap();
             assert_eq!(
