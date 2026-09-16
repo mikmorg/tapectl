@@ -275,6 +275,7 @@ fn validate_cartridge_status(value: &str) -> Result<()> {
 
 pub fn run(
     conn: &Connection,
+    config: &crate::config::Config,
     command: &CartridgeCommands,
     json_output: bool,
     yes: bool,
@@ -545,6 +546,7 @@ pub fn run(
         } => {
             crate::cli::operations::cartridge_retire(
                 conn,
+                config,
                 barcode,
                 reason.as_deref(),
                 *force,
@@ -1191,6 +1193,7 @@ mod tests {
         let conn = seed();
         let err = run(
             &conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::List {
                 status: Some("offsite".to_string()),
                 location: None,
@@ -1216,6 +1219,7 @@ mod tests {
         let conn = seed();
         let err = run(
             &conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::List {
                 status: Some("avilable".to_string()),
                 location: None,
@@ -1363,6 +1367,7 @@ mod tests {
     ) -> Result<()> {
         run(
             conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Register {
                 barcode: barcode.to_string(),
                 generation: generation.to_string(),
@@ -1574,6 +1579,7 @@ mod tests {
     fn relabel(conn: &Connection, barcode: &str, new_barcode: &str, dry_run: bool) -> Result<()> {
         run(
             conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Relabel {
                 barcode: barcode.to_string(),
                 new_barcode: new_barcode.to_string(),
@@ -1713,6 +1719,7 @@ mod tests {
     fn edit(conn: &Connection, barcode: &str, generation: &str) -> Result<()> {
         run(
             conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Edit {
                 barcode: barcode.to_string(),
                 generation: Some(generation.to_string()),
@@ -1730,6 +1737,7 @@ mod tests {
     fn edit_serial(conn: &Connection, barcode: &str, serial: &str, yes: bool) -> Result<()> {
         run(
             conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Edit {
                 barcode: barcode.to_string(),
                 generation: None,
@@ -1757,6 +1765,7 @@ mod tests {
 
         run(
             &conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Edit {
                 barcode: "B001".to_string(),
                 generation: Some("LTO-5".to_string()),
@@ -1978,6 +1987,7 @@ mod tests {
         register(&conn, "B001", "LTO-6", None, None).unwrap();
         let err = run(
             &conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Edit {
                 barcode: "B001".to_string(),
                 generation: None,
@@ -2082,6 +2092,7 @@ mod tests {
         register(&conn, "B001", "LTO-6", None, None).unwrap();
         run(
             &conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Edit {
                 barcode: "B001".to_string(),
                 generation: None,
@@ -2107,6 +2118,7 @@ mod tests {
         register(&conn, "B001", "LTO-6", None, None).unwrap();
         run(
             &conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Edit {
                 barcode: "B001".to_string(),
                 generation: Some("LTO-5".to_string()),

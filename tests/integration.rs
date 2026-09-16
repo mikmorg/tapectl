@@ -431,6 +431,7 @@ fn test_cartridge_edit_generation_round_trip() {
 
     tapectl::cli::cartridge::run(
         &conn,
+        &tapectl::config::Config::default(),
         &CartridgeCommands::Register {
             barcode: "L6-0001".to_string(),
             generation: "LTO-6".to_string(),
@@ -446,6 +447,7 @@ fn test_cartridge_edit_generation_round_trip() {
 
     tapectl::cli::cartridge::run(
         &conn,
+        &tapectl::config::Config::default(),
         &CartridgeCommands::Edit {
             barcode: "L6-0001".to_string(),
             generation: Some("LTO-5".to_string()),
@@ -530,6 +532,7 @@ fn test_cartridge_edit_serial_round_trip() {
 
     tapectl::cli::cartridge::run(
         &conn,
+        &tapectl::config::Config::default(),
         &CartridgeCommands::Register {
             barcode: "L6-0002".to_string(),
             generation: "LTO-6".to_string(),
@@ -548,6 +551,7 @@ fn test_cartridge_edit_serial_round_trip() {
     // untouched.
     let refused = tapectl::cli::cartridge::run(
         &conn,
+        &tapectl::config::Config::default(),
         &CartridgeCommands::Edit {
             barcode: "L6-0002".to_string(),
             generation: None,
@@ -565,6 +569,7 @@ fn test_cartridge_edit_serial_round_trip() {
     // With --yes, the claim is written.
     tapectl::cli::cartridge::run(
         &conn,
+        &tapectl::config::Config::default(),
         &CartridgeCommands::Edit {
             barcode: "L6-0002".to_string(),
             generation: None,
