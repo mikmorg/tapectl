@@ -157,9 +157,12 @@ pub(crate) struct BindOutcome {
 /// it is reported, not refused.
 ///
 /// ADR-0010's original text called the row-vs-medium *generation* disagreement
-/// "the only new refusal"; its 2026-09-14 correction retracts that. There are
-/// now four, listed in this module's header — two of them this function's own
-/// (an unregistered barcode, and a row carrying a DIFFERENT serial).
+/// "the only new refusal"; its 2026-09-14 correction retracts that, and the
+/// 2026-09-16 amendment (issue #197) adds two more. This function alone now
+/// refuses four ways: a `--cartridge` naming an unregistered barcode, a row
+/// carrying a DIFFERENT chip-confirmed serial, a row whose OPERATOR claim
+/// disagrees with the loaded medium, and — with no `--cartridge` at all — an
+/// `operator_serial` fallback that matches more than one pre-registered row.
 ///
 /// **Matching order (ADR-0012 amendment, 2026-09-16; issue #197):**
 /// `serial_number` (chip-confirmed) outranks an explicit `--cartridge`
@@ -225,13 +228,7 @@ pub(crate) fn lookup_cartridge(
         if row.serial_number.is_none() {
             if let (Some(claimed), Some(loaded)) = (&row.operator_serial, serial) {
                 if claimed != loaded {
-                    return Err(TapectlError::Other(format!(
-                        "cartridge \"{barcode}\" asserts operator-claimed serial {claimed}, \
-                         but the drive holds {loaded}. Either the assertion is wrong or the \
-                         wrong cartridge is loaded, and tapectl cannot tell which. If the \
-                         assertion is wrong: `tapectl cartridge edit {barcode} --serial \
-                         {loaded}`. If the wrong cartridge is loaded: load the right one."
-                    )));
+                    return Err(contradicted_operator_claim(barcode, claimed, loaded));
                 }
             }
         }
@@ -553,6 +550,26 @@ fn select_cartridges_by_operator_serial(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// The one error text for "a MAM read contradicts a named row's OPERATOR
+/// claim" (ADR-0012 amendment, 2026-09-16; issue #197) — shared by
+/// [`lookup_cartridge`] (an explicit `--cartridge` at `volume init`),
+/// [`corroborate_contact`] (every later contact) and
+/// [`record_medium_serial`] (`catalog rebuild`'s resolve step, and the
+/// structural backstop for the other two). Three call sites is exactly how
+/// this kind of message drifts if it is typed three times, so it is typed
+/// once. Mirrors `media_detect::resolve_media`'s contradicted-generation
+/// shape: name both values, say tapectl cannot tell which is wrong, point at
+/// the correction.
+fn contradicted_operator_claim(barcode: &str, claimed: &str, loaded: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "cartridge \"{barcode}\" asserts operator-claimed serial {claimed}, but the loaded \
+         medium reports {loaded}. Either the assertion is wrong or the wrong cartridge is \
+         loaded, and tapectl cannot tell which. If the assertion is wrong: `tapectl cartridge \
+         edit {barcode} --serial {loaded}`. If the wrong cartridge is loaded: load the right \
+         one."
+    ))
 }
 
 /// What [`resolve_or_register_cartridge`] found or created — the row
@@ -1088,6 +1105,13 @@ pub(crate) struct BoundCartridge {
     /// the `operator` case is corroborated by the EXISTENCE of this binding,
     /// not by anything compared against this field.
     pub identity_source: Option<String>,
+    /// The operator's claimed serial (ADR-0012 amendment, 2026-09-16; issue
+    /// #197), consulted by [`corroborate_contact`] only while
+    /// `serial_number` is still `None`. Needed here, not just in
+    /// [`record_medium_serial`]'s own check, because that check runs inside
+    /// a BEST-EFFORT block this function swallows errors from — a
+    /// contradiction must be a real refusal, not a swallowed warning.
+    pub operator_serial: Option<String>,
 }
 
 /// What File 0 says, when File 0 was readable and parseable.
@@ -1244,7 +1268,7 @@ pub(crate) fn claim_for_volume(
     // as "unbound" and wave a wrong cartridge through.
     let bound = conn
         .query_row(
-            "SELECT c.id, c.barcode, c.serial_number, cv.identity_source
+            "SELECT c.id, c.barcode, c.serial_number, cv.identity_source, c.operator_serial
              FROM cartridge_volumes cv
              JOIN cartridges c ON c.id = cv.cartridge_id
              WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
@@ -1255,6 +1279,7 @@ pub(crate) fn claim_for_volume(
                     barcode: r.get(1)?,
                     serial_number: r.get(2)?,
                     identity_source: r.get(3)?,
+                    operator_serial: r.get(4)?,
                 })
             },
         )
@@ -1494,6 +1519,20 @@ pub(crate) fn corroborate_contact(
         )));
     }
 
+    // ...or the bound row itself carries an OPERATOR claim that disagrees
+    // (ADR-0012 amendment, 2026-09-16; issue #197). This is a REAL refusal,
+    // deliberately checked HERE and not left to `record_medium_serial`'s own
+    // check alone: everything below is the BEST-EFFORT block, and a write
+    // failure there is swallowed to a warning on purpose (a locked catalog
+    // must not turn a working contact into a failure). A CONTRADICTION is
+    // not a write failure — it is exactly the fact this function exists to
+    // refuse — so it must never reach that swallow.
+    if let Some(claimed) = &bound.operator_serial {
+        if claimed != loaded {
+            return Err(contradicted_operator_claim(barcode, claimed, loaded));
+        }
+    }
+
     // BEST-EFFORT, deliberately (issue #193's judgement point). The serial is
     // a fact the chip reported; it is true whether or not this contact's
     // operation succeeds, so it is recorded rather than discarded. But
@@ -1588,13 +1627,7 @@ pub(crate) fn record_medium_serial(
     )?;
     if let Some(claimed) = &operator_serial {
         if claimed != serial {
-            return Err(TapectlError::Other(format!(
-                "cartridge \"{barcode}\" asserts operator-claimed serial {claimed}, but the \
-                 loaded medium reports {serial}. Either the assertion is wrong or the wrong \
-                 cartridge is loaded, and tapectl cannot tell which. If the assertion is \
-                 wrong: `tapectl cartridge edit {barcode} --serial {serial}`. If the wrong \
-                 cartridge is loaded: load the right one."
-            )));
+            return Err(contradicted_operator_claim(barcode, claimed, serial));
         }
     }
 
@@ -1771,8 +1804,9 @@ mod tests {
     /// A superseded `--cartridge` is not among the refusals ADR-0010 and
     /// ADR-0012 introduce, so this is reported, not refused. (ADR-0010's
     /// original text called the row-vs-medium GENERATION disagreement "the
-    /// only new refusal"; its 2026-09-14 correction retracts that — there are
-    /// now four, listed in this module's header.)
+    /// only new refusal"; its 2026-09-14 and 2026-09-16 corrections retract
+    /// that — see [`lookup_cartridge`]'s own doc comment for the current
+    /// count.)
     #[test]
     fn a_serial_match_supersedes_an_explicit_cartridge_flag_without_erroring() {
         let conn = db::open_memory().unwrap();
@@ -1910,7 +1944,10 @@ mod tests {
             err.contains("asserts operator-claimed serial SER-CLAIMED"),
             "{err}"
         );
-        assert!(err.contains("the drive holds SER-ACTUAL"), "{err}");
+        assert!(
+            err.contains("the loaded medium reports SER-ACTUAL"),
+            "{err}"
+        );
         assert!(
             err.contains("cartridge edit BC001 --serial SER-ACTUAL"),
             "must name the correction command: {err}"
@@ -3469,6 +3506,54 @@ mod tests {
                 Some("SER-1"),
                 "a refused contact must not have rewritten the serial"
             );
+        }
+
+        /// ADR-0012 amendment, 2026-09-16 (issue #197). This is the case the
+        /// advisor caught: `record_medium_serial`'s own contradiction check
+        /// runs INSIDE the best-effort block below, which deliberately
+        /// swallows write failures to a warning. A contradicted OPERATOR
+        /// claim is not a write failure, so it must be refused HERE, before
+        /// that block ever runs — never swallowed to `Agreed` with a log
+        /// line nobody watching `volume write`/`resume`/`verify`/`restore`
+        /// would see.
+        #[test]
+        fn a_contradicted_operator_claim_is_refused_at_contact_not_swallowed() {
+            let conn = db::open_memory().unwrap();
+            register_claimed(&conn, "BC001", "LTO-6", "SER-CLAIMED");
+            let cart_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM cartridges WHERE barcode = 'BC001'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let vol_id = new_volume(&conn, "L6-0001");
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'operator')",
+                params![cart_id, vol_id],
+            )
+            .unwrap();
+
+            let err = corroborate_contact(
+                &conn,
+                Some(&claim(&conn, vol_id)),
+                &MediumFacts::from_serial(Some("SER-ACTUAL".into())),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("SER-CLAIMED"), "{err}");
+            assert!(err.contains("SER-ACTUAL"), "{err}");
+            assert!(
+                err.contains("cartridge edit BC001 --serial SER-ACTUAL"),
+                "{err}"
+            );
+
+            // Refused before either column could move.
+            let (serial_number, operator_serial) = row_serial_columns(&conn, "BC001");
+            assert_eq!(serial_number, None);
+            assert_eq!(operator_serial.as_deref(), Some("SER-CLAIMED"));
         }
 
         /// `bind_cartridge` writes `identity_source = 'mam'` exactly when
