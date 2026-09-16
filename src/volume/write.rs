@@ -4541,6 +4541,76 @@ mod tests {
         );
     }
 
+    /// ADR-0012 / issue #161, fix item 3: the status guard runs BEFORE the
+    /// unresolved-write-session check, and this pins that ORDER rather than
+    /// merely the guard's existence.
+    ///
+    /// The item-7 loop above cannot pin it: none of its fixtures seed a
+    /// `writes` row, so `find_staged_data`'s "no staged data" refusal would
+    /// have fired anyway whichever order the two checks ran in. Here the
+    /// volume is BOTH non-initialized AND carries an `interrupted` session,
+    /// so exactly one of the two refusals can win and the winner names the
+    /// order. Guard-second would answer "already has an unresolved write
+    /// session" — true, but not the truer fact: a sealed volume is not a
+    /// write target at all, and telling the operator to `volume resume` it
+    /// would point them at a dead end (ADR-0003: never written again).
+    #[test]
+    fn volume_write_refuses_by_status_before_the_unresolved_session_check() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-BOTH', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+
+        // `planned`/`in_progress`/`interrupted` are what the session check
+        // counts as unresolved (see `volume_write`); `interrupted` is the one
+        // an operator would actually meet.
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &config,
+            "L6-BOTH",
+            "/nonexistent/tapectl-order-test-nst",
+            512 * 1024,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, TapectlError::VolumeNotWriteTarget { ref status, .. } if status == "sealed"),
+            "the status guard must win over the unresolved-session check, got: {err}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("unresolved write session"),
+            "guard ran second — the session check answered first: {msg}"
+        );
+    }
+
     #[test]
     fn record_write_bookkeeping_sums_only_padded_slice_entries() {
         let conn = crate::db::open_memory().unwrap();
