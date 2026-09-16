@@ -369,6 +369,51 @@ hdr 7 "Initialise the tapectl home"
 skip_if || {
 if as_svc test -e "$EFFECTIVE_HOME/tapectl.db"; then
   ok "$EFFECTIVE_HOME is already initialised — not re-running init"
+  # An initialised home can still carry a config this version refuses to
+  # load: #171 made unknown keys a hard error and #172 deleted four keys
+  # that older `init` runs wrote. The db check above says nothing about
+  # that, so without this every step below dies on the same load error with
+  # no idea why (ADR-0012; the pre-production rulings ruled the breakage
+  # acceptable BECAUSE first-run offers a way out — this is that way out).
+  # Probe BEHAVIOUR, not a message: `config show` succeeds only if the
+  # config actually loads, which is true whatever `config check` prints
+  # (issue #173 changed that text, and pinning a substring of it here would
+  # silently stop detecting the day it changes again).
+  if ! tc config show >/dev/null 2>&1; then
+    note "config.toml exists but this tapectl cannot LOAD it:"
+    tc config check 2>&1 | head -20 | sed 's/^/     /'
+    explain <<'EOF'
+The message above names the offending key. If it names a specific table or key
+to delete, that edit is the smallest fix and keeps your backends, collections
+and staging path intact.
+
+Regenerating starts from tapectl's own defaults instead. Your database, keys,
+tenants and every tape are untouched — only config.toml is replaced — but the
+config's [[backends.lto]] and [[collections]] tables are NOT carried over.
+This script re-adds the drive in step 8; any collections must be re-added by
+hand afterwards.
+EOF
+    if confirm "Back up config.toml and write a fresh default one?"; then
+      CFG_BAK="$EFFECTIVE_HOME/config.toml.superseded-$(date +%Y%m%d-%H%M%S)"
+      as_svc cp "$EFFECTIVE_HOME/config.toml" "$CFG_BAK" || die "could not back up config.toml"
+      # Generated through tapectl's own writer in a throwaway home, never a
+      # template kept in this script: a hand-written default here would drift
+      # the moment a config field is added. --no-escrow so the throwaway home
+      # mints no identity and prints no secret (ADR-0005).
+      CFG_TMP="$(as_svc mktemp -d)" || die "could not make a temp dir"
+      as_svc "$TAPECTL" --home "$CFG_TMP" --config "$CFG_TMP/config.toml" init --no-escrow >/dev/null 2>&1 \
+        || { as_svc rm -rf "$CFG_TMP"; die "could not generate a fresh config; the original is untouched"; }
+      as_svc cp "$CFG_TMP/config.toml" "$EFFECTIVE_HOME/config.toml" \
+        || { as_svc rm -rf "$CFG_TMP"; die "could not install the fresh config; the original is at $CFG_BAK"; }
+      as_svc rm -rf "$CFG_TMP"
+      tc config show >/dev/null 2>&1 \
+        || die "the freshly generated config still does not load — that is a bug in tapectl, not in your configuration; your original is at $CFG_BAK"
+      ok "fresh config.toml written; previous kept at $CFG_BAK"
+      note "staging.directory and the drive are re-asked below; re-add any [[collections]] by hand."
+    else
+      die "cannot continue with a config tapectl will not load — fix the key named above, then re-run with --from 7"
+    fi
+  fi
 else
 explain <<'EOF'
 `tapectl init` creates the database, config and the operator tenant — and mints the permanent ESCROW IDENTITY (ADR-0005): the one key that is a recipient of every tape and is never rotated. Its SECRET half is printed ONCE, to your terminal, and stored nowhere on this machine. Have paper ready; write it down before you do anything else. It later goes on the Heir Kit's cover sheet (step 9), which is how an heir — or you, on a rebuilt machine — gets back in.
