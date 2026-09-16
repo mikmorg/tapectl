@@ -263,9 +263,17 @@ pub fn run(
                     )
                 }
             };
+            // `total_load_count` is bound explicitly as NULL rather than
+            // left to the schema's `DEFAULT 0` (issue #184): a hand-
+            // registered cartridge has by construction never had its MAM
+            // load count read, so "unknown" is the honest state, not a
+            // false "zero loads" that a later bind with no readable load
+            // count (`bind_cartridge`'s `COALESCE`) would otherwise make
+            // permanent.
             conn.execute(
-                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, notes)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO cartridges
+                    (barcode, media_type, nominal_capacity, serial_number, notes, total_load_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
                 params![barcode, canonical_generation, cap, serial, notes],
             )?;
             let id = conn.last_insert_rowid();
@@ -896,6 +904,26 @@ mod tests {
         register(&conn, "B001", "LTO-6", None, None).unwrap();
         let (_, _, serial) = stored_row(&conn, "B001");
         assert_eq!(serial, None);
+    }
+
+    /// Issue #184: a hand-registered cartridge has never had its MAM load
+    /// count read, so the column must land NULL (unknown) rather than the
+    /// schema's unused `DEFAULT 0` -- otherwise `bind_cartridge`'s
+    /// `COALESCE(mam.load_count, total_load_count)` would make that false
+    /// zero permanent the first time this cartridge is bound on a drive
+    /// that reports no load count.
+    #[test]
+    fn register_leaves_the_load_count_null() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let loads: Option<i64> = conn
+            .query_row(
+                "SELECT total_load_count FROM cartridges WHERE barcode = 'B001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loads, None);
     }
 
     // ---- #160: named refusals on the UNIQUE columns, and trimming --------
