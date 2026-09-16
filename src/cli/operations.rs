@@ -1618,11 +1618,31 @@ pub fn snapshot_delete(
     // clean`'s RETAIN/RECLAIM rules still govern it.
     let mut session_dirs_removed = 0usize;
     for dir in &session_dirs {
-        let still_referenced: i64 = conn.query_row(
+        // Fail OPEN on the query and CLOSED on the removal. The delete is
+        // already committed by this point, so propagating an error here
+        // would report failure for work that actually succeeded — and the
+        // operator's natural retry would then answer "snapshot not found".
+        // That is the same principle the `remove_dir_all` below already
+        // follows (warn, never error). Not being able to prove a directory
+        // is unreferenced is also the wrong moment to delete it, so an
+        // unreadable count skips the removal rather than forcing it.
+        let still_referenced: i64 = match conn.query_row(
             "SELECT COUNT(*) FROM writes WHERE session_dir = ?1",
             params![dir],
             |row| row.get(0),
-        )?;
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir,
+                    error = %e,
+                    "could not tell whether this write session directory is still \
+                     referenced; leaving it in place (`tapectl staging clean` will \
+                     reconsider it)"
+                );
+                continue;
+            }
+        };
         if still_referenced > 0 {
             continue;
         }
