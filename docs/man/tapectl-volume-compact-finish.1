@@ -10,7 +10,7 @@ Retire source volume after compaction (compaction step 3)
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Proceed even when a unit is left with no other copy (ADR\-0008 Tier 2, issue #147 — see cli::consent). It does NOT defeat the Tier\-3 refusal: a live slice with no copy anywhere still stops the retirement outright, and nothing waives that
+Waive the ADR\-0008 Tier\-2 prompt: proceed when the retirement leaves a live version below its policy but above zero. It defeats NEITHER Tier\-3 refusal (issue #147) — a live slice with no copy on another volume, and the last eligible copy of a live version, each stop the retirement outright and no flag reaches them. See cli::consent
 .TP
 \fB\-\-json\fR
 Output in JSON format
@@ -22,7 +22,7 @@ Show what would be done without making changes
 Enable verbose output
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip confirmation prompts
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.

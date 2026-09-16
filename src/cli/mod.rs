@@ -37,7 +37,8 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
-    /// Skip confirmation prompts
+    /// Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a
+    /// Tier-3 refusal — those are facts, not risks to accept (issue #147)
     #[arg(long, short, global = true)]
     pub yes: bool,
 

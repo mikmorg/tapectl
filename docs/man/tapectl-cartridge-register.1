@@ -33,7 +33,7 @@ The medium serial you BELIEVE this cartridge carries, for pre\-registering one t
 ADR\-0012 amendment (2026\-09\-16, issue #197): this is an unconfirmed CLAIM, stored in `operator_serial` — never the chip\*(Aqs own report. `volume init` writes the confirmed identity (`serial_number`) itself, from a real MAM read, the first time this cartridge is loaded; no operator command ever writes that column. Correct a wrong claim with `cartridge edit \-\-serial`.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip confirmation prompts
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.

@@ -88,8 +88,11 @@ pub enum CartridgeCommands {
         /// Why (appended to the cartridge's notes, never overwriting them)
         #[arg(long)]
         reason: Option<String>,
-        /// Proceed even when a unit is left with no other copy (ADR-0008
-        /// Tier 2 — see cli::consent)
+        /// Waive the ADR-0008 Tier-2 prompt: proceed when the retirement
+        /// leaves a live version below its policy but above zero. It does
+        /// NOT defeat the Tier-3 refusal (issue #147) — a cartridge holding
+        /// the last eligible copy of a live version is refused outright and
+        /// no flag reaches it. See cli::consent.
         #[arg(long)]
         force: bool,
     },

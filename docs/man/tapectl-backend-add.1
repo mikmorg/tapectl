@@ -33,7 +33,7 @@ Enable verbose output
 Generation this drive natively writes, e.g. LTO\-6 (ADR\-0010: a drive declares only what it can write; the medium\*(Aqs actual generation is detected at `volume init`, not declared here)
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip confirmation prompts
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
 .TP
 \fB\-\-capacity\-override\fR \fI<CAPACITY_OVERRIDE>\fR
 Capacity override — for virtual drives (mhvtl) and test harnesses only. A real drive\*(Aqs capacity follows the loaded cartridge\*(Aqs detected generation (ADR\-0010); leave this unset. Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `enospc_buffer` uses

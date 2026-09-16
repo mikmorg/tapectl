@@ -35,7 +35,7 @@ Bind this volume to an already\-registered cartridge by barcode.
 Normally unnecessary: `volume init` matches the loaded medium\*(Aqs MAM serial to `cartridges.serial_number`, and auto\-registers a cartridge (barcode = that serial) when nothing matches. Use this to attach the volume to a cartridge YOU labelled — the barcode on the physical sticker — instead. A serial match wins over this flag, since the serial was read off the medium.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip confirmation prompts
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
