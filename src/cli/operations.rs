@@ -4273,6 +4273,262 @@ mod tests {
         }
     }
 
+    /// Issue #177: the pre-fix `db_fsck` hand-rolled exactly two orphan
+    /// scans (`writes.volume_id`, `stage_slices.stage_set_id`) out of 35
+    /// FK edges the schema declares, so a database with orphans anywhere
+    /// else reported clean. This fixture orphans four OTHER edges the old
+    /// scans never looked at.
+    ///
+    /// Negative control (pre-fix HEAD): `db_fsck(&conn, false).unwrap()`
+    /// returns `issues.is_empty() == true` for this exact fixture.
+    #[test]
+    fn fsck_reports_orphans_on_edges_the_old_scans_ignored() {
+        let conn = crate::db::open_memory().unwrap();
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+
+        // A valid cartridge and location so only the ONE targeted column
+        // on each orphan row dangles -- never two edges confused as one.
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity)
+             VALUES ('BC-ORPHAN', 'LTO-6', 2500000000000)",
+            [],
+        )
+        .unwrap();
+        let cart_id = conn.last_insert_rowid();
+
+        conn.execute("INSERT INTO locations (name) VALUES ('loc-orphan')", [])
+            .unwrap();
+        let loc_id = conn.last_insert_rowid();
+
+        // snapshots.unit_id -> units: dangling.
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, source_path)
+             VALUES (99999, 1, '/nonexistent')",
+            [],
+        )
+        .unwrap();
+
+        // manifest_entries.manifest_id -> manifests: dangling.
+        conn.execute(
+            "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime)
+             VALUES (99999, '/nonexistent', 1, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // cartridge_volumes.volume_id -> volumes: dangling.
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, 99999)",
+            [cart_id],
+        )
+        .unwrap();
+
+        // volume_deposits.volume_id -> volumes: dangling.
+        conn.execute(
+            "INSERT INTO volume_deposits (volume_id, location_id) VALUES (99999, ?1)",
+            [loc_id],
+        )
+        .unwrap();
+
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        let report = db_fsck(&conn, false).unwrap();
+        assert!(report.integrity_ok);
+        assert_eq!(report.repaired, 0, "a dry run must delete nothing");
+
+        let has_edge = |child: &str, parent: &str| {
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains(child) && i.contains(parent))
+        };
+        assert!(
+            has_edge("snapshots", "units"),
+            "issues: {:?}",
+            report.issues
+        );
+        assert!(
+            has_edge("manifest_entries", "manifests"),
+            "issues: {:?}",
+            report.issues
+        );
+        assert!(
+            has_edge("cartridge_volumes", "volumes"),
+            "issues: {:?}",
+            report.issues
+        );
+        assert!(
+            has_edge("volume_deposits", "volumes"),
+            "issues: {:?}",
+            report.issues
+        );
+    }
+
+    /// Issue #177: `--repair`'s naive DELETEs failed with a bare
+    /// `FOREIGN KEY constraint failed` whenever an orphan row had children
+    /// of its own -- exactly the shape a real corrupt catalog has, and the
+    /// only shape `--repair` exists to fix. This fixture builds a `writes`
+    /// row orphaned on `volumes` with a `write_positions` child and a
+    /// `verification_results` grandchild (via that child), plus a
+    /// `stage_slices` row orphaned on `stage_sets` referenced by a second
+    /// `write_positions` row and by the orphan write's
+    /// `sacrificed_slice_id`.
+    ///
+    /// Negative control (pre-fix HEAD): `db_fsck(&conn, true)` returns
+    /// `Err` whose text contains `FOREIGN KEY constraint failed`, and every
+    /// orphan row is left in place.
+    #[test]
+    fn fsck_repair_deletes_children_before_parents() {
+        let conn = crate::db::open_memory().unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator) VALUES ('t1', 0)",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id) VALUES ('u-1', 'unit1', ?1)",
+            [tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, source_path) VALUES (?1, 1, '/src')",
+            [unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size) VALUES (?1, 1048576)",
+            [snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                       encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (?1, 0, 1, 1, 'aa', 'bb')",
+            [stage_set_id],
+        )
+        .unwrap();
+        let slice_valid_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
+             VALUES ('vol1', 'lto', 'drive0', 1000000)",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'passed')",
+            [volume_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+
+        // An orphan stage_slices row -- its OWN stage_set_id dangles.
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                       encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (88888, 0, 1, 1, 'cc', 'dd')",
+            [],
+        )
+        .unwrap();
+        let slice_orphan_id = conn.last_insert_rowid();
+
+        // An orphan writes row -- its OWN volume_id dangles -- that also
+        // references the orphan slice via `sacrificed_slice_id` (that
+        // reference is not itself dangling: the row exists).
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, sacrificed_slice_id)
+             VALUES (?1, ?2, 99999, 'completed', ?3)",
+            params![stage_set_id, snap_id, slice_orphan_id],
+        )
+        .unwrap();
+        let write_orphan_id = conn.last_insert_rowid();
+
+        // write_positions child of the orphan write, pointing at the VALID
+        // slice -- it only dangles once its parent write is deleted.
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position)
+             VALUES (?1, ?2, '1')",
+            params![write_orphan_id, slice_valid_id],
+        )
+        .unwrap();
+        let wp_child_id = conn.last_insert_rowid();
+
+        // A second write_positions row referencing the orphan slice
+        // directly -- it only dangles once the orphan slice is deleted.
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position)
+             VALUES (?1, ?2, '2')",
+            params![write_orphan_id, slice_orphan_id],
+        )
+        .unwrap();
+        let wp_slice_ref_id = conn.last_insert_rowid();
+
+        // verification_results grandchild of the orphan write, via
+        // wp_child -- only dangles once wp_child is deleted.
+        conn.execute(
+            "INSERT INTO verification_results (session_id, write_position_id, stage_slice_id, result)
+             VALUES (?1, ?2, ?3, 'passed')",
+            params![session_id, wp_child_id, slice_valid_id],
+        )
+        .unwrap();
+        let vr_id = conn.last_insert_rowid();
+
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        let report = db_fsck(&conn, true).unwrap();
+        assert!(report.integrity_ok);
+        assert_eq!(
+            report.repaired, 5,
+            "must delete write_orphan, slice_orphan, both write_positions \
+             rows, and the verification_results row -- report: {report:?}"
+        );
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "the FK graph must be fully closed after repair"
+        );
+
+        for (table, id) in [
+            ("writes", write_orphan_id),
+            ("stage_slices", slice_orphan_id),
+            ("write_positions", wp_child_id),
+            ("write_positions", wp_slice_ref_id),
+            ("verification_results", vr_id),
+        ] {
+            let left: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE rowid = {id}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "{table} rowid {id} should have been deleted");
+        }
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE action = 'db_fsck_repair'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "a repair must leave exactly one audit event");
+    }
+
     /// Issue #104: insert orphans into BOTH tables `db_fsck` repairs, then
     /// repair. Three properties at once: `repaired` is a row count (3, not
     /// the old category count of 2), both tables are actually emptied by
@@ -4280,6 +4536,14 @@ mod tests {
     ///
     /// This is the test that fails against pre-#104 code: it asserted
     /// `repaired == 2` there, and found no event at all.
+    ///
+    /// Issue #177 strengthens this test's `issues` expectation (2 -> 4):
+    /// `pragma_foreign_key_check` reports one line per (child, parent,
+    /// constraint) group, and these two `writes` rows dangle on THREE
+    /// parents (volumes, stage_sets, snapshots) while the `stage_slices`
+    /// row dangles on one (stage_sets) -- four groups, not the old two
+    /// hand-kept categories. `repaired == 3` and the single-event
+    /// assertion are unchanged.
     #[test]
     fn fsck_repair_is_transactional_row_counted_and_audited() {
         let conn = crate::db::open_memory().unwrap();
