@@ -3,7 +3,7 @@ use tapectl::{cli, config, db, error, signal, tenant};
 use anyhow::{bail, Context};
 use clap::Parser;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, ConfigCommands};
 use config::{Config, TapectlPaths};
 
 fn main() {
@@ -220,6 +220,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         .ensure_dirs()
         .context("failed to secure tapectl home directories")?;
 
+    // Issue #173: `config check`'s whole job is diagnosing a config that
+    // fails to load — so it must not be gated behind the strict
+    // `Config::load` two lines below the way every other command
+    // (including `config show`) still is. It gets its own view of the
+    // config via `policy::lenient_config` instead, so it is dispatched
+    // here, before that load, the same way `Init`/`Completions` are
+    // special-cased above.
+    //
+    // `config show` deliberately stays on the normal path below: it reads
+    // the raw file either way, so it does not need the lenient parser, and
+    // issue #172's own acceptance test depends on `Config::load` actually
+    // running for it (the "loaded config" DEBUG line only fires from there).
+    if matches!(
+        cli.command,
+        Commands::Config {
+            command: ConfigCommands::Check
+        }
+    ) {
+        let conn = db::open(&paths.db_file).context("failed to open database")?;
+        let exit_code = cli::config::run(&conn, &paths, &ConfigCommands::Check, cli.json)?;
+        exit_if_nonzero(exit_code);
+        return Ok(());
+    }
+
     let cfg = Config::load(&paths.config_file).context("failed to load config")?;
     // Issue #172: a real, generically useful DEBUG-level log line — proof,
     // observable from `logging.level = "debug"` alone with no tape/write
@@ -339,7 +363,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             exit_if_nonzero(exit_code);
         }
         Commands::Config { ref command } => {
-            cli::config::run(&conn, &paths, command, cli.json)?;
+            // `Check` is intercepted above, before the strict `Config::load`
+            // (#173); only `Show` ever reaches here.
+            let exit_code = cli::config::run(&conn, &paths, command, cli.json)?;
+            exit_if_nonzero(exit_code);
         }
         Commands::Init { .. } | Commands::Completions { .. } => {
             unreachable!()

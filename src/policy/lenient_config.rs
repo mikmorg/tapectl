@@ -404,7 +404,10 @@ mod tests {
         );
         // No unknown-key noise for a config whose only problem is a bad value.
         assert!(
-            !report.problems.iter().any(|p| p.starts_with("unknown key:")),
+            !report
+                .problems
+                .iter()
+                .any(|p| p.starts_with("unknown key:")),
             "{:?}",
             report.problems
         );

@@ -1224,3 +1224,192 @@ fn write_paths_refuse_an_unconfigured_device_by_name() {
         "a write path with no configured backend must say so; got:\n{err}"
     );
 }
+
+/// Issue #173's whole defect, as a negative control: before the fix, EVERY
+/// one of these four tests failed the same way — `tapectl` (via `main.rs`'s
+/// common dispatch, which loads the config strictly before any subcommand
+/// runs at all) aborted with a bare `error: failed to load config: ...` at
+/// exit 2, and `config check`'s own body — the `Check` arm in
+/// `cli::config::run` — never ran, `--json` included. `config check` is now
+/// dispatched before that strict load and reports every problem it finds
+/// via its own lenient parse path (`policy::lenient_config`).
+fn config_toml_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".tapectl").join("config.toml")
+}
+
+/// Parse `stdout` as one JSON object, the way `--json config check` must
+/// always produce — on a valid config as much as a broken one (issue #173
+/// fix item 3: "Keep `--json` — it must emit its object on a broken config,
+/// not a bare error string").
+fn parse_json_stdout(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap_or_else(|e| {
+        panic!(
+            "config check --json must emit one JSON object, valid or not: {e}\nstdout={:?}\nstderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        )
+    })
+}
+
+#[test]
+fn config_check_reports_a_misspelled_key_and_exits_nonzero() {
+    let home = TempDir::new().unwrap();
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let cfg = config_toml_path(home.path());
+    let original = std::fs::read_to_string(&cfg).unwrap();
+    let broken = original.replacen("[defaults]\n", "[defaults]\nbadkey_typo = 1\n", 1);
+    assert_ne!(
+        broken, original,
+        "fixture assumption broken — init no longer writes a bare [defaults] header"
+    );
+    std::fs::write(&cfg, &broken).unwrap();
+
+    let human = run_tapectl(home.path(), &["config", "check"]);
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("badkey_typo"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    let json_run = run_tapectl(home.path(), &["--json", "config", "check"]);
+    assert_eq!(json_run.status.code(), Some(2));
+    let parsed = parse_json_stdout(&json_run);
+    assert_eq!(parsed["valid"], serde_json::json!(false));
+    let problems = parsed["problems"]
+        .as_array()
+        .expect("problems must be an array");
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("badkey_typo")),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn config_check_reports_a_bad_closed_set_value_and_exits_nonzero() {
+    let home = TempDir::new().unwrap();
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let cfg = config_toml_path(home.path());
+    let original = std::fs::read_to_string(&cfg).unwrap();
+    let broken = original.replace("compression = \"none\"", "compression = \"banana\"");
+    assert_ne!(
+        broken, original,
+        "fixture assumption broken — init no longer writes defaults.compression = \"none\""
+    );
+    std::fs::write(&cfg, &broken).unwrap();
+
+    let human = run_tapectl(home.path(), &["config", "check"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("banana"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    let json_run = run_tapectl(home.path(), &["--json", "config", "check"]);
+    assert_eq!(json_run.status.code(), Some(2));
+    let parsed = parse_json_stdout(&json_run);
+    assert_eq!(parsed["valid"], serde_json::json!(false));
+    assert!(
+        parsed["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("banana")),
+        "{parsed}"
+    );
+}
+
+/// Acceptance criterion, verbatim: "A config so malformed it is not valid
+/// TOML reports that, once."
+#[test]
+fn config_check_on_syntactically_invalid_toml_reports_it_exactly_once() {
+    let home = TempDir::new().unwrap();
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let cfg = config_toml_path(home.path());
+    std::fs::write(&cfg, "this is not [ valid toml {{{\n").unwrap();
+
+    let json_run = run_tapectl(home.path(), &["--json", "config", "check"]);
+    assert_eq!(json_run.status.code(), Some(2));
+    let parsed = parse_json_stdout(&json_run);
+    assert_eq!(parsed["valid"], serde_json::json!(false));
+    let problems = parsed["problems"].as_array().unwrap();
+    assert_eq!(
+        problems.len(),
+        1,
+        "a syntactically broken file must report its one problem once: {parsed}"
+    );
+}
+
+/// The end-to-end acceptance demo (issue #173, process step 6): an unknown
+/// key, a bad closed-set value, and a missing staging directory, all at
+/// once, must ALL THREE be reported in a single run, with a non-zero exit
+/// and a still-valid `--json` object.
+#[test]
+fn config_check_reports_all_three_problems_from_one_broken_config_at_once() {
+    let home = TempDir::new().unwrap();
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let cfg = config_toml_path(home.path());
+    let original = std::fs::read_to_string(&cfg).unwrap();
+
+    // (a) unknown key, (b) bad closed-set value.
+    let mut broken = original.replacen("[defaults]\n", "[defaults]\nbadkey_typo = 1\n", 1);
+    broken = broken.replace("compression = \"none\"", "compression = \"banana\"");
+    assert_ne!(broken, original, "fixture assumption broken");
+    std::fs::write(&cfg, &broken).unwrap();
+
+    // (c) missing staging directory — remove the one `init` created.
+    let staging_dir = home.path().join(".tapectl").join("staging");
+    assert!(
+        staging_dir.is_dir(),
+        "fixture assumption: init creates staging"
+    );
+    std::fs::remove_dir_all(&staging_dir).unwrap();
+
+    let human = run_tapectl(home.path(), &["config", "check"]);
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_text = String::from_utf8_lossy(&human.stdout);
+    assert!(human_text.contains("badkey_typo"), "{human_text}");
+    assert!(human_text.contains("banana"), "{human_text}");
+    assert!(
+        human_text.contains("staging") && human_text.contains("does not exist"),
+        "{human_text}"
+    );
+
+    let json_run = run_tapectl(home.path(), &["--json", "config", "check"]);
+    assert_eq!(json_run.status.code(), Some(2));
+    let parsed = parse_json_stdout(&json_run);
+    assert_eq!(parsed["valid"], serde_json::json!(false));
+    let problems = parsed["problems"].as_array().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("badkey_typo")),
+        "{parsed}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("banana")),
+        "{parsed}"
+    );
+    assert_eq!(
+        parsed["staging"]["status"],
+        serde_json::json!("missing"),
+        "{parsed}"
+    );
+}
