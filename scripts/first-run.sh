@@ -14,7 +14,8 @@
 #       every tapectl command from here on runs as it (sudo -u tapectl -H)
 #    6  find the tape drive BY SERIAL and confirm the service user can open it
 #    7  initialise the tapectl home — mints the escrow identity (paper ready)
-#    8  register the drive as a backend, by-id path
+#    8  register the drive as a backend, by-id path, generation from the
+#       drive's INQUIRY product id (never from the loaded cartridge)
 #    9  the Heir Kit — generate, print, seal, two failure domains
 #   10  a shelf location for cartridges
 #   11  tenants and units: who owns which paths; the service user is granted read by ACL
@@ -162,6 +163,9 @@ run_capture() {
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
 tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
+# The DRIVE's own generation, parsed from its INQUIRY product id (issue #178).
+# shellcheck source=lib/drive-generation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/drive-generation.sh"
 # The heir kit is YOUR artifact to print, but escrow-kit chmods its out dir 0700
 # as whoever runs it. Hand the dir to the service user for the write, take it back after.
 kit_prepare() { mkdir -p "$1"; [ "$SVC_MODE" = 1 ] && sudo chown -R "$SVC_USER" "$1"; return 0; }
@@ -470,12 +474,61 @@ explain <<'EOF'
 EOF
   [ -n "$DEVICE" ] || die "no device chosen — run with --from 6"
   ask BNAME "backend name" "lto6"
-  # Default to what the drive reports for the loaded medium: on a drive holding
-  # its own native generation that is the right answer, and it is never a worse
-  # guess than a hardcoded one.
-  DSEEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
-  [ -n "$DSEEN" ] && note "the drive currently reports $DSEEN media loaded"
-  ask DGEN "generation this DRIVE natively writes (LTO-5 … LTO-9)" "${DGEN:-${DSEEN:-LTO-6}}"
+  # ADR-0010 decision 1: a drive declares only the one generation it IS. What
+  # cartridge happens to be loaded says NOTHING about that — this used to
+  # default from the loaded medium's density, so an LTO-5 tape in an LTO-6
+  # drive during setup wrote `generation = "LTO-5"` permanently, and every
+  # later `volume init` refused with a message about physics instead of naming
+  # the config key that was wrong (issue #178).
+  #
+  # The drive's identity comes from its own INQUIRY product id. sysfs first:
+  # world-readable, opens no device node, needs no sg permission for the
+  # service user, and identical for mhvtl and the real drive.
+  DRIVE_MODEL="$(as_svc cat "/sys/class/scsi_tape/$NSTN/device/model" 2>/dev/null | sed 's/[[:space:]]*$//')"
+  DRIVE_VENDOR="$(as_svc cat "/sys/class/scsi_tape/$NSTN/device/vendor" 2>/dev/null | sed 's/[[:space:]]*$//')"
+  if [ -z "$DRIVE_MODEL" ] && command -v sg_inq >/dev/null 2>&1 && [ -n "$SG" ]; then
+    DRIVE_MODEL="$(as_svc sg_inq "$SG" 2>/dev/null | sed -n 's/^ *Product identification: *//p' | head -1 | sed 's/[[:space:]]*$//')"
+  fi
+  DRIVE_GEN=""
+  if [ -n "$DRIVE_MODEL" ]; then
+    DRIVE_GEN="$(drive_generation_from_model "$DRIVE_MODEL")" || DRIVE_GEN=""
+  fi
+  if [ -n "$DRIVE_GEN" ]; then
+    ok "drive identifies as '${DRIVE_VENDOR:+$DRIVE_VENDOR }$DRIVE_MODEL' -> $DRIVE_GEN"
+  else
+    note "cannot derive a generation from this drive's product id '${DRIVE_VENDOR:+$DRIVE_VENDOR }${DRIVE_MODEL:-<unreadable>}'"
+  fi
+
+  # Default chain: --generation, else the product id, else NOTHING. There is
+  # deliberately no literal fallback: a wrong generation here is written into
+  # config.toml permanently and there is no `backend edit`.
+  if [ -n "${DGEN:-}" ]; then
+    :
+  elif [ -n "$DRIVE_GEN" ]; then
+    DGEN="$DRIVE_GEN"
+  elif [ "$AUTO" = 1 ]; then
+    die "cannot derive this drive's generation from '${DRIVE_VENDOR:+$DRIVE_VENDOR }${DRIVE_MODEL:-<unreadable>}' — pass --generation LTO-n"
+  fi
+  ask DGEN "generation this DRIVE natively writes (LTO-5 … LTO-9)" "${DGEN:-}"
+  [ -n "$DGEN" ] || die "no drive generation given, and none could be derived — pass --generation LTO-n"
+
+  # The loaded medium's density is a CROSS-CHECK, evaluated after DGEN is
+  # final. It never feeds the default (ADR-0010) and never changes DGEN.
+  MEDIUM_GEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
+  if [ -z "$MEDIUM_GEN" ]; then
+    note "no cartridge loaded or density unreadable — nothing to cross-check"
+  else
+    dnum="${DGEN##*-}"; mnum="$(printf '%s' "$MEDIUM_GEN" | sed -n 's/.*[Ll][Tt][Oo][- ]*\([0-9][0-9]*\).*/\1/p')"
+    if [ -z "$mnum" ]; then
+      note "loaded medium reports '$MEDIUM_GEN', which is not an LTO generation — nothing to cross-check"
+    elif [ "$mnum" = "$dnum" ]; then
+      ok "loaded medium agrees (LTO-$mnum)"
+    elif [ "$mnum" -gt "$dnum" ] 2>/dev/null; then
+      note "loaded medium reports LTO-$mnum but this drive identifies as $DGEN — an LTO drive cannot hold a newer generation, so the model string was misread or 'mt status' is not this drive; check 'lsscsi -g' and pass --generation if the drive is right"
+    else
+      note "loaded medium is LTO-$mnum — a fact about that cartridge, not this drive (ADR-0010); the drive stays $DGEN"
+    fi
+  fi
   run tc backend add --name "$BNAME" --device-tape "$DEVICE" --device-sg "$SG" --generation "$DGEN"
   run tc config check || true
 fi
@@ -676,7 +729,12 @@ EOF
       if ! tc cartridge list --json 2>/dev/null | grep -q "\"$CARTRIDGE\""; then
         CGEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
         if [ -n "$CGEN" ]; then note "the loaded medium reports $CGEN"; else note "could not read the medium's density from the drive"; fi
-        ask CGEN "generation of THIS cartridge" "${CGEN:-${DGEN:-LTO-6}}"
+        # DGEN is now the DRIVE's identity, so `${CGEN:-$DGEN}` is exactly
+        # ADR-0010's last rung (detected -> --generation -> row -> drive) and
+        # `volume init` refuses any contradiction. The trailing LTO-6 literal
+        # is gone: guessing a generation is what issue #178 removed.
+        ask CGEN "generation of THIS cartridge" "${CGEN:-${DGEN:-}}"
+        [ -n "$CGEN" ] || die "no cartridge generation given — pass --generation, or load the cartridge so its density can be read"
         run tc cartridge register --barcode "$CARTRIDGE" --generation "$CGEN" || die "cartridge register failed"
       fi
       run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --cartridge "$CARTRIDGE" || die "volume init failed"
