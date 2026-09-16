@@ -1414,6 +1414,27 @@ pub fn export_unit(
     Ok(())
 }
 
+/// The volumes whose `interrupted` write rows a delete of `snap_id` will
+/// remove (issue #176 step 4).
+///
+/// Extracted so the rule can be tested directly. It used to be inline, and
+/// its test asserted on CAPTURED TRACING OUTPUT — which is not deterministic:
+/// `tracing`'s per-callsite `Interest` is process-global, so under a parallel
+/// `cargo test` whichever thread reaches the `warn!` first can decide the
+/// callsite is uninteresting for every later one, and the capture comes back
+/// empty. That flake reached master and failed a coordinator gate on
+/// 2026-09-16; `rebuild_interest_cache()` narrowed the window but did not
+/// close it. The SQL is the part worth pinning, and it needs no subscriber.
+fn interrupted_write_volumes(conn: &Connection, snap_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT v.label FROM writes w
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE w.snapshot_id = ?1 AND w.status = 'interrupted'",
+    )?;
+    let rows = stmt.query_map(params![snap_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 /// Delete an unwritten snapshot.
 pub fn snapshot_delete(
     conn: &Connection,
@@ -1501,15 +1522,7 @@ pub fn snapshot_delete(
     // revalidation would refuse it anyway. #94 settled that only the
     // operator judges a session unrecoverable, so this collects a warning
     // naming the volume rather than auto-aborting the row.
-    let interrupted_volumes: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT v.label FROM writes w
-             JOIN volumes v ON v.id = w.volume_id
-             WHERE w.snapshot_id = ?1 AND w.status = 'interrupted'",
-        )?;
-        let rows = stmt.query_map(params![snap_id], |row| row.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
+    let interrupted_volumes = interrupted_write_volumes(conn, snap_id)?;
 
     // Cascade delete: verification_results -> write_positions -> writes ->
     // stage_slices -> stage_sets -> manifest_entries -> manifests -> files
@@ -4503,65 +4516,6 @@ mod tests {
         (write_id, wp_id)
     }
 
-    /// Captures whatever `tracing::warn!`/etc. emit during `f`, via a
-    /// thread-scoped subscriber (`tracing::subscriber::with_default`)
-    /// rather than swapping the process's real stdout/stderr file
-    /// descriptor — safe under `cargo test`'s default parallel,
-    /// multi-threaded execution (issue #176).
-    fn capture_tracing<F: FnOnce()>(f: F) -> String {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-            type Writer = Buf;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buf = Buf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
-            // `tracing`'s per-callsite `Interest` (always/never/sometimes)
-            // is cached the first time any thread in the process reaches a
-            // given `tracing::warn!`/etc. call site, and that cache is
-            // process-global, not thread-local. Under `cargo test`'s
-            // default parallelism, some OTHER test's thread can reach
-            // `snapshot_delete`'s interrupted-write warning first with NO
-            // subscriber installed, permanently caching it "never
-            // interesting" and silently defeating this scope's
-            // `with_default` — exactly the flakiness `rebuild_interest_cache`
-            // exists to clear: force every callsite to re-register against
-            // *this* thread's now-current subscriber before running `f`.
-            tracing::callsite::rebuild_interest_cache();
-            f();
-        });
-        // Rebuild once more on the way out so the cache does not keep
-        // favoring this scope's subscriber for other tests running
-        // concurrently on other threads once it is gone.
-        tracing::callsite::rebuild_interest_cache();
-
-        let bytes = buf.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
     /// The encrypted `.age` files must not be orphaned. `stage_slices` rows
     /// are the ONLY handle `staging::clean_staging` has on them (it finds
     /// files exclusively by joining that table), so deleting the rows
@@ -4866,13 +4820,31 @@ mod tests {
         let volume_id = insert_volume(&conn, "VOL-NAMED-INTERRUPTED");
         insert_write(&conn, snap_id, volume_id, "interrupted", None);
 
-        let output = capture_tracing(|| {
-            snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
-        });
-        assert!(
-            output.contains("VOL-NAMED-INTERRUPTED"),
-            "the interrupted-write warning must name the volume label, got: {output}"
+        // Asserted against the rule itself, NOT against captured tracing
+        // output: `tracing`'s per-callsite `Interest` is process-global, so
+        // under a parallel `cargo test` whichever thread reaches the `warn!`
+        // first can decide the callsite is uninteresting for every later
+        // one and the capture comes back empty. That is a property of the
+        // test harness, not of this code, and it failed a gate on master.
+        let named = interrupted_write_volumes(&conn, snap_id).unwrap();
+        assert_eq!(
+            named,
+            vec!["VOL-NAMED-INTERRUPTED".to_string()],
+            "the interrupted write's volume must be the one the warning names"
         );
+
+        snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
+
+        // And it named it because the row was really there and is really
+        // gone — the warning is about work this delete actually did.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM writes WHERE snapshot_id = ?1",
+                params![snap_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "the interrupted write row must be gone");
     }
 
     /// Issue #176 step 2: the `completed` guard is the ONLY write-related
