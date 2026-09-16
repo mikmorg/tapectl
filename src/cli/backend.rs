@@ -260,8 +260,12 @@ mod tests {
     /// table at all.
     #[test]
     fn an_empty_lto_stub_is_cleared_so_the_appended_table_parses() {
+        // `defaults.hash` was this fixture's "other tables survive" witness
+        // until issue #172 deleted it (nothing ever read it); `checksum_mode`
+        // makes the same point — a real, still-live `[defaults]` field whose
+        // non-default value must still be exactly what comes back out.
         let before =
-            "[dar]\nbinary = \"dar\"\n\n[backends]\nlto = []\n\n[defaults]\nhash = \"sha256\"\n";
+            "[dar]\nbinary = \"dar\"\n\n[backends]\nlto = []\n\n[defaults]\nchecksum_mode = \"sha256\"\n";
         let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None);
         assert!(
             toml::from_str::<Config>(&format!("{before}{block}")).is_err(),
@@ -273,7 +277,7 @@ mod tests {
         let cfg: Config =
             toml::from_str(&format!("{after}{block}")).expect("cleared stub must let it parse");
         assert_eq!(cfg.backends.lto.len(), 1);
-        assert_eq!(cfg.defaults.hash, "sha256", "other tables survive");
+        assert_eq!(cfg.defaults.checksum_mode, "sha256", "other tables survive");
     }
 
     /// The commented example `init` writes contains lines that look like

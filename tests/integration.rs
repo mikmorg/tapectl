@@ -36,7 +36,6 @@ directory = "{staging}"
 [defaults]
 slice_size = "100M"
 compression = "none"
-hash = "sha256"
 checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true
@@ -2184,7 +2183,6 @@ directory = "{staging_str}"
 [defaults]
 slice_size = "100M"
 compression = "none"
-hash = "sha256"
 checksum_mode = "mtime_size"
 encrypt = true
 preserve_xattrs = true

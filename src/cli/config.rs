@@ -66,8 +66,13 @@ pub fn run(
                         )
                     };
                     // Decorative-key advisory (issue #62, #92/#50
-                    // precedent): keys that are parsed but have no
-                    // reader yet get surfaced, not deleted.
+                    // precedent). Originally: keys that are parsed but have
+                    // no reader yet get surfaced, not deleted. Spec W4 and
+                    // issue #172 both found that stance does not survive
+                    // contact with a config that has never been used in
+                    // production — see `policy::decorative`'s module doc for
+                    // why every key it was built for is now deleted from
+                    // `Config` instead.
                     let decorative_hits = crate::policy::decorative::scan(&loaded);
 
                     // Unknown-key advisory (issue #129). Serde silently drops

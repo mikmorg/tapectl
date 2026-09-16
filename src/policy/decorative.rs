@@ -3,17 +3,32 @@
 //! surface a dead knob and never change `config check`'s exit code.
 //!
 //! **There are currently no such keys, and `scan` returns nothing.** That is
-//! the honest state of the config, not an oversight, and the module survives
-//! deliberately: it is the mechanism that catches the NEXT key someone adds
-//! to `Config` and forgets to wire, and re-adding it later would be more
-//! work than leaving one empty `Vec` behind.
+//! the honest state of the config, not an oversight — but be clear about
+//! WHY it is empty: `scan` is a hand-maintained match, not a detector. It
+//! only ever reports a key someone has already noticed and added an arm
+//! for; it cannot discover an unwired key by inspecting `Config` itself.
+//! The 2026-09-13 post-redesign review (`docs/audits/`) found this the hard
+//! way — `scan`'s own doc comment claimed "every decorative-key occurrence
+//! in a loaded config" while SIX keys sat in `Config` with no reader and
+//! zero of them were listed here. Three (below) were spec W4's; issue #172
+//! found the other three: `packing.strategy`, `packing.fill_threshold` and
+//! `defaults.hash` join the delete list below. The audit's count of six
+//! also included `logging.level`/`logging.format` — issue #172 WIRES those
+//! two instead of deleting them (they now do something — see
+//! `config::LoggingConfig`), which is why they never join this list at all.
+//! So: read an empty `scan` result as "no key has been through this
+//! deliberate delete-or-wire decision and come out decorative", never as
+//! "nothing is decorative" — that second reading is exactly the false claim
+//! the audit caught, and the fix each time is to run the same decision on
+//! the newly found key, not to add it to a running list here.
 //!
-//! The three keys this module was built for are GONE from `Config`
-//! altogether (spec W4, operator decision 2026-09-13 — tapectl has never
-//! been used in production, so a knob that does nothing should be deleted
-//! rather than documented forever). They were deleted rather than demoted
-//! because in each case the thing the knob claimed to control is not merely
-//! unimplemented, it is decided somewhere else and cannot move:
+//! Every key this module was built for is GONE from `Config` altogether
+//! (spec W4, operator decision 2026-09-13, extended by issue #172 —
+//! tapectl has never been used in production, so a knob that does nothing
+//! should be deleted rather than documented forever). They were deleted
+//! rather than demoted because in each case the thing the knob claimed to
+//! control is not merely unimplemented, it is decided somewhere else and
+//! cannot move:
 //!
 //! - `backends.lto[].block_size` — the write path's block size is a FORMAT
 //!   CONSTANT (512 KiB: `collection::plan::BLOCK_SIZE`,
@@ -28,9 +43,19 @@
 //!   could never re-enable compression; a `true` value was silently ignored.
 //! - `packing.min_free_for_append` — append is rejected outright
 //!   (ADR-0003); there is no append path for this knob to gate.
+//! - `packing.strategy` (issue #172) — the real batch selector is
+//!   alphabetical first-fit (`src/collection/`), not a configurable
+//!   best-fit-decreasing strategy.
+//! - `packing.fill_threshold` (issue #172) — no bin-packing code ever
+//!   consulted a fill threshold.
+//! - `labels.format` (issue #172) — volume labels are always
+//!   operator-supplied (`--label`), never generated from a template.
+//! - `defaults.hash` (issue #172) — every checksum tapectl computes is
+//!   sha256, hardcoded; `checksum_mode` is the real knob, and it governs
+//!   WHEN a checksum runs, never which algorithm.
 //!
-//! A config file still carrying any of the three is now REJECTED by name,
-//! with the reason, by `config::stale_lto_fields_message` — a sharper answer
+//! A config file still carrying any of these is now REJECTED by name, with
+//! the reason, by `config::stale_lto_fields_message` — a sharper answer
 //! than an advisory note, and the reason deleting them is not a loss of
 //! operator-facing surface.
 

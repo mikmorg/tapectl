@@ -29,10 +29,11 @@ pub struct UnknownKeyHit {
 /// Kept as a literal list, and pinned by a test that fails if `DefaultsConfig`
 /// gains or loses a field — otherwise a new setting would be reported as
 /// "unknown" the day it is added, which is worse than not scanning at all.
+/// (That pin is exactly what caught `hash`'s removal, issue #172: it had no
+/// reader at all and is gone from `DefaultsConfig`, not merely unlisted here.)
 const DEFAULTS_FIELDS: &[&str] = &[
     "slice_size",
     "compression",
-    "hash",
     "checksum_mode",
     "encrypt",
     "preserve_xattrs",

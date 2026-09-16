@@ -86,13 +86,7 @@ pub struct Config {
     pub collections: Vec<CollectionConfig>,
 
     #[serde(default)]
-    pub packing: PackingConfig,
-
-    #[serde(default)]
     pub compaction: CompactionConfig,
-
-    #[serde(default)]
-    pub labels: LabelsConfig,
 
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -257,8 +251,6 @@ pub struct DefaultsConfig {
     pub slice_size: String,
     #[serde(default = "default_compression")]
     pub compression: String,
-    #[serde(default = "default_hash")]
-    pub hash: String,
     #[serde(default = "default_checksum_mode")]
     pub checksum_mode: String,
     #[serde(default = "default_true")]
@@ -299,9 +291,6 @@ fn default_slice_size() -> String {
 fn default_compression() -> String {
     "none".to_string()
 }
-fn default_hash() -> String {
-    "sha256".to_string()
-}
 fn default_checksum_mode() -> String {
     "mtime_size".to_string()
 }
@@ -323,7 +312,6 @@ impl Default for DefaultsConfig {
         Self {
             slice_size: default_slice_size(),
             compression: default_compression(),
-            hash: default_hash(),
             checksum_mode: default_checksum_mode(),
             encrypt: true,
             preserve_xattrs: true,
@@ -426,31 +414,6 @@ fn default_unit_depth() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackingConfig {
-    #[serde(default = "default_packing_strategy")]
-    pub strategy: String,
-    #[serde(default = "default_fill_threshold")]
-    pub fill_threshold: f64,
-}
-
-fn default_packing_strategy() -> String {
-    "best_fit_decreasing".to_string()
-}
-fn default_fill_threshold() -> f64 {
-    0.95
-}
-
-impl Default for PackingConfig {
-    fn default() -> Self {
-        Self {
-            strategy: default_packing_strategy(),
-            fill_threshold: default_fill_threshold(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
     #[serde(default = "default_utilization_threshold")]
     pub utilization_threshold: f64,
@@ -470,25 +433,6 @@ impl Default for CompactionConfig {
         Self {
             utilization_threshold: default_utilization_threshold(),
             tape_only_safety_multiplier: default_tape_only_safety(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LabelsConfig {
-    #[serde(default = "default_label_format")]
-    pub format: String,
-}
-
-fn default_label_format() -> String {
-    "L{gen}-{seq:04}".to_string()
-}
-
-impl Default for LabelsConfig {
-    fn default() -> Self {
-        Self {
-            format: default_label_format(),
         }
     }
 }
@@ -758,15 +702,21 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
 /// different real setting — return the exact remediation message for it,
 /// rather than serde's generic "unknown field" line.
 ///
-/// Three cases feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
+/// Several cases feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
 /// `.nominal_capacity`, so their message says where the fact went. Spec W4
 /// DELETED `backends.lto[].block_size`, `.hardware_compression` and
-/// `packing.min_free_for_append` outright because nothing ever read them, so
-/// their message says why there is nowhere for the value to go. Issue #129
-/// found `defaults.min_copies` reads like the general copy requirement and
-/// is not one, so its message names the real knob. As of issue #171 / ADR-
-/// 0012, EVERY section carries `#[serde(deny_unknown_fields)]`, so serde
-/// alone would already reject all three — this pre-scan exists to say
+/// `packing.min_free_for_append` outright because nothing ever read them;
+/// issue #172 deletes four more the same way — `packing.strategy`,
+/// `packing.fill_threshold`, `labels.format`, `defaults.hash` — which is
+/// also why the WHOLE `[packing]` and `[labels]` sections are gone rather
+/// than just those fields: with `min_free_for_append` already deleted,
+/// `strategy`/`fill_threshold` were `PackingConfig`'s only members, and
+/// `format` was `LabelsConfig`'s only member. Every "deleted outright"
+/// message says why there is nowhere for the value to go. Issue #129 found
+/// `defaults.min_copies` reads like the general copy requirement and is not
+/// one, so its message names the real knob. As of issue #171 / ADR-0012,
+/// EVERY section carries `#[serde(deny_unknown_fields)]`, so serde alone
+/// would already reject all of these — this pre-scan exists to say
 /// something more useful than "unknown field" for the keys whose history we
 /// actually know, not to catch what serde otherwise misses.
 ///
@@ -777,16 +727,19 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
 /// this check only ever *sharpens* an error that was going to happen anyway,
 /// never introduces a new failure mode of its own.
 ///
-/// The `[[backends.lto]]`, `[packing]` and `[defaults]` scans are
-/// INDEPENDENT: a config missing any two of the three sections must still
-/// be told about a stale key in the third, so none may short-circuit the
-/// others.
+/// The `[[backends.lto]]`, `[packing]`, `[labels]` and `[defaults]` scans
+/// are INDEPENDENT: a config missing any three of the four sections must
+/// still be told about a stale key in the fourth, so none may short-circuit
+/// the others.
 fn stale_lto_fields_message(content: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(content).ok()?;
     if let Some(msg) = stale_backend_fields_message(&value) {
         return Some(msg);
     }
     if let Some(msg) = stale_packing_fields_message(&value) {
+        return Some(msg);
+    }
+    if let Some(msg) = stale_labels_fields_message(&value) {
         return Some(msg);
     }
     stale_defaults_fields_message(&value)
@@ -827,6 +780,14 @@ fn stale_backend_fields_message(value: &toml::Value) -> Option<String> {
 }
 
 /// The `[packing]` half of [`stale_lto_fields_message`].
+///
+/// The whole `[packing]` table is gone as of issue #172: `min_free_for_append`
+/// was already deleted (spec W4, ADR-0003 — append is rejected outright), and
+/// `strategy`/`fill_threshold` were `PackingConfig`'s only other fields, with
+/// no reader anywhere (`grep -rn 'packing\.' src/ --include=*.rs` outside this
+/// file returns nothing) — the real batch selector is alphabetical first-fit
+/// (`src/collection/`), never a configurable best-fit-decreasing strategy,
+/// and no code ever consulted a fill threshold.
 fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
     let packing = value.get("packing")?.as_table()?;
     if packing.contains_key("min_free_for_append") {
@@ -834,6 +795,33 @@ fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
             "packing.min_free_for_append was removed — append is rejected outright \
              (ADR-0003), so there has never been an append path for this to gate. \
              Delete the line."
+                .to_string(),
+        );
+    }
+    if packing.contains_key("strategy") || packing.contains_key("fill_threshold") {
+        return Some(
+            "the [packing] section was removed (issue #172, ADR-0012) — `strategy` and \
+             `fill_threshold` were parsed but never read: the real batch selector is \
+             alphabetical first-fit (src/collection/), not a configurable best-fit \
+             strategy, and no code ever consulted a fill threshold. Delete the \
+             [packing] table."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// The `[labels]` half of [`stale_lto_fields_message`] (issue #172):
+/// `format` was `LabelsConfig`'s only field and had no reader — volume
+/// labels are always operator-supplied (`--label`), never generated from a
+/// template, so the whole `[labels]` section is gone.
+fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
+    let labels = value.get("labels")?.as_table()?;
+    if labels.contains_key("format") {
+        return Some(
+            "the [labels] section was removed (issue #172, ADR-0012) — `format` was \
+             parsed but never read: volume labels are always operator-supplied \
+             (`--label`), not generated from a template. Delete the [labels] table."
                 .to_string(),
         );
     }
@@ -850,6 +838,11 @@ fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
 /// hard load error like every other section, so the friendly remediation
 /// has to live here or vanish behind serde's generic "unknown field"
 /// message.
+///
+/// `hash` is issue #172's fourth deletion: every checksum path is sha256,
+/// hardcoded (`sha2` crate, `checksum_mode` governs WHEN it runs, never
+/// which algorithm), so the field had no reader to disagree with a
+/// non-default value in the first place.
 fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
     let defaults = value.get("defaults")?.as_table()?;
     if defaults.contains_key("min_copies") {
@@ -858,6 +851,15 @@ fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
              requirement is defaults.min_copies_for_tape_only; a per-set override \
              goes on an [[archive_sets]] entry as min_copies. Delete the line, or \
              rename it to min_copies_for_tape_only if that is what you meant."
+                .to_string(),
+        );
+    }
+    if defaults.contains_key("hash") {
+        return Some(
+            "defaults.hash was removed (issue #172, ADR-0012) — nothing ever read it: \
+             every checksum tapectl computes is sha256, hardcoded; `defaults.checksum_mode` \
+             is the real knob (it governs WHEN a checksum is taken, not which algorithm). \
+             Delete the line."
                 .to_string(),
         );
     }
@@ -1394,7 +1396,7 @@ mod tests {
         assert!(msg.contains("ADR-0003"), "{msg}");
     }
 
-    /// The two halves must not short-circuit each other: a config with a
+    /// The scans must not short-circuit each other: a config with a
     /// stale `[packing]` key and no `[[backends.lto]]` at all is the exact
     /// shape a naive single-expression scan would miss.
     #[test]
@@ -1421,10 +1423,50 @@ mod tests {
         assert!(msg.contains("was removed"), "{msg}");
     }
 
+    /// Issue #172 item 4's pin, and ADR-0012's ratified acceptance
+    /// criterion verbatim: "a config carrying `packing.fill_threshold`
+    /// fails to load naming the key". This is INTENTIONAL, not a
+    /// regression to soften later — #171's ruling on `deny_unknown_fields`
+    /// is explicit that a key which silently reads as its default is the
+    /// failure that never gets noticed. Before #172 this exact fixture
+    /// (`[packing] strategy = ...` / `fill_threshold = ...`) was the
+    /// positive control proving `[packing]` still had LIVE, non-stale keys
+    /// — it flips here because #172 establishes that it never did.
     #[test]
-    fn a_clean_packing_table_is_not_flagged() {
-        let text = "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n";
-        assert!(stale_lto_fields_message(text).is_none());
+    fn a_config_carrying_packing_fill_threshold_fails_to_load_naming_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fill_threshold"), "{msg}");
+        assert!(msg.contains("removed"), "{msg}");
+    }
+
+    #[test]
+    fn a_config_carrying_labels_format_fails_to_load_naming_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[labels]\nformat = \"L{gen}-{seq:04}\"\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("format"), "{msg}");
+        assert!(msg.contains("removed"), "{msg}");
+    }
+
+    #[test]
+    fn a_config_carrying_defaults_hash_fails_to_load_naming_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[defaults]\nhash = \"sha256\"\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("defaults.hash"), "{msg}");
+        assert!(msg.contains("removed"), "{msg}");
     }
 
     #[test]
