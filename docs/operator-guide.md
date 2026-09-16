@@ -971,6 +971,15 @@ tapectl db stats
 tapectl db export  # JSON row counts
 ```
 
+`db fsck` runs SQLite's `integrity_check` and `foreign_key_check` and reports
+every violation it finds. `--repair` deletes rows whose foreign-key parent is
+missing, closing the graph in one transaction, and logs what it deleted — if
+anything is still dangling at commit the whole repair rolls back, so a failed
+repair leaves the database exactly as it was.
+
+Run it on a database you brought in with `db import` before you use it:
+`db import` is a raw page copy and validates no foreign keys of its own.
+
 ## Disaster Recovery
 
 Every tape is self-describing, so the database being gone costs you convenience,

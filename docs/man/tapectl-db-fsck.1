@@ -13,7 +13,7 @@ Check database integrity
 Output in JSON format
 .TP
 \fB\-\-repair\fR
-Attempt to repair issues
+Delete rows whose foreign\-key parent is missing, closing the graph in one transaction (children first, in effect); logged
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
