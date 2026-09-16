@@ -97,7 +97,7 @@ tapectl staging                 status, clean
 tapectl volume                  init, write, resume, abort, verify, identify,
                                 move, retire, read-slices, plan, deposit,
                                 compact-read, compact-write, compact-finish, compact
-tapectl cartridge               register, list, info, mark-erased
+tapectl cartridge               register, relabel, list, info, move, retire, mark-erased
 tapectl archive-set             create, edit, list, info, sync
 tapectl audit                   Policy compliance (--action-plan, --json)
 tapectl catalog                 ls, search, locate, stats, rebuild

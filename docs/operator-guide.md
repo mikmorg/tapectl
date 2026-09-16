@@ -845,20 +845,97 @@ tapectl volume compact L6-0001 --device /dev/nst0
 
 ## Cartridge Tracking
 
-You usually do not register cartridges by hand. `volume init` reads the medium
-serial from the cartridge's MAM, matches it to a cartridge you already
-registered, and registers one for you if there is none — so the catalog knows
-which physical tape carries which volume without your typing it (ADR-0010).
-Register by hand only when you want your own barcode rather than the medium
-serial, and do it before the first `volume init` on that tape.
+**A cartridge is known by the serial its chip reports. A barcode is a sticker**
+(ADR-0012). The serial is burned into the cartridge's memory chip at the
+factory, tapectl reads it through the drive, and it never changes. The barcode
+is whatever label you choose to put on the shell, and you can change it any time
+without changing which cartridge it is.
+
+That ordering is what makes the rest simple: **do not register a cartridge
+before writing to it.** `volume init` reads the chip and registers the cartridge
+itself.
+
+### The sequence, end to end
+
+Load a new tape and initialise a volume on it. You register nothing first:
 
 ```bash
-tapectl cartridge register --barcode L6-0001 --media-type LTO-6   # optional; capacity comes from the generation
+tapectl volume init L6-0001 --device /dev/nst1
+```
+
+`volume init` reads the chip, finds no cartridge registered under that serial,
+and registers one — using the serial itself as a placeholder barcode, because
+that is the only identifier the tape carries:
+
+```
+cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
+volume "L6-0001" initialized (id=1)
+```
+
+Now put a sticker on the shell and tell the catalog what it says. Before or
+after the first write — it makes no difference:
+
+```bash
+tapectl cartridge relabel E01001L8_1775794348 L6-0001
+# cartridge "E01001L8_1775794348" relabelled to "L6-0001"
+```
+
+One cartridge row, with your barcode on it and the chip serial underneath as its
+identity. The volume stays bound throughout: relabelling changes the label, not
+the cartridge.
+
+> **Do not `cartridge register --barcode <sticker>` first and then write.**
+> `volume init` matches on the chip serial, finds no row carrying it, and
+> registers a *second* cartridge. You end up with this:
+>
+> ```
+> | Barcode             | Type  | Status    | Location | Loads | Volume  |
+> | E01001L8_1775794348 | LTO-8 | in_use    |          | 0     | L6-0009 |
+> | L6-0009             | LTO-8 | available |          | 0     |         |
+> ```
+>
+> Two rows for one physical tape — and the barcode you chose is on the one the
+> catalog is *not* using. Let `volume init` register it, then relabel.
+
+### When the drive reads no serial
+
+Some drives — and some virtual libraries — report no medium serial at all. Then
+tapectl cannot tell which cartridge is loaded, and it will not guess:
+
+```bash
+tapectl volume init L6-0002 --device /dev/nst1
+# refused: this drive reports no medium serial, so tapectl cannot tell which
+# physical cartridge is loaded. Name it: ... --cartridge <barcode>
+```
+
+Register the cartridge yourself and name it. On this path the barcode you give
+**is** the recorded identity, and the tape records that fact — File 0 carries
+`cartridge_identity_source = "operator"` rather than `"mam"`, so anyone reading
+the tape later (you, or an heir with no catalog) can tell a chip-verified serial
+from a label somebody typed:
+
+```bash
+tapectl cartridge register --barcode L6-0002 --media-type LTO-6
+tapectl volume init L6-0002 --device /dev/nst1 --cartridge L6-0002
+```
+
+One safeguard on this path: if the barcode you name is still carrying a live
+volume, tapectl refuses rather than displacing it. With no serial it cannot tell
+whether that cartridge was erased or whether you have loaded a different tape
+wearing its sticker. Say the bytes are gone first — `volume retire <volume>` or
+`cartridge mark-erased <barcode>` — and run it again. There is no `--force`;
+this is something tapectl cannot know, not a risk for you to accept.
+
+### Everything else
+
+```bash
 tapectl cartridge list                      # barcode, generation, status, location, volume
+tapectl cartridge list --location offsite-vault
 tapectl cartridge info L6-0001
+tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
-tapectl cartridge mark-erased L6-0001       # after a physical erase, and the only way back from retire
+tapectl cartridge mark-erased L6-0001       # after a physical erase
 ```
 
 **A cartridge's place is a location, never a status** (ADR-0011). "Offsite" is
