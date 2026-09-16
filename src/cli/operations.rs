@@ -642,7 +642,10 @@ pub(crate) fn refuse_last_eligible_copy(
          tapectl volume write <OTHER-LABEL>\n\
          or, if the content is still on disk, stage it again — one line per version at \
          stake — and write that:\n\
-         {restage}\n    \
+         {restage}\n\
+         (if a line there answers \"already has a stage set with live slices\", that \
+         version is still staged from last time — skip it and go straight to the write \
+         below, which consumes what is already there.)\n    \
          tapectl volume init <OTHER-LABEL>\n    \
          tapectl volume write <OTHER-LABEL>\n\
          \n\
