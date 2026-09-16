@@ -219,6 +219,29 @@ tapectl volume write L6-0001 --device /dev/nst0
 tapectl volume verify L6-0001 --device /dev/nst0
 ```
 
+**`volume write` writes everything still staged, not just what you staged in
+this sitting** — and since 2026-09-16 it says so before it touches the drive:
+
+```
+about to write to volume "L6-0001":
+  tv/breaking-bad/s01 v1: 3 slices, 42 MB
+  photos/2019 v2: 1 slices, 8 MB
+
+total: 4 slices, 50 MB
+```
+
+That is by design, not a bug: staging happens once and a stage set stays
+`staged` until `staging clean` releases it, which is what lets you write the
+same data to a second and third cartridge without re-archiving it (ADR-0006).
+The consequence is that a stage set left over from last week rides along on
+today's tape. **Read the list.** This is write-once media — a tape that
+received four units when you meant one cannot be un-written, and under ADR-0003
+it cannot even be overwritten without a real erase.
+
+The announcement is display only. It does not prompt, and there is no flag to
+select a subset: if the list is not what you want, stop, run `staging clean` to
+release what is already safely on tape, and start again.
+
 ### Check What's Pending
 
 ```bash
@@ -932,6 +955,7 @@ this is something tapectl cannot know, not a risk for you to accept.
 tapectl cartridge list                      # barcode, generation, status, location, volume
 tapectl cartridge list --location offsite-vault
 tapectl cartridge info L6-0001
+tapectl cartridge edit L6-0001 --generation LTO-5  # the registration was wrong about the medium
 tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
@@ -956,6 +980,30 @@ you get when you try to write a retired cartridge now names `unretire`.
 
 Reach for `mark-erased` when you have actually erased the tape. Reach for
 `unretire` when you simply changed your mind.
+
+**`cartridge edit --generation` is the third correction in that family**, and
+the same logic places it: it is a claim about *what medium this is*. Registering
+a cartridge as LTO-6 when the plastic is LTO-5 used to be unfixable — a real
+`volume init` would read the density code, disagree with the row, and refuse
+with "either the registration is wrong or the wrong cartridge is loaded, and
+tapectl cannot tell which", naming a cause you had no command to act on. The
+refusal now names the repair. It is Tier 1 for the same reason as `unretire`:
+correcting a fact destroys nothing, so there is no prompt and no `--force`, and
+it works on every status including `retired_permanent`.
+
+It edits the cartridge row and nothing else. A volume already written to that
+cartridge keeps the capacity it was planned against — ADR-0010 decides capacity
+once, at `volume init`, and stores it on the volume. If the corrected generation
+now disagrees with a volume still mounted on the cartridge, the command says so
+and changes nothing about that volume; the warning is there so you know the
+tape was planned against a figure you have just called wrong.
+
+Capacity follows the correction **only when you never chose it yourself**. If
+the stored figure is exactly the old generation's table value, it was a default
+and gets re-defaulted to the new generation's; if it differs — you passed
+`--capacity`, or a virtual drive's `capacity_override` was baked in — it is left
+alone. Either way the command tells you which happened and why, so you never
+have to infer it.
 
 If the catalog was rebuilt since the retirement, the events rows that recorded
 the prior statuses may be gone. `unretire` then restores the cartridge to
