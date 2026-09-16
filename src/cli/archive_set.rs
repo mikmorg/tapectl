@@ -7,29 +7,17 @@ use crate::config::Config;
 use crate::db::events;
 use crate::error::{Result, TapectlError};
 
-/// Compression values `dar` accepts via `-z`. An archive_set's `compression`
-/// now reaches the dar invocation directly (issue #92 made the dotfile
-/// policy layer stop unconditionally shadowing it), so a bogus value must be
-/// rejected here rather than surfacing as a runtime dar failure later.
-const VALID_COMPRESSION_VALUES: &[&str] =
-    &["none", "gzip", "bzip2", "lzo", "xz", "lzma", "zstd", "lz4"];
-
-fn validate_compression(value: &str) -> Result<()> {
-    if VALID_COMPRESSION_VALUES.contains(&value) {
-        Ok(())
-    } else {
-        Err(TapectlError::Other(format!(
-            "invalid compression \"{value}\": accepted values are {}",
-            VALID_COMPRESSION_VALUES.join(", ")
-        )))
-    }
-}
-
 /// Syntactic check first, then capability check against the locally
-/// installed `dar` binary (issue #97): a value from `VALID_COMPRESSION_VALUES`
-/// can still be one the local dar was not compiled to support (`lzo`,
-/// `zstd`, `lz4`, `lzma` are commonly absent from distro builds), which
-/// otherwise only surfaces as a runtime `dar -z` failure at archive time.
+/// installed `dar` binary (issue #97): a value from
+/// `crate::config::VALID_COMPRESSION_VALUES` can still be one the local dar
+/// was not compiled to support (`lzo`, `zstd`, `lz4`, `lzma` are commonly
+/// absent from distro builds), which otherwise only surfaces as a runtime
+/// `dar -z` failure at archive time.
+///
+/// The syntactic half moved to `crate::config::validate_compression` under
+/// issue #171 so `[defaults].compression` and an archive_set's `compression`
+/// share ONE check instead of `[defaults]` accepting any string while this
+/// path validated it — see `crate::config::Config::validate_closed_sets`.
 ///
 /// Fails open on capability-probe trouble: if `dar::version::capabilities`
 /// itself errors (binary missing, unreadable, etc.), that is a pre-existing,
@@ -38,11 +26,11 @@ fn validate_compression(value: &str) -> Result<()> {
 /// the value through so the syntactic check remains authoritative in that
 /// case.
 fn validate_compression_capability(value: &str, config: &Config) -> Result<()> {
-    validate_compression(value)?;
+    crate::config::validate_compression(value).map_err(TapectlError::Other)?;
 
     if let Ok(caps) = crate::dar::version::capabilities(&config.dar.binary) {
         if !caps.supports(value) {
-            let supported: Vec<&str> = VALID_COMPRESSION_VALUES
+            let supported: Vec<&str> = crate::config::VALID_COMPRESSION_VALUES
                 .iter()
                 .filter(|alg| caps.supports(alg))
                 .copied()
@@ -208,6 +196,13 @@ pub fn run(
             if let Some(c) = compression {
                 validate_compression_capability(c, config)?;
             }
+            if let Some(m) = checksum_mode {
+                // ADR-0012 "same treatment" as compression (issue #171):
+                // was unvalidated here even though `units.checksum_mode`'s
+                // CHECK constraint would reject a bad value anyway, just
+                // hours later at unit-write time with a raw SQLite error.
+                crate::config::validate_checksum_mode(m).map_err(TapectlError::Other)?;
+            }
             let locations_json = required_locations.as_ref().map(|locs| {
                 let arr: Vec<&str> = locs.split(',').map(|s| s.trim()).collect();
                 serde_json::to_string(&arr).unwrap()
@@ -259,6 +254,9 @@ pub fn run(
         } => {
             if let Some(c) = compression {
                 validate_compression_capability(c, config)?;
+            }
+            if let Some(m) = checksum_mode {
+                crate::config::validate_checksum_mode(m).map_err(TapectlError::Other)?;
             }
             let id: i64 = conn
                 .query_row(
@@ -644,6 +642,12 @@ pub fn run(
                         TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
                     })?;
                 }
+                // ADR-0012 "same treatment" as compression (issue #171).
+                if let Some(m) = &as_cfg.checksum_mode {
+                    crate::config::validate_checksum_mode(m).map_err(|e| {
+                        TapectlError::Other(format!("archive set \"{}\": {e}", as_cfg.name))
+                    })?;
+                }
                 // Issue #59: same all-or-nothing discipline as the
                 // compression guard above — a malformed slice_size in the
                 // config file must not silently become 0 or the wrong
@@ -829,6 +833,38 @@ mod tests {
             .unwrap()
                 == 0,
             "no archive_set row should be created when compression is invalid"
+        );
+    }
+
+    /// ADR-0012 gives checksum mode the same treatment as compression
+    /// (issue #171): a bogus value must be rejected here, not surface as an
+    /// opaque SQLite CHECK-constraint failure when a unit is finally
+    /// written with it.
+    #[test]
+    fn create_rejects_invalid_checksum_mode() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let mut cmd = create_cmd("cold", None, None);
+        if let ArchiveSetCommands::Create { checksum_mode, .. } = &mut cmd {
+            *checksum_mode = Some("not-a-real-mode".to_string());
+        } else {
+            unreachable!("create_cmd always returns Create");
+        }
+        let err = run(&conn, &config, &cmd, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not-a-real-mode"),
+            "error must name the invalid value, got: {msg}"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap()
+                == 0,
+            "no archive_set row should be created when checksum_mode is invalid"
         );
     }
 

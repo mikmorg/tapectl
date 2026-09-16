@@ -62,6 +62,7 @@ fn dirs_home() -> PathBuf {
 
 /// Root configuration — maps to ~/.tapectl/config.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub dar: DarConfig,
@@ -98,6 +99,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DarConfig {
     #[serde(default = "default_dar_binary")]
     pub binary: String,
@@ -120,6 +122,7 @@ impl Default for DarConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendsConfig {
     // Skipped when empty so a fresh `init` does not write a bare `lto = []`.
     // That stub is not harmless: TOML rejects a later `[[backends.lto]]` table
@@ -231,6 +234,7 @@ impl LtoBackendConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveSetConfig {
     pub name: String,
     pub min_copies: Option<i32>,
@@ -247,6 +251,7 @@ pub struct ArchiveSetConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultsConfig {
     #[serde(default = "default_slice_size")]
     pub slice_size: String,
@@ -340,6 +345,7 @@ impl Default for DefaultsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagingConfig {
     #[serde(default = "default_staging_dir")]
     pub directory: String,
@@ -373,6 +379,7 @@ impl Default for StagingConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     #[serde(default)]
     pub watch_roots: Vec<String>,
@@ -382,6 +389,7 @@ pub struct DiscoveryConfig {
 /// folder=unit factory over existing unit machinery, batch-synced and
 /// batch-written instead of ceremonially `unit init`'d one at a time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionConfig {
     /// Collection name — also the unit-name prefix collection sync assigns
     /// (`"{name}/{relative_path}"`), so units stay unique across collections.
@@ -417,6 +425,7 @@ fn default_unit_depth() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackingConfig {
     #[serde(default = "default_packing_strategy")]
     pub strategy: String,
@@ -441,6 +450,7 @@ impl Default for PackingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
     #[serde(default = "default_utilization_threshold")]
     pub utilization_threshold: f64,
@@ -465,6 +475,7 @@ impl Default for CompactionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LabelsConfig {
     #[serde(default = "default_label_format")]
     pub format: String,
@@ -483,6 +494,7 @@ impl Default for LabelsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -520,11 +532,16 @@ impl Config {
         // it here, before serde ever sees it, so the operator gets the exact
         // remediation instead.
         if let Some(msg) = stale_lto_fields_message(&content) {
-            return Err(TapectlError::Config(msg));
+            return Err(TapectlError::Config(format!("{}: {msg}", path.display())));
         }
-        let config: Config =
-            toml::from_str(&content).map_err(|e| TapectlError::Config(e.to_string()))?;
-        config.validate_sizes()?;
+        // Issue #171 / ADR-0012: every section now carries
+        // `#[serde(deny_unknown_fields)]`, so a typo anywhere in the file —
+        // not just `[[backends.lto]]` — fails here by name, naming the FILE
+        // too so `config check` and the operator can find it.
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| TapectlError::Config(format!("{}: {e}", path.display())))?;
+        config.validate_sizes(path)?;
+        config.validate_closed_sets(path)?;
         Ok(config)
     }
 
@@ -546,35 +563,72 @@ impl Config {
     /// too. They are gone (spec W4): a config still carrying one is rejected
     /// by name in [`Config::load`]'s stale-field pre-scan, which is a
     /// sharper answer than validating a value nothing acts on.
-    fn validate_sizes(&self) -> Result<()> {
-        crate::staging::parse_size_to_bytes(&self.defaults.slice_size)
-            .map_err(|e| TapectlError::Config(format!("defaults.slice_size = {e}")))?;
+    ///
+    /// Every error names `path` too (issue #171 fix item 4), so `config
+    /// check` and an operator staring at more than one config file can tell
+    /// which one is wrong without re-deriving it from context.
+    fn validate_sizes(&self, path: &Path) -> Result<()> {
+        crate::staging::parse_size_to_bytes(&self.defaults.slice_size).map_err(|e| {
+            TapectlError::Config(format!("{}: defaults.slice_size = {e}", path.display()))
+        })?;
         crate::staging::parse_size_to_bytes(&self.defaults.large_file_warn_threshold).map_err(
-            |e| TapectlError::Config(format!("defaults.large_file_warn_threshold = {e}")),
+            |e| {
+                TapectlError::Config(format!(
+                    "{}: defaults.large_file_warn_threshold = {e}",
+                    path.display()
+                ))
+            },
         )?;
         for (i, backend) in self.backends.lto.iter().enumerate() {
             if crate::media::Generation::parse(&backend.generation).is_none() {
                 return Err(TapectlError::Config(format!(
-                    "backends.lto[{i}] (\"{}\").generation = {:?} is not a recognised LTO \
+                    "{}: backends.lto[{i}] (\"{}\").generation = {:?} is not a recognised LTO \
                      generation (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)",
-                    backend.name, backend.generation
+                    path.display(),
+                    backend.name,
+                    backend.generation
                 )));
             }
             if let Some(cap) = &backend.capacity_override {
                 crate::staging::parse_size_to_bytes(cap).map_err(|e| {
                     TapectlError::Config(format!(
-                        "backends.lto[{i}] (\"{}\").capacity_override = {e}",
+                        "{}: backends.lto[{i}] (\"{}\").capacity_override = {e}",
+                        path.display(),
                         backend.name
                     ))
                 })?;
             }
             crate::staging::parse_size_to_bytes(&backend.enospc_buffer).map_err(|e| {
                 TapectlError::Config(format!(
-                    "backends.lto[{i}] (\"{}\").enospc_buffer = {e}",
+                    "{}: backends.lto[{i}] (\"{}\").enospc_buffer = {e}",
+                    path.display(),
                     backend.name
                 ))
             })?;
         }
+        Ok(())
+    }
+
+    /// ADR-0012 "closed-set values are validated at load" (issue #171):
+    /// `[defaults].compression` / `.checksum_mode` used to accept any
+    /// string even though the archive-set path already validates the same
+    /// two fields (`cli::archive_set::validate_compression_capability`), so
+    /// a typo here surfaced as a raw `dar -zbanana` failure at stage time,
+    /// hours later, or an opaque SQLite CHECK-constraint failure when a
+    /// unit was finally written with a bad `checksum_mode`.
+    ///
+    /// `defaults.hash` is deliberately NOT checked here even though the
+    /// issue's own Defect prose names it alongside these two: ADR-0012's
+    /// ruling text and issue #172 (landing with or after this one) instead
+    /// DELETE `defaults.hash` outright as decorative rather than validate
+    /// it, and adding a validator here would fight that deletion.
+    fn validate_closed_sets(&self, path: &Path) -> Result<()> {
+        validate_compression(&self.defaults.compression).map_err(|e| {
+            TapectlError::Config(format!("{}: defaults.compression: {e}", path.display()))
+        })?;
+        validate_checksum_mode(&self.defaults.checksum_mode).map_err(|e| {
+            TapectlError::Config(format!("{}: defaults.checksum_mode: {e}", path.display()))
+        })?;
         Ok(())
     }
 
@@ -635,19 +689,22 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
     ))
 }
 
-/// If `content` (raw, unparsed config TOML) still carries a key that has
-/// been removed from the schema, return the exact remediation message for
-/// it.
+/// If `content` (raw, unparsed config TOML) still carries a key with a
+/// known history — renamed, deleted outright, or merely confusable with a
+/// different real setting — return the exact remediation message for it,
+/// rather than serde's generic "unknown field" line.
 ///
-/// Two removals feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
+/// Three cases feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
 /// `.nominal_capacity`, so their message says where the fact went. Spec W4
 /// DELETED `backends.lto[].block_size`, `.hardware_compression` and
 /// `packing.min_free_for_append` outright because nothing ever read them, so
-/// their message says why there is nowhere for the value to go. Both are one
-/// mechanism on purpose: `LtoBackendConfig` has `deny_unknown_fields` and
-/// would otherwise fail with serde's generic "unknown field" line, and
-/// `PackingConfig` does NOT, so `min_free_for_append` would otherwise be
-/// silently swallowed — the worst outcome of the three.
+/// their message says why there is nowhere for the value to go. Issue #129
+/// found `defaults.min_copies` reads like the general copy requirement and
+/// is not one, so its message names the real knob. As of issue #171 / ADR-
+/// 0012, EVERY section carries `#[serde(deny_unknown_fields)]`, so serde
+/// alone would already reject all three — this pre-scan exists to say
+/// something more useful than "unknown field" for the keys whose history we
+/// actually know, not to catch what serde otherwise misses.
 ///
 /// Parses `content` as generic `toml::Value` rather than scanning lines by
 /// hand, so comments and quoting are handled the way TOML actually defines
@@ -656,15 +713,19 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
 /// this check only ever *sharpens* an error that was going to happen anyway,
 /// never introduces a new failure mode of its own.
 ///
-/// The `[packing]` and `[[backends.lto]]` scans are INDEPENDENT: a config
-/// with no `[[backends.lto]]` at all must still be told about a stale
-/// `packing.min_free_for_append`, so neither may short-circuit the other.
+/// The `[[backends.lto]]`, `[packing]` and `[defaults]` scans are
+/// INDEPENDENT: a config missing any two of the three sections must still
+/// be told about a stale key in the third, so none may short-circuit the
+/// others.
 fn stale_lto_fields_message(content: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(content).ok()?;
     if let Some(msg) = stale_backend_fields_message(&value) {
         return Some(msg);
     }
-    stale_packing_fields_message(&value)
+    if let Some(msg) = stale_packing_fields_message(&value) {
+        return Some(msg);
+    }
+    stale_defaults_fields_message(&value)
 }
 
 /// The `[[backends.lto]]` half of [`stale_lto_fields_message`].
@@ -713,6 +774,77 @@ fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
         );
     }
     None
+}
+
+/// The `[defaults]` half of [`stale_lto_fields_message`] (issue #129,
+/// carried forward by #171): `min_copies` reads like the general copy
+/// requirement and is not one — the real knob is
+/// `defaults.min_copies_for_tape_only`, and a per-set override goes on an
+/// `[[archive_sets]]` entry as `min_copies`. This used to be an ADVISORY
+/// `config check` note (`policy::unknown_keys`) while `[defaults]` merely
+/// warned about unknown keys; #171 makes an unknown key in `[defaults]` a
+/// hard load error like every other section, so the friendly remediation
+/// has to live here or vanish behind serde's generic "unknown field"
+/// message.
+fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
+    let defaults = value.get("defaults")?.as_table()?;
+    if defaults.contains_key("min_copies") {
+        return Some(
+            "defaults.min_copies is not a setting (issue #129) — the general copy \
+             requirement is defaults.min_copies_for_tape_only; a per-set override \
+             goes on an [[archive_sets]] entry as min_copies. Delete the line, or \
+             rename it to min_copies_for_tape_only if that is what you meant."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Membership check shared by every ADR-0012 boundary validator (issue
+/// #171): compression, checksum mode, and each `--status` filter across the
+/// CLI (`cli::cartridge`, `cli::unit`, `cli::stage`, `cli::snapshot`,
+/// `cli::volume`). Returns the bare message, never a [`TapectlError`],
+/// because each caller needs a different variant and a different amount of
+/// context (`Config::load` names the file; the CLI commands do not).
+pub fn validate_closed_set(
+    field: &str,
+    value: &str,
+    accepted: &[&str],
+) -> std::result::Result<(), String> {
+    if accepted.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid {field} {value:?}: accepted values are {}",
+            accepted.join(", ")
+        ))
+    }
+}
+
+/// Compression algorithms `dar` accepts via `-z`. Moved here from
+/// `cli::archive_set` under issue #171 so `[defaults].compression` and an
+/// `[[archive_sets]]` entry's `compression` share one syntactic check —
+/// previously only the archive-set path validated this at all, so a typo in
+/// `[defaults]` surfaced as a raw `dar -zbanana` failure at stage time.
+/// Whether the LOCAL `dar` binary was actually compiled with a given codec
+/// is a separate, capability-probing question
+/// (`cli::archive_set::validate_compression_capability`), which wraps this.
+pub const VALID_COMPRESSION_VALUES: &[&str] =
+    &["none", "gzip", "bzip2", "lzo", "xz", "lzma", "zstd", "lz4"];
+
+pub fn validate_compression(value: &str) -> std::result::Result<(), String> {
+    validate_closed_set("compression", value, VALID_COMPRESSION_VALUES)
+}
+
+/// Checksum modes `units.checksum_mode` accepts — the CHECK constraint in
+/// `src/db/migrations/001_initial.sql`. ADR-0012 gives checksum mode "the
+/// same treatment" as compression (issue #171): a bogus value must fail at
+/// config load / archive-set write, not as an opaque SQLite CHECK-
+/// constraint failure when a unit is finally written with it.
+pub const VALID_CHECKSUM_MODES: &[&str] = &["mtime_size", "sha256", "sha256_on_archive"];
+
+pub fn validate_checksum_mode(value: &str) -> std::result::Result<(), String> {
+    validate_closed_set("checksum_mode", value, VALID_CHECKSUM_MODES)
 }
 
 /// Match a configured `device_tape` against a requested device path.
@@ -1186,10 +1318,10 @@ mod tests {
         assert!(msg.contains("MTCOMPRESSION"), "{msg}");
     }
 
-    /// `PackingConfig` has no `deny_unknown_fields`, so without this
-    /// pre-scan a stale `min_free_for_append` would be silently swallowed
-    /// rather than rejected — the one removal of the three that serde does
-    /// not catch on its own.
+    /// `PackingConfig` now carries `#[serde(deny_unknown_fields)]` too
+    /// (issue #171), so serde alone would already reject a stale
+    /// `min_free_for_append` — this pre-scan exists to give the ADR-0003
+    /// reason instead of serde's generic "unknown field" line.
     #[test]
     fn a_removed_min_free_for_append_is_named_with_adr_0003() {
         let text = "[packing]\nmin_free_for_append = \"50G\"\n";
