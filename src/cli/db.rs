@@ -96,8 +96,8 @@ pub fn run(
                 );
             } else {
                 println!(
-                    "database: {} KB, {table_count} tables, {page_count} pages",
-                    db_size / 1024
+                    "database: {}, {table_count} tables, {page_count} pages",
+                    crate::util::format_bytes_binary(db_size)
                 );
             }
         }

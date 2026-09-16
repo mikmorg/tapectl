@@ -612,7 +612,13 @@ pub fn run(
                     checksum_mode.as_deref().unwrap_or("-")
                 );
                 if let Some(sz) = slice_size {
-                    println!("  Slice size:       {} GB", sz / (1024 * 1024 * 1024));
+                    // Binary: `slice_size` is parsed by `staging::parse_size_to_bytes`
+                    // ("G" => 1024^3), so the figure was always binary and only the
+                    // label was wrong (issue #204, class 1 — relabel, never re-divide).
+                    println!(
+                        "  Slice size:       {}",
+                        crate::util::format_bytes_binary(sz)
+                    );
                 }
                 println!(
                     "  Verify interval:  {} days",
