@@ -418,6 +418,90 @@ fn test_cartridge_lifecycle() {
     assert_eq!(status, "available");
 }
 
+/// Issue #167, ADR-0012 Tier 1: `cartridge edit --generation` is the only
+/// repair for a registered cartridge's generation, applied at every status.
+/// Driven through `tapectl::cli::cartridge::run` (not raw SQL, unlike
+/// `test_cartridge_lifecycle` above) because the acceptance criterion names
+/// the COMMAND, not the schema.
+#[test]
+fn test_cartridge_edit_generation_round_trip() {
+    use tapectl::cli::cartridge::CartridgeCommands;
+
+    let (_tmp, conn, _home) = setup();
+
+    tapectl::cli::cartridge::run(
+        &conn,
+        &CartridgeCommands::Register {
+            barcode: "L6-0001".to_string(),
+            generation: "LTO-6".to_string(),
+            capacity: None,
+            serial: Some("EW7VWMVKF6".to_string()),
+            notes: None,
+        },
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+
+    tapectl::cli::cartridge::run(
+        &conn,
+        &CartridgeCommands::Edit {
+            barcode: "L6-0001".to_string(),
+            generation: "LTO-5".to_string(),
+        },
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let (media_type, nominal_capacity, serial_number): (String, i64, Option<String>) = conn
+        .query_row(
+            "SELECT media_type, nominal_capacity, serial_number FROM cartridges
+             WHERE barcode = 'L6-0001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(media_type, "LTO-5");
+    assert_eq!(
+        nominal_capacity,
+        tapectl::media::Generation::Lto5.native_capacity_bytes() as i64,
+        "an unset capacity re-defaults to the corrected generation's table figure"
+    );
+    assert_eq!(
+        serial_number.as_deref(),
+        Some("EW7VWMVKF6"),
+        "editing the generation must never touch the serial"
+    );
+
+    let events: Vec<(String, String, Option<String>, Option<String>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT action, field, old_value, new_value FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'updated'
+                 ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    assert_eq!(
+        events.len(),
+        2,
+        "media_type + the re-defaulted nominal_capacity: {events:?}"
+    );
+    assert_eq!(events[0].1, "media_type");
+    assert_eq!(events[0].2.as_deref(), Some("LTO-6"));
+    assert_eq!(events[0].3.as_deref(), Some("LTO-5"));
+    assert_eq!(events[1].1, "nominal_capacity");
+}
+
 // ── Event Audit Trail Tests ──
 
 #[test]
