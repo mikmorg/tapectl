@@ -351,7 +351,9 @@ pub fn resolve_media(
             return Err(TapectlError::Other(format!(
                 "cartridge {barcode} is registered as {row_gen}, {what_says}. Either the \
                  registration is wrong or the wrong cartridge is loaded, and tapectl \
-                 cannot tell which."
+                 cannot tell which. If the registration is wrong: `tapectl cartridge edit \
+                 {barcode} --generation {generation}`. If the wrong cartridge is loaded: \
+                 load the right one."
             )));
         }
     }
@@ -646,6 +648,12 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("the loaded medium is LTO-5"), "{err}");
+        // Issue #167: the escape hatch names the repair command with the
+        // RESOLVED (winning) generation, not the row's stale one.
+        assert!(
+            err.contains("cartridge edit BC001 --generation LTO-5"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -724,6 +732,12 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("--generation says LTO-8"), "{err}");
+        // Issue #167: the escape hatch names the repair command with the
+        // RESOLVED (winning) generation, not the row's stale one.
+        assert!(
+            err.contains("cartridge edit BC001 --generation LTO-8"),
+            "{err}"
+        );
     }
 
     /// ...and the row winning the ladder can never contradict itself.
