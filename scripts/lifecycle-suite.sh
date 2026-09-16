@@ -1912,12 +1912,26 @@ rr_volinit_volx_refused_with_force() {
 # `cartridge mark-erased` (needs no consent now — status is 'pending_erase'
 # since the retire above), THEN `volume init` on the reused cartridge
 # succeeds WITHOUT --force (the tape is genuinely blank now).
+# `blank_tape`, not `erase_tape`: this step stands in for the operator
+# physically erasing the cartridge, and the next check asserts `volume init`
+# then succeeds WITHOUT --force. Under `--erase short` (the mode the
+# autopilot Policy runs), `erase_tape` is `weof 1` at BOT, which UNSEALS a
+# tape but does not blank one — a read at BOT still returns the previous
+# volume's bytes and init correctly refuses:
+#
+#     error: refusing to write volume "VOL-H": the loaded cartridge's File 0
+#     already identifies a DIFFERENT volume ... re-run with --force
+#
+# That is the issue #194 finding, in a scenario that had never reached this
+# step to show it (issue #198). `blank_tape` is the helper #194 added for
+# precisely this: a real erase whatever `--erase` says. Giving the init
+# `--force` instead would defeat the check this scenario exists to prove.
 rr_physical_erase() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
         skip "rr.physical_erase" "single-cartridge mode: VOL-A's cartridge was already reused by an earlier next_tape in this run"
         return $?
     fi
-    erase_tape
+    blank_tape
 }
 
 rr_mark_erased_after_retire_succeeds() {
