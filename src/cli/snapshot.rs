@@ -110,8 +110,7 @@ fn display_opt_i64(v: &Option<i64>) -> String {
 }
 
 fn display_size_mb(v: &Option<i64>) -> String {
-    v.map(|s| format!("{} MB", s / (1024 * 1024)))
-        .unwrap_or_default()
+    v.map(crate::util::format_bytes_binary).unwrap_or_default()
 }
 
 /// `snapshot list --json` shape. `files`/`size`/`created` were table-only
@@ -179,11 +178,11 @@ pub fn run(
                 );
             } else if outcome.minted {
                 println!(
-                    "snapshot created: {} v{} ({} files, {} MB)",
+                    "snapshot created: {} v{} ({} files, {})",
                     name,
                     outcome.version,
                     file_count.unwrap_or(0),
-                    total_size.unwrap_or(0) / (1024 * 1024),
+                    crate::util::format_bytes_binary(total_size.unwrap_or(0)),
                 );
             } else {
                 println!(
@@ -309,7 +308,7 @@ mod tests {
     /// (architecture review C2 follow-up, C2b). The byte count
     /// (125_829_121) is deliberately not an even multiple of 1 MiB, proving
     /// the JSON carries the raw fact rather than a value recomputed from
-    /// the table's "120 MB" text.
+    /// the table's "120 MiB" text.
     #[test]
     fn pin_snapshot_rows_json_shape() {
         let rows = vec![

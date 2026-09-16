@@ -362,7 +362,7 @@ pub fn run(
                         size: if is_dir {
                             "-".into()
                         } else {
-                            format_size(size)
+                            crate::util::format_bytes_binary(size)
                         },
                         modified: row.get::<_, Option<String>>(2)?,
                         sha256: row
@@ -426,7 +426,10 @@ pub fn run(
                 println!("no files matching \"{pattern}\"");
             } else {
                 for (path, size, unit, ver) in &rows {
-                    println!("  {unit} v{ver}: {path} ({})", format_size(*size));
+                    println!(
+                        "  {unit} v{ver}: {path} ({})",
+                        crate::util::format_bytes_binary(*size)
+                    );
                 }
                 println!("{} result(s)", rows.len());
             }
@@ -719,24 +722,15 @@ pub fn run(
                 println!("  Units:     {unit_count}");
                 println!("  Snapshots: {snapshot_count}");
                 println!("  Files:     {file_count}");
-                println!("  Total:     {}", format_size(total_size));
+                println!(
+                    "  Total:     {}",
+                    crate::util::format_bytes_binary(total_size)
+                );
                 println!("  Volumes:   {volume_count}");
             }
         }
     }
     Ok(())
-}
-
-fn format_size(bytes: i64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// First 12 characters of a hash, elided — or the whole thing when it is

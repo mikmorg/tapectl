@@ -1653,9 +1653,9 @@ pub fn export_unit(
         );
     } else {
         println!(
-            "exported {} slices ({} MB) to {}",
+            "exported {} slices ({}) to {}",
             slices.len(),
-            total / (1024 * 1024),
+            crate::util::format_bytes_binary(total),
             dest_dir,
         );
     }

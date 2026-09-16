@@ -34,7 +34,7 @@ struct StagingRow {
     #[tabled(rename = "Slices", display_with = "display_opt_i64")]
     #[serde(rename = "num_slices")]
     slices: Option<i64>,
-    #[tabled(rename = "Size (MB)", display_with = "display_size_mb")]
+    #[tabled(rename = "Size (MiB)", display_with = "display_size_mb")]
     #[serde(rename = "total_encrypted_size")]
     encrypted_bytes: Option<i64>,
     #[tabled(rename = "Writes")]
@@ -66,7 +66,7 @@ fn display_size_mb(v: &Option<i64>) -> String {
 
 /// `staging status --json` shape. Change 1 already types `slices` and
 /// `encrypted_bytes` as `Option<i64>` (rather than the pre-formatted display
-/// strings the table needs) because the MB division the table performs is
+/// strings the table needs) because the MiB division the table performs is
 /// lossy -- a string-typed intermediate row could not reconstruct the exact
 /// byte count the JSON contract requires, so there is no honest "verbatim,
 /// then retype later" split for this one field. The row is built once in
@@ -143,10 +143,10 @@ pub fn run(
                 );
             } else {
                 println!(
-                    "cleaned {} stage set(s), {} files removed, {} MB freed",
+                    "cleaned {} stage set(s), {} files removed, {} freed",
                     report.sets_cleaned,
                     report.files_removed,
-                    report.bytes_freed / (1024 * 1024),
+                    crate::util::format_bytes_binary(report.bytes_freed),
                 );
                 println!(
                     "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed",
@@ -186,7 +186,7 @@ mod tests {
     /// `staging status --json` shape (issue: C2 row-listing drift). One row
     /// has every optional field populated with a byte count that is NOT an
     /// even multiple of 1 MiB -- proof the JSON carries raw bytes, not the
-    /// table's lossy MB-divided display value. The other row has every
+    /// table's lossy MiB-divided display value. The other row has every
     /// optional field absent (`null`).
     #[test]
     fn pin_staging_rows_json_shape() {

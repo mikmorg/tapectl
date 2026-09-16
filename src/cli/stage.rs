@@ -67,8 +67,7 @@ struct StageRow {
 }
 
 fn display_encrypted_mb(v: &Option<i64>) -> String {
-    v.map(|s| format!("{} MB", s / (1024 * 1024)))
-        .unwrap_or_default()
+    v.map(crate::util::format_bytes_binary).unwrap_or_default()
 }
 
 fn display_opt_string(v: &Option<String>) -> String {
@@ -249,8 +248,14 @@ pub fn run(
                     println!("  command:   {dc}");
                 }
                 println!("  Slices:    {}", num_slices.unwrap_or(0));
-                println!("  dar size:  {} MB", dar_size.unwrap_or(0) / (1024 * 1024));
-                println!("  encrypted: {} MB", enc_size.unwrap_or(0) / (1024 * 1024));
+                println!(
+                    "  dar size:  {}",
+                    crate::util::format_bytes_binary(dar_size.unwrap_or(0))
+                );
+                println!(
+                    "  encrypted: {}",
+                    crate::util::format_bytes_binary(enc_size.unwrap_or(0))
+                );
                 if let Some(sa) = &staged_at {
                     println!("  Staged at: {sa}");
                 }
@@ -258,9 +263,9 @@ pub fn run(
                     println!("  Slices:");
                     for (num, size, enc, sha) in &slices {
                         println!(
-                            "    #{num}: {} MB dar, {} MB enc, sha256={}",
-                            size / (1024 * 1024),
-                            enc.unwrap_or(0) / (1024 * 1024),
+                            "    #{num}: {} dar, {} enc, sha256={}",
+                            crate::util::format_bytes_binary(*size),
+                            crate::util::format_bytes_binary(enc.unwrap_or(0)),
                             sha.as_deref().unwrap_or("(none)"),
                         );
                     }
@@ -348,11 +353,11 @@ pub fn run(
                 );
             } else {
                 println!(
-                    "staged: {} ({} slices, {} MB dar, {} MB encrypted)",
+                    "staged: {} ({} slices, {} dar, {} encrypted)",
                     name,
                     num_slices.unwrap_or(0),
-                    total_dar.unwrap_or(0) / (1024 * 1024),
-                    total_enc.unwrap_or(0) / (1024 * 1024),
+                    crate::util::format_bytes_binary(total_dar.unwrap_or(0)),
+                    crate::util::format_bytes_binary(total_enc.unwrap_or(0)),
                 );
             }
         }
@@ -398,7 +403,7 @@ mod tests {
     /// 2026-09-11 (architecture review C2 follow-up, C2b). The byte count
     /// (125_829_121) is deliberately not an even multiple of 1 MiB, proving
     /// the JSON carries the raw fact rather than a value recomputed from
-    /// the table's "120 MB" text.
+    /// the table's "120 MiB" text.
     #[test]
     fn pin_stage_rows_json_shape() {
         let rows = vec![

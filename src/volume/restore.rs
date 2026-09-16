@@ -229,7 +229,10 @@ pub(crate) fn restore_unit_from_store(
 
         info!(
             slice = i + 1,
-            mb = plain_size / (1024 * 1024),
+            // Binary (issue #204): a decrypted slice is a measured data
+            // size, so this stays 1024-based -- only the field name was
+            // wrong, not the division.
+            mib = plain_size / (1024 * 1024),
             "decrypted slice"
         );
     }

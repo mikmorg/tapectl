@@ -138,10 +138,10 @@ fn report_supersedable(conn: &Connection, config: &Config, json_output: bool) ->
                     superseding_version,
                     freeable_bytes,
                 } => println!(
-                    "  {} v{}: superseded by v{superseding_version} — RELEASABLE, frees {} MB\n      tapectl snapshot mark-reclaimable {} --version {}",
+                    "  {} v{}: superseded by v{superseding_version} — RELEASABLE, frees {}\n      tapectl snapshot mark-reclaimable {} --version {}",
                     c.unit_name,
                     c.version,
-                    freeable_bytes / (1024 * 1024),
+                    crate::util::format_bytes_binary(*freeable_bytes),
                     c.unit_name,
                     c.version,
                 ),
@@ -150,10 +150,10 @@ fn report_supersedable(conn: &Connection, config: &Config, json_output: bool) ->
                     reason,
                     ..
                 } => println!(
-                    "  {} v{}: BLOCKED ({} MB would be freed) — {reason}",
+                    "  {} v{}: BLOCKED ({} would be freed) — {reason}",
                     c.unit_name,
                     c.version,
-                    freeable_bytes / (1024 * 1024),
+                    crate::util::format_bytes_binary(*freeable_bytes),
                 ),
             }
         }
@@ -162,8 +162,10 @@ fn report_supersedable(conn: &Connection, config: &Config, json_output: bool) ->
             println!("nothing to release: every candidate is blocked");
         } else {
             println!(
-                "{releasable} releasable, freeing {} MB total",
-                summary["total_freeable_bytes"].as_i64().unwrap_or(0) / (1024 * 1024)
+                "{releasable} releasable, freeing {} total",
+                crate::util::format_bytes_binary(
+                    summary["total_freeable_bytes"].as_i64().unwrap_or(0)
+                )
             );
         }
     }
@@ -291,8 +293,8 @@ fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
         println!("  Volumes:    {volume_count} active");
         println!("  Writes:     {write_count} completed");
         println!(
-            "  Total data: {} GB on tape",
-            total_bytes / (1024 * 1024 * 1024)
+            "  Total data: {} on tape",
+            crate::util::format_bytes_binary(total_bytes)
         );
         if staged_count > 0 {
             println!("  Pending:    {staged_count} stage set(s) awaiting write");
@@ -886,9 +888,9 @@ fn report_pending(conn: &Connection, json_output: bool) -> Result<()> {
         println!("pending writes:");
         for (name, ver, _status, slices, size) in &rows {
             println!(
-                "  {name} v{ver}: {} slices, {} MB",
+                "  {name} v{ver}: {} slices, {}",
                 slices.unwrap_or(0),
-                size.unwrap_or(0) / (1024 * 1024),
+                crate::util::format_bytes_binary(size.unwrap_or(0)),
             );
         }
     }
@@ -1531,10 +1533,10 @@ fn report_compaction_candidates(
                 flagged += 1;
             }
             println!(
-                "  {label}: {:.0}% utilized ({} MB live, {} MB reclaimable){flag}",
+                "  {label}: {:.0}% utilized ({} live, {} reclaimable){flag}",
                 util * 100.0,
-                live / (1024 * 1024),
-                reclaimable / (1024 * 1024),
+                crate::util::format_bytes_binary(*live),
+                crate::util::format_bytes_binary(*reclaimable),
             );
         }
         if flagged == 0 {

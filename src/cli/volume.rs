@@ -643,9 +643,9 @@ pub fn run(
                 );
             } else {
                 println!(
-                    "read {} slices ({} MB) from \"{}\" into staging",
+                    "read {} slices ({}) from \"{}\" into staging",
                     report.slices_read,
-                    report.bytes_read / (1024 * 1024),
+                    crate::util::format_bytes_binary(report.bytes_read),
                     from,
                 );
                 println!(
@@ -699,15 +699,15 @@ pub fn run(
                     println!("volume write plan ({copies} copy/copies):");
                     for (name, ver, slices, size) in &rows {
                         println!(
-                            "  {name} v{ver}: {} slices, {} MB",
+                            "  {name} v{ver}: {} slices, {}",
                             slices.unwrap_or(0),
-                            size.unwrap_or(0) / (1024 * 1024),
+                            crate::util::format_bytes_binary(size.unwrap_or(0)),
                         );
                     }
                     println!(
-                        "\ntotal: {total_slices} slices, {} MB x {copies} = {} MB",
-                        total_bytes / (1024 * 1024),
-                        total_bytes * copies / (1024 * 1024),
+                        "\ntotal: {total_slices} slices, {} x {copies} = {}",
+                        crate::util::format_bytes_binary(total_bytes),
+                        crate::util::format_bytes_binary(total_bytes * copies),
                     );
                     // Estimate tapes needed from the configured LTO backend.
                     // ADR-0010: the figure follows the GENERATION being
@@ -742,9 +742,9 @@ pub fn run(
                 );
             } else {
                 println!(
-                    "compact-read \"{label}\": {} live slices ({} MB) staged",
+                    "compact-read \"{label}\": {} live slices ({}) staged",
                     report.slices_read,
-                    report.bytes_read / (1024 * 1024),
+                    crate::util::format_bytes_binary(report.bytes_read),
                 );
             }
         }
@@ -815,9 +815,9 @@ pub fn run(
                 write::compact_read(conn, config, label, &mut store, medium_serial.as_deref())?
             };
             println!(
-                "  Read {} slices ({} MB)",
+                "  Read {} slices ({})",
                 report.slices_read,
-                report.bytes_read / (1024 * 1024),
+                crate::util::format_bytes_binary(report.bytes_read),
             );
 
             let dest_label = resolve_compact_destination(to.as_deref())?;
@@ -1758,9 +1758,9 @@ fn print_volume_info(info: &VolumeInfo) {
         println!("Units carried: none");
     } else {
         println!(
-            "Units carried: {} ({} MB across {} tenant(s){})",
+            "Units carried: {} ({} across {} tenant(s){})",
             info.unit_count,
-            info.unit_total_bytes / (1024 * 1024),
+            crate::util::format_bytes_binary(info.unit_total_bytes),
             info.tenants.len(),
             match (&info.units_first_seen, &info.units_last_seen) {
                 (Some(a), Some(b)) if a != b => format!(", {a} .. {b}"),
@@ -1771,11 +1771,11 @@ fn print_volume_info(info: &VolumeInfo) {
         let shown = info.units.as_deref().unwrap_or(&info.largest_units);
         for u in shown {
             println!(
-                "    {} v{} ({}) — {} MB",
+                "    {} v{} ({}) — {}",
                 u.unit,
                 u.version,
                 u.tenant,
-                u.bytes / (1024 * 1024),
+                crate::util::format_bytes_binary(u.bytes),
             );
         }
         if info.units.is_none() && info.unit_count as usize > shown.len() {
