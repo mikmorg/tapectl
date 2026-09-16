@@ -118,7 +118,7 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 ///
 /// Ordering is load-bearing. Every FACT check (detect, the `--media`
 /// contradiction, `can_write`, a `--cartridge` that names no row, a
-/// serial-less `--cartridge` that would displace a live volume) runs
+/// `--cartridge` with no serial match that would displace a live volume) runs
 /// before the tape device is opened, so a wrong-tape or wrong-flag run costs
 /// nothing. Every catalog MUTATION runs after `check_fresh_write_contact`
 /// passes and inside one transaction, so a refused init never displaces a
@@ -196,11 +196,13 @@ pub fn volume_init(
     // on volumes initialised before this rule.
     binding::require_named_cartridge(serial, lookup.row.as_ref())?;
     // ADR-0012 / ADR-0010's "Correction 2026-09-14": ADR-0010's no-second-gate
-    // rule holds only on a serial match. With no serial, a typed `--cartridge`
-    // naming a row still bound to a live volume is undecidable — that
-    // cartridge erased, or a different tape wearing its sticker — so it is
-    // refused (issue #155). Here with the other FACT checks, before the drive
-    // is opened and before the transaction: a refusal must displace nothing.
+    // rule holds only when the cartridge was matched by MAM serial, which
+    // needs one on BOTH sides. With none from the drive, or none recorded on
+    // the row the typed `--cartridge` named, a row still bound to a live
+    // volume is undecidable — that cartridge erased, or a different tape
+    // wearing its sticker — so it is refused (issue #155). Here with the other
+    // FACT checks, before the drive is opened and before the transaction: a
+    // refusal must displace nothing.
     binding::refuse_unwitnessed_displacement(conn, serial, lookup.row.as_ref())?;
     // ADR-0011: the one status-based refusal binding has. A medium the
     // operator declared permanently unfit cannot be written, and `--force`

@@ -21,13 +21,14 @@
 //! init` — the most ordinary reuse there is — into a two-command catalog
 //! dance that teaches operators to reach for `--force` by reflex.
 //!
-//! **That rule holds only on a serial match** (ADR-0010's "Correction
+//! **That rule holds only on a serial MATCH** (ADR-0010's "Correction
 //! 2026-09-14", ADR-0012, issue #155). It rests on two facts, not one: File 0
 //! decided consent, AND the MAM serial proves the blank tape in the drive is
-//! the cartridge being displaced. With no readable serial and a typed
-//! `--cartridge`, the second fact is missing, and the case is refused rather
-//! than gated — see [`refuse_unwitnessed_displacement`], which is a FACT
-//! refusal like the rest below, not the consent gate ADR-0010 rejected.
+//! the cartridge being displaced. A match needs a serial on both sides, so the
+//! second fact is missing whenever the DRIVE reports none or the named ROW has
+//! none recorded. Then the case is refused rather than gated — see
+//! [`refuse_unwitnessed_displacement`], which is a FACT refusal like the rest
+//! below, not the consent gate ADR-0010 rejected.
 //!
 //! So binding RECORDS the displacement instead of relitigating it: the open
 //! mount is closed, the displaced volume moves to `erased`, an events row
@@ -47,7 +48,7 @@
 //!   permanently unfit fit again (ADR-0011).
 //! - [`require_named_cartridge`]: no serial and no `--cartridge` leaves
 //!   nothing to bind to at all (ADR-0012, issue #192).
-//! - [`refuse_unwitnessed_displacement`]: no serial and a `--cartridge`
+//! - [`refuse_unwitnessed_displacement`]: no serial MATCH and a `--cartridge`
 //!   naming a row still bound to a LIVE volume is undecidable — that
 //!   cartridge erased, or a different tape wearing its sticker (ADR-0012,
 //!   issue #155).
@@ -125,10 +126,14 @@ pub(crate) struct BindOutcome {
 /// `volumes` row exists.
 ///
 /// The MAM serial wins over `--cartridge`: it was read off the medium, while
-/// the barcode was typed by a human who may have picked up the wrong tape.
-/// ADR-0010 names the row-vs-medium *generation* disagreement as the only new
-/// refusal binding introduces, so a superseded `--cartridge` is reported, not
-/// refused.
+/// the barcode was typed by a human who may have picked up the wrong tape. A
+/// superseded `--cartridge` is not among the refusals binding introduces, so
+/// it is reported, not refused.
+///
+/// ADR-0010's original text called the row-vs-medium *generation* disagreement
+/// "the only new refusal"; its 2026-09-14 correction retracts that. There are
+/// now four, listed in this module's header — two of them this function's own
+/// (an unregistered barcode, and a row carrying a DIFFERENT serial).
 pub(crate) fn lookup_cartridge(
     conn: &Connection,
     serial: Option<&str>,
@@ -227,35 +232,56 @@ pub(crate) fn require_named_cartridge(
     ))
 }
 
-/// Refuse a serial-less `--cartridge` that would displace a LIVE volume
-/// (ADR-0012; ADR-0010's "Correction 2026-09-14"; issue #155).
+/// Refuse a `--cartridge` with NO SERIAL MATCH that would displace a LIVE
+/// volume (ADR-0012; ADR-0010's "Correction 2026-09-14"; issue #155).
 ///
 /// ADR-0010's "Binding adds no second consent gate" rests on TWO facts, not
 /// one: File 0 has already decided consent, **and** the MAM serial proves the
 /// blank tape in the drive is the same cartridge whose volume is being
-/// displaced. When the drive reports no serial and the operator names the row
-/// by typed barcode, the second fact is missing. The medium that consented via
-/// File 0 is then a different physical object from the row being erased, and
-/// `--cartridge B` over a blank tape is either B erased or a different tape
-/// wearing B's sticker. tapectl cannot tell which.
+/// displaced. ADR-0010's correction states the restriction in exactly those
+/// terms — the rule "holds only when the cartridge was **matched by MAM
+/// serial**" — and a match needs a serial on BOTH sides:
+///
+/// - The drive reports none. The operator named the row by typed barcode, so
+///   the medium that consented via File 0 is a different physical object from
+///   the row being erased.
+/// - The drive reports one but the named row has none recorded. There is
+///   nothing to have matched it against, so the serial proves nothing about
+///   *this* row. This case is worse than the first: binding would also write
+///   that serial onto the row permanently ([`bind_cartridge`] records a serial
+///   onto a row that lacks one), so the real cartridge could never be bound
+///   again — data loss with a dead end attached.
+///
+/// Either way `--cartridge B` over a blank tape is B erased or a different
+/// tape wearing B's sticker, and tapectl cannot tell which.
+///
+/// `lookup_cartridge` has already refused the remaining shape — both serials
+/// present and DIFFERENT — so by the time this runs, two `Some`s mean they
+/// match. "Witnessed" therefore reduces to `serial.is_some() &&
+/// row.serial_number.is_some()`.
+///
+/// **A non-displacing init is untouched.** ADR-0012's "a bound row that has no
+/// serial yet learns it at that contact" governs corroboration, not assertion:
+/// where no live volume is displaced this returns `Ok` and the row learns its
+/// serial exactly as before.
 ///
 /// So this is refused rather than gated — incoherence, not risk (ADR-0008).
 /// Like [`refuse_retired`] and [`require_named_cartridge`] it takes no `force`
 /// AT ALL, structurally, so a caller cannot defeat it by mistake. The way past
 /// is the operator saying the bytes are gone, in the vocabulary that already
 /// exists for exactly that statement: `volume retire` or `cartridge
-/// mark-erased`. Where the serial DOES name the cartridge, ADR-0010's original
-/// reasoning still governs and the displacement is recorded, not relitigated.
+/// mark-erased`. Where the serial DOES match, ADR-0010's original reasoning
+/// still governs and the displacement is recorded, not relitigated.
 ///
 /// "Live" is [`crate::policy::coverage::in_service`], the named predicate,
 /// never an inlined status list (issue #96). An `initialized` volume is
 /// deliberately NOT live: it holds no bytes, and refusing there would block
 /// re-initialising a cartridge whose first init was abandoned — an ordinary
-/// workflow precisely on the serial-less drives this refusal is about.
+/// workflow precisely on the drives this refusal is about.
 ///
 /// **This lives here but is called only from `volume_init`**, for the same
 /// reason as [`require_named_cartridge`]: [`bind_cartridge`] must keep
-/// accepting a serial-less bind, because `bind_late` calls it with no
+/// accepting a bind with no serial match, because `bind_late` calls it with no
 /// `--cartridge` to offer and that no-op is what keeps `volume write` working
 /// on volumes initialised before these rules. Pure of the tape and of the
 /// transaction, so a refused init leaves nothing behind.
@@ -264,10 +290,13 @@ pub(crate) fn refuse_unwitnessed_displacement(
     serial: Option<&str>,
     row: Option<&CartridgeRow>,
 ) -> Result<()> {
-    if serial.is_some() {
+    let Some(row) = row else { return Ok(()) };
+    // Witnessed: the chip named the tape in the drive AND the row has a serial
+    // it was named BY. `lookup_cartridge` already refused two Somes that
+    // differ, so reaching here with both present means they agree.
+    if serial.is_some() && row.serial_number.is_some() {
         return Ok(());
     }
-    let Some(row) = row else { return Ok(()) };
 
     // No `cv.volume_id != ?` exclusion, unlike `bind_cartridge`'s own
     // displacement query and `free_cartridge_if_last_live`: this runs before
@@ -306,18 +335,28 @@ pub(crate) fn refuse_unwitnessed_displacement(
         .map(|l| format!("    tapectl volume retire {l}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // Why there is no serial MATCH — the two shapes that reach here. Both end
+    // in the same place, but an operator staring at a drive that plainly did
+    // read a serial needs to be told the gap is in the catalog, not the drive.
+    let why = match serial {
+        None => "this drive reports no medium serial".to_string(),
+        Some(s) => format!(
+            "the drive reports medium serial {s}, but \"{barcode}\" has none recorded to \
+             compare it against — and binding would write {s} onto \"{barcode}\" \
+             permanently, so the real \"{barcode}\" could never be bound again"
+        ),
+    };
     Err(TapectlError::Other(format!(
-        "this drive reports no medium serial, so tapectl cannot confirm the tape in the \
-         drive is cartridge \"{barcode}\" — and \"{barcode}\" is bound to {volume_s} \
+        "{why}, so tapectl cannot confirm the tape in the drive is cartridge \
+         \"{barcode}\" — and \"{barcode}\" is bound to {volume_s} \
          {labels}, which {is_are} still live.\n\
          \n\
          That makes this undecidable: either \"{barcode}\" has been erased, in which case \
          those bytes are already gone, or a DIFFERENT tape is wearing \"{barcode}\"'s \
          sticker and the real one is still on the shelf, holding whatever copies the \
          catalog credits it with. File 0 consented for the tape in the DRIVE; it says \
-         nothing about \
-         which cartridge that is. Only the medium serial proves that, and this drive \
-         reports none.\n\
+         nothing about which cartridge that is. Only a matching medium serial proves \
+         that, and there is none here.\n\
          \n\
          Say the bytes are gone first, then re-run this init:\n\
          {retires}\n\
@@ -510,8 +549,8 @@ pub(crate) fn bind_cartridge(
     // Still never refused HERE, and the one case ADR-0010's rule does not
     // cover was already refused upstream: `volume_init` calls
     // `refuse_unwitnessed_displacement` before the transaction, so a
-    // serial-less `--cartridge` naming a row bound to a live volume never
-    // reaches this loop (ADR-0012, issue #155). What does reach it is a
+    // `--cartridge` with no serial MATCH naming a row bound to a live volume
+    // never reaches this loop (ADR-0012, issue #155). What does reach it is a
     // serial match — where the medium itself proves which cartridge this is —
     // or a displacement of something not live.
     let mut stmt = conn.prepare(
@@ -789,8 +828,11 @@ mod tests {
     }
 
     /// The serial was read off the medium; the barcode was typed by a human.
-    /// ADR-0010 makes only the row-vs-medium GENERATION disagreement a
-    /// refusal, so this is reported, not refused.
+    /// A superseded `--cartridge` is not among the refusals ADR-0010 and
+    /// ADR-0012 introduce, so this is reported, not refused. (ADR-0010's
+    /// original text called the row-vs-medium GENERATION disagreement "the
+    /// only new refusal"; its 2026-09-14 correction retracts that — there are
+    /// now four, listed in this module's header.)
     #[test]
     fn a_serial_match_supersedes_an_explicit_cartridge_flag_without_erroring() {
         let conn = db::open_memory().unwrap();
@@ -1081,6 +1123,64 @@ mod tests {
         );
     }
 
+    /// The other half of "matched by MAM serial" (ADR-0010's Correction
+    /// 2026-09-14): a match needs a serial on BOTH sides, and here the DRIVE
+    /// has one but the named ROW does not. The serial proves the tape in the
+    /// drive is *some* cartridge; it proves nothing about BC002, which has
+    /// nothing recorded to have matched.
+    ///
+    /// Strictly worse than the serial-less case above, which is why the
+    /// condition covers both: binding would ALSO record SER-9 onto BC002
+    /// permanently (`bind_cartridge` writes a serial onto a row that lacks
+    /// one), so the real BC002 could never be bound again — data loss with a
+    /// dead end attached.
+    ///
+    /// The non-displacing version of this exact input stays legal and is
+    /// covered by `a_hand_registered_cartridge_learns_its_serial_on_first_bind`
+    /// below: ADR-0012's "a bound row that has no serial yet learns it at that
+    /// contact" is about corroboration, not about asserting over a live volume.
+    #[test]
+    fn a_cartridge_flag_naming_a_serial_less_row_will_not_displace_a_live_volume() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC002", "LTO-6", None, "available");
+        bind_then_set_status(&conn, "BC002", None, "L6-SEALED", "sealed");
+
+        // The drive DOES read a serial this time; it just matches nothing.
+        let found = lookup_cartridge(&conn, Some("SER-9"), Some("BC002")).unwrap();
+        assert_eq!(found.row.as_ref().unwrap().barcode, "BC002");
+        assert!(
+            found.row.as_ref().unwrap().serial_number.is_none(),
+            "fixture must give BC002 no recorded serial — that is the whole point"
+        );
+
+        let err = refuse_unwitnessed_displacement(&conn, Some("SER-9"), found.row.as_ref())
+            .expect_err("a serial the named row cannot match witnesses nothing; init must refuse")
+            .to_string();
+
+        assert!(
+            err.contains("SER-9") && err.contains("none recorded to compare it against"),
+            "the refusal must say the gap is in the catalog, not the drive — an operator \
+             watching the drive read a serial needs that; got: {err}"
+        );
+        assert!(
+            err.contains("could never be bound again"),
+            "the refusal must name the dead end binding would create; got: {err}"
+        );
+        assert!(
+            err.contains("BC002") && err.contains("L6-SEALED"),
+            "the refusal must name the cartridge AND the volume at stake; got: {err}"
+        );
+        assert!(
+            err.contains("tapectl volume retire L6-SEALED")
+                && err.contains("tapectl cartridge mark-erased BC002"),
+            "the refusal must name both ways past, ready to paste; got: {err}"
+        );
+        assert!(
+            err.contains("no --force for this"),
+            "the refusal must close the --force door explicitly; got: {err}"
+        );
+    }
+
     /// The deliberate line, pinned so it stays where ADR-0012 put it: an
     /// `initialized` volume holds no bytes, so it is NOT live and must still
     /// displace. Refusing here would block re-initialising a cartridge whose
@@ -1154,12 +1254,13 @@ mod tests {
             .expect("an erased volume is not live; re-init must not be blocked");
     }
 
-    /// The restriction is a RESTRICTION, not a replacement. With a serial
-    /// match the medium itself proves which cartridge is loaded, the second
-    /// fact ADR-0010 rests on is present, and its original reasoning still
-    /// governs: the displacement is recorded, never refused. Identical setup
-    /// to `a_serial_less_cartridge_flag_will_not_displace_a_live_volume`
-    /// apart from the serial.
+    /// The restriction is a RESTRICTION, not a replacement, and this is its
+    /// precise boundary: a serial on BOTH sides that agree. The medium itself
+    /// then proves which cartridge is loaded, the second fact ADR-0010 rests
+    /// on is present, and its original reasoning still governs — the
+    /// displacement is recorded, never refused. Identical setup to the two
+    /// refusal tests above apart from the serials, so what separates them is
+    /// exactly the match and nothing else.
     #[test]
     fn a_witnessed_displacement_of_a_live_volume_still_proceeds() {
         let conn = db::open_memory().unwrap();
@@ -1167,6 +1268,13 @@ mod tests {
         let sealed = bind_then_set_status(&conn, "BC002", Some("SER-1"), "L6-SEALED", "sealed");
 
         let found = lookup_cartridge(&conn, Some("SER-1"), Some("BC002")).unwrap();
+        // What makes this "witnessed" is the RECORDED serial, not just the one
+        // the drive read — assert the fixture really provides it, or this test
+        // would silently become a third copy of the refusal case.
+        assert_eq!(
+            found.row.as_ref().unwrap().serial_number.as_deref(),
+            Some("SER-1")
+        );
         refuse_unwitnessed_displacement(&conn, Some("SER-1"), found.row.as_ref())
             .expect("the serial proves which cartridge this is (ADR-0010); never refuse");
 
