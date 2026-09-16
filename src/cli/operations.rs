@@ -1480,14 +1480,75 @@ pub fn snapshot_delete(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    // Cascade delete: stage_slices -> stage_sets -> manifest_entries -> manifests -> files -> snapshot
+    // `writes.session_dir` (migration 006) is the only handle a restarted
+    // process has on a resumable write session's staging directory. Same
+    // reasoning as `staging_paths` above (issue #176, mirrors #55):
+    // collected before the transaction, removed after commit, and only for
+    // a directory no OTHER writes row still references — a multi-unit
+    // `collection run` session shares one `session_dir` across snapshots.
+    let session_dirs: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session_dir FROM writes
+             WHERE snapshot_id = ?1 AND session_dir IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![snap_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    // Any `writes` row this delete removes that sits at `interrupted` names
+    // a write session that can never be resumed again — its Layout
+    // referenced slices this command is about to drop, and resume's
+    // revalidation would refuse it anyway. #94 settled that only the
+    // operator judges a session unrecoverable, so this collects a warning
+    // naming the volume rather than auto-aborting the row.
+    let interrupted_volumes: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT v.label FROM writes w
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE w.snapshot_id = ?1 AND w.status = 'interrupted'",
+        )?;
+        let rows = stmt.query_map(params![snap_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    // Cascade delete: verification_results -> write_positions -> writes ->
+    // stage_slices -> stage_sets -> manifest_entries -> manifests -> files
+    // -> snapshot
     //
-    // One transaction, including the event (issue #55): as six bare
+    // One transaction, including the event (issue #55): as bare
     // `conn.execute` calls, a failure partway left a half-deleted snapshot —
     // e.g. `stage_slices` gone but `stage_sets` still present, referencing
     // slices that no longer exist. Mirrors `snapshot_purge` above, which
     // already had this treatment.
+    //
+    // The new head (issue #176): a snapshot's `writes` row can sit at any
+    // non-`completed` status (the guard above only refuses `completed`),
+    // and `write_positions`/`writes` are never touched by the rest of the
+    // cascade, so their FKs on `stage_slices`/`stage_sets`/`snapshots`
+    // tripped on the very first DELETE below. `verification_results` rows
+    // (written on a failed confirm, or by a later `volume verify`) point at
+    // both `write_positions` and `stage_slices`, so they must go first;
+    // the `stage_slice_id` predicate alone covers both FKs, because every
+    // such row's `write_position_id` and `stage_slice_id` come from the
+    // same `write_positions` row. `verification_sessions` is evidence about
+    // the *volume*, not this snapshot, and is never touched.
     let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM verification_results WHERE stage_slice_id IN
+         (SELECT sl.id FROM stage_slices sl
+          JOIN stage_sets ss ON ss.id = sl.stage_set_id
+          WHERE ss.snapshot_id = ?1)",
+        params![snap_id],
+    )?;
+    tx.execute(
+        "DELETE FROM write_positions WHERE write_id IN
+         (SELECT id FROM writes WHERE snapshot_id = ?1)",
+        params![snap_id],
+    )?;
+    tx.execute(
+        "DELETE FROM writes WHERE snapshot_id = ?1",
+        params![snap_id],
+    )?;
     tx.execute(
         "DELETE FROM stage_slices WHERE stage_set_id IN
          (SELECT id FROM stage_sets WHERE snapshot_id = ?1)",
@@ -1549,10 +1610,62 @@ pub fn snapshot_delete(
         );
     }
 
+    // Same after-commit treatment as the staged slices above, for the same
+    // reason: a rolled-back delete that had already removed a session
+    // directory would leave a live, resumable snapshot pointing at
+    // nothing. A directory another surviving `writes` row still names (a
+    // multi-unit `collection run` session) is left alone — `staging
+    // clean`'s RETAIN/RECLAIM rules still govern it.
+    let mut session_dirs_removed = 0usize;
+    for dir in &session_dirs {
+        let still_referenced: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM writes WHERE session_dir = ?1",
+            params![dir],
+            |row| row.get(0),
+        )?;
+        if still_referenced > 0 {
+            continue;
+        }
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => session_dirs_removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(dir = %dir, error = %e, "could not remove write session directory")
+            }
+        }
+    }
+    if session_dirs_removed > 0 {
+        tracing::info!(
+            count = session_dirs_removed,
+            snapshot = %format!("{unit_name}/v{version}"),
+            "removed write session directories no snapshot references any more"
+        );
+    }
+
+    // Issue #176 step 4: an `interrupted` write's session cannot be resumed
+    // once its slices are gone -- #94 settled that only the operator
+    // decides a session is unrecoverable, so this names the volume rather
+    // than auto-aborting the sibling `writes` row (already deleted above).
+    let mut warnings = Vec::new();
+    for label in &interrupted_volumes {
+        let msg = format!(
+            "snapshot {unit_name} v{version} had an interrupted write on volume \"{label}\" \
+             -- that session can no longer be resumed now that its slices are gone; \
+             run `tapectl volume abort {label}` before reusing the cartridge"
+        );
+        tracing::warn!(volume = %label, unit = %unit_name, version, "{msg}");
+        warnings.push(msg);
+    }
+
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"unit": unit_name, "version": version, "deleted": true})
+            serde_json::json!({
+                "unit": unit_name,
+                "version": version,
+                "deleted": true,
+                "warnings": warnings,
+            })
         );
     } else {
         println!("snapshot {unit_name} v{version} deleted (was: {status})");
