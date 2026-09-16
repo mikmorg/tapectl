@@ -518,11 +518,15 @@ pub(crate) fn bind_cartridge(
                          tapectl cartridge relabel {s} <new-barcode>"
                     )));
                 }
+                // `total_load_count` is bound explicitly (not left to the
+                // schema's `DEFAULT 0`) so a drive that reports no load
+                // count leaves this brand-new row NULL -- "never observed",
+                // not a false "zero loads" (issue #184).
                 conn.execute(
                     "INSERT INTO cartridges
                         (barcode, media_type, manufacturer, serial_number,
-                         tape_length_meters, nominal_capacity, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'in_use')",
+                         tape_length_meters, nominal_capacity, status, total_load_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'in_use', ?7)",
                     params![
                         s,
                         generation.as_str(),
@@ -530,6 +534,7 @@ pub(crate) fn bind_cartridge(
                         s,
                         mam.length_meters,
                         capacity_bytes,
+                        mam.load_count,
                     ],
                 )?;
                 let id = conn.last_insert_rowid();
@@ -674,10 +679,22 @@ pub(crate) fn bind_cartridge(
     // `in_use` unconditionally, from ANY prior status. A precondition here
     // would be a consent gate in disguise: `pending_erase -> mt erase ->
     // volume init` is exactly the ordinary reuse ADR-0010 protects.
+    //
+    // `total_load_count` is recorded at the same contact (issue #184): it is
+    // a monotone counter the DRIVE maintains, so this SETs the observed
+    // value rather than incrementing it. `COALESCE(?2, total_load_count)`
+    // means a read with no load count (`mam.load_count` is `None`) leaves
+    // whatever was already recorded alone -- a later contact that cannot
+    // read the attribute must not erase a value an earlier one established.
+    // For the auto-register branch above, that prior value is already
+    // exactly what this same MAM read produced (`None` or `Some`), so this
+    // is a no-op there, not a second, conflicting write.
     if prior_status != "in_use" {
         conn.execute(
-            "UPDATE cartridges SET status = 'in_use', last_use = datetime('now') WHERE id = ?1",
-            params![cartridge_id],
+            "UPDATE cartridges SET status = 'in_use', last_use = datetime('now'),
+                 total_load_count = COALESCE(?2, total_load_count)
+             WHERE id = ?1",
+            params![cartridge_id, mam.load_count],
         )?;
         events::log_field_change(
             conn,
@@ -692,8 +709,10 @@ pub(crate) fn bind_cartridge(
         )?;
     } else {
         conn.execute(
-            "UPDATE cartridges SET last_use = datetime('now') WHERE id = ?1",
-            params![cartridge_id],
+            "UPDATE cartridges SET last_use = datetime('now'),
+                 total_load_count = COALESCE(?2, total_load_count)
+             WHERE id = ?1",
+            params![cartridge_id, mam.load_count],
         )?;
     }
 
