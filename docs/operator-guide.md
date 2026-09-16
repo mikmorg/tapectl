@@ -935,8 +935,32 @@ tapectl cartridge info L6-0001
 tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
+tapectl cartridge unretire L6-0001          # you were wrong about the medium; undo the retire
 tapectl cartridge mark-erased L6-0001       # after a physical erase
 ```
+
+**`unretire` and `mark-erased` are different statements, and the difference
+matters.** `cartridge retire` is a claim about the *medium*: this plastic is
+worn out, never write it again. If that claim was wrong, `cartridge unretire`
+withdraws it and puts the cartridge and its volumes back the way they were,
+reading their prior statuses out of the audit trail. It is a Tier-1 correction
+(ADR-0008): no prompt, no `--force`, because correcting a claim destroys
+nothing.
+
+`cartridge mark-erased` says something else entirely — *the bytes are gone* —
+and marks every volume on the cartridge `erased` to match. Until 2026-09-16 it
+was the only route out of `retired_permanent`, which meant undoing "I was wrong
+to condemn this tape" cost you the catalog's record that those tapes held data.
+ADR-0011's lifecycle carries a dated correction to that effect, and the refusal
+you get when you try to write a retired cartridge now names `unretire`.
+
+Reach for `mark-erased` when you have actually erased the tape. Reach for
+`unretire` when you simply changed your mind.
+
+If the catalog was rebuilt since the retirement, the events rows that recorded
+the prior statuses may be gone. `unretire` then restores the cartridge to
+`available`, leaves the volumes exactly as they are, and tells you which ones it
+could not restore — an honest partial restore rather than a guess.
 
 **A cartridge's place is a location, never a status** (ADR-0011). "Offsite" is
 a location you named with `location add`, and `cartridge move` puts the
