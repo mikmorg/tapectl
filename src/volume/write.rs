@@ -2155,14 +2155,14 @@ pub fn volume_identify_corroborated(
     conn: &Connection,
     store: &mut dyn Store,
     medium_serial: Option<&str>,
-) -> Result<String> {
+) -> Result<Identified> {
     let text = volume_identify(store)?;
     let file0 = binding::file0_facts_from_text(&text);
     // The volume this tape says it is — not one named on the command line,
     // because `identify` takes no label. No File 0 label, or a label no row
     // matches, is an absence: nothing to corroborate, so nothing refused.
     let Some(label) = file0.label.clone() else {
-        return Ok(text);
+        return Ok(Identified::agreed(text));
     };
     let volume_id: Option<i64> = conn
         .query_row(
@@ -2171,11 +2171,47 @@ pub fn volume_identify_corroborated(
             |r| r.get(0),
         )
         .optional()?;
-    if let Some(volume_id) = volume_id {
-        let medium = binding::MediumFacts::new(medium_serial.map(str::to_string), file0);
-        binding::corroborate_volume(conn, volume_id, &label, &medium)?;
+    let Some(volume_id) = volume_id else {
+        return Ok(Identified::agreed(text));
+    };
+    let medium = binding::MediumFacts::new(medium_serial.map(str::to_string), file0);
+    // `identify` REPORTS a contradiction, it does not withhold the answer.
+    // Every other contact refuses, because every other contact is about to
+    // act on the tape. This one exists to tell the operator what is loaded,
+    // and it is what they run precisely WHEN the catalog and the shelf have
+    // stopped agreeing — so swallowing File 0 here denies them the one fact
+    // that resolves it. ADR-0004's advisory rule, and `catalog locate`'s
+    // precedent of listing rows it disapproves of rather than hiding them.
+    match binding::corroborate_volume(conn, volume_id, &label, &medium) {
+        Ok(_) => Ok(Identified::agreed(text)),
+        Err(e) => Ok(Identified {
+            text,
+            contradiction: Some(e.to_string()),
+        }),
     }
-    Ok(text)
+}
+
+/// What `volume identify` found: the tape's own File 0 text, and whatever the
+/// catalog says that contradicts it (issue #193).
+///
+/// Two fields rather than a `Result` because they are not alternatives — a
+/// contradicted tape still has an identity, and printing it is the whole job.
+/// The caller prints `text` either way and treats `contradiction` as the exit
+/// status, so a human sees the answer and a script can still detect the
+/// disagreement.
+#[derive(Debug)]
+pub struct Identified {
+    pub text: String,
+    pub contradiction: Option<String>,
+}
+
+impl Identified {
+    fn agreed(text: String) -> Self {
+        Self {
+            text,
+            contradiction: None,
+        }
+    }
 }
 
 /// Outcome of [`stream_verify_slice_to_staging`]. `write_positions.
@@ -5487,8 +5523,12 @@ mod tests {
 
         // ── `volume identify` ──
 
+        /// `identify` REPORTS a contradiction rather than withholding the
+        /// answer. Every other contact refuses because it is about to act on
+        /// the tape; this one exists to say what is loaded, and it is run
+        /// precisely when the catalog and the shelf have stopped agreeing.
         #[test]
-        fn identify_refuses_when_the_catalog_binds_that_volume_elsewhere() {
+        fn identify_reports_the_contradiction_but_still_prints_the_tape() {
             let conn = crate::db::open_memory().unwrap();
             let mut store = wrong_tape(&conn, "ID-VOL", "ID-VOL", "id-unit");
             let v = volume_id(&conn, "ID-VOL");
@@ -5506,10 +5546,14 @@ mod tests {
             )
             .unwrap();
 
-            let err = volume_identify_corroborated(&conn, &mut store, Some("SER-DRIVE"))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("wrong cartridge"), "{err}");
+            let id = volume_identify_corroborated(&conn, &mut store, Some("SER-DRIVE")).unwrap();
+            // The answer is printed, not withheld: the tape's own File 0 comes
+            // back intact, and the disagreement rides alongside it.
+            assert!(id.text.contains("ID-VOL"), "{}", id.text);
+            let why = id
+                .contradiction
+                .expect("the contradiction must be reported");
+            assert!(why.contains("wrong cartridge"), "{why}");
         }
 
         /// `identify` is what an operator runs when they do NOT know what is
@@ -5520,8 +5564,12 @@ mod tests {
             let conn = crate::db::open_memory().unwrap();
             let data = b"x".repeat(16);
             let mut store = mem_store_v2_tape("NEVER-SEEN", &data, &data);
-            let text = volume_identify_corroborated(&conn, &mut store, Some("SER-ANY")).unwrap();
-            assert!(text.contains("NEVER-SEEN"), "{text}");
+            let id = volume_identify_corroborated(&conn, &mut store, Some("SER-ANY")).unwrap();
+            assert!(id.text.contains("NEVER-SEEN"), "{}", id.text);
+            assert!(
+                id.contradiction.is_none(),
+                "an absence is not a contradiction"
+            );
         }
 
         // ── the two device-bound contacts ──
@@ -5540,6 +5588,16 @@ mod tests {
                 // Function bodies end at the first `\n}` in column 0.
                 let end = SRC[start..].find("\n}\n").unwrap() + start;
                 let body = &SRC[start..end];
+                // Guard the FALSE PASS, which is the failure mode that would
+                // matter: if the `\n}\n` scan ever ran past the end of this
+                // function, `body` could pick up a sibling's corroboration
+                // call and report a deleted one as present. A second `pub fn`
+                // in the slice means the extraction, not the code, is wrong.
+                assert!(
+                    !body[f.len()..].contains("\npub fn "),
+                    "{f}: body extraction overran into another function; fix this test's \
+                     scan before trusting its verdict"
+                );
                 assert!(
                     body.contains("binding::corroborate_volume("),
                     "{f} no longer corroborates the loaded medium at contact (ADR-0012, \

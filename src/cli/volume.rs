@@ -5,7 +5,7 @@ use tabled::{Table, Tabled};
 
 use crate::cli::{read_device, write_device};
 use crate::config::{Config, TapectlPaths};
-use crate::error::Result;
+use crate::error::{Result, TapectlError};
 use crate::store::{TapeStore, Tier};
 use crate::volume::write;
 
@@ -520,7 +520,18 @@ pub fn run(
             // DB-less File 0 reader the heir path mirrors.
             let id =
                 write::volume_identify_corroborated(conn, &mut store, medium_serial.as_deref())?;
-            println!("{id}");
+            // The tape's own account FIRST, always — see `Identified`. A
+            // contradiction is reported after it and through the exit code,
+            // never by withholding the answer the operator asked for.
+            println!("{}", id.text);
+            if let Some(why) = id.contradiction {
+                eprintln!("\nwarning: this tape contradicts the catalog.\n{why}");
+                return Err(TapectlError::Other(
+                    "the loaded tape and the catalog disagree (above); the tape's own \
+                     identity is printed unchanged"
+                        .to_string(),
+                ));
+            }
         }
 
         VolumeCommands::Move { label, to } => {
