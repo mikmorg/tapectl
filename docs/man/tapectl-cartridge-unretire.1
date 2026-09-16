@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-cartridge-unretire 1  "tapectl-cartridge-unretire " 
+.SH NAME
+tapectl\-cartridge\-unretire \- Reverse a `cartridge retire` — the operator saying they were wrong about the *medium*, not that its bytes are gone
+.SH SYNOPSIS
+\fBtapectl cartridge unretire\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
+.SH DESCRIPTION
+Reverse a `cartridge retire` — the operator saying they were wrong about the *medium*, not that its bytes are gone
+.PP
+ADR\-0012\*(Aqs consequences bullet: restores the cartridge, and any volumes retired with it, to the status recorded in the `events` audit trail from that retirement (`cartridge retire` already logs `old_value` there — no schema change needed). If that history is gone (a catalog rebuilt from tape since), the cartridge falls back to `available` and any volumes are left untouched — an honest partial restore beats a guessed status, and the command says so.
+.PP
+Tier 1 under ADR\-0008: a correction of a claim, not a destructive act — no prompt, no `\-\-force`, no `\-\-yes`. Refuses when the cartridge is not `retired_permanent`, naming its actual status. `cartridge mark\-erased` is untouched by this command and remains the separate, irreversible statement that the bytes are gone (ADR\-0011, corrected 2026\-09\-14).
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip confirmation prompts
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, receipts, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIBARCODE\fR>
+Barcode

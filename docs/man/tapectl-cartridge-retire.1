@@ -8,7 +8,7 @@ tapectl\-cartridge\-retire \- Retire a cartridge permanently — it must never b
 .SH DESCRIPTION
 Retire a cartridge permanently — it must never be written again
 .PP
-ADR\-0011: for wear, read errors, or any judgement that the medium is no longer fit to hold data. This is NOT an erasure and NOT a location change: the bytes may still be readable, but nothing will ever write to this cartridge again, and `volume init` refuses to bind it. `cartridge mark\-erased` is the only way back.
+ADR\-0011: for wear, read errors, or any judgement that the medium is no longer fit to hold data. This is NOT an erasure and NOT a location change: the bytes may still be readable, but nothing will ever write to this cartridge again, and `volume init` refuses to bind it. `cartridge unretire` is the way back — the operator saying they were wrong about the medium; `cartridge mark\-erased` is a different statement, that the bytes are gone (ADR\-0011, corrected 2026\-09\-14).
 .PP
 ADR\-0008 Tier 2: the coverage impact is displayed first, and `\-\-force`/`\-\-yes` is required when a unit is left below its policy.
 .SH OPTIONS
