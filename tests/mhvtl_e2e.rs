@@ -1087,7 +1087,11 @@ fn mhvtl_verify_with_no_backend_says_health_not_collected() {
     }
     let _g = tape_lock();
     let label = "MHVTLNOBK";
-    let h = write_volume("verify-no-backend-health", label, &[("alice", "alice-u", 2)]);
+    let h = write_volume(
+        "verify-no-backend-health",
+        label,
+        &[("alice", "alice-u", 2)],
+    );
 
     let mut config_no_backend = h.config.clone();
     config_no_backend.backends.lto.clear();
@@ -1120,7 +1124,10 @@ fn mhvtl_verify_with_no_backend_says_health_not_collected() {
         .conn
         .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(after, before, "no backend means no health_logs row is added");
+    assert_eq!(
+        after, before,
+        "no backend means no health_logs row is added"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

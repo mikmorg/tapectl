@@ -927,9 +927,11 @@ pub fn volume_write(
     // volume's own recorded generation stand in. Before `bind_late` (issue
     // #154: a refused write must displace nothing) and before the session
     // directory / `build()`.
-    let medium_for_write_check = det
-        .generation
-        .or_else(|| volume_media_type.as_deref().and_then(crate::media::Generation::parse));
+    let medium_for_write_check = det.generation.or_else(|| {
+        volume_media_type
+            .as_deref()
+            .and_then(crate::media::Generation::parse)
+    });
     if let Some(m) = medium_for_write_check {
         crate::tape::media_detect::check_drive_can_write(backend, m)?;
     }
@@ -1233,9 +1235,11 @@ pub fn volume_resume(
     // free, before the store is opened. Must call `detect` itself (just
     // above) rather than reuse one from elsewhere — resume's `det` is
     // this contact's own reading of the tape, exactly like `volume_write`'s.
-    let medium_for_write_check = det
-        .generation
-        .or_else(|| volume_media_type.as_deref().and_then(crate::media::Generation::parse));
+    let medium_for_write_check = det.generation.or_else(|| {
+        volume_media_type
+            .as_deref()
+            .and_then(crate::media::Generation::parse)
+    });
     if let Some(m) = medium_for_write_check {
         crate::tape::media_detect::check_drive_can_write(backend, m)?;
     }
@@ -4729,7 +4733,10 @@ mod tests {
         let writes: i64 = conn
             .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(writes, 0, "no write session may exist after a refused write");
+        assert_eq!(
+            writes, 0,
+            "no write session may exist after a refused write"
+        );
         let bindings: i64 = conn
             .query_row("SELECT COUNT(*) FROM cartridge_volumes", [], |r| r.get(0))
             .unwrap();
@@ -4811,7 +4818,9 @@ mod tests {
         };
         let json = serde_json::to_vec_pretty(&layout).unwrap();
         std::fs::write(
-            session_dir.path().join(crate::volume::build::LAYOUT_SIDECAR),
+            session_dir
+                .path()
+                .join(crate::volume::build::LAYOUT_SIDECAR),
             json,
         )
         .unwrap();
