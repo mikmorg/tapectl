@@ -2627,32 +2627,45 @@ pub fn compact_write(
 pub struct CompactFinishReport {
     pub unit_name: String,
     pub unit_status: String,
-    /// ADR-0004-eligible copies this unit still has on some OTHER volume.
-    /// Zero is the Tier-2 trigger (issue #147).
+    /// ADR-0004-eligible copies this unit still has on some OTHER volume,
+    /// across ANY snapshot. Display only — it is deliberately NOT what
+    /// either consent tier reads (issue #147): see `RetireImpact::at_stake`
+    /// for why a per-unit count cannot answer a per-version question.
     pub other_copies: i64,
     pub evidence: Vec<crate::policy::evidence::CoverageEvidence>,
 }
 
 /// Compact-finish: retire the source volume after compaction.
 ///
-/// Two gates, in this order, and the order is the ADR-0008 tier order:
+/// **Three gates, in this order, and the order is the ADR-0008 tier
+/// order** (ADR-0012, issue #147 — this command shipped the tiers
+/// inverted, prompting at zero and letting `--force` through):
 ///
-/// 1. **Tier 3, absolute.** Any LIVE slice on this volume with no copy on
-///    another volume refuses outright. No flag defeats it — this is the
-///    zero-coverage case ADR-0008 says nothing may waive, and it runs
-///    first so that `--yes` can never reach it.
-/// 2. **Tier 2, overridable (issue #147).** If retiring the volume leaves
-///    any unit with ZERO ADR-0004-eligible copies elsewhere, the coverage
-///    facts are displayed and consent is required; `--force`/`--yes`
-///    overrides, and a non-interactive session with neither refuses rather
-///    than hanging. ADR-0008 names this command Tier 2, and until #147 it
-///    had only the Tier-3 refusal.
+/// 1. **Tier 3, absolute — unprotected live SLICES.** Any live slice on
+///    this volume with no copy on another volume refuses outright. No flag
+///    defeats it, and it runs first so that `--yes` can never reach it.
+/// 2. **Tier 3, absolute — the last eligible COPY of a live version**
+///    (`cli::operations::refuse_last_eligible_copy`, which takes no
+///    `force` parameter at all). A different fact from gate 1 and neither
+///    subsumes the other: gate 1 asks whether these BYTES exist on another
+///    cartridge, gate 2 asks whether the CATALOG will still credit a copy
+///    of that version afterwards. A slice can be safely duplicated while
+///    the volume carrying it is the last eligible copy of some other
+///    unit's version — and gate 1, which reads `write_positions`, sees
+///    nothing of a unit whose stage set has no position rows at all.
+/// 3. **Tier 2, overridable.** If the retirement leaves a live version
+///    below its RESOLVED policy but above zero
+///    (`cli::operations::below_policy_facts`), or leaves a unit the impact
+///    analysis reads as zero-copy without gate 2 having fired, the
+///    coverage facts are displayed and consent is required;
+///    `--force`/`--yes` overrides, and a non-interactive session with
+///    neither refuses rather than hanging.
 ///
-/// Gate 2 can fire where gate 1 does not: gate 1 asks about live SLICES
-/// (skipping reclaimable and purged snapshots), while coverage is a
-/// question about UNITS across every snapshot they ever had.
+/// Tier 1 (ADR-0004) is unchanged and never gates: evidence age for the
+/// units that DO retain coverage is shown at the moment consent is asked.
 pub fn compact_finish(
     conn: &Connection,
+    config: &crate::config::Config,
     label: &str,
     assume_yes: bool,
 ) -> Result<Vec<CompactFinishReport>> {
@@ -2708,7 +2721,19 @@ pub fn compact_finish(
     // `other_copies`; two coverage queries that can disagree is how this
     // codebase has been bitten before, so the copy is gone rather than
     // extended.
-    let report: Vec<CompactFinishReport> = crate::cli::operations::retire_impacts(conn, vol_id)?
+    let impacts = crate::cli::operations::retire_impacts(conn, vol_id)?;
+    let action = format!("retire volume \"{label}\" (compact-finish)");
+
+    // ADR-0008 TIER 3, gate 2 (ADR-0012, issue #147). Still before any
+    // consent, and still with no `force` in scope to defeat it -- including
+    // through the `compact` wrapper, which calls this as its step 3 with
+    // `*force || yes` and must not be able to buy past the floor with it.
+    crate::cli::operations::refuse_last_eligible_copy(&action, label, &impacts)?;
+
+    // ADR-0008 TIER 2 (issue #147).
+    let below_policy = crate::cli::operations::below_policy_facts(conn, config, &impacts)?;
+
+    let report: Vec<CompactFinishReport> = impacts
         .into_iter()
         .map(|impact| CompactFinishReport {
             unit_name: impact.unit_name,
@@ -2718,13 +2743,9 @@ pub fn compact_finish(
         })
         .collect();
 
-    // ADR-0008 Tier 2 (issue #147). Only the zero-copy case gates, exactly
-    // as `volume_retire` reads the tier: a retirement that leaves every
-    // affected unit with another copy is an ordinary operation.
     let at_risk: Vec<&CompactFinishReport> =
         report.iter().filter(|u| u.other_copies == 0).collect();
-    if !at_risk.is_empty() {
-        let action = format!("retire volume \"{label}\" (compact-finish)");
+    if !at_risk.is_empty() || !below_policy.is_empty() {
         let mut facts: Vec<String> = at_risk
             .iter()
             .map(|u| {
@@ -2734,6 +2755,7 @@ pub fn compact_finish(
                 )
             })
             .collect();
+        facts.extend(below_policy);
         // ADR-0004 Tier 1: evidence age for the units that DO retain
         // coverage, shown at the moment consent is asked and never gating.
         let now = chrono::Utc::now().naive_utc();
@@ -2887,11 +2909,14 @@ mod tests {
     use crate::store::{Evidence, Mismatch, MismatchKind};
     use sha2::{Digest, Sha256};
 
-    /// Issue #147: `compact-finish` is named Tier 2 by ADR-0008 and had
-    /// only the Tier-3 refusal. These prove the Tier-3 refusal still comes
-    /// FIRST and absolutely, that the new Tier-2 gate fires on zero
-    /// coverage, and that a non-interactive session refuses rather than
-    /// hangs. Every test passes `assume_yes` or asserts the non-TTY
+    /// Issue #147 / ADR-0012: `compact-finish` shipped ADR-0008's tiers
+    /// inverted — it prompted at zero coverage and let `--force` through,
+    /// and it did not gate below-policy coverage at all. These prove the
+    /// unprotected-SLICE refusal still comes first and absolutely, that the
+    /// last-eligible-COPY floor is a second absolute refusal no flag
+    /// reaches, that below-policy coverage now gates at Tier 2 where a flag
+    /// does waive it, and that a non-interactive session refuses rather
+    /// than hangs. Every test passes `assume_yes` or asserts the non-TTY
     /// refusal, so none can touch real stdin.
     mod compact_finish_consent {
         use super::*;
@@ -2977,11 +3002,13 @@ mod tests {
 
         /// The bug #147 names: a unit that ends with ZERO copies used to be
         /// retired silently, because the Tier-3 slice check skips
-        /// reclaimable snapshots and nothing else looked.
+        /// reclaimable snapshots and nothing else looked. Tier 2, not the
+        /// floor: every version in this fixture is RELEASED, so retiring
+        /// the volume removes nothing ADR-0008 protects.
         #[test]
         fn zero_remaining_copies_now_refuses_without_consent() {
             let conn = setup(false);
-            let err = compact_finish(&conn, "L6-SRC", false)
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
                 .expect_err("a unit dropping to zero copies must gate (ADR-0008 Tier 2)");
             assert!(err.to_string().contains("refused"), "got: {err}");
             assert_eq!(
@@ -2991,11 +3018,17 @@ mod tests {
             );
         }
 
-        /// Tier 2, not Tier 3: `--force`/`--yes` genuinely overrides.
+        /// Tier 2, and `--force`/`--yes` genuinely overrides it — because
+        /// this fixture's versions are RELEASED (`reclaimable`), which is
+        /// the operator having already given them up. Change that one word
+        /// to `current` and the same call is refused outright:
+        /// `tier3_refuses_the_last_eligible_copy_of_a_live_version` below
+        /// is exactly that test.
         #[test]
-        fn assume_yes_overrides_the_zero_copy_gate() {
+        fn assume_yes_overrides_the_gate_when_every_version_is_released() {
             let conn = setup(false);
-            compact_finish(&conn, "L6-SRC", true).expect("--yes must override a Tier-2 gate");
+            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect("--yes must override a Tier-2 gate");
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
 
@@ -3006,7 +3039,7 @@ mod tests {
         #[test]
         fn a_unit_that_keeps_a_copy_needs_no_consent_at_all() {
             let conn = setup(true);
-            compact_finish(&conn, "L6-SRC", false)
+            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
                 .expect("no at-risk unit means no gate, exactly as before #147");
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
@@ -3038,11 +3071,115 @@ mod tests {
             )
             .unwrap();
 
-            let err = compact_finish(&conn, "L6-SRC", true)
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
                 .expect_err("no flag may defeat the Tier-3 refusal (ADR-0008)");
             assert!(
                 err.to_string().contains("have no copy on another volume"),
                 "the Tier-3 refusal must be the one that fired; got: {err}"
+            );
+            assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
+        }
+
+        // ── The second Tier-3 floor (ADR-0012, issue #147) ──
+
+        /// The same fixture with the version LIVE rather than released.
+        /// Deliberately no `stage_slices`/`write_positions`, so gate 1 (the
+        /// unprotected-slice check, which reads `write_positions`) finds
+        /// nothing and the COPY floor is exercised in isolation. That
+        /// divergence is not hypothetical: a unit whose stage set has no
+        /// position rows is invisible to gate 1 entirely.
+        fn setup_live(with_other_copy: bool) -> Connection {
+            let conn = setup(with_other_copy);
+            conn.execute("UPDATE snapshots SET status = 'current'", [])
+                .unwrap();
+            conn
+        }
+
+        #[test]
+        fn tier3_refuses_the_last_eligible_copy_of_a_live_version() {
+            let conn = setup_live(false);
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
+                .expect_err("the last eligible copy of a live version must be refused");
+            assert!(err.to_string().contains("LAST eligible copy"), "got: {err}");
+            assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
+        }
+
+        /// The trap issue #147 names explicitly: the `compact` wrapper
+        /// calls this as step 3 with `*force || yes`, so the floor has to
+        /// be undefeatable by that argument and not merely un-prompted.
+        #[test]
+        fn tier3_is_not_defeated_by_assume_yes() {
+            let conn = setup_live(false);
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect_err("no flag may defeat ADR-0008 Tier 3");
+            let msg = err.to_string();
+            assert!(msg.contains("no --force for this"), "got: {msg}");
+            assert!(
+                !msg.contains("refused: non-interactive session")
+                    && !msg.contains("aborted, not confirmed"),
+                "the floor's text must not look like a consent refusal, or the \
+                 `compact` wrapper will offer --force as the way out: {msg}"
+            );
+            assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
+        }
+
+        /// ADR-0008 Tier 2, the limb that did not exist: one copy left
+        /// against the shipped `min_copies = 2` is below policy and above
+        /// zero, so it gates — and a flag waives it.
+        #[test]
+        fn tier2_gates_a_below_policy_version_and_a_flag_waives_it() {
+            let conn = setup_live(true);
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
+                .expect_err("one copy against min_copies = 2 must gate");
+            assert!(err.to_string().contains("refused"), "got: {err}");
+            assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
+
+            let conn = setup_live(true);
+            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect("--yes waives Tier 2, which is the whole distinction");
+            assert_eq!(status_of(&conn, "L6-SRC"), "retired");
+        }
+
+        /// No gate at all when the surviving coverage meets policy: the
+        /// ordinary compaction must not become a ceremony.
+        #[test]
+        fn no_gate_at_all_when_every_version_stays_at_or_above_policy() {
+            let conn = setup_live(true);
+            let mut config = crate::config::Config::default();
+            config.defaults.min_copies_for_tape_only = 1;
+            compact_finish(&conn, &config, "L6-SRC", false)
+                .expect("one surviving copy meets a min_copies of 1");
+            assert_eq!(status_of(&conn, "L6-SRC"), "retired");
+        }
+
+        /// Trap named in issue #147: the unprotected-live-slices refusal is
+        /// a DIFFERENT fact and must survive intact. Here the slice has no
+        /// copy anywhere AND the unit has another eligible volume, so only
+        /// gate 1 can be what fires.
+        #[test]
+        fn the_unprotected_slice_refusal_is_still_absolute_and_still_first() {
+            let conn = setup_live(true);
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           sha256_plain, encrypted_bytes, sha256_encrypted)
+                 VALUES (1, 0, 1024, 'cafe', 1024, 'deadbeef')",
+                [],
+            )
+            .unwrap();
+            let slice_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO write_positions (write_id, stage_slice_id, position,
+                                              sha256_on_volume, status)
+                 VALUES (1, ?1, '5', 'deadbeef', 'written')",
+                params![slice_id],
+            )
+            .unwrap();
+
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect_err("an unprotected live slice is its own absolute refusal");
+            assert!(
+                err.to_string().contains("have no copy on another volume"),
+                "gate 1 must still fire, and still first: {err}"
             );
             assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
         }

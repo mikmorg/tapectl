@@ -154,6 +154,7 @@ fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
 
 pub fn run(
     conn: &Connection,
+    config: &crate::config::Config,
     command: &CartridgeCommands,
     json_output: bool,
     yes: bool,
@@ -366,6 +367,7 @@ pub fn run(
         } => {
             crate::cli::operations::cartridge_retire(
                 conn,
+                config,
                 barcode,
                 reason.as_deref(),
                 *force,
@@ -720,6 +722,7 @@ mod tests {
     ) -> Result<()> {
         run(
             conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Register {
                 barcode: barcode.to_string(),
                 media_type: media_type.to_string(),
@@ -846,6 +849,7 @@ mod tests {
     fn relabel(conn: &Connection, barcode: &str, new_barcode: &str, dry_run: bool) -> Result<()> {
         run(
             conn,
+            &crate::config::Config::default(),
             &CartridgeCommands::Relabel {
                 barcode: barcode.to_string(),
                 new_barcode: new_barcode.to_string(),

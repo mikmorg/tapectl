@@ -572,7 +572,7 @@ pub fn run(
         }
 
         VolumeCommands::Retire { label } => {
-            crate::cli::operations::volume_retire(conn, label, yes, dry_run, json_output)?;
+            crate::cli::operations::volume_retire(conn, config, label, yes, dry_run, json_output)?;
         }
 
         VolumeCommands::ReadSlices { from, unit, device } => {
@@ -727,7 +727,7 @@ pub fn run(
         }
 
         VolumeCommands::CompactFinish { label, force } => {
-            let report = write::compact_finish(conn, label, *force || yes)?;
+            let report = write::compact_finish(conn, config, label, *force || yes)?;
             if json_output {
                 println!(
                     "{}",
@@ -799,25 +799,29 @@ pub fn run(
             // and invert the gate's meaning. Only after step 2 does the
             // at-risk set narrow to units whose content was not carried
             // forward — exactly the issue #147 case that should gate.
-            let report = write::compact_finish(conn, label, *force || yes).inspect_err(|e| {
-                // ONLY the consent refusal. `compact_finish`'s other
-                // failure is the Tier-3 refusal, and after a successful
-                // compact-write that means a live slice was not carried
-                // forward — a bug, not a `--force` situation. Naming
-                // `--force` as the recovery for it is precisely the
-                // confusion ADR-0008 warns about.
-                let msg = e.to_string();
-                if msg.contains("refused: non-interactive session")
-                    || msg.contains("aborted, not confirmed")
-                {
-                    eprintln!(
-                        "\nNothing was lost: destination \"{dest_label}\" is written and \
+            let report =
+                write::compact_finish(conn, config, label, *force || yes).inspect_err(|e| {
+                    // ONLY the consent refusal. `compact_finish`'s other two
+                    // failures are its Tier-3 refusals (an unprotected live
+                    // slice; the last eligible copy of a live version), and
+                    // after a successful compact-write either means content was
+                    // not carried forward — a bug, not a `--force` situation.
+                    // Neither refusal's text contains these substrings, so
+                    // neither can reach this hint; naming `--force` as the
+                    // recovery for an absolute floor is precisely the confusion
+                    // ADR-0008 warns about.
+                    let msg = e.to_string();
+                    if msg.contains("refused: non-interactive session")
+                        || msg.contains("aborted, not confirmed")
+                    {
+                        eprintln!(
+                            "\nNothing was lost: destination \"{dest_label}\" is written and \
                          sealed, and source \"{label}\" is simply not retired yet.\n\
                          To complete step 3 without re-reading or re-writing anything:\n    \
                          tapectl volume compact-finish {label} --force"
-                    );
-                }
-            })?;
+                        );
+                    }
+                })?;
             println!("  Volume \"{label}\" retired");
             if !json_output {
                 print_compact_finish_evidence(&report);

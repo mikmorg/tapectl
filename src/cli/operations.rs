@@ -176,16 +176,32 @@ pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: boo
 
 /// Retire a volume with impact analysis.
 ///
-/// ADR-0008 Tier 2: if any unit would drop to ZERO remaining copies, the
-/// retirement needs consent before it proceeds (`--yes` overrides; a
-/// non-interactive session with no `--yes` refuses rather than assuming
-/// consent — see `cli::consent`). `--dry-run` reports the same impact
-/// analysis and changes nothing. A refusal is reported through the normal
-/// return channel (`Err`) *and*, when `--json` was requested, as a JSON
-/// object on stdout — a JSON consumer must be able to see why, not just
-/// observe a non-zero exit.
+/// **Two gates, in ADR-0008's tier order** (ADR-0012, issue #147 — this
+/// command shipped them inverted, prompting only at zero and letting
+/// `--force` through):
+///
+/// 1. **Tier 3, absolute.** If retiring this volume takes any live version
+///    to zero copies, [`refuse_last_eligible_copy`] refuses. It takes no
+///    `force` parameter, so neither `--yes` nor anything else can reach
+///    past it, and it runs first so no prompt can arrive before it.
+/// 2. **Tier 2, overridable.** If the retirement leaves a live version
+///    below its RESOLVED policy but above zero
+///    ([`below_policy_facts`]), the facts are displayed and consent is
+///    required; `--yes` overrides, and a non-interactive session with no
+///    `--yes` refuses rather than assuming consent (see `cli::consent`).
+///
+/// Tier 1 (ADR-0004) is unchanged and never gates: evidence age is
+/// displayed for every impacted unit that retains coverage, both in the
+/// impact analysis and at the moment consent is asked.
+///
+/// `--dry-run` reports the same impact analysis — naming any version the
+/// Tier-3 floor would refuse on — and changes nothing. A refusal is
+/// reported through the normal return channel (`Err`) *and*, when `--json`
+/// was requested, as a JSON object on stdout — a JSON consumer must be
+/// able to see why, not just observe a non-zero exit.
 pub fn volume_retire(
     conn: &Connection,
+    config: &Config,
     label: &str,
     assume_yes: bool,
     dry_run: bool,
@@ -225,18 +241,42 @@ pub fn volume_retire(
         return Ok(());
     }
 
-    // ADR-0008 Tier 2: only the zero-copy case needs consent -- a
-    // retirement that leaves every affected unit with at least one other
-    // copy is a normal, non-risky operation and proceeds unconditionally,
-    // same as before this change.
-    if !at_risk.is_empty() {
-        let action = format!("retire volume \"{label}\"");
+    let action = format!("retire volume \"{label}\"");
+
+    // ADR-0008 TIER 3, the absolute floor (ADR-0012, issue #147). First,
+    // and structurally undefeatable -- `refuse_last_eligible_copy` takes no
+    // `force`, so `assume_yes` is not even in scope for this decision.
+    if let Err(e) = refuse_last_eligible_copy(&action, label, &impacts) {
+        let reason = e.to_string();
+        if json_output {
+            println!(
+                "{}",
+                retire_refusal_json(label, &impacts, &at_risk, &reason)
+            );
+        } else {
+            print_retire_impact(label, &status, &impacts, &at_risk);
+            println!("\n  REFUSED: {reason}");
+        }
+        return Err(e);
+    }
+
+    // ADR-0008 TIER 2: degraded but non-zero. Two populations reach it --
+    // a version left below its resolved policy (issue #147's own case,
+    // which had no gate at all), and a unit the impact analysis reads as
+    // zero-copy WITHOUT the Tier-3 floor having fired. The second is not a
+    // contradiction: the floor is defined by what the act REMOVES, so a
+    // unit whose only claim is on this very volume while it sits
+    // quarantined, or on a version already released, was at zero before
+    // this command ran and stays there. Worth showing; not worth refusing.
+    let below_policy = below_policy_facts(conn, config, &impacts)?;
+    if !at_risk.is_empty() || !below_policy.is_empty() {
         let mut facts: Vec<String> = at_risk
             .iter()
             .map(|name| {
                 format!("unit \"{name}\" would have ZERO copies remaining after this retirement")
             })
             .collect();
+        facts.extend(below_policy);
         // ADR-0004 Tier 1: also show evidence age for any OTHER impacted
         // unit that still retains coverage, so the prompt carries the full
         // picture, not just the zero-copy units (issue #91). Tier 1 is
@@ -400,11 +440,31 @@ pub(crate) fn free_cartridge_if_last_live(
 /// ADR-0004-eligible copy count after the volume being retired is
 /// excluded, and (issue #91) the per-volume evidence backing that
 /// remaining coverage.
+#[derive(Clone)]
 pub(crate) struct RetireImpact {
     pub(crate) unit_name: String,
     pub(crate) unit_status: String,
     pub(crate) other_copies: i64,
     pub(crate) evidence: Vec<crate::policy::evidence::CoverageEvidence>,
+    /// The CURRENT versions of this unit whose coverage the retirement
+    /// actually CONSUMES, and what each would have left (ADR-0012, issue
+    /// #147) — `policy::coverage::versions_at_stake`, the one derivation
+    /// both consent tiers read.
+    ///
+    /// Deliberately NOT the same question as `other_copies`, which stays
+    /// what it always was: a per-UNIT count across ANY snapshot the volume
+    /// participates in, for DISPLAY and `--json`. The tiers cannot be read
+    /// off that number. A unit can show two remaining copies there and
+    /// still be losing the last copy of v2 (issue #153: a newer version is
+    /// not a copy of an older one), and a unit can show zero there while
+    /// the retirement removes nothing at all — the volume was quarantined,
+    /// or every version on it was released. Both readings are wrong in a
+    /// direction that matters, so the gates read these rows instead.
+    ///
+    /// EMPTY is the ordinary case for a volume that counts for nothing:
+    /// quarantined, unsealed, already retired, or holding only released
+    /// versions. Nothing gates on it then, which is the point.
+    pub(crate) at_stake: Vec<crate::policy::coverage::VersionAtStake>,
 }
 
 /// The impact analysis behind `volume_retire`: one [`RetireImpact`] per
@@ -454,14 +514,193 @@ pub(crate) fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<Retir
     for (unit_id, unit_name, unit_status, other_copies) in rows {
         let evidence =
             crate::policy::evidence::remaining_coverage_evidence(conn, unit_id, Some(vol_id))?;
+        // Issue #147: the per-version rows both ADR-0008 tiers read. Derived
+        // HERE rather than at each gate, so `volume retire`, `cartridge
+        // retire` and `volume compact-finish` cannot come to different
+        // conclusions about the same retirement -- the whole reason this
+        // function is shared in the first place.
+        let at_stake = crate::policy::coverage::versions_at_stake(conn, unit_id, vol_id)?;
         impacts.push(RetireImpact {
             unit_name,
             unit_status,
             other_copies,
             evidence,
+            at_stake,
         });
     }
     Ok(impacts)
+}
+
+/// **ADR-0008 Tier 3, the retire family's absolute floor.** Refuse when
+/// retiring `volume_label` would take any live version to zero copies
+/// (ADR-0012, issue #147).
+///
+/// **This takes no `force` parameter, structurally**, and that is the
+/// design, not an omission. It joins the family `src/volume/binding.rs`
+/// documents — `refuse_retired`, `require_named_cartridge`,
+/// `refuse_unwitnessed_displacement`, `corroborate_contact` — plus
+/// `session.rs`'s `check_tape_contact`/`AlreadySealed`: a caller cannot
+/// defeat any of them even by mistake, because there is no argument to
+/// pass. ADR-0008 says Tier 3 conditions "must NEVER call
+/// [`crate::cli::consent::confirm`]" (see that module's header); routing
+/// this one through consent would itself be the bug, since `--yes` would
+/// then waive a guard ADR-0008 says nothing may waive.
+///
+/// The three callers are `volume retire`, `cartridge retire` and
+/// `volume compact-finish` — the three commands ADR-0012 names as having
+/// shipped the tiers inverted. Each calls this BEFORE reaching any
+/// Tier-2 prompt, so no ordering can let consent arrive first.
+///
+/// `act` names what the operator asked for, in the imperative
+/// (`retire volume "L6-0007"`), and `volume_label` is the volume whose
+/// coverage is at stake — for a cartridge those differ, and the recovery
+/// commands must name the VOLUME.
+///
+/// Returns `Ok(())` when nothing is at stake, which is the ordinary case:
+/// `impacts` carries no `at_stake` rows at all for a quarantined,
+/// unsealed or already-retired volume, nor for one holding only released
+/// versions.
+pub(crate) fn refuse_last_eligible_copy(
+    act: &str,
+    volume_label: &str,
+    impacts: &[RetireImpact],
+) -> Result<()> {
+    let mut doomed: Vec<(&str, i64)> = Vec::new();
+    for impact in impacts {
+        for version in &impact.at_stake {
+            if version.copies_after == 0 {
+                doomed.push((impact.unit_name.as_str(), version.version));
+            }
+        }
+    }
+    if doomed.is_empty() {
+        return Ok(());
+    }
+
+    let named = doomed
+        .iter()
+        .map(|(unit, version)| format!("unit \"{unit}\" v{version}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (count, is_are) = if doomed.len() == 1 {
+        ("1 live version".to_string(), "it")
+    } else {
+        (format!("{} live versions", doomed.len()), "them")
+    };
+
+    // One recovery line per DISTINCT unit, and one release line per
+    // (unit, version): the operator has to act on each separately, and a
+    // single example would leave them guessing at the rest.
+    let mut units: Vec<&str> = doomed.iter().map(|(unit, _)| *unit).collect();
+    units.dedup();
+    let copy_out = units
+        .iter()
+        .map(|unit| format!("    tapectl volume read-slices --from {volume_label} --unit {unit}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let release = doomed
+        .iter()
+        .map(|(unit, version)| {
+            format!("    tapectl snapshot mark-reclaimable {unit} --version {version}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Err(TapectlError::Other(format!(
+        "cannot {act}: volume \"{volume_label}\" holds the LAST eligible copy of {count} \
+         — {named}.\n\
+         \n\
+         Retiring it takes {is_are} to zero copies. Nothing else sealed, unquarantined and \
+         unretired carries {is_are}, and no recorded warehouse deposit stands in either. \
+         That is not a thinner safety margin to accept — it is the data ceasing to exist, \
+         and ADR-0008 puts it in Tier 3. There is no --force for this, and --yes does not \
+         reach it.\n\
+         \n\
+         Make another copy first, then re-run this:\n\
+         {copy_out}\n    \
+         tapectl volume write <OTHER-LABEL>\n\
+         or re-stage the unit from a source that still exists (`tapectl snapshot create` \
+         then `tapectl stage create`).\n\
+         \n\
+         Or give the version up on purpose — a different statement, with its own command \
+         and its own preconditions:\n\
+         {release}\n\
+         \n\
+         If you are retiring this tape BECAUSE it no longer reads, say that with the drive \
+         rather than with the catalog: `tapectl volume verify {volume_label}` quarantines \
+         the volume when it fails, a quarantined volume counts for nothing, and retiring it \
+         is then Tier 2 at most. A catalog saying \"one copy, unverified\" is telling the \
+         truth; \"no copy\" for data nobody has tried to read is not."
+    )))
+}
+
+/// **ADR-0008 Tier 2, the gate the retire family never had** (issue #147):
+/// the retirement leaves a live version below its RESOLVED policy, but
+/// above zero.
+///
+/// Returns one already-formatted fact line per shortfall, for
+/// [`crate::cli::consent::confirm`] to display at the moment consent is
+/// asked (ADR-0004: the one place the operator is guaranteed to read
+/// them). An empty result means every version the act touches stays at or
+/// above policy — no prompt, no flag, exactly as before.
+///
+/// Zero cannot appear here: zero-after-removal is
+/// [`refuse_last_eligible_copy`]'s absolute floor, and every caller runs
+/// that first. So "degraded but non-zero", ADR-0008's own words for Tier 2,
+/// is a property of the ordering rather than a filter written here.
+///
+/// **Policy comes from the 3-level resolver** (`policy::resolve`: dotfile >
+/// archive_set > defaults), never from `config.defaults` directly — a unit
+/// that carries its own `min_copies` must be gated on ITS number, not on
+/// the fleet default. The location floor is `required_locations.len()`,
+/// which is the resolver's expression of that requirement and exactly what
+/// `audit`'s `location_presence` check compares against; an empty list
+/// means no location requirement was configured, and silence is then
+/// correct rather than a gate on a number nobody set.
+///
+/// An unresolvable policy PROPAGATES (issue #105's rule, applied at a
+/// destructive moment): tapectl cannot say whether the retirement is within
+/// policy, and quietly falling back to the weaker defaults would gate — or
+/// fail to gate — against a policy the operator never chose.
+pub(crate) fn below_policy_facts(
+    conn: &Connection,
+    config: &Config,
+    impacts: &[RetireImpact],
+) -> Result<Vec<String>> {
+    let mut facts = Vec::new();
+    for impact in impacts {
+        // Nothing at stake, or every touched version is Tier 3's business
+        // already: no policy to resolve and nothing to say.
+        if impact.at_stake.iter().all(|v| v.copies_after == 0) {
+            continue;
+        }
+        let unit = queries::get_unit_by_name(conn, &impact.unit_name)?
+            .ok_or_else(|| TapectlError::UnitNotFound(impact.unit_name.clone()))?;
+        let policy = crate::policy::resolve(conn, config, &unit)?;
+        let needed_locations = policy.required_locations.len() as i64;
+        for version in &impact.at_stake {
+            if version.copies_after == 0 {
+                continue;
+            }
+            if version.copies_after < policy.min_copies {
+                facts.push(format!(
+                    "unit \"{}\" v{} would be left with {} copy/copies, below its policy of {}",
+                    impact.unit_name, version.version, version.copies_after, policy.min_copies
+                ));
+            }
+            if needed_locations > 0 && version.locations_after < needed_locations {
+                facts.push(format!(
+                    "unit \"{}\" v{} would be left in {} location(s), below its policy of {} ({:?})",
+                    impact.unit_name,
+                    version.version,
+                    version.locations_after,
+                    needed_locations,
+                    policy.required_locations
+                ));
+            }
+        }
+    }
+    Ok(facts)
 }
 
 /// The `--json` shape for ONE piece of remaining-coverage evidence,
@@ -495,10 +734,24 @@ fn retire_impacts_json(impacts: &[RetireImpact]) -> Vec<serde_json::Value> {
             let now = chrono::Utc::now().naive_utc();
             let evidence_summary =
                 crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now);
+            // `last_copy_versions` is ADDITIVE (issue #147) and is the ONLY
+            // field that answers the Tier-3 question. `remaining_copies`
+            // keeps its meaning exactly -- a per-unit count across any
+            // snapshot -- and deliberately cannot be read as the tier: a
+            // unit can show 2 there and still be losing the last copy of
+            // v2 (issue #153), and show 0 there while this retirement
+            // removes nothing at all.
+            let last_copy_versions: Vec<i64> = impact
+                .at_stake
+                .iter()
+                .filter(|v| v.copies_after == 0)
+                .map(|v| v.version)
+                .collect();
             serde_json::json!({
                 "unit": impact.unit_name,
                 "status": impact.unit_status,
                 "remaining_copies": impact.other_copies,
+                "last_copy_versions": last_copy_versions,
                 "evidence": evidence,
                 "evidence_summary": evidence_summary,
             })
@@ -542,6 +795,17 @@ fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_r
             "    {} [{}]: {} other copy/copies{warning}",
             impact.unit_name, impact.unit_status, impact.other_copies
         );
+        // ADR-0008 Tier 3 (issue #147): name the versions this volume is
+        // the LAST eligible copy of. In `--dry-run` this is the whole
+        // point -- a dry run that stayed silent about an absolute refusal
+        // the real run is about to hit would be worse than no dry run.
+        for version in impact.at_stake.iter().filter(|v| v.copies_after == 0) {
+            println!(
+                "      *** v{} — this volume is its LAST eligible copy; retirement is \
+                 REFUSED (ADR-0008 Tier 3) ***",
+                version.version
+            );
+        }
         // ADR-0004 Tier 1: display evidence age wherever a destructive
         // operation consumes copy coverage -- never gate, never a flag.
         // Zero-copy units have no evidence to describe (they keep only the
@@ -584,13 +848,30 @@ fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_r
 /// physically on the cartridge; it is `cartridge mark-erased` that closes
 /// them, because that is when the bytes actually go.
 ///
-/// ADR-0008 Tier 2, not Tier 3: the data may still be readable (ADR-0011 is
-/// explicit that retirement is "not an erasure"), so `--force`/`--yes`
-/// overrides, and a non-interactive session with neither refuses rather
-/// than hanging. `cartridge mark-erased` is the only way back out of
+/// **Both ADR-0008 tiers, in order** (ADR-0012, issue #147 — this command
+/// shipped them inverted too).
+///
+/// The old reading was that retirement is Tier 2 throughout, because
+/// ADR-0011 is explicit that retiring a cartridge is "not an erasure" and
+/// the data may still be readable. ADR-0012 overruled it: what the tier
+/// turns on is not whether the plastic still holds bits, it is whether the
+/// CATALOG will still credit a copy afterwards — and this command's own
+/// justification is that it "removes a physical copy from every coverage
+/// count that policy computes". A cartridge carrying the last eligible copy
+/// of a live version therefore hits the absolute floor
+/// ([`refuse_last_eligible_copy`]) before any consent is asked, and no flag
+/// reaches past it.
+///
+/// Everything short of that stays Tier 2, and consent is still asked EVERY
+/// time — retiring a medium permanently is a declaration worth confirming
+/// even when no unit loses coverage by it. `--force`/`--yes` overrides; a
+/// non-interactive session with neither refuses rather than hanging.
+/// `cartridge mark-erased` is the only way back out of
 /// `retired_permanent` — the operator saying they were wrong.
+#[allow(clippy::too_many_arguments)]
 pub fn cartridge_retire(
     conn: &Connection,
+    config: &Config,
     barcode: &str,
     reason: Option<&str>,
     force: bool,
@@ -642,8 +923,15 @@ pub fn cartridge_retire(
     // unit (the lowest remaining copy count) so it can never under-report
     // risk at the moment consent is asked.
     let mut merged: Vec<RetireImpact> = Vec::new();
-    for (vol_id, _, _) in &mounted {
-        for impact in retire_impacts(conn, *vol_id)? {
+    // Kept per-VOLUME as well as merged: the Tier-3 refusal's recovery
+    // commands name a volume (`volume read-slices --from <LABEL>`), so the
+    // merge — which deliberately keeps only the worst reading per unit —
+    // is the wrong shape to refuse from.
+    let mut per_volume: Vec<(String, Vec<RetireImpact>)> = Vec::new();
+    for (vol_id, vol_label, _) in &mounted {
+        let impacts = retire_impacts(conn, *vol_id)?;
+        per_volume.push((vol_label.clone(), impacts.clone()));
+        for impact in impacts {
             match merged.iter_mut().find(|m| m.unit_name == impact.unit_name) {
                 Some(existing) if impact.other_copies < existing.other_copies => {
                     *existing = impact;
@@ -681,15 +969,44 @@ pub fn cartridge_retire(
         return Ok(());
     }
 
-    // ADR-0008: consent is asked EVERY time, because retiring a cartridge is
-    // an irreversible-by-design declaration about a physical medium even
-    // when no unit loses coverage by it. What varies is the facts shown —
-    // and, per ADR-0004, the facts are shown at exactly this moment.
     let action = format!("retire cartridge \"{barcode}\" permanently");
+
+    // ADR-0008 TIER 3, the absolute floor (ADR-0012, issue #147). Before
+    // consent, and with no `force` in scope to defeat it. Per volume, so
+    // the refusal can name the one whose slices have to be copied off.
+    for (vol_label, impacts) in &per_volume {
+        if let Err(e) = refuse_last_eligible_copy(&action, vol_label, impacts) {
+            let reason_text = e.to_string();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "barcode": barcode,
+                        "status": status,
+                        "affected_units": retire_impacts_json(&merged),
+                        "at_risk_units": at_risk,
+                        "consent": "refused",
+                        "reason": reason_text,
+                    })
+                );
+            } else {
+                print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
+                println!("\n  REFUSED: {reason_text}");
+            }
+            return Err(e);
+        }
+    }
+
+    // ADR-0008 TIER 2: consent is asked EVERY time, because retiring a
+    // cartridge is an irreversible-by-design declaration about a physical
+    // medium even when no unit loses coverage by it. What varies is the
+    // facts shown — and, per ADR-0004, the facts are shown at exactly this
+    // moment.
     let mut facts: Vec<String> = at_risk
         .iter()
         .map(|name| format!("unit \"{name}\" would have ZERO copies remaining after this"))
         .collect();
+    facts.extend(below_policy_facts(conn, config, &merged)?);
     let now = chrono::Utc::now().naive_utc();
     for impact in &merged {
         if impact.other_copies != 0 {
@@ -2747,7 +3064,8 @@ mod tests {
         #[test]
         fn dry_run_mutates_nothing_even_when_a_unit_is_at_risk() {
             let (conn, vol_id) = setup_volume_with_one_unit("L6-DRYRUN", false);
-            volume_retire(&conn, "L6-DRYRUN", false, true, false).expect("dry-run must succeed");
+            volume_retire(&conn, &Config::default(), "L6-DRYRUN", false, true, false)
+                .expect("dry-run must succeed");
 
             assert_eq!(
                 volume_status(&conn, vol_id),
@@ -2764,23 +3082,33 @@ mod tests {
             assert_eq!(event_count, 0, "dry-run must not write an audit event");
         }
 
+        /// `--yes` waives TIER 2, and this fixture is a Tier-2 case for a
+        /// reason worth stating (issue #147): the volume being retired is
+        /// `active`, i.e. never sealed, so under ADR-0012 it counts for
+        /// nothing and retiring it REMOVES nothing. The unit reads
+        /// zero-copy before the command runs and zero-copy after it — a
+        /// state worth showing the operator, not one to refuse. The
+        /// sibling `tier3_*` tests below cover the case where the volume
+        /// IS a copy, and there `--yes` gets nowhere.
         #[test]
-        fn assume_yes_proceeds_even_when_a_unit_is_at_risk() {
+        fn assume_yes_proceeds_when_the_retirement_removes_nothing() {
             // Safe: assume_yes=true short-circuits confirm() before any
             // stdin interaction, regardless of the test process's TTY-ness.
             let (conn, vol_id) = setup_volume_with_one_unit("L6-FORCED", false);
-            volume_retire(&conn, "L6-FORCED", true, false, false)
+            volume_retire(&conn, &Config::default(), "L6-FORCED", true, false, false)
                 .expect("--yes must override the zero-copy consent gate");
             assert_eq!(volume_status(&conn, vol_id), "retired");
         }
 
+        /// An `active` (never-sealed) volume with the unit also covered
+        /// elsewhere: nothing at stake, nothing below policy, no gate.
         #[test]
         fn proceeds_without_any_consent_gate_when_no_unit_is_at_risk() {
             // Safe with assume_yes=false: with_other_copy=true means no
             // unit drops to zero copies, so `confirm()` (and therefore any
             // stdin interaction) is never reached at all.
             let (conn, vol_id) = setup_volume_with_one_unit("L6-SAFE", true);
-            volume_retire(&conn, "L6-SAFE", false, false, false)
+            volume_retire(&conn, &Config::default(), "L6-SAFE", false, false, false)
                 .expect("no at-risk units must retire without any consent gate");
             assert_eq!(volume_status(&conn, vol_id), "retired");
         }
@@ -2862,6 +3190,7 @@ mod tests {
                 unit_status: "active".to_string(),
                 other_copies: 0,
                 evidence: vec![],
+                at_stake: vec![],
             }];
             let at_risk = vec!["unitA".to_string()];
             let reason = "retire volume \"L6-0001\" refused: non-interactive session with no \
@@ -2875,6 +3204,317 @@ mod tests {
             assert_eq!(json["at_risk_units"][0], "unitA");
             assert_eq!(json["affected_units"][0]["unit"], "unitA");
             assert_eq!(json["affected_units"][0]["remaining_copies"], 0);
+        }
+
+        // ── ADR-0008 Tier 3 / Tier 2, restored (ADR-0012, issue #147) ──
+        //
+        // Before this, `volume retire` gated ONLY at zero and at Tier 2, so
+        // `--yes` retired the last copy of live data and a retirement that
+        // left a unit one copy short of its policy was not gated at all.
+
+        fn seal(conn: &Connection, label: &str) {
+            conn.execute(
+                "UPDATE volumes SET status = 'sealed' WHERE label = ?1",
+                params![label],
+            )
+            .unwrap();
+        }
+
+        /// `setup_volume_with_one_unit` with the retiring volume SEALED —
+        /// the only shape in which retiring it removes anything (ADR-0012)
+        /// — plus `copies_elsewhere` further sealed volumes carrying the
+        /// same v1 of `unitA`.
+        fn setup_sealed(label: &str, copies_elsewhere: usize) -> (Connection, i64) {
+            let (conn, vol_id) = setup_volume_with_one_unit(label, false);
+            seal(&conn, label);
+            let (ss_id, snap_id): (i64, i64) = conn
+                .query_row("SELECT id, snapshot_id FROM stage_sets LIMIT 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            for n in 0..copies_elsewhere {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                              capacity_bytes, status)
+                         VALUES ('COPY-{n}', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+                    ),
+                    [],
+                )
+                .unwrap();
+                let other = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss_id, snap_id, other],
+                )
+                .unwrap();
+            }
+            (conn, vol_id)
+        }
+
+        fn config_with_min_copies(n: i32) -> Config {
+            let mut config = Config::default();
+            config.defaults.min_copies_for_tape_only = n;
+            config
+        }
+
+        /// THE headline of issue #147: the last eligible copy of a current
+        /// version is refused, full stop.
+        #[test]
+        fn tier3_refuses_the_last_eligible_copy_of_a_current_version() {
+            let (conn, vol_id) = setup_sealed("L6-LAST", 0);
+            let err = volume_retire(&conn, &Config::default(), "L6-LAST", false, false, false)
+                .expect_err("the last eligible copy of a live version must be refused");
+            assert!(
+                err.to_string().contains("LAST eligible copy"),
+                "the Tier-3 floor must be what fired, not a consent prompt: {err}"
+            );
+            assert_eq!(volume_status(&conn, vol_id), "sealed");
+        }
+
+        /// Tier 3 is ABSOLUTE: `--yes` is not a way past it. This is the
+        /// exact inversion ADR-0012 names — the command used to prompt here
+        /// and let the flag through.
+        #[test]
+        fn tier3_is_not_defeated_by_assume_yes() {
+            let (conn, vol_id) = setup_sealed("L6-LAST-YES", 0);
+            let err = volume_retire(&conn, &Config::default(), "L6-LAST-YES", true, false, false)
+                .expect_err("no flag may defeat ADR-0008 Tier 3");
+            assert!(err.to_string().contains("LAST eligible copy"), "got: {err}");
+            assert!(
+                err.to_string().contains("no --force for this"),
+                "the refusal must say plainly that no flag reaches it: {err}"
+            );
+            assert_eq!(volume_status(&conn, vol_id), "sealed");
+        }
+
+        /// A zero `min_copies` must not buy past the floor either: Tier 3
+        /// is not a threshold comparison, it is a fact about what the act
+        /// removes.
+        #[test]
+        fn tier3_is_not_defeated_by_a_zero_min_copies_policy() {
+            let (conn, _) = setup_sealed("L6-LAST-ZERO", 0);
+            let err = volume_retire(
+                &conn,
+                &config_with_min_copies(0),
+                "L6-LAST-ZERO",
+                true,
+                false,
+                false,
+            )
+            .expect_err("Tier 3 is not a policy threshold");
+            assert!(err.to_string().contains("LAST eligible copy"), "got: {err}");
+        }
+
+        /// ADR-0012's per-version rule (issue #153): v1 elsewhere, v2 only
+        /// here. A per-UNIT copy count reads this unit as covered; the
+        /// floor must still fire, and name v2.
+        #[test]
+        fn tier3_fires_per_version_when_only_the_newest_is_here() {
+            let (conn, _) = setup_sealed("L6-V2", 1);
+            let unit_id: i64 = conn
+                .query_row("SELECT id FROM units WHERE name = 'unitA'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let vol_id: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'L6-V2'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 2, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'staged', 524288)",
+                params![snap2],
+            )
+            .unwrap();
+            let ss2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss2, snap2, vol_id],
+            )
+            .unwrap();
+
+            let err = volume_retire(&conn, &Config::default(), "L6-V2", true, false, false)
+                .expect_err("v2 is only here; a newer version is not a copy of an older one");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("v2"),
+                "the refusal must name the version: {msg}"
+            );
+            assert!(
+                !msg.contains("unit \"unitA\" v1"),
+                "v1 has a copy elsewhere and must NOT be named: {msg}"
+            );
+        }
+
+        /// The other direction, and the one that matters for the read-error
+        /// tape (ADR-0012): a volume that counts for nothing removes
+        /// nothing. Refusing here would make `volume retire` useless
+        /// exactly when an operator needs it most — `volume verify` failing
+        /// is the documented escape, and it works by quarantining.
+        fn tier3_does_not_fire_for_status(status: &str, label: &str) {
+            let (conn, vol_id) = setup_sealed(label, 0);
+            conn.execute(
+                "UPDATE volumes SET status = ?1 WHERE id = ?2",
+                params![status, vol_id],
+            )
+            .unwrap();
+            // assume_yes: this is a Tier-2 case (the unit reads zero-copy),
+            // and Tier 2 is exactly what a flag is allowed to waive.
+            volume_retire(&conn, &Config::default(), label, true, false, false).unwrap_or_else(
+                |e| panic!("a {status} volume removes nothing and must not hit the floor: {e}"),
+            );
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        #[test]
+        fn tier3_does_not_fire_for_a_quarantined_volume() {
+            tier3_does_not_fire_for_status("quarantined", "L6-QUAR-RETIRE");
+        }
+
+        #[test]
+        fn tier3_does_not_fire_for_an_unsealed_volume() {
+            tier3_does_not_fire_for_status("active", "L6-UNSEALED");
+        }
+
+        #[test]
+        fn tier3_does_not_fire_for_an_already_retired_volume() {
+            tier3_does_not_fire_for_status("retired", "L6-ALREADY");
+        }
+
+        /// A RELEASED version is one the operator gave up on purpose. The
+        /// floor does not protect it — `snapshot mark-reclaimable` IS the
+        /// documented escape, so it must actually work.
+        #[test]
+        fn tier3_does_not_fire_for_a_released_version() {
+            let (conn, vol_id) = setup_sealed("L6-RELEASED", 0);
+            conn.execute("UPDATE snapshots SET status = 'reclaimable'", [])
+                .unwrap();
+            volume_retire(&conn, &Config::default(), "L6-RELEASED", true, false, false)
+                .expect("mark-reclaimable is the escape the refusal names; it must work");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// The refusal is what the operator has to act on, so its content is
+        /// part of the contract: the escapes are COMMANDS, not flags.
+        #[test]
+        fn tier3_refusal_names_the_escapes_and_denies_a_flag() {
+            let (conn, _) = setup_sealed("L6-TEXT", 0);
+            let msg = volume_retire(&conn, &Config::default(), "L6-TEXT", true, false, false)
+                .expect_err("must refuse")
+                .to_string();
+            for needle in [
+                "tapectl volume read-slices --from L6-TEXT --unit unitA",
+                "tapectl volume write <OTHER-LABEL>",
+                "tapectl snapshot mark-reclaimable unitA --version 1",
+                "tapectl volume verify L6-TEXT",
+                "quarantines the volume when it fails",
+                "no --force for this",
+            ] {
+                assert!(
+                    msg.contains(needle),
+                    "refusal must contain {needle:?}: {msg}"
+                );
+            }
+            assert!(
+                !msg.contains("re-run with --yes"),
+                "the Tier-3 refusal must never suggest a flag: {msg}"
+            );
+        }
+
+        /// ADR-0008 TIER 2, the gate that did not exist: one copy left
+        /// against a policy of two is below policy and above zero.
+        #[test]
+        fn tier2_gates_when_a_version_is_left_below_min_copies() {
+            let (conn, vol_id) = setup_sealed("L6-THIN", 1);
+            let err = volume_retire(&conn, &Config::default(), "L6-THIN", false, false, false)
+                .expect_err("one copy against min_copies = 2 must gate");
+            assert!(err.to_string().contains("refused"), "got: {err}");
+            assert_eq!(
+                volume_status(&conn, vol_id),
+                "sealed",
+                "a refused retirement must not retire the volume"
+            );
+        }
+
+        /// ...and Tier 2 is what a flag IS allowed to waive.
+        #[test]
+        fn tier2_below_policy_is_waived_by_assume_yes() {
+            let (conn, vol_id) = setup_sealed("L6-THIN-YES", 1);
+            volume_retire(&conn, &Config::default(), "L6-THIN-YES", true, false, false)
+                .expect("--yes waives Tier 2, which is the whole distinction");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// No gate at all when every version stays at or above policy —
+        /// ordinary retirement must not become a ceremony (ADR-0008's own
+        /// warning).
+        #[test]
+        fn no_gate_at_all_when_every_version_stays_at_or_above_policy() {
+            let (conn, vol_id) = setup_sealed("L6-FAT", 2);
+            volume_retire(&conn, &Config::default(), "L6-FAT", false, false, false)
+                .expect("two copies left against min_copies = 2 is within policy");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// ADR-0004 Tier 1: evidence age is DISPLAYED and never gates. The
+        /// testable form of "never gates" is that a within-policy
+        /// retirement whose remaining coverage was last verified in 2011
+        /// still needs no consent at all.
+        #[test]
+        fn tier1_evidence_age_is_displayed_and_never_gates() {
+            let (conn, vol_id) = setup_sealed("L6-ANCIENT", 2);
+            // Both survivors verified long ago, so the summary's WEAKEST
+            // reading is the ancient one rather than a never-verified peer.
+            conn.execute(
+                "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
+                 SELECT id, '2011-08-01 00:00:00', 'passed' FROM volumes
+                 WHERE label IN ('COPY-0', 'COPY-1')",
+                [],
+            )
+            .unwrap();
+
+            let impacts = retire_impacts(&conn, vol_id).unwrap();
+            let summary = crate::policy::evidence::describe(
+                &impacts[0].unit_name,
+                &impacts[0].evidence,
+                chrono::Utc::now().naive_utc(),
+            )
+            .expect("evidence must be described for a unit that retains coverage");
+            assert!(
+                summary.contains("days ago"),
+                "the age must be rendered, not just the volume: {summary}"
+            );
+
+            volume_retire(&conn, &Config::default(), "L6-ANCIENT", false, false, false)
+                .expect("ADR-0004: evidence age is shown, never a gate");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// `--dry-run` must say what the real run would do — a dry run that
+        /// stayed silent about an absolute refusal would be worse than none.
+        #[test]
+        fn dry_run_names_the_versions_the_floor_would_refuse_on() {
+            let (conn, vol_id) = setup_sealed("L6-DRY3", 0);
+            volume_retire(&conn, &Config::default(), "L6-DRY3", false, true, false)
+                .expect("dry-run reports, it does not gate");
+            assert_eq!(volume_status(&conn, vol_id), "sealed");
+            let impacts = retire_impacts(&conn, vol_id).unwrap();
+            let json = retire_impacts_json(&impacts);
+            assert_eq!(
+                json[0]["last_copy_versions"][0], 1,
+                "the dry-run JSON must name the version the floor protects: {json:?}"
+            );
         }
     }
 
@@ -3504,7 +4144,7 @@ mod tests {
         #[test]
         fn retiring_the_last_live_volume_moves_the_cartridge_to_pending_erase() {
             let (conn, cart_id, _) = setup();
-            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-CART", false, false, false).unwrap();
             assert_eq!(cartridge_status(&conn, cart_id), "pending_erase");
 
             // With an event, so the lifecycle is auditable rather than a
@@ -3527,7 +4167,7 @@ mod tests {
         #[test]
         fn the_mount_is_left_open_for_mark_erased_to_close() {
             let (conn, cart_id, vol_id) = setup();
-            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-CART", false, false, false).unwrap();
             let open: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM cartridge_volumes
@@ -3545,7 +4185,7 @@ mod tests {
         fn another_live_volume_on_the_cartridge_leaves_it_in_use() {
             let (conn, cart_id, _) = setup();
             add_volume_on(&conn, cart_id, "L6-OTHER", "sealed");
-            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-CART", false, false, false).unwrap();
             assert_eq!(cartridge_status(&conn, cart_id), "in_use");
         }
 
@@ -3556,7 +4196,7 @@ mod tests {
         fn an_already_retired_neighbour_does_not_hold_the_cartridge() {
             let (conn, cart_id, _) = setup();
             add_volume_on(&conn, cart_id, "L6-DEAD", "retired");
-            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-CART", false, false, false).unwrap();
             assert_eq!(cartridge_status(&conn, cart_id), "pending_erase");
         }
 
@@ -3572,7 +4212,7 @@ mod tests {
                 params![cart_id],
             )
             .unwrap();
-            volume_retire(&conn, "L6-CART", false, false, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-CART", false, false, false).unwrap();
             assert_eq!(cartridge_status(&conn, cart_id), "retired_permanent");
         }
 
@@ -3582,7 +4222,7 @@ mod tests {
         fn an_unbound_volume_retires_with_no_cartridge_to_free() {
             let (conn, vol_id) =
                 super::volume_retire_consent::setup_volume_with_one_unit("L6-LOOSE", true);
-            volume_retire(&conn, "L6-LOOSE", false, false, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-LOOSE", false, false, false).unwrap();
             let status: String = conn
                 .query_row(
                     "SELECT status FROM volumes WHERE id = ?1",
@@ -3598,7 +4238,7 @@ mod tests {
         #[test]
         fn dry_run_does_not_free_the_cartridge() {
             let (conn, cart_id, _) = setup();
-            volume_retire(&conn, "L6-CART", false, true, false).unwrap();
+            volume_retire(&conn, &Config::default(), "L6-CART", false, true, false).unwrap();
             assert_eq!(cartridge_status(&conn, cart_id), "in_use");
         }
     }
@@ -3649,8 +4289,17 @@ mod tests {
         #[test]
         fn retire_writes_the_status_and_retires_the_volume_on_it() {
             let (conn, cart_id, vol_id) = setup(true);
-            cartridge_retire(&conn, "BC-RET", None, false, true, false, false)
-                .expect("--yes must satisfy the gate");
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                true,
+                false,
+                false,
+            )
+            .expect("--yes must satisfy the gate");
 
             assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
             assert_eq!(
@@ -3666,7 +4315,17 @@ mod tests {
         #[test]
         fn retire_leaves_the_mount_open_because_the_bytes_are_still_there() {
             let (conn, cart_id, _) = setup(true);
-            cartridge_retire(&conn, "BC-RET", None, false, true, false, false).unwrap();
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
             let open: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM cartridge_volumes
@@ -3688,8 +4347,17 @@ mod tests {
             // `stdin().is_terminal()`, which is false under `cargo test`'s
             // captured stdin -- and `cli::consent`'s own tests prove that
             // branch never attempts a read.
-            let err = cartridge_retire(&conn, "BC-RET", None, false, false, false, false)
-                .expect_err("no consent in a non-interactive session must refuse");
+            let err = cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                false,
+                false,
+                false,
+            )
+            .expect_err("no consent in a non-interactive session must refuse");
             assert!(err.to_string().contains("refused"), "got: {err}");
             assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
             assert_eq!(
@@ -3699,21 +4367,171 @@ mod tests {
             );
         }
 
-        /// ADR-0008 Tier 2, not Tier 3: the data may still be readable, so
-        /// `--force` genuinely overrides the zero-copy case.
+        /// Tier 2, and the fixture is one for a reason worth stating
+        /// (issue #147): the volume on this cartridge is `active`, never
+        /// sealed, so under ADR-0012 it counts for nothing and retiring the
+        /// cartridge REMOVES nothing. `--force` waives a Tier-2 prompt;
+        /// `tier3_is_not_defeated_by_force` below proves it waives nothing
+        /// when the cartridge actually carries the last copy.
         #[test]
-        fn force_overrides_the_zero_copy_case() {
+        fn force_overrides_when_the_retirement_removes_nothing() {
             let (conn, cart_id, _) = setup(false);
-            cartridge_retire(&conn, "BC-RET", None, true, false, false, false)
-                .expect("--force must override a zero-copy impact");
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                true,
+                false,
+                false,
+                false,
+            )
+            .expect("--force must override a zero-copy impact");
             assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+        }
+
+        // ── ADR-0008 Tier 3, restored (ADR-0012, issue #147) ──
+
+        /// `setup` with the cartridge's volume SEALED, so retiring the
+        /// cartridge really does remove the catalog's last eligible copy of
+        /// `unitA`'s current v1. ADR-0011's own justification for gating
+        /// this command is that it "removes a physical copy from every
+        /// coverage count that policy computes" — which is exactly the
+        /// thing ADR-0008 puts an absolute floor under.
+        fn setup_sealed_cartridge() -> (Connection, i64, i64) {
+            let (conn, cart_id, vol_id) = setup(false);
+            conn.execute(
+                "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+                params![vol_id],
+            )
+            .unwrap();
+            (conn, cart_id, vol_id)
+        }
+
+        #[test]
+        fn tier3_refuses_when_the_cartridge_holds_the_last_eligible_copy() {
+            let (conn, cart_id, vol_id) = setup_sealed_cartridge();
+            let err = cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                false,
+                false,
+                false,
+            )
+            .expect_err("the last eligible copy of a live version must be refused");
+            assert!(err.to_string().contains("LAST eligible copy"), "got: {err}");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
+            assert_eq!(status_of(&conn, "volumes", vol_id), "sealed");
+        }
+
+        /// Neither `--force` nor `--yes` reaches the floor. Both are passed
+        /// here because `cartridge_retire` ORs them into one waiver, and a
+        /// waiver is precisely what Tier 3 does not accept.
+        #[test]
+        fn tier3_is_not_defeated_by_force() {
+            let (conn, cart_id, _) = setup_sealed_cartridge();
+            let err = cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                true,
+                true,
+                false,
+                false,
+            )
+            .expect_err("no flag may defeat ADR-0008 Tier 3");
+            assert!(
+                err.to_string().contains("no --force for this"),
+                "got: {err}"
+            );
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
+        }
+
+        /// The refusal must name the VOLUME to copy off, not the cartridge:
+        /// `volume read-slices` takes a volume label.
+        #[test]
+        fn tier3_refusal_names_the_volume_not_the_cartridge() {
+            let (conn, _, _) = setup_sealed_cartridge();
+            let msg = cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                true,
+                true,
+                false,
+                false,
+            )
+            .expect_err("must refuse")
+            .to_string();
+            assert!(
+                msg.contains("tapectl volume read-slices --from L6-CART --unit unitA"),
+                "recovery must name the volume: {msg}"
+            );
+        }
+
+        /// The other direction: a quarantined volume on the cartridge
+        /// counts for nothing, so retiring the cartridge removes nothing
+        /// and the floor must stay out of the way.
+        #[test]
+        fn tier3_does_not_fire_for_a_quarantined_volume_on_the_cartridge() {
+            let (conn, cart_id, vol_id) = setup_sealed_cartridge();
+            conn.execute(
+                "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                params![vol_id],
+            )
+            .unwrap();
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                true,
+                false,
+                false,
+                false,
+            )
+            .expect("a quarantined volume removes nothing; this must stay Tier 2");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+        }
+
+        /// `--dry-run` still reports before any gate, floor included.
+        #[test]
+        fn tier3_dry_run_still_reports_and_changes_nothing() {
+            let (conn, cart_id, vol_id) = setup_sealed_cartridge();
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                false,
+                true,
+                false,
+            )
+            .expect("dry-run reports, it does not gate");
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
+            assert_eq!(status_of(&conn, "volumes", vol_id), "sealed");
         }
 
         #[test]
         fn dry_run_mutates_nothing() {
             let (conn, cart_id, vol_id) = setup(false);
-            cartridge_retire(&conn, "BC-RET", None, false, false, true, false)
-                .expect("dry-run must succeed before any consent gate");
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                None,
+                false,
+                false,
+                true,
+                false,
+            )
+            .expect("dry-run must succeed before any consent gate");
             assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
             assert_eq!(status_of(&conn, "volumes", vol_id), "active");
             let events: i64 = conn
@@ -3739,6 +4557,7 @@ mod tests {
             .unwrap();
             cartridge_retire(
                 &conn,
+                &Config::default(),
                 "BC-RET",
                 Some("read errors on 3 consecutive verifies"),
                 false,
@@ -3763,7 +4582,17 @@ mod tests {
         #[test]
         fn reason_on_an_empty_note_does_not_lead_with_a_newline() {
             let (conn, _, _) = setup(true);
-            cartridge_retire(&conn, "BC-RET", Some("worn"), false, true, false, false).unwrap();
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                Some("worn"),
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
             let notes: String = conn
                 .query_row(
                     "SELECT notes FROM cartridges WHERE barcode = 'BC-RET'",
@@ -3780,12 +4609,23 @@ mod tests {
         #[test]
         fn retiring_an_already_retired_cartridge_changes_nothing() {
             let (conn, _, _) = setup(true);
-            cartridge_retire(&conn, "BC-RET", Some("worn"), false, true, false, false).unwrap();
+            cartridge_retire(
+                &conn,
+                &Config::default(),
+                "BC-RET",
+                Some("worn"),
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
             let before: i64 = conn
                 .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
                 .unwrap();
             cartridge_retire(
                 &conn,
+                &Config::default(),
                 "BC-RET",
                 Some("worn again"),
                 false,
@@ -3811,7 +4651,17 @@ mod tests {
         #[test]
         fn an_unknown_barcode_says_so() {
             let (conn, _, _) = setup(true);
-            let err = cartridge_retire(&conn, "NOPE", None, true, true, false, false).unwrap_err();
+            let err = cartridge_retire(
+                &conn,
+                &Config::default(),
+                "NOPE",
+                None,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("NOPE"));
         }
     }
