@@ -81,7 +81,12 @@ usage: lifecycle-suite.sh [--scenario NAME | --all] [--device /dev/nstN]
   --device PATH                   Tape device (default: $TAPECTL_GATE_TAPE or /dev/nst0).
   --erase long|short              long = mt rewind+erase (instant on mhvtl, HOURS on
                                    real LTO — never the default on a real drive).
-                                   short = mt rewind+weof 1+rewind (empty File 0 at BOT).
+                                   short = mt rewind+weof 1+rewind. This UNSEALS a tape;
+                                   it does NOT blank one — a read at BOT still returns
+                                   the old File 0's bytes, so `volume init` refuses it as
+                                   "present but unparseable" unless --force. Usable only
+                                   where --force is in play (--single-cartridge reuse).
+                                   A freshly loaded slot tape is always really erased.
   --single-cartridge              Reuse one cartridge for every "next tape" instead of
                                    loading a new slot. Cross-volume checks become SKIP,
                                    visibly.
@@ -366,6 +371,26 @@ erase_tape() {
     esac
 }
 
+# blank_tape: a REAL erase, whatever --erase says (issue #194).
+#
+# `--erase short` (weof 1 at BOT) unseals a tape but does not blank one: a read
+# at BOT still returns the previous volume's bytes, and `volume init` refuses
+# that as "a present but unparseable/corrupt File 0" -- correctly, per #27
+# contact discipline and ADR-0003. Measured on mhvtl: after `short` over a
+# written tape, init refuses; after a real erase, it initialises.
+#
+# --single-cartridge never hit this because `vinit` passes $REUSE_FORCE
+# (--force) on that branch alone, which overrides the refusal. A freshly loaded
+# slot tape has no such cover, and MUST NOT get one: widening --force to this
+# path would defeat exactly the check that catches a wrong-cartridge load.
+#
+# The cost is nil today. Multi-slot loading requires a changer, and a real drive
+# is already refused this path (--single-cartridge is mandatory there), so this
+# only ever runs on mhvtl, where `mt erase` is instant.
+blank_tape() {
+    devcmd mt -f "$TAPE_DEV" rewind && devcmd mt -f "$TAPE_DEV" erase
+}
+
 # ---------- next_tape: multi-tape on mhvtl, same-cartridge on single ----------
 # Tracks which library slots this RUN has already used so a long scenario (or
 # --all) doesn't reload the same cartridge and call it a second volume.
@@ -425,7 +450,9 @@ next_tape() { # next_tape <intended-label>
     USED_SLOTS="$USED_SLOTS $slot"
     LOADED_TAG="$(mtx -f "$CHG_SG" status | sed -n "s/.*Data Transfer Element $DTE:Full.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p")"
     echo "$slot	$label	$LOADED_TAG" >>"$SLOT_LABEL_MAP"
-    erase_tape
+    # A real erase, not erase_tape: this slot tape carries whatever a previous
+    # RUN left on it, and there is no --force on this path (issue #194).
+    blank_tape
     PREV_LABEL="$label"
 }
 
