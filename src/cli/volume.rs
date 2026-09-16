@@ -37,10 +37,10 @@ pub enum VolumeCommands {
         /// generation from the drive (MAM medium density code, else MAM
         /// format density code, else the st driver's density register), and
         /// a detected code is a fact about the tape that this flag cannot
-        /// override — a `--media` contradicting one is an error, not a hint.
-        /// It is consulted only when no source reports a recognised code.
+        /// override — a `--generation` contradicting one is an error, not a
+        /// hint. It is consulted only when no source reports a recognised code.
         #[arg(long)]
-        media: Option<String>,
+        generation: Option<String>,
         /// Bind this volume to an already-registered cartridge by barcode.
         ///
         /// Normally unnecessary: `volume init` matches the loaded medium's
@@ -205,7 +205,7 @@ pub enum VolumeCommands {
         /// authoritative figure is each volume's own `capacity_bytes` once
         /// `volume init` has detected the medium it is actually on.
         #[arg(long)]
-        media: Option<String>,
+        generation: Option<String>,
         /// Which configured drive to plan against, by its device path. Only
         /// needed when more than one `[[backends.lto]]` is configured —
         /// without it, planning errored outright on a multi-drive config
@@ -363,7 +363,7 @@ pub fn run(
             label,
             device,
             force,
-            media,
+            generation,
             cartridge,
         } => {
             let device = write_device(config, device.as_deref())?;
@@ -374,7 +374,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *force,
-                media.as_deref(),
+                generation.as_deref(),
                 cartridge.as_deref(),
             )?;
             if json_output {
@@ -612,7 +612,7 @@ pub fn run(
 
         VolumeCommands::Plan {
             copies,
-            media,
+            generation,
             device,
         } => {
             // Show what staged data would be written
@@ -666,10 +666,10 @@ pub fn run(
                     );
                     // Estimate tapes needed from the configured LTO backend.
                     // ADR-0010: the figure follows the GENERATION being
-                    // planned for (`--media`, else the drive's own), not a
+                    // planned for (`--generation`, else the drive's own), not a
                     // capacity declared on the drive.
                     let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
-                    let tape_cap = backend.planning_capacity_bytes(media.as_deref())? as i64;
+                    let tape_cap = backend.planning_capacity_bytes(generation.as_deref())? as i64;
                     let factor = backend.usable_capacity_factor;
                     let usable = (tape_cap as f64 * factor) as i64;
                     let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;

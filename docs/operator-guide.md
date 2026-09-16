@@ -915,7 +915,7 @@ the tape later (you, or an heir with no catalog) can tell a chip-verified serial
 from a label somebody typed:
 
 ```bash
-tapectl cartridge register --barcode L6-0002 --media-type LTO-6
+tapectl cartridge register --barcode L6-0002 --generation LTO-6
 tapectl volume init L6-0002 --device /dev/nst1 --cartridge L6-0002
 ```
 

@@ -36,7 +36,7 @@ pub enum CollectionCommands {
         /// (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6
         /// drive will write. No cartridge need be loaded.
         #[arg(long)]
-        media: Option<String>,
+        generation: Option<String>,
         /// Which configured drive to plan against, by its device path. Only
         /// needed when more than one `[[backends.lto]]` is configured —
         /// without it, planning errored outright on a multi-drive config
@@ -84,13 +84,13 @@ pub fn run(
         CollectionCommands::Status => cmd_status(conn, config, json_output),
         CollectionCommands::Plan {
             copies,
-            media,
+            generation,
             device,
         } => cmd_plan(
             conn,
             config,
             *copies,
-            media.as_deref(),
+            generation.as_deref(),
             device.as_deref(),
             json_output,
         ),
@@ -219,7 +219,7 @@ fn cmd_plan(
     conn: &Connection,
     config: &Config,
     copies: i64,
-    media: Option<&str>,
+    generation: Option<&str>,
     device: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
@@ -230,7 +230,7 @@ fn cmd_plan(
 
     let mut rows = Vec::new();
     for lib in &config.collections {
-        let batches = collection::plan::plan_for_collection(conn, config, lib, media, device)?;
+        let batches = collection::plan::plan_for_collection(conn, config, lib, generation, device)?;
         rows.push((lib.name.clone(), batches));
     }
 
@@ -299,7 +299,7 @@ fn cmd_run(
     json_output: bool,
 ) -> Result<()> {
     let lib = collection::find_collection(config, collection_name)?;
-    // No `--media` here: `collection run` writes to volumes that are already
+    // No `--generation` here: `collection run` writes to volumes that are already
     // `volume init`-ed, so each destination's real capacity is on its own row.
     // The device IS given though: `run` already resolved the drive it is
     // writing to, and batching against a different one would size the batch

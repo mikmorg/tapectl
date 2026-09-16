@@ -38,7 +38,7 @@ pub fn plan_for_collection(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
-    // `--media <GEN>`: plan for a generation other than the drive's own
+    // `--generation <GEN>`: plan for a generation other than the drive's own
     // (ADR-0010) — sizing batches for LTO-5 stock in an LTO-6 drive, say.
     // `None` means the drive's native generation.
     media: Option<&str>,

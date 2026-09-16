@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-cartridge\-register \- Register a physical cartridge
 .SH SYNOPSIS
-\fBtapectl cartridge register\fR <\fB\-\-barcode\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-media\-type\fR> [\fB\-\-capacity\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-serial\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-notes\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl cartridge register\fR <\fB\-\-barcode\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-generation\fR> [\fB\-\-capacity\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-serial\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-notes\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Register a physical cartridge
 .SH OPTIONS
@@ -18,7 +18,7 @@ Output in JSON format
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
 .TP
-\fB\-\-media\-type\fR \fI<MEDIA_TYPE>\fR
+\fB\-\-generation\fR \fI<GENERATION>\fR
 Media generation (e.g., LTO\-6, LTO\-7, LTO\-7\-M8, LTO\-8)
 .TP
 \fB\-\-capacity\fR \fI<CAPACITY>\fR

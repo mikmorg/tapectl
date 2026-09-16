@@ -206,7 +206,7 @@ impl LtoBackendConfig {
     /// says so, which is why the `capacity_bytes()` alias that did not is
     /// gone (spec W4) rather than kept as a shorter way to say it.
     ///
-    /// `media` is the operator's `--media <GEN>`, defaulting to this drive's
+    /// `media` is the operator's `--generation <GEN>`, defaulting to this drive's
     /// native generation. The cartridge row is deliberately absent from the
     /// precedence that [`crate::media::resolve_capacity`] applies here:
     /// nothing is bound yet, because nothing has been initialised. Once a
@@ -216,7 +216,7 @@ impl LtoBackendConfig {
         let generation = match media {
             Some(m) => crate::media::Generation::parse(m).ok_or_else(|| {
                 TapectlError::Other(format!(
-                    "--media {m:?} is not a recognised LTO generation \
+                    "--generation {m:?} is not a recognised LTO generation \
                      (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
                 ))
             })?,

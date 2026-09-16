@@ -9,7 +9,7 @@
 //! and treated as "this source gave nothing", never as a hard failure of
 //! detection as a whole. `detect` never returns an `Err`; a caller that
 //! cannot determine a generation this way falls back to a declaration
-//! (`--media`, a bound cartridge row, or the drive's own `generation`) —
+//! (`--generation`, a bound cartridge row, or the drive's own `generation`) —
 //! that fallback is `volume_init`'s job, not this module's.
 
 use tracing::warn;
@@ -129,7 +129,7 @@ pub enum MediaSource {
     /// Read off the medium itself, by the named detection source. The only
     /// non-fallback answer.
     Detected(DetectSource),
-    /// `--media` on the command line.
+    /// `--generation` on the command line.
     Declared,
     /// The registered `media_type` of the cartridge whose serial matches the
     /// loaded medium (or which `--cartridge` named). Carries the barcode so
@@ -153,7 +153,7 @@ impl MediaSource {
     pub fn describe(&self) -> String {
         match self {
             Self::Detected(_) => "the medium itself".to_string(),
-            Self::Declared => "--media".to_string(),
+            Self::Declared => "--generation".to_string(),
             Self::CartridgeRow(barcode) => format!("cartridge {barcode}"),
             Self::DriveGeneration => "the drive's generation".to_string(),
         }
@@ -163,17 +163,17 @@ impl MediaSource {
 /// Decide the loaded medium's generation (ADR-0010, decision 2), purely.
 ///
 /// Detection wins outright. The medium's own density code is a fact about
-/// the physical tape; `--media` and a registered `media_type` are claims
+/// the physical tape; `--generation` and a registered `media_type` are claims
 /// about it, and a claim that contradicts the fact is an ERROR rather than a
 /// hint — either the wrong tape is loaded or the claim is wrong, and tapectl
 /// cannot tell which. Only when no source read a recognised density code
-/// does a declaration stand in, in the order `--media` → the matched
+/// does a declaration stand in, in the order `--generation` → the matched
 /// cartridge row → the drive's own generation.
 ///
 /// Arguments:
 /// - `det` — what [`detect`] found (`det.code` is only used to make the
 ///   contradiction message specific).
-/// - `declared` — a parsed `--media`.
+/// - `declared` — a parsed `--generation`.
 /// - `row` — the matched cartridge's `(generation, barcode)`, if a row was
 ///   matched by serial or named by `--cartridge`.
 /// - `drive_gen` — the drive's configured native generation.
@@ -191,16 +191,16 @@ pub fn resolve_media(
     if let (Some(detected), Some(d)) = (det.generation, declared) {
         if d != detected {
             return Err(TapectlError::Other(format!(
-                "loaded medium is {detected} ({}), --media says {d}. \
+                "loaded medium is {detected} ({}), --generation says {d}. \
                  The medium's own density code is a fact about the tape; \
-                 --media is a claim about it. Either the wrong cartridge \
-                 is loaded or --media is wrong.",
+                 --generation is a claim about it. Either the wrong \
+                 cartridge is loaded or --generation is wrong.",
                 density_phrase(det.code),
             )));
         }
     }
 
-    // 2. The ladder: detection, else --media, else the row, else the drive.
+    // 2. The ladder: detection, else --generation, else the row, else the drive.
     let (generation, source) = if let Some(detected) = det.generation {
         (detected, MediaSource::Detected(det.source))
     } else if let Some(d) = declared {
@@ -214,7 +214,7 @@ pub fn resolve_media(
     // 3. A matched row must agree with whatever won — this is ADR-0010's
     //    "registered row whose media_type disagrees ... is an error". It is
     //    checked against the RESOLVED generation, not only against a detected
-    //    one, so that `--media LTO-8` on a cartridge registered LTO-6 is
+    //    one, so that `--generation LTO-8` on a cartridge registered LTO-6 is
     //    caught too: those are two claims by the same operator that
     //    contradict each other, and tapectl can see the contradiction even
     //    when it cannot see the tape. Vacuous when the row itself won.
@@ -226,7 +226,7 @@ pub fn resolve_media(
                     density_phrase(det.code)
                 )
             } else {
-                format!("--media says {generation}")
+                format!("--generation says {generation}")
             };
             return Err(TapectlError::Other(format!(
                 "cartridge {barcode} is registered as {row_gen}, {what_says}. Either the \
@@ -327,7 +327,7 @@ mod tests {
         .to_string();
         assert!(err.contains("loaded medium is LTO-5"), "{err}");
         assert!(err.contains("density 0x58"), "{err}");
-        assert!(err.contains("--media says LTO-6"), "{err}");
+        assert!(err.contains("--generation says LTO-6"), "{err}");
     }
 
     #[test]
@@ -362,10 +362,10 @@ mod tests {
 
     // ---- resolve_media: the declaration ladder, only when nothing is detected ----
 
-    /// `--media` outranks a matched cartridge row. With both present they
+    /// `--generation` outranks a matched cartridge row. With both present they
     /// must AGREE (see `undetected_media_contradicting_a_registered_row_...`
     /// below), so the priority shows in the reported SOURCE rather than in
-    /// the generation: the warning must say "--media", not "cartridge
+    /// the generation: the warning must say "--generation", not "cartridge
     /// BC001", because that is what the operator will go and check.
     #[test]
     fn undetected_falls_back_to_media_first() {
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(gen, Generation::Lto6);
         assert_eq!(src, MediaSource::Declared);
         assert!(!src.is_detected());
-        assert_eq!(src.describe(), "--media");
+        assert_eq!(src.describe(), "--generation");
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(src.describe(), "the drive's generation");
     }
 
-    /// Even with nothing detected, `--media` and a matched cartridge row are
+    /// Even with nothing detected, `--generation` and a matched cartridge row are
     /// two claims by the same operator, and tapectl CAN see them contradict
     /// each other. The row check therefore runs against the RESOLVED
     /// generation, not only a detected one.
@@ -422,7 +422,7 @@ mod tests {
             err.contains("cartridge BC001 is registered as LTO-6"),
             "{err}"
         );
-        assert!(err.contains("--media says LTO-8"), "{err}");
+        assert!(err.contains("--generation says LTO-8"), "{err}");
     }
 
     /// ...and the row winning the ladder can never contradict itself.

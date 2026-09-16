@@ -632,7 +632,7 @@ EOF
         CGEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
         if [ -n "$CGEN" ]; then note "the loaded medium reports $CGEN"; else note "could not read the medium's density from the drive"; fi
         ask CGEN "generation of THIS cartridge" "${CGEN:-${DGEN:-LTO-6}}"
-        run tc cartridge register --barcode "$CARTRIDGE" --media-type "$CGEN" || die "cartridge register failed"
+        run tc cartridge register --barcode "$CARTRIDGE" --generation "$CGEN" || die "cartridge register failed"
       fi
       run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --cartridge "$CARTRIDGE" || die "volume init failed"
     else

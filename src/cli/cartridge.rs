@@ -16,7 +16,7 @@ pub enum CartridgeCommands {
         barcode: String,
         /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
         #[arg(long)]
-        media_type: String,
+        generation: String,
         /// Nominal capacity, e.g. "2500G". Defaults to the generation
         /// table's marketed figure (ADR-0010) when omitted — give this
         /// explicitly only when the physical cartridge really differs (a
@@ -162,7 +162,7 @@ pub fn run(
     match command {
         CartridgeCommands::Register {
             barcode,
-            media_type,
+            generation,
             capacity,
             serial,
             notes,
@@ -209,27 +209,27 @@ pub fn run(
             // ADR-0010: stored canonical, not the operator's raw spelling,
             // so a later comparison against a detected generation
             // (`volume init`) is a plain string match.
-            let generation = crate::media::Generation::parse(media_type).ok_or_else(|| {
+            let parsed = crate::media::Generation::parse(generation).ok_or_else(|| {
                 TapectlError::Other(format!(
-                    "{media_type:?} is not a recognised LTO generation \
+                    "{generation:?} is not a recognised LTO generation \
                      (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
                 ))
             })?;
-            let canonical_media_type = generation.as_str();
+            let canonical_generation = parsed.as_str();
             let (cap, capacity_display) = match capacity {
                 Some(c) => (staging::parse_size_to_bytes(c)?, c.clone()),
                 None => {
-                    let bytes = generation.native_capacity_bytes();
+                    let bytes = parsed.native_capacity_bytes();
                     (
                         bytes as i64,
-                        format!("{bytes} bytes, the {canonical_media_type} default"),
+                        format!("{bytes} bytes, the {canonical_generation} default"),
                     )
                 }
             };
             conn.execute(
                 "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, notes)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![barcode, canonical_media_type, cap, serial, notes],
+                params![barcode, canonical_generation, cap, serial, notes],
             )?;
             let id = conn.last_insert_rowid();
             events::log_created(conn, "cartridge", id, barcode, None)?;
@@ -237,7 +237,7 @@ pub fn run(
                 println!("{}", serde_json::json!({"id": id, "barcode": barcode}));
             } else {
                 println!(
-                    "cartridge \"{barcode}\" registered (id={id}, {canonical_media_type}, {capacity_display})"
+                    "cartridge \"{barcode}\" registered (id={id}, {canonical_generation}, {capacity_display})"
                 );
             }
         }
@@ -714,7 +714,7 @@ mod tests {
     fn register(
         conn: &Connection,
         barcode: &str,
-        media_type: &str,
+        generation: &str,
         capacity: Option<&str>,
         serial: Option<&str>,
     ) -> Result<()> {
@@ -722,7 +722,7 @@ mod tests {
             conn,
             &CartridgeCommands::Register {
                 barcode: barcode.to_string(),
-                media_type: media_type.to_string(),
+                generation: generation.to_string(),
                 capacity: capacity.map(str::to_string),
                 serial: serial.map(str::to_string),
                 notes: None,

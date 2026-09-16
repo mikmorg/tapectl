@@ -101,9 +101,9 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// are decided, once, and then never re-derived from config:
 ///
 /// 1. **Generation** — detected from the drive
-///    ([`media_detect::detect`]), with `--media` / a matched cartridge row /
+///    ([`media_detect::detect`]), with `--generation` / a matched cartridge row /
 ///    the drive's own generation standing in only when nothing is readable
-///    ([`media_detect::resolve_media`]). A `--media` that contradicts a
+///    ([`media_detect::resolve_media`]). A `--generation` that contradicts a
 ///    detected code is an error, and a drive that cannot write the detected
 ///    generation is a hard refusal `--force` does not bypass: it is a
 ///    physical fact, not a consent tier (ADR-0008).
@@ -116,7 +116,7 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 ///    ([`crate::volume::binding`]), which is the first time any production
 ///    path has written the `cartridge_volumes` join.
 ///
-/// Ordering is load-bearing. Every FACT check (detect, the `--media`
+/// Ordering is load-bearing. Every FACT check (detect, the `--generation`
 /// contradiction, `can_write`, a `--cartridge` that names no row, a
 /// `--cartridge` with no serial match that would displace a live volume) runs
 /// before the tape device is opened, so a wrong-tape or wrong-flag run costs
@@ -135,7 +135,7 @@ pub fn volume_init(
     device: &str,
     block_size: usize,
     force: bool,
-    // `--media <GEN>`: the operator's declaration of the loaded medium's
+    // `--generation <GEN>`: the operator's declaration of the loaded medium's
     // generation. Only consulted when nothing could be detected; an error
     // when it contradicts a detected density code.
     declared_media: Option<&str>,
@@ -176,7 +176,7 @@ pub fn volume_init(
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
             TapectlError::Other(format!(
-                "--media {m:?} is not a recognised LTO generation \
+                "--generation {m:?} is not a recognised LTO generation \
                  (e.g. LTO-6, LTO-7, LTO-7-M8, LTO-8)"
             ))
         })?),

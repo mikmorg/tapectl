@@ -169,7 +169,7 @@ pub(crate) fn lookup_cartridge(
         let row = select_cartridge(conn, "barcode", barcode)?.ok_or_else(|| {
             TapectlError::Other(format!(
                 "cartridge \"{barcode}\" is not registered. Register it first \
-                 (`tapectl cartridge register --barcode {barcode} --media-type <GEN>`), \
+                 (`tapectl cartridge register --barcode {barcode} --generation <GEN>`), \
                  or omit --cartridge and let `volume init` auto-register this medium \
                  from its MAM serial."
             ))
@@ -238,7 +238,7 @@ pub(crate) fn require_named_cartridge(
          cannot tell it from another tape, `volume write` cannot check you reloaded the \
          same one, and the tape itself can record no identity. Register the cartridge \
          first if it is new (`tapectl cartridge register --barcode <barcode> \
-         --media-type <GEN>`). There is no --force for this — it is a fact tapectl \
+         --generation <GEN>`). There is no --force for this — it is a fact tapectl \
          cannot resolve on its own, not a risk to accept."
             .to_string(),
     ))

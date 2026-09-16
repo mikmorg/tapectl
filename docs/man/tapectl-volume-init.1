@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-init \- Initialize a new volume (write ID thunk to tape)
 .SH SYNOPSIS
-\fBtapectl volume init\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-media\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-cartridge\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume init\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-generation\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-cartridge\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Initialize a new volume (write ID thunk to tape)
 .SH OPTIONS
@@ -21,10 +21,10 @@ Show what would be done without making changes
 \fB\-\-force\fR
 Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape). Refused by default (issue #27) — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR\-0003): bulk\-erase the physical tape and run `cartridge mark\-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010)
 .TP
-\fB\-\-media\fR \fI<MEDIA>\fR
+\fB\-\-generation\fR \fI<GENERATION>\fR
 Declare the loaded medium\*(Aqs generation (e.g. LTO\-6, LTO\-7\-M8).
 
-Normally unnecessary and normally ignored: ADR\-0010 DETECTS the generation from the drive (MAM medium density code, else MAM format density code, else the st driver\*(Aqs density register), and a detected code is a fact about the tape that this flag cannot override — a `\-\-media` contradicting one is an error, not a hint. It is consulted only when no source reports a recognised code.
+Normally unnecessary and normally ignored: ADR\-0010 DETECTS the generation from the drive (MAM medium density code, else MAM format density code, else the st driver\*(Aqs density register), and a detected code is a fact about the tape that this flag cannot override — a `\-\-generation` contradicting one is an error, not a hint. It is consulted only when no source reports a recognised code.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

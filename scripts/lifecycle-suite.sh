@@ -1957,7 +1957,7 @@ d = json.load(open(sys.argv[1]))
 assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
 ' "$rawlog" || { echo "raw-volume did not verify cleanly:"; cat "$rawlog"; return 1; }
 
-    NEWHOME_TCTL "$newhome" import --label VOL-A --media-type LTO-6 >"$sd/dl.b.import.txt" 2>&1 \
+    NEWHOME_TCTL "$newhome" import --label VOL-A --generation LTO-6 >"$sd/dl.b.import.txt" 2>&1 \
         || { echo "top-level 'tapectl import' itself failed:"; cat "$sd/dl.b.import.txt"; return 1; }
     local to="$sd/dl.b.restore-photos"
     if NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \

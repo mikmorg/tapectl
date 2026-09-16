@@ -202,9 +202,9 @@ pub enum Commands {
         /// Backend type
         #[arg(long, default_value = "lto")]
         backend: String,
-        /// Media type
+        /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
         #[arg(long, default_value = "LTO-6")]
-        media_type: String,
+        generation: String,
         /// Capacity (e.g., "2500G")
         #[arg(long, default_value = "2500G")]
         capacity: String,

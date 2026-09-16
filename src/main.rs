@@ -210,7 +210,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Import {
             ref label,
             ref backend,
-            ref media_type,
+            ref generation,
             ref capacity,
             ref device,
             ref notes,
@@ -220,7 +220,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 &cfg,
                 label,
                 backend,
-                media_type,
+                generation,
                 capacity,
                 device.as_deref(),
                 notes.as_deref(),

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-import \- Import a pre\-existing volume into the database
 .SH SYNOPSIS
-\fBtapectl import\fR [\fB\-\-json\fR] <\fB\-\-label\fR> [\fB\-\-backend\fR] [\fB\-\-dry\-run\fR] [\fB\-\-media\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-capacity\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-device\fR] [\fB\-\-home\fR] [\fB\-\-notes\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl import\fR [\fB\-\-json\fR] <\fB\-\-label\fR> [\fB\-\-backend\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-capacity\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-device\fR] [\fB\-\-home\fR] [\fB\-\-notes\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Import a pre\-existing volume into the database
 .SH OPTIONS
@@ -21,8 +21,8 @@ Backend type
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
 .TP
-\fB\-\-media\-type\fR \fI<MEDIA_TYPE>\fR [default: LTO\-6]
-Media type
+\fB\-\-generation\fR \fI<GENERATION>\fR [default: LTO\-6]
+Media generation (e.g., LTO\-6, LTO\-7, LTO\-7\-M8, LTO\-8)
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
