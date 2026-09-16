@@ -4380,7 +4380,11 @@ mod tests {
             name: "no-such-drive".into(),
             device_tape: "/nonexistent/tapectl-force-test-nst".into(),
             device_sg: "/nonexistent/tapectl-force-test-sg".into(),
-            generation: "LTO-8".into(),
+            // Must be able to write the volume's own LTO-6 media (issue
+            // #166: volume_write now checks this before the pre-write
+            // validate this test is aimed at) — an unrelated mismatch here
+            // would refuse earlier, for the wrong reason.
+            generation: "LTO-6".into(),
             capacity_override: Some("2400G".into()),
             usable_capacity_factor: 0.92,
             enospc_buffer: "50M".into(),
@@ -5752,7 +5756,11 @@ mod tests {
                 name: "no-such-drive".into(),
                 device_tape: "/nonexistent/tapectl-order-test-nst".into(),
                 device_sg: "/nonexistent/tapectl-order-test-sg".into(),
-                generation: "LTO-8".into(),
+                // Must be able to write ORDERTEST's own LTO-6 media (issue
+                // #166: volume_write now checks this before the pre-write
+                // validate this test is aimed at) — an unrelated mismatch
+                // here would refuse earlier, for the wrong reason.
+                generation: "LTO-6".into(),
                 capacity_override: Some("2400G".into()),
                 usable_capacity_factor: 0.92,
                 enospc_buffer: "50M".into(),

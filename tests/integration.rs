@@ -1872,7 +1872,11 @@ fn test_volume_write_refuses_over_capacity() {
         name: "p".into(),
         device_tape: "/dev/null".into(),
         device_sg: "/dev/null".into(),
-        generation: "LTO-8".into(),
+        // Must be able to write L6-CAP's own LTO-6 media (issue #166:
+        // volume_write now checks this before the pre-write validate this
+        // test is aimed at) — an unrelated mismatch here would refuse
+        // earlier, for the wrong reason.
+        generation: "LTO-6".into(),
         capacity_override: Some("50M".into()),
         usable_capacity_factor: 1.0,
         enospc_buffer: "0".into(),
