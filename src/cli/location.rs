@@ -812,6 +812,61 @@ mod tests {
         );
     }
 
+    /// A cartridge with no prior location (`location_id IS NULL`) must log
+    /// `None` on the old side of its first move — never the id (there isn't
+    /// one) and never some other stand-in.
+    #[test]
+    fn moving_an_unlocated_cartridge_logs_none_on_the_old_side() {
+        let conn = setup_bound();
+        move_cartridge(&conn, "A001L6", "home").unwrap();
+
+        let old_value: Option<String> = conn
+            .query_row(
+                "SELECT old_value FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'moved'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_value, None,
+            "a previously unlocated cartridge's first move must log None on the old side"
+        );
+    }
+
+    /// ADR-0012's consequences bullet, proven for `volume move` too (not
+    /// just `cartridge move`): both entity kinds go through `move_together`,
+    /// but the fix could still have been wired at only one call site.
+    #[test]
+    fn volume_move_also_logs_the_previous_locations_name_not_its_id() {
+        let conn = setup_bound();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('bank', 'shelf')",
+            [],
+        )
+        .unwrap();
+
+        move_volume(&conn, "L6-0001", "home").unwrap();
+        move_volume(&conn, "L6-0001", "bank").unwrap();
+
+        let (old_value, new_value): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT old_value, new_value FROM events
+                 WHERE entity_type = 'volume' AND action = 'moved' AND entity_label = 'L6-0001'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            old_value.as_deref(),
+            Some("home"),
+            "a volume move's event must carry the previous location's NAME, not its id"
+        );
+        assert_eq!(new_value.as_deref(), Some("bank"));
+    }
+
     /// The other direction (ADR-0011: "`volume move` keeps its name and
     /// meaning, and now also moves the cartridge the volume is bound to").
     #[test]
