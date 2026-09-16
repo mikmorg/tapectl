@@ -19,6 +19,7 @@ use std::os::unix::io::AsRawFd;
 
 use tracing::warn;
 
+use crate::config::{Config, LtoBackendConfig};
 use crate::error::{Result, TapectlError};
 use crate::media::Generation;
 use crate::tape::ioctl;
@@ -366,6 +367,138 @@ fn density_phrase(code: Option<u8>) -> String {
     }
 }
 
+// ── The drive/medium fact refusal, applied at every contact (issue #166) ──
+//
+// ADR-0010 decision 2 says a drive that cannot write the detected generation
+// is a hard refusal `--force` does not override — a physical fact, not a
+// consent tier (ADR-0008). Until issue #178/#166, that refusal was checked
+// only at `volume_init`, inline. It now lives here, ONCE, so `volume_init`,
+// `volume_write` and `volume_resume` (and everything that delegates to
+// `volume_write`: `compact_write`, `quick-archive`, `collection run`) all
+// reach the exact same message rather than three copies that could drift.
+// The read half (`check_drive_can_read`) is the mirror ADR-0010's own ruling
+// ("Read paths stay usable without a configured drive") extends the same
+// fact check to.
+
+/// The refusal when this drive cannot write the medium that is loaded
+/// (ADR-0010 decision 2; ADR-0008 Tier 3 — `--force` is not consulted, and
+/// deliberately absent from this function's signature: there is no
+/// `force` parameter for a physical fact to override).
+///
+/// Two halves, and the second is the one issue #178 added. The physics is
+/// only half an answer: the *other* reason this fires is that `generation`
+/// in the `[[backends.lto]]` block is wrong — which is exactly what happened
+/// when `first-run.sh` defaulted the DRIVE's generation from whatever
+/// cartridge was loaded during setup. An operator reading only the physics
+/// sentence goes looking for the wrong cartridge, when the cartridge is fine
+/// and the config is not.
+///
+/// Names the block, the drive it claims to be and the device path, because
+/// there is no `backend edit` (ADR-0012, #143): the repair is editing
+/// config.toml by hand, and the operator needs to know which block.
+fn cannot_write_message(
+    drive_gen: Generation,
+    medium_gen: Generation,
+    backend: &LtoBackendConfig,
+) -> String {
+    format!(
+        "an {drive_gen} drive cannot write {medium_gen} media. This is a physical \
+         limit of the drive, not a policy — --force does not override it. Load a \
+         {drive_gen}-writable cartridge, or write this one in a drive that can.\n\n\
+         If this drive is not really an {drive_gen}, `generation` in the \
+         [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
+         (`tapectl config show` prints it; there is no `backend edit`, by decision: \
+         ADR-0012, #143) and run `tapectl config check`.",
+        backend.name, backend.device_tape,
+    )
+}
+
+/// The read-side mirror of [`cannot_write_message`]: a drive that cannot
+/// READ the medium that is loaded. No `--force` here either — a read path
+/// has no consent tier to defeat in the first place, and the fact is exactly
+/// as physical as the write side's.
+///
+/// Names the drive generation, the medium generation, and the
+/// `[[backends.lto]]` entry the drive generation came from — the same
+/// recoverable half `cannot_write_message` carries, for the same reason:
+/// the fix may be the config, not the tape.
+fn cannot_read_message(
+    drive_gen: Generation,
+    medium_gen: Generation,
+    backend: &LtoBackendConfig,
+) -> String {
+    format!(
+        "an {drive_gen} drive cannot read {medium_gen} media. This is a physical limit \
+         of the drive, not a policy. Read this tape in a drive that can, or move it to \
+         one that can before restoring, verifying, or rebuilding from it.\n\n\
+         If this drive is not really an {drive_gen}, `generation` in the \
+         [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
+         (`tapectl config show` prints it; there is no `backend edit`, by decision: \
+         ADR-0012, #143) and run `tapectl config check`.",
+        backend.name, backend.device_tape,
+    )
+}
+
+/// Refuse if `backend`'s native generation cannot WRITE `medium` (ADR-0010
+/// decision 2). The one write-side fact check, called at every write contact:
+/// `volume_init`, `volume_write` (and everything that delegates to it) and
+/// `volume_resume`.
+///
+/// No `force` parameter, by construction — a physical fact is not a consent
+/// tier (ADR-0008 Tier 3), so nothing here could honour one anyway.
+pub fn check_drive_can_write(backend: &LtoBackendConfig, medium: Generation) -> Result<()> {
+    let drive_gen = backend.native_generation()?;
+    if Generation::can_write(drive_gen, medium) {
+        return Ok(());
+    }
+    Err(TapectlError::Other(cannot_write_message(
+        drive_gen, medium, backend,
+    )))
+}
+
+/// Refuse if `backend`'s native generation cannot READ `medium` (ADR-0010's
+/// ruling extending decision 2 to the read paths, issue #166). The mirror of
+/// [`check_drive_can_write`] over [`Generation::can_read`].
+pub fn check_drive_can_read(backend: &LtoBackendConfig, medium: Generation) -> Result<()> {
+    let drive_gen = backend.native_generation()?;
+    if Generation::can_read(drive_gen, medium) {
+        return Ok(());
+    }
+    Err(TapectlError::Other(cannot_read_message(
+        drive_gen, medium, backend,
+    )))
+}
+
+/// The read-path orchestrator (issue #166): refuse before a read-only store
+/// is opened if THIS drive cannot read the medium that is loaded, while
+/// staying usable with no configured backend at all (ADR-0010, "Read paths
+/// stay usable without a configured drive" — the DR path, ADR-0005).
+///
+/// Three ways this returns `Ok(())` without ever consulting
+/// [`check_drive_can_read`]:
+/// - no backend resolves for `device` at all (the rebuilt machine with keys
+///   and no `backend add` yet);
+/// - a backend resolves, but nothing on the medium yields a recognised
+///   generation (the same cannot-see-cannot-refuse rule
+///   [`super::write::check_loaded_generation`] already follows — a check
+///   that cannot see a fact cannot refuse on it).
+///
+/// **Must run before the caller opens its store for real** (`TapeStore::open`
+/// / `open_read`) **on the same device**: [`detect`] opens the device
+/// read-only and drops the fd, and the `st` driver refuses a second
+/// concurrent open.
+pub fn check_read_contact(config: &Config, device: &str) -> Result<()> {
+    let (_, backend) = crate::config::resolve_device(config, Some(device))?;
+    let Some(backend) = backend else {
+        return Ok(());
+    };
+    let detected = detect(device, &backend.device_sg);
+    let Some(medium) = detected.generation else {
+        return Ok(());
+    };
+    check_drive_can_read(backend, medium)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +752,103 @@ mod tests {
         let (_, src) = resolve_media(&det, None, None, Generation::Lto8).unwrap();
         assert_eq!(src, MediaSource::Detected(DetectSource::Driver));
         assert!(src.is_detected());
+    }
+
+    // ---- check_drive_can_write / check_drive_can_read (issue #166) ----
+
+    fn test_backend(name: &str, device_tape: &str, generation: &str) -> LtoBackendConfig {
+        LtoBackendConfig {
+            name: name.to_string(),
+            device_tape: device_tape.to_string(),
+            device_sg: "/dev/sg9".to_string(),
+            generation: generation.to_string(),
+            capacity_override: None,
+            usable_capacity_factor: 0.92,
+            enospc_buffer: "50M".to_string(),
+        }
+    }
+
+    /// Issue #178: the drive/medium refusal must name the config key, not only
+    /// the physics. Moved here (issue #166) with `cannot_write_message`
+    /// itself — same test, same assertions, new home.
+    ///
+    /// Both halves matter. The physics sentence alone sends an operator hunting
+    /// for the wrong cartridge when the cartridge is fine and
+    /// `[[backends.lto]].generation` is wrong — which is precisely what
+    /// `first-run.sh` used to produce by defaulting the DRIVE's generation from
+    /// whatever tape happened to be loaded during setup. There is no
+    /// `backend edit` (ADR-0012, #143), so the message has to say which block
+    /// to edit by hand.
+    #[test]
+    fn cannot_write_message_names_the_backend_block_and_keeps_the_physics() {
+        let backend = test_backend("lto6", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-5");
+        let msg = cannot_write_message(Generation::Lto5, Generation::Lto6, &backend);
+
+        // The physics half survives unchanged — this is ADR-0008 Tier 3 and
+        // `--force` must still be documented as not applying.
+        assert!(msg.contains("physical"), "{msg}");
+        assert!(msg.contains("--force does not override it"), "{msg}");
+
+        // The recoverable half: which block, which drive it claims to be,
+        // which device, and what to run afterwards.
+        assert!(msg.contains("[[backends.lto]]"), "{msg}");
+        assert!(msg.contains("generation"), "{msg}");
+        assert!(msg.contains("\"lto6\""), "{msg}");
+        assert!(msg.contains("/dev/tape/by-id/scsi-EXAMPLE-nst"), "{msg}");
+        assert!(msg.contains("config check"), "{msg}");
+    }
+
+    #[test]
+    fn an_lto7_drive_cannot_write_lto5_media() {
+        let backend = test_backend("lto7", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-7");
+        let err = check_drive_can_write(&backend, Generation::Lto5)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LTO-7"), "{err}");
+        assert!(err.contains("LTO-5"), "{err}");
+        assert!(err.contains("[[backends.lto]]"), "{err}");
+    }
+
+    #[test]
+    fn an_lto6_drive_writes_lto5_media() {
+        let backend = test_backend("lto6", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-6");
+        check_drive_can_write(&backend, Generation::Lto5).unwrap();
+    }
+
+    /// The table distinction only the read half shows: an LTO-6 drive reads
+    /// two generations back (LTO-4) but writes only one (LTO-5).
+    #[test]
+    fn an_lto6_drive_reads_lto4_media_but_cannot_write_it() {
+        let backend = test_backend("lto6", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-6");
+        check_drive_can_read(&backend, Generation::Lto4).unwrap();
+        let err = check_drive_can_write(&backend, Generation::Lto4).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot write"), "{msg}");
+    }
+
+    #[test]
+    fn an_lto9_drive_cannot_read_lto7_media() {
+        let backend = test_backend("lto9", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-9");
+        let err = check_drive_can_read(&backend, Generation::Lto7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot read"), "{err}");
+        assert!(err.contains("LTO-9"), "{err}");
+        assert!(err.contains("LTO-7"), "{err}");
+        assert!(err.contains("[[backends.lto]]"), "{err}");
+    }
+
+    // ---- check_read_contact: the DR-path leniency (ADR-0010/ADR-0005) ----
+
+    /// No backend resolved for this device at all — the rebuilt machine with
+    /// keys and no `backend add` yet. `check_read_contact` must return `Ok`
+    /// without ever calling `detect` on a real generation mismatch: proven
+    /// here by a `Config` with an empty backend list, so a device path that
+    /// is not even a real path cannot spuriously "pass" for any other
+    /// reason.
+    #[test]
+    fn no_backend_means_no_read_check() {
+        let config = Config::default();
+        check_read_contact(&config, "/nonexistent/tapectl-check-read-contact-device").unwrap();
     }
 }
