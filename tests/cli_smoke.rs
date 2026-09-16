@@ -397,7 +397,13 @@ fn init_config_show_roundtrip_exits_zero_with_no_deleted_keys() {
     assert!(shown.contains("[logging]"), "{shown}");
     assert!(shown.contains("level = \"warn\""), "{shown}");
     assert!(shown.contains("format = \"full\""), "{shown}");
-    for dead in ["[packing]", "[labels]", "strategy", "fill_threshold", "hash"] {
+    for dead in [
+        "[packing]",
+        "[labels]",
+        "strategy",
+        "fill_threshold",
+        "hash",
+    ] {
         assert!(
             !shown.contains(dead),
             "init's config still writes deleted key/section {dead:?}:\n{shown}"

@@ -631,9 +631,8 @@ impl Config {
         validate_checksum_mode(&self.defaults.checksum_mode).map_err(|e| {
             TapectlError::Config(format!("{}: defaults.checksum_mode: {e}", path.display()))
         })?;
-        validate_log_level(&self.logging.level).map_err(|e| {
-            TapectlError::Config(format!("{}: logging.level: {e}", path.display()))
-        })?;
+        validate_log_level(&self.logging.level)
+            .map_err(|e| TapectlError::Config(format!("{}: logging.level: {e}", path.display())))?;
         validate_log_format(&self.logging.format).map_err(|e| {
             TapectlError::Config(format!("{}: logging.format: {e}", path.display()))
         })?;
