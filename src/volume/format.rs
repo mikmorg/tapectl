@@ -806,8 +806,10 @@ load_count_at_write = 5
 [media]
 cartridge_serial = \"SERIAL1\"
 ";
-        let parsed = parse_id_thunk_media(bare).expect("a [media] table missing the new keys \
-            entirely must still parse");
+        let parsed = parse_id_thunk_media(bare).expect(
+            "a [media] table missing the new keys \
+            entirely must still parse",
+        );
         assert_eq!(parsed.cartridge_serial, "SERIAL1");
         assert_eq!(parsed.cartridge_manufacturer, None);
         assert_eq!(parsed.tape_length_meters, None);

@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
 use tapectl::crypto::keys::generate_keypair;
@@ -108,7 +109,30 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     })
 }
 
+/// Every existing test in this file wants a `mam`-sourced serial and does
+/// not care what it is — `"REBUILDSERIAL"` was always meant to represent one
+/// (issue #165's cartridge-binding tests are the first to need the other
+/// shapes File 0 can carry).
 fn build_sealed_volume_with(catalog_db: CatalogDb) -> SealedVolume {
+    build_sealed_volume_full(catalog_db, "REBUILDSERIAL", Some("mam"))
+}
+
+/// [`build_sealed_volume_with`], parameterized on the cartridge identity File
+/// 0 will carry (issue #165) — the same three shapes `rebuild`'s own
+/// resolution distinguishes:
+///
+/// - `(serial, Some("mam"))` — a chip-reported serial.
+/// - `(barcode, Some("operator"))` — an operator-typed barcode.
+/// - `(serial_or_empty, None)` — UNKNOWN: either the ADR-0010-to-#192 window
+///   (a non-empty serial with no identity source recorded) or a fully legacy
+///   write (`""`, standing in for a File 0 with no `[media]` table at all —
+///   `classify_media` treats both the same way, so this fixture does not
+///   need to fabricate a thunk with the whole table missing to exercise it).
+fn build_sealed_volume_full(
+    catalog_db: CatalogDb,
+    mam_serial: &str,
+    cartridge_identity_source: Option<&str>,
+) -> SealedVolume {
     let db_dir = tempfile::tempdir().unwrap();
     let conn = db::open(&db_dir.path().join("src.db")).unwrap();
 
@@ -292,8 +316,8 @@ fn build_sealed_volume_with(catalog_db: CatalogDb) -> SealedVolume {
         nominal_capacity: 2_400_000_000,
         mam_capacity: 2_400_000_000,
         mam_manufacturer: "TAPECTL-TEST".to_string(),
-        mam_serial: "REBUILDSERIAL".to_string(),
-        cartridge_identity_source: None,
+        mam_serial: mam_serial.to_string(),
+        cartridge_identity_source: cartridge_identity_source.map(str::to_string),
         mam_length: 0,
         mam_loads: 0,
         units: build_units.clone(),
@@ -429,6 +453,25 @@ fn rebuild(
     secret: &str,
     scratch: &Path,
 ) -> tapectl::error::Result<rebuild::RebuildReport> {
+    // No medium serial: a `MemStore` has no MAM, and a drive that reports
+    // none is an absence, which corroborates against nothing (ADR-0012,
+    // issue #193) — the DR shape this suite is about.
+    rebuild_observing(conn, vol, secret, scratch, None)
+}
+
+/// [`rebuild`], but standing in for a live drive that DID read a medium
+/// serial this contact (issue #165's operator-identity resolution: a serial
+/// observed now can supersede or corroborate a barcode File 0 recorded at
+/// write time). `MemStore` still carries no MAM of its own — this is the
+/// caller ASSERTING what a real drive would have reported, exactly as
+/// `rebuild_from_volume`'s own `medium_serial` parameter does in production.
+fn rebuild_observing(
+    conn: &rusqlite::Connection,
+    vol: &mut SealedVolume,
+    secret: &str,
+    scratch: &Path,
+    observed_serial: Option<&str>,
+) -> tapectl::error::Result<rebuild::RebuildReport> {
     let key_dir = tempfile::tempdir().unwrap();
     let key = key_file(key_dir.path(), "k.age.key", secret);
     let secret_str = tapectl::crypto::keys::read_secret_key(&key)?;
@@ -442,10 +485,7 @@ fn rebuild(
         Some("lto0"),
         scratch,
         "memstore",
-        // No medium serial: a `MemStore` has no MAM, and a drive that
-        // reports none is an absence, which corroborates against nothing
-        // (ADR-0012, issue #193) — the DR shape this suite is about.
-        None,
+        observed_serial,
     )
 }
 
@@ -752,6 +792,10 @@ fn row_counts(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
         "writes",
         "write_positions",
         "files",
+        // Issue #165: without these two, the idempotence test below proves
+        // nothing about the cartridge writes a rebuild now makes.
+        "cartridges",
+        "cartridge_volumes",
     ]
     .iter()
     .map(|t| {
@@ -761,6 +805,478 @@ fn row_counts(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
         (t.to_string(), n)
     })
     .collect()
+}
+
+// ── Issue #165: catalog rebuild binds the cartridge it observed ──────────
+
+fn cartridge_row(
+    conn: &rusqlite::Connection,
+    barcode: &str,
+) -> (String, Option<String>, String, String, i64) {
+    conn.query_row(
+        "SELECT barcode, serial_number, status, media_type, nominal_capacity
+         FROM cartridges WHERE barcode = ?1",
+        rusqlite::params![barcode],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .unwrap_or_else(|e| panic!("no cartridge row \"{barcode}\": {e}"))
+}
+
+fn open_mount_cartridge(conn: &rusqlite::Connection, volume_label: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT c.barcode FROM cartridge_volumes cv
+         JOIN cartridges c ON c.id = cv.cartridge_id
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE v.label = ?1 AND cv.unmounted_at IS NULL",
+        rusqlite::params![volume_label],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap()
+}
+
+fn cartridge_count(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM cartridges", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The defect itself, fixed: before issue #165, `insert_all` wrote a
+/// `volumes` row and its unit chain and NOTHING else — no `cartridges` row,
+/// no `cartridge_volumes` mount, so a recovered tape could never be
+/// re-bound. This is the `mam`-identity path (ADR-0012): File 0's own chip
+/// serial names a cartridge nothing in the catalog knows yet.
+#[test]
+fn a_rebuild_registers_the_cartridge_file_0_names_and_binds_the_volume_to_it() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let (barcode, serial, status, media_type, capacity) = cartridge_row(&conn, "REBUILDSERIAL");
+    assert_eq!(barcode, "REBUILDSERIAL");
+    assert_eq!(serial.as_deref(), Some("REBUILDSERIAL"));
+    assert_eq!(status, "in_use");
+    assert_eq!(media_type, "LTO-6");
+    assert_eq!(capacity, 2_400_000_000);
+    assert_eq!(cartridge_count(&conn), 1);
+    assert_eq!(
+        open_mount_cartridge(&conn, LABEL).as_deref(),
+        Some("REBUILDSERIAL"),
+        "the rebuilt volume must carry an open mount onto the registered cartridge"
+    );
+
+    assert!(report.cartridge_registered, "{report:?}");
+    assert!(report.cartridge_bound, "{report:?}");
+    assert_eq!(report.cartridge_barcode.as_deref(), Some("REBUILDSERIAL"));
+    assert!(report.unbound_reason.is_none());
+}
+
+/// The other half of the same path: a serial File 0 names that the catalog
+/// ALREADY has, registered by hand (an operator who registered the
+/// cartridge, with its real serial, before ever loading it for a rebuild).
+/// No second row, and the existing barcode is kept — rebuild binds to what
+/// it finds rather than re-registering under the serial.
+#[test]
+fn a_rebuild_binds_to_a_cartridge_already_registered_by_serial() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('L6-0001', 'LTO-6', 2400000000, 'REBUILDSERIAL', 'available')",
+        [],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(cartridge_count(&conn), 1, "no second row registered");
+    let (barcode, serial, status, _, _) = cartridge_row(&conn, "L6-0001");
+    assert_eq!(barcode, "L6-0001", "the existing barcode is kept");
+    assert_eq!(serial.as_deref(), Some("REBUILDSERIAL"));
+    assert_eq!(status, "in_use");
+    assert_eq!(
+        open_mount_cartridge(&conn, LABEL).as_deref(),
+        Some("L6-0001")
+    );
+
+    assert!(!report.cartridge_registered, "no new row this run");
+    assert!(report.cartridge_bound);
+    assert_eq!(report.cartridge_barcode.as_deref(), Some("L6-0001"));
+}
+
+/// Displacement is recorded (never refused) exactly when the serial PROVES
+/// the medium — a `mam` identity match is always that proof: the row was
+/// found BY the serial File 0 itself carries. The same ADR-0010 record used
+/// at `volume init`, now reachable from `catalog rebuild` too.
+#[test]
+fn a_rebuild_records_the_displacement_the_serial_proves() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('L6-0001', 'LTO-6', 2400000000, 'REBUILDSERIAL', 'in_use')",
+        [],
+    )
+    .unwrap();
+    let cartridge_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES ('L6-STALE', 'lto', 'lto0', 'LTO-6', 2400000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let stale_vol = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, 'mam')",
+        rusqlite::params![cartridge_id, stale_vol],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(report.displaced, vec!["L6-STALE".to_string()], "{report:?}");
+    let stale_status: String = conn
+        .query_row(
+            "SELECT status FROM volumes WHERE id = ?1",
+            rusqlite::params![stale_vol],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_status, "erased");
+    let displaced_event: String = conn
+        .query_row(
+            "SELECT details FROM events WHERE entity_type = 'cartridge' AND action = 'displaced'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("a displaced event");
+    assert!(
+        displaced_event.contains("catalog rebuild"),
+        "{displaced_event}"
+    );
+    assert!(displaced_event.contains("L6-STALE"), "{displaced_event}");
+    assert_eq!(
+        open_mount_cartridge(&conn, LABEL).as_deref(),
+        Some("L6-0001")
+    );
+}
+
+/// The un-witnessed-displacement refusal (issue #155's rule, rebuild's own
+/// version of it, item 3): an `operator`-identity barcode with no serial to
+/// prove it, bound in the catalog to a DIFFERENT live volume, must be
+/// refused before any write rather than silently displacing it.
+#[test]
+fn a_rebuild_refuses_a_barcode_bound_to_another_live_volume_without_serial_proof() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "OPBARCODE", Some("operator"));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+         VALUES ('OPBARCODE', 'LTO-6', 2400000000, 'in_use')",
+        [],
+    )
+    .unwrap();
+    let cartridge_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES ('L6-LIVE', 'lto', 'lto0', 'LTO-6', 2400000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let live_vol = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, 'operator')",
+        rusqlite::params![cartridge_id, live_vol],
+    )
+    .unwrap();
+
+    let before = row_counts(&conn);
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("OPBARCODE"), "{err}");
+    assert!(err.contains("L6-LIVE"), "{err}");
+    assert!(err.contains("no --force"), "{err}");
+    assert_eq!(before, row_counts(&conn), "a refusal must write nothing");
+}
+
+/// A rebuild that ALREADY has an open mount recorded to a DIFFERENT
+/// cartridge than the one this tape's own identity now names — item 3: "a
+/// row it finds" is never edited. Reachable only by hand-seeding a
+/// contradiction no ordinary sequence of rebuilds could produce; the
+/// defence exists anyway.
+#[test]
+fn a_rebuild_refuses_a_volume_the_catalog_mounts_elsewhere() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2400000000, 'sealed')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+         VALUES ('WRONG-CART', 'LTO-6', 2400000000, 'in_use')",
+        [],
+    )
+    .unwrap();
+    let wrong_cart = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, 'operator')",
+        rusqlite::params![wrong_cart, volume_id],
+    )
+    .unwrap();
+
+    let before = row_counts(&conn);
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("WRONG-CART"), "{err}");
+    assert!(err.contains("never edits a row it finds"), "{err}");
+    assert_eq!(before, row_counts(&conn), "a refusal must write nothing");
+}
+
+/// The explicit trap (item 3): a legacy File 0 recording NO cartridge
+/// identity at all (`cartridge_serial = ""`) must not fail the rebuild. The
+/// volume rebuilds unbound, and the report says why.
+#[test]
+fn a_legacy_file_0_with_no_serial_rebuilds_unbound_and_says_so() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "", None);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert!(report.volume_inserted, "{report:?}");
+    assert!(!report.cartridge_registered, "{report:?}");
+    assert!(!report.cartridge_bound, "{report:?}");
+    assert!(report.cartridge_barcode.is_none(), "{report:?}");
+    assert!(
+        report.unbound_reason.is_some(),
+        "the report must say why it could not bind: {report:?}"
+    );
+    assert_eq!(cartridge_count(&conn), 0);
+    assert_eq!(open_mount_cartridge(&conn, LABEL), None);
+}
+
+/// The SAME legacy outcome, but for the OTHER shape `classify_media`
+/// treats as unknown: a non-empty `cartridge_serial` with no
+/// `cartridge_identity_source` recorded at all — the ADR-0010-to-#192
+/// window. Distinct code path from the empty-serial case above; both must
+/// land here, and the report should say which.
+#[test]
+fn a_serial_with_no_identity_source_also_rebuilds_unbound_and_says_so() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "PRE192SERIAL", None);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert!(!report.cartridge_bound, "{report:?}");
+    assert_eq!(cartridge_count(&conn), 0);
+    let reason = report
+        .unbound_reason
+        .as_deref()
+        .expect("the report must say why");
+    assert!(
+        reason.contains("PRE192SERIAL"),
+        "the reason should name the serial nobody can vouch for: {reason}"
+    );
+}
+
+/// The recipe `volume_init`'s `AlreadySealed` refusal already prints —
+/// `tapectl cartridge mark-erased <barcode>` — must be runnable on a
+/// rebuilt tape. Before issue #165 there was no row to name at all.
+#[test]
+fn the_already_sealed_recipe_is_runnable_on_a_rebuilt_tape() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    tapectl::cli::operations::cartridge_mark_erased(
+        &conn,
+        "REBUILDSERIAL",
+        true,
+        false,
+        false,
+        false,
+    )
+    .expect("a rebuilt cartridge must be nameable by cartridge mark-erased");
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM cartridges WHERE barcode = 'REBUILDSERIAL'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "available");
+    let vol_status: String = conn
+        .query_row(
+            "SELECT status FROM volumes WHERE label = ?1",
+            rusqlite::params![LABEL],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(vol_status, "erased");
+}
+
+/// The `operator`-identity path (ADR-0012's other half): File 0 carries a
+/// barcode, not a chip serial. A live drive reading a serial THIS contact
+/// separately corroborates it — the row learns that serial (`NULL` →
+/// value, once).
+#[test]
+fn a_rebuild_registers_under_the_operator_barcode_and_learns_the_serial() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "OPBARCODE", Some("operator"));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report =
+        rebuild_observing(&conn, &mut vol, &secret, scratch.path(), Some("SER-LIVE")).unwrap();
+
+    let (barcode, serial, status, _, _) = cartridge_row(&conn, "OPBARCODE");
+    assert_eq!(barcode, "OPBARCODE");
+    assert_eq!(serial.as_deref(), Some("SER-LIVE"));
+    assert_eq!(status, "in_use");
+    assert!(report.cartridge_registered, "{report:?}");
+    assert!(report.cartridge_bound, "{report:?}");
+    assert_eq!(report.cartridge_barcode.as_deref(), Some("OPBARCODE"));
+}
+
+/// The corroboration half stated as a refusal: an `operator`-identity
+/// barcode whose row ALREADY carries a DIFFERENT serial than what this
+/// contact observed means another cartridge is wearing that sticker.
+#[test]
+fn a_rebuild_refuses_an_operator_barcode_whose_row_carries_another_serial() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "OPBARCODE", Some("operator"));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('OPBARCODE', 'LTO-6', 2400000000, 'SER-RECORDED', 'available')",
+        [],
+    )
+    .unwrap();
+
+    let before = row_counts(&conn);
+    let err = rebuild_observing(&conn, &mut vol, &secret, scratch.path(), Some("SER-LIVE"))
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("OPBARCODE"), "{err}");
+    assert!(err.contains("SER-RECORDED"), "{err}");
+    assert!(err.contains("SER-LIVE"), "{err}");
+    assert_eq!(before, row_counts(&conn), "a refusal must write nothing");
+}
+
+/// ADR-0012: "the loaded tape *is* that other cartridge" — a live serial
+/// this contact observed can match a DIFFERENT row than the barcode File 0
+/// recorded. The medium's own serial outranks a sticker; the superseded
+/// barcode is reported, not silently dropped.
+#[test]
+fn a_live_serial_supersedes_the_operator_barcode_when_it_matches_another_row() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "OPBARCODE", Some("operator"));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('REAL-CART', 'LTO-6', 2400000000, 'SER-LIVE', 'available')",
+        [],
+    )
+    .unwrap();
+
+    let report =
+        rebuild_observing(&conn, &mut vol, &secret, scratch.path(), Some("SER-LIVE")).unwrap();
+
+    assert_eq!(cartridge_count(&conn), 1, "no second row registered");
+    assert_eq!(
+        open_mount_cartridge(&conn, LABEL).as_deref(),
+        Some("REAL-CART")
+    );
+    assert_eq!(
+        report.cartridge_barcode_superseded.as_deref(),
+        Some("OPBARCODE")
+    );
+    assert_eq!(report.cartridge_barcode.as_deref(), Some("REAL-CART"));
+}
+
+/// Item 3's `retired_permanent` carve-out: the mount is recorded as a
+/// physical fact, but the cartridge's status is left exactly as found — no
+/// amount of contact makes a medium declared permanently unfit fit again
+/// (ADR-0011), and rebuild must never call anything resembling
+/// `refuse_retired`.
+#[test]
+fn a_rebuild_mounts_onto_a_retired_permanent_cartridge_without_reviving_it() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('REBUILDSERIAL', 'LTO-6', 2400000000, 'REBUILDSERIAL', 'retired_permanent')",
+        [],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("a retired_permanent cartridge must not refuse the rebuild");
+
+    let (_, _, status, _, _) = cartridge_row(&conn, "REBUILDSERIAL");
+    assert_eq!(
+        status, "retired_permanent",
+        "rebuild must never revive a retired_permanent cartridge's status"
+    );
+    assert_eq!(
+        open_mount_cartridge(&conn, LABEL).as_deref(),
+        Some("REBUILDSERIAL"),
+        "the mount is a physical fact and is still recorded"
+    );
+    assert!(report.cartridge_retired, "{report:?}");
+    assert!(report.cartridge_bound, "{report:?}");
 }
 
 /// The access-control boundary, and the reason it needs no key introspection:
@@ -1202,7 +1718,13 @@ fn the_dr_path_rebuilds_with_no_catalog_row_at_all() {
 /// corroboration is the defect returning".
 #[test]
 fn rebuild_refuses_when_the_catalog_binds_that_volume_to_another_cartridge() {
-    let mut vol = build_sealed_volume(true);
+    // The tape's OWN File 0 must agree with what the drive reports below
+    // (`"SER-DRIVE"`) — this test is about the CATALOG's cartridge binding
+    // (`SER-SHELF`) disagreeing with the drive, a different contradiction
+    // from issue #165 item 4's File-0-vs-drive check. Using the shared
+    // `"REBUILDSERIAL"` default here would trip that check first, on a
+    // string this test never intended to be a claim about anything.
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "SER-DRIVE", Some("mam"));
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     let scratch = tempfile::tempdir().unwrap();

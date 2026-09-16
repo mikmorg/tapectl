@@ -117,6 +117,74 @@ pub struct RebuildReport {
     /// status an operator established on purpose would destroy a fact,
     /// not a mistake, so the fix is to surface the mismatch, not repair it.
     pub volume_status_mismatch: Option<String>,
+
+    // --- cartridge identity (issue #165) -----------------------------------
+    //
+    // Before this, `insert_all` wrote a `volumes` row and its unit chain and
+    // nothing else: no `cartridges` row, no `cartridge_volumes` mount, so a
+    // recovered tape could never be re-bound (`cartridge mark-erased`,
+    // `cartridge move`/`info` all die with no row to name). ADR-0012's
+    // ruling: "`catalog rebuild --from-volume` binds the cartridge it
+    // observed (from File 0's identity)". These fields are additive; every
+    // key above is unchanged.
+    /// The cartridge this volume was bound (or would be bound) to, once
+    /// resolved — set even when nothing NEW was written this run (an
+    /// idempotent second rebuild still names it), unlike the write counters
+    /// below.
+    pub cartridge_barcode: Option<String>,
+    /// A new `cartridges` row was inserted this run, from File 0's identity
+    /// alone (no catalog and no `--cartridge` — rebuild resolves its own
+    /// identity claim, never `binding::lookup_cartridge`'s).
+    pub cartridge_registered: bool,
+    /// A `cartridge_volumes` mount was opened this run. `false` on an
+    /// idempotent re-run that found the volume already mounted to the same
+    /// cartridge, and `false` when [`Self::unbound_reason`] is set — a
+    /// legacy tape whose identity File 0 cannot attest is inserted unbound,
+    /// on purpose (do not force one).
+    pub cartridge_bound: bool,
+    /// The bound cartridge row had no `serial_number` recorded, and this
+    /// contact separately observed one and recorded it (`NULL` → value,
+    /// once — ADR-0012). Only reachable on the `operator`-identity path: the
+    /// `mam`-identity path only ever finds a row BY its serial, so it always
+    /// already has one.
+    pub serial_learned: bool,
+    /// Whether THIS contact observed a medium serial at all (a real drive
+    /// read returned `Some`, whether or not it matched anything) — distinct
+    /// from [`Self::serial_learned`], which is whether that observation was
+    /// recorded onto a row. `false` covers two different facts a report
+    /// reader needs told apart: no backend was configured for this device at
+    /// all (ADR-0010's DR leniency — `catalog rebuild` stays usable with keys
+    /// and no `backend add`), or a backend was configured and its drive
+    /// simply reported no serial. `catalog rebuild` on a `MemStore` (every
+    /// test in this module) also reads `false` — there is no MAM to read.
+    pub serial_checked: bool,
+    /// Cartridge `barcode` the resolved identity SUPERSEDED: File 0's
+    /// `operator`-sourced barcode named one cartridge, but the serial this
+    /// contact observed matched a DIFFERENT row — ADR-0012: "the loaded tape
+    /// *is* that other cartridge". `None` in every other case, including
+    /// every `mam`-identity rebuild (there is no barcode to supersede).
+    pub cartridge_barcode_superseded: Option<String>,
+    /// Labels of volumes displaced from the bound cartridge this run — the
+    /// same ADR-0010 record-don't-refuse displacement `volume init` performs,
+    /// reachable here only when a chip serial proves the medium (a `mam`
+    /// identity match, or an `operator` identity the observed serial
+    /// superseded); an unwitnessed displacement is refused before any write
+    /// (ADR-0012, issue #155's rule, rebuild's own version of it).
+    pub displaced: Vec<String>,
+    /// The bound cartridge's status was (and remains) `retired_permanent`.
+    /// Rebuild records the mount as a physical fact — the tape IS on that
+    /// cartridge — but never calls anything resembling `refuse_retired`, and
+    /// never flips the status back to `in_use`: no amount of contact makes a
+    /// medium declared permanently unfit fit again (ADR-0011).
+    pub cartridge_retired: bool,
+    /// Why the volume was inserted with NO cartridge binding at all: File 0
+    /// carries no `[media]` table (pre-ADR-0010), an empty `cartridge_serial`
+    /// (a legacy write with nothing to attest), or a non-empty serial with no
+    /// `cartridge_identity_source` (written in the ADR-0010-to-#192 window —
+    /// UNKNOWN, and never assumed to be `"mam"`; `volume-format-v2.md` §1.1).
+    /// `None` whenever a cartridge WAS resolved (bound, registered, or
+    /// refused outright).
+    pub unbound_reason: Option<String>,
 }
 
 impl RebuildReport {
@@ -133,6 +201,10 @@ impl RebuildReport {
             && self.positions == 0
             && self.files == 0
             && self.attested == 0
+            && !self.cartridge_registered
+            && !self.cartridge_bound
+            && !self.serial_learned
+            && self.displaced.is_empty()
     }
 }
 
@@ -209,6 +281,32 @@ pub fn rebuild_from_store(
     let ident = format::parse_id_thunk_identity(&thunk_text)?;
     let pointers = format::parse_id_thunk_layout_pointers(&thunk_text)?;
     let meta = format::parse_id_thunk_volume_meta(&thunk_text)?;
+    // Absent/malformed `[media]` is an ABSENCE (`format::parse_id_thunk_media`'s
+    // own fail-safe convention), never a reason to fail the rebuild — the
+    // legacy tapes this covers are exactly what issue #165's "insert unbound"
+    // path exists for.
+    let media = format::parse_id_thunk_media(&thunk_text).ok();
+    let identity = classify_media(media.as_ref());
+
+    // Item 4 (issue #165): a `mam`-sourced File 0 that disagrees with a
+    // serial THIS CONTACT actually observed is refused before any write.
+    // `corroborate_volume` below only fires when `claim_volume_id` already
+    // exists — the DR case (no row for this label yet) is the NORMAL one for
+    // a rebuild, and it returns `Agreed` unconditionally on an absent claim,
+    // so it never sees this disagreement on a fresh rebuild.
+    if let RebuildIdentity::Mam(s) = &identity {
+        if let Some(observed) = medium_serial {
+            if observed != s {
+                return Err(TapectlError::Other(format!(
+                    "wrong cartridge: this tape's File 0 records medium serial {s}, but the \
+                     drive holds {observed}. Load the cartridge this tape's own identity \
+                     names, or run without a configured backend for this device if you \
+                     cannot. There is no --force for this — it is a fact tapectl cannot \
+                     resolve on its own, not a risk to accept."
+                )));
+            }
+        }
+    }
 
     if let Some(expected) = expect_label {
         if expected != ident.label {
@@ -264,6 +362,7 @@ pub fn rebuild_from_store(
         uuid: ident.uuid.clone(),
         envelopes_opened: opened.len(),
         had_catalog_db: operator.catalog_db.is_some(),
+        serial_checked: medium_serial.is_some(),
         ..Default::default()
     };
 
@@ -288,6 +387,16 @@ pub fn rebuild_from_store(
         fallback_tenant,
         backend_name,
         &supplement,
+        &mut report,
+    )?;
+    resolve_and_bind_cartridge(
+        &tx,
+        volume_id,
+        &ident.label,
+        &identity,
+        medium_serial,
+        &meta,
+        media.as_ref(),
         &mut report,
     )?;
     attest_escrow(&tx, store, identities, &operator.manifest, &mut report)?;
@@ -1055,10 +1164,34 @@ fn record_event(
     volume_id: i64,
     device: &str,
 ) -> Result<()> {
+    // The cartridge clause (issue #165): names what File 0's identity
+    // resolved to, so the events row — a ledger of claims, ADR-0001 — records
+    // WHICH cartridge this rebuild bound as plainly as it already records
+    // which tenants/units/snapshots it inserted.
+    let cartridge_clause = match (&report.cartridge_barcode, &report.unbound_reason) {
+        (Some(barcode), _) if report.cartridge_registered => {
+            format!("; registered and bound cartridge \"{barcode}\"")
+        }
+        (Some(barcode), _) if report.cartridge_bound => {
+            format!("; bound to cartridge \"{barcode}\"")
+        }
+        (Some(barcode), _) => format!("; already on cartridge \"{barcode}\" (unchanged)"),
+        (None, Some(reason)) => format!("; left unbound ({reason})"),
+        (None, None) => String::new(),
+    };
+    let displaced_clause = if report.displaced.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; displaced from that cartridge: {}",
+            report.displaced.join(", ")
+        )
+    };
+
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{cartridge_clause}{displaced_clause}",
         report.label,
         report.uuid,
         device,
@@ -1092,6 +1225,429 @@ fn record_event(
         None,
     )?;
     Ok(())
+}
+
+// ── Cartridge identity (issue #165) ──────────────────────────────────────
+//
+// Everything below reconstructs the one thing `insert_all` never touched:
+// which physical cartridge this tape is on. ADR-0012's ruling: "`catalog
+// rebuild --from-volume` binds the cartridge it observed (from File 0's
+// identity)". Deliberately its own resolution, not `binding::lookup_cartridge`
+// or `binding::resolve_or_register_cartridge`: rebuild has no `--cartridge`
+// to prefer or fall back from, and exactly ONE identity claim — read off the
+// tape itself, tagged `mam` or `operator` by File 0's own
+// `cartridge_identity_source` (issue #192). It shares
+// `binding::mount_and_record` for everything after a row is settled on:
+// displacement, the `cartridge_volumes` mount, ADR-0011 location
+// inheritance, and the `in_use` transition are the one implementation
+// ADR-0010 already established, and rebuild does not get a second copy.
+
+/// What File 0's `[media]` table lets a rebuild claim about the cartridge —
+/// classified once so every branch below reasons about ONE of three shapes
+/// rather than re-deriving it from `Option<format::IdThunkMedia>` each time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RebuildIdentity {
+    /// A chip-reported serial. Proves which physical cartridge this is —
+    /// established at WRITE time by a real MAM read (migration 014's
+    /// write-once rule), so a rebuild trusts it without needing its own live
+    /// drive access (ADR-0010's DR leniency: keys and no `backend add`).
+    Mam(String),
+    /// An operator-typed barcode. Corroborated through the catalog binding,
+    /// never string-matched against it (ADR-0012) — `cartridge relabel` is
+    /// legitimate and must not break this.
+    Operator(String),
+    /// No identity this rebuild can safely assume, with the reason so the
+    /// operator-facing warning can say which. Never treated as `Mam`:
+    /// `docs/design/volume-format-v2.md` §1.1 forbids defaulting an absent
+    /// `cartridge_identity_source` to `"mam"`.
+    Unknown(String),
+}
+
+/// Classify File 0's `[media]` claim. `media = None` covers both "no
+/// `[media]` table at all" (pre-ADR-0010) and "the table was unparseable" —
+/// `rebuild_from_store` folds `parse_id_thunk_media`'s `Err` into `None` via
+/// `.ok()` before calling this, matching every other absence in this format
+/// (`format.rs`'s fail-safe convention: absent/malformed is an `Err`, and the
+/// caller decides what absence means).
+fn classify_media(media: Option<&format::IdThunkMedia>) -> RebuildIdentity {
+    let Some(media) = media else {
+        return RebuildIdentity::Unknown(
+            "this tape's File 0 carries no [media] table (written before ADR-0010)".to_string(),
+        );
+    };
+    if media.cartridge_serial.is_empty() {
+        return RebuildIdentity::Unknown(
+            "this tape's File 0 [media] table records no cartridge identity \
+             (cartridge_serial is empty)"
+                .to_string(),
+        );
+    }
+    match media.cartridge_identity_source.as_deref() {
+        Some("mam") => RebuildIdentity::Mam(media.cartridge_serial.clone()),
+        Some("operator") => RebuildIdentity::Operator(media.cartridge_serial.clone()),
+        _ => RebuildIdentity::Unknown(format!(
+            "this tape's File 0 records cartridge_serial \"{}\" but no \
+             cartridge_identity_source (written before issue #192) — it cannot be told \
+             apart from an operator-typed barcode, so it is not assumed to be a \
+             chip-verified serial",
+            media.cartridge_serial
+        )),
+    }
+}
+
+/// A resolved (found, or freshly registered) cartridge row, ready for
+/// [`crate::volume::binding::mount_and_record`].
+struct ResolvedCartridge {
+    id: i64,
+    barcode: String,
+    prior_status: String,
+    /// A serial match PROVES this is the right physical cartridge — always
+    /// true for a `mam` identity (the row was found BY that serial, which
+    /// was itself corroborated against any live drive read before the
+    /// transaction opened, or the row is brand new) and for an `operator`
+    /// identity a live serial match SUPERSEDED; false for an `operator`
+    /// identity resolved by barcode alone with no live serial to corroborate
+    /// it against.
+    witnessed: bool,
+}
+
+/// Resolve File 0's cartridge claim to a row (auto-registering when nothing
+/// matches) and, on success, mount `volume_id` onto it via
+/// [`crate::volume::binding::mount_and_record`] — the whole of issue #165
+/// items 3 through 5.
+///
+/// Called inside `rebuild_from_store`'s transaction, after the `volumes`
+/// INSERT: a volume that exists but is not bound, or a mount recorded for a
+/// volume that was never created, are both worse than either change alone.
+///
+/// Never reads or writes `volumes.status` (item 5) — every status touched
+/// here belongs to some OTHER volume (a displaced one, flipped to `erased`
+/// by `mount_and_record`, exactly as `volume init` already does) or to the
+/// bound `cartridges` row. The rebuilt volume's own status is #158's, landed
+/// separately, and this function does not look at it.
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_bind_cartridge(
+    tx: &Connection,
+    volume_id: i64,
+    label: &str,
+    identity: &RebuildIdentity,
+    observed_serial: Option<&str>,
+    meta: &format::IdThunkVolumeMeta,
+    media: Option<&format::IdThunkMedia>,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let unknown_reason = match identity {
+        RebuildIdentity::Unknown(reason) => Some(reason.clone()),
+        _ => None,
+    };
+    if let Some(reason) = unknown_reason {
+        // The explicit trap this item calls out: a legacy File 0 must not
+        // fail the rebuild. The volume `insert_all` just wrote stays
+        // unbound; warn (via the report — `cli::catalog` prints it) and say
+        // why. A later run that observes a real identity binds it, because
+        // rebuild "only inserts what is missing" (this module's own "What it
+        // deliberately does not do").
+        report.unbound_reason = Some(reason);
+        return Ok(());
+    }
+
+    let resolved = match identity {
+        RebuildIdentity::Unknown(_) => unreachable!("handled above"),
+        RebuildIdentity::Mam(serial) => resolve_mam_identity(tx, serial, meta, media, report)?,
+        RebuildIdentity::Operator(barcode) => {
+            resolve_operator_identity(tx, barcode, observed_serial, meta, media, report)?
+        }
+    };
+    report.cartridge_barcode = Some(resolved.barcode.clone());
+
+    // Idempotence (acceptance: "rebuilding the same volume twice changes
+    // nothing the second time") and "never edits a row it finds" in one
+    // check: does `volume_id` already carry an open mount?
+    let already_mounted: Option<i64> = tx
+        .query_row(
+            "SELECT cartridge_id FROM cartridge_volumes
+             WHERE volume_id = ?1 AND unmounted_at IS NULL",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = already_mounted {
+        if existing != resolved.id {
+            let existing_barcode: String = tx.query_row(
+                "SELECT barcode FROM cartridges WHERE id = ?1",
+                params![existing],
+                |r| r.get(0),
+            )?;
+            return Err(TapectlError::Other(format!(
+                "volume \"{label}\" is already bound to cartridge \"{existing_barcode}\" in \
+                 this catalog, but this tape's own identity names cartridge \"{}\". `catalog \
+                 rebuild` never edits a row it finds — resolve the mismatch by hand before \
+                 re-running.",
+                resolved.barcode
+            )));
+        }
+        // Same cartridge: an idempotent re-run. Nothing left to do — and
+        // nothing counted as newly written, matching `is_noop()`'s contract.
+        return Ok(());
+    }
+
+    // The unwitnessed-displacement refusal (item 3), rebuild's own version of
+    // `binding::refuse_unwitnessed_displacement` (issue #155's rule): that
+    // function assumes a PRE-transaction caller with no self-mount to
+    // exclude and its message says "re-run this init" — wrong on both counts
+    // here, so this is its own query and its own wording, naming both
+    // volumes.
+    if !resolved.witnessed {
+        let sql = format!(
+            "SELECT v.label FROM cartridge_volumes cv
+             JOIN volumes v ON v.id = cv.volume_id
+             WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL AND cv.volume_id != ?2
+               AND {}",
+            crate::policy::coverage::in_service("v")
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let live: Vec<String> = stmt
+            .query_map(params![resolved.id, volume_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if !live.is_empty() {
+            let (is_are, volume_s) = if live.len() == 1 {
+                ("is", "volume")
+            } else {
+                ("are", "volumes")
+            };
+            let labels = live
+                .iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(TapectlError::Other(format!(
+                "wrong cartridge: volume \"{label}\"'s tape names cartridge \"{}\" by \
+                 barcode, with no chip serial to prove it, but this catalog already binds \
+                 \"{}\" to {volume_s} {labels}, which {is_are} still live. Say the bytes are \
+                 gone first (`tapectl volume retire <label>` or `tapectl cartridge \
+                 mark-erased {}`), or re-run naming the cartridge that really holds this \
+                 tape's data. There is no --force for this — it is a fact tapectl cannot \
+                 resolve on its own, not a risk to accept.",
+                resolved.barcode, resolved.barcode, resolved.barcode
+            )));
+        }
+    }
+
+    let is_retired = resolved.prior_status == "retired_permanent";
+    report.cartridge_retired = is_retired;
+
+    // No live `MamInfo` here — rebuild has, at most, a bare medium serial
+    // (`loaded_medium_serial`, only when a backend resolved); `default()`
+    // means `mount_and_record`'s `total_load_count` COALESCE is a no-op,
+    // preserving whatever the row already had rather than asserting a
+    // reading nobody took.
+    let mam = crate::tape::mam::MamInfo::default();
+    let serial_for_mount = match identity {
+        RebuildIdentity::Mam(s) => Some(s.as_str()),
+        // The binding's `identity_source` must read `"operator"`, matching
+        // what File 0 already claims — even when this contact separately
+        // learned a serial onto the row. `mount_and_record` decides
+        // `identity_source` from this argument alone.
+        RebuildIdentity::Operator(_) => None,
+        RebuildIdentity::Unknown(_) => unreachable!("handled above"),
+    };
+    // `update_status = !is_retired` (item 3's `retired_permanent` carve-out):
+    // the mount is a physical fact, recorded either way, but no amount of
+    // contact makes a medium declared permanently unfit fit again — never
+    // call anything resembling `refuse_retired`, and never flip the status
+    // back to `in_use` (ADR-0011).
+    let outcome = crate::volume::binding::mount_and_record(
+        tx,
+        volume_id,
+        resolved.id,
+        &resolved.barcode,
+        &resolved.prior_status,
+        serial_for_mount,
+        &mam,
+        "catalog rebuild",
+        !is_retired,
+    )?;
+    report.cartridge_bound = true;
+    report.displaced = outcome.displaced.into_iter().map(|d| d.label).collect();
+    Ok(())
+}
+
+/// The `mam`-identity resolve: find by `serial_number`, else auto-register
+/// with `barcode = serial_number = S` — the same convention
+/// `binding::resolve_or_register_cartridge`'s auto-register uses, but never
+/// calling it directly: that function only ever auto-registers FROM a
+/// serial (never a barcode, and rebuild's operator path needs exactly that),
+/// so sharing it for one identity and not the other would read as more
+/// coupled than two short, obviously-parallel functions actually are.
+fn resolve_mam_identity(
+    tx: &Connection,
+    serial: &str,
+    meta: &format::IdThunkVolumeMeta,
+    media: Option<&format::IdThunkMedia>,
+    report: &mut RebuildReport,
+) -> Result<ResolvedCartridge> {
+    if let Some(row) = crate::volume::binding::select_cartridge(tx, "serial_number", serial)? {
+        return Ok(ResolvedCartridge {
+            id: row.id,
+            barcode: row.barcode,
+            prior_status: row.status,
+            witnessed: true,
+        });
+    }
+
+    // Same collision `bind_cartridge`'s own auto-register arm refuses: a row
+    // already registered under barcode = S (an operator who hand-registered
+    // a cartridge using the serial printed on its shell, before it was ever
+    // loaded). Refuse by name rather than surface the raw UNIQUE constraint
+    // failure, or silently adopt a row that might be a different physical
+    // cartridge.
+    if crate::volume::binding::select_cartridge(tx, "barcode", serial)?.is_some() {
+        return Err(TapectlError::Other(format!(
+            "this tape's File 0 reports medium serial {serial}, which matches no registered \
+             cartridge's serial_number — but a cartridge is already registered under the \
+             barcode \"{serial}\". `catalog rebuild` cannot tell whether that is this same \
+             physical cartridge, registered by hand before it was ever loaded, or a \
+             different one whose sticker happens to read the same. It will not guess.\n\
+             \n\
+             If it IS this cartridge, bind the serial onto it by hand, then re-run this \
+             rebuild:\n    \
+             tapectl volume init <a throwaway label> --device <dev> --cartridge {serial}\n\
+             \n\
+             If it is a DIFFERENT cartridge, give the registered one a barcode of its own:\n    \
+             tapectl cartridge relabel {serial} <new-barcode>"
+        )));
+    }
+
+    let manufacturer = media.and_then(|m| m.cartridge_manufacturer.as_deref());
+    let length = media.and_then(|m| m.tape_length_meters);
+    // `total_load_count` bound explicitly to `NULL`, not left to the
+    // schema's `DEFAULT 0` (issue #184): rebuild has no live load-count
+    // reading at all, and the schema default would assert a false "zero
+    // loads" rather than "never observed".
+    tx.execute(
+        "INSERT INTO cartridges
+            (barcode, media_type, manufacturer, serial_number, tape_length_meters,
+             nominal_capacity, status, total_load_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'in_use', NULL)",
+        params![
+            serial,
+            meta.media_type,
+            manufacturer,
+            serial,
+            length,
+            meta.nominal_capacity_bytes,
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    crate::db::events::log_created(tx, "cartridge", id, serial, None)?;
+    report.cartridge_registered = true;
+    Ok(ResolvedCartridge {
+        id,
+        barcode: serial.to_string(),
+        prior_status: "in_use".to_string(),
+        witnessed: true,
+    })
+}
+
+/// The `operator`-identity resolve: a serial this contact separately
+/// observed (if any) wins over the barcode — exactly the priority
+/// `binding::lookup_cartridge` gives `--cartridge` at `volume init`: the
+/// serial is read off THIS medium, while the barcode is a sticker File 0
+/// recorded at write time and may since have been relabelled (ADR-0012).
+fn resolve_operator_identity(
+    tx: &Connection,
+    barcode: &str,
+    observed_serial: Option<&str>,
+    meta: &format::IdThunkVolumeMeta,
+    media: Option<&format::IdThunkMedia>,
+    report: &mut RebuildReport,
+) -> Result<ResolvedCartridge> {
+    if let Some(observed) = observed_serial {
+        if let Some(row) = crate::volume::binding::select_cartridge(tx, "serial_number", observed)?
+        {
+            // ADR-0012: "the loaded tape *is* that other cartridge" — the
+            // medium's own serial outranks a sticker File 0 merely recorded.
+            if row.barcode != barcode {
+                report.cartridge_barcode_superseded = Some(barcode.to_string());
+            }
+            return Ok(ResolvedCartridge {
+                id: row.id,
+                barcode: row.barcode,
+                prior_status: row.status,
+                witnessed: true,
+            });
+        }
+    }
+
+    match crate::volume::binding::select_cartridge(tx, "barcode", barcode)? {
+        Some(row) => {
+            if let (Some(recorded), Some(observed)) = (&row.serial_number, observed_serial) {
+                if recorded != observed {
+                    return Err(TapectlError::Other(format!(
+                        "wrong cartridge: this tape's File 0 names cartridge \"{barcode}\" by \
+                         barcode, but this catalog records \"{barcode}\" as medium serial \
+                         {recorded}, and the drive holds {observed}. Another cartridge is \
+                         wearing \"{barcode}\"'s sticker. There is no --force for this — it \
+                         is a fact tapectl cannot resolve on its own, not a risk to accept."
+                    )));
+                }
+            }
+            // Computed from the row as SELECTed, before any learning below —
+            // a serial recorded FOR THE FIRST TIME by this very contact
+            // proves nothing about a displacement this same contact is about
+            // to consider (item 3: "a row whose serial was NULL ... proves
+            // nothing about it").
+            let witnessed = matches!(
+                (&row.serial_number, observed_serial),
+                (Some(r), Some(o)) if r == o
+            );
+            if row.serial_number.is_none() {
+                if let Some(observed) = observed_serial {
+                    crate::volume::binding::record_medium_serial(
+                        tx,
+                        row.id,
+                        &row.barcode,
+                        observed,
+                    )?;
+                    report.serial_learned = true;
+                }
+            }
+            Ok(ResolvedCartridge {
+                id: row.id,
+                barcode: row.barcode,
+                prior_status: row.status,
+                witnessed,
+            })
+        }
+        None => {
+            // `total_load_count` explicit `NULL`, same reasoning as
+            // `resolve_mam_identity`'s auto-register arm.
+            tx.execute(
+                "INSERT INTO cartridges
+                    (barcode, media_type, manufacturer, serial_number, tape_length_meters,
+                     nominal_capacity, status, total_load_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'in_use', NULL)",
+                params![
+                    barcode,
+                    meta.media_type,
+                    media.and_then(|m| m.cartridge_manufacturer.as_deref()),
+                    observed_serial,
+                    media.and_then(|m| m.tape_length_meters),
+                    meta.nominal_capacity_bytes,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            crate::db::events::log_created(tx, "cartridge", id, barcode, None)?;
+            report.cartridge_registered = true;
+            Ok(ResolvedCartridge {
+                id,
+                barcode: barcode.to_string(),
+                prior_status: "in_use".to_string(),
+                witnessed: true,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
