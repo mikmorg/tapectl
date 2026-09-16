@@ -2783,8 +2783,14 @@ mod tests {
             ),
         };
         let msg = err.to_string();
-        assert!(msg.contains("BC001"), "must name the existing cartridge: {msg}");
-        assert!(msg.contains("BC002"), "must name the requested cartridge: {msg}");
+        assert!(
+            msg.contains("BC001"),
+            "must name the existing cartridge: {msg}"
+        );
+        assert!(
+            msg.contains("BC002"),
+            "must name the requested cartridge: {msg}"
+        );
         assert!(
             msg.contains("permanent once its mount is closed"),
             "must cite ADR-0012's closing ruling: {msg}"
@@ -2844,7 +2850,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(row_count, 1, "a same-cartridge re-bind must not add a second row");
+        assert_eq!(
+            row_count, 1,
+            "a same-cartridge re-bind must not add a second row"
+        );
     }
 
     /// ── ADR-0012 corroboration, one test per branch (issue #193) ────────

@@ -5272,8 +5272,14 @@ mod tests {
             let err = call(&conn, vol_id, &det_with_serial(Some("SER-2")))
                 .expect_err("a write whose medium resolves to a DIFFERENT cartridge must refuse");
             let msg = err.to_string();
-            assert!(msg.contains("BC-A"), "must name the existing cartridge: {msg}");
-            assert!(msg.contains("BC-B"), "must name the resolved cartridge: {msg}");
+            assert!(
+                msg.contains("BC-A"),
+                "must name the existing cartridge: {msg}"
+            );
+            assert!(
+                msg.contains("BC-B"),
+                "must name the resolved cartridge: {msg}"
+            );
             assert!(
                 msg.contains("permanent once its mount is closed"),
                 "must cite ADR-0012's closing ruling: {msg}"
