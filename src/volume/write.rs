@@ -128,6 +128,37 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// `check_fresh_write_contact` + `reposition_for_resume(0)`, not before
 /// `build`/`validate`/`TapeStore::open`, so a write refused at any of those
 /// stages cannot leave a committed displacement behind either (issue #154).
+/// The refusal when this drive cannot write the medium that is loaded
+/// (ADR-0010 decision 2; ADR-0008 Tier 3 — `--force` is not consulted).
+///
+/// Two halves, and the second is the one issue #178 adds. The physics is only
+/// half an answer: the *other* reason this fires is that `generation` in the
+/// `[[backends.lto]]` block is wrong — which is exactly what happened when
+/// `first-run.sh` defaulted the DRIVE's generation from whatever cartridge was
+/// loaded during setup. An operator reading only the physics sentence goes
+/// looking for the wrong cartridge, when the cartridge is fine and the config
+/// is not.
+///
+/// Names the block, the drive it claims to be and the device path, because
+/// there is no `backend edit` (ADR-0012, #143): the repair is editing
+/// config.toml by hand, and the operator needs to know which block.
+fn cannot_write_message(
+    drive_gen: crate::media::Generation,
+    medium_gen: crate::media::Generation,
+    backend: &crate::config::LtoBackendConfig,
+) -> String {
+    format!(
+        "an {drive_gen} drive cannot write {medium_gen} media. This is a physical \
+         limit of the drive, not a policy — --force does not override it. Load a \
+         {drive_gen}-writable cartridge, or write this one in a drive that can.\n\n\
+         If this drive is not really an {drive_gen}, `generation` in the \
+         [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
+         (`tapectl config show` prints it; there is no `backend edit`, by decision: \
+         ADR-0012, #143) and run `tapectl config check`.",
+        backend.name, backend.device_tape,
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // conn/config + label/device/block_size + force + the two ADR-0010 declarations
 pub fn volume_init(
     conn: &Connection,
@@ -273,10 +304,8 @@ pub fn volume_init(
     // A physical fact, not a risk judgement: `--force` is deliberately NOT
     // consulted (ADR-0010 decision 2, ADR-0008's tiers).
     if !crate::media::Generation::can_write(drive_gen, generation) {
-        return Err(TapectlError::Other(format!(
-            "an {drive_gen} drive cannot write {generation} media. This is a physical \
-             limit of the drive, not a policy — --force does not override it. Load a \
-             {drive_gen}-writable cartridge, or write this one in a drive that can."
+        return Err(TapectlError::Other(cannot_write_message(
+            drive_gen, generation, backend,
         )));
     }
 
@@ -2932,6 +2961,47 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #178: the drive/medium refusal must name the config key, not only
+    /// the physics.
+    ///
+    /// Both halves matter. The physics sentence alone sends an operator hunting
+    /// for the wrong cartridge when the cartridge is fine and
+    /// `[[backends.lto]].generation` is wrong — which is precisely what
+    /// `first-run.sh` used to produce by defaulting the DRIVE's generation from
+    /// whatever tape happened to be loaded during setup. There is no
+    /// `backend edit` (ADR-0012, #143), so the message has to say which block
+    /// to edit by hand.
+    #[test]
+    fn cannot_write_message_names_the_backend_block_and_keeps_the_physics() {
+        let backend = crate::config::LtoBackendConfig {
+            name: "lto6".into(),
+            device_tape: "/dev/tape/by-id/scsi-EXAMPLE-nst".into(),
+            device_sg: "/dev/sg9".into(),
+            generation: "LTO-5".into(),
+            capacity_override: None,
+            usable_capacity_factor: 0.92,
+            enospc_buffer: "50M".into(),
+        };
+        let msg = cannot_write_message(
+            crate::media::Generation::Lto5,
+            crate::media::Generation::Lto6,
+            &backend,
+        );
+
+        // The physics half survives unchanged — this is ADR-0008 Tier 3 and
+        // `--force` must still be documented as not applying.
+        assert!(msg.contains("physical"), "{msg}");
+        assert!(msg.contains("--force does not override it"), "{msg}");
+
+        // The recoverable half: which block, which drive it claims to be,
+        // which device, and what to run afterwards.
+        assert!(msg.contains("[[backends.lto]]"), "{msg}");
+        assert!(msg.contains("generation"), "{msg}");
+        assert!(msg.contains("\"lto6\""), "{msg}");
+        assert!(msg.contains("/dev/tape/by-id/scsi-EXAMPLE-nst"), "{msg}");
+        assert!(msg.contains("config check"), "{msg}");
+    }
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
     use sha2::{Digest, Sha256};
