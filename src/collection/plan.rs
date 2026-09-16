@@ -493,7 +493,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let dir = root.path().join("alpha");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        // 20 MiB — bigger than `config_with_tiny_backend`'s 10 MiB
+        // generation-planned capacity. This makes the ordering claim in
+        // `plan_for_run`'s doc comment an assertion, not just a comment: if
+        // the budget were ever resolved AFTER `batches_for_budget` ran
+        // (i.e. the bug this issue fixes, reintroduced), this oversized
+        // unit would surface as the "exceed the per-tape budget" error
+        // instead of `VolumeNotFound`, and the `matches!` below would catch
+        // that regression.
+        std::fs::write(dir.join("f.dat"), vec![0u8; 20 * 1024 * 1024]).unwrap();
         let lib = CollectionConfig {
             name: "testlib".into(),
             root: root.path().to_string_lossy().to_string(),

@@ -13,11 +13,18 @@ const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 /// Human-readable byte count for `cmd_run`'s budget line (issue #175) — a
 /// tiny local formatter rather than reaching into `cli::catalog`'s private
 /// `format_size`, which this module has no business depending on.
+///
+/// Decimal (1000-based), not binary: this prints a `volumes.capacity_bytes`
+/// figure and the budget derived from it, and ADR-0012 ratified "cartridge
+/// capacities are decimal, data sizes binary" specifically so a 2.5 TB
+/// LTO-6 cartridge (`media.rs`'s `2_500_000_000_000`) reads as "2.5 TB", not
+/// a binary-divided "2.27 TB" that would contradict the marketed figure the
+/// operator already knows.
 fn format_bytes(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    const TB: f64 = GB * 1024.0;
+    const KB: f64 = 1_000.0;
+    const MB: f64 = KB * 1_000.0;
+    const GB: f64 = MB * 1_000.0;
+    const TB: f64 = GB * 1_000.0;
     let b = bytes as f64;
     if b >= TB {
         format!("{:.2} TB", b / TB)
