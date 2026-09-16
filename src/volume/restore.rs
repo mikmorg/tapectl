@@ -963,4 +963,160 @@ mod tests {
         place_restored_entry(&link, &lmeta, &dest).unwrap();
         assert!(std::fs::symlink_metadata(&dest).unwrap().is_symlink());
     }
+
+    /// Restore is a contact (ADR-0012, issue #193) and corroborates before it
+    /// makes a scratch directory, loads a key or reads a slice. Proves only
+    /// that the CALL happens — the rule's own branches are drilled in
+    /// `volume::binding`.
+    mod contact {
+        use super::*;
+        use crate::store::Store;
+        use crate::volume::layout;
+
+        /// Enough catalog for `restore_unit_from_store` to reach the contact
+        /// check: one tenant, unit, snapshot, stage set, slice, volume,
+        /// completed write and written position.
+        fn seed(conn: &Connection, volume_label: &str, unit_name: &str) {
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tenant_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                params![unit_name, tenant_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, 'staged', '/tmp', 1, 16)",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (?1, 1, 16, 16, 'aa', 'bb')",
+                params![ss_id],
+            )
+            .unwrap();
+            let slice_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                params![volume_label],
+            )
+            .unwrap();
+            let volume_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss_id, snap_id, volume_id],
+            )
+            .unwrap();
+            let write_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO write_positions (write_id, stage_slice_id, position, status, sha256_on_volume)
+                 VALUES (?1, ?2, '4', 'written', 'bb')",
+                params![write_id, slice_id],
+            )
+            .unwrap();
+        }
+
+        /// A MemStore whose File 0 is a real v2 ID thunk naming `label`.
+        /// Nothing beyond File 0 is needed: the contact refusal must fire
+        /// before anything else is read.
+        fn tape_labelled(label: &str) -> MemStore {
+            let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+                label,
+                uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                media_type: "LTO-6",
+                tapectl_version: "0.0.0-test",
+                nominal_capacity: 2_500_000_000_000,
+                mam_capacity: 2_400_000_000_000,
+                total_files: 6,
+                mam_manufacturer: "TESTCO",
+                mam_serial: "",
+                mam_length: 846,
+                mam_loads: 1,
+                created_at: "2026-09-16T00:00:00Z",
+                cartridge_identity_source: None,
+            })
+            .into_bytes();
+            let mut store = MemStore::new(4096);
+            store
+                .execute(&mut Cursor::new(thunk.clone()), thunk.len() as u64, false)
+                .unwrap();
+            store
+        }
+
+        #[test]
+        fn restore_refuses_a_tape_whose_file0_names_another_volume() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "RESTORE-WANT", "r-unit");
+            let mut store = tape_labelled("RESTORE-LOADED");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+
+            let err = restore_unit_from_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "r-unit",
+                "RESTORE-WANT",
+                &dest.path().to_string_lossy(),
+                &mut store,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("wrong tape"), "{err}");
+            assert!(err.contains("RESTORE-WANT"), "{err}");
+            assert!(err.contains("RESTORE-LOADED"), "{err}");
+            assert!(
+                !dest.path().join(".tapectl-restore-tmp").exists(),
+                "a refused contact must not have made a scratch directory"
+            );
+        }
+
+        /// The DR shape: the same restore with the RIGHT tape gets past the
+        /// contact check and fails later, on the key load — proving the
+        /// refusal above is the contact check and not an unrelated early
+        /// error.
+        #[test]
+        fn restore_with_the_right_tape_gets_past_the_contact_check() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "RESTORE-OK", "r-unit");
+            let mut store = tape_labelled("RESTORE-OK");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+
+            let err = restore_unit_from_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "r-unit",
+                "RESTORE-OK",
+                &dest.path().to_string_lossy(),
+                &mut store,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                !err.contains("wrong tape"),
+                "the contact check must have passed; got: {err}"
+            );
+        }
+    }
 }

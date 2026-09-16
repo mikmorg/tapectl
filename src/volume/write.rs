@@ -5294,4 +5294,259 @@ mod tests {
             check_loaded_generation("L6-0001", &detected(Some(Generation::Lto6)), None).unwrap();
         }
     }
+
+    // --- Per-call-site contact tests (ADR-0012, issues #193/#164) ----------
+    //
+    // The RULE's own branch tests live in `volume::binding`. These prove only
+    // that each contact CALLS it — "a contact that skips corroboration is the
+    // defect returning" — by loading a tape whose File 0 names a DIFFERENT
+    // volume and asserting the contact refuses before doing its work.
+    mod contacts {
+        use super::*;
+
+        /// A volume row plus one slice at position 4, and a MemStore holding
+        /// a complete v2 tape that claims to be `on_tape_label`.
+        ///
+        /// When the two labels differ, this is the wrong cartridge in the
+        /// drive — the whole point.
+        fn wrong_tape(
+            conn: &Connection,
+            catalog_label: &str,
+            on_tape_label: &str,
+            unit: &str,
+        ) -> MemStore {
+            let data = b"contact fixture slice bytes, repeated. ".repeat(4);
+            seed_one_slice_fixture(conn, catalog_label, unit, 4, &data, "completed", "staged");
+            mem_store_v2_tape(on_tape_label, &data, &data)
+        }
+
+        fn volume_id(conn: &Connection, label: &str) -> i64 {
+            conn.query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn verification_sessions(conn: &Connection) -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM verification_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        }
+
+        // ── issue #164: `volume verify` ──
+
+        /// THE #164 test: verify `L6-B` with `L6-A` in the drive refuses,
+        /// errors (a non-zero exit — `cli::volume` propagates this `Err`
+        /// rather than reaching `verify_exit_code` at all), and leaves
+        /// `verification_sessions` EMPTY FOR BOTH volumes.
+        ///
+        /// Evidence recorded against the wrong volume is worse than no
+        /// evidence, because it refreshes a staleness clock that gates
+        /// nothing else; and quarantine is for the volume whose claims were
+        /// contradicted, never the innocent one whose label was typed. So
+        /// neither row may exist.
+        #[test]
+        fn verify_refuses_when_file0_names_another_volume_and_records_nothing() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "L6-B", "L6-A", "cb-unit");
+            // The innocent volume whose tape is actually loaded.
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('L6-A', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                [],
+            )
+            .unwrap();
+
+            let b = volume_id(&conn, "L6-B");
+            let err =
+                volume_verify_with_store(&conn, &mut store, "L6-B", b, 4096, Tier::Integrity, None)
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("wrong tape"), "{err}");
+            assert!(err.contains("L6-B"), "must name what was asked for: {err}");
+            assert!(err.contains("L6-A"), "must name what was found: {err}");
+
+            assert_eq!(
+                verification_sessions(&conn),
+                0,
+                "no verification_sessions row may exist for EITHER volume"
+            );
+            let results: i64 = conn
+                .query_row("SELECT COUNT(*) FROM verification_results", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(results, 0);
+        }
+
+        /// The other half of #164: the CORRECT tape still records the
+        /// session exactly as before.
+        #[test]
+        fn verify_with_the_correct_tape_records_the_session_as_before() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "L6-RIGHT", "L6-RIGHT", "cb-unit");
+            let v = volume_id(&conn, "L6-RIGHT");
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "L6-RIGHT",
+                v,
+                4096,
+                Tier::Integrity,
+                None,
+            )
+            .unwrap();
+            assert_eq!(report.failed, 0, "{:?}", report.mismatches);
+            let (vol, outcome): (i64, String) = conn
+                .query_row(
+                    "SELECT volume_id, outcome FROM verification_sessions",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(vol, v);
+            assert_eq!(outcome, "passed");
+        }
+
+        /// A wrong CARTRIDGE, rather than a wrong volume label: File 0 agrees
+        /// with the catalog about which volume this is, but the bound row's
+        /// serial and the drive's disagree. Same refusal, same empty table.
+        #[test]
+        fn verify_refuses_a_wrong_cartridge_and_records_nothing() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "L6-C", "L6-C", "cb-unit");
+            let v = volume_id(&conn, "L6-C");
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('BC-BOUND', 'LTO-6', 2500000000000, 'SER-BOUND', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'mam')",
+                params![cart, v],
+            )
+            .unwrap();
+
+            let err = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "L6-C",
+                v,
+                4096,
+                Tier::Integrity,
+                Some("SER-LOADED"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("wrong cartridge"), "{err}");
+            assert_eq!(verification_sessions(&conn), 0);
+        }
+
+        // ── the other store-injectable contacts ──
+
+        #[test]
+        fn read_slices_refuses_the_wrong_tape_before_reading_a_slice() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "RS-WANT", "RS-LOADED", "rs-unit2");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+            let err = read_slices(&conn, &config, "RS-WANT", "rs-unit2", &mut store, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("wrong tape"), "{err}");
+            let staged: Option<String> = conn
+                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
+                .unwrap();
+            assert!(
+                staged.is_none(),
+                "a refused contact must not have staged anything: {staged:?}"
+            );
+        }
+
+        #[test]
+        fn compact_read_refuses_the_wrong_tape_before_reading_a_slice() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "CR-WANT", "CR-LOADED", "cr-unit2");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+            let err = compact_read(&conn, &config, "CR-WANT", &mut store, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("wrong tape"), "{err}");
+        }
+
+        // ── `volume identify` ──
+
+        #[test]
+        fn identify_refuses_when_the_catalog_binds_that_volume_elsewhere() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "ID-VOL", "ID-VOL", "id-unit");
+            let v = volume_id(&conn, "ID-VOL");
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('BC-ID', 'LTO-6', 2500000000000, 'SER-SHELF', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'mam')",
+                params![cart, v],
+            )
+            .unwrap();
+
+            let err = volume_identify_corroborated(&conn, &mut store, Some("SER-DRIVE"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("wrong cartridge"), "{err}");
+        }
+
+        /// `identify` is what an operator runs when they do NOT know what is
+        /// loaded, so a tape this catalog has never heard of is the ANSWER,
+        /// not a contradiction: it prints and returns Ok.
+        #[test]
+        fn identify_prints_a_tape_the_catalog_has_never_heard_of() {
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"x".repeat(16);
+            let mut store = mem_store_v2_tape("NEVER-SEEN", &data, &data);
+            let text = volume_identify_corroborated(&conn, &mut store, Some("SER-ANY")).unwrap();
+            assert!(text.contains("NEVER-SEEN"), "{text}");
+        }
+
+        // ── the two device-bound contacts ──
+
+        /// `volume write` and `volume resume` cannot be driven without a tape
+        /// device, so their corroboration is proved on real hardware by the
+        /// mhvtl gate. This is the ungated guard that the CALL is still
+        /// there: issue #193's "a contact that skips corroboration is the
+        /// defect returning" is a statement about the source, and deleting
+        /// the call is exactly how the defect comes back.
+        #[test]
+        fn the_two_write_contacts_still_corroborate() {
+            const SRC: &str = include_str!("write.rs");
+            for f in ["pub fn volume_write(", "pub fn volume_resume("] {
+                let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+                // Function bodies end at the first `\n}` in column 0.
+                let end = SRC[start..].find("\n}\n").unwrap() + start;
+                let body = &SRC[start..end];
+                assert!(
+                    body.contains("binding::corroborate_volume("),
+                    "{f} no longer corroborates the loaded medium at contact (ADR-0012, \
+                     issue #193). If this call moved, move this assertion with it; do not \
+                     delete it."
+                );
+            }
+        }
+    }
 }

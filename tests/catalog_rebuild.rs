@@ -1095,3 +1095,97 @@ fn a_second_run_with_the_escrow_key_fills_what_the_first_left_unknown() {
     let third = rebuild(&conn, &mut vol, &esc, scratch.path()).unwrap();
     assert!(third.is_noop(), "{third:?}");
 }
+
+// ── Contact corroboration on the rebuild path (ADR-0012, issues #193/#158) ──
+//
+// `catalog rebuild` is a contact under CONTEXT.md's definition, and the one
+// where issue #193's absence rule matters most: rebuild exists FOR the catalog
+// that does not know this tape, so "no claim to corroborate" is the normal
+// case, not a failure.
+
+/// The acceptance criterion in as many words: **the DR path works with no
+/// catalog row at all.** A rebuilt machine has keys, a fresh database and no
+/// `backend add`, so there is no volume row, no cartridge row and no medium
+/// serial — three absences, and an absence never refuses.
+///
+/// Every other test in this file relies on this; it is stated once on its own
+/// so that a corroboration change that broke it fails by NAME rather than as
+/// nineteen unrelated-looking failures.
+#[test]
+fn the_dr_path_rebuilds_with_no_catalog_row_at_all() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let existing: i64 = conn
+        .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(existing, 0, "the DR case is a catalog that knows nothing");
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("a rebuild with no catalog claim must proceed");
+    assert!(report.volume_inserted);
+}
+
+/// ...and the contradiction it CAN refuse: a catalog that already binds this
+/// volume to a cartridge whose serial is not the one in the drive. Proves the
+/// rebuild contact actually calls the rule — "a contact that skips
+/// corroboration is the defect returning".
+#[test]
+fn rebuild_refuses_when_the_catalog_binds_that_volume_to_another_cartridge() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('BC-SHELF', 'LTO-6', 2500000000000, 'SER-SHELF', 'in_use')",
+        [],
+    )
+    .unwrap();
+    let cartridge_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, 'mam')",
+        rusqlite::params![cartridge_id, volume_id],
+    )
+    .unwrap();
+
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_file(key_dir.path(), "k.age.key", &vol.operator_secret);
+    let secret_str = tapectl::crypto::keys::read_secret_key(&key).unwrap();
+    let identity: age::x25519::Identity = secret_str.parse().unwrap();
+
+    let err = rebuild::rebuild_from_store(
+        &conn,
+        &mut vol.store,
+        &[identity],
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        Some("SER-DRIVE"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("wrong cartridge"), "{err}");
+    assert!(
+        err.contains("SER-SHELF"),
+        "must name the catalog's claim: {err}"
+    );
+    assert!(
+        err.contains("SER-DRIVE"),
+        "must name what the drive holds: {err}"
+    );
+}
