@@ -79,6 +79,68 @@ operator saying the bytes are gone. With a serial match the displacement is reco
 as ADR-0010 says. Binding is also *ordered* after the tape-contact check, so a refused
 `volume write` displaces nothing (#154), and a binding is permanent once its mount is closed.
 
+**Amendment, 2026-09-16 — a typed serial and a chip-read serial are different
+facts and live in different columns (#197); and "is this volume a write target"
+stops being answered by a status (#199).** Two rulings from the same session,
+both prompted by defects found while implementing the above.
+
+*The serial.* `cartridge register --serial` lets an operator type a medium
+serial by hand, for pre-registering a cartridge that has not been loaded yet. It
+landed in `cartridges.serial_number` — the same column a real MAM read writes —
+so the schema could not distinguish an operator's *assertion about* a chip from
+what the chip *said*, and no code could either. A typo was then permanent: a MAM
+read will not overwrite a recorded serial (write-once, above), `--cartridge` on
+the real medium is refused as a different cartridge, and no command edits the
+field. Every escape produced a duplicate row or a refusal.
+
+Two shapes were put to the CTO — a `serial_source` provenance flag on the one
+column, or a correction command — and both were declined in favour of a third:
+**store them in different fields.** `serial_number` remains the identity and is
+written *only* from a MAM read, which makes "never overwrite a chip-read serial"
+structurally true rather than a rule code must remember; the operator's claim
+lives in a new `operator_serial` and is the only one any operator command may
+write. The naming follows File 0's existing `cartridge_identity_source` values,
+`"mam"` and `"operator"`.
+
+This dissolves the question that was actually asked, which is why it is the
+better answer: there is no promote-or-refuse decision when a MAM read arrives,
+because the two values never occupy the same slot — the read always writes its
+own column and overwrites nothing. What follows is mechanical, not a further
+trade-off: `lookup_cartridge` matches `serial_number` first, and falls back to
+`operator_serial` only while `serial_number` is NULL, which is what makes
+pre-registration work at all; a MAM read that confirms an assertion fills
+`serial_number` and the assertion stands as the record of what was claimed; a
+MAM read that *contradicts* a named row is refused naming both values — "this
+row asserts X, the loaded medium reports Y" — and points at the correction,
+exactly the shape `resolve_media` uses for a contradicted generation. Once
+`serial_number` is set, `operator_serial` is never consulted again: the chip has
+spoken. `cartridge info` shows both, labelled.
+
+*The write target.* `policy::coverage::is_write_target` was `status ==
+"initialized"`, and `catalog rebuild --from-volume` landing on a pre-existing
+`initialized` row leaves the status alone (deliberately — overwriting an
+operator's `quarantined` would destroy a fact a failed verify established). So a
+rebuild could attach a whole tape's contents to a row that the catalog still
+called a write target. Bytes were never at risk: the tape carries a seal marker,
+`check_fresh_write_contact` refuses, and ADR-0003 means `--force` cannot
+override it. What was lost is the *ordering* #161 exists to guarantee — the
+refusal arrived from the tape side after `find_staged_data`, the
+`mam_capacity_bytes` UPDATE and `TapeStore::open` had already run.
+
+The ruling is **not** to have rebuild write a better status. It is to stop using
+a status as the proxy: `is_write_target` additionally refuses a volume that
+already has write or slice rows attached, because the question being asked is
+"does this volume hold bytes we know about?" and status only approximates it.
+The rejected alternative — rebuild marking such a row `sealed` — is narrower but
+can mark a *blank, freshly initialised* tape sealed when two cartridges share a
+label, and ADR-0003 then makes it unwritable without a real erase; a guard that
+is right in the common case and destroys something in the uncommon one is the
+trade this queue exists to refuse. The cost of the chosen option is that the
+resume path must keep working, so the attached-rows test must distinguish the
+resumable states (`planned`/`in_progress`/`interrupted`) from `completed` — a
+coding risk, which tests pin and review catches, rather than an operator-facing
+one.
+
 **Cartridge capacities are decimal; data sizes are binary; the two are named apart.** The
 generation table holds the marketed decimal figures (LTO-6 2.5 TB = 2 500 000 000 000), and a
 `--capacity 2.5T` on `cartridge register`/`import` or a drive's `capacity_override` must mean
