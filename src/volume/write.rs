@@ -170,12 +170,11 @@ pub fn volume_init(
     }
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
-    let drive_gen = crate::media::Generation::parse(&backend.generation).ok_or_else(|| {
-        TapectlError::Config(format!(
-            "backends.lto[\"{}\"].generation = {:?} is not a recognised LTO generation",
-            backend.name, backend.generation
-        ))
-    })?;
+    // `native_generation()` parses the same field with the identical error
+    // text `check_drive_can_write` itself uses below, so this and the
+    // helper it calls can never drift on what "not a recognised generation"
+    // means.
+    let drive_gen = backend.native_generation()?;
 
     // ---- ADR-0010 fact-finding, all before the tape device is opened ----
     //
