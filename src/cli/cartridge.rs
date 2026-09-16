@@ -97,6 +97,23 @@ pub enum CartridgeCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Correct a registered cartridge's generation
+    ///
+    /// ADR-0012, *Rulings recorded as consequences*: "`cartridge edit
+    /// --generation` corrects a wrong generation (Tier 1: it is a fact
+    /// correction, and the wrong-medium check at the next init still
+    /// applies)." Tier 1 under ADR-0008 — no prompt, no `--force`, no
+    /// `--yes`, and it applies to every status, `retired_permanent`
+    /// included. This edits only the `cartridges` row: it never rewrites
+    /// `volumes.media_type` or `volumes.capacity_bytes` (ADR-0010 decision
+    /// 3 — capacity is decided once at init and stored on the volume).
+    Edit {
+        /// Barcode
+        barcode: String,
+        /// The cartridge's corrected generation (e.g. LTO-5, LTO-6, LTO-7-M8)
+        #[arg(long)]
+        generation: String,
+    },
     /// Correct a cartridge's barcode label
     ///
     /// ADR-0012: a cartridge's identity is its chip serial; the barcode is a
@@ -451,6 +468,57 @@ pub fn run(
                 json_output,
             )?;
         }
+        CartridgeCommands::Edit {
+            barcode,
+            generation,
+        } => {
+            let barcode = barcode.trim();
+            let outcome = cartridge_edit(conn, barcode, generation, dry_run)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "barcode": barcode,
+                        "media_type": {
+                            "old": outcome.old_media_type,
+                            "new": outcome.new_media_type,
+                        },
+                        "nominal_capacity": {
+                            "old": outcome.old_capacity,
+                            "new": outcome.new_capacity,
+                            "redefaulted": outcome.redefaulted,
+                        },
+                        "changed": outcome.changed,
+                        "dry_run": dry_run && outcome.changed,
+                    })
+                );
+            } else if !outcome.changed {
+                println!(
+                    "cartridge \"{barcode}\" is already {}; nothing changed",
+                    outcome.new_media_type
+                );
+            } else {
+                let suffix = if dry_run {
+                    " (DRY RUN — no changes made)"
+                } else {
+                    ""
+                };
+                println!(
+                    "cartridge \"{barcode}\" media_type: {} -> {}{suffix}",
+                    outcome.old_media_type, outcome.new_media_type
+                );
+                println!("{}", outcome.capacity_note);
+                for (label, vol_media) in &outcome.mismatched_volumes {
+                    println!(
+                        "warning: volume \"{label}\" has an open mount on this cartridge and \
+                         was planned as {vol_media}, which now differs from the corrected \
+                         generation {} -- display only, nothing about the volume is changed \
+                         (ADR-0010 decision 3)",
+                        outcome.new_media_type
+                    );
+                }
+            }
+        }
         CartridgeCommands::Relabel {
             barcode,
             new_barcode,
@@ -533,6 +601,187 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// The result of `cartridge edit --generation` (issue #167, ADR-0012 Tier 1),
+/// split out from the printing so it is assertable in tests without
+/// capturing stdout — the same pattern as `location::MoveOutcome`.
+struct EditOutcome {
+    /// `false` for the same-value no-op (step 4): nothing was written, no
+    /// event was logged, and `old_media_type == new_media_type`.
+    changed: bool,
+    old_media_type: String,
+    new_media_type: String,
+    old_capacity: i64,
+    new_capacity: i64,
+    /// Did the capacity re-default (step 5's first branch)? `false` for the
+    /// no-op case too.
+    redefaulted: bool,
+    /// Step 5's text, stating which capacity branch ran and why. Empty for
+    /// the no-op case (nothing to say about capacity when nothing changed).
+    capacity_note: String,
+    /// Step 6: `(volume label, volume media_type)` for every volume with an
+    /// open `cartridge_volumes` mount on this cartridge whose planned
+    /// `media_type` now differs from the corrected generation. Display-only
+    /// (ADR-0008 Tier 1) — this command never rewrites `volumes.media_type`
+    /// or `volumes.capacity_bytes` (ADR-0010 decision 3: capacity is decided
+    /// once at init).
+    mismatched_volumes: Vec<(String, String)>,
+}
+
+/// `cartridge edit --generation`: corrects a registered cartridge's
+/// generation (ADR-0012, *Rulings recorded as consequences*; issue #167).
+///
+/// Tier 1 under ADR-0008 — no prompt, no `--force`, no `--yes` — and applies
+/// to every status, `retired_permanent` included: a fact correction is not
+/// gated by fitness. Edits only the `cartridges` row; `volumes.media_type`
+/// and `volumes.capacity_bytes` are never rewritten (ADR-0010 decision 3 —
+/// capacity is decided once at init and stored on the volume).
+///
+/// `dry_run` still honours the convention every other mutating command in
+/// this file follows (`Retire`/`MarkErased`/`Relabel`/`Unretire`): the
+/// computed outcome is returned for display, but the transaction in step 7
+/// is skipped, so the row and the events table are untouched.
+fn cartridge_edit(
+    conn: &Connection,
+    barcode: &str,
+    generation: &str,
+    dry_run: bool,
+) -> Result<EditOutcome> {
+    // ADR-0012, *Unknown config keys are errors everywhere; closed-set
+    // values are validated at load*: the same validator `Register` uses, so
+    // the error text cannot drift between the two commands.
+    let parsed = crate::media::parse_generation_or_error(generation)?;
+    let new_media_type = parsed.as_str();
+
+    let (id, old_media_type, old_capacity): (i64, String, i64) = conn
+        .query_row(
+            "SELECT id, media_type, nominal_capacity FROM cartridges WHERE barcode = ?1",
+            params![barcode],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    // Step 4: same value -> no-op. No UPDATE, no event, exit 0.
+    if old_media_type == new_media_type {
+        return Ok(EditOutcome {
+            changed: false,
+            old_media_type,
+            new_media_type: new_media_type.to_string(),
+            old_capacity,
+            new_capacity: old_capacity,
+            redefaulted: false,
+            capacity_note: String::new(),
+            mismatched_volumes: Vec::new(),
+        });
+    }
+
+    // Step 5: capacity re-default, mechanical and exact -- no judgement.
+    // Equality is tested against the OLD generation's table figure, so this
+    // is independent of the binary/decimal parser question (ADR-0012).
+    let (new_capacity, redefaulted, capacity_note) =
+        match crate::media::Generation::parse(&old_media_type) {
+            Some(old_gen) if old_capacity == old_gen.native_capacity_bytes() as i64 => {
+                let redefaulted_capacity = parsed.native_capacity_bytes() as i64;
+                (
+                    redefaulted_capacity,
+                    true,
+                    format!(
+                        "capacity re-defaulted from the {old_media_type} table figure \
+                         ({old_capacity}) to the {new_media_type} table figure \
+                         ({redefaulted_capacity})"
+                    ),
+                )
+            }
+            Some(_) => (
+                old_capacity,
+                false,
+                format!(
+                    "capacity left at {old_capacity} (not the {old_media_type} table \
+                     figure, so it was set deliberately)"
+                ),
+            ),
+            None => (
+                old_capacity,
+                false,
+                format!(
+                    "capacity left at {old_capacity} (the old media_type {old_media_type:?} \
+                     does not parse as a recognised generation, so the old table figure \
+                     cannot be computed)"
+                ),
+            ),
+        };
+
+    // Step 6: display-only warning for any volume with an open mount here
+    // whose planned media_type now disagrees. Never gates; never writes.
+    let mut stmt = conn.prepare(
+        "SELECT v.label, v.media_type FROM cartridge_volumes cv
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL
+           AND v.media_type IS NOT NULL AND v.media_type != ?2",
+    )?;
+    let mismatched_volumes: Vec<(String, String)> = stmt
+        .query_map(params![id, new_media_type], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    if dry_run {
+        return Ok(EditOutcome {
+            changed: true,
+            old_media_type,
+            new_media_type: new_media_type.to_string(),
+            old_capacity,
+            new_capacity,
+            redefaulted,
+            capacity_note,
+            mismatched_volumes,
+        });
+    }
+
+    // Step 7: one transaction for the UPDATE and its event(s).
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE cartridges SET media_type = ?1, nominal_capacity = ?2 WHERE id = ?3",
+        params![new_media_type, new_capacity, id],
+    )?;
+    events::log_field_change(
+        &tx,
+        "cartridge",
+        id,
+        barcode,
+        "updated",
+        "media_type",
+        Some(&old_media_type),
+        new_media_type,
+        None,
+    )?;
+    if redefaulted {
+        events::log_field_change(
+            &tx,
+            "cartridge",
+            id,
+            barcode,
+            "updated",
+            "nominal_capacity",
+            Some(&old_capacity.to_string()),
+            &new_capacity.to_string(),
+            None,
+        )?;
+    }
+    tx.commit()?;
+
+    Ok(EditOutcome {
+        changed: true,
+        old_media_type,
+        new_media_type: new_media_type.to_string(),
+        old_capacity,
+        new_capacity,
+        redefaulted,
+        capacity_note,
+        mismatched_volumes,
+    })
 }
 
 /// Cartridge listing rows, split out from the printing so they are assertable
@@ -1149,5 +1398,206 @@ mod tests {
             event_count, 1,
             "only the original registration event -- dry-run logs nothing"
         );
+    }
+
+    // ---- issue #167: `cartridge edit --generation` ------------------------
+
+    fn edit(conn: &Connection, barcode: &str, generation: &str) -> Result<()> {
+        run(
+            conn,
+            &CartridgeCommands::Edit {
+                barcode: barcode.to_string(),
+                generation: generation.to_string(),
+            },
+            false,
+            true,
+            false,
+        )
+    }
+
+    #[test]
+    fn edit_generation_stores_the_canonical_spelling() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        edit(&conn, "B001", "lto5").unwrap();
+        let (media_type, ..) = stored_row(&conn, "B001");
+        assert_eq!(media_type, "LTO-5");
+    }
+
+    #[test]
+    fn edit_generation_redefaults_a_table_valued_capacity() {
+        let conn = crate::db::open_memory().unwrap();
+        // Registered with no --capacity: the table figure
+        // (2,500,000,000,000), never operator-set.
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        edit(&conn, "B001", "LTO-5").unwrap();
+        let (_, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(
+            cap,
+            crate::media::Generation::Lto5.native_capacity_bytes() as i64
+        );
+    }
+
+    #[test]
+    fn edit_generation_leaves_an_operator_set_capacity_alone() {
+        let conn = crate::db::open_memory().unwrap();
+        // 40000G is never the LTO-10 table figure (30 TB), so it was set
+        // deliberately and must survive the edit untouched.
+        register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
+        edit(&conn, "B001", "LTO-9").unwrap();
+        let (_, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(cap, 40_000_000_000_000);
+    }
+
+    #[test]
+    fn edit_generation_leaves_capacity_alone_when_the_old_row_does_not_parse() {
+        let conn = crate::db::open_memory().unwrap();
+        // A pre-ADR-0010 or hand-edited row whose media_type does not parse
+        // (issue #167's third reachability path) -- the old table figure
+        // cannot be computed, so the capacity branch must leave it alone
+        // rather than guess.
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity)
+             VALUES ('B001', 'ULTRIUM6', 2500000000000)",
+            [],
+        )
+        .unwrap();
+        edit(&conn, "B001", "LTO-6").unwrap();
+        let (media_type, cap, _) = stored_row(&conn, "B001");
+        assert_eq!(media_type, "LTO-6");
+        assert_eq!(cap, 2_500_000_000_000, "capacity must be left untouched");
+    }
+
+    #[test]
+    fn edit_generation_rejects_an_unrecognised_generation() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let err = edit(&conn, "B001", "banana").unwrap_err();
+        assert!(err.to_string().contains("banana"));
+        let (media_type, ..) = stored_row(&conn, "B001");
+        assert_eq!(
+            media_type, "LTO-6",
+            "a rejected edit must not touch the row"
+        );
+    }
+
+    #[test]
+    fn edit_generation_on_an_unknown_barcode_is_not_found() {
+        let conn = crate::db::open_memory().unwrap();
+        let err = edit(&conn, "NOPE", "LTO-6").unwrap_err();
+        assert!(err.to_string().contains("\"NOPE\" not found"));
+    }
+
+    #[test]
+    fn edit_generation_same_value_writes_no_event() {
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        // Same value, different spelling -- must still be recognised as a
+        // no-op once canonicalised.
+        edit(&conn, "B001", "lto6").unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "a same-value edit must log no event");
+    }
+
+    #[test]
+    fn edit_generation_logs_a_field_change_event() {
+        let conn = crate::db::open_memory().unwrap();
+
+        // An explicit --capacity is never the table figure by construction,
+        // so only the media_type event fires.
+        register(&conn, "B001", "LTO-10", Some("40000G"), None).unwrap();
+        edit(&conn, "B001", "LTO-9").unwrap();
+        let updated_b001: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'updated' AND entity_label = 'B001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_b001, 1, "only media_type changed, no re-default");
+
+        // A table-valued capacity re-defaults: two event rows.
+        register(&conn, "B002", "LTO-6", None, None).unwrap();
+        edit(&conn, "B002", "LTO-5").unwrap();
+        let updated_b002: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'updated' AND entity_label = 'B002'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_b002, 2, "media_type + nominal_capacity");
+
+        let (field, old_value, new_value): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT field, old_value, new_value FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'updated' AND entity_label = 'B001'
+                 ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(field, "media_type");
+        assert_eq!(old_value.as_deref(), Some("LTO-10"));
+        assert_eq!(new_value.as_deref(), Some("LTO-9"));
+    }
+
+    /// Proves "the wrong-medium check at the next init still applies"
+    /// without a drive: `resolve_media` refuses a row that disagrees with
+    /// the detected medium, names the exact repair command, and once that
+    /// repair is applied via `cartridge edit`, the same call succeeds.
+    #[test]
+    fn edit_generation_clears_the_init_refusal() {
+        use crate::media::Generation;
+        use crate::tape::mam::MamInfo;
+        use crate::tape::media_detect::{resolve_media, DetectSource, Detected};
+
+        let conn = crate::db::open_memory().unwrap();
+        register(&conn, "B001", "LTO-6", None, None).unwrap();
+
+        let detected_lto5 = Detected {
+            generation: Some(Generation::Lto5),
+            code: Some(0x58),
+            source: DetectSource::MamMedium,
+            mam: MamInfo::default(),
+        };
+
+        // The stale row (LTO-6) disagrees with the loaded medium (LTO-5):
+        // refused, and the refusal names the exact repair.
+        let err = resolve_media(
+            &detected_lto5,
+            None,
+            Some((Generation::Lto6, "B001")),
+            Generation::Lto6,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cartridge edit B001 --generation LTO-5"),
+            "{err}"
+        );
+
+        edit(&conn, "B001", "LTO-5").unwrap();
+        let (media_type, ..) = stored_row(&conn, "B001");
+        let corrected = Generation::parse(&media_type).unwrap();
+        assert_eq!(corrected, Generation::Lto5);
+
+        // The same call, with the corrected row, now agrees.
+        let (gen, source) = resolve_media(
+            &detected_lto5,
+            None,
+            Some((corrected, "B001")),
+            Generation::Lto6,
+        )
+        .unwrap();
+        assert_eq!(gen, Generation::Lto5);
+        assert!(source.is_detected());
     }
 }
