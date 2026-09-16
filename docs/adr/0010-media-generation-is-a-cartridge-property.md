@@ -24,6 +24,22 @@ drive, and the drive's only media fact is which generations it can write and rea
    drive's own generation — and it says so. A `--generation` that contradicts a detected code
    is an error, not a hint. A drive that cannot write the detected generation is a hard refusal that
    `--force` does not override: it is a physical fact, not a consent tier (ADR-0008).
+   *Amendment 2026-09-16 (issue #166): the original text left the refusal's SCOPE unstated, and
+   the code applied it at `volume init` alone. It applies at every write contact — `volume init`,
+   `volume write`, `volume resume`, and everything delegating to them (`compact-write`,
+   `quick-archive`, `collection run`) — because the fact is about the drive in front of the
+   operator now, not the drive that happened to initialise the cartridge. A cartridge
+   initialised on an LTO-6 drive and carried to an LTO-7 drive was previously refused by the
+   device's own I/O error, midway through a write session, leaving an `interrupted` row —
+   instead of by the free pre-open refusal this decision promises. The read half is the same
+   ruling: `identify`, `verify`, `read-slices`, `compact-read`, `restore unit|file|raw-volume`
+   and `catalog rebuild` apply `can_read` the same way, refused before the store is opened
+   rather than surfacing as a raw I/O error. This does NOT narrow* Read paths stay usable
+   without a configured drive *below: with no backend resolved there is no drive generation to
+   check and the read proceeds, and a medium whose generation cannot be detected is likewise
+   not refused — cannot-see-cannot-refuse. Ordering follows ADR-0012 (#154): the check is a
+   tape-contact fact and sits with the others, before the cartridge is bound, so a refused
+   write displaces nothing.*
 3. **Capacity is a function of generation** with two overrides in a fixed order: the drive's
    `capacity_override` (the drive lies, as mhvtl does) → the bound cartridge row's
    `nominal_capacity` (an operator said so at `cartridge register --capacity`) → the
