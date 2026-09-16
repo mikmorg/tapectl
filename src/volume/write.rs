@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
+use crate::policy::coverage;
 use crate::staging;
 use crate::tape::health;
 use crate::util::{HashingWriter, TruncatingWriter};
@@ -744,13 +745,30 @@ pub fn volume_write(
     force: bool,
     allow_missing_escrow: bool,
 ) -> Result<()> {
-    let volume_id: i64 = conn
+    let (volume_id, volume_status): (i64, String) = conn
         .query_row(
-            "SELECT id FROM volumes WHERE label = ?1",
+            "SELECT id, status FROM volumes WHERE label = ?1",
             params![label],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // ADR-0012 (issue #161): the catalog's own statement that this volume is
+    // finished, gone, or untrusted is a fact, not a risk judgement -- refuse
+    // it before ANY other check, including the unresolved-session check
+    // just below. A sealed volume's writes are all `completed`, so that
+    // check would never fire on it and this status refusal is the truer
+    // message; refusing here also means nothing after this point --
+    // `find_staged_data`, the MAM `UPDATE`, `check_loaded_generation`,
+    // `TapeStore::open`, `check_fresh_write_contact`, `bind_late` -- ever
+    // runs for a non-target row, which is what keeps a closed binding
+    // permanent (#154).
+    if !coverage::is_write_target(&volume_status) {
+        return Err(TapectlError::VolumeNotWriteTarget {
+            label: label.to_string(),
+            status: volume_status,
+        });
+    }
 
     // Refuse fast, before any real work, if this volume already has an
     // unresolved write session. `ValidatedLayout::plan` would otherwise hit
@@ -1065,13 +1083,24 @@ pub fn volume_resume(
     device: &str,
     block_size: usize,
 ) -> Result<()> {
-    let volume_id: i64 = conn
+    let (volume_id, volume_status): (i64, String) = conn
         .query_row(
-            "SELECT id FROM volumes WHERE label = ?1",
+            "SELECT id, status FROM volumes WHERE label = ?1",
             params![label],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // ADR-0012 (issue #161): same fact refusal as `volume_write`, and for
+    // the same reason it must come before anything else -- a `quarantined`
+    // volume must be named by its status, not answered with
+    // `nothing_to_resume`'s message about `writes` rows.
+    if !coverage::is_write_target(&volume_status) {
+        return Err(TapectlError::VolumeNotWriteTarget {
+            label: label.to_string(),
+            status: volume_status,
+        });
+    }
 
     let session = match session::InterruptedSession::rehydrate(conn, volume_id)? {
         Some(s) => s,
