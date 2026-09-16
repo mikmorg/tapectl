@@ -4245,10 +4245,26 @@ mod tests {
         )
         .unwrap();
         let tid = conn.last_insert_rowid();
+
+        let (snap_id, slice_files) = add_unit_snapshot(&conn, tid, "unit1", dir);
+        (conn, snap_id, slice_files)
+    }
+
+    /// Registers one unit + snapshot + staged stage_set (two slices) +
+    /// manifest under an existing connection/tenant. Factored out of
+    /// `setup_deletable_snapshot` (issue #176) so a multi-unit fixture —
+    /// two units sharing one connection and one write session — can be
+    /// built without two separate in-memory databases.
+    fn add_unit_snapshot(
+        conn: &Connection,
+        tenant_id: i64,
+        unit_name: &str,
+        dir: &Path,
+    ) -> (i64, Vec<std::path::PathBuf>) {
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
-             VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
-            params![tid],
+             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+            params![format!("u-{unit_name}"), unit_name, tenant_id],
         )
         .unwrap();
         let uid = conn.last_insert_rowid();
@@ -4270,7 +4286,7 @@ mod tests {
 
         let mut slice_files = Vec::new();
         for n in 1..=2i64 {
-            let f = dir.join(format!("slice{n}.dar.age"));
+            let f = dir.join(format!("{unit_name}-slice{n}.dar.age"));
             fs::write(&f, b"ciphertext").unwrap();
             conn.execute(
                 "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
@@ -4288,9 +4304,111 @@ mod tests {
             params![snap_id],
         )
         .unwrap();
-        insert_file(&conn, snap_id, "/src/a.txt", 3, "cc");
+        insert_file(conn, snap_id, &format!("/src/{unit_name}.txt"), 3, "cc");
 
-        (conn, snap_id, slice_files)
+        (snap_id, slice_files)
+    }
+
+    /// Registers a `volumes` row and returns its id — the minimal shape
+    /// `insert_write` needs to attach a `writes` row (issue #176).
+    fn insert_volume(conn: &Connection, label: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES (?1, 'lto', 'drive0', 1000000, 'active')",
+            params![label],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Adds one `writes` row (at `status`, optionally with a `session_dir`)
+    /// plus one `write_positions` row for `snap_id`'s first stage slice —
+    /// the exact shape issue #176's pre-fix cascade could not delete:
+    /// `write_positions` references `stage_slices` and `writes`, and
+    /// `writes` references `stage_sets`/`snapshots`/`volumes`, none of
+    /// which the old six-statement cascade touched. Returns
+    /// `(write_id, write_position_id)`.
+    fn insert_write(
+        conn: &Connection,
+        snap_id: i64,
+        volume_id: i64,
+        status: &str,
+        session_dir: Option<&str>,
+    ) -> (i64, i64) {
+        let stage_set_id: i64 = conn
+            .query_row(
+                "SELECT id FROM stage_sets WHERE snapshot_id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let slice_id: i64 = conn
+            .query_row(
+                "SELECT id FROM stage_slices WHERE stage_set_id = ?1
+                 ORDER BY slice_number LIMIT 1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![stage_set_id, snap_id, volume_id, status, session_dir],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position)
+             VALUES (?1, ?2, '1')",
+            params![write_id, slice_id],
+        )
+        .unwrap();
+        let wp_id = conn.last_insert_rowid();
+
+        (write_id, wp_id)
+    }
+
+    /// Captures whatever `tracing::warn!`/etc. emit during `f`, via a
+    /// thread-scoped subscriber (`tracing::subscriber::with_default`)
+    /// rather than swapping the process's real stdout/stderr file
+    /// descriptor — safe under `cargo test`'s default parallel,
+    /// multi-threaded execution (issue #176).
+    fn capture_tracing<F: FnOnce()>(f: F) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
     }
 
     /// The encrypted `.age` files must not be orphaned. `stage_slices` rows
@@ -4321,13 +4439,18 @@ mod tests {
     }
 
     /// The cascade must be all-or-nothing. Driven by a trigger that rejects
-    /// the final `DELETE FROM snapshots`, i.e. a failure at the LAST of the
-    /// six statements — the case that, untransacted, left every dependent
-    /// row deleted while the snapshot itself survived, referencing nothing.
+    /// the final `DELETE FROM snapshots`, i.e. a failure at the LAST
+    /// statement — the case that, untransacted, left every dependent row
+    /// deleted while the snapshot itself survived, referencing nothing.
+    /// Extended by issue #176 to also carry a `writes`/`write_positions`
+    /// row through the rollback, now that the cascade's new head deletes
+    /// them too.
     #[test]
     fn a_failure_late_in_the_cascade_rolls_back_the_whole_delete() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (conn, snap_id, slice_files) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-ROLLBACK");
+        insert_write(&conn, snap_id, volume_id, "planned", None);
 
         conn.execute_batch(
             "CREATE TRIGGER reject_snapshot_delete
@@ -4342,13 +4465,15 @@ mod tests {
             "expected the trigger's abort, got: {err}"
         );
 
-        // Every dependent row must survive: without a transaction the five
+        // Every dependent row must survive: without a transaction the
         // earlier DELETEs would have committed individually.
         for (table, sql) in [
             ("stage_slices", "SELECT COUNT(*) FROM stage_slices"),
             ("stage_sets", "SELECT COUNT(*) FROM stage_sets"),
             ("manifests", "SELECT COUNT(*) FROM manifests"),
             ("files", "SELECT COUNT(*) FROM files"),
+            ("writes", "SELECT COUNT(*) FROM writes"),
+            ("write_positions", "SELECT COUNT(*) FROM write_positions"),
         ] {
             let n: i64 = conn.query_row(sql, [], |row| row.get(0)).unwrap();
             assert!(
@@ -4375,6 +4500,236 @@ mod tests {
                 f.display()
             );
         }
+    }
+
+    /// Issue #176: `snapshot_delete`'s only write-related guard checked
+    /// `status = 'completed'`; every other reachable `writes` status —
+    /// `planned` (right after `volume write` plans, before a byte is
+    /// written), `in_progress`, `failed`, `aborted` (a failed confirm) and
+    /// `interrupted` (a crash mid-write, per `recover_orphaned_sessions`)
+    /// — passed the guard straight into a cascade that never touched
+    /// `writes`/`write_positions`, tripping their FKs on the very first
+    /// `DELETE FROM stage_slices`.
+    ///
+    /// Negative control (pre-fix HEAD): `snapshot_delete` returns
+    /// `Err("FOREIGN KEY constraint failed")` for every one of these five
+    /// statuses.
+    #[test]
+    fn delete_succeeds_with_a_non_completed_write_row() {
+        for status in ["planned", "in_progress", "failed", "aborted", "interrupted"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, snap_id, _slices) = setup_deletable_snapshot(tmp.path());
+            let volume_id = insert_volume(&conn, &format!("VOL-{status}"));
+            insert_write(&conn, snap_id, volume_id, status, None);
+
+            snapshot_delete(&conn, "unit1", 1, true, false)
+                .unwrap_or_else(|e| panic!("status '{status}' must not block delete: {e}"));
+
+            let writes: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(writes, 0, "writes rows must be gone for status '{status}'");
+            let wps: i64 = conn
+                .query_row("SELECT COUNT(*) FROM write_positions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                wps, 0,
+                "write_positions rows must be gone for status '{status}'"
+            );
+            let fk_violations: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                fk_violations, 0,
+                "no dangling FK rows may remain for status '{status}'"
+            );
+        }
+    }
+
+    /// Issue #176: a failed confirm (`SealedPending::confirm` erroring)
+    /// leaves `writes.status = 'aborted'` AND writes
+    /// `verification_results` rows keyed to that write's
+    /// `write_positions` — a third FK layer the audit's two-DELETE fix
+    /// missed. `verification_sessions` is evidence about the *volume*
+    /// (a later `volume verify` reuses it across many snapshots' writes),
+    /// so it must survive; only its per-mismatch `verification_results`
+    /// children belonging to THIS snapshot are deleted.
+    #[test]
+    fn delete_succeeds_after_a_failed_confirm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, _slices) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-FAIL");
+        let (_write_id, wp_id) = insert_write(&conn, snap_id, volume_id, "aborted", None);
+        let stage_slice_id: i64 = conn
+            .query_row(
+                "SELECT stage_slice_id FROM write_positions WHERE id = ?1",
+                params![wp_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'failed')",
+            params![volume_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO verification_results
+             (session_id, write_position_id, stage_slice_id, result)
+             VALUES (?1, ?2, ?3, 'failed_checksum')",
+            params![session_id, wp_id, stage_slice_id],
+        )
+        .unwrap();
+
+        snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
+
+        let vr: i64 = conn
+            .query_row("SELECT COUNT(*) FROM verification_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            vr, 0,
+            "verification_results rows belonging to the deleted snapshot must be gone"
+        );
+
+        let vs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM verification_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vs, 1,
+            "verification_sessions is evidence about the VOLUME, not this \
+             snapshot -- it must survive"
+        );
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "no dangling FK rows may remain");
+    }
+
+    /// Issue #176 step 3: a `writes.session_dir` still referenced by
+    /// another snapshot's `writes` row — `collection run`'s normal
+    /// multi-unit-per-session shape — must survive this delete, exactly as
+    /// #55 already guarantees for `stage_slices.staging_path`. Only once
+    /// the LAST referencing row is gone does the directory get removed.
+    #[test]
+    fn delete_leaves_a_sibling_snapshots_session_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+
+        let (snap1_id, _slices1) = add_unit_snapshot(&conn, tid, "unit1", tmp.path());
+        let (snap2_id, slices2) = add_unit_snapshot(&conn, tid, "unit2", tmp.path());
+
+        let session_dir = tmp.path().join("sessions").join("shared-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_dir_str = session_dir.to_string_lossy().to_string();
+
+        let volume_id = insert_volume(&conn, "VOL-SHARED");
+        insert_write(
+            &conn,
+            snap1_id,
+            volume_id,
+            "interrupted",
+            Some(&session_dir_str),
+        );
+        insert_write(
+            &conn,
+            snap2_id,
+            volume_id,
+            "interrupted",
+            Some(&session_dir_str),
+        );
+
+        // Delete unit1's snapshot: unit2's sibling row and the shared
+        // directory must both survive.
+        snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
+
+        assert!(
+            session_dir.exists(),
+            "session dir still referenced by unit2's writes row must survive"
+        );
+        let snap2_writes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM writes WHERE snapshot_id = ?1",
+                params![snap2_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            snap2_writes, 1,
+            "sibling snapshot's writes row must survive"
+        );
+        for f in &slices2 {
+            assert!(f.exists(), "sibling's staged slice files must survive");
+        }
+
+        // Delete unit2's snapshot too: nothing references the directory
+        // any more, so it goes.
+        snapshot_delete(&conn, "unit2", 1, true, false).unwrap();
+        assert!(
+            !session_dir.exists(),
+            "session dir must be removed once no writes row references it"
+        );
+    }
+
+    /// Issue #176 step 4: an `interrupted` write's session can never be
+    /// resumed once this delete removes the slices its Layout referenced,
+    /// so the operator needs a pointer to `tapectl volume abort <label>`.
+    /// #94 already settled that this must be a warning, never an
+    /// auto-abort of the row.
+    #[test]
+    fn delete_of_an_interrupted_session_names_the_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, _slices) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-NAMED-INTERRUPTED");
+        insert_write(&conn, snap_id, volume_id, "interrupted", None);
+
+        let output = capture_tracing(|| {
+            snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
+        });
+        assert!(
+            output.contains("VOL-NAMED-INTERRUPTED"),
+            "the interrupted-write warning must name the volume label, got: {output}"
+        );
+    }
+
+    /// Issue #176 step 2: the `completed` guard is the ONLY write-related
+    /// refusal and must stay that way — this pins that a `completed` row
+    /// still refuses exactly as before the fix.
+    #[test]
+    fn delete_still_refuses_a_completed_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, _slices) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-DONE");
+        insert_write(&conn, snap_id, volume_id, "completed", None);
+
+        let err = snapshot_delete(&conn, "unit1", 1, true, false).unwrap_err();
+        assert!(
+            err.to_string().contains("completed write"),
+            "expected the existing completed-write refusal, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("cannot delete"),
+            "expected the existing completed-write refusal, got: {err}"
+        );
     }
 
     /// Issue #177: the pre-fix `db_fsck` hand-rolled exactly two orphan
