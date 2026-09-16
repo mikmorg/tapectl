@@ -130,7 +130,13 @@ struct CartridgeRow {
     location: Option<String>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). Raw `total_load_count` (matches `cartridge info
-    /// --json`'s "loads" key for the same column).
+    /// --json`'s "loads" key for the same column). Since issue #184,
+    /// `None` here is a REAL state (never observed via MAM), not merely
+    /// LEFT JOIN defensiveness -- `--json` already serialised it as `null`
+    /// (`pin_cartridge_rows_json_shape` below), but every real row used to
+    /// come back `Some` (the column's unused `DEFAULT 0`), so a consumer
+    /// could previously treat this key as always-a-number in practice. It
+    /// can now genuinely be `null`.
     #[tabled(rename = "Loads", display_with = "display_opt_i64")]
     loads: Option<i64>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
@@ -139,8 +145,14 @@ struct CartridgeRow {
     volume: Option<String>,
 }
 
+/// Renders a load count. `None` means the MAM load count has never been
+/// observed for this cartridge (issue #184) -- rendered as the word
+/// "unknown", the one spelling used here and in `cartridge info`'s
+/// plain-text render, never as blank (indistinguishable from a stripped 0)
+/// or as `0` (a false claim about wear).
 fn display_opt_i64(v: &Option<i64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_default()
+    v.map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn display_opt_string(v: &Option<String>) -> String {
@@ -346,7 +358,7 @@ pub fn run(
                     "  Location: {}",
                     location.as_deref().unwrap_or("(not placed)")
                 );
-                println!("  Loads:    {}", loads.unwrap_or(0));
+                println!("  Loads:    {}", display_opt_i64(&loads));
                 println!("  Capacity: {} GB", cap / (1024 * 1024 * 1024));
                 println!("  Created:  {created}");
                 if let Some(n) = &notes {
