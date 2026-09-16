@@ -542,6 +542,7 @@ pub fn run(
                         "unknown_remaining": report.unknown_remaining,
                         "units_without_tenant_envelope": report.units_without_tenant_envelope,
                         "no_changes": report.is_noop(),
+                        "volume_status_mismatch": report.volume_status_mismatch,
                     })
                 );
             } else {
@@ -567,6 +568,19 @@ pub fn run(
                         } else {
                             ""
                         }
+                    );
+                }
+                // Outside the is_noop() branch on purpose: a second rebuild
+                // onto a row that is still non-sealed is a no-op for row
+                // counts and must still warn every time (issue #158).
+                if let Some(status) = &report.volume_status_mismatch {
+                    println!(
+                        "  warning: volume \"{}\" was already in this catalog as \"{status}\", \
+                         not sealed — the rebuild attached its units to that row and left the \
+                         status alone; until it is sealed, nothing on it counts as a copy. Run \
+                         `tapectl volume verify {}` to check the tape; the status itself will \
+                         not change automatically",
+                        report.label, report.label
                     );
                 }
                 if !report.had_catalog_db {
