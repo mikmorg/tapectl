@@ -748,6 +748,39 @@ mod tests {
         );
     }
 
+    /// ADR-0012's consequences bullet: "Move events carry location *names*
+    /// on both sides, never an id on one and a name on the other." Move a
+    /// cartridge that is ALREADY located (into "home" first) and then again
+    /// (into "bank"), and check the second move's event: the old side must
+    /// be the FIRST location's name, not its id.
+    #[test]
+    fn moving_an_already_located_cartridge_logs_the_previous_locations_name_not_its_id() {
+        let conn = setup_bound();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('bank', 'shelf')",
+            [],
+        )
+        .unwrap();
+
+        move_cartridge(&conn, "A001L6", "home").unwrap();
+        move_cartridge(&conn, "A001L6", "bank").unwrap();
+
+        let old_value: Option<String> = conn
+            .query_row(
+                "SELECT old_value FROM events
+                 WHERE entity_type = 'cartridge' AND action = 'moved'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_value.as_deref(),
+            Some("home"),
+            "the event's old value must be the previous location's NAME, not its id (ADR-0012)"
+        );
+    }
+
     /// The other direction (ADR-0011: "`volume move` keeps its name and
     /// meaning, and now also moves the cartridge the volume is bound to").
     #[test]
