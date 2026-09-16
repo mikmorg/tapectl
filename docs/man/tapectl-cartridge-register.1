@@ -22,7 +22,7 @@ Show what would be done without making changes
 Media generation (e.g., LTO\-6, LTO\-7, LTO\-7\-M8, LTO\-8)
 .TP
 \fB\-\-capacity\fR \fI<CAPACITY>\fR
-Nominal capacity, e.g. "2500G". Defaults to the generation table\*(Aqs marketed figure (ADR\-0010) when omitted — give this explicitly only when the physical cartridge really differs (a declared 40 TB LTO\-10 cartridge, an mhvtl micro\-tape, ...)
+Nominal capacity, e.g. "2500G". Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `slice_size`/`enospc_buffer` use. Defaults to the generation table\*(Aqs marketed figure (ADR\-0010) when omitted — give this explicitly only when the physical cartridge really differs (a declared 40 TB LTO\-10 cartridge, an mhvtl micro\-tape, ...)
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
