@@ -2502,6 +2502,8 @@ mod tests {
                 media: Some(IdThunkMedia {
                     cartridge_serial: serial.to_string(),
                     cartridge_identity_source: source.map(str::to_string),
+                    cartridge_manufacturer: None,
+                    tape_length_meters: None,
                 }),
             }
         }

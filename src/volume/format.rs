@@ -304,6 +304,19 @@ pub struct IdThunkMedia {
     /// make all of them falsely attest a chip-verified serial. A reader that
     /// cannot tell must say so.
     pub cartridge_identity_source: Option<String>,
+    /// The cartridge manufacturer `volume init`/`volume write` recorded from
+    /// MAM at write time (`layout::generate_id_thunk_v2`'s
+    /// `cartridge_manufacturer`), when the tape carries one. `#[serde(default)]`
+    /// (issue #165): every `[media]` table `volume init` has ever written
+    /// carries this key, but a hand-assembled or future-shrunk thunk that
+    /// omits it must still parse — additive, like every other field here.
+    /// `catalog rebuild` (#165) is the one consumer: registering a cartridge
+    /// from a tape's own claim needs the same fact `cartridge register
+    /// --manufacturer` would ask an operator to type.
+    pub cartridge_manufacturer: Option<String>,
+    /// The cartridge's length in meters, same provenance and same
+    /// `#[serde(default)]` reasoning as `cartridge_manufacturer` above.
+    pub tape_length_meters: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +327,12 @@ struct MediaToml {
     /// must be impossible to read this and wonder what a missing key does.
     #[serde(default)]
     cartridge_identity_source: Option<String>,
+    /// Additive (issue #165): a `[media]` table that predates this field, or
+    /// one hand-assembled without it, must still parse rather than error.
+    #[serde(default)]
+    cartridge_manufacturer: Option<String>,
+    #[serde(default)]
+    tape_length_meters: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,6 +350,8 @@ pub fn parse_id_thunk_media(raw: &str) -> Result<IdThunkMedia> {
     Ok(IdThunkMedia {
         cartridge_serial: doc.media.cartridge_serial,
         cartridge_identity_source: doc.media.cartridge_identity_source,
+        cartridge_manufacturer: doc.media.cartridge_manufacturer,
+        tape_length_meters: doc.media.tape_length_meters,
     })
 }
 
@@ -759,6 +780,37 @@ load_count_at_write = 5
     #[test]
     fn id_thunk_media_missing_marker_is_an_err_not_a_panic() {
         assert!(parse_id_thunk_media("no toml here at all").is_err());
+    }
+
+    /// Issue #165 item 1: `catalog rebuild`'s cartridge auto-registration
+    /// needs manufacturer + length off the tape, the same facts `cartridge
+    /// register --manufacturer/--length` would ask an operator to type. Both
+    /// are read straight off the `[media]` table the live generator already
+    /// writes.
+    #[test]
+    fn id_thunk_media_carries_manufacturer_and_length() {
+        let params = sample_id_thunk_params("RT11", "77777777-8888-9999-aaaa-bbbbbbbbbbbb");
+        let generated = generate_id_thunk_v2(&params);
+        let parsed = parse_id_thunk_media(&generated).expect("parses");
+        assert_eq!(parsed.cartridge_manufacturer.as_deref(), Some("IBM"));
+        assert_eq!(parsed.tape_length_meters, Some(846));
+    }
+
+    /// Additive (issue #165): a `[media]` table missing `cartridge_manufacturer`
+    /// / `tape_length_meters` entirely — a hand-assembled thunk, or a future
+    /// shape that drops them — must still parse, with both fields reading as
+    /// `None` rather than failing the whole document.
+    #[test]
+    fn id_thunk_media_without_manufacturer_or_length_still_parses() {
+        let bare = "\
+[media]
+cartridge_serial = \"SERIAL1\"
+";
+        let parsed = parse_id_thunk_media(bare).expect("a [media] table missing the new keys \
+            entirely must still parse");
+        assert_eq!(parsed.cartridge_serial, "SERIAL1");
+        assert_eq!(parsed.cartridge_manufacturer, None);
+        assert_eq!(parsed.tape_length_meters, None);
     }
 
     // --- id thunk layout pointers (the foreign-tape seal-position check, #27) --
