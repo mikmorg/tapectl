@@ -533,9 +533,20 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
 /// Copies and locations route through `policy::coverage`'s shared
 /// deposit-aware expressions, so this report can never disagree with the
 /// gates about either count (ADR-0004 eligibility + ADR-0006 deposits).
-/// The trailing `i64` is how many of `copies` are warehouse deposits —
+/// The 5th field (`i64`) is how many of `copies` are warehouse deposits —
 /// see [`FireRiskRow`] for why that is a separate number.
-pub(crate) type CopyRow = (String, i64, i64, Option<String>, i64);
+///
+/// The 6th field (issue #236 finding 2 follow-up) is the SUBSET of the 4th
+/// field's labels that are `in_service` but not currently ADR-0004-eligible
+/// (not sealed) -- appended at the end, never inserted between existing
+/// fields, so an out-of-fence positional consumer (`cli::volume`'s `(name,
+/// ..)`, `cli::operations`'s `.1`) keeps working unchanged. Kept as a
+/// SIBLING list rather than baked into the 4th field as a `*` marker: a
+/// `*`-suffixed label inside `--json`'s `"volumes"` string is exactly the
+/// #205/finding-5 defect this fix must not reintroduce (a raw fact must
+/// carry no display-only annotation) -- `report_copies` renders the marker
+/// for the table only, from these two clean lists.
+pub(crate) type CopyRow = (String, i64, i64, Option<String>, i64, Option<String>);
 
 pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<CopyRow>> {
     let eligible = crate::policy::coverage::eligible("v");
@@ -546,9 +557,10 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
     // exactly where the escrow line three lines below already names it.
     // Using `eligible` (sealed-only) here silently dropped those volumes,
     // producing `[tapes holding any version: -]` directly above an escrow
-    // line naming the tape that holds it. A label not currently `eligible`
-    // (ADR-0004 -- it does not count as a COPY) is marked `*` so the two
-    // numbers above never look like they agree when they do not.
+    // line naming the tape that holds it. `volumes_not_eligible` names
+    // which of `volumes`' labels do not currently count toward `copies` --
+    // a clean, separate list rather than a marker baked into `volumes`
+    // itself (see the field's doc above).
     let in_service = crate::policy::coverage::in_service("v");
     let scope = crate::policy::coverage::CoverageQuery::current_unit("u.id");
     // Copies/locations/deposits come from the shared deposit-aware
@@ -560,10 +572,10 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
         "SELECT u.name,
                 {} as copies,
                 {} as locations,
-                GROUP_CONCAT(DISTINCT CASE WHEN {in_service} THEN
-                    v.label || CASE WHEN {eligible} THEN '' ELSE '*' END
-                END) as volumes,
-                {} as deposits
+                GROUP_CONCAT(DISTINCT CASE WHEN {in_service} THEN v.label END) as volumes,
+                {} as deposits,
+                GROUP_CONCAT(DISTINCT CASE WHEN {in_service} AND NOT ({eligible})
+                    THEN v.label END) as volumes_not_eligible
          FROM units u",
         crate::policy::coverage::copy_count_expr(&scope),
         crate::policy::coverage::location_count_expr(&scope),
@@ -595,10 +607,35 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// The table-only `*` rendering for `report copies`' volume list (issue
+/// #236 finding 2 follow-up). Takes the two CLEAN, comma-separated lists
+/// `copies_rows` returns (`volumes`, `volumes_not_eligible`) and produces
+/// the marked display string -- `*` is applied here, in the renderer,
+/// never baked into the raw fact `--json` emits (that would reintroduce
+/// the exact #205/finding-5 defect: a display annotation smuggled into a
+/// value a machine consumer parses as data).
+fn mark_ineligible_volumes(vols: &str, not_eligible: &str) -> String {
+    if vols.is_empty() {
+        return vols.to_string();
+    }
+    let not_eligible: std::collections::HashSet<&str> = not_eligible.split(',').collect();
+    vols.split(',')
+        .map(|label| {
+            if not_eligible.contains(label) {
+                format!("{label}*")
+            } else {
+                label.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
@@ -608,16 +645,21 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, copies, locs, vols, deposits)| {
+            .map(|(name, copies, locs, vols, deposits, not_eligible)| {
                 let no_escrow = gaps.get(name).cloned().unwrap_or_default();
                 serde_json::json!({"unit": name, "copies": copies, "locations": locs,
                                    "volumes": vols, "warehouse_deposits": deposits,
+                                   // Issue #236 finding 2 follow-up: additive,
+                                   // never folded into "volumes" as a marker --
+                                   // a raw fact carries no display annotation
+                                   // (the finding-5 rule, applied here too).
+                                   "volumes_not_eligible": not_eligible,
                                    "volumes_without_escrow": no_escrow})
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        for (name, copies, locs, vols, deposits) in &rows {
+        for (name, copies, locs, vols, deposits, not_eligible) in &rows {
             // The COUNT and the LIST answer different questions, and since
             // issue #153 they can legitimately disagree: `copies` is how
             // many copies the unit's THINNEST current version has (ADR-0012
@@ -633,18 +675,23 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
             // query behind it (`copies_rows`) uses the same `in_service`
             // predicate `policy::escrow`'s coverage line below uses for the
             // SAME volume, not the narrower `eligible` (sealed-only) this
-            // used to filter through. A label suffixed `*` is in the list
-            // but not currently ADR-0004-eligible (not sealed), so it does
-            // not count toward `copies` above -- called out once, after the
-            // list, rather than silently dropped.
+            // used to filter through. A label marked `*` in the TABLE ONLY
+            // (`mark_ineligible_volumes`) is in the list but not currently
+            // ADR-0004-eligible (not sealed), so it does not count toward
+            // `copies` above -- called out once, after the list, rather
+            // than silently dropped or baked into the raw `--json` value.
             let vols_str = vols.as_deref().unwrap_or("-");
+            let marked = not_eligible
+                .as_deref()
+                .map(|ne| mark_ineligible_volumes(vols_str, ne))
+                .unwrap_or_else(|| vols_str.to_string());
             println!(
                 "  {name}: {copies} {}{}, {locs} {} [tapes holding any version: {}]{}",
                 if *copies == 1 { "copy" } else { "copies" },
                 warehouse_note(*deposits),
                 if *locs == 1 { "location" } else { "locations" },
-                vols_str,
-                if vols_str.contains('*') {
+                marked,
+                if not_eligible.is_some() {
                     " (* not sealed -- does not count toward copies)"
                 } else {
                     ""
@@ -2228,9 +2275,12 @@ mod tests {
         /// itself already uses, not the wider `in_service` question the
         /// escrow line three lines below asks of the SAME volume. A `full`
         /// volume (ADR-0011's legacy sealed-equivalent: `in_service` but not
-        /// `eligible`) genuinely holds a version and must appear, marked so
-        /// it is visibly not counted -- not be silently dropped the way a
-        /// `quarantined`/`retired`/`erased` volume correctly still is
+        /// `eligible`) genuinely holds a version and must appear, listed in
+        /// the additive `volumes_not_eligible` sibling (6th field) rather
+        /// than baked into `volumes` itself as a `*` marker -- a raw fact
+        /// carries no display annotation (the finding-5 rule) -- and not be
+        /// silently dropped the way a `quarantined`/`retired`/`erased`
+        /// volume correctly still is
         /// (`copies_rows_volume_label_list_excludes_a_non_sealed_volume`
         /// above pins that those stay excluded under `in_service` too).
         #[test]
@@ -2248,10 +2298,37 @@ mod tests {
                 "the sealed volume must still be listed: {volumes}"
             );
             assert!(
-                volumes.contains("rep-full-OTHER*"),
-                "the `full` volume must be listed too, marked `*` since it is not \
-                 eligible: {volumes}"
+                volumes.contains("rep-full-OTHER"),
+                "the `full` volume must be listed too: {volumes}"
             );
+            assert!(
+                !volumes.contains('*'),
+                "the raw `volumes` fact must carry no display marker: {volumes}"
+            );
+            let not_eligible = rows[0].5.as_deref().unwrap_or("");
+            assert_eq!(
+                not_eligible, "rep-full-OTHER",
+                "the ineligible subset is named separately, not folded into `volumes`"
+            );
+        }
+
+        /// The table renderer applies the `*` marker FROM the two clean
+        /// lists `copies_rows` returns -- proven directly, since
+        /// `report_copies`'s own printing is not otherwise assertable
+        /// without capturing stdout.
+        #[test]
+        fn mark_ineligible_volumes_flags_only_the_named_subset() {
+            assert_eq!(
+                mark_ineligible_volumes("A,B,C", "B"),
+                "A,B*,C",
+                "only the named label gets the marker"
+            );
+            assert_eq!(
+                mark_ineligible_volumes("A,B", ""),
+                "A,B",
+                "an empty ineligible list marks nothing"
+            );
+            assert_eq!(mark_ineligible_volumes("", ""), "");
         }
 
         #[test]
