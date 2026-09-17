@@ -38,6 +38,7 @@ use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
 
 use super::selector::{self, Batch};
+use crate::volume::layout_model::pad_to_blocks;
 
 /// The format-constant block size every write path pads against
 /// (`docs/design/v2-open-questions.md` §8: "block size — format constant,
@@ -143,6 +144,48 @@ pub struct DestinationBudget {
     pub binding_capacity_bytes: i64,
     /// How many `--label` destinations were given.
     pub num_destinations: usize,
+}
+
+/// Sum of the on-tape (block-padded) footprint every currently `'staged'`
+/// stage set would add if `volume_write` ran right now — the exact set
+/// `volume::write::find_staged_data` selects (`WHERE ss.status = 'staged'`,
+/// joined to its slices `WHERE staging_path IS NOT NULL`), with no batch,
+/// collection or tenant scope, because that function has none either
+/// (issue #232 item 1: the whole point is that its selection is unscoped,
+/// so the budget must account for exactly what it will pick up, not a
+/// narrower guess). A stage set with zero live slices contributes nothing,
+/// matching `find_staged_data`'s own "skip if slices is empty" rule.
+///
+/// Per-slice bytes are padded with [`pad_to_blocks`] at the same
+/// [`BLOCK_SIZE`] `Layout::on_tape_bytes` pads every slice entry to
+/// (`src/volume/layout_model.rs`: `LayoutEntry::on_tape_bytes`, which does
+/// `size_bytes.map(|s| pad_to_blocks(s, block_size))` where a slice's
+/// `size_bytes` is set from `BuildSlice::encrypted_bytes`,
+/// `src/volume/build.rs`) — summing padded slices is exactly
+/// `Layout::on_tape_bytes`'s own per-entry arithmetic, just computed here
+/// from the database ahead of a `BuiltLayout` existing at all, since a
+/// second retained batch's `Layout` is never built until its own `volume
+/// write` runs.
+fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
+    // Padding is applied per-slice, not to the aggregate sum: summing first
+    // and padding once would round a batch of small slices up only a single
+    // time instead of once per slice, understating the total in a way
+    // `Layout::on_tape_bytes` never does (it pads each `LayoutEntry` before
+    // summing). So this reads every live slice's raw bytes and pads each
+    // individually before adding it in.
+    let mut stmt = conn.prepare(
+        "SELECT sl.encrypted_bytes
+         FROM stage_sets ss
+         JOIN stage_slices sl ON sl.stage_set_id = ss.id
+         WHERE ss.status = 'staged' AND sl.staging_path IS NOT NULL",
+    )?;
+    let total: u64 = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|bytes| pad_to_blocks(bytes.max(0) as u64, BLOCK_SIZE))
+        .sum();
+    Ok(total)
 }
 
 /// Resolve `collection run`'s budget from the destination volumes' own
@@ -257,7 +300,18 @@ pub fn destination_budget(
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
     let usable = (binding_capacity_bytes as f64 * backend.usable_capacity_factor) as u64;
     let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
-    let bytes = usable.saturating_sub(enospc_buffer);
+    // Issue #232 item 1: `volume_write`'s `find_staged_data` selects every
+    // `'staged'` stage set in the database, not just the batch this run is
+    // about to plan — under #238's retain-until-`min_copies` design, live
+    // `'staged'` sets from an already-planned batch are the NORMAL state
+    // between copies, not wreckage. Whatever is already staged will ride
+    // along with this batch onto whichever destination `execute_batch`
+    // writes to, so it must come out of the budget before packing runs, or
+    // the number gates capacity while `volume_write` gates payload.
+    let already_staged = already_staged_on_tape_bytes(conn)?;
+    let bytes = usable
+        .saturating_sub(enospc_buffer)
+        .saturating_sub(already_staged);
 
     Ok(DestinationBudget {
         bytes,
@@ -977,6 +1031,116 @@ mod tests {
         assert_eq!(
             before, after,
             "more than one destination label must fail before staging ever touches snapshots"
+        );
+    }
+
+    /// Issue #232 item 1 (2026-09-17 correction): `destination_budget` used
+    /// to size the batch purely from the destination volume's own capacity,
+    /// with no regard for stage sets that are ALREADY `'staged'` and will
+    /// also land on whichever volume `execute_batch` eventually calls
+    /// `volume_write` against — `find_staged_data`
+    /// (`src/volume/write.rs`) selects every `'staged'` stage set in the
+    /// database with no batch/collection/tenant scope, so those bytes are
+    /// written alongside the new batch, not instead of it. Under #238's
+    /// retain-staging-until-`min_copies` design this is the NORMAL state
+    /// between copies, not leftover wreckage — so the fix must shrink the
+    /// budget, never refuse outright.
+    ///
+    /// Fixture: a 10 MiB destination, and 6 MiB already sitting in a
+    /// `'staged'` stage set that belongs to no collection this run will
+    /// touch (no `current_path`, so `pending_units_for_collection` cannot
+    /// see it — it is exactly the kind of already-staged data
+    /// `find_staged_data` would still pick up). The two pending units this
+    /// run WOULD plan are 3 MiB each: they fit together in one batch against
+    /// the raw 10 MiB destination capacity, but not against the 4 MiB
+    /// (10 MiB − 6 MiB) that is actually free once the retained set is
+    /// accounted for.
+    #[test]
+    fn destination_budget_subtracts_bytes_already_retained_by_other_staged_sets() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', ?1, 'initialized')",
+            [10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+
+        // The pre-existing retained stage set: a unit with no `current_path`
+        // (so no collection walk will ever see it as pending), already
+        // `'staged'`, with one live slice (`staging_path` set, matching
+        // `find_staged_data`'s own filter) whose `encrypted_bytes` is a
+        // clean multiple of the 512 KiB block size so padding does not
+        // perturb the arithmetic.
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status) \
+             VALUES ('retained', 'retained', (SELECT id FROM tenants WHERE name = 'media'), \
+                     'mtime_size', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let retained_unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size) \
+             VALUES (?1, 1, 'staged', '/tmp/retained', 1, 6291456)",
+            params![retained_unit_id],
+        )
+        .unwrap();
+        let retained_snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 6291456)",
+            params![retained_snap_id],
+        )
+        .unwrap();
+        let retained_ss_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices \
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, \
+                 sha256_encrypted, staging_path) \
+             VALUES (?1, 1, 6291456, 6291456, 'a', 'b', '/tmp/retained-slice')",
+            params![retained_ss_id],
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+
+        let budget = destination_budget(&conn, &config, "/dev/null", &["L1".to_string()]).unwrap();
+        assert_eq!(
+            budget.bytes,
+            4 * 1024 * 1024,
+            "budget must be the 10 MiB destination minus the 6 MiB already retained by \
+             the other staged set, not the raw 10 MiB capacity"
+        );
+
+        let batches = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        assert_eq!(
+            batches.len(),
+            2,
+            "two 3 MiB units fit together under the raw 10 MiB capacity but must NOT fit \
+             under the 4 MiB actually free once the retained 6 MiB set is accounted for"
         );
     }
 
