@@ -526,9 +526,15 @@ pub(crate) fn select_cartridge(
 ///
 /// Returns every match rather than assuming uniqueness — `operator_serial`
 /// carries no UNIQUE index (two operators can mistype the same wrong value;
-/// see the migration 016 header), so [`lookup_cartridge`] decides what to do
-/// with more than one.
-fn select_cartridges_by_operator_serial(
+/// see the migration 016 header), so each CALLER decides what to do with more
+/// than one.
+///
+/// `pub(crate)` for `catalog rebuild`'s `mam`-identity resolve (issue #214),
+/// which is not on `lookup_cartridge`'s path at all — it resolves File 0's
+/// own claim, not a `--cartridge`, and so needs this query directly. The
+/// query and the `serial_number IS NULL` restriction are unchanged by that:
+/// both callers want exactly the rows the chip has not yet confirmed.
+pub(crate) fn select_cartridges_by_operator_serial(
     conn: &Connection,
     value: &str,
 ) -> Result<Vec<CartridgeRow>> {
