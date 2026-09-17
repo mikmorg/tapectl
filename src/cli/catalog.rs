@@ -91,6 +91,25 @@ struct FileRow {
     path: String,
     #[tabled(rename = "Size")]
     size: String,
+    /// Additive per CTO decision 2026-09-11 (architecture review C2
+    /// follow-up, C2b): a raw value alongside the humanised `size` display
+    /// string, so a machine consumer of `--json` can get the exact byte
+    /// count instead of parsing `size`'s one-decimal-rounded text back
+    /// (issue #205 -- 1_234_567 and 1_240_000 both render `"1.2 MiB"`).
+    /// `#[tabled(skip)]`: the table is explicitly out of scope for this
+    /// fix, a human reading `catalog ls` wants `size`'s `1.2 KiB`, not a
+    /// second raw-bytes column.
+    ///
+    /// `None` for a directory row, not `Some(0)`. The `files.size_bytes`
+    /// column actually stores a literal `0` for a directory (see
+    /// `staging/mod.rs`'s manifest walk: `let size = if is_dir { 0 } else
+    /// { meta.len() as i64 };`) -- that is a placeholder for "not
+    /// measured", not a real content size, and surfacing it as `Some(0)`
+    /// would make a directory indistinguishable from a genuine
+    /// zero-byte file to a machine consumer. `size` already renders `"-"`
+    /// for the same row for the same reason.
+    #[tabled(skip)]
+    size_bytes: Option<i64>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b): the raw `modified_at` column is nullable, so this
     /// carries `Option<String>` (the DB's own timestamp string, unchanged)
@@ -116,6 +135,35 @@ fn display_opt_string(v: &Option<String>) -> String {
 /// 2026-09-11 (architecture review C2 follow-up, C2b) added it as `Option<String>`.
 fn file_rows_to_json(rows: &[FileRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
+}
+
+/// Builds one `FileRow` from the `files` table's raw columns. Extracted
+/// (issue #205) out of `Ls`'s `query_map` closure so this mapping --
+/// specifically the `size`/`size_bytes` split -- is a function a test can
+/// call directly, rather than something only provable by re-typing a
+/// literal into the struct. That literal-only testing is exactly what let
+/// #205's rounding regression through the existing JSON pin unnoticed: see
+/// `pin_file_rows_json_shape`'s own doc comment.
+fn file_row(
+    raw_path: String,
+    size: i64,
+    is_dir: bool,
+    modified: Option<String>,
+    sha256_raw: Option<String>,
+) -> FileRow {
+    FileRow {
+        path: format!("{}{}", if is_dir { "d " } else { "  " }, raw_path),
+        size: if is_dir {
+            "-".into()
+        } else {
+            crate::util::format_bytes_binary(size)
+        },
+        size_bytes: if is_dir { None } else { Some(size) },
+        modified,
+        sha256: sha256_raw
+            .map(|s| short_hash(&s))
+            .unwrap_or_else(|| "(unstaged)".into()),
+    }
 }
 
 #[derive(Tabled, Debug, Serialize)]
@@ -353,23 +401,13 @@ pub fn run(
                 .query_map(params![snapshot_id], |row| {
                     let size: i64 = row.get(1)?;
                     let is_dir: bool = row.get(4)?;
-                    Ok(FileRow {
-                        path: format!(
-                            "{}{}",
-                            if is_dir { "d " } else { "  " },
-                            row.get::<_, String>(0)?
-                        ),
-                        size: if is_dir {
-                            "-".into()
-                        } else {
-                            crate::util::format_bytes_binary(size)
-                        },
-                        modified: row.get::<_, Option<String>>(2)?,
-                        sha256: row
-                            .get::<_, Option<String>>(3)?
-                            .map(|s| short_hash(&s))
-                            .unwrap_or_else(|| "(unstaged)".into()),
-                    })
+                    Ok(file_row(
+                        row.get::<_, String>(0)?,
+                        size,
+                        is_dir,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -794,23 +832,30 @@ mod tests {
     /// task fixes.
     #[test]
     /// This pins the JSON SHAPE — key names, key ordering, null handling —
-    /// and nothing else. It feeds `size` in as a literal, so the humaniser is
-    /// never called and this test cannot catch a unit change; the formatter
-    /// itself is pinned in `crate::util`. The literal moved `KB` -> `KiB` with
-    /// issue #204 only so the fixture stops modelling output the code no
-    /// longer produces. Do not add a unit assertion here: put it on the
-    /// formatter, where it can actually fail.
+    /// and nothing else. It feeds `size` AND `size_bytes` in as literals, so
+    /// the humaniser is never called and this test cannot catch a unit
+    /// change; the formatter itself is pinned in `crate::util`. The literal
+    /// moved `KB` -> `KiB` with issue #204 only so the fixture stops
+    /// modelling output the code no longer produces. Do not add a unit
+    /// assertion here: put it on the formatter, where it can actually fail.
+    /// `size_bytes` (issue #205) is additive: `None` for the directory row,
+    /// `Some(n)` for the file row -- what production actually maps is
+    /// proven separately below, by calling `file_row` directly, since a
+    /// literal here proves only that the struct serialises, not that the
+    /// mapping into it is correct (the exact gap #205 found).
     fn pin_file_rows_json_shape() {
         let rows = vec![
             FileRow {
                 path: "d subdir".to_string(),
                 size: "-".to_string(),
+                size_bytes: None,
                 modified: Some("2026-01-01T00:00:00Z".to_string()),
                 sha256: "(unstaged)".to_string(),
             },
             FileRow {
                 path: "  some/file.txt".to_string(),
                 size: "1.2 KiB".to_string(),
+                size_bytes: Some(1229),
                 modified: None,
                 sha256: "0123456789ab...".to_string(),
             },
@@ -818,8 +863,42 @@ mod tests {
         let value = file_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"modified":"2026-01-01T00:00:00Z","path":"d subdir","sha256":"(unstaged)","size":"-"},{"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KiB"}]"#
+            r#"[{"modified":"2026-01-01T00:00:00Z","path":"d subdir","sha256":"(unstaged)","size":"-","size_bytes":null},{"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KiB","size_bytes":1229}]"#
         );
+    }
+
+    /// Issue #205: `size_bytes` must carry the exact byte count even when
+    /// the humaniser's one-decimal rounding makes two different sizes
+    /// render identically -- 1_234_567 and 1_240_000 both round to
+    /// `"1.2 MiB"`. Calling `file_row` directly (the real production
+    /// mapping, not a literal restated into the struct) is the point: the
+    /// existing pin above never calls it and so never called the humaniser
+    /// either, which is exactly how a rounding regression got through
+    /// unnoticed.
+    #[test]
+    fn size_bytes_survives_the_humanisers_rounding_collision() {
+        let a = file_row("a".to_string(), 1_234_567, false, None, None);
+        let b = file_row("b".to_string(), 1_240_000, false, None, None);
+        assert_eq!(
+            a.size, b.size,
+            "both sizes should round to the same display string"
+        );
+        assert_eq!(a.size_bytes, Some(1_234_567));
+        assert_eq!(b.size_bytes, Some(1_240_000));
+        assert_ne!(a.size_bytes, b.size_bytes);
+    }
+
+    /// A directory row's `size_bytes` is `None`, not `Some(0)`. The `files`
+    /// table's `size_bytes` column literally stores `0` for a directory
+    /// (`staging/mod.rs`'s manifest walk), which is a placeholder for "not
+    /// measured", not a real content size -- `Some(0)` would make a
+    /// directory indistinguishable from a genuine empty file to a machine
+    /// JSON consumer.
+    #[test]
+    fn directory_row_has_no_size_bytes() {
+        let row = file_row("subdir".to_string(), 0, true, None, None);
+        assert_eq!(row.size, "-");
+        assert_eq!(row.size_bytes, None);
     }
 
     /// Pins the WHOLE `--json` shape, including `last_verified` (issue
