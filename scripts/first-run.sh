@@ -738,9 +738,26 @@ EOF
         run tc cartridge register --barcode "$CARTRIDGE" --generation "$CGEN" || die "cartridge register failed"
       fi
       run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --cartridge "$CARTRIDGE" || die "volume init failed"
+    elif grep -q "ADR-0003" "$INIT_OUT"; then
+      # The SEALED case, split out from the mismatch case below (issue #223).
+      #
+      # This branch used to share the one below, whose text named a sealed
+      # volume as "the usual reason" and then prescribed --force. For a genuinely
+      # sealed tape that is impossible: `decide_fresh_write_contact` refuses
+      # `AlreadySealed` outright, and its own message says "--force cannot
+      # override this". The script then ran init --force anyway, failed
+      # identically, and died -- walking the operator into the same wall twice
+      # and naming none of the real remedy.
+      #
+      # tapectl's refusal already says what to do, so this does not repeat it;
+      # it stops rather than offering a flag that cannot work.
+      explain <<'EOF'
+volume init was refused by an ADR-0003 rule — almost always because the loaded cartridge already carries a SEALED volume. This is not a consent question and --force does not reach it: every ADR-0003 refusal says so itself, because a sealed volume is immutable and there is no append. Read the refusal above; it names the remedy for the case you hit. For a sealed cartridge that is: retire the volume on it, bulk-erase the physical tape, then `tapectl cartridge mark-erased` before writing to it again. If you did not expect a sealed tape here, `tapectl volume identify --device <dev>` will say what it actually holds.
+EOF
+      die "volume init refused by ADR-0003 and no flag overrides it. Act on the remedy in the refusal above (for a sealed cartridge: retire, erase, cartridge mark-erased), or load a different cartridge, then re-run scripts/first-run.sh --from 13"
     else
       explain <<'EOF'
-volume init refused. The usual reason: the cartridge's File 0 already identifies a DIFFERENT sealed volume, and sealed volumes are immutable (ADR-0003) — tapectl will not overwrite one by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first.
+volume init refused. The cartridge's File 0 identifies a DIFFERENT volume that is NOT sealed — a stale or foreign tape. tapectl will not overwrite one by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first. (A SEALED tape is a different case and --force would not help there; this is not that.)
 EOF
       [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
       confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" || die "stopped"
