@@ -1112,7 +1112,14 @@ the normative design set named in the Policy block below.
   those gaps explicitly, so closing one of those issues means editing the guide
   in the same commit.
 - **Man pages:** any clap change regenerates `docs/man` in the same commit
-  (`cargo run --example gen_man`).
+  (`cargo run --example gen_man`). **Regenerate again AFTER a rebase, before
+  integrating** — a branch's generated artifacts are stale by definition once
+  it moves onto a newer base. #147 changed the GLOBAL `--yes` help, so all 123
+  pages moved; but it had regenerated before being rebased onto a master that
+  had since gained `cartridge edit` (#167) and `cartridge unretire` (#163), and
+  those two pages kept the old wording. The local gate does not check man-page
+  drift — CI's "Man pages in sync" job is the only thing that does, which is
+  why the Policy says to READ the CI result rather than assume it.
 - **Model tactics:** you keep judgment (task selection, review, integration,
   anything crypto/tape-semantics/state-machine). Sonnet workers for spec'd
   legwork via the `worktree-agent` template; haiku for fully-specified
