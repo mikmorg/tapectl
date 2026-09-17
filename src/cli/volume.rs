@@ -1279,7 +1279,10 @@ impl VolumeRow {
         if self.copies.is_none() {
             "—".to_string()
         } else {
-            verified_display(self.verified.as_deref(), chrono::Utc::now().naive_utc())
+            crate::policy::evidence::compact_age(
+                self.verified.as_deref(),
+                chrono::Utc::now().naive_utc(),
+            )
         }
     }
 }
@@ -1300,16 +1303,6 @@ fn display_copies(v: &Option<i64>) -> String {
 /// never-vs-aged rendering is deterministically testable (same split as
 /// `policy::evidence::describe`). An unparseable stamp renders raw, matching
 /// that module's honesty rule rather than silently reading as "never".
-fn verified_display(stamp: Option<&str>, now: chrono::NaiveDateTime) -> String {
-    match stamp {
-        None => "never".to_string(),
-        Some(raw) => match chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
-            Ok(dt) => format!("{}d ago", (now - dt).num_days()),
-            Err(_) => raw.to_string(),
-        },
-    }
-}
-
 /// `volume list --json` shape (rule #7: raw values, the render functions are
 /// table-only).
 fn volume_rows_to_json(rows: &[VolumeRow]) -> serde_json::Value {
@@ -2493,21 +2486,22 @@ mod tests {
             let now =
                 chrono::NaiveDateTime::parse_from_str("2026-09-15 00:00:00", "%Y-%m-%d %H:%M:%S")
                     .unwrap();
-            assert_eq!(verified_display(None, now), "never");
-            assert_eq!(
-                verified_display(Some("2026-09-01 00:00:00"), now),
-                "14d ago"
-            );
+            use crate::policy::evidence::compact_age;
+            assert_eq!(compact_age(None, now), "never");
+            assert_eq!(compact_age(Some("2026-09-01 00:00:00"), now), "14d ago");
             assert_ne!(
-                verified_display(None, now),
-                verified_display(Some("2026-09-01 00:00:00"), now)
+                compact_age(None, now),
+                compact_age(Some("2026-09-01 00:00:00"), now)
             );
-            // An unparseable stamp renders raw rather than as "never" —
-            // matches `policy::evidence`'s honesty rule.
-            assert_eq!(
-                verified_display(Some("not-a-timestamp"), now),
-                "not-a-timestamp"
-            );
+            // An unparseable stamp says so (issue #217). This used to assert
+            // the RAW string, with a comment claiming that "matches
+            // `policy::evidence`'s honesty rule" -- it did the opposite:
+            // `compact_age` has always returned "unparseable", so `volume
+            // list` would print a garbage timestamp verbatim in a column
+            // where `catalog locate` printed "unparseable" for the same row.
+            // The test pinned the divergence AND mis-cited the module it
+            // diverged from.
+            assert_eq!(compact_age(Some("not-a-timestamp"), now), "unparseable");
         }
 
         /// The table cell goes a step further than the pure formatter: a

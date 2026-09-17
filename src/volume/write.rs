@@ -915,13 +915,6 @@ pub fn volume_write(
     // (`layout-session.md`'s validation point 1).
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
     let mam = det.mam.clone();
-    if mam.max_capacity_bytes.is_some() || mam.remaining_bytes.is_some() {
-        let _ = conn.execute(
-            "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
-             WHERE id = ?3",
-            params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
-        );
-    }
 
     // Corroborate at contact (ADR-0012, issue #193) — wrong-cartridge
     // discipline one layer earlier than the File 0 check (ADR-0010): the
@@ -956,6 +949,29 @@ pub fn volume_write(
     });
     if let Some(m) = medium_for_write_check {
         crate::tape::media_detect::check_drive_can_write(backend, m)?;
+    }
+
+    // MAM bookkeeping, moved BELOW the three refusals above (issue #220).
+    //
+    // It used to sit immediately after `detect`, which meant a write refused
+    // by corroboration, by `check_loaded_generation` or by
+    // `check_drive_can_write` had already written that cartridge's MAM facts
+    // onto this volume's row. On the corroboration path those are facts about
+    // a DIFFERENT physical cartridge -- the refusal's whole point -- so the
+    // row was left claiming capacity and remaining-space figures read from a
+    // tape it is not on.
+    //
+    // #161 put the catalog guard ahead of everything for exactly this reason:
+    // a refused write must touch nothing. These columns are informational and
+    // never gate the write (the pre-flight reads `volumes.capacity_bytes`,
+    // decided at init), which is why this is low severity -- but informational
+    // and wrong is still wrong, and `report capacity` reads them.
+    if mam.max_capacity_bytes.is_some() || mam.remaining_bytes.is_some() {
+        let _ = conn.execute(
+            "UPDATE volumes SET mam_capacity_bytes = ?1, mam_remaining_at_start = ?2
+             WHERE id = ?3",
+            params![mam.max_capacity_bytes, mam.remaining_bytes, volume_id],
+        );
     }
 
     // File 0's `[media]` identity, taken from the BINDING (ADR-0012, issue
@@ -7182,6 +7198,54 @@ mod tests {
                     "{f} no longer corroborates the loaded medium at contact (ADR-0012, \
                      issue #193). If this call moved, move this assertion with it; do not \
                      delete it."
+                );
+            }
+        }
+
+        /// Issue #220. The three tape-side refusals -- corroboration,
+        /// `check_loaded_generation`, `check_drive_can_write` -- all need a
+        /// drive, so "a refused write leaves the MAM columns untouched"
+        /// cannot be asserted by calling anything. The existing
+        /// untouched-MAM tests cover only the CATALOG-status refusal, which
+        /// fires before `detect` runs at all and so never exercised this.
+        ///
+        /// Same source-scan shape as the corroboration guard above, and for
+        /// the same reason: the property is an ORDERING, and deleting or
+        /// moving the write back above the refusals is exactly how it
+        /// regresses.
+        #[test]
+        fn volume_write_records_mam_facts_only_after_the_tape_side_refusals() {
+            const SRC: &str = include_str!("write.rs");
+            let f = "pub fn volume_write(";
+            let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+            let end = SRC[start..].find("\n}\n").unwrap() + start;
+            let body = &SRC[start..end];
+            assert!(
+                !body[f.len()..].contains("\npub fn "),
+                "body extraction overran into another function; fix this test's scan \
+                 before trusting its verdict"
+            );
+
+            let mam_update = body
+                .find("UPDATE volumes SET mam_capacity_bytes")
+                .expect("volume_write no longer records MAM facts at all");
+            for (needle, what) in [
+                (
+                    "binding::corroborate_volume(",
+                    "wrong-cartridge corroboration",
+                ),
+                ("check_loaded_generation(", "the wrong-medium refusal"),
+                ("check_drive_can_write(", "the drive-cannot-write refusal"),
+            ] {
+                let guard = body
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("volume_write no longer calls {needle}"));
+                assert!(
+                    guard < mam_update,
+                    "the MAM bookkeeping UPDATE must run AFTER {what} (issue #220): a write \
+                     refused there would otherwise record THAT cartridge's capacity facts \
+                     onto this volume's row -- and on the corroboration path those are facts \
+                     about a different physical cartridge, which is the refusal's whole point"
                 );
             }
         }
