@@ -4235,6 +4235,14 @@ mod tests {
             "quarantined",
             "a proven-bad medium must leave the volume quarantined"
         );
+        let effect = report.quarantine.as_ref().expect("the report must say so");
+        assert_eq!(effect.previous_status, "sealed");
+        assert!(effect.status_changed());
+        assert_eq!(effect.proof.len(), 1);
+        assert_eq!(
+            effect.proof[0].kind,
+            crate::store::MismatchKind::ContentHashMismatch
+        );
         let events = volume_events(&conn, "Q-ROT");
         assert!(
             events.iter().any(|(action, old, new)| action
@@ -4314,6 +4322,244 @@ mod tests {
             &impacts,
         )
         .expect("a quarantined volume is no longer the last eligible copy of anything");
+    }
+
+    /// A clean verify changes nothing. The status assertion is the point:
+    /// the quarantine is reached from inside the verify transaction, so a
+    /// passing tape must come out the other side untouched.
+    #[test]
+    fn a_clean_verify_leaves_the_volume_status_alone() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, "Q-OK", "q-ok-unit", 4, &good, "completed", "current");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-OK'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-OK'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("Q-OK", &good, &good);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-OK",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
+        assert!(report.quarantine.is_none());
+        assert_eq!(volume_status(&conn, "Q-OK"), "sealed");
+        assert!(volume_events(&conn, "Q-OK").is_empty());
+    }
+
+    /// An unparseable seal marker is `SealUnreadable`, whose own doc has
+    /// always said it is the NORMAL signal for an unsealed tape, "never an
+    /// error". It must not quarantine — and this goes through the real
+    /// `volume_verify_with_store` call site, not the seam, so it proves the
+    /// wiring and not just the predicate.
+    #[test]
+    fn a_seal_unreadable_failure_does_not_quarantine() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"slice bytes that are perfectly fine on tape. ".repeat(4);
+        seed_one_slice_fixture(&conn, "Q-SEAL", "q-seal-unit", 4, &good, "completed", "current");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-SEAL'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-SEAL'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("Q-SEAL", &good, &good);
+        store.files[5] = b"NOT TOML AT ALL [".to_vec();
+
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-SEAL",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+        assert_eq!(
+            report.mismatches[0].kind,
+            crate::store::MismatchKind::SealUnreadable
+        );
+        assert!(
+            report.quarantine.is_none(),
+            "an unreadable seal is not evidence about the medium"
+        );
+        assert_eq!(
+            volume_status(&conn, "Q-SEAL"),
+            "sealed",
+            "the volume's status must be exactly what it was"
+        );
+        assert!(
+            volume_events(&conn, "Q-SEAL").is_empty(),
+            "nothing to record: no quarantine happened"
+        );
+    }
+
+    /// One `Evidence` with exactly one mismatch of `kind`, as `chain_walk`
+    /// would have returned it.
+    fn evidence_of(kind: crate::store::MismatchKind) -> crate::store::Evidence {
+        crate::store::Evidence {
+            tier: Tier::Integrity,
+            files_checked: 2,
+            mismatches: vec![crate::store::Mismatch {
+                position: 3,
+                kind,
+                expected: "front index present and readable".into(),
+                actual: "read failed: Input/output error".into(),
+            }],
+        }
+    }
+
+    /// THE crux of ADR-0012's 2026-09-17 amendment.
+    ///
+    /// `FrontIndexUnreadable` is produced by `store.rs` from a genuine I/O
+    /// or transport error and from a short read; neither tells a bad tape
+    /// from a dirty drive, a wrong block size or a transient SCSI error. It
+    /// must leave the volume EXACTLY as it was, because `quarantined` is
+    /// what makes a volume stop counting as a copy — a false one silently
+    /// takes real coverage to zero, and a bad drive would condemn a library
+    /// one cartridge at a time.
+    ///
+    /// Driven through the seam rather than a fixture because
+    /// `volume_verify_with_store` reads File 3 itself before `confirm`, so
+    /// no MemStore tape can reach this kind: a File 3 it cannot read fails
+    /// earlier, as an `Err`. On a real drive it is exactly the transient
+    /// case, which is why the arm exists at all.
+    #[test]
+    fn a_front_index_unreadable_failure_does_not_quarantine() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"bytes that were never even reached. ".repeat(4);
+        seed_one_slice_fixture(&conn, "Q-FI", "q-fi-unit", 4, &good, "completed", "current");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-FI'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-FI'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let effect = quarantine_on_medium_evidence(
+            &conn,
+            volume_id,
+            "Q-FI",
+            &evidence_of(crate::store::MismatchKind::FrontIndexUnreadable),
+        )
+        .unwrap();
+
+        assert!(effect.is_none(), "\"could not read it today\" is not proof");
+        assert_eq!(volume_status(&conn, "Q-FI"), "sealed");
+        assert!(volume_events(&conn, "Q-FI").is_empty());
+    }
+
+    /// The other three medium-proving kinds reach the status write through
+    /// the same seam, and the two non-proving ones do not. Asserted against
+    /// a REAL row each time rather than against the predicate, so a wiring
+    /// mistake (say, filtering on the wrong side) cannot pass.
+    #[test]
+    fn the_seam_quarantines_exactly_the_medium_proving_kinds() {
+        use crate::store::MismatchKind::*;
+        for (kind, expected) in [
+            (ContentHashMismatch, "quarantined"),
+            (FrontIndexDivergesFromSeal, "quarantined"),
+            (FrontIndexInconsistent, "quarantined"),
+            (NavigationDisagreement, "quarantined"),
+            (FrontIndexUnreadable, "sealed"),
+            (SealUnreadable, "sealed"),
+        ] {
+            let conn = crate::db::open_memory().unwrap();
+            let good = b"fixture bytes. ".repeat(4);
+            let label = "Q-SEAM";
+            seed_one_slice_fixture(&conn, label, "q-seam-unit", 4, &good, "completed", "current");
+            conn.execute(
+                "UPDATE volumes SET status = 'sealed' WHERE label = ?1",
+                params![label],
+            )
+            .unwrap();
+            let volume_id: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = ?1", params![label], |r| r.get(0))
+                .unwrap();
+
+            quarantine_on_medium_evidence(&conn, volume_id, label, &evidence_of(kind)).unwrap();
+            assert_eq!(
+                volume_status(&conn, label),
+                expected,
+                "{} must leave the volume {expected}",
+                kind.label()
+            );
+        }
+    }
+
+    /// A volume that was ALREADY quarantined reports the fact honestly:
+    /// there is fresh evidence, but the status is not new. A report that
+    /// said "QUARANTINED (was sealed)" here would be lying.
+    #[test]
+    fn re_verifying_an_already_quarantined_volume_reports_no_status_change() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the bytes the front index promises. ".repeat(4);
+        let rotted = b"the bytes the tape actually holds!! ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "Q-AGAIN",
+            "q-again-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'quarantined' WHERE label = 'Q-AGAIN'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-AGAIN'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("Q-AGAIN", &good, &rotted);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-AGAIN",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+
+        let effect = report.quarantine.expect("the evidence is still medium-proving");
+        assert_eq!(effect.previous_status, "quarantined");
+        assert!(
+            !effect.status_changed(),
+            "the evidence is fresh; the status is not new"
+        );
+        assert_eq!(volume_status(&conn, "Q-AGAIN"), "quarantined");
     }
 
     fn mem_store_with_slice_at(position: u32, bytes: &[u8]) -> MemStore {
