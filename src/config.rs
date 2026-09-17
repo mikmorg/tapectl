@@ -597,6 +597,7 @@ impl Config {
         config.validate_sizes(path)?;
         config.validate_closed_sets(path)?;
         config.validate_ranges(path)?;
+        config.validate_backends(path)?;
         Ok(config)
     }
 
@@ -848,9 +849,61 @@ impl Config {
         }
     }
 
+    /// Reject two `[[backends.lto]]` entries that make `resolve_lto_backend`
+    /// (STRICT, ADR-0010) and `resolve_device` (lenient) silently pick
+    /// "whichever happened to be first" (issue #222) — both resolvers are
+    /// `.find(...)`, so a hand-edited config that never went through
+    /// `cli::backend::add` (which already refuses this exact shape,
+    /// `src/cli/backend.rs`) loaded, and passed `config check`, cleanly.
+    /// Compared pairwise: `name` by string equality (how every lookup by
+    /// name works), `device_tape` via [`device_matches`] (string-equality-
+    /// then-canonicalize — the same comparison `resolve_lto_backend`,
+    /// `resolve_device` and `backend::add` already use), so a `/dev/nstN`
+    /// target and a by-id symlink to it are caught as the same drive, not
+    /// just a literal string match.
+    fn backend_problems(&self, path: &Path) -> Vec<String> {
+        let mut problems = Vec::new();
+        let backends = &self.backends.lto;
+        for i in 0..backends.len() {
+            for j in (i + 1)..backends.len() {
+                if backends[i].name == backends[j].name {
+                    problems.push(format!(
+                        "{}: backends.lto[{i}] and backends.lto[{j}] share name \"{}\" — \
+                         names must be unique, or lookups by name resolve to whichever \
+                         entry happens to be first",
+                        path.display(),
+                        backends[i].name
+                    ));
+                }
+                if device_matches(&backends[i].device_tape, &backends[j].device_tape) {
+                    problems.push(format!(
+                        "{}: backends.lto[{i}] (\"{}\") and backends.lto[{j}] (\"{}\") both \
+                         resolve to device_tape \"{}\" — two backends on the same drive make \
+                         --device resolution ambiguous (resolve_lto_backend/resolve_device \
+                         would silently pick the first); edit one block or point it at a \
+                         different device",
+                        path.display(),
+                        backends[i].name,
+                        backends[j].name,
+                        backends[i].device_tape
+                    ));
+                }
+            }
+        }
+        problems
+    }
+
+    fn validate_backends(&self, path: &Path) -> Result<()> {
+        match self.backend_problems(path).into_iter().next() {
+            None => Ok(()),
+            Some(msg) => Err(TapectlError::Config(msg)),
+        }
+    }
+
     /// Every semantic problem `Config::load` would reject on an otherwise
     /// structurally-parseable config — [`Config::size_problems`] then
-    /// [`Config::closed_set_problems`] then [`Config::range_problems`], in the same relative order
+    /// [`Config::closed_set_problems`] then [`Config::range_problems`] then
+    /// [`Config::backend_problems`], in the same relative order
     /// `Config::load` checks them in, so the FIRST entry here is always
     /// identical to the error `Config::load` itself would raise.
     ///
@@ -861,6 +914,7 @@ impl Config {
         let mut problems = self.size_problems(path);
         problems.extend(self.closed_set_problems(path));
         problems.extend(self.range_problems(path));
+        problems.extend(self.backend_problems(path));
         problems
     }
 
@@ -2168,5 +2222,87 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).expect("valid closed-set values must still load");
         assert_eq!(cfg.archive_sets.len(), 1);
+    }
+
+    // ---- issue #222: two [[backends.lto]] entries on one drive ----
+
+    #[test]
+    fn config_load_rejects_two_backends_sharing_a_device_tape() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"a\"\ndevice_tape = \"/dev/null\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\n\
+             [[backends.lto]]\nname = \"b\"\ndevice_tape = \"/dev/null\"\n\
+             device_sg = \"/dev/sg1\"\ngeneration = \"LTO-6\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/dev/null"), "{msg}");
+        assert!(msg.contains('a') && msg.contains('b'), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_two_backends_sharing_a_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"a\"\ndevice_tape = \"/dev/null\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\n\
+             [[backends.lto]]\nname = \"a\"\ndevice_tape = \"/dev/zero\"\n\
+             device_sg = \"/dev/sg1\"\ngeneration = \"LTO-6\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("share name \"a\""), "{msg}");
+    }
+
+    #[test]
+    fn config_load_accepts_two_backends_on_genuinely_distinct_devices() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[backends.lto]]\nname = \"a\"\ndevice_tape = \"/dev/null\"\n\
+             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\n\
+             [[backends.lto]]\nname = \"b\"\ndevice_tape = \"/dev/zero\"\n\
+             device_sg = \"/dev/sg1\"\ngeneration = \"LTO-6\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("distinct devices/names must still load");
+        assert_eq!(cfg.backends.lto.len(), 2);
+    }
+
+    // ---- regression: the shapes the mhvtl harness scripts generate ----
+
+    /// Mirrors `scripts/lifecycle-suite.sh`'s `bootstrap_config` /
+    /// `scripts/mhvtl-verify-gate.sh`'s `step_init` python rewrite: a single
+    /// `[[backends.lto]]` entry, a bare-integer decimal `capacity_override`,
+    /// a non-default `usable_capacity_factor`/`enospc_buffer`, `slice_size
+    /// = "1M"`, and `compaction.utilization_threshold` raised to `0.95`.
+    /// None of this issue's new validation may reject the one shape every
+    /// mhvtl gate run actually writes to disk.
+    #[test]
+    fn a_config_matching_the_mhvtl_harness_shape_loads_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[dar]\nbinary = \"dar\"\n\n\
+             [defaults]\nslice_size = \"1M\"\n\n\
+             [compaction]\nutilization_threshold = 0.95\n\n\
+             [[backends.lto]]\nname = \"lifecycle\"\ndevice_tape = \"/dev/null\"\n\
+             device_sg = \"/dev/null\"\ngeneration = \"LTO-8\"\n\
+             capacity_override = \"2748779069440\"\nusable_capacity_factor = 0.95\n\
+             enospc_buffer = \"2G\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("the mhvtl harness's own config shape must load");
+        assert_eq!(cfg.backends.lto.len(), 1);
+        assert_eq!(cfg.compaction.utilization_threshold, 0.95);
     }
 }
