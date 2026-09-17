@@ -51,7 +51,7 @@ SCENARIO_NAMES=(
     first-year evolving-source key-rotation tenant-reassign
     tape-only-and-reclaim compaction retire-and-reuse db-loss
     escrow-ordering restore-file-and-catalog quick-archive collection permute
-    stale-catalog-sealed-tape
+    stale-catalog-sealed-tape cartridge-displacement collection-second-copy
 )
 SCENARIO_DESCS=(
     "Baseline multi-tenant archive: escrow BEFORE staging, 3 units, 1 volume, full restore matrix"
@@ -68,6 +68,8 @@ SCENARIO_DESCS=(
     "Folder-per-unit collection sync/status/plan/run, including a rename-by-uuid"
     "Seeded random walk exercising the full command surface (--seed/--steps)"
     "issue #208: a sealed tape refuses a write the CATALOG still thinks is allowed"
+    "issue #226: ADR-0010 re-init displaces a bound volume and names who lost their last copy"
+    "issue #226/#229: the per-copy flow -- one collection run, staging retained, a second volume write"
 )
 
 usage() {
@@ -3246,6 +3248,457 @@ scenario_stale_catalog_sealed_tape() {
     check sct.stale_catalog_refused  sct_stale_catalog_write_refused
 }
 
+# ============================================================
+# Scenario: cartridge-displacement
+# ============================================================
+# ADR-0010's re-initialisation path, on media (issue #226 scenario A).
+#
+# `volume init` BINDS the cartridge it is talking to by its MAM medium serial,
+# and when that cartridge already carries another volume it RECORDS the
+# displacement rather than refusing it: the open mount closes, the displaced
+# volume moves to `erased`, a `displaced` event is written, and the warning
+# names every unit the displacement leaves without a copy
+# (`binding::mount_and_record` + `binding::render_displacement`, issue #235).
+# In-module tests cover the catalog half; nothing has ever driven it from a
+# drive.
+#
+# THE SHAPE IS DECIDED BY ADR-0003, not by preference. Displacement is not
+# gated by the displaced volume being sealed -- that refusal lives on the TAPE
+# side, in `check_tape_contact`'s File 0 probe, not in the catalog binding. So
+# a re-init over a still-readable sealed tape is refused (correctly, and
+# --force does not help), and the catalog-layer displacement path is reachable
+# only once File 0 is gone. This scenario therefore erases the cartridge IN
+# PLACE and re-inits it WITHOUT --force: there is no second consent gate, and
+# asserting that there isn't one is half the point.
+#
+# TWO units, deliberately. `solo`'s only copy is on the displaced volume;
+# `kept` has another copy on a different cartridge. The warning has two arms
+# (`*** ZERO copies ***` versus "N other copy/copies remain") and a
+# single-unit scenario cannot tell "named the right unit" from "named every
+# unit". The matrix at the end then proves the surviving copy is real rather
+# than merely counted -- the warning's claim is what an operator acts on.
+#
+# MEASURED 2026-09-17, before this scenario was written: `mt erase` on mhvtl
+# leaves the MAM medium serial intact (E01001L8_1775794348, byte-identical
+# before and after). That is what makes the binding survive the erase and the
+# displacement reachable at all. If it ever stops holding, this scenario goes
+# red at cd.init_d2_displaces with no displacement warning at all -- read this
+# note before blaming the code.
+cd_skip_single_cartridge() {
+    skip "cd.scenario" "displacement needs a real erase of a cartridge already bound to a sealed volume (mt erase -- instant on mhvtl, HOURS on a real LTO, and --erase short cannot reach the no-force path) plus a second cartridge to hold the surviving copy that gives the warning two arms"
+    return $?
+}
+
+cd_setup() {
+    bootstrap_config || return 1
+    TCTL tenant add alice || return 1
+    # ADR-0005: staging refuses without an escrow recipient.
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL key generate --escrow
+    else
+        TCTL key generate --escrow >"$RUN/log-cd_escrow.txt" 2>&1 || return 1
+        capture_escrow_secret cd_escrow
+    fi
+    make_source "$SRC/kept" "plain" || return 1
+    make_source "$SRC/solo" "unicode" || return 1
+    TCTL unit init "$SRC/kept" --tenant alice --name kept || return 1
+    TCTL unit init "$SRC/solo" --tenant alice --name solo || return 1
+}
+
+cd_stage_kept() { TCTL snapshot create kept && TCTL stage create kept; }
+
+cd_write_kept_on_d0() {
+    next_tape VOL-D0 || return 1
+    vinit VOL-D0 || return 1
+    TCTL volume write VOL-D0 --device "$TAPE_DEV"
+}
+
+cd_stage_solo() { TCTL snapshot create solo && TCTL stage create solo; }
+
+# `volume write` consumes every stage set still at status='staged', and
+# nothing in the write path moves one out of it (verified 2026-09-17: the only
+# writers of `stage_sets.status` are `staging::stage_create` -> 'staged',
+# `staging::clean` -> 'cleaned', `db::open`'s crash sweep -> 'failed', and
+# `read-slices`' restore-to-'staged'). So this one call puts kept's SECOND
+# copy and solo's FIRST on the same cartridge -- which is the state the
+# displacement has to reason about.
+cd_write_both_on_d1() {
+    next_tape VOL-D1 || return 1
+    vinit VOL-D1 || return 1
+    TCTL volume write VOL-D1 --device "$TAPE_DEV"
+}
+
+# The precondition the whole scenario rests on. If kept does not really have
+# two copies here, the "1 other copy/copies remain" arm below would pass for
+# the wrong reason -- and a displacement warning that says ZERO for everything
+# is indistinguishable from one that is right.
+cd_preconditions() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report copies --json (assert kept=2, solo=1 BEFORE the erase)"; return 0; }
+    local f="$RUN/log-cd.copies-before.json"
+    TCTL report copies --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    python3 - "$f" <<'PY2' || { echo "copies before the erase are not 2/1:"; cat "$f"; return 1; }
+import json, sys
+d = {r["unit"]: r["copies"] for r in json.load(open(sys.argv[1]))}
+assert d.get("kept") == 2, d
+assert d.get("solo") == 1, d
+PY2
+}
+
+# blank_tape, never erase_tape: `--erase short` (weof at BOT) leaves a present
+# but unparseable File 0, which `volume init` refuses WITHOUT --force -- and
+# this scenario's point is that displacement needs no second consent, so it
+# must not be run with one. A real erase removes File 0 and leaves the
+# ADR-0003 tape-side gate nothing to refuse, while the MAM serial (and so the
+# catalog binding) survives untouched.
+cd_erase_c1_in_place() { blank_tape; }
+
+# Deliberately NOT `vinit`: vinit appends $REUSE_FORCE, and a --force here
+# would prove nothing -- the claim under test is that ADR-0010 records a
+# displacement rather than demanding consent for it.
+cd_init_d2_displaces() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl volume init VOL-D2 --device $TAPE_DEV (NO --force) -- expect exit 0, a warning naming VOL-D1, solo at ZERO copies, kept with one copy remaining, and kept NOT named as zero"
+        return 0
+    fi
+    local out rc
+    out="$(TCTL volume init VOL-D2 --device "$TAPE_DEV" 2>&1)"; rc=$?
+    printf '%s\n' "$out" >"$RUN/log-cd.init-d2.txt"
+    [ "$rc" -eq 0 ] || {
+        echo "volume init VOL-D2 was REFUSED on a blanked cartridge (exit $rc). ADR-0010 records a displacement, it never gates one; a second consent point was deliberately rejected: $out"
+        return 1
+    }
+    printf '%s\n' "$out" | grep -q 'previously held volume "VOL-D1"' || {
+        echo "init succeeded but recorded no displacement of VOL-D1 -- the cartridge binding did not survive the erase, or mount_and_record never ran: $out"
+        return 1
+    }
+    printf '%s\n' "$out" | grep -qE 'unit "solo" \[[^]]*\] now has ZERO copies' || {
+        echo "the displacement warning did not name solo as left with ZERO copies -- this is the half of render_displacement that #235 found dropped on the rebuild path: $out"
+        return 1
+    }
+    printf '%s\n' "$out" | grep -qE 'unit "kept" \[[^]]*\]: 1 other copy' || {
+        echo "the displacement warning did not report kept's surviving copy: $out"
+        return 1
+    }
+    printf '%s\n' "$out" | grep -E 'unit "kept"' | grep -q 'ZERO copies' && {
+        echo "the warning called kept zero-copy as well as solo -- it is naming every unit on the volume, not the ones actually left uncovered: $out"
+        return 1
+    }
+    return 0
+}
+
+# The catalog half of the same act, through `volume list` (issue #195) rather
+# than sqlite3: VOL-D1 is `erased`, VOL-D2 is live, and BOTH still name the
+# same cartridge barcode -- a displaced volume keeps naming the cartridge it
+# lived on, which is what lets an operator see where the bytes went.
+cd_catalog_records_the_displacement() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume list --json (VOL-D1 erased, VOL-D2 live, both on the SAME barcode, VOL-D0 on a different one)"; return 0; }
+    local f="$RUN/log-cd.volumes.json"
+    TCTL volume list --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    python3 - "$f" <<'PY2' || { cat "$f"; return 1; }
+import json, sys
+v = {r["label"]: r for r in json.load(open(sys.argv[1]))}
+for lbl in ("VOL-D0", "VOL-D1", "VOL-D2"):
+    assert lbl in v, (lbl, sorted(v))
+assert v["VOL-D1"]["status"] == "erased", v["VOL-D1"]
+assert v["VOL-D2"]["status"] != "erased", v["VOL-D2"]
+c1, c2, c0 = v["VOL-D1"]["cartridge"], v["VOL-D2"]["cartridge"], v["VOL-D0"]["cartridge"]
+assert c1 and c2 and c0, (c0, c1, c2)
+assert c1 == c2, ("displaced and displacing volumes must name the SAME cartridge", c1, c2)
+assert c0 != c1, ("VOL-D0 must be on a different cartridge", c0, c1)
+PY2
+}
+
+cd_displaced_event() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report events --json (assert an action='displaced' row for VOL-D1)"; return 0; }
+    local f="$RUN/log-cd.events.json"
+    TCTL report events --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    python3 - "$f" <<'PY2' || { echo "no displaced event for VOL-D1:"; cat "$f"; return 1; }
+import json, sys
+rows = json.load(open(sys.argv[1]))
+hit = [r for r in rows if r.get("action") == "displaced"]
+assert hit, rows[:5]
+assert any("VOL-D1" in json.dumps(r) for r in hit), hit
+PY2
+}
+
+cd_copies_after() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report copies --json (assert kept=1, solo=0 after the displacement)"; return 0; }
+    local f="$RUN/log-cd.copies-after.json"
+    TCTL report copies --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    python3 - "$f" <<'PY2' || { echo "copy counts did not follow the displacement:"; cat "$f"; return 1; }
+import json, sys
+d = {r["unit"]: r["copies"] for r in json.load(open(sys.argv[1]))}
+assert d.get("solo") == 0, ("solo's only copy was on the displaced volume", d)
+assert d.get("kept") == 1, ("kept must keep exactly the copy on VOL-D0", d)
+PY2
+}
+
+cd_reload_d0() { load_volume_tape VOL-D0; }
+
+scenario_cartridge_displacement() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        check cd.scenario cd_skip_single_cartridge
+        return 0
+    fi
+
+    check cd.setup             cd_setup
+    check cd.stage_kept        cd_stage_kept
+    check cd.write_kept_on_d0  cd_write_kept_on_d0
+    check cd.stage_solo        cd_stage_solo
+    check cd.write_both_on_d1  cd_write_both_on_d1
+    check cd.preconditions     cd_preconditions
+    check cd.erase_c1          cd_erase_c1_in_place
+    check cd.init_d2_displaces cd_init_d2_displaces
+    check cd.catalog_records   cd_catalog_records_the_displacement
+    check cd.displaced_event   cd_displaced_event
+    check cd.copies_after      cd_copies_after
+
+    # The warning said kept still has a copy. Prove that copy is real, every
+    # way tapectl can reach it -- an evidence line an operator acts on is
+    # worth only as much as the bytes behind it (ADR-0004).
+    check cd.reload_d0         cd_reload_d0
+    restore_matrix VOL-D0 kept alice "$SRC/kept" cd-kept
+}
+# ============================================================
+# Scenario: collection-second-copy
+# ============================================================
+# The per-copy flow, on media (issue #226 scenario B, rescoped by #229).
+#
+# This scenario replaces the multi-label one #226 originally asked for. That
+# one is gone: `collection run --label A --label B` could never complete --
+# `execute_batch`'s write loop drives ONE device with no prompt, eject, pause
+# or changer anywhere in src/, so copy 2 always met copy 1's cartridge still
+# loaded -- and the CTO ruled the command takes exactly one destination and
+# NAMES the per-copy `volume write` invocations instead (#229). A test written
+# against the original description would now be testing a refusal.
+#
+# So this tests the recipe the refusal prints, end to end, which is strictly
+# more valuable: it is the only supported route to min_copies = 2 through the
+# collection path, and nothing had ever run it.
+#
+#   1. `collection run` writes copy 1 and RETAINS staging, because the units
+#      resolve min_copies = 2 (#238: `execute_batch` gates release on each
+#      unit's own resolved min_copies, not on `clean_staging`'s guard, which
+#      passes vacuously once one write row is 'completed').
+#   2. Swap cartridges, `volume write VOL-CS2` -- and it consumes the SAME
+#      staged bytes rather than re-staging. That is the property the whole
+#      ruling rests on, and it was false when the ruling was written.
+#   3. Two copies, then staging releases.
+#
+# Needs two distinct cartridges, so it skips visibly under --single-cartridge,
+# the same way `compaction` does.
+csc_skip_single_cartridge() {
+    skip "csc.scenario" "the per-copy flow #229's refusal names needs two simultaneously distinct cartridges (VOL-CS1 then VOL-CS2) -- impossible under --single-cartridge"
+    return $?
+}
+
+# The ruling itself, pinned cheaply and FIRST: refused, for the stated reason,
+# and before anything is staged. `cmd_run` calls `plan_for_run` before any
+# side effect and `plan_for_run` checks the label count before it resolves a
+# destination budget, so this cannot be passing because the labels happen not
+# to exist.
+csc_multi_label_refused() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl collection run --collection media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED citing issue #229) then tapectl stage list --json (assert still empty -- refused BEFORE staging)"
+        return 0
+    fi
+    local out rc
+    out="$(TCTL collection run --collection media --batch 0 \
+              --label VOL-CS1 --label VOL-CS2 --device "$TAPE_DEV" 2>&1)"; rc=$?
+    printf '%s\n' "$out" >"$RUN/log-csc.multi-label.txt"
+    [ "$rc" -ne 0 ] || { echo "collection run accepted two --label values; #229 ruled it refuses: $out"; return 1; }
+    printf '%s\n' "$out" | grep -q "more than one destination label" || {
+        echo "refused, but not by #229's rule -- the message does not name the label count, so this proves nothing about the ruling: $out"
+        return 1
+    }
+    printf '%s\n' "$out" | grep -q "issue #229" || {
+        echo "the refusal does not cite issue #229: $out"; return 1; }
+    local f="$RUN/log-csc.staged-after-refusal.json"
+    TCTL stage list --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d == [], d' "$f" || {
+        echo "the refusal happened AFTER staging -- a refused run must cost nothing:"; cat "$f"; return 1; }
+}
+
+csc_run_first_copy() {
+    next_tape VOL-CS1 || return 1
+    vinit VOL-CS1 || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL collection run --collection media --batch 0 --label VOL-CS1 --device "$TAPE_DEV" --json
+        echo "PLAN: assert staging_released=false and every under_copied entry is 1/2"
+        return 0
+    fi
+    # stdout and stderr to SEPARATE files, deliberately. The suite's usual
+    # `>"$f" 2>&1` idiom would merge `volume_write`'s staged-selection
+    # announcement into the JSON and this check would fail on a parse error
+    # while the tool was behaving correctly (measured 2026-09-17, first run of
+    # this scenario). That announcement is on stderr precisely so `--json`
+    # stdout stays parseable (`announce_staged_selection`), and asserting the
+    # WHOLE stdout parses is the live guard against the #56 trailer defect --
+    # so the fix is to stop merging, never to grep the JSON object out of a
+    # mixed stream. Copy this shape, not the `2>&1` one, for any command that
+    # writes to stderr.
+    local f="$RUN/log-csc.run1.json" e="$RUN/log-csc.run1.err"
+    TCTL collection run --collection media --batch 0 --label VOL-CS1 \
+        --device "$TAPE_DEV" --json >"$f" 2>"$e" || { cat "$e" "$f"; return 1; }
+    python3 - "$f" <<'PY2' || { cat "$e" "$f"; return 1; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["copies_written"] == 1, d
+assert d["units_staged"] >= 1, d
+assert d["staging_released"] is False, (
+    "one copy released staging while min_copies is 2 -- issue #238's gate is not holding", d)
+assert d["under_copied"], d
+for p in d["under_copied"]:
+    assert p["copies"] == 1 and p["min_copies"] == 2, p
+PY2
+}
+
+# csc_fingerprint <outfile> -- a canonical record of every stage set and the
+# CIPHERTEXT sha256 of each of its slices, taken from `stage list` and `stage
+# info` (never sqlite3: both facts have a command that reports them).
+#
+# This is the whole proof that the second copy consumed the SAME staged bytes
+# instead of re-staging, and a re-stage would show in all three halves at
+# once: a new `stage_sets` row (new id), `stage_set_count` above 1 for that
+# version, and DIFFERENT sha256s -- dar stamps timestamps and age is
+# randomised per call, so identical input never re-encrypts to identical bytes
+# (CLAUDE.md, "Re-staging vs read-slices"). Comparing the ciphertext hash is
+# what makes this an assertion about BYTES rather than about row counts.
+csc_fingerprint() { # csc_fingerprint <outfile>
+    local out="$1" listf="$1.list" units="$1.units"
+    TCTL stage list --json >"$listf" 2>&1 || { cat "$listf"; return 1; }
+    python3 - "$listf" "$out" "$units" <<'PY2' || { cat "$listf"; return 1; }
+import json, sys
+rows = json.load(open(sys.argv[1]))
+rows.sort(key=lambda r: (r["unit"], r["version"], r["id"]))
+with open(sys.argv[2], "w") as f, open(sys.argv[3], "w") as u:
+    for r in rows:
+        f.write("set %s v%s %s id=%s\n" % (r["unit"], r["version"], r["status"], r["id"]))
+        u.write("%s %s\n" % (r["unit"], r["version"]))
+PY2
+    local unit ver
+    while read -r unit ver; do
+        TCTL stage info "$unit" --version "$ver" --json >"$listf.info" 2>&1 \
+            || { cat "$listf.info"; return 1; }
+        python3 - "$listf.info" "$out" <<'PY2' || return 1
+import json, sys
+d = json.load(open(sys.argv[1]))
+with open(sys.argv[2], "a") as f:
+    f.write("info %s v%s id=%s %s sets=%s\n"
+            % (d["unit"], d["version"], d["stage_set_id"], d["status"], d["stage_set_count"]))
+    for s in d["slices"]:
+        f.write("  slice %s %s\n" % (s["slice"], s["sha256"]))
+PY2
+    done <"$units"
+    [ -s "$out" ] || { echo "csc_fingerprint: no stage sets at all to fingerprint"; return 1; }
+    # EVERY set must still be LIVE ('staged'), and this is not decoration.
+    # Without it the fingerprint is satisfied by two identical records of
+    # NOTHING: run the pre-#238 negative control (release staging
+    # unconditionally in `execute_batch`) and both captures read "cleaned" for
+    # every set, so `diff` is empty and csc.same_staged_bytes passes while the
+    # property it exists to prove is false. Measured 2026-09-17 -- it passed,
+    # in exactly that control, before this guard was added. A comparison is
+    # only evidence if both sides are known to be non-vacuous.
+    grep -vq ' cleaned id=' "$out" || {
+        echo "csc_fingerprint: the stage sets are already 'cleaned' -- there are no live staged bytes left to consume, so comparing this fingerprint to another would prove nothing"
+        grep ' cleaned id=' "$out"
+        return 1
+    }
+    grep -c ' staged id=' "$out" >/dev/null || return 1
+}
+
+csc_capture_staged() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: record stage list --json + per-unit stage info --json (stage_set_id, stage_set_count, every slice sha256) as the pre-second-copy fingerprint"; return 0; }
+    csc_fingerprint "$RUN/csc.fingerprint.before"
+}
+
+csc_second_copy() {
+    next_tape VOL-CS2 || return 1
+    vinit VOL-CS2 || return 1
+    TCTL volume write VOL-CS2 --device "$TAPE_DEV"
+}
+
+csc_same_staged_bytes() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: re-take the fingerprint and diff it against the pre-second-copy one (must be identical -- the second copy consumed the staged bytes, it did not re-stage)"; return 0; }
+    csc_fingerprint "$RUN/csc.fingerprint.after" || return 1
+    diff -u "$RUN/csc.fingerprint.before" "$RUN/csc.fingerprint.after" || {
+        echo "the second copy did not consume the same staged bytes -- 'volume write' re-staged, and #229's whole recipe (run 'tapectl volume write <label>' directly against the same staged data) is false"
+        return 1
+    }
+}
+
+csc_two_copies() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl collection status --json (under_copied=0) and report copies --json (every media/* unit at 2)"; return 0; }
+    local sf="$RUN/log-csc.status2.json" cf="$RUN/log-csc.copies.json"
+    TCTL collection status --json >"$sf" 2>&1 || { cat "$sf"; return 1; }
+    python3 - "$sf" <<'PY2' || { echo "collection status still reports media under-copied after two copies:"; cat "$sf"; return 1; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+media = next((c for c in d if c.get("collection") == "media"), None)
+assert media is not None, d
+assert media.get("under_copied", 1) == 0, media
+PY2
+    TCTL report copies --json >"$cf" 2>&1 || { cat "$cf"; return 1; }
+    python3 - "$cf" <<'PY2' || { echo "policy::coverage does not see two copies:"; cat "$cf"; return 1; }
+import json, sys
+rows = [r for r in json.load(open(sys.argv[1])) if r["unit"].startswith("media/")]
+assert rows, "no media/* units in report copies"
+for r in rows:
+    assert r["copies"] == 2, r
+PY2
+}
+
+# Only NOW does staging release -- and it takes the operator asking. `volume
+# write` never calls `clean_staging`; `collection run` did not because #238's
+# gate held. This is the third state, after "retained" and "consumed".
+csc_staging_released() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean; assert every stage set is 'cleaned' and no .age file survives under the staging directory"; return 0; }
+    local f="$RUN/log-csc.clean.txt" lf="$RUN/log-csc.staged-final.json"
+    # Prove there is something to release before releasing it, so "everything
+    # is cleaned afterwards" cannot be satisfied by "everything was already
+    # cleaned beforehand" (same vacuity trap as csc_fingerprint's guard).
+    TCTL stage list --json >"$lf" 2>&1 || { cat "$lf"; return 1; }
+    python3 - "$lf" <<'PY2' || { echo "nothing was still staged before staging clean ran -- the release happened earlier than the second copy:"; cat "$lf"; return 1; }
+import json, sys
+rows = json.load(open(sys.argv[1]))
+assert rows and all(r["status"] == "staged" for r in rows), rows
+PY2
+    TCTL staging clean >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL stage list --json >"$lf" 2>&1 || { cat "$lf"; return 1; }
+    python3 - "$lf" <<'PY2' || { echo "stage sets are not 'cleaned' after both copies sealed:"; cat "$lf"; return 1; }
+import json, sys
+rows = json.load(open(sys.argv[1]))
+assert rows, rows
+for r in rows:
+    assert r["status"] == "cleaned", r
+PY2
+    local staging_dir; staging_dir="$(dirname "$HOME_DIR")/staging"
+    local left; left="$(find "$staging_dir" -name '*.age' 2>/dev/null | wc -l)"
+    [ "$left" = 0 ] || { echo "$left .age file(s) survived staging clean under $staging_dir"; find "$staging_dir" -name '*.age'; return 1; }
+}
+
+scenario_collection_second_copy() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        check csc.scenario csc_skip_single_cartridge
+        return 0
+    fi
+
+    check csc.setup               col_setup
+    check csc.sync                col_sync_registers_four
+    check csc.multi_label_refused csc_multi_label_refused
+    check csc.run_first_copy      csc_run_first_copy
+    check csc.capture_staged      csc_capture_staged
+    check csc.second_copy         csc_second_copy
+    check csc.same_staged_bytes   csc_same_staged_bytes
+    check csc.two_copies          csc_two_copies
+
+    # A second copy that cannot be restored from is not a copy. The matrix
+    # runs against VOL-CS2 -- the one written by the per-copy invocation, not
+    # by `collection run`.
+    restore_matrix VOL-CS2 media/alpha alice "$SRC/col-root/alpha" csc-alpha
+
+    check csc.staging_released    csc_staging_released
+}
 run_scenario() { # run_scenario <name>
     local name="$1" fn="scenario_${1//-/_}"
     HOME_DIR="$RUN/$name/home"
