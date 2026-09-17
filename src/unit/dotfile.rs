@@ -15,6 +15,16 @@ pub struct UnitDotfile {
     pub archive_set: Option<String>,
     pub checksum_mode: Option<String>,
     pub compression: Option<String>,
+    /// Issue #212: `[policy] slice_size` was read and honoured (by
+    /// `policy::resolve` and `staging::resolve_slice_size_string`) since
+    /// issue #47, but was never modeled here -- so `read_dotfile` dropped it
+    /// and `write_dotfile` re-serialized without it, meaning a round trip
+    /// through `unit rename` (read -> mutate name -> write) silently deleted
+    /// an operator's deliberate slice-size choice. Same `Option`-with-no-
+    /// serde-`default` rule as `warehouse_copies` below: absent means defer
+    /// upward (issue #92), never a filled-in value that would look like an
+    /// operator choice nobody made.
+    pub slice_size: Option<String>,
     /// ADR-0006 / issue #73: how many warehouse deposits this unit should
     /// carry. `None` means the dotfile is SILENT, so the archive set (then
     /// the system default) decides. It is an `Option` with no serde
@@ -74,6 +84,9 @@ struct PolicySection {
     checksum_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compression: Option<String>,
+    /// Issue #212. No `#[serde(default)]` -- see `warehouse_copies` below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slice_size: Option<String>,
     /// No `#[serde(default)]` -- see `UnitDotfile::warehouse_copies`.
     #[serde(skip_serializing_if = "Option::is_none")]
     warehouse_copies: Option<i64>,
@@ -89,6 +102,7 @@ struct ExcludesSection {
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
     let policy = if data.checksum_mode.is_none()
         && data.compression.is_none()
+        && data.slice_size.is_none()
         && data.warehouse_copies.is_none()
     {
         None
@@ -96,6 +110,7 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
         Some(PolicySection {
             checksum_mode: data.checksum_mode.clone(),
             compression: data.compression.clone(),
+            slice_size: data.slice_size.clone(),
             warehouse_copies: data.warehouse_copies,
         })
     };
@@ -139,6 +154,7 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
             .as_ref()
             .and_then(|p| p.checksum_mode.clone()),
         compression: wrapper.policy.as_ref().and_then(|p| p.compression.clone()),
+        slice_size: wrapper.policy.as_ref().and_then(|p| p.slice_size.clone()),
         warehouse_copies: wrapper.policy.as_ref().and_then(|p| p.warehouse_copies),
         exclude_patterns: wrapper.excludes.patterns,
     })
@@ -159,6 +175,7 @@ mod tests {
             archive_set: Some("cold".into()),
             checksum_mode: Some("sha256".into()),
             compression: Some("lzma".into()),
+            slice_size: None,
             warehouse_copies: None,
             exclude_patterns: vec!["*.tmp".into(), ".cache/".into()],
         }

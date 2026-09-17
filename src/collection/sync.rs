@@ -543,6 +543,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".to_string()),
                 compression: Some("none".to_string()),
+                slice_size: None,
                 warehouse_copies: None,
                 exclude_patterns: vec![],
             },
@@ -674,6 +675,7 @@ mod tests {
             archive_set: Some("bulk-media".to_string()),
             checksum_mode: Some("mtime_size".to_string()),
             compression: Some("none".to_string()),
+            slice_size: None,
             warehouse_copies: None,
             exclude_patterns: Vec::new(),
         };

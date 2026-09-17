@@ -103,6 +103,7 @@ pub fn init_unit(
         archive_set: archive_set.map(|s| s.to_string()),
         checksum_mode: None,
         compression: None,
+        slice_size: None,
         warehouse_copies: None,
         exclude_patterns: Vec::new(),
     };
@@ -437,5 +438,65 @@ mod tests {
             .query_row("SELECT name FROM units WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(name, "pictures", "the database rename must have landed");
+    }
+
+    /// Issue #212: `rename_unit` is a read -> mutate `name` -> write round
+    /// trip over the dotfile (`dotfile::read_dotfile` / `write_dotfile`),
+    /// and must preserve every `[policy]` key it never intended to touch --
+    /// not just `slice_size`, all of them. Written against the dotfile's
+    /// raw TOML text (never the `UnitDotfile` struct directly) so it proves
+    /// the on-disk behavior regardless of which fields that struct happens
+    /// to model.
+    #[test]
+    fn rename_preserves_every_policy_key_including_slice_size() {
+        let (conn, tmp, paths) = harness();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("original"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let dotfile_path = src.join(".tapectl-unit.toml");
+        // Hand-edit the dotfile the way an operator would, setting every
+        // documented `[policy]` key at once.
+        let mut contents = std::fs::read_to_string(&dotfile_path).unwrap();
+        contents.push_str(
+            "\n[policy]\nchecksum_mode = \"sha256\"\ncompression = \"gzip\"\n\
+             slice_size = \"500M\"\nwarehouse_copies = 2\n",
+        );
+        std::fs::write(&dotfile_path, &contents).unwrap();
+
+        rename_unit(&conn, "original", "renamed").unwrap();
+
+        let after = std::fs::read_to_string(&dotfile_path).unwrap();
+        assert!(
+            after.contains("checksum_mode"),
+            "checksum_mode must survive rename, got: {after}"
+        );
+        assert!(
+            after.contains("compression"),
+            "compression must survive rename, got: {after}"
+        );
+        assert!(
+            after.contains("slice_size"),
+            "slice_size must survive rename (issue #212) -- it must not be silently \
+             deleted, converting the operator's deliberate choice into silence; got: {after}"
+        );
+        assert!(
+            after.contains("500M"),
+            "slice_size's VALUE, not just some key, must survive; got: {after}"
+        );
+        assert!(
+            after.contains("warehouse_copies"),
+            "warehouse_copies must survive rename, got: {after}"
+        );
     }
 }
