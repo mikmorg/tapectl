@@ -1229,11 +1229,23 @@ pub fn volume_resume(
     };
     // The stage sets this session is writing, recovered from the rehydrated
     // Layout's own slice entries rather than from a fresh
-    // `WHERE status = 'staged'` query (issue #115). `plan` already moved
-    // those stage sets out of `'staged'`, so a second selection would return
-    // the wrong set — and a second selection is what issue #96 was. The
-    // Layout IS the frozen record of the one `find_staged_data` selection
-    // this session was planned from.
+    // `WHERE status = 'staged'` query (issue #115). The Layout IS the frozen
+    // record of the one `find_staged_data` selection this session was planned
+    // from, and a second selection would return a DIFFERENT set: `'staged'` is
+    // a standing state, not a transient one, so by the time a resume runs it
+    // also matches every stage set created since this session was planned. A
+    // second selection is what issue #96 was.
+    //
+    // This comment used to justify itself with "`plan` already moved those
+    // stage sets out of `'staged'`" (issue #245). Nothing does. Every writer of
+    // `stage_sets.status` in the tree: `staging::stage_create` -> `'staged'`,
+    // `staging::clean` -> `'cleaned'`, `db::open`'s crash sweep -> `'failed'`,
+    // and `read_slices` restoring a set to `'staged'`. `plan` inserts `writes`
+    // rows and touches the status not at all. A set stays `'staged'` from
+    // `stage create` until `staging clean` — which is precisely what makes
+    // ADR-0012's per-copy recipe work (`collection run --label A`, swap, then
+    // `volume write B` against the same staged bytes), proved on media by the
+    // `collection-second-copy` lifecycle scenario (issue #226).
     let stage_set_ids = stage_set_ids_for_layout(conn, &layout_snapshot)?;
     let SessionKeys { keys, .. } = assemble_session_keys(conn, &tenant_ids, &stage_set_ids)?;
 
