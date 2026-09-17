@@ -681,6 +681,25 @@ impl Config {
                 ));
             }
         }
+        // Issue #215 finding 2: an `[[archive_sets]]` entry's `slice_size`
+        // used to be validated only at `archive-set sync` time
+        // (`cli::archive_set::ArchiveSetCommands::Sync`), never at
+        // `Config::load`/`config check` — so a malformed value here looked
+        // clean to `config check` and only failed later, all-or-nothing, at
+        // `sync`. Same parser (`crate::staging::parse_size_to_bytes`) as
+        // `defaults.slice_size` above and the one `sync` already calls
+        // (issue #200's rule: one parser per field, never a second one).
+        for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+            if let Some(s) = &as_cfg.slice_size {
+                if let Err(e) = crate::staging::parse_size_to_bytes(s) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").slice_size = {e}",
+                        path.display(),
+                        as_cfg.name
+                    ));
+                }
+            }
+        }
         problems
     }
 
@@ -726,6 +745,35 @@ impl Config {
         }
         if let Err(e) = validate_log_format(&self.logging.format) {
             problems.push(format!("{}: logging.format: {e}", path.display()));
+        }
+        // Issue #215 finding 2: `[defaults].compression`/`.checksum_mode`
+        // get this closed-set treatment (issue #171), but the identically-
+        // typed fields one section over, on each `[[archive_sets]]` entry,
+        // did not — so `config check` passed a config whose archive set
+        // `archive-set sync` would refuse outright (all-or-nothing, at sync
+        // time, long after the operator's own "is my config right?" check
+        // said yes). Reuses the exact validators `sync`'s own guard already
+        // calls (`cli::archive_set::ArchiveSetCommands::Sync`) rather than
+        // writing a third one (ADR-0012: one closed set, one validator).
+        for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+            if let Some(c) = &as_cfg.compression {
+                if let Err(e) = validate_compression(c) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").compression: {e}",
+                        path.display(),
+                        as_cfg.name
+                    ));
+                }
+            }
+            if let Some(m) = &as_cfg.checksum_mode {
+                if let Err(e) = validate_checksum_mode(m) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").checksum_mode: {e}",
+                        path.display(),
+                        as_cfg.name
+                    ));
+                }
+            }
         }
         problems
     }
@@ -1899,5 +1947,68 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.logging.tracing_level(), tracing::Level::DEBUG);
         assert_eq!(cfg.logging.format, "json");
+    }
+
+    // ---- issue #215 finding 2: [[archive_sets]] closed-set validation ----
+
+    #[test]
+    fn config_load_rejects_an_archive_set_with_a_bad_compression_value() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[archive_sets]]\nname = \"cold\"\ncompression = \"zstd \"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("archive_sets[0]"), "{msg}");
+        assert!(msg.contains("cold"), "{msg}");
+        assert!(msg.contains("compression"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_an_archive_set_with_a_bad_checksum_mode() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[archive_sets]]\nname = \"cold\"\nchecksum_mode = \"sha256sums\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("archive_sets[0]"), "{msg}");
+        assert!(msg.contains("cold"), "{msg}");
+        assert!(msg.contains("checksum_mode"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_an_archive_set_with_an_unparseable_slice_size() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[archive_sets]]\nname = \"cold\"\nslice_size = \"not-a-size\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("archive_sets[0]"), "{msg}");
+        assert!(msg.contains("slice_size"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_accepts_an_archive_set_with_valid_closed_set_values() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[archive_sets]]\nname = \"cold\"\ncompression = \"zstd\"\n\
+             checksum_mode = \"sha256\"\nslice_size = \"250M\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("valid closed-set values must still load");
+        assert_eq!(cfg.archive_sets.len(), 1);
     }
 }
