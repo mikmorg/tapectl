@@ -152,30 +152,41 @@ pub fn run(
             description,
             kind,
         } => {
+            // Issue #231 (finding 2): `locations.name` is a BINARY-collated
+            // UNIQUE column (001_initial.sql) and nothing trimmed an
+            // operator-typed name before this -- a quoted paste with a
+            // trailing space would insert a row that looks identical in
+            // every listing but never matches a later lookup by the same
+            // typed name. `cartridge register`/`relabel` trim for the same
+            // reason (src/cli/cartridge.rs).
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(TapectlError::Other(
+                    "location name must not be blank".to_string(),
+                ));
+            }
+            // Pre-check and refuse by name rather than surface the raw
+            // `UNIQUE constraint failed: locations.name` -- same discipline
+            // as `cartridge relabel` (src/cli/cartridge.rs). Done for both
+            // the dry run and the real path, not only the dry run, so a
+            // dropped `--dry-run` behaves identically.
+            let taken: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM locations WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if taken.is_some() {
+                return Err(TapectlError::Other(format!(
+                    "location \"{name}\" already exists; choose a different name"
+                )));
+            }
             // The dry branch reports the name and kind it would have
             // inserted; there is no id to report, because an id is
             // precisely the thing only a real INSERT can decide. Printed
             // before any write so the real path below is unchanged.
             if dry_run {
-                // `locations.name` is `NOT NULL UNIQUE` (001_initial.sql),
-                // so the real INSERT would fail here. Checked INSIDE the
-                // dry branch, leaving the real path to the constraint
-                // exactly as before: a dry run that hides a refusal is
-                // worse than none, because the operator drops the flag
-                // expecting it to work. Same placement rule as `Rename`'s
-                // lookup and `move_together`'s warehouse check.
-                let taken: Option<i64> = conn
-                    .query_row(
-                        "SELECT id FROM locations WHERE name = ?1",
-                        params![name],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if taken.is_some() {
-                    return Err(TapectlError::Other(format!(
-                        "location \"{name}\" already exists; choose a different name"
-                    )));
-                }
                 if json_output {
                     println!(
                         "{}",
@@ -223,6 +234,9 @@ pub fn run(
             }
         }
         LocationCommands::Info { name } => {
+            // Issue #231 (finding 2): trim so a trailing/leading space typed
+            // at the CLI still matches the trimmed name `add`/`rename` store.
+            let name = name.trim();
             let (id, desc, created, kind): (i64, Option<String>, String, String) = conn
                 .query_row(
                     "SELECT id, description, created_at, kind FROM locations WHERE name = ?1",
@@ -316,6 +330,17 @@ pub fn run(
             }
         }
         LocationCommands::Rename { current, new } => {
+            // Issue #231 (finding 2): trim both sides, the same discipline
+            // as `add` -- an untrimmed `current` would never match a name
+            // `add` stored trimmed, and an untrimmed `new` would write the
+            // one remaining unpinned trailing space right back in.
+            let current = current.trim();
+            let new = new.trim();
+            if new.is_empty() {
+                return Err(TapectlError::Other(
+                    "location name must not be blank".to_string(),
+                ));
+            }
             let id: i64 = conn
                 .query_row(
                     "SELECT id FROM locations WHERE name = ?1",
@@ -323,9 +348,27 @@ pub fn run(
                     |row| row.get(0),
                 )
                 .map_err(|_| TapectlError::Other(format!("location \"{current}\" not found")))?;
-            // After the lookup, before the UPDATE: a dry run must still
-            // refuse a location that does not exist, or the operator drops
-            // the flag expecting the rename to work.
+            // Pre-check the destination and refuse by name rather than
+            // surface the raw UNIQUE constraint failure -- same discipline
+            // as `add` and `cartridge relabel`. Guard against `new == current`
+            // (the row's own name), which must remain a harmless no-op rename
+            // rather than "already exists".
+            let taken: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM locations WHERE name = ?1",
+                    params![new],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if taken.is_some_and(|other_id| other_id != id) {
+                return Err(TapectlError::Other(format!(
+                    "location \"{new}\" already exists; choose a different name"
+                )));
+            }
+            // After the lookups, before the UPDATE: a dry run must still
+            // refuse a location that does not exist or a destination that
+            // is taken, or the operator drops the flag expecting the rename
+            // to work.
             if dry_run {
                 if json_output {
                     println!(
