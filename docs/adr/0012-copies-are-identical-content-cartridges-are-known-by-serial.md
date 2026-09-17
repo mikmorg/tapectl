@@ -275,10 +275,32 @@ passes exactly one `--label`.
 
 **Ruled:** `collection run` accepts one destination label and **refuses more than one**,
 naming the per-copy `tapectl volume write <label>` invocations to run between cartridge
-swaps. §11's stage-once/write-N-times is preserved, because staging survives the first
-copy — `staging clean`'s non-force guard retains a set while any `writes` row is
-non-`completed` — so the per-copy invocations consume the same staged bytes and do not
-re-stage.
+swaps.
+
+*Correction, same day, before implementation.* This paragraph originally justified the
+ruling by asserting that "staging survives the first copy — `staging clean`'s non-force
+guard retains a set while any `writes` row is non-`completed`". **That is false**, and the
+worker sent to implement the ruling stopped and refused to write a recipe resting on it,
+which is the correct outcome. The guard is real, but `execute_batch` calls
+`clean_staging(force = false)` **unconditionally** immediately after the copy loop, and
+after a single copy each stage set has exactly one `writes` row, `completed` — so the
+guard passes *vacuously*, staging is released, and a later
+`tapectl volume write <label2>` finds nothing: `find_staged_data` selects only
+`status = 'staged'`. A green regression test,
+`default_guard_cleans_when_the_only_planned_copy_completed`, pins exactly that.
+
+The multi-label loop only ever *appeared* safe because copy 2 failed at the wrong-tape
+refusal and returned before `clean_staging` was reached.
+
+So the ruling stands and gains a second half, which is a **pre-existing defect the ruling
+merely exposes**: releasing staging after one copy is already wrong today whenever a unit
+resolves `min_copies > 1`, on the single-label path that works. `execute_batch` must
+release staging only when the copies actually written satisfy each unit's resolved
+`min_copies`, and otherwise retain it and say what remains. Consulting policy from the
+collection layer is established, not new: `collection/status.rs` already compares
+`policy::coverage::copy_count_expr` against `resolved.min_copies`.
+
+§11's stage-once/write-N-times is preserved by that retention, not by the guard.
 
 The reasoning is that tapectl drives no changer. `CONTEXT.md` says the changer is "an
 autoloader **or a human hand** otherwise", and a human hand needs a point at which to
