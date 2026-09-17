@@ -456,31 +456,17 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
         }
     }
 
+    // Issue #235: the lines themselves come from `binding::render_displacement`,
+    // the ONE renderer both displacement callers share. This function used to
+    // own them, and `catalog rebuild` — the other caller of
+    // `mount_and_record` — rendered the same `Displaced` independently and
+    // dropped the zero-copy half of it. Rendering here and printing there is
+    // what made that divergence possible; there is now nothing to diverge.
     let now = chrono::Utc::now().naive_utc();
+    let barcode = bound.barcode.as_deref().unwrap_or("?");
     for d in &bound.displaced {
-        eprintln!(
-            "warning: cartridge {} previously held volume \"{}\"; it is now marked erased \
-             because these bytes are being overwritten (ADR-0010).",
-            bound.barcode.as_deref().unwrap_or("?"),
-            d.label,
-        );
-        for impact in &d.impacts {
-            if impact.other_copies == 0 {
-                eprintln!(
-                    "         *** unit \"{}\" [{}] now has ZERO copies ***",
-                    impact.unit_name, impact.unit_status
-                );
-            } else {
-                let evidence =
-                    crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now);
-                eprintln!(
-                    "         unit \"{}\" [{}]: {} other copy/copies remain{}",
-                    impact.unit_name,
-                    impact.unit_status,
-                    impact.other_copies,
-                    evidence.map(|e| format!(" ({e})")).unwrap_or_default(),
-                );
-            }
+        for line in binding::render_displacement(barcode, d, now) {
+            eprintln!("{line}");
         }
     }
 }

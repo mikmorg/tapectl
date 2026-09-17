@@ -124,6 +124,56 @@ pub(crate) struct Displaced {
     pub impacts: Vec<RetireImpact>,
 }
 
+/// **The** rendering of a displacement warning — ADR-0004 Tier 1 at the
+/// irreversible moment, for every caller of [`mount_and_record`].
+///
+/// It lives here, beside [`Displaced`], because the alternative is what
+/// issue #235 was: `volume init` rendered this block inline and `catalog
+/// rebuild` — receiving the identical `Displaced` from the identical
+/// function — rendered only the label and threw the impacts away in the
+/// same statement that received them. A unit could reach ZERO copies during
+/// an irreversible step on the disaster-recovery path with nothing saying
+/// so. Two callers rendering one result independently IS the defect; one
+/// renderer they both call is the fix.
+///
+/// Returns lines rather than printing them, so the caller chooses the
+/// stream (`volume init` uses stderr, to keep `--json` stdout parseable)
+/// and its own indent, and so the text is directly testable.
+///
+/// This warns; it never gates. ADR-0012: "Binding records a displacement,
+/// it never gates one" — the File 0 check is the consent point (ADR-0003)
+/// and a second gate was deliberately rejected.
+pub(crate) fn render_displacement(
+    barcode: &str,
+    d: &Displaced,
+    now: chrono::NaiveDateTime,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "warning: cartridge {} previously held volume \"{}\"; it is now marked erased \
+         because these bytes are being overwritten (ADR-0010).",
+        barcode, d.label,
+    )];
+    for impact in &d.impacts {
+        if impact.other_copies == 0 {
+            lines.push(format!(
+                "         *** unit \"{}\" [{}] now has ZERO copies ***",
+                impact.unit_name, impact.unit_status
+            ));
+        } else {
+            let evidence =
+                crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now);
+            lines.push(format!(
+                "         unit \"{}\" [{}]: {} other copy/copies remain{}",
+                impact.unit_name,
+                impact.unit_status,
+                impact.other_copies,
+                evidence.map(|e| format!(" ({e})")).unwrap_or_default(),
+            ));
+        }
+    }
+    lines
+}
+
 /// What [`bind_cartridge`] did, in enough detail for the caller to say it.
 #[derive(Default)]
 pub(crate) struct BindOutcome {
@@ -3794,5 +3844,94 @@ mod tests {
             ) -> Result<Corroboration> = corroborate_contact;
             let _ = f;
         }
+    }
+
+    // ── render_displacement (issue #235) ────────────────────────────────
+    //
+    // These pin the EXACT lines `volume init` has always printed. The
+    // renderer was extracted from `write.rs::report_binding` so `catalog
+    // rebuild` could stop discarding the zero-copy half of it; an
+    // extraction that silently reworded the warning would be a regression
+    // in the one place that already worked. Expected strings are typed
+    // literally here, never derived from the format strings, so a reword
+    // cannot pass by changing both sides at once.
+
+    fn impact(name: &str, status: &str, other_copies: i64) -> RetireImpact {
+        RetireImpact {
+            unit_name: name.to_string(),
+            unit_status: status.to_string(),
+            other_copies,
+            evidence: Vec::new(),
+            at_stake: Vec::new(),
+        }
+    }
+
+    fn now() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 17)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_displacement_warning_reads_exactly_as_volume_init_has_always_printed_it() {
+        let d = Displaced {
+            label: "L6-0004".to_string(),
+            impacts: vec![
+                impact("photos", "tape_only", 0),
+                impact("archive", "active", 2),
+            ],
+        };
+        assert_eq!(
+            render_displacement("A001L6", &d, now()),
+            vec![
+                "warning: cartridge A001L6 previously held volume \"L6-0004\"; it is now marked \
+                 erased because these bytes are being overwritten (ADR-0010)."
+                    .to_string(),
+                "         *** unit \"photos\" [tape_only] now has ZERO copies ***".to_string(),
+                "         unit \"archive\" [active]: 2 other copy/copies remain".to_string(),
+            ]
+        );
+    }
+
+    /// A displacement that costs nothing is one line: no volume on the
+    /// cartridge held a completed write, so there is no unit to name.
+    #[test]
+    fn a_displacement_with_no_impacts_renders_the_header_alone() {
+        let d = Displaced {
+            label: "L6-0004".to_string(),
+            impacts: Vec::new(),
+        };
+        assert_eq!(render_displacement("A001L6", &d, now()).len(), 1);
+    }
+
+    /// The ADR-0004 evidence parenthetical still appends to the
+    /// copies-remain line — the half `describe` supplies.
+    #[test]
+    fn remaining_coverage_evidence_appends_to_the_copies_remain_line() {
+        let d = Displaced {
+            label: "L6-0004".to_string(),
+            impacts: vec![RetireImpact {
+                unit_name: "archive".to_string(),
+                unit_status: "active".to_string(),
+                other_copies: 1,
+                evidence: vec![crate::policy::evidence::CoverageEvidence {
+                    kind: crate::policy::evidence::EvidenceKind::Tape,
+                    volume_label: "L6-0009".to_string(),
+                    last_verified: None,
+                    deposited_at: None,
+                    location: None,
+                }],
+                at_stake: Vec::new(),
+            }],
+        };
+        let lines = render_displacement("A001L6", &d, now());
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1].starts_with("         unit \"archive\" [active]: 1 other copy/copies remain ("),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].ends_with(')'), "{}", lines[1]);
     }
 }
