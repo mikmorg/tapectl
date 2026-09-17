@@ -289,6 +289,15 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
 
+    /// One row of the precedence table: `--home`, `--config`,
+    /// `TAPECTL_HOME`, `HOME` — exactly [`resolve_from`]'s parameters.
+    type Row<'a> = (
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a OsStr>,
+        Option<&'a OsStr>,
+    );
+
     fn os(s: &str) -> OsString {
         OsString::from(s)
     }
@@ -639,7 +648,7 @@ mod tests {
         let home = os("/home/op");
         let env = os("/mnt/from-env");
         let empty = os("");
-        let rows: &[(Option<&str>, Option<&str>, Option<&OsStr>, Option<&OsStr>)] = &[
+        let rows: &[Row<'_>] = &[
             (None, None, None, Some(home.as_os_str())),
             (Some("/mnt/a"), None, None, Some(home.as_os_str())),
             (
