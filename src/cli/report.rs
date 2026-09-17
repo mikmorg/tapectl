@@ -2747,7 +2747,10 @@ Write error counter page [0x2]
              unfinished write session (`volume abort`)"
         );
         assert!(!line.contains("(none)"), "{line}");
-        assert!(!line.contains('\u{2192}'), "no field means no transition: {line}");
+        assert!(
+            !line.contains('\u{2192}'),
+            "no field means no transition: {line}"
+        );
     }
 
     /// The exact shape `write::log_quarantine` logs for `write_quarantined`:
@@ -2768,7 +2771,10 @@ Write error counter page [0x2]
             "2026-09-16 12:00:00 volume/L6-0004 write_quarantined: checksum mismatch at \
              position 12"
         );
-        assert!(!line.contains('\u{2192}'), "no field means no transition: {line}");
+        assert!(
+            !line.contains('\u{2192}'),
+            "no field means no transition: {line}"
+        );
     }
 
     /// A genuine field CHANGE (`field = Some`) with only the new side known

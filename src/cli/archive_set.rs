@@ -880,7 +880,9 @@ mod tests {
     /// `None` from a real `0`.
     #[test]
     fn info_json_leaves_encrypt_null_when_the_column_is_null() {
-        let value = info_json("cold", &None, None, &None, None, &None, &None, None, None, 0);
+        let value = info_json(
+            "cold", &None, None, &None, None, &None, &None, None, None, 0,
+        );
         assert_eq!(value["encrypt"], serde_json::Value::Null);
     }
 

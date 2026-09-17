@@ -131,7 +131,11 @@ struct FileRow {
 
 impl FileRow {
     fn display_path(&self) -> String {
-        format!("{}{}", if self.is_directory { "d " } else { "  " }, self.path)
+        format!(
+            "{}{}",
+            if self.is_directory { "d " } else { "  " },
+            self.path
+        )
     }
 }
 

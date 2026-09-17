@@ -2052,8 +2052,15 @@ mod tests {
         let escrow = crate::crypto::keys::generate_keypair();
         let other = crate::crypto::keys::generate_keypair();
         let op_id = crate::db::queries::insert_tenant(&conn, "op", None, true).unwrap();
-        crate::db::queries::insert_escrow_key(&conn, op_id, "escrow", "fp", &escrow.public_key, None)
-            .unwrap();
+        crate::db::queries::insert_escrow_key(
+            &conn,
+            op_id,
+            "escrow",
+            "fp",
+            &escrow.public_key,
+            None,
+        )
+        .unwrap();
 
         let slice_at = |position: i64| envelope::ManifestSlice {
             number: 1,
@@ -2108,7 +2115,11 @@ mod tests {
             crate::staging::encrypt_data(b"payload", std::slice::from_ref(&escrow.public_key))
                 .unwrap();
         store
-            .execute(&mut Cursor::new(escrow_ct.clone()), escrow_ct.len() as u64, false)
+            .execute(
+                &mut Cursor::new(escrow_ct.clone()),
+                escrow_ct.len() as u64,
+                false,
+            )
             .unwrap();
         // Position 1: a real age header, but for a DIFFERENT recipient --
         // NoMatchingKeys, the permanent Gap arm.
@@ -2116,12 +2127,20 @@ mod tests {
             crate::staging::encrypt_data(b"payload", std::slice::from_ref(&other.public_key))
                 .unwrap();
         store
-            .execute(&mut Cursor::new(other_ct.clone()), other_ct.len() as u64, false)
+            .execute(
+                &mut Cursor::new(other_ct.clone()),
+                other_ct.len() as u64,
+                false,
+            )
             .unwrap();
         // Position 2: not an age file at all -- the header fails to parse.
         let garbage = b"not an age file at all".to_vec();
         store
-            .execute(&mut Cursor::new(garbage.clone()), garbage.len() as u64, false)
+            .execute(
+                &mut Cursor::new(garbage.clone()),
+                garbage.len() as u64,
+                false,
+            )
             .unwrap();
         // Position 99 is never written -- `read_file_head` errors outright.
 
