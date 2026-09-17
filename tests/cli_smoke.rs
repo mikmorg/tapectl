@@ -1851,3 +1851,150 @@ fn volume_abort_without_yes_refuses_non_interactively() {
         "must refuse with the documented non-interactive message: {stderr}"
     );
 }
+
+/// Minimal fixture for issue #244's CLI gate: one unit with exactly one
+/// `completed` write on a `sealed` volume, its lone `stage_set` still
+/// `'staged'` -- the exact vacuous-pass shape `clean_staging`'s own
+/// non-force guard accepts on its own
+/// (`default_guard_cleans_when_the_only_planned_copy_completed`,
+/// `src/staging/clean.rs`). No `stage_slices`/on-disk `.age` file is
+/// needed: the CLI's under-copied gate (`src/cli/staging.rs`) refuses
+/// BEFORE `clean_staging` ever runs, so nothing here is read from disk.
+/// Modelled on `seed_planned_write_session` above.
+fn seed_one_completed_copy_stage_set(home: &std::path::Path, label: &str) {
+    let db_path = home.join(".tapectl").join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).expect("open db to seed staging-clean fixture");
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES (?1, 0, 'active')",
+        params![format!("tenant-{label}")],
+    )
+    .expect("insert tenant");
+    let tenant_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+         VALUES (?1, ?2, ?3, '/tmp/unit', 'active')",
+        params![format!("uuid-{label}"), format!("unit-{label}"), tenant_id],
+    )
+    .expect("insert unit");
+    let unit_id = conn.last_insert_rowid();
+
+    // 'current': `policy::coverage::CoverageQuery::current_unit` only
+    // counts a unit's CURRENT snapshot(s), matching what a real sealed
+    // write promotes its snapshot to.
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+         VALUES (?1, 1, 'current', '/tmp/unit', 1, 32)",
+        params![unit_id],
+    )
+    .expect("insert snapshot");
+    let snapshot_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+        params![snapshot_id],
+    )
+    .expect("insert stage_set");
+    let stage_set_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+        params![label],
+    )
+    .expect("insert volume");
+    let volume_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        params![stage_set_id, snapshot_id, volume_id],
+    )
+    .expect("insert writes row");
+}
+
+/// Issue #244 (ADR-0012's 2026-09-17 amendment): `staging clean --json`'s
+/// refusal must itself be a single, parseable JSON document on stdout --
+/// never a JSON object beside a plain-text line (issue #56's defect class,
+/// guarded live by `scripts/lifecycle-suite.sh`'s "assert the WHOLE stdout
+/// parses"). This is checked against the real binary, not the in-process
+/// `cli::staging::run` unit tests in `src/cli/staging.rs`, because only a
+/// real process run distinguishes "printed to stdout" from "baked into the
+/// error and printed to stderr at exit".
+#[test]
+fn staging_clean_json_refusal_is_one_parseable_document() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let config_path = home.path().join(".tapectl").join("config.toml");
+    let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
+    cfg.defaults.min_copies_for_tape_only = 2;
+    cfg.save(&config_path).expect("save edited config");
+
+    seed_one_completed_copy_stage_set(home.path(), "PM244-JSON");
+
+    let out = run_tapectl_noninteractive(home.path(), &["--json", "staging", "clean"]);
+    assert!(
+        !out.status.success(),
+        "staging clean --json must refuse when a unit is below its policy's min_copies"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "staging clean --json's refusal did not parse as one JSON document: {e}\n\
+             stdout={stdout:?}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(parsed["refused"], serde_json::json!(true), "{parsed}");
+    let under_copied = parsed["under_copied"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing 'under_copied' array: {parsed}"));
+    assert!(
+        under_copied
+            .iter()
+            .any(|u| u["unit"] == "unit-PM244-JSON" && u["copies"] == 1 && u["min_copies"] == 2),
+        "expected unit-PM244-JSON at 1/2 copies: {under_copied:?}"
+    );
+}
+
+/// Negative control for the test above: with `--force`, the same fixture
+/// must clean exactly as it always has -- the new gate must not change
+/// `--force`'s behaviour, only whether the gate is reached at all.
+#[test]
+fn staging_clean_force_still_overrides_the_under_copied_refusal() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let config_path = home.path().join(".tapectl").join("config.toml");
+    let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
+    cfg.defaults.min_copies_for_tape_only = 2;
+    cfg.save(&config_path).expect("save edited config");
+
+    seed_one_completed_copy_stage_set(home.path(), "PM244-FORCE");
+
+    let out = run_tapectl_noninteractive(home.path(), &["staging", "clean", "--force"]);
+    assert!(
+        out.status.success(),
+        "staging clean --force must still clean: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("cleaned 1 stage set"),
+        "stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
