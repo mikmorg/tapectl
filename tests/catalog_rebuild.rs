@@ -1179,6 +1179,53 @@ fn a_rebuild_registers_under_the_operator_barcode_and_learns_the_serial() {
     assert_eq!(report.cartridge_barcode.as_deref(), Some("OPBARCODE"));
 }
 
+/// Issue #221: a SECOND contact is where a serial is often learnt, not the
+/// first. The first rebuild here registers "OPBARCODE" with no serial at
+/// all (no live drive observed one); the second contact is where a drive
+/// first reports "SER-LIVE" — `rebuild_from_store`'s pre-transaction
+/// `binding::corroborate_volume` call (rebuild.rs) records it onto the row
+/// (and its `events` row) via `record_medium_serial` BEFORE
+/// `resolve_operator_identity` ever runs, so `resolve_operator_identity`'s
+/// own learn branch never fires and every write-counter would read zero.
+/// The report must say so anyway: it must not read `no_changes: true`
+/// about a run that changed `cartridges.serial_number` and said so on its
+/// own stderr.
+#[test]
+fn a_rebuild_that_learns_a_serial_at_contact_reports_it_changed_the_catalog() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "OPBARCODE", Some("operator"));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let first = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(!first.is_noop(), "{first:?}");
+    let (_, serial_before, _, _, _) = cartridge_row(&conn, "OPBARCODE");
+    assert_eq!(
+        serial_before, None,
+        "the first rebuild observed no serial and must not have recorded one"
+    );
+
+    let second =
+        rebuild_observing(&conn, &mut vol, &secret, scratch.path(), Some("SER-LIVE")).unwrap();
+
+    let (_, serial_after, _, _, _) = cartridge_row(&conn, "OPBARCODE");
+    assert_eq!(
+        serial_after.as_deref(),
+        Some("SER-LIVE"),
+        "the contact must have recorded the serial this drive reported"
+    );
+    assert!(
+        second.serial_learned,
+        "the report must say this run learnt a serial: {second:?}"
+    );
+    assert!(
+        !second.is_noop(),
+        "a run that wrote cartridges.serial_number and an events row must not report \
+         no_changes: true: {second:?}"
+    );
+}
+
 /// The corroboration half stated as a refusal: an `operator`-identity
 /// barcode whose row ALREADY carries a DIFFERENT serial than what this
 /// contact observed means another cartridge is wearing that sticker.

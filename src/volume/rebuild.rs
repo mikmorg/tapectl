@@ -147,6 +147,17 @@ pub struct RebuildReport {
     /// once — ADR-0012). Only reachable on the `operator`-identity path: the
     /// `mam`-identity path only ever finds a row BY its serial, so it always
     /// already has one.
+    ///
+    /// Set from either of two sources (issue #221): `resolve_operator_identity`'s
+    /// own learn branch, when the row is still found by BARCODE and only then
+    /// discovered to lack a serial; or the pre-transaction
+    /// `binding::corroborate_volume` contact check in `rebuild_from_store`,
+    /// when this same tape's label already names a bound cartridge and this
+    /// contact is the first to observe its serial — which happens BEFORE the
+    /// transaction, so it can teach the row its serial and make
+    /// `resolve_operator_identity` find it BY that serial instead, skipping
+    /// its own learn branch entirely. Either way the row changed, so this
+    /// field must be true.
     pub serial_learned: bool,
     /// Whether THIS contact observed a medium serial at all (a real drive
     /// read returned `Some`, whether or not it matched anything) — distinct
@@ -333,13 +344,26 @@ pub fn rebuild_from_store(
             |r| r.get(0),
         )
         .optional()?;
-    if let Some(volume_id) = claim_volume_id {
-        let medium = crate::volume::binding::MediumFacts::new(
-            medium_serial.map(str::to_string),
-            crate::volume::binding::file0_facts_from_text(&thunk_text),
-        );
-        crate::volume::binding::corroborate_volume(conn, volume_id, &ident.label, &medium)?;
-    }
+    // Issue #221: this can itself teach a bound cartridge row its serial
+    // (`record_medium_serial`, committed straight to `conn` — there is no
+    // `tx` yet) and print the "learnt" note to stderr. `report` does not
+    // exist yet at this point (it is built below, once the operator
+    // envelope is open), so the outcome is captured here and folded into
+    // the struct literal instead of moving this call — corroboration must
+    // stay the very first fact check, before any envelope is opened.
+    let serial_learned_at_contact = match claim_volume_id {
+        Some(volume_id) => {
+            let medium = crate::volume::binding::MediumFacts::new(
+                medium_serial.map(str::to_string),
+                crate::volume::binding::file0_facts_from_text(&thunk_text),
+            );
+            matches!(
+                crate::volume::binding::corroborate_volume(conn, volume_id, &ident.label, &medium)?,
+                crate::volume::binding::Corroboration::SerialLearned { .. }
+            )
+        }
+        None => false,
+    };
 
     let mut fi = Vec::new();
     store.read_file(pointers.front_index as u32, &mut fi)?;
@@ -363,6 +387,15 @@ pub fn rebuild_from_store(
         envelopes_opened: opened.len(),
         had_catalog_db: operator.catalog_db.is_some(),
         serial_checked: medium_serial.is_some(),
+        // Issue #221: a serial can be learnt at the pre-transaction
+        // corroboration above, before `resolve_operator_identity` (which
+        // sets this same field on its own learn branch) ever runs — once
+        // the row is found BY that serial, `resolve_operator_identity`
+        // takes its "already witnessed" branch instead, so its own
+        // learn-branch write to this field never fires. Seeded here so a
+        // rebuild that changed `cartridges.serial_number` before the
+        // transaction even opened is not reported as `no_changes: true`.
+        serial_learned: serial_learned_at_contact,
         ..Default::default()
     };
 
