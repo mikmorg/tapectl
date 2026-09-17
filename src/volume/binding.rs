@@ -3928,7 +3928,8 @@ mod tests {
         let lines = render_displacement("A001L6", &d, now());
         assert_eq!(lines.len(), 2);
         assert!(
-            lines[1].starts_with("         unit \"archive\" [active]: 1 other copy/copies remain ("),
+            lines[1]
+                .starts_with("         unit \"archive\" [active]: 1 other copy/copies remain ("),
             "{}",
             lines[1]
         );

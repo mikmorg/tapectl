@@ -1347,7 +1347,10 @@ mod tests {
 
     #[test]
     fn rebuild_json_names_the_unit_a_displacement_takes_to_zero_copies() {
-        let report = report_with_displacement(vec![("archive", "tape_only", 1), ("photos", "tape_only", 0)]);
+        let report = report_with_displacement(vec![
+            ("archive", "tape_only", 1),
+            ("photos", "tape_only", 0),
+        ]);
         let json = displacements_json(&report);
         assert_eq!(
             json,
@@ -1366,7 +1369,8 @@ mod tests {
     /// elsewhere reports an EMPTY `zero_copy_units`, not every unit on it.
     #[test]
     fn rebuild_json_leaves_zero_copy_units_empty_when_nothing_went_to_zero() {
-        let report = report_with_displacement(vec![("archive", "tape_only", 1), ("photos", "active", 2)]);
+        let report =
+            report_with_displacement(vec![("archive", "tape_only", 1), ("photos", "active", 2)]);
         let json = displacements_json(&report);
         assert_eq!(json[0]["zero_copy_units"], serde_json::json!([]));
         assert_eq!(json[0]["units"].as_array().unwrap().len(), 2);
