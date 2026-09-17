@@ -1759,51 +1759,24 @@ fn finish_session(
     }
 }
 
-/// The one place a quarantine is recorded — every `events` row that says a
-/// volume was quarantined is written here, whichever act established it.
+/// The one place a WRITE-path quarantine is recorded and reported — reached
+/// from `confirm`'s failure (either path) and from `resume`'s own divergence
+/// findings (the resume-only arm). ADR-0001 contact-time divergence;
+/// `session.rs` has already written `volumes.status = 'quarantined'` by the
+/// time this runs, so this only reports it and turns the outcome into the
+/// `Err` the command exits on.
 ///
-/// Two acts reach it, and they are different rules answering to different
-/// ADRs, which is why the action name is a parameter rather than a constant:
-///
-/// - `write_quarantined` — ADR-0001 contact-time divergence, from
-///   [`log_quarantine`] (the write/resume confirm path). `status_change` is
-///   `None` there: `session.rs` owns that status write and this only reports
-///   it.
-/// - `verify_quarantined` — ADR-0012's 2026-09-17 amendment, from
-///   [`quarantine_on_medium_evidence`]. That one owns both halves, so it
-///   passes the transition it just made.
-fn record_quarantine_event(
-    conn: &Connection,
-    volume_id: i64,
-    label: &str,
-    action: &str,
-    status_change: Option<(&str, &str)>,
-    reason: &str,
-) -> Result<()> {
-    let (field, old, new) = match status_change {
-        Some((old, new)) => (Some("status"), Some(old), Some(new)),
-        None => (None, None, None),
-    };
-    events::log_event(
-        conn,
-        "volume",
-        volume_id,
-        Some(label),
-        action,
-        field,
-        old,
-        new,
-        Some(reason),
-        None,
-    )?;
-    Ok(())
-}
-
-/// The write path's quarantine report — reached from `confirm`'s failure
-/// (either path) and from `resume`'s own divergence findings (the
-/// resume-only arm). `session.rs` has already written
-/// `volumes.status = 'quarantined'` by the time this runs; this records the
-/// event and turns the outcome into the `Err` the command exits on.
+/// **Deliberately not factored together with
+/// [`quarantine_on_medium_evidence`]'s event**, issue #234's peer under
+/// ADR-0012. The two rows are different SHAPES, not just different action
+/// names: this one carries its reason in `new_value` with no `field` (the
+/// status write is not its own), and the verify one is a genuine field
+/// change (`field = 'status'`, old -> new) with its reason in `details`.
+/// Routing both through one helper silently moved this reason from
+/// `new_value` to `details` — an operator-visible change to `report events`
+/// on a path issue #234 was explicitly not supposed to touch. The two acts
+/// answer to different ADRs and record different facts; sharing a writer
+/// bought nothing and cost a regression.
 fn log_quarantine(
     conn: &Connection,
     volume_id: i64,
@@ -1811,7 +1784,18 @@ fn log_quarantine(
     reason: &QuarantineReason,
 ) -> Result<()> {
     let reason = describe_quarantine(reason);
-    record_quarantine_event(conn, volume_id, label, "write_quarantined", None, &reason)?;
+    events::log_event(
+        conn,
+        "volume",
+        volume_id,
+        Some(label),
+        "write_quarantined",
+        None,
+        None,
+        Some(&reason),
+        None,
+        None,
+    )?;
     Err(TapectlError::Other(format!(
         "volume \"{label}\" quarantined: {reason}"
     )))
@@ -1905,13 +1889,21 @@ pub(crate) fn quarantine_on_medium_evidence(
         params![volume_id],
     )?;
     let reason = describe_medium_evidence(&proof);
-    record_quarantine_event(
+    // A genuine field change, recorded as one: this function owns BOTH the
+    // status write and the row that explains it, so `old_value` -> `new_value`
+    // is the transition it just made and `details` carries why. That is a
+    // different row shape from [`log_quarantine`]'s, on purpose — see its doc.
+    events::log_event(
         conn,
+        "volume",
         volume_id,
-        label,
+        Some(label),
         "verify_quarantined",
-        Some((previous_status.as_str(), "quarantined")),
-        &reason,
+        Some("status"),
+        Some(previous_status.as_str()),
+        Some("quarantined"),
+        Some(&reason),
+        None,
     )?;
     warn!(
         label = label,

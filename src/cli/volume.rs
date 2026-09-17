@@ -576,7 +576,8 @@ pub fn run(
                                 "volume \"{label}\" QUARANTINED (was {}): {} of {} failure(s) \
                                  prove the medium is bad. It no longer counts as a copy, so \
                                  `volume retire` will no longer refuse it as the last one — \
-                                 copy what you still can off other tapes first.",
+                                 salvage what still reads off it first \
+                                 (`volume read-slices --from {label} --unit <UNIT>`).",
                                 q.previous_status,
                                 q.proof.len(),
                                 report.failed,
