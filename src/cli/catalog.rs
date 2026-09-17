@@ -715,15 +715,27 @@ pub fn run(
                     );
                 }
                 if report.unknown_remaining > 0 {
+                    // Reachable with or without a registered escrow, so the
+                    // remedy must branch on that instead of assuming the
+                    // no-escrow path — `key import --escrow` is refused
+                    // outright once one is registered (issue #214, finding
+                    // 2-4 sibling: same trap as `escrow_identity_findings`).
+                    let note = if report.key_is_escrow {
+                        " — the escrow key is not a recipient of their slices".to_string()
+                    } else if crate::db::queries::escrow_public_key(conn)?.is_some() {
+                        " — re-run `tapectl catalog rebuild --key <the REGISTERED escrow \
+                         secret key>` to attest them, or re-stage"
+                            .to_string()
+                    } else {
+                        " — no escrow is registered in this catalog yet: register the \
+                         ORIGINAL escrow public key with `tapectl key import --escrow <key>`, \
+                         then re-run `tapectl catalog rebuild --key <its secret key file>` \
+                         to attest them, or re-stage"
+                            .to_string()
+                    };
                     println!(
                         "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown){}",
-                        report.unknown_remaining,
-                        if report.key_is_escrow {
-                            " — the escrow key is not a recipient of their slices"
-                        } else {
-                            " — attest them with `catalog rebuild --key <the REGISTERED escrow key>` \
-                             (import the original with `key import --escrow` first), or re-stage"
-                        }
+                        report.unknown_remaining, note
                     );
                 }
             }

@@ -1142,7 +1142,9 @@ fn escrow_identity_findings(conn: &Connection, escrow: Option<&str>) -> Result<V
             candidates.join(", "),
         ),
         action: format!(
-            "tapectl key import --escrow {}   # the ORIGINAL escrow public key, from the heir kit",
+            "no command replaces a registered escrow identity (ADR-0005) — re-initialise a \
+             fresh tapectl home with `tapectl init --escrow-public-key {}` (the ORIGINAL \
+             escrow public key, from the heir kit), then re-run `tapectl catalog rebuild`",
             candidates[0]
         ),
     }])
@@ -2922,7 +2924,7 @@ mod tests {
         }
 
         #[test]
-        fn the_former_escrow_key_is_named_once_with_the_import_command() {
+        fn the_former_escrow_key_is_named_once_with_the_reinit_recipe() {
             // Two stage sets, both to the old escrow key + alice's registered key.
             let conn = setup(
                 "age1new",
@@ -2938,9 +2940,28 @@ mod tests {
                 !f[0].message.contains("age1alice"),
                 "a registered key is not a candidate"
             );
+            // ADR-0005 / issue #139: no command replaces a registered escrow
+            // identity — the recipe is a fresh `init --escrow-public-key`,
+            // never `key import --escrow` (that is always refused here,
+            // since this finding only fires while an escrow IS registered).
             assert!(
-                f[0].action.contains("key import --escrow age1old"),
+                f[0]
+                    .action
+                    .contains("tapectl init --escrow-public-key age1old"),
                 "{}",
+                f[0].action
+            );
+            assert!(
+                f[0].action.contains("catalog rebuild"),
+                "{}",
+                f[0].action
+            );
+            assert!(
+                !f[0].action.contains("key import --escrow"),
+                "key import --escrow is refused while an escrow is already \
+                 registered (escrow_already_registered_error) — this finding \
+                 only fires in exactly that state, so naming it here is a \
+                 dead-end recipe: {}",
                 f[0].action
             );
         }
