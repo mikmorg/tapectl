@@ -214,4 +214,43 @@ mod tests {
             r#"[{"created_at":"2026-01-01T00:00:00Z","description":"primary","is_operator":"yes","name":"alice","status":"active"},{"created_at":"2026-02-01T00:00:00Z","description":"","is_operator":"","name":"bob","status":"deleted"}]"#
         );
     }
+
+    /// Issue #243: `tenant reassign` used to log the raw database ids in the
+    /// event's `old_value`/`new_value`, so `report events` rendered
+    /// `tenant/acme reassign.tenant_id: 3 -> 7` -- unreadable once either
+    /// tenant is renamed or deleted, and exactly the shape ADR-0012's
+    /// move-event ruling forbids (`location.rs`'s mover logs location NAMES
+    /// on both sides, never an id). The event must carry tenant NAMES on
+    /// both sides instead.
+    #[test]
+    fn reassign_logs_tenant_names_not_ids() {
+        let conn = crate::db::open_memory().unwrap();
+        queries::insert_tenant(&conn, "acme", None, false).unwrap();
+        queries::insert_tenant(&conn, "othertenant", None, false).unwrap();
+        let paths = TapectlPaths::new(std::path::PathBuf::from("/nonexistent-pm243-test"));
+
+        run(
+            &conn,
+            &paths,
+            &TenantCommands::Reassign {
+                source: "acme".to_string(),
+                to: "othertenant".to_string(),
+            },
+            false,
+        )
+        .unwrap();
+
+        let (old_value, new_value): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT old_value, new_value FROM events
+                 WHERE entity_type = 'tenant' AND action = 'reassign'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(old_value.as_deref(), Some("acme"));
+        assert_eq!(new_value.as_deref(), Some("othertenant"));
+    }
 }
