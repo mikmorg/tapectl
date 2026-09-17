@@ -2945,17 +2945,12 @@ mod tests {
             // never `key import --escrow` (that is always refused here,
             // since this finding only fires while an escrow IS registered).
             assert!(
-                f[0]
-                    .action
+                f[0].action
                     .contains("tapectl init --escrow-public-key age1old"),
                 "{}",
                 f[0].action
             );
-            assert!(
-                f[0].action.contains("catalog rebuild"),
-                "{}",
-                f[0].action
-            );
+            assert!(f[0].action.contains("catalog rebuild"), "{}", f[0].action);
             assert!(
                 !f[0].action.contains("key import --escrow"),
                 "key import --escrow is refused while an escrow is already \
