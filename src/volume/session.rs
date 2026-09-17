@@ -374,30 +374,49 @@ pub fn check_tape_contact(
             &identity,
             Ok(id) if id.label == expected_label && id.uuid == expected_uuid
         );
-        if !matches {
-            // Before concluding a plain identity mismatch, check whether
-            // THIS tape — whatever foreign or stale volume it actually
-            // holds — is itself already sealed, at ITS OWN self-reported
-            // seal position (`format::parse_id_thunk_layout_pointers`'
-            // `[layout].seal_marker`, not the caller's `seal_position`
-            // argument below, which is a position in the CALLER's own
-            // layout and has no relationship to a different tape's real
-            // seal marker). This closes issue #27's headline scenario:
-            // without it, a foreign-but-sealed cartridge would present as
-            // a plain `IdentityMismatch`, which the fresh-write path's
-            // `--force` override is allowed to defeat — silently
-            // permitting exactly the sealed-volume overwrite ADR-0003
-            // forbids. `resume_checking` never uses `--force`, so this is
-            // pure additional safety there, not a behavior change.
-            if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
-                if pointers.seal_marker >= 0
-                    && seal_marker_parses_at(store, pointers.seal_marker as u32)
-                {
-                    return ContactOutcome::AlreadySealed {
-                        seal_position: pointers.seal_marker as u32,
-                    };
-                }
+
+        // THE TAPE'S OWN seal pointer, consulted whether or not the identity
+        // matched (issue #208, 2026-09-17 pre-production review).
+        //
+        // This used to sit inside the `!matches` arm below, which left the
+        // matching-identity case relying entirely on the CALLER's
+        // `seal_position` argument. For `resume_checking` that is sound --
+        // its layout is rehydrated from the very session that wrote this
+        // tape, so its seal entry is where the seal really is. For
+        // `volume_write` it is not: its layout is freshly built from
+        // whatever is staged NOW, so its seal position matches the tape's
+        // only when the new content happens to lay out identically. Write
+        // different content to a tape the catalog still believes is
+        // `initialized` -- a DB restored from a backup predating the seal,
+        // or a row a rebuild left alone -- and the probe reads a position
+        // with no marker, returns `Matches`, and a SEALED tape is
+        // overwritten. ADR-0003 forbids that outright and `--force` cannot
+        // reach it, so the guard must not depend on the caller guessing the
+        // right position.
+        //
+        // The tape's self-reported `[layout].seal_marker` has no such
+        // problem: it is where THIS tape says its own seal is. Probing it
+        // first is strictly more conservative -- it can only add refusals,
+        // and only for tapes that genuinely carry a parsing seal marker.
+        // Re-initialising a cartridge is unaffected: that path erases the
+        // medium first, so File 0 is gone or unparseable long before here.
+        if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
+            if pointers.seal_marker >= 0
+                && seal_marker_parses_at(store, pointers.seal_marker as u32)
+            {
+                return ContactOutcome::AlreadySealed {
+                    seal_position: pointers.seal_marker as u32,
+                };
             }
+        }
+
+        if !matches {
+            // The sealed case already returned above (issue #208), so a
+            // mismatch reaching here is a genuinely unsealed foreign or
+            // stale tape. That is what `--force` is allowed to overwrite;
+            // issue #27's headline scenario -- a foreign-but-SEALED
+            // cartridge presenting as a plain mismatch the flag could
+            // defeat -- is closed by the hoisted probe, not here.
             return ContactOutcome::IdentityMismatch {
                 found: identity.ok(),
             };
@@ -2465,6 +2484,71 @@ mod tests {
         match outcome {
             ContactOutcome::AlreadySealed { seal_position } => assert_eq!(seal_position, 5),
             other => panic!("expected AlreadySealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    /// Issue #208, the pre-production review's highest-severity finding.
+    ///
+    /// The sibling test below covers a foreign SEALED tape. This one is the
+    /// case that was NOT covered and was the actual hole: identity MATCHES
+    /// -- the tape really does hold this volume -- and the tape is sealed,
+    /// but the caller's `seal_position` points somewhere else.
+    ///
+    /// That is `volume_write`'s ordinary shape. Its layout is built from
+    /// whatever is staged now, so its seal-marker entry lands where the NEW
+    /// content would end, not where the existing seal sits. Reachable
+    /// whenever the catalog still believes the volume is writable while the
+    /// tape is already sealed -- a DB restored from a backup predating the
+    /// write, or a row `catalog rebuild` deliberately left alone (#158).
+    /// Before the fix this returned `Matches` and a sealed tape was
+    /// overwritten, with no `--force` required and nothing to refuse it:
+    /// ADR-0003 says sealed volumes are immutable and no flag reaches that.
+    ///
+    /// Deliberately passes caller `seal_position` 7 against a real seal at
+    /// 5, so the test fails if the fix ever regresses to trusting the
+    /// caller's guess.
+    fn check_tape_contact_already_sealed_when_identity_matches_and_the_caller_probes_elsewhere() {
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
+        );
+        let seal_bytes =
+            layout::generate_seal_marker(CONTACT_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        put_file(&mut store, 5, seal_padded);
+
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(7));
+        match outcome {
+            ContactOutcome::AlreadySealed { seal_position } => assert_eq!(seal_position, 5),
+            other => panic!(
+                "a sealed tape whose identity MATCHES must refuse (ADR-0003); \
+                 the caller's own seal_position must not be the only probe. got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    /// The same hole with `seal_position: None` -- no caller probe at all.
+    fn check_tape_contact_already_sealed_when_identity_matches_and_no_caller_probe() {
+        let mut store = MemStore::new(BS as usize);
+        put_file(
+            &mut store,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
+        );
+        let seal_bytes =
+            layout::generate_seal_marker(CONTACT_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        put_file(&mut store, 5, seal_padded);
+
+        match check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None) {
+            ContactOutcome::AlreadySealed { seal_position } => assert_eq!(seal_position, 5),
+            other => panic!("expected AlreadySealed with no caller probe, got {other:?}"),
         }
     }
 

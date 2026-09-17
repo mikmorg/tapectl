@@ -51,6 +51,7 @@ SCENARIO_NAMES=(
     first-year evolving-source key-rotation tenant-reassign
     tape-only-and-reclaim compaction retire-and-reuse db-loss
     escrow-ordering restore-file-and-catalog quick-archive collection permute
+    stale-catalog-sealed-tape
 )
 SCENARIO_DESCS=(
     "Baseline multi-tenant archive: escrow BEFORE staging, 3 units, 1 volume, full restore matrix"
@@ -66,6 +67,7 @@ SCENARIO_DESCS=(
     "The one-shot create+stage+write flow"
     "Folder-per-unit collection sync/status/plan/run, including a rename-by-uuid"
     "Seeded random walk exercising the full command surface (--seed/--steps)"
+    "issue #208: a sealed tape refuses a write the CATALOG still thinks is allowed"
 )
 
 usage() {
@@ -3090,6 +3092,132 @@ write_report_footer() {
 # names and restore-matrix tags are scenario-prefixed by convention, so the
 # shared $CHECKS/$RESULT arrays and $RUN/log-<name>.txt paths stay unique
 # without needing a second layer of namespacing.
+# ---------------------------------------------------------------------------
+# Scenario: stale-catalog-sealed-tape (issue #208)
+#
+# The ADR-0003 case that NO scenario covered until 2026-09-17, and the reason
+# the pre-production review ranked #208 high rather than medium.
+#
+# Every other sealed-tape check in this suite drives the identity-MISMATCH
+# branch of `check_tape_contact`: `volume init VOL-X` over VOL-A's cartridge,
+# where File 0 names a different volume. That branch has always consulted the
+# TAPE's own seal pointer, so it always refused.
+#
+# The identity-MATCHES branch did not. There, the only seal probe was the
+# CALLER's `seal_position` — a position in the layout `volume write` has just
+# built from whatever is staged NOW, which coincides with the tape's real seal
+# only if the new content lays out identically. Different content, and the
+# probe reads a position with no marker, returns Matches, and a SEALED tape is
+# overwritten. ADR-0003 forbids that outright and `--force` cannot even reach
+# it, so nothing downstream would have refused.
+#
+# Reaching it needs the catalog and the tape to disagree: the row must still
+# say `initialized` while the tape is sealed. That is not contrived — it is a
+# database restored from a backup predating the write, which `db backup` makes
+# a first-class operation and `docs/handoff.md` treats as a supported recovery
+# path. So this scenario builds it with tapectl's own commands and one file
+# copy, because restoring a backup IS copying the backup DB into place.
+#
+# The assertion that matters is the LAST one: the refusal must cite ADR-0003.
+# A refusal citing anything else means the catalog-side guard fired first and
+# the scenario never reached the tape check it exists to exercise.
+sct_setup() {
+    bootstrap_config || return 1
+    TCTL location add vault --description "Home vault" || return 1
+    TCTL tenant add alice || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL key generate --escrow
+    else
+        TCTL key generate --escrow >"$RUN/log-_sct_escrow.txt" 2>&1 || return 1
+        capture_escrow_secret _sct_escrow
+    fi
+    make_source "$SRC/photos" "plain" || return 1
+    TCTL unit init "$SRC/photos" --tenant alice --name photos || return 1
+    TCTL snapshot create photos || return 1
+    TCTL stage create photos || return 1
+    next_tape VOL-S || return 1
+    vinit VOL-S
+}
+
+# Taken while VOL-S is `initialized` and File 0 is stamped but no data is
+# written. This is the state the stale catalog will be rolled back to.
+sct_backup_while_writable() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl db backup --to \$sd/sct-pre-write.db --include-keys (VOL-S still 'initialized')"; return 0; }
+    local sd; sd="$(dirname "$HOME_DIR")"
+    TCTL db backup --to "$sd/sct-pre-write.db" --include-keys
+}
+
+sct_write_and_seal() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume write VOL-S (seals the tape; catalog now says 'sealed')"; return 0; }
+    TCTL volume write VOL-S --device "$TAPE_DEV"
+}
+
+sct_stale_catalog_write_refused() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: restore the pre-write backup into a copy of the home, then tapectl volume write VOL-S (expect REFUSED citing ADR-0003 — the tape-side check, not the catalog guard)"
+        return 0
+    fi
+    local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/sct-restored-home"
+    rm -rf "$newhome"
+    # A copy of the home, not a fresh `init`: `volume write` resolves its
+    # backend STRICTLY (config::resolve_lto_backend), so a home without this
+    # run's [[backends.lto]] would fail on the backend long before the tape
+    # check and the scenario would assert the wrong refusal.
+    cp -a "$HOME_DIR" "$newhome" || { echo "could not copy the home"; return 1; }
+    cp "$sd/sct-pre-write.db" "$newhome/tapectl.db" || { echo "could not restore the pre-write backup"; return 1; }
+    # Sanity: the restored catalog really must believe VOL-S is writable,
+    # otherwise the refusal below proves nothing about the tape check.
+    local status
+    status="$(python3 - "$newhome/tapectl.db" <<'PY2'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT status FROM volumes WHERE label = 'VOL-S'").fetchone()
+print(row[0] if row else "MISSING")
+PY2
+)"
+    [ "$status" = "initialized" ] || {
+        echo "restored catalog says VOL-S is \"$status\", not \"initialized\" — this scenario cannot reach the tape-side check, so its refusal would prove nothing"
+        return 1
+    }
+    # The layout must DIFFER from the one already on the tape, and this is
+    # the whole point of the scenario rather than a detail. `volume write`
+    # probes the seal at ITS OWN layout's seal-marker position; re-writing
+    # byte-identical content puts that position exactly where the real seal
+    # is, so the probe finds it by coincidence and the bug hides. Measured:
+    # a first draft of this scenario re-wrote the same stage set and PASSED
+    # against the unfixed code -- green for the wrong reason, which is the
+    # failure mode this suite has produced three times (#198, #203).
+    #
+    # Staging a second unit in the restored home grows the layout, so the new
+    # seal-marker entry lands past the real seal and the caller's probe reads
+    # an unwritten position.
+    make_source "$SRC/extra" "plain" || return 1
+    NEWHOME_TCTL "$newhome" unit init "$SRC/extra" --tenant alice --name extra \
+        >"$sd/sct.extra-init.txt" 2>&1 || { cat "$sd/sct.extra-init.txt"; return 1; }
+    NEWHOME_TCTL "$newhome" snapshot create extra >"$sd/sct.extra-snap.txt" 2>&1 \
+        || { cat "$sd/sct.extra-snap.txt"; return 1; }
+    NEWHOME_TCTL "$newhome" stage create extra >"$sd/sct.extra-stage.txt" 2>&1 \
+        || { cat "$sd/sct.extra-stage.txt"; return 1; }
+
+    local out rc
+    out="$(NEWHOME_TCTL "$newhome" volume write VOL-S --device "$TAPE_DEV" 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || {
+        echo "volume write VOL-S SUCCEEDED against an already-sealed tape — ADR-0003 violation (issue #208): $out"
+        return 1
+    }
+    echo "$out" | grep -q "ADR-0003" || {
+        echo "refused, but not by the tape-side seal check: the message does not cite ADR-0003, so the catalog guard fired first and this scenario did not exercise what it claims: $out"
+        return 1
+    }
+}
+
+scenario_stale_catalog_sealed_tape() {
+    check sct.setup                  sct_setup
+    check sct.backup_while_writable  sct_backup_while_writable
+    check sct.write_and_seal         sct_write_and_seal
+    check sct.stale_catalog_refused  sct_stale_catalog_write_refused
+}
+
 run_scenario() { # run_scenario <name>
     local name="$1" fn="scenario_${1//-/_}"
     HOME_DIR="$RUN/$name/home"
