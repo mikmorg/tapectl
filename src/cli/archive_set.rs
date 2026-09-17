@@ -179,6 +179,41 @@ fn archive_set_rows_to_json(rows: &[ArchiveSetRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
+/// `archive-set info --json` shape, aligned with `list`'s (issue #236
+/// finding 6): `info` used to emit the raw `required_locations` COLUMN --
+/// the JSON-encoded array stored as a plain string -- so `jq
+/// '.required_locations[0]'` worked on `list`'s parsed `locations` array
+/// and failed on `info`'s string. It also spelled the same fact
+/// `verify_interval_days` where `list` says `verify_days`, and emitted
+/// `encrypt` as the raw `0`/`1`/`NULL` column instead of a bool. This is
+/// the diff's own precedent (`ArchiveSetRow.min_copies`, `ArchiveSetRow`'s
+/// doc comment above): when two subcommands disagree about the same fact,
+/// the fix is correctness, not preserving either side's exact prior shape.
+#[allow(clippy::too_many_arguments)]
+fn info_json(
+    name: &str,
+    description: &Option<String>,
+    min_copies: Option<i64>,
+    required_locations: &Option<String>,
+    encrypt: Option<i64>,
+    compression: &Option<String>,
+    checksum_mode: &Option<String>,
+    slice_size: Option<i64>,
+    verify_days: Option<i64>,
+    unit_count: i64,
+) -> serde_json::Value {
+    let locations = required_locations
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+    serde_json::json!({
+        "name": name, "description": description, "min_copies": min_copies,
+        "locations": locations, "encrypt": encrypt.map(|n| n != 0),
+        "compression": compression, "checksum_mode": checksum_mode,
+        "slice_size": slice_size, "verify_days": verify_days,
+        "units": unit_count,
+    })
+}
+
 pub fn run(
     conn: &Connection,
     config: &Config,
@@ -581,13 +616,18 @@ pub fn run(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "name": name, "description": desc, "min_copies": min_copies,
-                        "required_locations": locs, "encrypt": encrypt,
-                        "compression": compression, "checksum_mode": checksum_mode,
-                        "slice_size": slice_size, "verify_interval_days": verify_days,
-                        "units": unit_count,
-                    })
+                    info_json(
+                        name,
+                        &desc,
+                        min_copies,
+                        &locs,
+                        encrypt,
+                        &compression,
+                        &checksum_mode,
+                        slice_size,
+                        verify_days,
+                        unit_count,
+                    )
                 );
             } else {
                 println!("Archive set: {name}");
@@ -787,6 +827,61 @@ mod tests {
             serde_json::to_string(&value).unwrap(),
             r#"[{"locations":["home","offsite"],"min_copies":3,"name":"daily","units":5,"verify_days":90},{"locations":null,"min_copies":null,"name":"ephemeral","units":0,"verify_days":null}]"#
         );
+    }
+
+    /// Issue #236 finding 6: `info --json` must agree with `list --json`
+    /// about the SAME facts -- a JSON-encoded array as a `Vec<String>`
+    /// under the same key (`locations`, not `required_locations`), the
+    /// same `verify_days` key, and a real bool for `encrypt` rather than
+    /// the raw `0`/`1`/`null` column.
+    #[test]
+    fn info_json_agrees_with_list_json_about_shared_facts() {
+        let value = info_json(
+            "daily",
+            &None,
+            Some(3),
+            &Some(r#"["home","offsite"]"#.to_string()),
+            Some(1),
+            &Some("zstd".to_string()),
+            &Some("sha256".to_string()),
+            Some(1_048_576),
+            Some(90),
+            5,
+        );
+        assert_eq!(value["locations"], serde_json::json!(["home", "offsite"]));
+        assert_eq!(value["verify_days"], serde_json::json!(90));
+        assert_eq!(value["encrypt"], serde_json::json!(true));
+        assert!(
+            value.get("required_locations").is_none(),
+            "the old string-shaped key must not linger alongside the fixed one: {value}"
+        );
+        assert!(
+            value.get("verify_interval_days").is_none(),
+            "the old key name must not linger alongside `verify_days`: {value}"
+        );
+
+        // The list-side fixture above (`pin_archive_set_rows_json_shape`)
+        // proves `list` renders the identical `locations`/`verify_days`
+        // values for the same underlying facts -- same keys, same types.
+        let list_value = archive_set_rows_to_json(&[ArchiveSetRow {
+            name: "daily".to_string(),
+            min_copies: Some(3),
+            locations: Some(vec!["home".to_string(), "offsite".to_string()]),
+            verify_days: Some(90),
+            unit_count: 5,
+        }]);
+        assert_eq!(value["locations"], list_value[0]["locations"]);
+        assert_eq!(value["verify_days"], list_value[0]["verify_days"]);
+    }
+
+    /// A `None`/`NULL` archive set must not manufacture a `false` for
+    /// `encrypt` -- "not configured" and "configured off" are different
+    /// facts, exactly as `min_copies`/`slice_size`/etc. already distinguish
+    /// `None` from a real `0`.
+    #[test]
+    fn info_json_leaves_encrypt_null_when_the_column_is_null() {
+        let value = info_json("cold", &None, None, &None, None, &None, &None, None, None, 0);
+        assert_eq!(value["encrypt"], serde_json::Value::Null);
     }
 
     fn fresh_conn() -> Connection {
