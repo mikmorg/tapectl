@@ -330,6 +330,42 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-17 (late) — #226 LANDED; the first write is no longer gated by a
+  missing test.** Master `ef48cf6`. **Lifecycle `--all` is GREEN at 383 checks / 372
+  passed / 0 failed / 11 skipped** (was 338/329/0/9 on `b865764`); gate 1570 tests, 0
+  clippy, fmt clean. The measured-green invocation is unchanged and must be run BARE:
+  `TAPECTL_MHVTL=1 bash scripts/lifecycle-suite.sh --all --device /dev/nst1 --erase short`.
+  Two scenarios were added — `cartridge-displacement` and `collection-second-copy` — and
+  **both skip visibly under `--single-cartridge`** (each needs two cartridges; the first
+  also needs a real `mt erase`, instant on mhvtl and hours on a real LTO).
+  **Open: #232, #233, #240, #241, #242, #243, #244, #245, #246.** Nothing parked.
+  **Two CTO rulings arrived 2026-09-17 and are in ADR-0012 (`ef48cf6`) — do not
+  re-litigate:**
+  - **#242 — a separate condition column**, NOT the narrower fix I recommended.
+    `volumes.status` is operator-owned; a medium's observed condition becomes its own
+    column. The load-bearing consequence: `eligible` is `status = 'sealed'`, so quarantine
+    today removes a copy BY moving the status out of `sealed` — once condition is separate
+    that mechanism is gone and `eligible` must consult both, or every quarantine silently
+    stops reducing the copy count (#153's class). The three unconditional writers in
+    `session.rs` move with verify's; `quarantined` is retired as a status value, not
+    repurposed. Migration + `coverage.rs` + every volume-listing surface: **a worker to
+    itself**, conflicting with anything touching `coverage.rs` or `session.rs`.
+  - **#244 — refuse unless `--force`**, as recommended. `clean_staging` stays policy-free;
+    the gate goes in the CLI caller, routed through `policy::coverage::copy_count_expr`
+    against `policy::resolve(...).min_copies` — the same derivation `execute_batch` uses.
+  **A process rule earned the hard way, now standing:** a change to operator-facing text
+  or a `--json` shape needs a **grep of `scripts/` before it lands**. The first `--all`
+  since `b865764` came back 2 RED, both in untouched scenarios, both because a correct
+  change (`f7f2431`, `9b42828`) moved a string the harness pinned. The mhvtl gate does not
+  run those scenarios and nothing ran `--all` in between, so the interval between breaking
+  one and finding out is measured in commits. Both assertions now pin the RULE, not the
+  sentence.
+  **And a sharpening of the RED-first rule:** running the negative control is not enough —
+  **read which checks stayed GREEN and ask why each one did.** #226's control reddened 12
+  of 19 checks while the single most important one passed, because it diffed two
+  fingerprints that were identically *empty* of the thing being measured. Every
+  comparison-based check must assert its inputs are live before comparing them.
+
 - **QUEUE STATE 2026-09-17 (evening) — the review-of-the-review is what is left.**
   The 21 issues filed from the 2026-09-17 audit (#206-#226) are all closed except
   #226. What is open now came from the FOLLOW-UP passes over the gaps that audit did
