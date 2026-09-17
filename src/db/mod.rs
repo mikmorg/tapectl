@@ -474,6 +474,28 @@ mod tests {
             .unwrap()
     }
 
+    /// (referenced table, from-column, to-column) for every outbound foreign
+    /// key, sorted. `PRAGMA table_info` reports neither FK nor CHECK
+    /// constraints, which is why this exists separately — see
+    /// `test_migration_012_changes_no_cartridge_column`'s own note.
+    fn foreign_keys_of(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
+        let mut fks: Vec<(String, String, String)> = conn
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        fks.sort();
+        fks
+    }
+
     fn index_names(conn: &Connection, table: &str) -> Vec<String> {
         let mut names: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?1")
@@ -1183,6 +1205,59 @@ mod tests {
         assert!(
             err.is_err(),
             "'offsite' is a location, not a status (ADR-0011) — the CHECK must reject it"
+        );
+    }
+
+    /// The last unpinned edge of 012's rebuild (issue #227).
+    ///
+    /// A create/copy/drop/rename rebuild silently drops whatever the new
+    /// table's DDL forgets to restate, and `PRAGMA table_info` reports
+    /// neither FK nor CHECK constraints — so
+    /// `test_migration_012_changes_no_cartridge_column` would pass just as
+    /// happily if the rebuild had dropped `location_id REFERENCES
+    /// locations(id)`. The CHECK half of that blind spot is covered by
+    /// `test_migration_012_offsite_rejected_four_states_accepted`; this is
+    /// the FK half.
+    ///
+    /// It matters under ADR-0011 specifically: a cartridge's PLACE is a
+    /// location, so `location_id` is the column that ADR made load-bearing,
+    /// and an unenforced reference is how a cartridge ends up pointing at a
+    /// location that no longer exists.
+    ///
+    /// Two assertions, and the second is the one that would actually catch a
+    /// dropped constraint: the enumeration proves the edge is declared, the
+    /// insert proves it is ENFORCED.
+    #[test]
+    fn test_migration_012_preserves_the_cartridge_location_foreign_key() {
+        let before = open_memory_at_011();
+        let after = open_memory().unwrap();
+
+        let expected = vec![(
+            "locations".to_string(),
+            "location_id".to_string(),
+            "id".to_string(),
+        )];
+        assert_eq!(
+            foreign_keys_of(&before, "cartridges"),
+            expected,
+            "precondition: 011 declares exactly the one outbound FK"
+        );
+        assert_eq!(
+            foreign_keys_of(&after, "cartridges"),
+            expected,
+            "012's rebuild must restate `location_id REFERENCES locations(id)` — \
+             a rebuild drops any constraint its new DDL omits"
+        );
+
+        let err = after.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status, location_id)
+             VALUES ('BC-dangling', 'LTO-6', 2500000000000, 'available', 99999)",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "the FK must be ENFORCED after the rebuild, not merely declared: \
+             a cartridge cannot sit at a location that does not exist (ADR-0011)"
         );
     }
 }
