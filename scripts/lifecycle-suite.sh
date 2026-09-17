@@ -1905,12 +1905,40 @@ rr_mark_erased_before_retire_refused() {
     [ "$rc" -ne 0 ] || { echo "cartridge mark-erased unexpectedly succeeded before any retirement: $out"; return 1; }
 }
 
+# Two attempts, and the SECOND is the one that matters (issue #223).
+#
+# Until 2026-09-17 this ran `volume retire VOL-A` with no --yes and grepped for
+# "ZERO copies remaining". That string is the impact analysis, which prints
+# whether the refusal came from the ADR-0008 Tier-3 floor or merely from the
+# ordinary non-interactive "nobody confirmed" guard — so the check could not
+# tell those apart, and before #147 it would have passed for the wrong reason
+# entirely. Meanwhile the comment above cp_compact_finish_succeeds asserts in
+# prose that "--yes does not reach Tier 3", and nothing in this suite ever
+# passed --yes to a Tier-3 case to find out.
+#
+# So: attempt 1 without consent (the operator-facing display), attempt 2 WITH
+# --yes, which must still be refused and must cite the floor's own language.
+# That is what makes the prose claim a measurement.
 rr_retire_refused_sole_copy() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A (no --yes; sole copy -> refused, impact analysis names a ZERO-copy unit)"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume retire VOL-A (no --yes -> refused, impact names a ZERO-copy unit); then --yes (ADR-0008 Tier 3 -> STILL refused, names the LAST eligible copy and says no --force reaches it)"; return 0; }
     local out rc
     out="$(TCTL volume retire VOL-A 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "volume retire VOL-A unexpectedly succeeded without consent while it is the sole copy: $out"; return 1; }
     echo "$out" | grep -qi "ZERO copies remaining" || { echo "impact analysis did not name a zero-copy unit ('ZERO copies remaining'): $out"; return 1; }
+
+    out="$(TCTL volume retire VOL-A --yes 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || {
+        echo "volume retire VOL-A --yes SUCCEEDED on the sole eligible copy of a live version -- ADR-0008 Tier 3 is absolute and no flag may reach it (issue #147): $out"
+        return 1
+    }
+    echo "$out" | grep -qi "LAST eligible copy" || {
+        echo "refused with --yes, but not by the Tier-3 floor -- the message does not name the LAST eligible copy, so this refusal is the non-interactive guard and the floor is unproven: $out"
+        return 1
+    }
+    echo "$out" | grep -qi "no --force for this" || {
+        echo "the Tier-3 refusal did not say that no flag reaches it, which is the property this check exists to pin: $out"
+        return 1
+    }
 }
 
 # A second COPY of the same v1 content — not a new version, and not
