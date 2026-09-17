@@ -110,12 +110,16 @@ pub fn run(
     global_dry_run: bool,
 ) -> Result<()> {
     match command {
-        // `Sync` declares its OWN `--dry-run`, which shadows the global one
-        // on this subcommand, so the two are OR-ed: `tapectl --dry-run
-        // collection sync` meant the same thing as `collection sync
-        // --dry-run` to every operator reading the global flag's help, and
-        // did not behave like it. Neither spelling can now turn a dry run
-        // back into a real one.
+        // `Sync` declares its OWN `--dry-run` as well. The two are OR-ed,
+        // but NOT because the global one was being dropped here: both args
+        // carry the clap id `dry_run`, so clap propagates the global value
+        // into the subcommand's own field and `tapectl --dry-run collection
+        // sync` already behaved as a dry run before issue #230. That was
+        // measured, not assumed — reverting this OR does not make
+        // `a_global_dry_run_before_collection_sync_registers_nothing` fail.
+        // The OR is here so the behaviour stops depending on that clap
+        // detail: rename either field and the two spellings would silently
+        // diverge. Neither can turn a dry run back into a real one.
         CollectionCommands::Sync { dry_run } => {
             cmd_sync(conn, paths, config, *dry_run || global_dry_run, json_output)
         }

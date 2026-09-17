@@ -157,6 +157,25 @@ pub fn run(
             // precisely the thing only a real INSERT can decide. Printed
             // before any write so the real path below is unchanged.
             if dry_run {
+                // `locations.name` is `NOT NULL UNIQUE` (001_initial.sql),
+                // so the real INSERT would fail here. Checked INSIDE the
+                // dry branch, leaving the real path to the constraint
+                // exactly as before: a dry run that hides a refusal is
+                // worse than none, because the operator drops the flag
+                // expecting it to work. Same placement rule as `Rename`'s
+                // lookup and `move_together`'s warehouse check.
+                let taken: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM locations WHERE name = ?1",
+                        params![name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if taken.is_some() {
+                    return Err(TapectlError::Other(format!(
+                        "location \"{name}\" already exists; choose a different name"
+                    )));
+                }
                 if json_output {
                     println!(
                         "{}",

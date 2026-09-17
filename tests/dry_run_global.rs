@@ -585,3 +585,81 @@ fn a_dry_run_collection_run_still_refuses_an_unknown_label() {
         "a dry run must still refuse an unknown destination label"
     );
 }
+
+/// `locations.name` is `NOT NULL UNIQUE` (001_initial.sql), so a real
+/// `location add` of a name already taken fails on the constraint. The
+/// dry-run branch must reach the same verdict, for the reason the move and
+/// rename gates are placed where they are: a dry run that hides a refusal
+/// is worse than none, because the operator drops the flag expecting it to
+/// work.
+#[test]
+fn a_dry_run_location_add_still_refuses_a_name_already_taken() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["location", "add", "shed"]);
+
+    let real = run_tapectl(home.path(), &["location", "add", "shed"]);
+    assert!(
+        !real.status.success(),
+        "fixture assumption broken — a duplicate location name is no longer refused"
+    );
+
+    let dry = run_tapectl(home.path(), &["location", "add", "shed", "--dry-run"]);
+    assert!(
+        !dry.status.success(),
+        "a dry run reported a name would be added that the real run refuses:\nstdout={}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+}
+
+/// `collection sync` declares its OWN `--dry-run` alongside the global one.
+///
+/// This test was written GREEN and is a characterisation, not a regression
+/// guard for a bug that existed: both args carry the clap id `dry_run`, so
+/// clap propagates the global value into the subcommand's own field, and
+/// `tapectl --dry-run collection sync` was already a dry run before issue
+/// #230 even though `main.rs` passed the flag nowhere. That was measured by
+/// reverting the `*dry_run || global_dry_run` in `cli::collection::run` and
+/// watching this test still pass. It is pinned because the behaviour rests
+/// on two fields happening to share an id — rename either and the two
+/// spellings would silently diverge, with no other test noticing.
+#[test]
+fn a_global_dry_run_before_collection_sync_registers_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "media"]);
+
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+    std::fs::write(root.path().join("alpha").join("f.dat"), b"hello").unwrap();
+
+    let cfg = home.path().join(".tapectl").join("config.toml");
+    let written = std::fs::read_to_string(&cfg).unwrap();
+    let mut text = written.replace("collections = []\n", "");
+    assert_ne!(text, written, "fixture assumption broken");
+    text.push_str(&format!(
+        "\n[[collections]]\nname = \"microlib\"\nroot = \"{}\"\ntenant = \"media\"\nunit_depth = 1\n",
+        root.path().display()
+    ));
+    std::fs::write(&cfg, &text).unwrap();
+
+    // The flag in GLOBAL position, ahead of the subcommand — the spelling
+    // clap accepts because `--dry-run` is `global = true`.
+    let out = ok(home.path(), &["--dry-run", "collection", "sync"]);
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM units"),
+        0,
+        "a global --dry-run registered a unit anyway: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !root
+            .path()
+            .join("alpha")
+            .join(".tapectl-unit.toml")
+            .exists(),
+        "a global --dry-run wrote a dotfile into the source tree"
+    );
+}
