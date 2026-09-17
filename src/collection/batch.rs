@@ -355,4 +355,122 @@ mod tests {
         assert_eq!(under[0].copies, 1);
         assert_eq!(under[0].min_copies, 2);
     }
+
+    /// Like [`seed_unit_with_one_completed_copy`], but also creates a real
+    /// staged `.age` file on disk with a `stage_slices` row pointing at it
+    /// — what `clean_staging` actually reads and unlinks. Returns `(conn,
+    /// stage_set_id, staged_file_path, TempDir guard)`; the guard must
+    /// outlive the assertions or the directory is removed early.
+    fn seed_unit_with_one_completed_copy_and_staged_file(
+        unit_name: &str,
+    ) -> (Connection, i64, std::path::PathBuf, tempfile::TempDir) {
+        let conn = db::open_memory().unwrap();
+        seed_unit_with_one_completed_copy(&conn, unit_name);
+        let stage_set_id: i64 = conn
+            .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slice_1.age");
+        std::fs::write(&path, b"staged slice bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 19, 19, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_id, path.to_string_lossy()],
+        )
+        .unwrap();
+
+        (conn, stage_set_id, path, dir)
+    }
+
+    fn config_with_staging_dir(dir: &std::path::Path, min_copies: i32) -> Config {
+        let mut config = Config {
+            staging: crate::config::StagingConfig {
+                directory: dir.to_string_lossy().to_string(),
+            },
+            ..Default::default()
+        };
+        config.defaults.min_copies_for_tape_only = min_copies;
+        config
+    }
+
+    /// Issue #229, change 6: the recipe the refusal message now names
+    /// (swap cartridges, then `tapectl volume write <label2>`) is verified
+    /// END TO END here, not reasoned about. This reproduces `execute_batch`'s
+    /// own tail exactly — call [`under_copied_units`], and call
+    /// `clean_staging` ONLY when it comes back empty — and then checks the
+    /// two facts a second `volume write` actually depends on:
+    /// `stage_sets.status` is still `'staged'` (the exact precondition
+    /// `find_staged_data`'s `WHERE ss.status = 'staged'`,
+    /// `src/volume/write.rs`, requires), and the physical `.age` file
+    /// `stage_slices.staging_path` points at is still on disk. Before issue
+    /// #229's fix, `execute_batch` called `clean_staging(force = false)`
+    /// unconditionally right after the single write this batch just did,
+    /// and the non-force guard passed vacuously (one `writes` row,
+    /// `'completed'`) — see
+    /// `staging::clean::tests::default_guard_cleans_when_the_only_planned_copy_completed`
+    /// for that same guard pinned green on exactly this shape.
+    #[test]
+    fn release_gate_retains_staged_bytes_when_a_unit_is_still_under_copied() {
+        let (conn, stage_set_id, staged_file, dir_guard) =
+            seed_unit_with_one_completed_copy_and_staged_file("testlib/alpha");
+        let config = config_with_staging_dir(dir_guard.path(), 2);
+        let batch = one_unit_batch("testlib/alpha");
+
+        let under = under_copied_units(&conn, &config, &batch).unwrap();
+        assert_eq!(under.len(), 1, "{under:?}");
+        if under.is_empty() {
+            crate::staging::clean::clean_staging(&conn, &config, false).unwrap();
+        }
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "staged",
+            "a still-under-copied unit's stage_set must stay 'staged' so a second \
+             `tapectl volume write <label2>` can find it"
+        );
+        assert!(
+            staged_file.exists(),
+            "the staged .age file must survive on disk for a second copy to consume"
+        );
+    }
+
+    /// Issue #229, change 7 — the negative control for the test above: a
+    /// collection whose units resolve `min_copies = 1` must still
+    /// auto-release after its single copy, exactly as before this fix. This
+    /// is the behaviour the retention gate above could most easily break.
+    #[test]
+    fn release_gate_cleans_staged_bytes_when_min_copies_one_is_already_met() {
+        let (conn, stage_set_id, staged_file, dir_guard) =
+            seed_unit_with_one_completed_copy_and_staged_file("testlib/alpha");
+        let config = config_with_staging_dir(dir_guard.path(), 1);
+        let batch = one_unit_batch("testlib/alpha");
+
+        let under = under_copied_units(&conn, &config, &batch).unwrap();
+        assert!(under.is_empty(), "{under:?}");
+        if under.is_empty() {
+            crate::staging::clean::clean_staging(&conn, &config, false).unwrap();
+        }
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "cleaned",
+            "min_copies=1 is already met by the one copy just written -- this must \
+             still auto-release exactly as it did before issue #229"
+        );
+        assert!(!staged_file.exists(), "the staged .age file must be removed");
+    }
 }
