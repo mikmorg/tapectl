@@ -9,6 +9,7 @@ use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::error::{Result, TapectlError};
+use crate::volume::rebuild::RebuildReport;
 
 #[derive(Subcommand, Debug)]
 pub enum CatalogCommands {
@@ -81,13 +82,16 @@ pub enum CatalogCommands {
 
 #[derive(Tabled, Serialize)]
 struct FileRow {
-    /// `d `/`  ` is prefixed onto the real path for table display (below).
-    /// JSON trims it via `serialize_trimmed` -- which, for a directory row,
-    /// strips only the trailing space: `.trim()` removes whitespace, not
-    /// the `d` itself, so a directory's JSON `path` keeps its `"d "`
-    /// prefix. That is the existing, pinned contract, not fixed here.
-    #[tabled(rename = "Path")]
-    #[serde(serialize_with = "serialize_trimmed")]
+    /// The real path, unprefixed (issue #236 finding 5). This used to store
+    /// `"d "`/`"  "` prefixed onto the path for table display, with
+    /// `serialize_trimmed` stripping only whitespace for JSON -- so a
+    /// directory's JSON `path` came out as `"d subdir"`, matching nothing on
+    /// tape or disk, and indistinguishable from a genuine file literally
+    /// named `"d subdir"`. The prefix is now a table-only rendering,
+    /// produced by `Self::display_path` from [`Self::is_directory`] below --
+    /// exactly how `size`/`modified` already keep their display transform
+    /// out of the serialized value.
+    #[tabled(rename = "Path", display_with("Self::display_path", self))]
     path: String,
     #[tabled(rename = "Size")]
     size: String,
@@ -118,13 +122,17 @@ struct FileRow {
     modified: Option<String>,
     #[tabled(rename = "SHA256")]
     sha256: String,
+    /// Additive (issue #236 finding 5): the fact the `"d "` table prefix
+    /// used to encode into `path` itself, with no way for a `--json`
+    /// consumer to recover it now that `path` holds the real path.
+    #[tabled(skip)]
+    is_directory: bool,
 }
 
-fn serialize_trimmed<S: serde::Serializer>(
-    value: &str,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.serialize_str(value.trim())
+impl FileRow {
+    fn display_path(&self) -> String {
+        format!("{}{}", if self.is_directory { "d " } else { "  " }, self.path)
+    }
 }
 
 fn display_opt_string(v: &Option<String>) -> String {
@@ -152,7 +160,7 @@ fn file_row(
     sha256_raw: Option<String>,
 ) -> FileRow {
     FileRow {
-        path: format!("{}{}", if is_dir { "d " } else { "  " }, raw_path),
+        path: raw_path,
         size: if is_dir {
             "-".into()
         } else {
@@ -163,6 +171,7 @@ fn file_row(
         sha256: sha256_raw
             .map(|s| short_hash(&s))
             .unwrap_or_else(|| "(unstaged)".into()),
+        is_directory: is_dir,
     }
 }
 
@@ -586,6 +595,15 @@ pub fn run(
                         "attested": report.attested,
                         "key_is_escrow": report.key_is_escrow,
                         "unknown_remaining": report.unknown_remaining,
+                        // Issue #236 finding 1: the three distinct arms
+                        // `attest_escrow` can leave a stage set unattested
+                        // on, so a consumer can tell a permanent Gap
+                        // ("not_recipient") apart from a possibly-transient
+                        // Unknown ("unreadable"/"unparseable") instead of
+                        // reading one collapsed sentence.
+                        "escrow_attest_not_recipient": report.escrow_attest_not_recipient,
+                        "escrow_attest_unreadable": report.escrow_attest_unreadable,
+                        "escrow_attest_unparseable": report.escrow_attest_unparseable,
                         "units_without_tenant_envelope": report.units_without_tenant_envelope,
                         "no_changes": report.is_noop(),
                         "volume_status_mismatch": report.volume_status_mismatch,
@@ -662,10 +680,11 @@ pub fn run(
                     (None, None) => {}
                 }
                 if let Some(superseded) = &report.cartridge_barcode_superseded {
-                    println!(
-                        "  note: --cartridge \"{superseded}\" was superseded by a live medium \
-                         serial matching a different registered cartridge"
-                    );
+                    // Issue #236 finding 3: this used to say "`--cartridge`
+                    // ... was superseded", naming a flag `CatalogCommands::Rebuild`
+                    // does not have. See `cartridge_supersession_note`'s doc.
+                    let winner = report.cartridge_barcode.as_deref().unwrap_or("?");
+                    println!("{}", cartridge_supersession_note(superseded, winner));
                 }
                 // Issue #235: the SAME lines `volume init` prints, from the
                 // one renderer (`binding::render_displacement`, already run
@@ -736,23 +755,10 @@ pub fn run(
                     // no-escrow path — `key import --escrow` is refused
                     // outright once one is registered (issue #214, finding
                     // 2-4 sibling: same trap as `escrow_identity_findings`).
-                    let note = if report.key_is_escrow {
-                        " — the escrow key is not a recipient of their slices".to_string()
-                    } else if crate::db::queries::escrow_public_key(conn)?.is_some() {
-                        " — re-run `tapectl catalog rebuild --key <the REGISTERED escrow \
-                         secret key>` to attest them, or re-stage"
-                            .to_string()
-                    } else {
-                        " — no escrow is registered in this catalog yet: register the \
-                         ORIGINAL escrow public key with `tapectl key import --escrow <key>`, \
-                         then re-run `tapectl catalog rebuild --key <its secret key file>` \
-                         to attest them, or re-stage"
-                            .to_string()
-                    };
-                    println!(
-                        "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown){}",
-                        report.unknown_remaining, note
-                    );
+                    let escrow_registered = crate::db::queries::escrow_public_key(conn)?.is_some();
+                    for line in escrow_unknown_lines(&report, escrow_registered) {
+                        println!("{line}");
+                    }
                 }
             }
         }
@@ -797,6 +803,111 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// The `escrow: ... still report \`?\` (unknown)` lines `catalog rebuild`
+/// prints when `report.unknown_remaining > 0`, extracted out of `run`'s
+/// match arm (issue #236 finding 1) so the exact wording per cause is a
+/// function a test can call directly, rather than something only provable
+/// by capturing stdout off a full tape rebuild.
+///
+/// `attest_escrow` (`volume::rebuild`) leaves a stage set unattested on
+/// THREE different arms, and only one of them — the escrow key
+/// demonstrably is not a recipient (`escrow_attest_not_recipient`) — is the
+/// permanent Gap statement (ADR-0005/#137's `Coverage::Gap`); the other two
+/// (`escrow_attest_unreadable`/`escrow_attest_unparseable`) are `Unknown`:
+/// the bytes may be perfectly escrow-covered and merely unreadable or
+/// unparseable at this position, a different problem with a different
+/// remedy. Printing the Gap sentence for all three (the pre-#236 behavior)
+/// collapsed `Unknown` into `Gap` at exactly the moment #137 invented the
+/// distinction for.
+fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !report.key_is_escrow {
+        // Reachable with or without a registered escrow, so the remedy must
+        // branch on that instead of assuming the no-escrow path — `key
+        // import --escrow` is refused outright once one is registered
+        // (issue #214, finding 2-4 sibling: same trap as
+        // `escrow_identity_findings`). Both remedies name `--from-volume`
+        // (issue #236 finding 3 sub-finding): `catalog rebuild` hard-refuses
+        // without it (`volume::rebuild`'s pre-transaction guard), so a
+        // remedy omitting it sends the operator to a command that refuses.
+        if escrow_registered {
+            lines.push(format!(
+                "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) \
+                 — re-run `tapectl catalog rebuild --from-volume --key <the REGISTERED escrow \
+                 secret key>` to attest them, or re-stage",
+                report.unknown_remaining
+            ));
+        } else {
+            lines.push(format!(
+                "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) \
+                 — no escrow is registered in this catalog yet: register the ORIGINAL escrow \
+                 public key with `tapectl key import --escrow <key>`, then re-run `tapectl \
+                 catalog rebuild --from-volume --key <its secret key file>` to attest them, or \
+                 re-stage",
+                report.unknown_remaining
+            ));
+        }
+        return lines;
+    }
+
+    if report.escrow_attest_not_recipient > 0 {
+        lines.push(format!(
+            "  escrow: {} rebuilt stage set(s) still report `?` (unknown) — the escrow key \
+             is not a recipient of their slices (permanent: re-running will not change this)",
+            report.escrow_attest_not_recipient
+        ));
+    }
+    if report.escrow_attest_unreadable > 0 {
+        lines.push(format!(
+            "  escrow: {} rebuilt stage set(s) still report `?` (unknown) — their slice \
+             header could not be read; the bytes may still be escrow-covered and merely \
+             unreadable at this position — try `tapectl volume verify {}`, a copy on another \
+             cartridge, or re-running this rebuild",
+            report.escrow_attest_unreadable, report.label
+        ));
+    }
+    if report.escrow_attest_unparseable > 0 {
+        lines.push(format!(
+            "  escrow: {} rebuilt stage set(s) still report `?` (unknown) — their slice \
+             header did not parse; coverage stays unknown",
+            report.escrow_attest_unparseable
+        ));
+    }
+    let observed = report.escrow_attest_not_recipient
+        + report.escrow_attest_unreadable
+        + report.escrow_attest_unparseable;
+    if observed == 0 {
+        // Every currently-unknown stage set predates this run's attestation
+        // attempt (already reported unknown by an earlier rebuild) — there
+        // was nothing new for this run to try.
+        lines.push(format!(
+            "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) — \
+             the escrow key found nothing new to attest this run",
+            report.unknown_remaining
+        ));
+    }
+    lines
+}
+
+/// The `note: ...` line `catalog rebuild` prints when this tape's File 0
+/// named one cartridge but the medium's own serial matched a DIFFERENT
+/// registered cartridge (ADR-0012's "the loaded tape *is* that other
+/// cartridge"), extracted (issue #236 finding 3) so the exact wording is
+/// directly assertable.
+///
+/// `CatalogCommands::Rebuild` (above) has no `--cartridge` flag — only
+/// `--from-volume`/`--device`/`--key`/`--label`/`--tenant` — so this note
+/// must never name one; `superseded` is File 0's own recorded barcode (an
+/// operator claim from write time, never something an operator typed on
+/// this command), not something a flag supplied.
+fn cartridge_supersession_note(superseded: &str, winner: &str) -> String {
+    format!(
+        "  note: this tape's File 0 names cartridge \"{superseded}\", but the medium's own \
+         serial matches registered cartridge \"{winner}\" — the serial wins (ADR-0012); the \
+         mount was recorded against \"{winner}\""
+    )
 }
 
 /// First 12 characters of a hash, elided — or the whole thing when it is
@@ -880,14 +991,143 @@ mod tests {
     use super::*;
     use crate::db;
 
+    // --- Issue #236 finding 1: `escrow_unknown_lines` must print the cause
+    // actually observed, not assert the Gap sentence for every arm. ---
+
+    #[test]
+    fn escrow_unknown_lines_names_the_gap_for_a_confirmed_non_recipient() {
+        let report = RebuildReport {
+            key_is_escrow: true,
+            escrow_attest_not_recipient: 2,
+            unknown_remaining: 2,
+            ..Default::default()
+        };
+        let lines = escrow_unknown_lines(&report, true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("is not a recipient"),
+            "the confirmed-Gap arm must say so: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("permanent"),
+            "a confirmed non-recipient never changes on re-run: {lines:?}"
+        );
+    }
+
+    /// The defect this fix is about: an unreadable slice header is an I/O
+    /// failure, not proof the escrow key is not a recipient. Pre-#236 this
+    /// printed the SAME "not a recipient" sentence `escrow_attest_not_recipient`
+    /// gets above -- collapsing Unknown into Gap.
+    #[test]
+    fn escrow_unknown_lines_never_asserts_gap_for_an_unreadable_header() {
+        let report = RebuildReport {
+            key_is_escrow: true,
+            escrow_attest_unreadable: 1,
+            unknown_remaining: 1,
+            label: "L6-0004".to_string(),
+            ..Default::default()
+        };
+        let lines = escrow_unknown_lines(&report, true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            !lines[0].contains("is not a recipient"),
+            "an unreadable header must never assert the confirmed Gap sentence: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("could not be read"),
+            "the unreadable arm must say so: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("volume verify L6-0004"),
+            "the remedy must name the actual volume: {lines:?}"
+        );
+    }
+
+    /// Same shape, the other arm: a header that could not PARSE is also not
+    /// proof of non-recipiency.
+    #[test]
+    fn escrow_unknown_lines_never_asserts_gap_for_an_unparseable_header() {
+        let report = RebuildReport {
+            key_is_escrow: true,
+            escrow_attest_unparseable: 1,
+            unknown_remaining: 1,
+            ..Default::default()
+        };
+        let lines = escrow_unknown_lines(&report, true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            !lines[0].contains("is not a recipient"),
+            "an unparseable header must never assert the confirmed Gap sentence: {lines:?}"
+        );
+        assert!(lines[0].contains("did not parse"), "{lines:?}");
+    }
+
+    /// All three arms can occur in one run (a damaged patch of tape plus a
+    /// genuinely uncovered unit) -- each must get its own line.
+    #[test]
+    fn escrow_unknown_lines_reports_every_observed_cause_separately() {
+        let report = RebuildReport {
+            key_is_escrow: true,
+            escrow_attest_not_recipient: 1,
+            escrow_attest_unreadable: 1,
+            escrow_attest_unparseable: 1,
+            unknown_remaining: 3,
+            label: "L6-0004".to_string(),
+            ..Default::default()
+        };
+        let lines = escrow_unknown_lines(&report, true);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+    }
+
+    /// The sub-finding: the no-escrow-attempted remedies must name
+    /// `--from-volume`, the flag `catalog rebuild` hard-refuses without.
+    #[test]
+    fn escrow_unknown_lines_remedy_names_from_volume() {
+        let report = RebuildReport {
+            key_is_escrow: false,
+            unknown_remaining: 1,
+            ..Default::default()
+        };
+        for registered in [true, false] {
+            let lines = escrow_unknown_lines(&report, registered);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].contains("catalog rebuild --from-volume"),
+                "the remedy must name --from-volume (registered={registered}): {lines:?}"
+            );
+        }
+    }
+
+    // --- Issue #236 finding 3: the supersession note must name only
+    // things that run in the state that prints it. ---
+
+    #[test]
+    fn cartridge_supersession_note_never_names_a_nonexistent_flag() {
+        let note = cartridge_supersession_note("OLD-BARCODE", "NEW-BARCODE");
+        assert!(
+            !note.contains("--cartridge"),
+            "`catalog rebuild` has no --cartridge flag: {note}"
+        );
+        assert!(note.contains("OLD-BARCODE"), "{note}");
+        assert!(note.contains("NEW-BARCODE"), "{note}");
+        assert!(note.contains("File 0"), "{note}");
+        assert!(note.contains("ADR-0012"), "{note}");
+    }
+
     // --- C2 pins: `catalog ls`/`catalog locate` --json shapes, locked down
     // BEFORE the row structs are retyped (issue: C2 row-listing drift). ---
 
-    /// `d ` (or `  `) is prefixed onto `path` for table display and then
-    /// `.trim()`-ed for JSON in the current code. `.trim()` strips
-    /// whitespace only, so a directory row's `"d "` prefix survives into
-    /// JSON — that quirk is part of the pinned contract, not a bug this
-    /// task fixes.
+    /// Issue #236 finding 5: `path` used to store `"d "`/`"  "` prefixed
+    /// onto the real path for table display, with `.trim()` clearing it for
+    /// JSON -- which strips whitespace only, so a directory row's `"d "`
+    /// prefix SURVIVED into JSON (`"path": "d subdir"`, matching nothing on
+    /// tape or disk and indistinguishable from a genuine file literally
+    /// named that). This pin was updated to keep asserting that broken
+    /// value, which was itself part of the defect (a test asserting
+    /// yesterday's wrong output is not "pinned", it is stale). `path` now
+    /// holds the real path unconditionally and `is_directory` is the
+    /// additive fact a `--json` consumer needs to tell the two apart; the
+    /// `"d "` prefix survives ONLY in the table, via `Self::display_path`.
     #[test]
     /// This pins the JSON SHAPE — key names, key ordering, null handling —
     /// and nothing else. It feeds `size` AND `size_bytes` in as literals, so
@@ -904,24 +1144,26 @@ mod tests {
     fn pin_file_rows_json_shape() {
         let rows = vec![
             FileRow {
-                path: "d subdir".to_string(),
+                path: "subdir".to_string(),
                 size: "-".to_string(),
                 size_bytes: None,
                 modified: Some("2026-01-01T00:00:00Z".to_string()),
                 sha256: "(unstaged)".to_string(),
+                is_directory: true,
             },
             FileRow {
-                path: "  some/file.txt".to_string(),
+                path: "some/file.txt".to_string(),
                 size: "1.2 KiB".to_string(),
                 size_bytes: Some(1229),
                 modified: None,
                 sha256: "0123456789ab...".to_string(),
+                is_directory: false,
             },
         ];
         let value = file_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"modified":"2026-01-01T00:00:00Z","path":"d subdir","sha256":"(unstaged)","size":"-","size_bytes":null},{"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KiB","size_bytes":1229}]"#
+            r#"[{"is_directory":true,"modified":"2026-01-01T00:00:00Z","path":"subdir","sha256":"(unstaged)","size":"-","size_bytes":null},{"is_directory":false,"modified":null,"path":"some/file.txt","sha256":"0123456789ab...","size":"1.2 KiB","size_bytes":1229}]"#
         );
     }
 
@@ -957,6 +1199,26 @@ mod tests {
         let row = file_row("subdir".to_string(), 0, true, None, None);
         assert_eq!(row.size, "-");
         assert_eq!(row.size_bytes, None);
+    }
+
+    /// Issue #236 finding 5: `path` must hold the REAL path unconditionally
+    /// -- the `"d "` table marker used to be baked into `path` itself by
+    /// `file_row`, so a directory's JSON `path` came out `"d subdir"`,
+    /// matching nothing on tape or disk and indistinguishable from a
+    /// genuine file literally named that. `is_directory` is the additive
+    /// fact a `--json` consumer needs; the marker survives ONLY in
+    /// `Self::display_path`, the table-only rendering.
+    #[test]
+    fn file_row_path_carries_no_table_prefix_is_directory_is_additive() {
+        let dir = file_row("subdir".to_string(), 0, true, None, None);
+        assert_eq!(dir.path, "subdir", "the real path, not \"d subdir\"");
+        assert!(dir.is_directory);
+        assert_eq!(dir.display_path(), "d subdir", "the prefix is table-only");
+
+        let file = file_row("some/file.txt".to_string(), 10, false, None, None);
+        assert_eq!(file.path, "some/file.txt");
+        assert!(!file.is_directory);
+        assert_eq!(file.display_path(), "  some/file.txt");
     }
 
     /// Pins the WHOLE `--json` shape, including `last_verified` (issue
