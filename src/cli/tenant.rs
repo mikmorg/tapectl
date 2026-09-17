@@ -150,16 +150,21 @@ pub fn run(
                 "UPDATE units SET tenant_id = ?1 WHERE tenant_id = ?2",
                 rusqlite::params![dst.id, src.id],
             )?;
-            crate::db::events::log_event(
+            // Issue #243 / ADR-0012's move-event ruling: the value fields
+            // carry tenant NAMES on both sides, never a raw id -- a reader
+            // of `report events` (and `location.rs`'s mover, the pattern
+            // this follows) must never have to query a table the event was
+            // supposed to spare them, and an id here would name nothing at
+            // all once either tenant is renamed or deleted.
+            crate::db::events::log_field_change(
                 conn,
                 "tenant",
                 src.id,
-                Some(source),
+                source,
                 "reassign",
-                Some("tenant_id"),
-                Some(&src.id.to_string()),
-                Some(&dst.id.to_string()),
-                None,
+                "tenant",
+                Some(source),
+                to,
                 None,
             )?;
             if json_output {
