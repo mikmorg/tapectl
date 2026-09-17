@@ -294,7 +294,7 @@ pub fn run(
                     )
                     .map_err(|_| {
                         TapectlError::Other(format!(
-                            "no unstaged snapshot for unit \"{name}\" — run `tapectl snapshot create` first"
+                            "no unstaged snapshot for unit \"{name}\" — run `tapectl snapshot create {name}` first if the contents changed, or re-stage an existing version with `tapectl stage create {name} --version <N>` (`tapectl snapshot list --unit {name}` shows them)"
                         ))
                     })?
                 }
