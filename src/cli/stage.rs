@@ -51,8 +51,12 @@ struct StageRow {
     version: i64,
     #[tabled(rename = "Status")]
     status: String,
-    #[tabled(rename = "Slices")]
-    slices: String,
+    /// Raw `Option<i64>`, not a pre-rendered string (issue #205's audit).
+    /// A slice COUNT is a quantity; `SnapshotRow.files` next door already
+    /// carried the correct shape. `display_opt_i64` keeps the table's `-`
+    /// for NULL unchanged.
+    #[tabled(rename = "Slices", display_with = "display_opt_i64")]
+    slices: Option<i64>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). Raw bytes; renamed to `total_encrypted_size` to
     /// match `stage info --json`'s existing key for the same
@@ -68,6 +72,10 @@ struct StageRow {
 
 fn display_encrypted_mb(v: &Option<i64>) -> String {
     v.map(crate::util::format_bytes_binary).unwrap_or_default()
+}
+
+fn display_opt_i64(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
 fn display_opt_string(v: &Option<String>) -> String {
@@ -128,10 +136,7 @@ pub fn run(
                         unit: row.get(1)?,
                         version: row.get(2)?,
                         status: row.get(3)?,
-                        slices: row
-                            .get::<_, Option<i64>>(4)?
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
+                        slices: row.get::<_, Option<i64>>(4)?,
                         encrypted_size: enc_size,
                         staged_at: row.get::<_, Option<String>>(6)?,
                     })
@@ -412,7 +417,7 @@ mod tests {
                 unit: "backups".to_string(),
                 version: 2,
                 status: "staged".to_string(),
-                slices: "3".to_string(),
+                slices: Some(3),
                 encrypted_size: Some(125_829_121),
                 staged_at: Some("2026-07-01T00:00:00Z".to_string()),
             },
@@ -421,7 +426,7 @@ mod tests {
                 unit: "photos".to_string(),
                 version: 1,
                 status: "staging".to_string(),
-                slices: String::new(),
+                slices: None,
                 encrypted_size: None,
                 staged_at: None,
             },
@@ -429,7 +434,7 @@ mod tests {
         let value = stage_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"id":1,"slices":"3","staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":125829121,"unit":"backups","version":2},{"id":2,"slices":"","staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1}]"#
+            r#"[{"id":1,"slices":3,"staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":125829121,"unit":"backups","version":2},{"id":2,"slices":null,"staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1}]"#
         );
     }
 

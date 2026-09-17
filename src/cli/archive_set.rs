@@ -134,8 +134,13 @@ pub enum ArchiveSetCommands {
 struct ArchiveSetRow {
     #[tabled(rename = "Name")]
     name: String,
-    #[tabled(rename = "Copies")]
-    min_copies: String,
+    /// Raw `Option<i64>`, not a pre-rendered string (issue #205's audit).
+    /// `archive-set info --json` already emitted this same column raw, so
+    /// the two subcommands disagreed in TYPE about the same fact — a
+    /// consumer reading `min_copies` got `"3"` from one and `3` from the
+    /// other. `display_opt_i64` keeps the table's `-` for NULL unchanged.
+    #[tabled(rename = "Copies", display_with = "display_opt_i64")]
+    min_copies: Option<i64>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). `required_locations` is stored as a JSON array
     /// string (or NULL); `None` covers both NULL and an unparseable value
@@ -494,10 +499,7 @@ pub fn run(
                 .query_map([], |row| {
                     Ok(ArchiveSetRow {
                         name: row.get(0)?,
-                        min_copies: row
-                            .get::<_, Option<i64>>(1)?
-                            .map(|n| n.to_string())
-                            .unwrap_or("-".into()),
+                        min_copies: row.get::<_, Option<i64>>(1)?,
                         locations: row
                             .get::<_, Option<String>>(2)?
                             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
@@ -767,14 +769,14 @@ mod tests {
         let rows = vec![
             ArchiveSetRow {
                 name: "daily".to_string(),
-                min_copies: "3".to_string(),
+                min_copies: Some(3),
                 locations: Some(vec!["home".to_string(), "offsite".to_string()]),
                 verify_days: Some(90),
                 unit_count: 5,
             },
             ArchiveSetRow {
                 name: "ephemeral".to_string(),
-                min_copies: "-".to_string(),
+                min_copies: None,
                 locations: None,
                 verify_days: None,
                 unit_count: 0,
@@ -783,7 +785,7 @@ mod tests {
         let value = archive_set_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"locations":["home","offsite"],"min_copies":"3","name":"daily","units":5,"verify_days":90},{"locations":null,"min_copies":"-","name":"ephemeral","units":0,"verify_days":null}]"#
+            r#"[{"locations":["home","offsite"],"min_copies":3,"name":"daily","units":5,"verify_days":90},{"locations":null,"min_copies":null,"name":"ephemeral","units":0,"verify_days":null}]"#
         );
     }
 
