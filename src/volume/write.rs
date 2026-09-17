@@ -1396,8 +1396,9 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
         "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
          bulk-erased and reused (`cartridge mark-erased`)."
             .to_string(),
-        "The staged slices stay pinned on disk until `tapectl staging clean` runs, so the data \
-         can be re-staged or written to another volume."
+        "The staged slices stay pinned on disk; because this session's `writes` row becomes \
+         ABORTED, plain `tapectl staging clean` will not release them — use `tapectl staging \
+         clean --force`, or write them to another volume first."
             .to_string(),
     ];
     crate::cli::consent::confirm(
