@@ -4205,7 +4205,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let good = b"the bytes the front index promises. ".repeat(4);
         let rotted = b"the bytes the tape actually holds!! ".repeat(4);
-        seed_one_slice_fixture(&conn, "Q-ROT", "q-rot-unit", 4, &good, "completed", "current");
+        seed_one_slice_fixture(
+            &conn,
+            "Q-ROT",
+            "q-rot-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
         conn.execute(
             "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-ROT'",
             [],
@@ -4245,10 +4253,11 @@ mod tests {
         );
         let events = volume_events(&conn, "Q-ROT");
         assert!(
-            events.iter().any(|(action, old, new)| action
-                .contains("quarantined")
-                && old == "sealed"
-                && new == "quarantined"),
+            events
+                .iter()
+                .any(|(action, old, new)| action.contains("quarantined")
+                    && old == "sealed"
+                    && new == "quarantined"),
             "the catalog must record the status transition: {events:?}"
         );
     }
@@ -4370,7 +4379,15 @@ mod tests {
     fn a_seal_unreadable_failure_does_not_quarantine() {
         let conn = crate::db::open_memory().unwrap();
         let good = b"slice bytes that are perfectly fine on tape. ".repeat(4);
-        seed_one_slice_fixture(&conn, "Q-SEAL", "q-seal-unit", 4, &good, "completed", "current");
+        seed_one_slice_fixture(
+            &conn,
+            "Q-SEAL",
+            "q-seal-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
         conn.execute(
             "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-SEAL'",
             [],
@@ -4493,14 +4510,26 @@ mod tests {
             let conn = crate::db::open_memory().unwrap();
             let good = b"fixture bytes. ".repeat(4);
             let label = "Q-SEAM";
-            seed_one_slice_fixture(&conn, label, "q-seam-unit", 4, &good, "completed", "current");
+            seed_one_slice_fixture(
+                &conn,
+                label,
+                "q-seam-unit",
+                4,
+                &good,
+                "completed",
+                "current",
+            );
             conn.execute(
                 "UPDATE volumes SET status = 'sealed' WHERE label = ?1",
                 params![label],
             )
             .unwrap();
             let volume_id: i64 = conn
-                .query_row("SELECT id FROM volumes WHERE label = ?1", params![label], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM volumes WHERE label = ?1",
+                    params![label],
+                    |r| r.get(0),
+                )
                 .unwrap();
 
             quarantine_on_medium_evidence(&conn, volume_id, label, &evidence_of(kind)).unwrap();
@@ -4553,7 +4582,9 @@ mod tests {
         )
         .unwrap();
 
-        let effect = report.quarantine.expect("the evidence is still medium-proving");
+        let effect = report
+            .quarantine
+            .expect("the evidence is still medium-proving");
         assert_eq!(effect.previous_status, "quarantined");
         assert!(
             !effect.status_changed(),

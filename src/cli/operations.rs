@@ -4395,7 +4395,15 @@ mod tests {
                 "tapectl stage create unitA --version 1",
                 "tapectl snapshot mark-reclaimable unitA --version 1",
                 "tapectl volume verify L6-TEXT",
-                "quarantines the volume when it fails",
+                // Issue #234: the escape is CONDITIONAL, and the refusal has
+                // to say so. It used to promise "quarantines the volume when
+                // it fails" — the blanket wording ADR-0012's 2026-09-17
+                // amendment corrected. Both halves are pinned, because an
+                // operator told only the first half would follow this recipe
+                // with a dirty drive and get no explanation for why nothing
+                // changed.
+                "quarantines the volume when the failure PROVES the medium is bad",
+                "read or transport failure the volume is left untouched",
                 "no --force for this",
             ] {
                 assert!(
