@@ -122,12 +122,25 @@ pub fn assess(
     let mut required_copies = resolved.min_copies;
     let mut required_locations = resolved.required_locations.len() as i64;
 
-    // Precondition 3: tape-only units get multiplied requirements
-    if unit.status == "tape_only" {
+    // Precondition 3: tape-only units get multiplied requirements.
+    //
+    // `tape_only_multiplier` is carried past this block (rather than
+    // recomputed at each `if unit.status == "tape_only"` site below) so the
+    // refusal text below can name the CONFIGURED multiplier. Before issue
+    // #215 finding 1, the refusal hardcoded the literal "2x" regardless of
+    // `config.compaction.tape_only_safety_multiplier`'s actual value, so an
+    // operator who had (legitimately) set a different multiplier read a
+    // rule that was not the one actually enforced. `Config::load` now
+    // refuses a multiplier below 1 (`Config::range_problems`), so this is
+    // always `>= 1` here.
+    let tape_only_multiplier = if unit.status == "tape_only" {
         let multiplier = config.compaction.tape_only_safety_multiplier as i64;
         required_copies *= multiplier;
         required_locations *= multiplier;
-    }
+        Some(multiplier)
+    } else {
+        None
+    };
 
     // ADR-0004 (issue #89): this query previously had no JOIN to
     // volumes at all, so it counted every completed write regardless
@@ -149,7 +162,10 @@ pub fn assess(
             reason: format!(
                 "superseding v{} has {copy_count} copies, needs {required_copies}{} (use --force to override)",
                 superseding.1,
-                if unit.status == "tape_only" { " (tape-only 2x)" } else { "" }
+                match tape_only_multiplier {
+                    Some(m) => format!(" (tape-only {m}x)"),
+                    None => String::new(),
+                }
             ),
         });
     }
@@ -420,6 +436,37 @@ pub(crate) mod tests {
                     "{reason}"
                 );
                 assert!(reason.contains("(tape-only 2x)"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// Issue #215 finding 1: the "(tape-only Nx)" fragment in the refusal
+    /// text must name the CONFIGURED multiplier, not a hardcoded literal
+    /// "2x" — an operator who set `tape_only_safety_multiplier = 3` must
+    /// read "3x" in the message that names the multiplied requirement, not
+    /// a "2x" that was never actually applied.
+    #[test]
+    fn d_tape_only_message_names_the_configured_multiplier_not_a_hardcoded_2x() {
+        let (conn, unit) = setup("sup-tapeonly3", 2, "sealed", "tape_only");
+        let mut config = Config::default();
+        config.compaction.tape_only_safety_multiplier = 3;
+        let verdict = assess(&conn, &config, &unit, 1).unwrap();
+        match verdict {
+            ReclaimVerdict::Blocked { reason, .. } => {
+                assert!(
+                    reason.contains("has 2 copies, needs 6"),
+                    "expected the requirement multiplied by 3 (needs 6), got: {reason}"
+                );
+                assert!(
+                    reason.contains("(tape-only 3x)"),
+                    "must name the configured multiplier (3x): {reason}"
+                );
+                assert!(
+                    !reason.contains("(tape-only 2x)"),
+                    "must not name a hardcoded 2x once the multiplier is configured \
+                     differently: {reason}"
+                );
             }
             other => panic!("expected Blocked, got {other:?}"),
         }

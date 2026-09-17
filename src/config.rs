@@ -596,6 +596,7 @@ impl Config {
             .map_err(|e| TapectlError::Config(format!("{}: {e}", path.display())))?;
         config.validate_sizes(path)?;
         config.validate_closed_sets(path)?;
+        config.validate_ranges(path)?;
         Ok(config)
     }
 
@@ -778,9 +779,78 @@ impl Config {
         problems
     }
 
+    /// Reject `[compaction]` values outside the range their arithmetic can
+    /// tolerate (issue #215 finding 1) — a separate collector from
+    /// [`Config::closed_set_problems`] because these are continuous ranges,
+    /// not finite string sets, but validated at load for the identical
+    /// ADR-0012 reason: a value accepted here that misbehaves later is
+    /// exactly the residue ADR-0012 exists to close.
+    ///
+    /// `tape_only_safety_multiplier` MULTIPLIES the base copy/location
+    /// requirement for a `tape_only` unit in
+    /// `policy::reclaimable::assess` (`required_copies *= multiplier`,
+    /// `required_locations *= multiplier`) — it never replaces it. `0`
+    /// zeroes both requirements outright (the subsequent `copy_count <
+    /// required_copies` and `required_locations > 0 && ...` guards both go
+    /// vacuous), and a negative value is worse: `required_copies` goes
+    /// negative, so `copy_count < required_copies` is false for any
+    /// non-negative `copy_count` and the location guard never even runs.
+    /// The only value that preserves "multiply, never replace, never
+    /// invert" is `>= 1` (`1` is a legitimate "no extra safety margin"
+    /// choice — the ordinary `min_copies`/`required_locations` still
+    /// apply unmultiplied; `0` is not the same thing, it deletes them).
+    /// TOML deserializes this field as an `i32`, so a fractional value
+    /// (e.g. `1.5`) is already refused by `toml::from_str` before this
+    /// method ever runs — not re-validated here.
+    ///
+    /// `utilization_threshold` is compared against a `live_bytes /
+    /// total_bytes` ratio that is always in `[0, 1]`
+    /// (`cli::audit::compaction_findings`,
+    /// `cli::report::report_compaction_candidates`), as `utilization <
+    /// threshold`. `0` or a negative threshold makes that comparison
+    /// always false — no volume is ever flagged, compaction-candidate
+    /// detection is silently disabled — and a threshold above `1.0` makes
+    /// it always true, flagging every written volume regardless of actual
+    /// utilization. The valid range is `(0.0, 1.0]`; `1.0` is a legitimate
+    /// "flag anything with any reclaimable space at all" choice, `0.0` is
+    /// not a legitimate "never flag anything" choice — that is an off
+    /// switch wearing a threshold's clothes, and it is refused by name so
+    /// an operator who wants compaction detection off says so, rather
+    /// than stumbling into silence.
+    fn range_problems(&self, path: &Path) -> Vec<String> {
+        let mut problems = Vec::new();
+        let multiplier = self.compaction.tape_only_safety_multiplier;
+        if multiplier < 1 {
+            problems.push(format!(
+                "{}: compaction.tape_only_safety_multiplier = {multiplier} must be >= 1 \
+                 (it multiplies the tape-only copy/location requirement in \
+                 `snapshot mark-reclaimable`; 0 zeroes that requirement and a negative \
+                 value inverts the comparison that enforces it)",
+                path.display()
+            ));
+        }
+        let threshold = self.compaction.utilization_threshold;
+        if !(threshold > 0.0 && threshold <= 1.0) {
+            problems.push(format!(
+                "{}: compaction.utilization_threshold = {threshold} must be > 0.0 and <= 1.0 \
+                 (it is compared against a live/total byte ratio that never exceeds 1.0; \
+                 0 or negative silently disables compaction-candidate detection)",
+                path.display()
+            ));
+        }
+        problems
+    }
+
+    fn validate_ranges(&self, path: &Path) -> Result<()> {
+        match self.range_problems(path).into_iter().next() {
+            None => Ok(()),
+            Some(msg) => Err(TapectlError::Config(msg)),
+        }
+    }
+
     /// Every semantic problem `Config::load` would reject on an otherwise
     /// structurally-parseable config — [`Config::size_problems`] then
-    /// [`Config::closed_set_problems`], in the same relative order
+    /// [`Config::closed_set_problems`] then [`Config::range_problems`], in the same relative order
     /// `Config::load` checks them in, so the FIRST entry here is always
     /// identical to the error `Config::load` itself would raise.
     ///
@@ -790,6 +860,7 @@ impl Config {
     pub(crate) fn semantic_problems(&self, path: &Path) -> Vec<String> {
         let mut problems = self.size_problems(path);
         problems.extend(self.closed_set_problems(path));
+        problems.extend(self.range_problems(path));
         problems
     }
 
@@ -1947,6 +2018,93 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.logging.tracing_level(), tracing::Level::DEBUG);
         assert_eq!(cfg.logging.format, "json");
+    }
+
+    // ---- issue #215 finding 1: [compaction] range validation ----
+
+    #[test]
+    fn config_load_rejects_a_zero_tape_only_safety_multiplier() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\ntape_only_safety_multiplier = 0\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compaction.tape_only_safety_multiplier"),
+            "{msg}"
+        );
+        assert!(msg.contains(">= 1"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_a_negative_tape_only_safety_multiplier() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\ntape_only_safety_multiplier = -3\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compaction.tape_only_safety_multiplier"),
+            "{msg}"
+        );
+    }
+
+    /// A `toml`-typed `i32` field never lets a fractional value reach our
+    /// own range check at all — `toml::from_str` refuses it first, at
+    /// structural-parse time. Documented here (rather than asserted from
+    /// memory) so the claim in this issue's writeup is backed by an actual
+    /// observed error string.
+    #[test]
+    fn config_load_rejects_a_fractional_tape_only_safety_multiplier_at_toml_parse_time() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\ntape_only_safety_multiplier = 1.5\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        // Not our range-check wording (no ">= 1" phrase) — a structural
+        // TOML/serde type error instead, confirming the value never reaches
+        // `Config::range_problems`.
+        assert!(!msg.contains(">= 1"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_a_zero_utilization_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\nutilization_threshold = 0.0\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("compaction.utilization_threshold"), "{msg}");
+    }
+
+    #[test]
+    fn config_load_rejects_a_negative_utilization_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\nutilization_threshold = -0.1\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("compaction.utilization_threshold"));
+    }
+
+    #[test]
+    fn config_load_rejects_a_utilization_threshold_above_one() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\nutilization_threshold = 1.5\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("compaction.utilization_threshold"));
+    }
+
+    #[test]
+    fn config_load_accepts_the_boundary_values_one_and_one_point_zero() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[compaction]\ntape_only_safety_multiplier = 1\nutilization_threshold = 1.0\n",
+        )
+        .unwrap();
+        Config::load(&path).expect("1 and 1.0 are both legitimate boundary values");
     }
 
     // ---- issue #215 finding 2: [[archive_sets]] closed-set validation ----
