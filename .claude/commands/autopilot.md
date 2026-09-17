@@ -119,6 +119,47 @@ the normative design set named in the Policy block below.
   #187) and restore items (#158, #165) both depend on the identity set, so they
   come after H4.
 
+- **THE QUEUE EMPTIED ON 2026-09-17, THE MANDATED REVIEW RAN, AND IT REFILLED IT.
+  This is the process working, not a setback — read this entry before the one
+  below, which describes the original 42-issue queue.**
+  Master reached `c309509` with **zero open issues under the label, none parked,
+  1425 tests, 0 clippy warnings, mhvtl 26/26, and lifecycle `--all` 338 checks /
+  329 passed / 0 failed** — every criterion rule 4 names.
+  Policy rule 7 then required the adversarial review of the full diff since
+  `5d4cc43` before the CTO's real-drive rehearsal. It ran as a 21-agent
+  workflow: ten dimension finders, an adversarial verifier per dimension told to
+  REFUTE and to default to "not a defect" when unsure, and a completeness critic.
+  Record: `docs/audits/2026-09-17-preproduction-review.md`.
+  **29 confirmed, 33 rejected** — the verifiers killed more than half, which is
+  the ratio to want. Filed as **#206-#226**: 2 high, 9 medium, 10 low.
+  Work them in severity order as usual. **#208 first** (`check_tape_contact`'s
+  identity-MATCHES branch never consults the tape's own seal pointer, so a
+  sealed tape can be overwritten *without* `--force`) — an ADR-0003 violation
+  with a data-loss outcome that **the harness cannot catch**: every ADR-0003
+  scenario drives the identity-MISMATCH branch, so a green `--all` says nothing
+  about it. Its acceptance must include a lifecycle scenario, not just a unit
+  test. Then **#206** (a reverted or reclaimable unit can mint a version
+  byte-identical to one already on tape, breaking the premise per-version copy
+  counting rests on) — labelled high because its severity is UNKNOWN until
+  someone proves reachability, and an unknown in the coverage-misstatement class
+  is triaged early or not at all.
+  **Three lessons about reviewing, worth more than the findings:**
+  1. The dimensions that paid were the ones drawn from what this session kept
+     finding, not from generic categories: operator-facing text naming commands
+     that would be refused, tests pinning defects as correct, and
+     single-derivation discipline. Choose dimensions from your own recent
+     misses.
+  2. **The completeness critic earned its place.** Four subsystems no dimension
+     reached, including `scripts/` — 669 changed lines, the only end-to-end gate
+     for the first write, containing four separate commits that fixed the
+     harness for asserting states it never created, and **nobody reviewed those
+     fixes** (#223). That was my design error: I told reviewers never to RUN
+     anything in `scripts/` and then never assigned anyone to READ it. "Do not
+     execute" and "do not examine" are different instructions.
+  3. A grouped filing pass silently dropped one finding (caught by auditing
+     filed-against-found, #222). Group issues if you like, but reconcile the
+     counts afterwards.
+
 - **THE PRE-PRODUCTION QUEUE — GitHub label `review-2026-09-13`, 42 issues
   (40 filed 2026-09-14; #160 split three ways on 2026-09-15). Nothing ships to a production tape until it is empty, documentation
   included.** The 2026-09-13 adversarial review
