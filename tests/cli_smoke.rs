@@ -1413,3 +1413,268 @@ fn config_check_reports_all_three_problems_from_one_broken_config_at_once() {
         "{parsed}"
     );
 }
+
+// --- issue #228: the startup path's four defects ------------------------
+//
+// Every test here spawns the real binary, because that is the only place
+// `main()`'s pre-subscriber resolution and `run()`'s authoritative one both
+// run. They are named with a common `issue_228_` prefix so the whole group
+// runs in one `cargo test --test cli_smoke issue_228`.
+//
+// All five were confirmed RED against the pre-fix binary before the fix
+// landed; see the issue for the recorded output.
+
+/// Spawn the binary with a fully-scrubbed environment: an inherited
+/// `TAPECTL_HOME` would mask the very rows these tests exercise, and
+/// `current_dir` matters because two of the defects resolve the home
+/// *relative to the working directory*.
+fn spawn_scrubbed(
+    cwd: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tapectl"));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("HOME")
+        .env_remove("TAPECTL_HOME")
+        .env_remove("XDG_CONFIG_HOME");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to spawn tapectl binary")
+}
+
+/// Finding 1. The notice that says "`--config` relocated your home" must not
+/// be suppressible by the config file that caused the relocation.
+///
+/// `logging.level` filtering every other `warn!` is by design (issue #172).
+/// This ONE notice is different: it is about the resolution the file itself
+/// caused, and before issue #172's range it was unconditional. So it is
+/// emitted outside the tracing pipeline, the way
+/// `print_escrow_secret_warning` already is.
+#[test]
+fn issue_228_a_relocated_config_cannot_silence_its_own_relocation_notice() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let cfg = archive.path().join("config.toml");
+
+    let init = spawn_scrubbed(
+        cwd.path(),
+        &["--config", cfg.to_str().unwrap(), "init"],
+        &[("HOME", real_home.path().as_os_str())],
+    );
+    assert!(
+        init.status.success(),
+        "init --config failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // `init` writes a `[logging]` table with `level = "warn"`; flip it in
+    // place (appending a second `[logging]` would be a TOML duplicate-key
+    // error, not a config an operator could actually have).
+    let written = std::fs::read_to_string(&cfg).expect("read init-written config");
+    assert!(
+        written.contains("level = \"warn\""),
+        "init must write logging.level for this test to mean anything; config was:\n{written}"
+    );
+    std::fs::write(
+        &cfg,
+        written.replace("level = \"warn\"", "level = \"error\""),
+    )
+    .expect("rewrite config");
+
+    let out = spawn_scrubbed(
+        cwd.path(),
+        &["--config", cfg.to_str().unwrap(), "config", "show"],
+        &[("HOME", real_home.path().as_os_str())],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "config show failed: stderr={stderr}\nstdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("--home"),
+        "logging.level = \"error\" must not silence the notice that this very config \
+         relocated the home; stderr={stderr:?}"
+    );
+}
+
+/// Finding 2(a). `TAPECTL_HOME=""` is a variable a wrapper forgot to set —
+/// `TAPECTL_HOME=$ARCHIVE_ROOT tapectl init` with `ARCHIVE_ROOT` unset. It
+/// must fall back to `~/.tapectl`, not invent a whole new archive in
+/// whatever directory the process happened to be started in.
+#[test]
+fn issue_228_empty_tapectl_home_falls_back_instead_of_inventing_an_archive_in_cwd() {
+    let real_home = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+
+    let out = spawn_scrubbed(
+        cwd.path(),
+        &["init"],
+        &[
+            ("HOME", real_home.path().as_os_str()),
+            ("TAPECTL_HOME", std::ffi::OsStr::new("")),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "init failed: {stderr}");
+    assert!(
+        !cwd.path().join("tapectl.db").exists(),
+        "an empty TAPECTL_HOME created an archive in the working directory; stderr={stderr}"
+    );
+    assert!(
+        real_home.path().join(".tapectl/tapectl.db").exists(),
+        "an empty TAPECTL_HOME must be treated as unset and fall back to ~/.tapectl; \
+         stderr={stderr}"
+    );
+}
+
+/// Finding 2(b). The same value passed as `--home` is a hard clap error
+/// (`Error::invalid_utf8`). Via the environment it was silently discarded
+/// and the REAL `~/.tapectl` used instead — the flag refuses loudly, the
+/// env var failed silently into the production catalog.
+#[test]
+fn issue_228_non_utf8_tapectl_home_is_refused_not_silently_swapped_for_the_real_home() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let real_home = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let bad = std::ffi::OsStr::from_bytes(b"/nonexistent/tapectl-\xff-archive");
+
+    let out = spawn_scrubbed(
+        cwd.path(),
+        &["init"],
+        &[
+            ("HOME", real_home.path().as_os_str()),
+            ("TAPECTL_HOME", bad),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a non-UTF-8 TAPECTL_HOME must be refused, not ignored; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("TAPECTL_HOME"),
+        "the refusal must name the variable it is refusing; stderr={stderr:?}"
+    );
+    assert!(
+        !real_home.path().join(".tapectl/tapectl.db").exists(),
+        "a non-UTF-8 TAPECTL_HOME silently initialized the REAL home; stderr={stderr}"
+    );
+}
+
+/// Finding 2, same class, `src/config.rs`. With `HOME` unset — cron,
+/// systemd, a container — the default home was `/root/.tapectl`: a guess,
+/// and the wrong archive. Refuse and name the variable instead.
+#[test]
+fn issue_228_unset_home_is_refused_rather_than_guessed_as_root() {
+    let cwd = TempDir::new().expect("tempdir");
+
+    let out = spawn_scrubbed(cwd.path(), &["init"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unset HOME must be refused, not guessed; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("HOME"),
+        "the refusal must name HOME (and suggest --home/TAPECTL_HOME); stderr={stderr:?}"
+    );
+}
+
+/// Finding 2, the lazy half. An unset `HOME` must only be fatal when it is
+/// actually what the home would be derived from — `--home`/`TAPECTL_HOME`
+/// is precisely the cron/systemd invocation the refusal above exists for,
+/// and it must keep working.
+#[test]
+fn issue_228_unset_home_is_fine_when_the_home_is_named_explicitly() {
+    let archive = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+
+    let out = spawn_scrubbed(
+        cwd.path(),
+        &["--home", archive.path().to_str().unwrap(), "init"],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "--home with HOME unset must work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(archive.path().join("tapectl.db").exists());
+
+    let env_run = spawn_scrubbed(
+        cwd.path(),
+        &["--home", archive.path().to_str().unwrap(), "config", "show"],
+        &[],
+    );
+    assert!(
+        env_run.status.success(),
+        "a second command with HOME unset must work too: {}",
+        String::from_utf8_lossy(&env_run.stderr)
+    );
+}
+
+/// Finding 4. `Path::new("config.toml").parent()` is `Some("")`, not
+/// `None`, so the `unwrap_or(".")` guard never fired for the common
+/// bare-relative case and the one message whose entire job is to name the
+/// home rendered it as nothing at all.
+///
+/// The assertion is deliberately format-independent: whatever the notice
+/// looks like, the text after `home=` must start with a real character.
+#[test]
+fn issue_228_a_bare_relative_config_names_a_non_empty_home_in_the_notice() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+
+    let out = spawn_scrubbed(
+        archive.path(),
+        &["--config", "config.toml", "init"],
+        &[("HOME", real_home.path().as_os_str())],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "init failed: {stderr}");
+
+    let after = stderr
+        .split("home=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the relocation notice must name a home; stderr={stderr:?}"));
+    assert!(
+        after.starts_with(|c: char| !c.is_whitespace()),
+        "the notice rendered an EMPTY home for a bare-relative --config; stderr={stderr:?}"
+    );
+
+    // And the derivation itself is unchanged: the home is still the config
+    // file's directory, which for a bare-relative path is the cwd.
+    assert!(
+        archive.path().join("tapectl.db").exists(),
+        "--config must still relocate the home to the config's directory; stderr={stderr}"
+    );
+}
+
+/// Finding 4's knock-on. An empty home string reached `create_dir_all("")`
+/// (a documented no-op) and then `secure_path(Path::new(""), 0o700)`, whose
+/// ENOENT surfaced as a second, entirely confusing warning about
+/// permissions on a path the operator never named.
+#[test]
+fn issue_228_a_bare_relative_config_emits_no_spurious_permissions_warning() {
+    let real_home = TempDir::new().expect("tempdir");
+    let archive = TempDir::new().expect("tempdir");
+
+    let out = spawn_scrubbed(
+        archive.path(),
+        &["--config", "config.toml", "init"],
+        &[("HOME", real_home.path().as_os_str())],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "init failed: {stderr}");
+    assert!(
+        !stderr.contains("could not set restrictive permissions"),
+        "the empty derived home produced a second, confusing warning; stderr={stderr:?}"
+    );
+}

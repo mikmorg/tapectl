@@ -1,4 +1,4 @@
-use tapectl::{cli, config, db, error, signal, tenant};
+use tapectl::{cli, config, db, error, signal, startup, tenant};
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -11,15 +11,42 @@ fn main() {
 
     // Issue #172: peek `[logging]` before installing the subscriber, so
     // `logging.level`/`logging.format` actually govern it instead of only
-    // ever seeing the `--verbose`-driven bootstrap default. This calls
-    // `resolve_paths` a second time (`run` below resolves it again,
+    // ever seeing the `--verbose`-driven bootstrap default. This resolves
+    // the home a second time (`run` below resolves it again,
     // authoritatively) rather than threading paths through — cheap, pure,
-    // and it keeps this peek from having to also reproduce `run`'s
-    // ambiguous-`--config`-without-`--home` warning, which cannot fire yet
-    // anyway: there is no subscriber for it to reach.
-    let (paths, _) = resolve_paths(&cli);
-    let logging = peek_logging_config(&paths);
+    // and now (issue #228) an ordinary library call whose whole input
+    // table is unit-tested in `startup`, which is what makes "the two
+    // resolutions cannot diverge" a checked property rather than an
+    // argument.
+    //
+    // A resolution ERROR is deliberately not reported from here: `run`
+    // resolves again and reports it through the single `exit_with_error`
+    // path below, so there is exactly one place a bad `TAPECTL_HOME` or an
+    // unset `HOME` is explained. Peeking just falls back to the defaults.
+    let resolved = startup::resolve(cli.home.as_deref(), cli.config.as_deref()).ok();
+    let logging = resolved
+        .as_ref()
+        .map(|r| startup::peek_logging_config(&r.paths))
+        .unwrap_or_default();
     init_tracing(cli.verbose, &logging);
+
+    // Issue #228: this ONE notice goes to stderr directly rather than
+    // through `tracing::warn!`. The subscriber's level was just taken from
+    // the very file `--config` named, so `logging.level = "error"` in a
+    // relocated config silenced the message announcing that that same file
+    // had relocated the home — and before issue #172's range the notice was
+    // unconditional. Every OTHER `warn!` staying subject to `logging.level`
+    // is correct and deliberate; this one is about the resolution the
+    // config file itself caused, so it cannot be the config file's to
+    // suppress. `cli::key::print_escrow_secret_warning` is the existing
+    // precedent for a must-be-seen notice bypassing the pipeline.
+    if let Some(home) = resolved
+        .as_ref()
+        .and_then(|r| r.ambiguous_config_home.as_ref())
+    {
+        eprintln!("{}", startup::ambiguous_config_notice(home));
+    }
+
     signal::install_handler();
 
     if let Err(err) = run(cli) {
@@ -79,65 +106,6 @@ fn init_tracing(verbose: bool, logging: &config::LoggingConfig) {
     };
 }
 
-/// Resolve `~/.tapectl` (or wherever `--home`/`--config`/`TAPECTL_HOME`
-/// point) — the precedence `run()` has always used, extracted (issue #172)
-/// so `main()` can peek `[logging]` before a tracing subscriber exists.
-///
-/// The second return value is the ambiguous "`--config` given without
-/// `--home`" warning's subject (the home it derived), for the caller that
-/// actually has a subscriber to emit it through — telling the operator
-/// where `--config` implies `--home` sits **is** this resolution, so the
-/// warning cannot itself wait for `init_tracing` to run first.
-fn resolve_paths(cli: &Cli) -> (TapectlPaths, Option<std::path::PathBuf>) {
-    if let Some(home) = cli
-        .home
-        .clone()
-        .or_else(|| std::env::var("TAPECTL_HOME").ok())
-    {
-        let mut p = TapectlPaths::new(std::path::PathBuf::from(home));
-        if let Some(ref config_path) = cli.config {
-            // Both given: --home selects the archive, --config selects the
-            // file within it. No warning — this combination is unambiguous.
-            p.config_file = std::path::PathBuf::from(config_path);
-        }
-        (p, None)
-    } else if let Some(ref config_path) = cli.config {
-        let config_file = std::path::Path::new(config_path);
-        let home = config_file
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-        (TapectlPaths::new(home.clone()), Some(home))
-    } else {
-        (TapectlPaths::default_paths(), None)
-    }
-}
-
-/// Best-effort peek at `[logging]` before a subscriber exists (issue #172).
-///
-/// Reads just the `logging` table, not the full `Config` — deserializing
-/// the whole file here would mean a stale key ANYWHERE else in it (which
-/// `run()`'s `Config::load` still rejects, loudly, as the one authoritative
-/// parse) also swallows the very `logging.level = "debug"` an operator set
-/// to go diagnose that failure.
-///
-/// Never fails: a missing home, unreadable file, unparseable TOML, absent
-/// `[logging]` table, or a `[logging]` table that itself fails to
-/// deserialize all fall back to `LoggingConfig::default()` silently. That
-/// silence is intentional — this is a convenience for picking the right
-/// verbosity/format, not a second validation pass; the authoritative error
-/// for a genuinely broken config still surfaces once `run()` loads it for
-/// real.
-fn peek_logging_config(paths: &TapectlPaths) -> config::LoggingConfig {
-    std::fs::read_to_string(&paths.config_file)
-        .ok()
-        .and_then(|content| content.parse::<toml::Value>().ok())
-        .and_then(|value| value.get("logging").cloned())
-        .and_then(|logging_value| toml::to_string(&logging_value).ok())
-        .and_then(|logging_str| toml::from_str(&logging_str).ok())
-        .unwrap_or_default()
-}
-
 /// Flush stdout, then exit with `code` if it is non-zero (issue #45/H10).
 /// A code of 0 is a no-op — the healthy/clean path returns normally rather
 /// than calling `process::exit(0)`. The explicit flush guards against
@@ -153,33 +121,27 @@ fn exit_if_nonzero(code: i32) {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    // Resolve paths (issue #109).
-    //
-    // Three inputs, in precedence order: --home, TAPECTL_HOME, then the
-    // legacy "--config relocates everything" behaviour, then the default.
-    //
-    // The legacy behaviour is KEPT rather than removed. `--config` deriving
-    // the whole home from the config file's parent is genuinely surprising —
-    // point it at a config in an unexpected directory and you get an empty
-    // catalog instead of an error — but it is also exactly how every test
-    // harness obtains an isolated home. Removing it would mean a script that
-    // used `--config` for isolation silently starts operating on the REAL
-    // ~/.tapectl, which is far worse than the surprise being fixed. So it
-    // still works, and now says so; `--home` is the explicit way to mean it.
-    //
-    // The precedence itself lives in `resolve_paths` (issue #172), shared
-    // with `main()`'s pre-subscriber `[logging]` peek; this call is what
-    // actually emits the ambiguous-`--config` warning, now that a
-    // subscriber is guaranteed to exist to receive it.
-    let (paths, ambiguous_config_home) = resolve_paths(&cli);
-    if let Some(home) = ambiguous_config_home {
-        tracing::warn!(
-            home = %home.display(),
-            "--config given without --home: the tapectl home (database, keys, \
-             catalogs, receipts) is being taken from the config file's parent \
-             directory. Pass --home to say that explicitly."
-        );
+    // Completions need neither a database nor a resolved home, so they are
+    // dispatched BEFORE the resolution below (issue #228): an unset `HOME`
+    // is now a refusal, and `tapectl completions bash` in the very cron,
+    // systemd or container shell that lacks one must keep working — it
+    // reads nothing and writes nothing but the script.
+    if let Commands::Completions { shell } = cli.command {
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        clap_complete::generate(shell, &mut cmd, "tapectl", &mut std::io::stdout());
+        return Ok(());
     }
+
+    // Resolve paths (issue #109) — `--home`, `TAPECTL_HOME`, the legacy
+    // "`--config` relocates everything" behaviour, then `$HOME/.tapectl`.
+    //
+    // The precedence, the reasons it is shaped that way, and the three
+    // refusals that keep leniency from silently choosing a DIFFERENT
+    // archive all live in `tapectl::startup` (issue #228), together with
+    // the input table as tests. `main()` above ran this same call before
+    // the subscriber existed, to peek `[logging]`, and emitted the
+    // ambiguous-`--config` notice from there.
+    let paths = startup::resolve(cli.home.as_deref(), cli.config.as_deref())?.paths;
 
     // Init is special — it creates everything from scratch
     if let Commands::Init {
@@ -195,13 +157,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             escrow_public_key.as_deref(),
             cli.json,
         );
-    }
-
-    // Completions don't need DB
-    if let Commands::Completions { shell } = cli.command {
-        let mut cmd = <Cli as clap::CommandFactory>::command();
-        clap_complete::generate(shell, &mut cmd, "tapectl", &mut std::io::stdout());
-        return Ok(());
     }
 
     // Everything else requires initialization

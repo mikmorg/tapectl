@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod signal;
+pub mod startup;
 pub mod tenant;
 pub mod unit;
 

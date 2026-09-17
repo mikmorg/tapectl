@@ -49,15 +49,35 @@ pub fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> Result<()>
     Ok(())
 }
 
-/// Default tapectl home directory.
-pub fn default_home() -> PathBuf {
-    dirs_home().join(".tapectl")
+/// The tapectl home implied by a `HOME` value, or `None` when `HOME` names
+/// nothing usable — unset, or set to the empty string.
+///
+/// Pure (issue #228): the environment arrives as a parameter so
+/// [`crate::startup::resolve_from`] can decide the question without reading
+/// `std::env`, which is what makes the whole precedence table unit-testable.
+///
+/// `OsStr`, not `str`, on purpose. The pre-#228 `std::env::var` turned a
+/// non-UTF-8 `HOME` into `Err` and therefore into `/root` — substituting a
+/// different archive for one that is perfectly representable as a
+/// `PathBuf`. Here it is simply used.
+pub fn default_home_from(home_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    home_env
+        .filter(|home| !home.is_empty())
+        .map(|home| Path::new(home).join(".tapectl"))
 }
 
-fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/root"))
+/// Default tapectl home directory, with `/root/.tapectl` as a last resort.
+///
+/// **Not the startup path.** Issue #228: guessing `/root` when `HOME` is
+/// unset silently pointed a cron, systemd or container invocation at an
+/// archive nobody chose, so [`crate::startup::resolve`] refuses instead of
+/// calling this. What remains here is the serde default for
+/// `[staging] directory` ([`default_staging_dir`]), which is a config
+/// *value* — written by `init`, which immediately overwrites it with the
+/// real home — and cannot return a `Result`.
+pub fn default_home() -> PathBuf {
+    let home_env = std::env::var_os("HOME");
+    default_home_from(home_env.as_deref()).unwrap_or_else(|| PathBuf::from("/root/.tapectl"))
 }
 
 /// Root configuration — maps to ~/.tapectl/config.toml.
@@ -1348,6 +1368,12 @@ impl TapectlPaths {
         }
     }
 
+    /// Paths under [`default_home`].
+    ///
+    /// Prefer [`crate::startup::resolve`] for anything on the startup path:
+    /// it honours `--home`/`TAPECTL_HOME`/`--config` and refuses an unset
+    /// `HOME` instead of inheriting this function's `/root` last resort
+    /// (issue #228).
     pub fn default_paths() -> Self {
         Self::new(default_home())
     }
