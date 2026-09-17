@@ -2906,7 +2906,7 @@ pub fn compact_finish(
     // consent, and still with no `force` in scope to defeat it -- including
     // through the `compact` wrapper, which calls this as its step 3 with
     // `*force || yes` and must not be able to buy past the floor with it.
-    crate::cli::operations::refuse_last_eligible_copy(&action, label, &impacts)?;
+    crate::cli::operations::refuse_last_eligible_copy(conn, &action, label, &impacts)?;
 
     // ADR-0008 TIER 2 (issue #147).
     let below_policy = crate::cli::operations::below_policy_facts(conn, config, &impacts)?;

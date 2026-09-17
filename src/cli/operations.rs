@@ -246,7 +246,7 @@ pub fn volume_retire(
     // ADR-0008 TIER 3, the absolute floor (ADR-0012, issue #147). First,
     // and structurally undefeatable -- `refuse_last_eligible_copy` takes no
     // `force`, so `assume_yes` is not even in scope for this decision.
-    if let Err(e) = refuse_last_eligible_copy(&action, label, &impacts) {
+    if let Err(e) = refuse_last_eligible_copy(conn, &action, label, &impacts) {
         if json_output {
             println!(
                 "{}",
@@ -565,7 +565,30 @@ pub(crate) fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<Retir
 /// `impacts` carries no `at_stake` rows at all for a quarantined,
 /// unsealed or already-retired volume, nor for one holding only released
 /// versions.
+/// Whether `unit`'s version `version` still has a stage set with live
+/// slices — i.e. its ciphertext is still sitting in staging.
+///
+/// Routed through [`crate::staging::stage_set_has_live_slices`] rather than
+/// inlining the status list, so this and `stage create`'s own refusal
+/// (`cli::stage.rs`) cannot drift apart; five inlined status lists is how
+/// issue #96 happened.
+fn version_has_live_stage_set(conn: &Connection, unit: &str, version: i64) -> Result<bool> {
+    let statuses: Vec<String> = conn
+        .prepare(
+            "SELECT ss.status FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE u.name = ?1 AND s.version = ?2",
+        )?
+        .query_map(params![unit, version], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(statuses
+        .iter()
+        .any(|st| crate::staging::stage_set_has_live_slices(st)))
+}
+
 pub(crate) fn refuse_last_eligible_copy(
+    conn: &Connection,
     act: &str,
     volume_label: &str,
     impacts: &[RetireImpact],
@@ -620,11 +643,77 @@ pub(crate) fn refuse_last_eligible_copy(
     // in danger. `snapshot create` is deliberately NOT offered as the first
     // step: under ADR-0012 it mints nothing when content is unchanged, so
     // it cannot reproduce a version the operator still has on disk.
-    let restage = doomed
-        .iter()
-        .map(|(unit, version)| format!("    tapectl stage create {unit} --version {version}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    //
+    // Split by whether the version's slices are STILL STAGED, because
+    // `stage create --version` refuses exactly then ("already has a stage
+    // set with live slices"). That is reachable rather than theoretical:
+    // `volume write` leaves every set it writes `staged` and `staging
+    // clean` is the release half, so a version written and never released
+    // is still staged when this refusal fires. A recipe that hands the
+    // operator a command which will be refused is not a recipe.
+    let mut restage_lines: Vec<String> = Vec::new();
+    let mut already_staged: Vec<String> = Vec::new();
+    for (unit, version) in &doomed {
+        if version_has_live_stage_set(conn, unit, *version)? {
+            already_staged.push(format!("unit \"{unit}\" v{version}"));
+        } else {
+            restage_lines.push(format!(
+                "    tapectl stage create {unit} --version {version}"
+            ));
+        }
+    }
+    let restage = restage_lines.join("\n");
+
+    // Three shapes, because the honest instruction differs and a single
+    // hedged paragraph would make the operator work out which half applies
+    // to them mid-incident.
+    let write_tail =
+        "    tapectl volume init <OTHER-LABEL>\n    tapectl volume write <OTHER-LABEL>";
+    let on_disk_branch = match (restage.is_empty(), already_staged.is_empty()) {
+        // Nothing left in staging: re-stage from the source, if it is there.
+        (false, true) => format!(
+            "or, if the content is still on disk, stage it again — one line per version \
+             at stake — and write that:\n{restage}\n{write_tail}\n"
+        ),
+        // Everything is still staged: the bytes are already in staging, so
+        // `stage create` would be refused and re-staging is not the act.
+        (true, false) => format!(
+            "or skip the copy-out entirely — {} still {} slices in staging from the \
+             write that put {} on this volume, so nothing needs re-staging. Write \
+             what is already there:\n{write_tail}\n",
+            already_staged.join(", "),
+            if already_staged.len() == 1 {
+                "has"
+            } else {
+                "have"
+            },
+            if already_staged.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+        ),
+        // Mixed: name which half is which, then one write covers both.
+        (false, false) => format!(
+            "or work from what is already staged plus the rest from disk. {} still {} \
+             slices in staging and {} nothing re-staged. Stage the others:\n{restage}\n\
+             then one write covers both:\n{write_tail}\n",
+            already_staged.join(", "),
+            if already_staged.len() == 1 {
+                "has"
+            } else {
+                "have"
+            },
+            if already_staged.len() == 1 {
+                "needs"
+            } else {
+                "need"
+            },
+        ),
+        // Unreachable: `doomed` is non-empty by the early return above, so
+        // every version landed in one list or the other.
+        (true, true) => String::new(),
+    };
 
     Err(TapectlError::Other(format!(
         "cannot {act}: \"{volume_label}\" holds the LAST eligible copy of {count} \
@@ -640,14 +729,7 @@ pub(crate) fn refuse_last_eligible_copy(
          {copy_out}\n    \
          tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
          tapectl volume write <OTHER-LABEL>\n\
-         or, if the content is still on disk, stage it again — one line per version at \
-         stake — and write that:\n\
-         {restage}\n\
-         (if a line there answers \"already has a stage set with live slices\", that \
-         version is still staged from last time — skip it and go straight to the write \
-         below, which consumes what is already there.)\n    \
-         tapectl volume init <OTHER-LABEL>\n    \
-         tapectl volume write <OTHER-LABEL>\n\
+         {on_disk_branch}\
          \n\
          Or give the version up on purpose — a different statement, with its own command \
          and its own preconditions:\n\
@@ -1006,7 +1088,7 @@ pub fn cartridge_retire(
     // consent, and with no `force` in scope to defeat it. Per volume, so
     // the refusal can name the one whose slices have to be copied off.
     for (vol_label, impacts) in &per_volume {
-        if let Err(e) = refuse_last_eligible_copy(&action, vol_label, impacts) {
+        if let Err(e) = refuse_last_eligible_copy(conn, &action, vol_label, impacts) {
             let reason_text = e.to_string();
             if json_output {
                 println!(
@@ -4011,6 +4093,110 @@ mod tests {
             config
         }
 
+        // ── the Tier-3 recipe must be executable as written (issue #147) ──
+        //
+        // `stage create --version` is REFUSED while that version still has a
+        // stage set with live slices, and `volume write` leaves every set it
+        // writes `staged`. So a recipe that always says "stage it again"
+        // hands the operator a command that fails, in the very common case
+        // where `staging clean` has not run. These pin all three shapes.
+
+        fn set_all_stage_sets(conn: &Connection, status: &str) {
+            conn.execute("UPDATE stage_sets SET status = ?1", params![status])
+                .unwrap();
+        }
+
+        #[test]
+        fn recipe_offers_a_plain_write_when_the_slices_are_still_staged() {
+            let (conn, _) = setup_sealed("L6-STAGED", 0);
+            set_all_stage_sets(&conn, "staged");
+            let err = volume_retire(&conn, &Config::default(), "L6-STAGED", false, false, false)
+                .expect_err("Tier 3 must fire");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("tapectl stage create"),
+                "must not tell the operator to re-stage a version `stage create` will \
+                 refuse: {msg}"
+            );
+            assert!(
+                msg.contains("still") && msg.contains("slices in staging"),
+                "must say the bytes are already staged: {msg}"
+            );
+            assert!(msg.contains("tapectl volume write <OTHER-LABEL>"), "{msg}");
+        }
+
+        #[test]
+        fn recipe_offers_a_restage_when_staging_has_been_released() {
+            let (conn, _) = setup_sealed("L6-CLEANED", 0);
+            set_all_stage_sets(&conn, "cleaned");
+            let err = volume_retire(&conn, &Config::default(), "L6-CLEANED", false, false, false)
+                .expect_err("Tier 3 must fire");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("tapectl stage create"),
+                "with staging released, re-staging IS the instruction: {msg}"
+            );
+            assert!(
+                !msg.contains("slices in staging"),
+                "must not claim bytes are staged when they are not: {msg}"
+            );
+        }
+
+        /// The mixed case is the one a single hedged paragraph got wrong:
+        /// some versions still staged, some not, and the operator has to
+        /// know which is which without working it out mid-incident.
+        #[test]
+        fn recipe_names_both_halves_when_only_some_versions_are_staged() {
+            let (conn, _) = setup_sealed("L6-MIXED", 0);
+            set_all_stage_sets(&conn, "staged");
+            // Add a SECOND unit whose version has no live stage set.
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-two', 'second', 1, 'mtime_size', 1, 'active')",
+                [],
+            )
+            .unwrap();
+            let unit2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src2')",
+                params![unit2],
+            )
+            .unwrap();
+            let snap2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'cleaned', 524288)",
+                params![snap2],
+            )
+            .unwrap();
+            let ss2 = conn.last_insert_rowid();
+            let vol_id: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'L6-MIXED'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss2, snap2, vol_id],
+            )
+            .unwrap();
+
+            let err = volume_retire(&conn, &Config::default(), "L6-MIXED", false, false, false)
+                .expect_err("Tier 3 must fire");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("tapectl stage create second --version 1"),
+                "the released version must get a re-stage line: {msg}"
+            );
+            assert!(
+                !msg.contains("tapectl stage create photos"),
+                "the STAGED version must not get one -- it would be refused: {msg}"
+            );
+            assert!(msg.contains("slices in staging"), "{msg}");
+        }
+
         /// THE headline of issue #147: the last eligible copy of a current
         /// version is refused, full stop.
         #[test]
@@ -4162,6 +4348,15 @@ mod tests {
         #[test]
         fn tier3_refusal_names_the_escapes_and_denies_a_flag() {
             let (conn, _) = setup_sealed("L6-TEXT", 0);
+            // EXPLICIT, not incidental: `setup_sealed` leaves the stage set
+            // `staged`, and a still-staged version deliberately gets a
+            // `volume write` line instead of a `stage create` one -- the
+            // latter would be refused. This test is about the refusal naming
+            // every escape, so it pins the released-staging shape and
+            // `recipe_offers_a_plain_write_when_the_slices_are_still_staged`
+            // pins the other. Before that split this assertion passed by
+            // pinning the very defect it now guards against.
+            set_all_stage_sets(&conn, "cleaned");
             let msg = volume_retire(&conn, &Config::default(), "L6-TEXT", true, false, false)
                 .expect_err("must refuse")
                 .to_string();

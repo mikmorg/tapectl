@@ -2924,7 +2924,15 @@ fn volume_retire_tier3_refuses_the_last_eligible_copy() {
         "unit \"photos\" v3",
         "tapectl volume read-slices --from L6-SOLE --unit photos",
         "tapectl volume init <OTHER-LABEL>",
-        "tapectl stage create photos --version 3",
+        // NOT "tapectl stage create photos --version 3". This fixture staged
+        // and wrote, and `volume write` leaves the set `staged` -- which is
+        // the state a real operator is in when this refusal fires, and the
+        // state where `stage create --version` is REFUSED. The recipe says
+        // so and points at the write instead (issue #147). Asserted
+        // negatively below; all three shapes are pinned as unit tests in
+        // `cli::operations::tests::volume_retire_consent`.
+        "slices in staging",
+        "tapectl volume write <OTHER-LABEL>",
         "tapectl snapshot mark-reclaimable photos --version 3",
         "tapectl volume verify L6-SOLE",
         "no --force for this",
@@ -2934,6 +2942,11 @@ fn volume_retire_tier3_refuses_the_last_eligible_copy() {
             "the operator must be told {needle:?}: {combined}"
         );
     }
+    assert!(
+        !combined.contains("tapectl stage create photos --version 3"),
+        "the recipe must not hand the operator a `stage create` that this very \
+         catalog state would refuse: {combined}"
+    );
 
     // And nothing moved.
     let conn = rusqlite::Connection::open(home.join("tapectl.db")).unwrap();
