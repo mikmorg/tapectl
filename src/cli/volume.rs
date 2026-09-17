@@ -508,6 +508,12 @@ pub fn run(
                             "kind": m.kind.label(),
                             "expected": m.expected,
                             "actual": m.actual,
+                            // Issue #234: per mismatch, which side of
+                            // ADR-0012's line it falls on, so a script can
+                            // tell "this tape is bad" from "this drive
+                            // could not read it" without a kind allow-list
+                            // of its own that would drift.
+                            "proves_medium_bad": m.kind.proves_medium_bad(),
                         })
                     })
                     .collect();
@@ -520,6 +526,21 @@ pub fn run(
                         "passed": report.passed,
                         "failed": report.failed,
                         "mismatches": mismatches,
+                        // Issue #234: `quarantined` is the headline answer;
+                        // `quarantine` carries what the status WAS, because
+                        // a volume that was already quarantined is a
+                        // different fact from one this verify took out of
+                        // service. `null` on a clean verify and on a failed
+                        // one that proved nothing about the medium.
+                        "quarantined": report.quarantine.is_some(),
+                        "quarantine": report.quarantine.as_ref().map(|q| serde_json::json!({
+                            "previous_status": q.previous_status,
+                            "status_changed": q.status_changed(),
+                            "proof": q.proof.iter().map(|m| serde_json::json!({
+                                "position": m.position,
+                                "kind": m.kind.label(),
+                            })).collect::<Vec<_>>(),
+                        })),
                         "drive_health_note": report.drive_health_note,
                     })
                 );
@@ -529,13 +550,56 @@ pub fn run(
                     report.checked, report.passed, report.failed,
                 );
                 for m in &report.mismatches {
+                    // Issue #234: the classification, per line. Without it
+                    // the operator has to know which of six kind names is
+                    // quarantine-grade to read the summary below.
+                    let verdict = if m.kind.proves_medium_bad() {
+                        "proves the medium is bad"
+                    } else {
+                        "not medium evidence"
+                    };
                     println!(
-                        "    position {}: {} — expected {}, found {}",
+                        "    position {}: {} ({verdict}) — expected {}, found {}",
                         m.position,
                         m.kind.label(),
                         m.expected,
                         m.actual
                     );
+                }
+                // Issue #234 / ADR-0012's 2026-09-17 amendment: the
+                // distinction must be visible. A clean verify says nothing
+                // new; a failure always says which of the two it was.
+                match (&report.quarantine, report.failed) {
+                    (Some(q), _) => {
+                        if q.status_changed() {
+                            println!(
+                                "volume \"{label}\" QUARANTINED (was {}): {} of {} failure(s) \
+                                 prove the medium is bad. It no longer counts as a copy, so \
+                                 `volume retire` will no longer refuse it as the last one — \
+                                 copy what you still can off other tapes first.",
+                                q.previous_status,
+                                q.proof.len(),
+                                report.failed,
+                            );
+                        } else {
+                            println!(
+                                "volume \"{label}\" was ALREADY quarantined; this verify \
+                                 confirms it — {} of {} failure(s) prove the medium is bad.",
+                                q.proof.len(),
+                                report.failed,
+                            );
+                        }
+                    }
+                    (None, failed) if failed > 0 => {
+                        println!(
+                            "volume \"{label}\" NOT quarantined: no failure here proves the \
+                             medium is bad — these are read or transport failures, and \"we \
+                             could not read it today\" is not \"the bytes are gone\". The \
+                             volume's status is unchanged. Check the drive (cleaning, block \
+                             size, cabling, the right tape loaded) and verify again."
+                        );
+                    }
+                    (None, _) => {}
                 }
                 // Issue #187: said out loud, not silently omitted.
                 if let Some(note) = &report.drive_health_note {
@@ -1229,6 +1293,17 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
 /// confirms every checked slice or it finds real corruption, so the
 /// result is binary — clean or violation — unlike `fsck`, which can also
 /// report a repaired-but-notable finding.
+///
+/// **Issue #234 deliberately does NOT change this.** A verify now has two
+/// distinguishable failure outcomes — one that quarantined the volume and
+/// one that did not — and neither changes the answer to the question this
+/// function asks. A read or transport failure is still a failure, so
+/// dropping it to `EXIT_SUCCESS` would resurrect issue #45/H10 exactly (a
+/// cron-scheduled integrity check that finds nothing readable and reports
+/// success); and giving a quarantine a third code would invent a CLI
+/// contract nobody asked for, when the distinction is already carried where
+/// the amendment requires it — in the printed summary and in `--json`'s
+/// `quarantined` / `quarantine` fields.
 fn verify_exit_code(report: &write::VerifyReport) -> i32 {
     if report.failed > 0 {
         crate::error::EXIT_ERROR
