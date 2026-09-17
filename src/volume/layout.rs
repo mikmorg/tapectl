@@ -365,6 +365,27 @@ padding can be defeated without knowing the exact size:
 /// reaches arithmetic, `fsf`, or `seq` (S2 hardening, carried over from v1).
 /// Tools used: mt, dd, age, dar, sha256sum, head, truncate, plus standard
 /// coreutils (awk/sed/grep/tr) — no TOML collection, per the grammar contract.
+/// **CARRIED FIX — issue #218, CTO ruling 2026-09-17.** The decrypted-slice
+/// progress line inside the template below reads
+/// `info "  decrypted ($((bytes / 1048576)) MB)"`. That labels a
+/// 1048576-divided figure `MB`, and ADR-0012 requires capacities decimal,
+/// data sizes binary, **the two named apart** — so it should read `MiB`.
+/// #204 fixed this class across ~40 CLI sites and deliberately left this one,
+/// because RESTORE.sh is on-tape content pinned by `RESTORE_SH_SHA256` in
+/// `tests/on_tape_golden.rs`, and a byte change there is a CTO decision.
+///
+/// **Ruled: batch it.** Do not spend a deliberate on-tape byte change and a
+/// golden re-pin on a cosmetic label alone — every re-pin trains the habit of
+/// re-pinning, and the next one might carry a real format change with it.
+///
+/// So: **if you are already changing this script for a substantive reason and
+/// re-pinning anyway, change that `MB` to `MiB` while you are here.** That is
+/// the entire fix.
+///
+/// This note lives on the FUNCTION, not inside the template: a comment added
+/// within the string becomes shell comment lines in the generated script and
+/// changes its hash. I did exactly that first, and the golden test caught it —
+/// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_PARSE_FILE_LIST,
