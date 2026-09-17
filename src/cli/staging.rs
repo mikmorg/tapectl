@@ -423,9 +423,13 @@ mod tests {
             false,
         );
 
+        let err = result.expect_err(
+            "staging clean must refuse when a unit is below its policy's min_copies",
+        );
+        let msg = err.to_string();
         assert!(
-            result.is_err(),
-            "staging clean must refuse when a unit is below its policy's min_copies"
+            msg.contains("testlib/alpha: 1/2 copies") && msg.contains("--force"),
+            "refusal must name the unit's N/M copies and --force as the override: {msg}"
         );
 
         let status: String = conn
