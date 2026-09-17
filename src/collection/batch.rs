@@ -38,6 +38,12 @@ pub struct CopyProgress {
 /// Outcome of executing one batch.
 #[derive(Debug)]
 pub struct BatchExecutionReport {
+    /// How many units in the batch actually had `stage_create` called for
+    /// them this run — NOT `batch.units.len()` (issue #232 item 2): a unit
+    /// already staged for this exact content, or one whose on-disk state
+    /// reverted back to the live version between plan and run, is a
+    /// deliberate no-op in the loop above and must not be counted as
+    /// "staged" here.
     pub units_staged: usize,
     pub copies_written: usize,
     /// `Some` when staging was released this call (every unit in the batch
@@ -126,17 +132,25 @@ pub fn execute_batch(
     // different for staging: explicit arms rather than one blanket
     // "skip if unchanged", which would silently stop staging a snapshot
     // that was created but never staged.
+    // Issue #232 item 2: two arms below are deliberate no-ops (already
+    // staged; reverted back to current) — `batch.units.len()` counts the
+    // whole batch regardless, so a batch of 40 where 3 hit either no-op
+    // still reported "40 unit(s) staged". Count only the arms that actually
+    // call `stage_create`, and report that instead.
+    let mut units_staged = 0usize;
     for u in &batch.units {
         let outcome = crate::staging::snapshot_create_detailed(conn, &u.name, config)?;
         match (outcome.minted, outcome.status.as_str()) {
             // A fresh version was minted — always needs staging.
             (true, _) => {
                 crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+                units_staged += 1;
             }
             // Existing but never-staged content (ADR-0012 reuse, Change 3)
             // — the row already exists, but its slices don't yet.
             (false, "created") => {
                 crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+                units_staged += 1;
             }
             // Already staged: a stage_set with live slices exists for this
             // exact content (`stage_set_has_live_slices`) — re-staging
@@ -166,6 +180,7 @@ pub fn execute_batch(
                     "unminted snapshot with an unexpected status — staging anyway"
                 );
                 crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+                units_staged += 1;
             }
         }
     }
@@ -195,7 +210,7 @@ pub fn execute_batch(
     };
 
     Ok(BatchExecutionReport {
-        units_staged: batch.units.len(),
+        units_staged,
         copies_written: copy_labels.len(),
         cleaned,
         under_copied,
