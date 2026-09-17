@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::Config;
 use crate::db::models::Unit;
@@ -415,6 +415,218 @@ fn collect_findings(
     Ok((violations, warnings))
 }
 
+// ── Action-plan remedies that actually run (issue #209) ──
+//
+// `check_copy_count`, `check_location_presence`, `check_escrow_coverage`,
+// `check_encryption` and `check_no_archive` used to hand the operator a
+// fixed string built on a pre-ADR-0012 assumption: that a bare
+// `tapectl stage create <unit>` (no `--version`) always has something to
+// stage. It does not — `cli/stage.rs`'s no-`--version` arm selects only a
+// `status = 'created'` snapshot, and `session.rs` flips a snapshot's
+// status to `'current'` the moment a write of it seals (never back). Once
+// that has happened once, the ONLY way a bare `stage create` finds a
+// `'created'` row again is for `snapshot create` to mint a fresh one — and
+// ADR-0012 makes `snapshot create` mint nothing when the walk matches the
+// existing content. An unchanged unit whose stage set has since been
+// released (`staging clean`) then cycles between two commands that each
+// report success and change nothing, exactly as issue #209 (and its
+// precedent, `operations::refuse_last_eligible_copy`, issue #147)
+// describes.
+//
+// The remedies below read the unit's actual current-snapshot state and
+// name whichever command that state will actually accept:
+//   - a stage set still holds live slices (`staging`/`staged`) -> nothing
+//     needs restaging, just write what is already there;
+//   - the content is fine but staging was released -> `volume
+//     read-slices` pulls the identical ciphertext back without touching
+//     the source (`copy_count`/`location_presence`: another copy of
+//     already-good bytes is all that is needed);
+//   - the content itself must change (unencrypted, or encrypted to a
+//     recipient list `escrow_coverage`/`encryption` flag) -> `read-slices`
+//     is never offered, because it reproduces the exact bytes the finding
+//     says are wrong; only a genuine `stage create <unit> --version <n>`
+//     (which re-runs dar against the unit's source path) produces new
+//     ciphertext, preceded by `staging clean` when a live stage set would
+//     otherwise block it (`cli/stage.rs`'s re-stage arm refuses while any
+//     live slices exist for that version).
+// A genuine re-stage needs the source on disk, so it is only offered for
+// an `active` unit; `tape_only`/`missing` units (whose source is gone by
+// definition) get an honest "cannot be re-staged" line instead of a
+// command that would fail.
+
+/// A unit's CURRENT-snapshot version numbers, each paired with whether
+/// ANY of its stage sets still has live slices
+/// ([`crate::staging::stage_set_has_live_slices`]). Grouped by version
+/// rather than by stage-set row because #153 permits more than one
+/// `'current'` snapshot per unit at once, and each is a distinct thing an
+/// action string must address.
+fn current_versions_live(conn: &Connection, unit_id: i64) -> Result<Vec<(i64, bool)>> {
+    let rows: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT s.version, ss.status FROM snapshots s
+             JOIN stage_sets ss ON ss.snapshot_id = s.id
+             WHERE s.unit_id = ?1 AND s.status = 'current'",
+        )?
+        .query_map(params![unit_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut live_by_version: std::collections::BTreeMap<i64, bool> = Default::default();
+    for (version, status) in rows {
+        let entry = live_by_version.entry(version).or_insert(false);
+        *entry = *entry || crate::staging::stage_set_has_live_slices(&status);
+    }
+    Ok(live_by_version.into_iter().collect())
+}
+
+/// An in-service ([`policy::coverage::in_service`]) volume already holding
+/// a completed write of `unit_id`'s snapshot `version`, if any — the
+/// source `volume read-slices --from` can pull the identical ciphertext
+/// back from without touching the unit's source directory.
+fn in_service_copy_of_version(
+    conn: &Connection,
+    unit_id: i64,
+    version: i64,
+) -> Result<Option<String>> {
+    conn.query_row(
+        &format!(
+            "SELECT v.label FROM writes w
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE s.unit_id = ?1 AND s.version = ?2 AND w.status = 'completed' AND {}
+             ORDER BY w.id DESC LIMIT 1",
+            policy::coverage::in_service("v")
+        ),
+        params![unit_id, version],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The remedy for "this unit needs another copy of its CURRENT-snapshot
+/// content" — `copy_count` and `location_presence`. The content itself is
+/// not in question, so a live stage set can be written as-is and a
+/// released one can be pulled back byte-for-byte with `read-slices`.
+/// `extra` is appended verbatim to the final write command (e.g.
+/// `location_presence`'s "(at missing location)" reminder).
+fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result<String> {
+    let versions = current_versions_live(conn, unit.id)?;
+    if versions.is_empty() {
+        // No current snapshot at all: this is `no_archive`'s territory
+        // (which may also be firing alongside this one), but a defensive
+        // fallback still needs a command that works. Nothing to
+        // distinguish from "the first copy" here, hence `<LABEL>` rather
+        // than `<OTHER-LABEL>`.
+        return Ok(format!(
+            "tapectl snapshot create {0} && tapectl stage create {0} && \
+             tapectl volume init <LABEL> && tapectl volume write <LABEL>{extra}",
+            unit.name
+        ));
+    }
+
+    let mut steps: Vec<String> = Vec::new();
+    let mut stuck: Vec<i64> = Vec::new();
+    let mut any_ready = false;
+
+    for (version, live) in &versions {
+        if *live {
+            any_ready = true;
+            continue;
+        }
+        match in_service_copy_of_version(conn, unit.id, *version)? {
+            Some(label) => {
+                steps.push(format!(
+                    "tapectl volume read-slices --from {label} --unit {}",
+                    unit.name
+                ));
+                any_ready = true;
+            }
+            None if unit.status == "active" => {
+                steps.push(format!(
+                    "tapectl stage create {} --version {version}",
+                    unit.name
+                ));
+                any_ready = true;
+            }
+            None => stuck.push(*version),
+        }
+    }
+
+    if !any_ready {
+        let vs = stuck
+            .iter()
+            .map(|v| format!("v{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(format!(
+            "no recoverable copy of {vs} was found in staging or on any in-service volume, \
+             and unit \"{}\" is not active — investigate with `tapectl catalog locate {}`",
+            unit.name, unit.name
+        ));
+    }
+
+    steps.push("tapectl volume init <OTHER-LABEL>".to_string());
+    steps.push(format!("tapectl volume write <OTHER-LABEL>{extra}"));
+    let mut action = steps.join(" && ");
+
+    if !stuck.is_empty() {
+        let vs = stuck
+            .iter()
+            .map(|v| format!("v{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        action.push_str(&format!(
+            " (this does not cover {vs}, which has no recoverable copy and cannot be \
+             re-staged because unit \"{}\" is not active)",
+            unit.name
+        ));
+    }
+    Ok(action)
+}
+
+/// The remedy for "this unit's CURRENT-snapshot content at version
+/// `versions` must be re-encrypted" — `escrow_coverage` (one gapped
+/// volume, one version) and `encryption` (every current version still
+/// carrying an unencrypted stage set). Never offers `read-slices`: it
+/// would reproduce the exact ciphertext/recipient list the finding says
+/// is wrong. `tapectl staging clean` is prefixed, un-scoped, exactly once
+/// when any named version still has live slices blocking a re-stage —
+/// every stage set that can reach this function already has a completed
+/// write (that is how the finding fired), so a bare `staging clean` (no
+/// `--force`) is guaranteed to reclaim it.
+fn restage_action(conn: &Connection, unit: &Unit, versions: &[i64], extra: &str) -> Result<String> {
+    if unit.status != "active" {
+        let vs = versions
+            .iter()
+            .map(|v| format!("v{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(format!(
+            "unit \"{}\" is not active, so {vs} cannot be re-staged from source — \
+             investigate with `tapectl catalog locate {}`",
+            unit.name, unit.name
+        ));
+    }
+
+    let live_by_version: std::collections::HashMap<i64, bool> =
+        current_versions_live(conn, unit.id)?.into_iter().collect();
+    let any_live = versions
+        .iter()
+        .any(|v| live_by_version.get(v).copied().unwrap_or(false));
+
+    let mut steps: Vec<String> = Vec::new();
+    if any_live {
+        steps.push("tapectl staging clean".to_string());
+    }
+    for v in versions {
+        steps.push(format!("tapectl stage create {} --version {v}", unit.name));
+    }
+    steps.push("tapectl volume init <OTHER-LABEL>".to_string());
+    steps.push(format!("tapectl volume write <OTHER-LABEL>{extra}"));
+    Ok(steps.join(" && "))
+}
+
 // Check copy count. Routes through the same ADR-0004 eligibility predicate
 // (issue #89) the gates use, so `audit` and `unit
 // mark-tape-only`/`snapshot mark-reclaimable` can never disagree about how
@@ -433,10 +645,7 @@ fn check_copy_count(
             unit: unit.name.clone(),
             check: "copy_count".into(),
             message: format!("has {copy_count} copies, needs {}", resolved.min_copies),
-            action: format!(
-                "tapectl stage create {} && tapectl volume write <LABEL>",
-                unit.name
-            ),
+            action: additional_copy_action(ctx.conn, unit, "")?,
         });
     }
     Ok(f)
@@ -494,7 +703,7 @@ fn check_location_presence(
                     "in {location_count} locations, needs {needed} ({:?})",
                     resolved.required_locations
                 ),
-                action: "tapectl volume write <LABEL> (at missing location)".to_string(),
+                action: additional_copy_action(ctx.conn, unit, " (at missing location)")?,
             });
         }
     }
@@ -599,6 +808,18 @@ fn check_escrow_coverage(
             };
 
             if let Some(reason) = reason {
+                // Issue #209: this stage set is already written and
+                // already has a completed write, so its `snapshot_id`
+                // resolves to a real version whether or not that
+                // snapshot's status has since moved past `'created'`.
+                let version: i64 = ctx.conn.query_row(
+                    "SELECT s.version FROM stage_sets ss
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     WHERE ss.id = ?1",
+                    params![stage_set_id],
+                    |row| row.get(0),
+                )?;
+                let action = restage_action(ctx.conn, unit, &[version], "")?;
                 f.warnings.push(AuditFinding {
                     unit: unit.name.clone(),
                     check: "escrow_coverage".into(),
@@ -609,8 +830,7 @@ fn check_escrow_coverage(
                     action: format!(
                         "re-stage and rewrite this unit to a new volume, or accept \
                          that {label} is recoverable only by its original recipients: \
-                         tapectl stage create {} && tapectl volume write <LABEL>",
-                        unit.name
+                         {action}"
                     ),
                 });
             }
@@ -641,19 +861,91 @@ fn check_no_archive(
             unit: unit.name.clone(),
             check: "no_archive".into(),
             message: "no current snapshot or tape copies".into(),
-            action: format!(
-                "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
-                unit.name, unit.name
-            ),
+            action: no_archive_action(ctx.conn, unit)?,
         });
     }
     Ok(f)
+}
+
+/// The remedy for `no_archive` (issue #209). `!has_current` (this check's
+/// own gate) rules out `'current'` as the unit's latest snapshot status —
+/// `session.rs` only sets it at seal, i.e. once a completed write exists,
+/// which would make `copy_count` at least 1 — so the only statuses left
+/// to branch on are `'created'`, a dead status (`'superseded'`,
+/// `'reclaimable'`, `'purged'`, `'failed'`), no snapshot at all, or
+/// `'staged'`:
+///   - no snapshot / `'created'` / dead: the pre-existing chain already
+///     works. `snapshot create` either mints the unit's first version or
+///     (ADR-0012's dead-row arm) mints fresh despite unchanged content, so
+///     a `'created'` row always exists afterward for the bare `stage
+///     create` to find.
+///   - `'staged'`: this is the one `#209` names — `snapshot create` is a
+///     guaranteed no-op (ADR-0012's `"staged"` short-circuit arm reuses
+///     this row rather than minting) and a bare `stage create` finds no
+///     `'created'` row to select. If the stage set is still live, nothing
+///     needs staging at all — just write it. If it was force-cleaned
+///     before ever being written (the only way a `'staged'` snapshot can
+///     have no live stage set, since reaching `'current'` requires a
+///     completed write), a genuine re-stage is needed, gated on `active`
+///     for the same reason [`restage_action`] gates on it.
+fn no_archive_action(conn: &Connection, unit: &Unit) -> Result<String> {
+    let default_chain = || {
+        format!(
+            "tapectl snapshot create {0} && tapectl stage create {0} && \
+             tapectl volume init <LABEL> && tapectl volume write <LABEL>",
+            unit.name
+        )
+    };
+
+    let Some((snapshot_id, version, status)) =
+        crate::unit::content_match::latest_snapshot(conn, unit.id)?
+    else {
+        return Ok(default_chain());
+    };
+
+    if status != "staged" {
+        return Ok(default_chain());
+    }
+
+    let live: bool = {
+        let statuses: Vec<String> = conn
+            .prepare("SELECT status FROM stage_sets WHERE snapshot_id = ?1")?
+            .query_map(params![snapshot_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        statuses
+            .iter()
+            .any(|s| crate::staging::stage_set_has_live_slices(s))
+    };
+
+    if live {
+        return Ok("tapectl volume init <LABEL> && tapectl volume write <LABEL>".to_string());
+    }
+
+    if unit.status == "active" {
+        Ok(format!(
+            "tapectl stage create {} --version {version} && tapectl volume init <LABEL> && \
+             tapectl volume write <LABEL>",
+            unit.name
+        ))
+    } else {
+        Ok(format!(
+            "unit \"{}\" is not active, so v{version} cannot be re-staged from source — \
+             investigate with `tapectl catalog locate {}`",
+            unit.name, unit.name
+        ))
+    }
 }
 
 // Check dirty status (design §2.20). MUST NOT fire for `PendingReason::New`
 // — a never-archived unit is already reported by `no_archive` above, and
 // firing both would double-report the same condition (`dirty_rows`'s "new"
 // state, distinct from "dirty", exists for exactly this reason).
+//
+// The action chain below is NOT an instance of issue #209, unlike its
+// neighbours: `state == "dirty"` means the walk DIFFERS from the latest
+// snapshot, so `snapshot create` always mints a fresh `'created'` row here
+// (ADR-0012 only short-circuits on a match) and the bare `stage create`
+// that follows always finds it.
 fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> Result<Findings> {
     let mut f = Findings::default();
     if let Some(row) = ctx.dirty_rows.iter().find(|r| r.name == unit.name) {
@@ -720,16 +1012,34 @@ fn check_encryption(
         };
 
         if unencrypted_count > 0 {
+            // Issue #209: name the actual affected version(s) rather than
+            // a bare `stage create <unit>`, which finds nothing once the
+            // current snapshot's status has moved past `'created'` (see
+            // `restage_action`'s doc comment).
+            let versions: Vec<i64> = {
+                let sql = format!(
+                    "SELECT DISTINCT s.version
+                     FROM writes w
+                     JOIN stage_sets ss ON ss.id = w.stage_set_id
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     JOIN volumes v ON v.id = w.volume_id
+                     WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+                       AND ss.encrypted = 0 AND {}
+                     ORDER BY s.version",
+                    policy::coverage::in_service("v")
+                );
+                ctx.conn
+                    .prepare(&sql)?
+                    .query_map(params![unit.id], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
             f.violations.push(AuditFinding {
                 unit: unit.name.clone(),
                 check: "encryption".into(),
                 message: format!(
                     "{unencrypted_count} unencrypted stage set(s) on tape, policy requires encryption"
                 ),
-                action: format!(
-                    "tapectl stage create {} && tapectl volume write <LABEL>",
-                    unit.name
-                ),
+                action: restage_action(ctx.conn, unit, &versions, "")?,
             });
         }
     }
@@ -1140,6 +1450,67 @@ mod tests {
         (conn, unit_id)
     }
 
+    /// tenant + unit `unit_name` + one `'current'` v1 snapshot + one
+    /// stage_set at `stage_status` + ONE sealed volume
+    /// (`{label_prefix}-SEALED`) with a completed write of it. Issue
+    /// #209: `stage_status` is exactly the axis `additional_copy_action`
+    /// branches on (`staging`/`staged` = live, everything else =
+    /// released), and `label_prefix`/`unit_name` are independent
+    /// parameters (unlike [`setup_unit_with_two_volumes`], where they are
+    /// the same string) so more than one of these fixtures can coexist in
+    /// one in-memory database without colliding on a volume label.
+    fn setup_unit_with_one_stage_set(
+        label_prefix: &str,
+        unit_name: &str,
+        stage_status: &str,
+    ) -> (Connection, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+            params![format!("uuid-{unit_name}"), unit_name, tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, ?2, 524288)",
+            params![snap_id, stage_status],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+
+        conn.execute(
+            &format!(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('{label_prefix}-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')"
+            ),
+            [],
+        )
+        .unwrap();
+        let vol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, vol_id],
+        )
+        .unwrap();
+
+        (conn, unit_id)
+    }
+
     /// Issue #138 — the measurement that found it, verbatim. The same
     /// one-copy unit MUST keep reporting `copy_count` after it is marked
     /// `tape_only` (the source is deleted; the tape is all there is) or
@@ -1247,6 +1618,65 @@ mod tests {
         let (conn, unit_id) = setup_unit_with_two_volumes("audit-both-sealed", "sealed");
         let count = copy_count_for_unit(&conn, unit_id).unwrap();
         assert_eq!(count, 2, "two sealed volumes must both count");
+    }
+
+    /// Issue #209's exact failure scenario: unit `photos` v1 written to one
+    /// sealed volume, staging released (`stage_sets.status = 'cleaned'`),
+    /// `min_copies = 2` (the `Config::default()`). The old action,
+    /// `tapectl stage create photos && tapectl volume write <LABEL>`, is
+    /// refused by the first half and a no-op from the second — see the
+    /// issue's "Failure scenario". The corrected action must pull the
+    /// already-written, byte-identical ciphertext back with `read-slices`
+    /// rather than re-stage from source (which the content does not need)
+    /// or hand back a `stage create` this exact state refuses.
+    #[test]
+    fn copy_count_action_reads_slices_back_when_staging_was_released() {
+        let (conn, unit_id) = setup_unit_with_one_stage_set("photos-cleaned", "photos", "cleaned");
+        let (violations, _warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        let finding = violations
+            .iter()
+            .find(|f| f.check == "copy_count" && f.unit == "photos")
+            .expect("one sealed copy against min_copies=2 must violate copy_count");
+
+        assert_eq!(
+            finding.action,
+            "tapectl volume read-slices --from photos-cleaned-SEALED --unit photos && \
+             tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>",
+            "got: {}",
+            finding.action
+        );
+        assert!(
+            !finding.action.contains("stage create photos &&"),
+            "must not hand back a bare `stage create` this catalog state refuses \
+             (no `status = 'created'` snapshot exists once sealed): {}",
+            finding.action
+        );
+        let _ = unit_id;
+    }
+
+    /// The sibling of the test above: the SAME shortfall, but the stage
+    /// set was never cleaned after the write that produced it (`volume
+    /// write` leaves the row `staged`, matching the state
+    /// `operations::refuse_last_eligible_copy`'s own "already staged"
+    /// branch documents). Nothing needs restaging or reading back — the
+    /// bytes are already sitting in staging, so the remedy is just another
+    /// write.
+    #[test]
+    fn copy_count_action_writes_directly_when_slices_are_still_staged() {
+        let (conn, unit_id) = setup_unit_with_one_stage_set("photos-staged", "photos2", "staged");
+        let (violations, _warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        let finding = violations
+            .iter()
+            .find(|f| f.check == "copy_count" && f.unit == "photos2")
+            .expect("one sealed copy against min_copies=2 must violate copy_count");
+
+        assert_eq!(
+            finding.action,
+            "tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>",
+            "got: {}",
+            finding.action
+        );
+        let _ = unit_id;
     }
 
     #[test]
@@ -2055,6 +2485,172 @@ mod tests {
             );
             assert_eq!(warnings[0].check, "no_archive");
         }
+    }
+
+    /// Issue #209: a `'staged'` (never written) v1 whose stage set is
+    /// STILL LIVE. `snapshot create` is a guaranteed no-op here and a bare
+    /// `stage create` finds no `'created'` row — but nothing needs
+    /// staging in the first place, so the corrected action skips straight
+    /// to writing what is already there.
+    #[test]
+    fn no_archive_action_writes_directly_when_a_staged_version_is_still_live() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'gallery', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'staged', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+
+        let unit = crate::db::queries::get_unit_by_name(&conn, "gallery")
+            .unwrap()
+            .unwrap();
+        let action = no_archive_action(&conn, &unit).unwrap();
+        assert_eq!(
+            action,
+            "tapectl volume init <LABEL> && tapectl volume write <LABEL>"
+        );
+    }
+
+    /// The sibling case: the `'staged'` v1's stage set was force-cleaned
+    /// (`staging clean --force`) before ever being written — the only way
+    /// a `'staged'` snapshot can end up with no live stage set, since
+    /// reaching `'current'` requires a completed write. A genuine
+    /// re-stage is the only path left, and it names the version
+    /// explicitly rather than relying on a bare `stage create` that would
+    /// find nothing.
+    #[test]
+    fn no_archive_action_restages_when_a_staged_version_was_force_cleaned() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'gallery2', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'staged', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+
+        let unit = crate::db::queries::get_unit_by_name(&conn, "gallery2")
+            .unwrap()
+            .unwrap();
+        let action = no_archive_action(&conn, &unit).unwrap();
+        assert_eq!(
+            action,
+            "tapectl stage create gallery2 --version 1 && tapectl volume init <LABEL> && \
+             tapectl volume write <LABEL>"
+        );
+    }
+
+    /// `escrow_coverage`/`encryption`'s shared remedy (`restage_action`,
+    /// issue #209): the flagged stage set is still LIVE (`staged`), so a
+    /// version-scoped re-stage would be refused
+    /// (`cli/stage.rs`'s live-slices gate) until it is released — and a
+    /// bare, un-scoped `tapectl staging clean` is guaranteed to release it
+    /// because it already carries a completed write.
+    #[test]
+    fn restage_action_cleans_before_restaging_a_still_live_version() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'reels', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        // Still `staged` -- a completed write does not by itself release
+        // staging (that is `staging clean`'s job), so this is the
+        // ordinary post-write state, not a contrived one.
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
+             VALUES (?1, 'staged', 524288, 0)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('REELS-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let vol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, vol_id],
+        )
+        .unwrap();
+
+        let unit = crate::db::queries::get_unit_by_name(&conn, "reels")
+            .unwrap()
+            .unwrap();
+        let action = restage_action(&conn, &unit, &[1], "").unwrap();
+        assert_eq!(
+            action,
+            "tapectl staging clean && tapectl stage create reels --version 1 && \
+             tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>"
+        );
+
+        // Full path: `check_encryption` fires on exactly this fixture
+        // (encrypted = 0, policy requires encryption) and must emit the
+        // same corrected action -- not the pre-#209
+        // `tapectl stage create reels && tapectl volume write <LABEL>`.
+        let (violations, _warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        let finding = violations
+            .iter()
+            .find(|f| f.check == "encryption" && f.unit == "reels")
+            .expect("an unencrypted stage set with policy.encrypt=true must violate");
+        assert_eq!(finding.action, action);
     }
 
     // ── output contract (issue #56) ──
