@@ -3732,7 +3732,18 @@ run_scenario() { # run_scenario <name>
     if [ "$DRY_RUN" != 1 ]; then
         mkdir -p "$HOME_DIR" "$SRC"
     fi
-    echo "=== ${DRY_RUN:+PLAN: }scenario $name ==="
+    # `[ "$DRY_RUN" = 1 ]`, not `${DRY_RUN:+...}` (issue #246). The parameter
+    # expansion tests whether DRY_RUN is set and NON-EMPTY, and a real run sets
+    # it to "0" — non-empty — so the "PLAN: " prefix was emitted on every run
+    # and never distinguished the two modes it exists to distinguish. Purely
+    # cosmetic (no check, exit code or report line reads it), but `--dry-run`'s
+    # contract is that its ordered trace IS the real execution order, so a
+    # transcript of a real run read as a plan that was never executed.
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "=== PLAN: scenario $name ==="
+    else
+        echo "=== scenario $name ==="
+    fi
     "$fn"
 }
 
