@@ -1671,7 +1671,47 @@ tor_purge_v1_photos() {
     TCTL snapshot purge --version 1 photos
 }
 
-tor_staging_clean() { TCTL staging clean; }
+# `staging clean` at this point in the scenario is the ADR-0012 refusal, not
+# housekeeping — and asserting both halves is worth more than adding --force
+# and moving on.
+#
+# `solo` has exactly ONE completed copy against this suite's min_copies = 2 (the
+# check immediately above, tor.mark_tape_only_solo_refused, asserts that very
+# fact). Issue #244's ruling makes a bare `staging clean` REFUSE that, naming
+# the under-copied unit, because releasing here destroys the only cheap route
+# to the second copy the operator's own policy requires. `--force` is the
+# documented override and the scenario genuinely means it: it is done with
+# these staged bytes.
+#
+# Flagged before it could turn the gate red, by the #244 worker reading
+# scripts/ read-only — it could not edit this file and correctly reported it
+# instead. Without that, this check would have gone PASS -> FAIL on the next
+# --all with the fix looking like the culprit.
+tor_staging_clean() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean (expect REFUSED naming solo at 1/2 copies), then tapectl staging clean --force (expect success)"; return 0; }
+    local out rc
+    out="$(TCTL staging clean 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || {
+        echo "staging clean released staged bytes while \"solo\" is at 1 copy against min_copies 2 — issue #244's gate is not holding: $out"
+        return 1
+    }
+    echo "$out" | grep -q "solo" || {
+        echo "staging clean refused, but did not name the under-copied unit, so an operator cannot tell which one: $out"
+        return 1
+    }
+    echo "$out" | grep -q -- "--force" || {
+        echo "staging clean refused without naming --force as the override: $out"
+        return 1
+    }
+    # Put the refusal in the report. Without this the log shows only the
+    # --force call's "cleaned N stage set(s)" line, and a reader cannot tell a
+    # real refusal from a check that passed for some other reason -- the
+    # assertions above would be the only evidence, and evidence you cannot see
+    # is how this suite produced five greens for the wrong reason.
+    echo "the refusal, verbatim:"
+    echo "$out" | sed 's/^/    /'
+    TCTL staging clean --force
+}
 tor_report_copies() { TCTL report copies; }
 
 tor_restore_latest() {
