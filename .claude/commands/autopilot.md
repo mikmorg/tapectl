@@ -329,6 +329,22 @@ the normative design set named in the Policy block below.
   check, so this block is the only record of it and goes stale silently. When
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
+
+- **THE 2026-09-17 REVIEW'S CRITIC GAPS ARE NOW FULLY RECONCILED (2026-09-17).**
+  The completeness critic listed NINE gaps; the queue only ever carried issues
+  for eight of them, and nothing recorded which. Reconciled at the #214 pickup:
+  gap 1 `scripts/` → #223 (closed), gap 2 `destination_budget` → #224 (closed),
+  gap 3 version-minting → #159/#206 (closed), gaps 4/5/6 Collection +
+  `location.rs` + `main.rs` → **#225 (open)**, gap 7 on-media coverage →
+  **#226 (open)**, gap 8 the seal-pointer data-loss finding → #208 (closed),
+  **gap 9 → nothing.** Filed 2026-09-17 as **#227** (migration 012's table
+  rebuild — the only rebuild in the range, indexes and `foreign_key_check`
+  unverified — plus `catalog.rs`/`report.rs`/`archive_set.rs`/`snapshot.rs`
+  read narrowly by two or three dimensions each and by none as a subsystem).
+  **Had this not been checked, "queue empty" would have been declared false.**
+  The general rule, now twice learned: when an audit produces a list, reconcile
+  the list against filed issues item by item before trusting the queue count.
+  Filing in a batch drops entries silently (#222 was caught the same way).
   **Rules if this work is ever extended:** catalog-only, never opens a drive (so
   no mhvtl gate is owed and it stays usable on a rebuilt machine with no
   `backend add`); every status visible by default, since ADR-0011 makes retired
@@ -347,13 +363,12 @@ the normative design set named in the Policy block below.
      form; cargo synchronous, never backgrounded; no GitHub closing keywords in
      commit messages; workers never touch `/dev/nst*` or `/dev/sg*`; the real
      `~/.tapectl` is never touched from this VM; migrations are forward-only and
-     the next free number is **016** (014 is
-     `014_cartridge_binding_identity_source.sql` from #192, 015 is
-     `015_cartridge_load_count_unknown.sql` from #184). This line has now been
-     stale TWICE — it said 014 until the #184 worker caught it on 2026-09-16,
-     and 015 until the coordinator caught it later the same day. It will go
-     stale again: **verify with `ls src/db/migrations/ | tail -1` before writing
-     one, and do not trust this line.**
+     the next free number is **017** (016 is
+     `016_cartridge_operator_serial.sql` from #197). This line has now been
+     stale THREE times — 014 until the #184 worker caught it on 2026-09-16, 015
+     until the coordinator caught it later the same day, 016 until 2026-09-17.
+     It will go stale again: **verify with `ls src/db/migrations/ | tail -1`
+     before writing one, and do not trust this line.**
 
 - **DEEPENING QUEUE 2026-09-11 (attended; CTO said "do all") — COMPLETE, all seven + C2b landed; real-drive pass #4 45/45 on 2026-09-12.**
   The CTO asked for an architecture review and then `/autopilot do all`. The
