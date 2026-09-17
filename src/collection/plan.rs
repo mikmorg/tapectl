@@ -236,12 +236,21 @@ fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
 /// paths "genuinely need the drive's factor, ENOSPC buffer" — only the
 /// nominal figure moves to the row), and no capacity override is re-applied
 /// here — the row already absorbed `capacity_override` at init, and
-/// re-applying it would double-count. This mirrors
-/// `volume::write::volume_write`'s own gate exactly: the same
-/// `volume_media` capacity lookup, the same `usable_bytes = nominal *
-/// usable_capacity_factor`, the same `enospc_buffer =
-/// parse_size_to_bytes(...)` (`src/volume/write.rs`, right after
-/// `resolve_lto_backend`).
+/// re-applying it would double-count. The arithmetic that follows is
+/// genuinely identical to `volume::write::volume_write`'s own gate: the same
+/// `usable_bytes = nominal * usable_capacity_factor`, the same
+/// `enospc_buffer = parse_size_to_bytes(...)` (`src/volume/write.rs`, right
+/// after `resolve_lto_backend`) — but this function reads `capacity_bytes`
+/// with its own inline query above (`SELECT id, status, capacity_bytes FROM
+/// volumes WHERE label = ?1`), not `volume_media` (`src/volume/write.rs`:
+/// `SELECT capacity_bytes, media_type FROM volumes WHERE id = ?1`). The one
+/// behavioural difference is deliberate, not a gap to close: `volume_media`
+/// also reads `media_type` so `volume_write` can refuse a drive that cannot
+/// write the recorded generation (ADR-0010) — a check that belongs at
+/// contact, when a cartridge is actually loaded, never at planning time when
+/// no drive has touched anything yet. `destination_budget` has no business
+/// asking that question, so it has no reason to share the query that asks
+/// it.
 pub fn destination_budget(
     conn: &Connection,
     config: &Config,
