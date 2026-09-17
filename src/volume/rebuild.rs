@@ -144,7 +144,7 @@ pub struct RebuildReport {
     pub cartridge_bound: bool,
     /// The bound cartridge row had no `serial_number` recorded, and this
     /// contact separately observed one and recorded it (`NULL` → value,
-    /// once — ADR-0012). Only reachable on the `operator`-identity path: the
+    /// once — ADR-0012). Set on the `operator`-identity path and (issue #221) by the pre-transaction `corroborate_volume` contact: the
     /// `mam`-identity path only ever finds a row BY its serial, so it always
     /// already has one.
     ///
@@ -1535,11 +1535,27 @@ fn cartridge_capacity_bytes(meta: &format::IdThunkVolumeMeta) -> i64 {
     match crate::media::Generation::parse(&meta.media_type) {
         Some(g) => g.native_capacity_bytes() as i64,
         None => {
+            // Warn and fall back rather than refuse (coordinator ruling,
+            // issue #210). `cartridges.nominal_capacity` is INTEGER NOT NULL
+            // so there is no "unknown" to record, and the alternatives are
+            // worse on the path this runs on: refusing to register would
+            // leave the volume UNBOUND, and an unbound rebuilt volume can
+            // never be bound by a later run on any drive (issue #216) — a
+            // permanent state traded for an advisory figure. The volume's
+            // own `capacity_bytes`, which is what actually gates writes, is
+            // decided at init and untouched here (ADR-0010 decision 3).
+            //
+            // Unreachable from any tapectl-written tape: `volume init`
+            // always writes `media_type: generation.as_str()`, which always
+            // round-trips through `Generation::parse`. Only a hand-edited or
+            // foreign File 0 reaches this.
             tracing::warn!(
                 media_type = %meta.media_type,
-                "rebuild: File 0's media_type is not a recognised LTO generation; \
-                 recording the volume's resolved capacity onto the new cartridge row \
-                 rather than the unknowable generation-table figure"
+                "rebuild: File 0's media_type is not a recognised LTO generation, so the \
+                 new cartridge row records this volume's resolved capacity instead of the \
+                 generation-table figure. Correct it with \
+                 `tapectl cartridge edit <barcode> --generation <G>` (issue #167), which \
+                 re-defaults the capacity when the stored figure was a table value"
             );
             meta.nominal_capacity_bytes
         }
