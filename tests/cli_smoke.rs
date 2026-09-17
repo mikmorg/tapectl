@@ -14,6 +14,7 @@
 //! process-level tests are the only way to reach `main`'s dispatch.
 
 use clap::{CommandFactory, Parser};
+use rusqlite::params;
 use std::process::Command;
 use tapectl::cli::Cli;
 use tempfile::TempDir;
@@ -1676,5 +1677,177 @@ fn issue_228_a_bare_relative_config_emits_no_spurious_permissions_warning() {
     assert!(
         !stderr.contains("could not set restrictive permissions"),
         "the empty derived home produced a second, confusing warning; stderr={stderr:?}"
+    );
+}
+
+/// Issue #237's investigation: `volume abort`'s `--yes`/`-y` promise against
+/// the global flag (`src/cli/mod.rs`'s `Cli::yes`,
+/// `#[arg(long, short, global = true)]`) versus `VolumeCommands::Abort`'s
+/// own local `#[arg(long)] yes: bool`.
+///
+/// Like `run_tapectl`, but with stdin explicitly detached rather than
+/// inherited, so `cli::consent::confirm`'s non-interactive branch is
+/// exercised deterministically no matter what stdin this suite itself
+/// happens to be run with.
+fn run_tapectl_noninteractive(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to spawn tapectl binary")
+}
+
+/// Minimal FK-satisfying fixture for `volume abort`'s Tier-2 gate: a
+/// `writes` row in `planned` status is all `volume_abort`
+/// (`src/volume/write.rs`) needs to reach `cli::consent::confirm` — no
+/// `write_positions` row is needed (0 planned slice positions aborts fine).
+/// Column set modelled on `tests/resume_session.rs::make_fixture`, which is
+/// kept correct against the post-migration schema; unlike that fixture, this
+/// one never drives an actual write session, so it skips the
+/// `volume::build`/`session` machinery entirely. Every row is namespaced by
+/// `label` so the helper can be called more than once against the same DB.
+fn seed_planned_write_session(home: &std::path::Path, label: &str) {
+    let db_path = home.join(".tapectl").join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).expect("open db to seed abort fixture");
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES (?1, 0, 'active')",
+        params![format!("tenant-{label}")],
+    )
+    .expect("insert tenant");
+    let tenant_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+         VALUES (?1, ?2, ?3, '/tmp/unit', 'active')",
+        params![format!("uuid-{label}"), format!("unit-{label}"), tenant_id],
+    )
+    .expect("insert unit");
+    let unit_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+         VALUES (?1, 1, 'staged', '/tmp/unit', 1, 32)",
+        params![unit_id],
+    )
+    .expect("insert snapshot");
+    let snapshot_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+        params![snapshot_id],
+    )
+    .expect("insert stage_set");
+    let stage_set_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+        params![label],
+    )
+    .expect("insert volume");
+    let volume_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'planned')",
+        params![stage_set_id, snapshot_id, volume_id],
+    )
+    .expect("insert writes row");
+}
+
+/// Issue #237's claim, checked against the real binary rather than only
+/// against source: `tapectl --yes volume abort LABEL` — the GLOBAL `--yes`
+/// given before the subcommand, no local `--yes` anywhere — was reported to
+/// "fail closed" because `src/cli/volume.rs`'s `Abort` arm passes only the
+/// subcommand-local flag (`write::volume_abort(conn, label, *yes)`),
+/// dropping the separate global `yes: bool` that `run()` also receives.
+///
+/// It does not reproduce. `Abort`'s local `yes` field and the global
+/// `Cli::yes` share clap's default arg id (the field name, "yes"), and
+/// clap's global-value propagation unifies matches by id regardless of
+/// where the flag was typed: giving `--yes` in EITHER position sets both
+/// `Cli.yes` and `Abort.yes` together (confirmed independently via
+/// `Cli::try_parse_from(["tapectl", "--yes", "volume", "abort", "L1"])`,
+/// which yields `Abort { yes: true, .. }` with no local `--yes` token
+/// anywhere). This test proves the same thing end-to-end against a fixture
+/// whose `writes` row genuinely reaches the consent gate — see
+/// `volume_abort_without_yes_refuses_non_interactively` below, which proves
+/// that same fixture refuses when NO `--yes` is given at all, so a success
+/// here cannot be explained by the gate never being reached.
+///
+/// This is a regression pin, not a fix verification. `src/cli/volume.rs`
+/// was deliberately NOT changed for issue #237: the requested `*yes || yes`
+/// would OR two values that are already always equal for the long flag — a
+/// no-op — and applying it anyway despite the premise not reproducing would
+/// have been "working around" a false claim rather than fixing a real one.
+#[test]
+fn volume_abort_proceeds_on_global_yes_alone() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    seed_planned_write_session(home.path(), "ABRT-GLOBAL");
+
+    let out = run_tapectl_noninteractive(home.path(), &["--yes", "volume", "abort", "ABRT-GLOBAL"]);
+    assert!(
+        out.status.success(),
+        "global --yes alone should skip the prompt and proceed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The local `--yes` (given after the subcommand, no global flag anywhere)
+/// must keep working — the regression this suite must not introduce.
+#[test]
+fn volume_abort_proceeds_on_local_yes_alone() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    seed_planned_write_session(home.path(), "ABRT-LOCAL");
+
+    let out = run_tapectl_noninteractive(home.path(), &["volume", "abort", "ABRT-LOCAL", "--yes"]);
+    assert!(
+        out.status.success(),
+        "local --yes alone should skip the prompt and proceed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Control for the two tests above: with NEITHER flag, in a non-interactive
+/// session, the same fixture must refuse rather than hang or silently
+/// proceed — proving they actually exercised `cli::consent::confirm`'s
+/// gate rather than some earlier, unrelated success path.
+#[test]
+fn volume_abort_without_yes_refuses_non_interactively() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    seed_planned_write_session(home.path(), "ABRT-NEITHER");
+
+    let out = run_tapectl_noninteractive(home.path(), &["volume", "abort", "ABRT-NEITHER"]);
+    assert!(!out.status.success(), "must refuse without consent");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refused: non-interactive"),
+        "must refuse with the documented non-interactive message: {stderr}"
     );
 }

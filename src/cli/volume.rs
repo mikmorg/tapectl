@@ -462,6 +462,22 @@ pub fn run(
             }
         }
 
+        // `*yes` alone, NOT `*yes || yes` — and that is correct, verified
+        // empirically rather than inferred (issue #237, closed as
+        // not-reproducible). This arm's local field and the global
+        // `Cli::yes` share clap's default arg id (the field name `yes`), and
+        // `global = true` unifies matches by id: `--yes` typed ANYWHERE sets
+        // both fields, omitted leaves both false. An `||` here would OR two
+        // values that are always equal — a no-op dressed as a fix.
+        //
+        // Written down because the SHAPE looks like the defect its siblings
+        // really had: `CompactFinish`/`Compact` do `*force || yes`, and that
+        // OR is load-bearing there only because `force` is a genuinely
+        // different arg id. #237 was filed off that resemblance, by reading
+        // source without testing behaviour. The three `volume_abort_*` tests
+        // in `tests/cli_smoke.rs` pin the real end-to-end behaviour, so a
+        // future rename that decoupled the ids goes red rather than silently
+        // reintroducing the bug this comment says does not exist.
         VolumeCommands::Abort { label, yes } => {
             write::volume_abort(conn, label, *yes)?;
             if json_output {
