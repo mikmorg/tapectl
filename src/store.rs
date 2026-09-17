@@ -103,6 +103,61 @@ impl MismatchKind {
             MismatchKind::ContentHashMismatch | MismatchKind::FrontIndexDivergesFromSeal
         )
     }
+
+    /// Whether this kind is evidence that **the medium is bad**, as opposed
+    /// to evidence that *this drive could not read it today*
+    /// (ADR-0012, amendment of 2026-09-17, issue #234).
+    ///
+    /// This is the predicate a failed `volume verify` quarantines on, and
+    /// the amendment is explicit that the blanket "a failed verify
+    /// quarantines the volume" was too strong: `quarantined` is precisely
+    /// what makes a volume stop counting as a copy, so a false quarantine
+    /// silently takes real coverage to zero, and a dirty drive could condemn
+    /// a library one cartridge at a time. `layout-session.md` states the
+    /// hazard in terms — quarantining a good tape is "silent corruption, not
+    /// a loud failure".
+    ///
+    /// The ruling: quarantine only on "a checksum mismatch, or an unreadable
+    /// block at a position the layout says carries data". Arm by arm:
+    ///
+    /// - `ContentHashMismatch` — **yes**, and it is both halves of the
+    ///   ruling at once. The on-tape bytes hash to something other than the
+    ///   front index promises (a checksum mismatch), and `chain_walk` also
+    ///   raises this kind for a read error or a short read at a CONTENT
+    ///   position — "an unreadable block at a position the layout says
+    ///   carries data", named by the amendment in as many words.
+    /// - `FrontIndexDivergesFromSeal` — **yes**. The tape's two ends
+    ///   disagree about bytes both of them recorded; its own doc has said
+    ///   "(quarantine-grade)" since the chain walk was written.
+    /// - `FrontIndexInconsistent` — **yes**. File 3's §2.5 self-consistency
+    ///   check failed: the tape's own map contradicts itself, which no
+    ///   drive fault produces.
+    /// - `NavigationDisagreement` — **yes**. The front index and the Layout
+    ///   disagree about a file's position, type or size. Nothing about a
+    ///   transport error changes what a successfully read index SAYS.
+    /// - `FrontIndexUnreadable` — **no**, and this is the crux. A genuine
+    ///   I/O or transport error becomes this variant, and so does a short
+    ///   read; neither distinguishes a bad tape from a dirty drive, a wrong
+    ///   block size or a transient SCSI error. "We could not read it today"
+    ///   is not "the bytes are gone".
+    /// - `SealUnreadable` — **no**, and never. Its own doc says an absent or
+    ///   unparseable seal marker is the *normal* signal for an unsealed
+    ///   tape, "never an error".
+    ///
+    /// Written as an exhaustive `match` with **no wildcard arm** on purpose:
+    /// a seventh variant must fail to compile until someone decides which
+    /// side of this line it falls on. The decision is a CTO one (ADR-0012),
+    /// not a default.
+    pub fn proves_medium_bad(self) -> bool {
+        match self {
+            MismatchKind::ContentHashMismatch => true,
+            MismatchKind::FrontIndexDivergesFromSeal => true,
+            MismatchKind::FrontIndexInconsistent => true,
+            MismatchKind::NavigationDisagreement => true,
+            MismatchKind::FrontIndexUnreadable => false,
+            MismatchKind::SealUnreadable => false,
+        }
+    }
 }
 
 /// One disagreement `confirm` found, at a specific tape position. Kept
@@ -133,6 +188,31 @@ pub struct Evidence {
     pub tier: Tier,
     pub files_checked: u32,
     pub mismatches: Vec<Mismatch>,
+}
+
+impl Evidence {
+    /// The mismatches that prove **the medium is bad**, in walk order
+    /// ([`MismatchKind::proves_medium_bad`], ADR-0012's 2026-09-17
+    /// amendment). Empty means either a clean pass or a failure that says
+    /// nothing about the tape — a dirty drive, a wrong block size, a
+    /// transient SCSI error, a tape not loaded.
+    ///
+    /// This is the question a failed `volume verify` actually asks, so it
+    /// lives next to the classification rather than as an `any()` at the
+    /// call site: one predicate, one place, and adding a caller cannot
+    /// reintroduce the blanket rule the amendment rejected.
+    pub fn medium_evidence(&self) -> Vec<&Mismatch> {
+        self.mismatches
+            .iter()
+            .filter(|m| m.kind.proves_medium_bad())
+            .collect()
+    }
+
+    /// Whether any mismatch proves the medium is bad — the quarantine
+    /// verdict, as a bool. See [`Evidence::medium_evidence`].
+    pub fn proves_medium_bad(&self) -> bool {
+        self.mismatches.iter().any(|m| m.kind.proves_medium_bad())
+    }
 }
 
 /// The validate-time capacity oracle (`layout-session.md` validation point 1).
@@ -1218,6 +1298,79 @@ mod tests {
             "corruption confined to block padding must not be flagged: {:?}",
             evidence.mismatches
         );
+    }
+
+    // ── issue #234: which failures prove the MEDIUM is bad ──
+
+    /// The classification ADR-0012's 2026-09-17 amendment ruled, pinned
+    /// variant by variant.
+    ///
+    /// Spelled out one per line rather than derived from a helper: this is
+    /// the list a CTO ratified, and a test that recomputed it from the same
+    /// predicate under test would assert nothing. If a variant moves sides,
+    /// this test is where that shows up as a deliberate edit.
+    #[test]
+    fn proves_medium_bad_classifies_every_kind_as_adr_0012_ruled() {
+        // Medium evidence: the bytes on the tape are wrong or gone.
+        assert!(MismatchKind::ContentHashMismatch.proves_medium_bad());
+        assert!(MismatchKind::FrontIndexDivergesFromSeal.proves_medium_bad());
+        assert!(MismatchKind::FrontIndexInconsistent.proves_medium_bad());
+        assert!(MismatchKind::NavigationDisagreement.proves_medium_bad());
+
+        // NOT medium evidence: "we could not read it today" is not "the
+        // bytes are gone", and an absent seal is the normal unsealed signal.
+        assert!(!MismatchKind::FrontIndexUnreadable.proves_medium_bad());
+        assert!(!MismatchKind::SealUnreadable.proves_medium_bad());
+    }
+
+    fn mismatch_of(kind: MismatchKind) -> Mismatch {
+        Mismatch {
+            position: 3,
+            kind,
+            expected: "e".into(),
+            actual: "a".into(),
+        }
+    }
+
+    /// `Evidence`'s verdict is "ANY mismatch proves it", not "all of them" —
+    /// a tape that is genuinely rotten does not stop being rotten because
+    /// the seal was also unreadable.
+    #[test]
+    fn evidence_medium_verdict_is_any_not_all() {
+        let clean = Evidence {
+            tier: Tier::Integrity,
+            files_checked: 6,
+            mismatches: Vec::new(),
+        };
+        assert!(!clean.proves_medium_bad());
+        assert!(clean.medium_evidence().is_empty());
+
+        let drive_only = Evidence {
+            tier: Tier::Integrity,
+            files_checked: 2,
+            mismatches: vec![
+                mismatch_of(MismatchKind::SealUnreadable),
+                mismatch_of(MismatchKind::FrontIndexUnreadable),
+            ],
+        };
+        assert!(
+            !drive_only.proves_medium_bad(),
+            "read failures alone say nothing about the tape"
+        );
+        assert!(drive_only.medium_evidence().is_empty());
+
+        let mixed = Evidence {
+            tier: Tier::Integrity,
+            files_checked: 6,
+            mismatches: vec![
+                mismatch_of(MismatchKind::SealUnreadable),
+                mismatch_of(MismatchKind::ContentHashMismatch),
+            ],
+        };
+        assert!(mixed.proves_medium_bad());
+        let named = mixed.medium_evidence();
+        assert_eq!(named.len(), 1, "only the medium-proving one is named");
+        assert_eq!(named[0].kind, MismatchKind::ContentHashMismatch);
     }
 
     #[test]
