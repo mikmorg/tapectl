@@ -216,7 +216,11 @@ pub fn execute_batch(
 /// its volume to `'sealed'` at seal/confirm time (`volume::session`), so a
 /// unit whose one-and-only copy this call just wrote is correctly counted
 /// here, not missed.
-fn under_copied_units(conn: &Connection, config: &Config, batch: &Batch) -> Result<Vec<CopyProgress>> {
+fn under_copied_units(
+    conn: &Connection,
+    config: &Config,
+    batch: &Batch,
+) -> Result<Vec<CopyProgress>> {
     let mut under = Vec::new();
     for u in &batch.units {
         let unit = crate::db::queries::get_unit_by_name(conn, &u.name)?.ok_or_else(|| {
@@ -471,6 +475,9 @@ mod tests {
             "min_copies=1 is already met by the one copy just written -- this must \
              still auto-release exactly as it did before issue #229"
         );
-        assert!(!staged_file.exists(), "the staged .age file must be removed");
+        assert!(
+            !staged_file.exists(),
+            "the staged .age file must be removed"
+        );
     }
 }
