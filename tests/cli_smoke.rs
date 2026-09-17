@@ -1804,10 +1804,12 @@ fn volume_abort_proceeds_on_global_yes_alone() {
     );
 }
 
-/// The local `--yes` (given after the subcommand, no global flag anywhere)
-/// must keep working — the regression this suite must not introduce.
+/// `--yes` given AFTER the subcommand must keep working — the regression
+/// this suite must not introduce. Since issue #240 there is no local field
+/// at all; this exercises the global flag in the trailing position, which is
+/// where an operator most naturally types it.
 #[test]
-fn volume_abort_proceeds_on_local_yes_alone() {
+fn volume_abort_proceeds_on_trailing_yes_alone() {
     let home = TempDir::new().expect("tempdir");
     let init = run_tapectl_noninteractive(home.path(), &["init"]);
     assert!(
@@ -1827,7 +1829,79 @@ fn volume_abort_proceeds_on_local_yes_alone() {
     );
 }
 
-/// Control for the two tests above: with NEITHER flag, in a non-interactive
+/// Issue #240: `-y` — the GLOBAL flag's short alias — must be accepted
+/// AFTER the subcommand, not only before it.
+///
+/// It was not. `Abort` redeclared `yes` locally as `#[arg(long)]`, sharing
+/// clap's arg id with the global but not its `short`, and the local
+/// declaration wins for that subcommand's parser. Measured against the real
+/// binary before the fix:
+///
+///     tapectl -y volume abort L        -> parsed
+///     tapectl volume abort L --yes     -> parsed
+///     tapectl volume abort L -y        -> error: unexpected argument '-y' found
+///
+/// The global's help promises unconditionally to skip Tier-2 prompts, so an
+/// operator who has used `-y` elsewhere hit a bare parse error with no hint
+/// that the long form would have worked — and in a non-interactive session
+/// the command then refused at the very gate it was told to skip.
+///
+/// Process-level on purpose: this is about argv parsing, which a library
+/// test cannot see.
+#[test]
+fn volume_abort_accepts_the_short_yes_after_the_subcommand() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    seed_planned_write_session(home.path(), "ABRT-SHORT");
+
+    let out = run_tapectl_noninteractive(home.path(), &["volume", "abort", "ABRT-SHORT", "-y"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "-y after the subcommand must parse, not die on argv (issue #240): {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "-y after the subcommand should skip the prompt and proceed: stdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+}
+
+/// The same alias in the LEADING position, so the pair pins both and a
+/// future change cannot fix one by breaking the other.
+#[test]
+fn volume_abort_accepts_the_short_yes_before_the_subcommand() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    seed_planned_write_session(home.path(), "ABRT-SHORT-LEAD");
+
+    let out =
+        run_tapectl_noninteractive(home.path(), &["-y", "volume", "abort", "ABRT-SHORT-LEAD"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "-y before the subcommand must parse (issue #240): {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "-y before the subcommand should skip the prompt and proceed: stdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+}
+
+/// Control for the tests above: with NEITHER flag, in a non-interactive
 /// session, the same fixture must refuse rather than hang or silently
 /// proceed — proving they actually exercised `cli::consent::confirm`'s
 /// gate rather than some earlier, unrelated success path.

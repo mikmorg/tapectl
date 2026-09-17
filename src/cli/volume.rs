@@ -112,11 +112,13 @@ pub enum VolumeCommands {
     Abort {
         /// Volume label
         label: String,
-        /// Skip the confirmation prompt (ADR-0008 Tier 2). Required in a
-        /// non-interactive session, which otherwise refuses rather than
-        /// assuming consent.
-        #[arg(long)]
-        yes: bool,
+        // No local `yes` field: consent comes from the GLOBAL `--yes`/`-y`
+        // (issue #240). It used to be redeclared here as `#[arg(long)]`,
+        // which shares clap's arg id with the global but NOT its `short` --
+        // and the local declaration wins for this subcommand's parser, so
+        // `tapectl volume abort L -y` died with "unexpected argument '-y'"
+        // while `tapectl -y volume abort L` and `... --yes` both worked.
+        // One declaration cannot drift from itself.
     },
 
     /// Verify volume contents via the keyless chain walk (seal -> front index
@@ -462,24 +464,23 @@ pub fn run(
             }
         }
 
-        // `*yes` alone, NOT `*yes || yes` — and that is correct, verified
-        // empirically rather than inferred (issue #237, closed as
-        // not-reproducible). This arm's local field and the global
-        // `Cli::yes` share clap's default arg id (the field name `yes`), and
-        // `global = true` unifies matches by id: `--yes` typed ANYWHERE sets
-        // both fields, omitted leaves both false. An `||` here would OR two
-        // values that are always equal — a no-op dressed as a fix.
+        // `yes` here is `run`'s GLOBAL parameter -- `Abort` no longer
+        // declares a local one (issue #240).
         //
-        // Written down because the SHAPE looks like the defect its siblings
-        // really had: `CompactFinish`/`Compact` do `*force || yes`, and that
-        // OR is load-bearing there only because `force` is a genuinely
-        // different arg id. #237 was filed off that resemblance, by reading
-        // source without testing behaviour. The three `volume_abort_*` tests
-        // in `tests/cli_smoke.rs` pin the real end-to-end behaviour, so a
-        // future rename that decoupled the ids goes red rather than silently
-        // reintroducing the bug this comment says does not exist.
-        VolumeCommands::Abort { label, yes } => {
-            write::volume_abort(conn, label, *yes)?;
+        // The removed field was not a bug in itself: it shared clap's arg id
+        // with the global, and `global = true` unifies matches by id, so
+        // `--yes` typed in either position set both and `*yes` alone was
+        // correct (that was issue #237, closed as not-reproducible after
+        // testing the binary rather than reading the source). What it could
+        // not share was the global's `short`, so `-y` was accepted before the
+        // subcommand and rejected after it.
+        //
+        // Do NOT reintroduce a local field "for clarity". The sibling arms
+        // `CompactFinish`/`Compact` do `*force || yes`, and that OR is
+        // load-bearing there only because `force` is a genuinely different
+        // arg id -- a resemblance that has already produced one false issue.
+        VolumeCommands::Abort { label } => {
+            write::volume_abort(conn, label, yes)?;
             if json_output {
                 println!(
                     "{}",

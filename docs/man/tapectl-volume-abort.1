@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-abort \- Deliberately abandon a volume\*(Aqs unfinished write session (issue #94): `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
 .SH SYNOPSIS
-\fBtapectl volume abort\fR [\fB\-\-json\fR] [\fB\-\-yes\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume abort\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Deliberately abandon a volume\*(Aqs unfinished write session (issue #94): `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
 .PP
@@ -14,14 +14,14 @@ The tape is never contacted (hence no \-\-device): the cartridge is left unseale
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-yes\fR
-Skip the confirmation prompt (ADR\-0008 Tier 2). Required in a non\-interactive session, which otherwise refuses rather than assuming consent
-.TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
