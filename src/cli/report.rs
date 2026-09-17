@@ -1405,16 +1405,36 @@ fn event_line(
 ) -> String {
     let label_str = label.unwrap_or("?");
     let field_str = field.map(|f| format!(".{f}")).unwrap_or_default();
-    let change = match (old, new) {
-        (None, None) => String::new(),
-        // "(none)" is the rendering for an absent side — an entity that was
-        // in no location before this move reads as a real transition rather
-        // than as a missing word.
-        (o, n) => format!(
-            ": {} \u{2192} {}",
-            o.unwrap_or("(none)"),
-            n.unwrap_or("(none)")
-        ),
+    // Issue #236 finding 4: an arrow asserts a TRANSITION, which requires a
+    // named `field` that actually changed value. Four production writers
+    // (`binding::mount_and_record`'s `displaced`, `write::abort_write` and
+    // `write::resume`'s `write_aborted`, `write::log_quarantine`'s
+    // `write_quarantined`) carry `field = None` and populate exactly ONE of
+    // `old_value`/`new_value` as a bare payload, not a "before" half. With
+    // the old unconditional arrow, `displaced`'s payload (`old_value =
+    // Some(label)`) rendered as "L6-0004 → (none)" — false: the cartridge
+    // did not go to nothing, it now holds the new volume. Render the arrow
+    // only when there IS a named field; a lone value with no field is a
+    // suffix in its own right, not a transition's dangling other half.
+    let change = match field {
+        Some(_) => match (old, new) {
+            (None, None) => String::new(),
+            // "(none)" is the rendering for an absent side — an entity that
+            // was in no location before this move reads as a real
+            // transition rather than as a missing word.
+            (o, n) => format!(
+                ": {} \u{2192} {}",
+                o.unwrap_or("(none)"),
+                n.unwrap_or("(none)")
+            ),
+        },
+        None => match (old, new) {
+            (None, None) => String::new(),
+            // Not observed by any writer today, but a genuine pair with no
+            // field name is still a transition, not two independent facts.
+            (Some(o), Some(n)) => format!(": {o} \u{2192} {n}"),
+            (Some(v), None) | (None, Some(v)) => format!(": {v}"),
+        },
     };
     format!("{ts} {etype}/{label_str} {action}{field_str}{change}")
 }
@@ -2673,5 +2693,103 @@ Write error counter page [0x2]
             None,
         );
         assert_eq!(line, "2026-09-16 12:00:00 volume/VOL-A created");
+    }
+
+    // ---- issue #236 finding 4: a bare payload (no `field`) is not a
+    // transition, and must never render an arrow to "(none)" ----
+
+    /// The exact shape `binding::mount_and_record` logs for `displaced`:
+    /// `field = None`, `old_value = Some(label)`, `new_value = None`. The
+    /// pre-#236 renderer applied the transition arrow unconditionally,
+    /// producing "displaced: L6-0004 → (none)" -- false: the cartridge did
+    /// not go to nothing, it now holds the new volume. With no `field`,
+    /// this is a payload, not a "before" half, and must render as a plain
+    /// suffix.
+    #[test]
+    fn a_displaced_event_with_no_field_never_renders_an_arrow_to_none() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "cartridge",
+            Some("A001L6"),
+            "displaced",
+            None,
+            Some("L6-0004"),
+            None,
+        );
+        assert_eq!(
+            line, "2026-09-16 12:00:00 cartridge/A001L6 displaced: L6-0004",
+            "a fieldless old_value is a payload, not a transition's dangling \
+             other half: {line}"
+        );
+        assert!(
+            !line.contains("(none)"),
+            "must never assert the cartridge went to nothing: {line}"
+        );
+    }
+
+    /// The exact shape `write::abort_write`/`write::resume` log for
+    /// `write_aborted`: `field = None`, `old_value = None`, `new_value =
+    /// Some(prose)`.
+    #[test]
+    fn a_write_aborted_event_with_no_field_renders_the_reason_alone() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "volume",
+            Some("L6-0004"),
+            "write_aborted",
+            None,
+            None,
+            Some("operator abandoned the unfinished write session (`volume abort`)"),
+        );
+        assert_eq!(
+            line,
+            "2026-09-16 12:00:00 volume/L6-0004 write_aborted: operator abandoned the \
+             unfinished write session (`volume abort`)"
+        );
+        assert!(!line.contains("(none)"), "{line}");
+        assert!(!line.contains('\u{2192}'), "no field means no transition: {line}");
+    }
+
+    /// The exact shape `write::log_quarantine` logs for `write_quarantined`:
+    /// `field = None`, `old_value = None`, `new_value = Some(reason)`.
+    #[test]
+    fn a_write_quarantined_event_with_no_field_renders_the_reason_alone() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "volume",
+            Some("L6-0004"),
+            "write_quarantined",
+            None,
+            None,
+            Some("checksum mismatch at position 12"),
+        );
+        assert_eq!(
+            line,
+            "2026-09-16 12:00:00 volume/L6-0004 write_quarantined: checksum mismatch at \
+             position 12"
+        );
+        assert!(!line.contains('\u{2192}'), "no field means no transition: {line}");
+    }
+
+    /// A genuine field CHANGE (`field = Some`) with only the new side known
+    /// (a first-time-set field) is a real transition and must keep the
+    /// arrow, with "(none)" on the absent old side -- unlike the fieldless
+    /// cases above. This is `log_field_change`'s own shape and must not
+    /// regress.
+    #[test]
+    fn a_field_change_with_no_prior_value_still_renders_the_arrow() {
+        let line = event_line(
+            "2026-09-16 12:00:00",
+            "unit",
+            Some("photos"),
+            "tagged",
+            Some("status"),
+            None,
+            Some("active"),
+        );
+        assert_eq!(
+            line, "2026-09-16 12:00:00 unit/photos tagged.status: (none) \u{2192} active",
+            "a NAMED field change with an absent old side is a real transition: {line}"
+        );
     }
 }
