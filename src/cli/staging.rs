@@ -1,10 +1,10 @@
 use clap::Subcommand;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
-use crate::error::Result;
+use crate::error::{Result, TapectlError};
 use crate::staging::clean;
 
 #[derive(Subcommand, Debug)]
@@ -14,10 +14,92 @@ pub enum StagingCommands {
 
     /// Clean staged files from disk
     Clean {
-        /// Clean all staged sets, not just those with completed writes
+        /// Clean all staged sets, not just those with completed writes;
+        /// also overrides the refusal to release a stage set whose unit is
+        /// below its policy's resolved min_copies (issue #244)
         #[arg(long)]
         force: bool,
     },
+}
+
+/// One unit whose eligible copy count is below its own resolved
+/// `min_copies`, among the units a non-force `staging clean` is about to
+/// release staging for (issue #244, `docs/adr/0012-...md`'s 2026-09-17
+/// amendment).
+#[derive(Debug)]
+struct UnderCopiedUnit {
+    unit_name: String,
+    copies: i64,
+    min_copies: i64,
+}
+
+/// Which units a non-force `clean::clean_staging` call is about to release
+/// staging for (its `'staged'` branch: at least one `writes` row exists and
+/// none is non-`completed` -- the EXACT eligibility guard in
+/// `staging::clean::clean_staging`'s `candidate_sql`, never re-derived a
+/// second way here) do not yet meet their own resolved `min_copies`.
+///
+/// `'failed'` stage_sets are never candidates: `clean_staging` reclaims
+/// those unconditionally and correctly (no `writes` row, no copy
+/// requirement), and this function's SQL deliberately excludes them.
+///
+/// The copy count itself is `policy::coverage::copy_count_expr` against
+/// `policy::resolve(...).min_copies` -- the SAME derivation
+/// `collection::batch::under_copied_units` uses for the exact same
+/// question after `execute_batch`'s own write loop (issue #96's
+/// single-derivation rule: `policy::coverage` is the sole owner of "how
+/// many copies does this unit have"). This is not a second definition —
+/// it is the same expression, applied to units enumerated from the DB
+/// instead of a known `Batch`.
+fn under_copied_release_candidates(
+    conn: &Connection,
+    config: &Config,
+) -> Result<Vec<UnderCopiedUnit>> {
+    let unit_names: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT u.name
+             FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE ss.status = 'staged'
+               AND EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = ss.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM writes w
+                   WHERE w.stage_set_id = ss.id AND w.status <> 'completed'
+               )
+             ORDER BY u.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let mut under = Vec::new();
+    for name in unit_names {
+        let unit = crate::db::queries::get_unit_by_name(conn, &name)?.ok_or_else(|| {
+            TapectlError::Other(format!(
+                "staging clean: unit \"{name}\" has a staged stage_set but is missing \
+                 from the catalog -- the catalog is inconsistent"
+            ))
+        })?;
+        let resolved = crate::policy::resolve(conn, config, &unit)?;
+        let sql = format!(
+            "SELECT {}",
+            crate::policy::coverage::copy_count_expr(
+                &crate::policy::coverage::CoverageQuery::current_unit("?1")
+            )
+        );
+        let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
+        if copies < resolved.min_copies {
+            under.push(UnderCopiedUnit {
+                unit_name: name,
+                copies,
+                min_copies: resolved.min_copies,
+            });
+        }
+    }
+    Ok(under)
 }
 
 #[derive(Tabled, Serialize)]
@@ -116,6 +198,52 @@ pub fn run(
         }
 
         StagingCommands::Clean { force } => {
+            // Issue #244, ADR-0012's 2026-09-17 amendment: refuse to
+            // release a stage set whose unit is below its own resolved
+            // min_copies, unless the operator passes --force. This gate
+            // runs BEFORE `clean::clean_staging` (which stays policy-free,
+            // per #238's conclusion for `execute_batch` and the amendment's
+            // explicit constraint) and is skipped entirely when `force` is
+            // set, so `--force`'s existing behaviour is unchanged.
+            if !*force {
+                let under_copied = under_copied_release_candidates(conn, config)?;
+                if !under_copied.is_empty() {
+                    // Issue #56's defect class: a `--json` refusal must be
+                    // ONE parseable document on stdout, never a JSON object
+                    // beside a human line. Printed here, then the process
+                    // still exits non-zero via the `Err` below (its text
+                    // lands on stderr, not stdout).
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "refused": true,
+                                "reason": "min_copies",
+                                "under_copied": under_copied.iter().map(|u| serde_json::json!({
+                                    "unit": u.unit_name,
+                                    "copies": u.copies,
+                                    "min_copies": u.min_copies,
+                                })).collect::<Vec<_>>(),
+                            })
+                        );
+                    }
+                    let mut msg = String::from(
+                        "staging clean refused: the following unit(s) have staged data \
+                         that has not yet met their policy's min_copies -- cleaning now \
+                         would discard the only cheap route to the copy the operator's \
+                         own policy requires (issue #244). Pass --force to release \
+                         anyway:\n",
+                    );
+                    for u in &under_copied {
+                        msg.push_str(&format!(
+                            "  {}: {}/{} copies\n",
+                            u.unit_name, u.copies, u.min_copies
+                        ));
+                    }
+                    return Err(TapectlError::Other(msg));
+                }
+            }
+
             let mut report = clean::clean_staging(conn, config, *force)?;
             clean::reclaim_session_dirs_and_lockfiles(
                 conn,
