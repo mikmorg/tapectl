@@ -1587,10 +1587,7 @@ mod tests {
         let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
         assert_eq!(evidence.mismatches.len(), 1, "{:?}", evidence.mismatches);
         assert_eq!(evidence.mismatches[0].position, 4);
-        assert_eq!(
-            evidence.mismatches[0].kind,
-            MismatchKind::ContentUnreadable
-        );
+        assert_eq!(evidence.mismatches[0].kind, MismatchKind::ContentUnreadable);
         assert!(!evidence.proves_medium_bad());
     }
 
