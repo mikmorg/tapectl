@@ -407,6 +407,12 @@ fn move_together(
     location_name: &str,
     dry_run: bool,
 ) -> Result<MoveOutcome> {
+    // Issue #231 (finding 2): the destination is operator-typed at the CLI
+    // and never trimmed, and `locations.name` is a BINARY-collated UNIQUE
+    // column (001_initial.sql) that a trailing space defeats. Trim here,
+    // once, so every use below (the lookup, the refusal text, and the
+    // event's `new_value`) agrees with what `add`/`rename` actually stored.
+    let location_name = location_name.trim();
     let (loc_id, loc_kind): (i64, String) = conn
         .query_row(
             "SELECT id, kind FROM locations WHERE name = ?1",
@@ -437,25 +443,68 @@ fn move_together(
     //
     // ADR-0011 adds `cartridges.location_id` as a second column this refusal
     // has to cover, and it covers it for the same reason and more literally:
-    // a physical cartridge cannot be inside a bucket. This function is the
-    // only production writer of EITHER column, so the one refusal still closes
-    // the whole path.
+    // a physical cartridge cannot be inside a bucket.
+    //
+    // Issue #231 (finding 4): this function is the only production writer of
+    // `cartridges.location_id` -- not, as an earlier version of this comment
+    // claimed, of "either column". `volumes.location_id` has a second
+    // production writer, `volume::binding::mount_and_record`
+    // (src/volume/binding.rs), which is a THIRD writer by its own comment's
+    // count. The conclusion still holds, for a different reason: binding
+    // only ever COPIES a value out of `cartridges.location_id` (never an
+    // independent one), so the vetting this refusal does on that column
+    // covers whatever binding later propagates. And `locations.kind` is
+    // immutable after `add` -- `LocationCommands` has no `edit` or
+    // `rename`-the-kind arm -- so a shelf this refusal already passed cannot
+    // later turn into a warehouse behind binding's back. That is what lets
+    // the one refusal here still close the whole path.
     if loc_kind == "warehouse" {
-        let hint = volumes
-            .first()
-            .map(|(_, label)| {
-                format!(
-                    "To record that a copy of this volume was uploaded to \
-                     \"{location_name}\", use:\n    \
-                     tapectl volume deposit add {label} --to {location_name}"
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "A warehouse only ever receives RECORDED deposits of sealed volumes \
-                     (`tapectl volume deposit add <LABEL> --to {location_name}`)."
-                )
-            });
+        let hint = match volumes.first() {
+            Some((vol_id, label)) => {
+                // Issue #231 (finding 1): the recipe below only ever runs
+                // when the volume is sealed -- `run_deposit`'s `Add` arm
+                // (src/cli/volume.rs) refuses unconditionally otherwise. An
+                // `active` volume (what `volume init` inserts) or a
+                // `retired` one (what `cartridge retire` leaves, mount
+                // deliberately open) must get a hint that actually runs.
+                let status: String = conn.query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![vol_id],
+                    |row| row.get(0),
+                )?;
+                if status == "sealed" {
+                    format!(
+                        "To record that a copy of this volume was uploaded to \
+                         \"{location_name}\", use:\n    \
+                         tapectl volume deposit add {label} --to {location_name}"
+                    )
+                } else {
+                    // Not merely unrunnable for `retired` -- wrong: the
+                    // volume's bytes are condemned, so a warehouse copy of
+                    // them must never be recorded, sealed or not. Moving the
+                    // physical cartridge to another SHELF remains fine
+                    // (ADR-0011 licenses exactly that); only the warehouse
+                    // destination is refused, so that is the step named
+                    // here, and `location list` always runs.
+                    let condemned = if status == "retired" {
+                        " -- and because it is retired, its bytes are \
+                          condemned, so a warehouse deposit must never be \
+                          recorded for it even after that"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "volume \"{label}\" is {status}, not sealed, so no deposit can \
+                         be recorded for it{condemned}. Move the cartridge to a shelf \
+                         location instead (`tapectl location list` shows the shelves)."
+                    )
+                }
+            }
+            None => format!(
+                "A warehouse only ever receives RECORDED deposits of sealed volumes \
+                 (`tapectl volume deposit add <LABEL> --to {location_name}`)."
+            ),
+        };
         return Err(TapectlError::Other(format!(
             "\"{location_name}\" is a warehouse location, and a physical cartridge cannot \
              be moved into one — `location_id` records where to go to FETCH the \
@@ -1175,5 +1224,103 @@ mod tests {
         let home = rows.iter().find(|r| r.name == "home").unwrap();
         assert_eq!(home.cartridges, 1);
         assert_eq!(home.volumes, 0, "the cartridge has no mounted volume");
+    }
+
+    // ---- issue #231 ----
+
+    /// Finding 1: `volume init` inserts `status = 'active'`
+    /// (src/cli/operations.rs), so a freshly written, not-yet-sealed volume
+    /// is the COMMON shape, not an edge case -- and it is the one the
+    /// existing warehouse-refusal tests never seed (`setup()` is
+    /// sealed-only). The recipe `run_deposit`'s `Add` arm would print here
+    /// must not be one that arm itself refuses.
+    #[test]
+    fn move_refuses_a_warehouse_destination_for_an_active_volume() {
+        let conn = setup();
+        conn.execute(
+            "UPDATE volumes SET status = 'active' WHERE label = 'L6-0001'",
+            [],
+        )
+        .unwrap();
+
+        let err = move_volume(&conn, "L6-0001", "glacier", false)
+            .expect_err("a cartridge cannot be moved into cold cloud storage");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("active") && msg.contains("not sealed"),
+            "the refusal must name the volume's actual status; got: {msg}"
+        );
+        assert!(
+            !msg.contains("volume deposit add"),
+            "an active volume's deposit would itself be refused by `run_deposit`, so the \
+             hint must not recommend it; got: {msg}"
+        );
+    }
+
+    /// Finding 2: `locations.name` is a BINARY-collated UNIQUE column and no
+    /// caller trims. A trailing-space paste must round-trip to the trimmed
+    /// name, and a duplicate (once trimmed) must be refused by name rather
+    /// than surfacing the raw `UNIQUE constraint failed: locations.name`.
+    #[test]
+    fn location_names_are_trimmed_on_add_and_duplicates_are_refused_by_name() {
+        let conn = crate::db::open_memory().unwrap();
+        run(
+            &conn,
+            &LocationCommands::Add {
+                name: "parents-house ".to_string(),
+                description: None,
+                kind: "shelf".to_string(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        let stored: String = conn
+            .query_row("SELECT name FROM locations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stored, "parents-house",
+            "the trailing space must be trimmed before storage"
+        );
+
+        let err = run(
+            &conn,
+            &LocationCommands::Add {
+                name: " parents-house".to_string(),
+                description: None,
+                kind: "shelf".to_string(),
+            },
+            false,
+            false,
+        )
+        .expect_err("a duplicate name (once trimmed) must be refused");
+        assert!(
+            err.to_string().contains("already exists"),
+            "must refuse by name, not surface the raw UNIQUE constraint failure; got: {err}"
+        );
+    }
+
+    /// Finding 3: `cartridge mark-erased` never clears `volumes.location_id`,
+    /// and `location_rows`'s Volumes column has no status predicate, so an
+    /// erased volume's stale row inflates the count of a shelf that
+    /// physically holds nothing at all.
+    #[test]
+    fn location_rows_does_not_count_an_erased_volume() {
+        let conn = setup();
+        conn.execute(
+            "UPDATE volumes SET status = 'erased',
+                                 location_id = (SELECT id FROM locations WHERE name = 'home')
+             WHERE label = 'L6-0001'",
+            [],
+        )
+        .unwrap();
+
+        let rows = location_rows(&conn).unwrap();
+        let home = rows.iter().find(|r| r.name == "home").unwrap();
+        assert_eq!(
+            home.volumes, 0,
+            "an erased volume's stale location_id must not be counted as physically present"
+        );
     }
 }
