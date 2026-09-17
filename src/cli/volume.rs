@@ -579,36 +579,58 @@ pub fn run(
         }
 
         VolumeCommands::Move { label, to } => {
-            let outcome = crate::cli::location::move_volume(conn, label, to)?;
+            // Issue #230: the global `--dry-run` reached this function and
+            // this arm never read it, so a dry run committed the move.
+            // `move_volume` honours it inside the one shared mover
+            // (`cli::location::move_together`), which is also why
+            // `cartridge move` needed no second gate of its own. The dry
+            // branch prints the outcome that WOULD have been written; the
+            // real branch below is byte-for-byte what it always was.
+            let outcome = crate::cli::location::move_volume(conn, label, to, dry_run)?;
+            let others: Vec<&str> = outcome
+                .volumes
+                .iter()
+                .filter(|l| l.as_str() != label)
+                .map(|l| l.as_str())
+                .collect();
             if json_output {
                 // `cartridge`/`volumes_moved` are ADDITIVE (ADR-0011): the
                 // move now carries the cartridge and any other volume on it,
                 // and a consumer that only reads `label`/`location` sees
                 // exactly what it saw before.
+                let mut obj = serde_json::json!({
+                    "label": label,
+                    "location": to,
+                    "cartridge": outcome.cartridge,
+                    "volumes_moved": outcome.volumes,
+                });
+                if dry_run {
+                    obj["dry_run"] = serde_json::json!(true);
+                }
+                println!("{obj}");
+            } else if dry_run {
                 println!(
-                    "{}",
-                    serde_json::json!({
-                        "label": label,
-                        "location": to,
-                        "cartridge": outcome.cartridge,
-                        "volumes_moved": outcome.volumes,
-                    })
+                    "volume \"{label}\" would be moved to \"{to}\" (DRY RUN — no changes made)"
                 );
+                if let Some(barcode) = &outcome.cartridge {
+                    println!("  cartridge \"{barcode}\" would move with it");
+                    if !others.is_empty() {
+                        println!(
+                            "  {} other volume(s) on that cartridge would move too: {}",
+                            others.len(),
+                            others.join(", ")
+                        );
+                    }
+                }
             } else {
                 println!("volume \"{label}\" moved to \"{to}\"");
                 if let Some(barcode) = &outcome.cartridge {
                     println!("  cartridge \"{barcode}\" moved with it");
-                    let others: Vec<&String> =
-                        outcome.volumes.iter().filter(|l| *l != label).collect();
                     if !others.is_empty() {
                         println!(
                             "  {} other volume(s) on that cartridge moved too: {}",
                             others.len(),
-                            others
-                                .iter()
-                                .map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            others.join(", ")
                         );
                     }
                 }

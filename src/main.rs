@@ -290,7 +290,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::catalog::run(&conn, &cfg, command, cli.json)?;
         }
         Commands::Location { ref command } => {
-            cli::location::run(&conn, command, cli.json)?;
+            cli::location::run(&conn, command, cli.json, cli.dry_run)?;
         }
         Commands::Cartridge { ref command } => {
             cli::cartridge::run(&conn, &cfg, command, cli.json, cli.yes, cli.dry_run)?;

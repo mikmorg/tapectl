@@ -536,16 +536,36 @@ pub fn run(
             }
         }
         CartridgeCommands::Move { barcode, to } => {
-            let outcome = crate::cli::location::move_cartridge(conn, barcode, to)?;
+            // Issue #230: `--dry-run` is global and was silently ignored
+            // here — the move committed. `move_together` now honours it and
+            // returns the outcome it WOULD have written, so the dry branch
+            // has the same facts to print as the real one: which cartridge,
+            // which destination, and every volume that would travel with
+            // it. Following `Relabel` above, the marker is emitted only in
+            // the dry branch, so the real run's output is unchanged.
+            let outcome = crate::cli::location::move_cartridge(conn, barcode, to, dry_run)?;
             if json_output {
+                let mut obj = serde_json::json!({
+                    "barcode": barcode,
+                    "location": to,
+                    "volumes_moved": outcome.volumes,
+                });
+                if dry_run {
+                    obj["dry_run"] = serde_json::json!(true);
+                }
+                println!("{obj}");
+            } else if dry_run {
                 println!(
-                    "{}",
-                    serde_json::json!({
-                        "barcode": barcode,
-                        "location": to,
-                        "volumes_moved": outcome.volumes,
-                    })
+                    "cartridge \"{barcode}\" would be moved to \"{to}\" \
+                     (DRY RUN — no changes made)"
                 );
+                match outcome.volumes.len() {
+                    0 => println!("  no volumes on this cartridge"),
+                    n => println!(
+                        "  {n} volume(s) would move with it: {}",
+                        outcome.volumes.join(", ")
+                    ),
+                }
             } else {
                 println!("cartridge \"{barcode}\" moved to \"{to}\"");
                 match outcome.volumes.len() {

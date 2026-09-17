@@ -134,13 +134,42 @@ fn cartridges_at(
     Ok(rows)
 }
 
-pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> Result<()> {
+/// Run a location subcommand.
+///
+/// `dry_run` is the global `--dry-run` (issue #230). `main.rs` never handed
+/// it to this dispatcher at all, so `location add`/`location rename`
+/// accepted the flag clap advertises on every subcommand and wrote the row
+/// anyway. `List`/`Info` are reads and have nothing to suppress.
+pub fn run(
+    conn: &Connection,
+    command: &LocationCommands,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
     match command {
         LocationCommands::Add {
             name,
             description,
             kind,
         } => {
+            // The dry branch reports the name and kind it would have
+            // inserted; there is no id to report, because an id is
+            // precisely the thing only a real INSERT can decide. Printed
+            // before any write so the real path below is unchanged.
+            if dry_run {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"name": name, "kind": kind, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "location \"{name}\" would be added (kind={kind}) \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
             conn.execute(
                 "INSERT INTO locations (name, description, kind) VALUES (?1, ?2, ?3)",
                 params![name, description, kind],
@@ -275,6 +304,23 @@ pub fn run(conn: &Connection, command: &LocationCommands, json_output: bool) -> 
                     |row| row.get(0),
                 )
                 .map_err(|_| TapectlError::Other(format!("location \"{current}\" not found")))?;
+            // After the lookup, before the UPDATE: a dry run must still
+            // refuse a location that does not exist, or the operator drops
+            // the flag expecting the rename to work.
+            if dry_run {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"old": current, "new": new, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "location \"{current}\" would be renamed to \"{new}\" \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
             conn.execute(
                 "UPDATE locations SET name = ?1 WHERE id = ?2",
                 params![new, id],
@@ -323,11 +369,24 @@ pub struct MoveOutcome {
 /// `volume_movements` gets a row per volume regardless of which command was
 /// used, so a volume's movement history does not depend on which noun the
 /// operator happened to type.
+///
+/// `dry_run` (issue #230) is honoured HERE rather than in the two `Move`
+/// arms, for the same reason there is only one mover: two dry-run gates
+/// would be two chances to disagree. The global `--dry-run` was accepted by
+/// both commands and ignored by both — the transaction below ran anyway.
+/// The early return sits immediately before that transaction and AFTER the
+/// destination lookup and the warehouse refusal, so a dry run still fails
+/// on a destination the real run would reject: a dry run that hides a
+/// refusal is worse than none, because the operator drops the flag
+/// expecting the move to work. `MoveOutcome` is built entirely from the
+/// arguments, so the answer a dry run prints is the same one the real run
+/// would have returned.
 fn move_together(
     conn: &Connection,
     cartridge: Option<(i64, String)>,
     volumes: &[(i64, String)],
     location_name: &str,
+    dry_run: bool,
 ) -> Result<MoveOutcome> {
     let (loc_id, loc_kind): (i64, String) = conn
         .query_row(
@@ -383,6 +442,16 @@ fn move_together(
              be moved into one — `location_id` records where to go to FETCH the \
              tape. {hint}"
         )));
+    }
+
+    // Issue #230: everything above this line is a lookup or a refusal, so a
+    // dry run has already surfaced every reason this move could fail. From
+    // here down it is all writes.
+    if dry_run {
+        return Ok(MoveOutcome {
+            cartridge: cartridge.map(|(_, barcode)| barcode),
+            volumes: volumes.iter().map(|(_, label)| label.clone()).collect(),
+        });
     }
 
     // One transaction: a cartridge recorded in a new place while its volumes
@@ -516,6 +585,7 @@ pub fn move_volume(
     conn: &Connection,
     volume_label: &str,
     location_name: &str,
+    dry_run: bool,
 ) -> Result<MoveOutcome> {
     let vol_id: i64 = conn
         .query_row(
@@ -540,13 +610,20 @@ pub fn move_volume(
             // Every volume on that cartridge, not just this one: they share
             // the medium, so they share the shelf.
             let volumes = mounted_volumes(conn, cart_id)?;
-            move_together(conn, Some((cart_id, barcode)), &volumes, location_name)
+            move_together(
+                conn,
+                Some((cart_id, barcode)),
+                &volumes,
+                location_name,
+                dry_run,
+            )
         }
         None => move_together(
             conn,
             None,
             &[(vol_id, volume_label.to_string())],
             location_name,
+            dry_run,
         ),
     }
 }
@@ -560,6 +637,7 @@ pub fn move_cartridge(
     conn: &Connection,
     barcode: &str,
     location_name: &str,
+    dry_run: bool,
 ) -> Result<MoveOutcome> {
     let cart_id: i64 = conn
         .query_row(
@@ -575,6 +653,7 @@ pub fn move_cartridge(
         Some((cart_id, barcode.to_string())),
         &volumes,
         location_name,
+        dry_run,
     )
 }
 
@@ -642,7 +721,7 @@ mod tests {
     #[test]
     fn move_refuses_a_warehouse_destination() {
         let conn = setup();
-        let err = move_volume(&conn, "L6-0001", "glacier")
+        let err = move_volume(&conn, "L6-0001", "glacier", false)
             .expect_err("a cartridge cannot be moved into cold cloud storage");
         let msg = err.to_string();
         assert!(
@@ -670,7 +749,7 @@ mod tests {
     #[test]
     fn move_to_a_shelf_still_succeeds_and_records_the_movement() {
         let conn = setup();
-        move_volume(&conn, "L6-0001", "home").expect("a shelf is a valid destination");
+        move_volume(&conn, "L6-0001", "home", false).expect("a shelf is a valid destination");
 
         let loc_name: String = conn
             .query_row(
@@ -737,7 +816,7 @@ mod tests {
     #[test]
     fn cartridge_move_moves_the_cartridge_and_every_volume_on_it() {
         let conn = setup_bound();
-        let outcome = move_cartridge(&conn, "A001L6", "home").unwrap();
+        let outcome = move_cartridge(&conn, "A001L6", "home", false).unwrap();
 
         assert_eq!(outcome.cartridge.as_deref(), Some("A001L6"));
         assert_eq!(outcome.volumes, vec!["L6-0001", "L6-0002"]);
@@ -772,7 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = move_cartridge(&conn, "A001L6", "home").unwrap();
+        let outcome = move_cartridge(&conn, "A001L6", "home", false).unwrap();
         assert_eq!(outcome.volumes, vec!["L6-0001"]);
         assert_eq!(
             location_of(&conn, "volumes", "label", "L6-0002"),
@@ -795,8 +874,8 @@ mod tests {
         )
         .unwrap();
 
-        move_cartridge(&conn, "A001L6", "home").unwrap();
-        move_cartridge(&conn, "A001L6", "bank").unwrap();
+        move_cartridge(&conn, "A001L6", "home", false).unwrap();
+        move_cartridge(&conn, "A001L6", "bank", false).unwrap();
 
         let old_value: Option<String> = conn
             .query_row(
@@ -820,7 +899,7 @@ mod tests {
     #[test]
     fn moving_an_unlocated_cartridge_logs_none_on_the_old_side() {
         let conn = setup_bound();
-        move_cartridge(&conn, "A001L6", "home").unwrap();
+        move_cartridge(&conn, "A001L6", "home", false).unwrap();
 
         let old_value: Option<String> = conn
             .query_row(
@@ -849,8 +928,8 @@ mod tests {
         )
         .unwrap();
 
-        move_volume(&conn, "L6-0001", "home").unwrap();
-        move_volume(&conn, "L6-0001", "bank").unwrap();
+        move_volume(&conn, "L6-0001", "home", false).unwrap();
+        move_volume(&conn, "L6-0001", "bank", false).unwrap();
 
         let (old_value, new_value): (Option<String>, Option<String>) = conn
             .query_row(
@@ -874,7 +953,7 @@ mod tests {
     #[test]
     fn volume_move_drags_the_cartridge_and_its_sibling_volume_along() {
         let conn = setup_bound();
-        let outcome = move_volume(&conn, "L6-0001", "home").unwrap();
+        let outcome = move_volume(&conn, "L6-0001", "home", false).unwrap();
 
         assert_eq!(outcome.cartridge.as_deref(), Some("A001L6"));
         assert_eq!(outcome.volumes, vec!["L6-0001", "L6-0002"]);
@@ -904,7 +983,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = move_volume(&conn, "L6-LONE", "home").unwrap();
+        let outcome = move_volume(&conn, "L6-LONE", "home", false).unwrap();
         assert!(outcome.cartridge.is_none());
         assert_eq!(outcome.volumes, vec!["L6-LONE"]);
         assert_eq!(
@@ -920,7 +999,7 @@ mod tests {
     #[test]
     fn cartridge_move_refuses_a_warehouse_destination() {
         let conn = setup_bound();
-        let err = move_cartridge(&conn, "A001L6", "glacier")
+        let err = move_cartridge(&conn, "A001L6", "glacier", false)
             .expect_err("a cartridge cannot be moved into cold cloud storage");
         assert!(
             err.to_string().contains("volume deposit add"),
@@ -943,7 +1022,7 @@ mod tests {
     #[test]
     fn an_unknown_location_names_the_known_ones() {
         let conn = setup_bound();
-        let err = move_cartridge(&conn, "A001L6", "hom").unwrap_err();
+        let err = move_cartridge(&conn, "A001L6", "hom", false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("glacier") && msg.contains("home"),
@@ -954,7 +1033,7 @@ mod tests {
     #[test]
     fn moving_an_unknown_cartridge_says_so() {
         let conn = setup_bound();
-        let err = move_cartridge(&conn, "NOPE", "home").unwrap_err();
+        let err = move_cartridge(&conn, "NOPE", "home", false).unwrap_err();
         assert!(err.to_string().contains("NOPE"));
     }
 
@@ -963,7 +1042,7 @@ mod tests {
     #[test]
     fn move_to_an_unknown_location_still_reports_not_found() {
         let conn = setup();
-        let err = move_volume(&conn, "L6-0001", "nowhere").expect_err("no such location");
+        let err = move_volume(&conn, "L6-0001", "nowhere", false).expect_err("no such location");
         assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
@@ -983,7 +1062,7 @@ mod tests {
             [],
         )
         .unwrap();
-        move_cartridge(&conn, "BC001", "home").unwrap();
+        move_cartridge(&conn, "BC001", "home", false).unwrap();
 
         let loc_id: i64 = conn
             .query_row("SELECT id FROM locations WHERE name = 'home'", [], |r| {
@@ -1008,7 +1087,7 @@ mod tests {
     #[test]
     fn cartridges_at_reports_the_current_volume_and_ignores_unmounted_ones() {
         let conn = setup_bound();
-        move_cartridge(&conn, "A001L6", "home").unwrap();
+        move_cartridge(&conn, "A001L6", "home", false).unwrap();
         conn.execute(
             "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
              WHERE volume_id = (SELECT id FROM volumes WHERE label = 'L6-0002')",
@@ -1071,7 +1150,7 @@ mod tests {
             [],
         )
         .unwrap();
-        move_cartridge(&conn, "BC001", "home").unwrap();
+        move_cartridge(&conn, "BC001", "home", false).unwrap();
 
         let rows = location_rows(&conn).unwrap();
         let home = rows.iter().find(|r| r.name == "home").unwrap();
