@@ -561,6 +561,43 @@ fn attest_escrow(
 /// diagnosis, because it is what a tenant key looks like from here, so it
 /// falls through to `operator_envelope_backup` (the redundant copy exists
 /// precisely for a damaged primary) before giving up.
+/// The HEIR's recipe, and the reason it is a function rather than an inline
+/// string: it names a command, a flag and a FILENAME, and all three are
+/// facts about other modules that can drift. Issue #214's sibling sweep
+/// found two of the three already wrong — `restore raw-volume` takes `--to`,
+/// not `--dest`, and the dumped file is named from the zone's own
+/// `type_label` (`restore_sh`), so `0002_restore_script.bin` never existed.
+///
+/// This message is printed when the supplied key opens no operator envelope,
+/// i.e. the operator key is gone and a tenant is recovering their own data
+/// with no catalog. It is read exactly once, mid-disaster, by someone who
+/// cannot ask anyone what the right spelling was.
+///
+/// The filename is DERIVED from `ZoneKind::RestoreSh::type_label()` and the
+/// `{:04}_{}.bin` shape `raw::dump` uses, so renaming the zone updates this
+/// message instead of silently re-breaking it.
+fn tenant_key_refusal_message() -> String {
+    // Position 2 is fixed by the format itself (`volume-format-v2.md`: 0 ID
+    // thunk, 1 system guide, 2 RESTORE.sh, 3 front index) and is pinned by
+    // `tests/on_tape_golden.rs`, so it is a literal. The LABEL is the half
+    // that drifted, so it is derived.
+    let restore_sh = format!(
+        "{:04}_{}.bin",
+        2,
+        crate::volume::layout_model::ZoneKind::RestoreSh.type_label()
+    );
+    format!(
+        "this key cannot open the operator envelope, so it is neither an \
+         operator key nor the escrow key.\n\n\
+         A tenant key restores that tenant's own data without a catalog at \
+         all: run RESTORE.sh from tape file 2 —\n\n    \
+         tapectl restore raw-volume --device DEV --to DIR\n    \
+         bash DIR/{restore_sh} --restore --unit UNIT --key KEYFILE --to DIR\n\n\
+         `catalog rebuild` reconstructs the operator's catalog and needs the \
+         operator's view of the tape."
+    )
+}
+
 fn open_all_envelopes(
     store: &mut dyn Store,
     entries: &[format::ParsedIndexEntry],
@@ -617,17 +654,7 @@ fn open_all_envelopes(
     }
 
     if operator_refused && !out.iter().any(|e| e.manifest.is_operator()) {
-        return Err(TapectlError::Other(
-            "this key cannot open the operator envelope, so it is neither an \
-             operator key nor the escrow key.\n\n\
-             A tenant key restores that tenant's own data without a catalog at \
-             all: run RESTORE.sh from tape file 2 —\n\n    \
-             tapectl restore raw-volume --device DEV --dest DIR\n    \
-             bash DIR/0002_restore_script.bin --restore --unit UNIT --key KEYFILE --to DIR\n\n\
-             `catalog rebuild` reconstructs the operator's catalog and needs the \
-             operator's view of the tape."
-                .to_string(),
-        ));
+        return Err(TapectlError::Other(tenant_key_refusal_message()));
     }
 
     Ok(out)
@@ -1472,10 +1499,13 @@ fn resolve_and_bind_cartridge(
                  barcode, with no chip serial to prove it, but this catalog already binds \
                  \"{}\" to {volume_s} {labels}, which {is_are} still live. Say the bytes are \
                  gone first (`tapectl volume retire <label>` or `tapectl cartridge \
-                 mark-erased {}`), or re-run naming the cartridge that really holds this \
-                 tape's data. There is no --force for this — it is a fact tapectl cannot \
-                 resolve on its own, not a risk to accept.",
-                resolved.barcode, resolved.barcode, resolved.barcode
+                 mark-erased {}`), or, if the registered row is a DIFFERENT physical \
+                 cartridge that merely wears the same sticker, free the barcode with \
+                 `tapectl cartridge relabel {} <new-barcode>` so this rebuild can \
+                 register the tape's own. `catalog rebuild` has no flag that names a \
+                 cartridge, so there is no third route. There is no --force for this — \
+                 it is a fact tapectl cannot resolve on its own, not a risk to accept.",
+                resolved.barcode, resolved.barcode, resolved.barcode, resolved.barcode
             )));
         }
     }
@@ -1919,6 +1949,44 @@ mod tests {
     /// by construction, and `decide_fresh_write_contact` refuses an
     /// `AlreadySealed` contact regardless of `--force`, ADR-0003), so the
     /// substring must not appear.
+    /// The tenant-key refusal at `open_all_envelopes` is the HEIR's recipe:
+    /// the operator key is gone, and this two-line message is how a tenant
+    /// gets their own data back without a catalog. Both lines were wrong
+    /// (issue #214's sibling sweep): `restore raw-volume` takes `--to`, not
+    /// `--dest`, and `raw.rs` names the dumped file from the zone's own
+    /// `type_label`, which is `restore_sh` — so `0002_restore_script.bin`
+    /// never existed. A recipe read mid-disaster failed at step one.
+    ///
+    /// Derived, not transcribed: the filename is built from
+    /// `ZoneKind::RestoreSh.type_label()` and the same `{:04}_{}.bin` shape
+    /// `raw.rs` uses, so renaming the zone breaks this test rather than
+    /// silently re-breaking the heir.
+    #[test]
+    fn the_tenant_key_refusal_names_the_file_raw_volume_actually_writes() {
+        let label = crate::volume::layout_model::ZoneKind::RestoreSh.type_label();
+        let expected = format!("{:04}_{}.bin", 2, label);
+
+        let err = super::tenant_key_refusal_message();
+
+        assert!(
+            err.contains(&expected),
+            "the heir recipe must name the file `restore raw-volume` writes \
+             ({expected}), got: {err}"
+        );
+        assert!(
+            !err.contains("0002_restore_script.bin"),
+            "the stale filename must not come back: {err}"
+        );
+        assert!(
+            err.contains("--to DIR"),
+            "`restore raw-volume` takes --to, not --dest: {err}"
+        );
+        assert!(
+            !err.contains("--dest"),
+            "--dest is not a flag on any restore subcommand: {err}"
+        );
+    }
+
     #[test]
     fn mam_identity_collision_names_cartridge_edit_not_volume_init() {
         let conn = crate::db::open_memory().unwrap();

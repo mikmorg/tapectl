@@ -659,10 +659,13 @@ fn resolve_or_register_cartridge(
                          loaded, or a different one whose sticker happens to read the \
                          same. It will not guess.\n\
                          \n\
-                         If it IS this cartridge, name it so the serial is recorded \
-                         onto the existing row:\n    \
-                         tapectl volume init <label> --device <dev> --cartridge {s}\n\
-                         (`volume write` has no --cartridge, so do this at init.)\n\
+                         If it IS this cartridge, record that on the row, then \
+                         re-run this command:\n    \
+                         tapectl cartridge edit \"{s}\" --serial {s}\n\
+                         (That writes the OPERATOR's claim, which this lookup then \
+                         finds and the chip's own reading confirms. Unlike \
+                         `--cartridge`, it works from `volume write` too, which has \
+                         no such flag — issue #214.)\n\
                          \n\
                          If it is a DIFFERENT cartridge, give the registered one a \
                          barcode of its own and retry:\n    \
