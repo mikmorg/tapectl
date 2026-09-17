@@ -64,9 +64,11 @@ pub enum CollectionCommands {
         device: Option<String>,
     },
 
-    /// Execute one batch: stage every unit in it once, write one session
-    /// per destination label, then release staging. Targets a single
-    /// collection (unlike `sync`/`status`/`plan`, which sweep every
+    /// Execute one batch: stage every unit in it once, write one session to
+    /// the destination label, then release staging IF that copy already
+    /// satisfies every unit's resolved `min_copies` — otherwise staging is
+    /// retained for the further copies still needed (issue #229). Targets a
+    /// single collection (unlike `sync`/`status`/`plan`, which sweep every
     /// configured collection) since a batch write is a real, one-shot tape
     /// action.
     Run {
@@ -83,8 +85,13 @@ pub enum CollectionCommands {
         #[arg(long, default_value = "0")]
         batch: usize,
         /// Destination volume label — already `volume init`'d on its own
-        /// cartridge. Repeat once per planned copy (e.g. `--label L1
-        /// --label L2` for two copies).
+        /// cartridge. Exactly one: tapectl drives no changer, so it cannot
+        /// write a second copy without a human swapping cartridges, and a
+        /// batch run has no point where that swap could happen. More than
+        /// one is refused (issue #229). For a second and further copy,
+        /// swap in the next cartridge after this run finishes and use
+        /// `tapectl volume write <label>` directly against the same
+        /// staged data.
         #[arg(long = "label")]
         labels: Vec<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
@@ -439,15 +446,38 @@ fn cmd_run(
                 "budget_from": budget.binding_label,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
-                "stage_sets_released": report.cleaned.sets_cleaned,
+                "staging_released": report.cleaned.is_some(),
+                "stage_sets_released": report.cleaned.as_ref().map_or(0, |c| c.sets_cleaned),
+                "under_copied": report.under_copied.iter().map(|p| serde_json::json!({
+                    "unit": p.unit_name,
+                    "copies": p.copies,
+                    "min_copies": p.min_copies,
+                })).collect::<Vec<_>>(),
             })
         );
     } else {
-        println!(
-            "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
-             written, {} stage set(s) released",
-            report.units_staged, report.copies_written, report.cleaned.sets_cleaned,
-        );
+        match &report.cleaned {
+            Some(cleaned) => println!(
+                "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
+                 written, {} stage set(s) released",
+                report.units_staged, report.copies_written, cleaned.sets_cleaned,
+            ),
+            None => {
+                println!(
+                    "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} \
+                     copy/copies written; staging RETAINED — not every unit meets its policy's \
+                     copy requirement yet:",
+                    report.units_staged, report.copies_written,
+                );
+                for p in &report.under_copied {
+                    println!(
+                        "    {}: {}/{} copies — swap in the next cartridge and run \
+                         `tapectl volume write <label>` to write another",
+                        p.unit_name, p.copies, p.min_copies,
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -158,6 +158,18 @@ pub struct DestinationBudget {
 /// size that fits every copy is one sized to the smallest destination — the
 /// largest or the first-named would silently overflow a smaller one.
 ///
+/// **This function still accepts N labels and still computes that minimum
+/// (ADR-0012's 2026-09-17 amendment, issue #229): the rule is unaffected by
+/// that amendment and stays, in case the one-label-per-run decision is ever
+/// revisited.** What changed is the caller: [`plan_for_run`] — the only
+/// production call site, and the one `cli::collection::cmd_run` actually
+/// uses — refuses more than one label BEFORE calling this function at all,
+/// so today this multi-label arithmetic is reachable only from a direct
+/// test call, never from the CLI. Do not move that refusal down into this
+/// function: doing so would make it impossible to exercise (or keep) the
+/// minimum-across-destinations logic at all, which is exactly what the
+/// amendment says not to delete.
+///
 /// Each `--label` is also checked here for write-targetness (issue #224),
 /// not just existence: `policy::coverage::is_write_target` is the declared
 /// sole owner of "may this volume be written?" (the issue #96/#187
@@ -261,6 +273,21 @@ pub fn destination_budget(
 /// `--label` or an empty `--label` list fails immediately, long before
 /// `batch::execute_batch` stages a single unit (hours of dar + age, a
 /// tape's worth of staging disk).
+///
+/// **More than one `--label` is refused HERE, before `destination_budget`
+/// runs at all** (ADR-0012's 2026-09-17 amendment, issue #229): `collection
+/// run` drives no changer, and nothing in the tree calls `mtx`/an
+/// autoloader — a second `--label` used to loop straight into a second
+/// `volume_write` against a device that still held the FIRST cartridge,
+/// which `binding::corroborate_volume` refused as `claim_mismatch_label`
+/// ("wrong tape ... There is no --force for this"). So the documented
+/// primary route to `min_copies = 2` could never complete. `len() > 1` also
+/// catches a duplicated label (`--label L1 --label L1`) for free: clap does
+/// not dedup a repeated `long`, so that used to slip through every check
+/// that follows. This refusal lives here and not inside
+/// [`destination_budget`] so that function's own minimum-across-
+/// destinations arithmetic stays reachable (and tested) even though no
+/// production caller can hand it more than one label today.
 pub fn plan_for_run(
     conn: &Connection,
     config: &Config,
@@ -268,6 +295,19 @@ pub fn plan_for_run(
     device: &str,
     labels: &[String],
 ) -> Result<(Vec<Batch>, DestinationBudget)> {
+    if labels.len() > 1 {
+        return Err(TapectlError::Other(format!(
+            "collection run: refuses more than one destination label ({} given: {}) — \
+             tapectl drives no changer, so writing a second copy needs a human to swap \
+             cartridges, and there is no point inside a `collection run` batch where \
+             that swap could happen. Run `collection run` with exactly one --label for \
+             the first copy; for each further copy your policy requires, swap in the \
+             next cartridge and run `tapectl volume write <label>` directly against the \
+             same staged data (issue #229).",
+            labels.len(),
+            labels.join(", "),
+        )));
+    }
     let budget = destination_budget(conn, config, device, labels)?;
     let batches = batches_for_budget(conn, config, lib, budget.bytes)?;
     Ok((batches, budget))
@@ -493,22 +533,32 @@ mod tests {
 
         let config = config_with_tiny_backend();
 
-        let (batches, budget) = plan_for_run(
+        // Calls `destination_budget` directly, NOT `plan_for_run`: since
+        // issue #229 (ADR-0012's 2026-09-17 amendment), `plan_for_run`
+        // refuses more than one `--label` before ever reaching this
+        // function, so this test's two labels would only ever exercise
+        // that refusal through the real entry point. The minimum-across-
+        // destinations arithmetic itself is unaffected by the amendment
+        // and stays (see `destination_budget`'s own doc comment) — this is
+        // that logic's regression test, run against the lower-level
+        // function that still carries it.
+        let budget = destination_budget(
             &conn,
             &config,
-            &lib,
             "/dev/null",
             &["big".to_string(), "small".to_string()],
         )
         .unwrap();
+        assert_eq!(budget.binding_label, "small");
+        assert_eq!(budget.binding_capacity_bytes, 4 * 1024 * 1024);
+        assert_eq!(budget.num_destinations, 2);
+
+        let batches = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
         assert_eq!(
             batches.len(),
             2,
             "the 4 MiB \"small\" destination is the binding constraint, not the 10 MiB \"big\" one"
         );
-        assert_eq!(budget.binding_label, "small");
-        assert_eq!(budget.binding_capacity_bytes, 4 * 1024 * 1024);
-        assert_eq!(budget.num_destinations, 2);
     }
 
     /// Issue #175: an unknown `--label` must fail before any unit is staged
@@ -854,6 +904,141 @@ mod tests {
         assert!(
             err.to_string().contains("testlib/huge"),
             "error must name the offending unit: {err}"
+        );
+    }
+
+    /// Issue #229 (ADR-0012's 2026-09-17 amendment): `collection run` drives
+    /// no changer, so a second `--label` always looped straight into a
+    /// second `volume_write` against a device that still held the FIRST
+    /// cartridge, which `binding::corroborate_volume` refused as
+    /// `claim_mismatch_label` — the documented primary route to
+    /// `min_copies = 2` could never complete. This must be refused HERE,
+    /// through `plan_for_run` (the entry point `cmd_run` actually calls),
+    /// before `batches_for_budget` ever runs the pending-unit filesystem
+    /// walk — proven, as with the unknown-label case above, by asserting
+    /// `snapshots` is untouched rather than merely matching the error.
+    #[test]
+    fn run_refuses_more_than_one_destination_label_before_staging() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        for label in ["L1", "L2"] {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+                 VALUES (?1, 'lto', 'p', ?2, 'initialized')",
+                params![label, 10 * 1024 * 1024_i64],
+            )
+            .unwrap();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+
+        let err = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string(), "L2".to_string()],
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("volume write"),
+            "refusal must name a next step that actually runs (issue #214): {msg}"
+        );
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "more than one destination label must fail before staging ever touches snapshots"
+        );
+    }
+
+    /// Issue #229's second finding on the same path: clap does not dedup a
+    /// repeated `long`, so `--label L1 --label L1` used to pass every check
+    /// that followed it (both labels resolve to the same, perfectly valid
+    /// write target). The `len() > 1` refusal above catches this for free —
+    /// this is the regression test proving it, not a second, redundant
+    /// dedup check.
+    #[test]
+    fn run_refuses_duplicate_destination_labels_via_the_same_path() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', ?1, 'initialized')",
+            [10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+
+        let err = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string(), "L1".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("volume write"), "{err}");
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a duplicated destination label must fail before staging ever touches snapshots"
         );
     }
 }

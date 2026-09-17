@@ -16,20 +16,37 @@
 //! unit-tested; the mhvtl e2e suite is what actually drives a device, and
 //! this workspace's guardrails forbid touching tape devices from here).
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
+use crate::policy::coverage::{copy_count_expr, CoverageQuery};
 use crate::staging::clean::CleanReport;
 
 use super::selector::Batch;
+
+/// One batch unit's copy count against its own resolved `min_copies`,
+/// computed AFTER this call's write(s) landed. Only populated when release
+/// did NOT happen (see [`BatchExecutionReport::cleaned`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyProgress {
+    pub unit_name: String,
+    pub copies: i64,
+    pub min_copies: i64,
+}
 
 /// Outcome of executing one batch.
 #[derive(Debug)]
 pub struct BatchExecutionReport {
     pub units_staged: usize,
     pub copies_written: usize,
-    pub cleaned: CleanReport,
+    /// `Some` when staging was released this call (every unit in the batch
+    /// now meets its own resolved `min_copies`); `None` when it was
+    /// deliberately retained — see [`under_copied_units`].
+    pub cleaned: Option<CleanReport>,
+    /// Non-empty exactly when `cleaned` is `None`: which units are still
+    /// short, and by how much.
+    pub under_copied: Vec<CopyProgress>,
 }
 
 /// Execute one batch: stage every unit once, write one session per
@@ -54,13 +71,27 @@ pub struct BatchExecutionReport {
 /// copy before retrying (same posture `volume_write` already takes for an
 /// unresolved session — see its own doc comment).
 ///
-/// Release (the last step) is exactly the existing GC guard
-/// (`staging::clean::clean_staging`, non-force): it independently
-/// re-checks, per stage_set, that every `writes` row is `'completed'`
-/// (`docs/design/v2-open-questions.md` §3.5) before removing anything, so
-/// calling it here needs no batch-scoped bookkeeping of its own — by the
-/// time this line runs, every copy in `copy_labels` sealed (or this
-/// function already returned), so this batch's stage_sets now qualify.
+/// Release (the last step) calls the existing GC guard
+/// (`staging::clean::clean_staging`, non-force) — but **only when every unit
+/// in this batch already has enough eligible copies to satisfy its own
+/// resolved `min_copies`** ([`under_copied_units`]). This gate did not
+/// exist before issue #229 and its absence was a real defect, not a
+/// theoretical one: `copy_labels` is now always exactly one label (`collection
+/// run` refuses more, `docs/adr/0012-...md`'s 2026-09-17 amendment), so this
+/// function writes ONE copy and returns. `clean_staging`'s non-force guard
+/// only checks that no `writes` row for a stage_set is non-`completed` — it
+/// has no notion of "more copies are still coming" — so with exactly one
+/// `completed` row it passes *vacuously*
+/// (`default_guard_cleans_when_the_only_planned_copy_completed` pins this).
+/// Calling it unconditionally here would release — and unlink — a unit's
+/// staged bytes the instant its first copy landed, even when policy wants a
+/// second, leaving nothing for the `tapectl volume write <label2>` this
+/// module's caller (`cli::collection::cmd_run`) now tells the operator to
+/// run next. So this function computes each unit's post-write copy count
+/// itself and only calls `clean_staging` when none are still short; a
+/// still-short batch retains ALL its staging (not merely the short units'),
+/// since `clean_staging`'s own selection is a global sweep with no
+/// batch-scoped filter to hand it — see [`under_copied_units`].
 pub fn execute_batch(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -151,12 +182,177 @@ pub fn execute_batch(
         )?;
     }
 
-    // Release staging: only reachable once every copy above sealed.
-    let cleaned = crate::staging::clean::clean_staging(conn, config, false)?;
+    // Release staging only when this batch's copy just sealed is enough:
+    // every unit in it must now meet its own resolved `min_copies` (issue
+    // #229's second half — see this function's doc comment and
+    // `under_copied_units` for why `clean_staging`'s own guard cannot tell
+    // this on its own).
+    let under_copied = under_copied_units(conn, config, batch)?;
+    let cleaned = if under_copied.is_empty() {
+        Some(crate::staging::clean::clean_staging(conn, config, false)?)
+    } else {
+        None
+    };
 
     Ok(BatchExecutionReport {
         units_staged: batch.units.len(),
         copies_written: copy_labels.len(),
         cleaned,
+        under_copied,
     })
+}
+
+/// Which of this batch's units still have fewer eligible copies than their
+/// own resolved `min_copies`, computed AFTER the write loop above landed.
+///
+/// Routed through `policy::coverage::copy_count_expr` — the declared sole
+/// owner of "how many copies does this unit have" (issue #96's derivation-
+/// discipline rule) — with the exact same call shape
+/// `collection::status::status_for_collection` already uses for its
+/// `under_copied` count, so the two surfaces cannot silently disagree about
+/// what "under-copied" means. `CoverageQuery::current_unit` compares the
+/// unit's CURRENT snapshot(s) against eligible (`sealed`) volumes; the write
+/// loop above promotes the snapshot this batch just wrote to `'current'` and
+/// its volume to `'sealed'` at seal/confirm time (`volume::session`), so a
+/// unit whose one-and-only copy this call just wrote is correctly counted
+/// here, not missed.
+fn under_copied_units(conn: &Connection, config: &Config, batch: &Batch) -> Result<Vec<CopyProgress>> {
+    let mut under = Vec::new();
+    for u in &batch.units {
+        let unit = crate::db::queries::get_unit_by_name(conn, &u.name)?.ok_or_else(|| {
+            TapectlError::Other(format!(
+                "execute_batch: unit \"{}\" is missing from the catalog right after its \
+                 own batch wrote it — the catalog is inconsistent",
+                u.name
+            ))
+        })?;
+        let resolved = crate::policy::resolve(conn, config, &unit)?;
+        let sql = format!(
+            "SELECT {}",
+            copy_count_expr(&CoverageQuery::current_unit("?1"))
+        );
+        let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
+        if copies < resolved.min_copies {
+            under.push(CopyProgress {
+                unit_name: u.name.clone(),
+                copies,
+                min_copies: resolved.min_copies,
+            });
+        }
+    }
+    Ok(under)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collection::selector::PendingUnit;
+    use crate::config::Config;
+    use crate::db;
+    use rusqlite::params;
+
+    /// Seeds one active unit with exactly one `completed` write on a
+    /// `sealed` volume — the DB state left behind right after
+    /// `execute_batch`'s write loop lands a single copy (`volume::session`
+    /// promotes the just-written snapshot to `'current'` and its volume to
+    /// `'sealed'` at seal/confirm). Returns the unit's row id (unused by
+    /// callers today, kept for a future test that wants it).
+    fn seed_unit_with_one_completed_copy(conn: &Connection, unit_name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status) \
+             VALUES (?1, ?1, (SELECT id FROM tenants WHERE name = 'media'), 'mtime_size', 1, 'active')",
+            params![unit_name],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size) \
+             VALUES (?1, 1, 'current', '/tmp', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES (?1, 'lto', 'p', 10485760, 'sealed')",
+            params![format!("V-{unit_name}")],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) \
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, volume_id],
+        )
+        .unwrap();
+        unit_id
+    }
+
+    fn one_unit_batch(name: &str) -> Batch {
+        Batch {
+            units: vec![PendingUnit {
+                name: name.into(),
+                size_bytes: 10,
+            }],
+            total_bytes: 10,
+            padded_bytes: 10,
+        }
+    }
+
+    /// Issue #229, change 7: a collection whose units resolve `min_copies =
+    /// 1` (the config default) must still read as fully covered by the ONE
+    /// copy `execute_batch` just wrote — this is the existing, correct
+    /// behaviour the fix below must not break.
+    #[test]
+    fn under_copied_units_is_empty_when_min_copies_one_is_already_met() {
+        let conn = db::open_memory().unwrap();
+        seed_unit_with_one_completed_copy(&conn, "testlib/alpha");
+
+        let mut config = Config::default();
+        config.defaults.min_copies_for_tape_only = 1;
+
+        let batch = one_unit_batch("testlib/alpha");
+
+        let under = under_copied_units(&conn, &config, &batch).unwrap();
+        assert!(
+            under.is_empty(),
+            "one completed copy must satisfy min_copies=1: {under:?}"
+        );
+    }
+
+    /// Issue #229's second half (the pre-existing defect the ruling
+    /// exposed): a unit whose resolved `min_copies` is 2 is NOT satisfied
+    /// by the one copy `execute_batch` just wrote. Before this fix,
+    /// `execute_batch` called `clean_staging(force = false)`
+    /// unconditionally right after that same single write, and the
+    /// non-force guard passed vacuously (exactly one `writes` row, and it
+    /// is `'completed'`) — so the staged bytes were released regardless of
+    /// policy.
+    #[test]
+    fn under_copied_units_reports_progress_when_min_copies_two_is_not_yet_met() {
+        let conn = db::open_memory().unwrap();
+        seed_unit_with_one_completed_copy(&conn, "testlib/alpha");
+
+        let mut config = Config::default();
+        config.defaults.min_copies_for_tape_only = 2;
+
+        let batch = one_unit_batch("testlib/alpha");
+
+        let under = under_copied_units(&conn, &config, &batch).unwrap();
+        assert_eq!(under.len(), 1, "{under:?}");
+        assert_eq!(under[0].unit_name, "testlib/alpha");
+        assert_eq!(under[0].copies, 1);
+        assert_eq!(under[0].min_copies, 2);
+    }
 }
