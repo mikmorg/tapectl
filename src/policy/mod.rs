@@ -44,12 +44,15 @@ pub struct ResolvedPolicy {
 /// 2. Archive set (from DB via unit.archive_set_id)
 /// 3. System defaults (from config.toml)
 ///
-/// Returns `Err` if the unit dotfile's own `[policy] slice_size` (the only
-/// layer parsed at USE time, not at config load — see below) is not a valid
-/// size string (issue #59). `config.defaults.slice_size` and any
-/// `archive_sets.slice_size` are already validated at config load /
-/// archive-set write time respectively, so in practice this can only fail on
-/// a bad operator-authored dotfile value.
+/// Returns `Err` if the unit dotfile's own `[policy]` section (the only
+/// layer parsed at USE time, not at config load — see below) is not valid:
+/// an invalid `slice_size` string (issue #59), or an unrecognized `[policy]`
+/// key (issue #211 — `PolicySection`'s `#[serde(deny_unknown_fields)]`
+/// refuses a misspelled key by name instead of silently deferring upward
+/// forever). `config.defaults.slice_size` and any `archive_sets.slice_size`
+/// are already validated at config load / archive-set write time
+/// respectively, so in practice this can only fail on a bad operator-
+/// authored dotfile value.
 ///
 /// **Every layer now fails loudly rather than falling through (issue #105.)**
 /// Each layer used to be wrapped in `if let Ok(..)`, so a database error, a
@@ -236,15 +239,37 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                             dotfile_path.display()
                         ),
                     })?;
-            if let Some(pol) = toml.get("policy").and_then(|v| v.as_table()) {
-                if let Some(v) = pol.get("checksum_mode").and_then(|v| v.as_str()) {
-                    policy.checksum_mode = v.to_string();
+            if let Some(pol_value) = toml.get("policy") {
+                // Issue #211: deserialize straight into `PolicySection`
+                // instead of hand-picking keys off the raw table. That
+                // struct carries `#[serde(deny_unknown_fields)]`, so a
+                // misspelled or non-existent key (`slize_size`, `min_copies`
+                // -- the latter belongs to an archive_set, never a unit
+                // dotfile) is refused by name here, at the highest-priority
+                // layer, instead of silently deferring upward forever
+                // (ADR-0012). This is the SAME struct `read_dotfile` uses,
+                // so the two paths can never disagree about what a
+                // dotfile's `[policy]` table may contain.
+                let section: crate::unit::dotfile::PolicySection = pol_value
+                    .clone()
+                    .try_into()
+                    .map_err(|e: toml::de::Error| TapectlError::PolicyUnresolvable {
+                        layer: PolicyLayer::Dotfile,
+                        detail: format!(
+                            "unit \"{}\" has an invalid [policy] section in {} ({e})",
+                            unit.name,
+                            dotfile_path.display()
+                        ),
+                    })?;
+
+                if let Some(v) = section.checksum_mode {
+                    policy.checksum_mode = v;
                 }
-                if let Some(v) = pol.get("compression").and_then(|v| v.as_str()) {
-                    policy.compression = v.to_string();
+                if let Some(v) = section.compression {
+                    policy.compression = v;
                 }
-                if let Some(v) = pol.get("slice_size").and_then(|v| v.as_str()) {
-                    policy.slice_size = crate::staging::parse_size_to_bytes(v).map_err(|e| {
+                if let Some(v) = section.slice_size {
+                    policy.slice_size = crate::staging::parse_size_to_bytes(&v).map_err(|e| {
                         TapectlError::PolicyUnresolvable {
                             layer: PolicyLayer::Dotfile,
                             detail: format!(
@@ -255,14 +280,12 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         }
                     })?;
                 }
-                // ADR-0006 / issue #73. Read straight off the TOML
-                // table, like every other dotfile knob here: absent
-                // means "defer to the archive set", so there is
-                // deliberately no default filled in anywhere on the
-                // way in (issue #92 -- a filled default is
-                // indistinguishable from an operator choice and
-                // would silently outrank the archive set).
-                if let Some(v) = pol.get("warehouse_copies").and_then(|v| v.as_integer()) {
+                // ADR-0006 / issue #73. Absent means "defer to the archive
+                // set", so there is deliberately no default filled in
+                // anywhere on the way in (issue #92 -- a filled default is
+                // indistinguishable from an operator choice and would
+                // silently outrank the archive set).
+                if let Some(v) = section.warehouse_copies {
                     policy.warehouse_copies = v;
                 }
             }
@@ -526,5 +549,106 @@ slice_size = "500M"
             "corrupt required_locations must not silently resolve to \"none required\"",
         );
         assert!(err.to_string().contains("required_locations"), "got: {err}");
+    }
+
+    /// Issue #211: `PolicySection`'s `#[serde(deny_unknown_fields)]` (via
+    /// `policy::resolve`'s dotfile layer) must refuse a misspelled or
+    /// nonexistent `[policy]` key by name -- not silently ignore it and
+    /// defer upward to the archive set/defaults as though the operator had
+    /// never written it.
+    #[test]
+    fn resolve_rejects_an_unknown_dotfile_policy_key() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\nslize_size = \"500M\"\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        let err = resolve(&conn, &config, &unit).expect_err(
+            "a misspelled [policy] key must not silently defer to the archive set/defaults \
+             (issue #211) -- it must be refused by name",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".tapectl-unit.toml"),
+            "the error must name the file the operator has to fix; got: {msg}"
+        );
+    }
+
+    /// Issue #211, the `min_copies` variant named explicitly in the
+    /// evidence: a real archive_set-level field, plausible to copy into a
+    /// unit dotfile by mistake, is not a legal `[policy]` key there either
+    /// and must be refused the same way.
+    #[test]
+    fn resolve_rejects_min_copies_in_a_dotfile_policy_table() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\nmin_copies = 5\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        resolve(&conn, &config, &unit).expect_err(
+            "min_copies is an archive_set field, not a unit dotfile [policy] key -- it \
+             must be refused, not silently ignored (issue #211)",
+        );
+    }
+
+    /// The rule #211 must NOT break (issue #92): a dotfile can be PRESENT
+    /// with a `[policy]` table that sets some keys and leaves others
+    /// completely absent. An absent key is a legitimate choice not to
+    /// override anything, and must keep deferring upward in silence --
+    /// unknown-key rejection must never be confused with "this field was
+    /// never set." This is the regression guard that matters most: if it
+    /// starts failing, the fix has resurrected the #92 bug one field at a
+    /// time.
+    #[test]
+    fn resolve_leaves_absent_dotfile_policy_keys_deferring_upward() {
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO archive_sets (name, compression, checksum_mode, warehouse_copies) \
+             VALUES ('media', 'lzma', 'sha256', 3)",
+            [],
+        )
+        .unwrap();
+        let as_id = conn.last_insert_rowid();
+
+        let tmp = TempDir::new().unwrap();
+        // Sets ONLY compression. checksum_mode, slice_size and
+        // warehouse_copies are all absent from this table and must defer to
+        // the archive set, not error and not silently fill a default.
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\ncompression = \"gzip\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let unit = make_unit(Some(as_id), Some(tmp.path().to_str().unwrap().to_string()));
+        let p = resolve(&conn, &config, &unit).expect(
+            "a dotfile present with SOME [policy] keys set and others left absent must \
+             still resolve -- an absent key is a legitimate silence, not an error (#92)",
+        );
+
+        assert_eq!(
+            p.compression, "gzip",
+            "the key that WAS set in the dotfile wins (dotfile > archive_set)"
+        );
+        assert_eq!(
+            p.checksum_mode, "sha256",
+            "the ABSENT checksum_mode key must defer to the archive set, not error and \
+             not silently pick a filled-in default"
+        );
+        assert_eq!(
+            p.warehouse_copies, 3,
+            "the ABSENT warehouse_copies key must defer to the archive set too"
+        );
     }
 }

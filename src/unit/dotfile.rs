@@ -78,18 +78,27 @@ struct UnitSection {
     archive_set: Option<String>,
 }
 
+/// `pub(crate)` (issue #211): `policy::resolve` deserializes a dotfile's
+/// `[policy]` sub-table straight into this type -- rather than hand-picking
+/// keys off a raw `toml::Table` the way it used to -- so `#[serde(deny_unknown_fields)]`
+/// below is the ONE definition of what a dotfile's `[policy]` table may
+/// contain, enforced identically by `read_dotfile` and by the resolver. A
+/// misspelled key (`slize_size`, `min_copies`, anything not one of the four
+/// fields here) is refused by name instead of silently deferring upward
+/// forever (ADR-0012).
 #[derive(Default, Serialize, Deserialize)]
-struct PolicySection {
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicySection {
     #[serde(skip_serializing_if = "Option::is_none")]
-    checksum_mode: Option<String>,
+    pub(crate) checksum_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    compression: Option<String>,
+    pub(crate) compression: Option<String>,
     /// Issue #212. No `#[serde(default)]` -- see `warehouse_copies` below.
     #[serde(skip_serializing_if = "Option::is_none")]
-    slice_size: Option<String>,
+    pub(crate) slice_size: Option<String>,
     /// No `#[serde(default)]` -- see `UnitDotfile::warehouse_copies`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    warehouse_copies: Option<i64>,
+    pub(crate) warehouse_copies: Option<i64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
