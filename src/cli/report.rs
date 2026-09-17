@@ -538,7 +538,18 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
 pub(crate) type CopyRow = (String, i64, i64, Option<String>, i64);
 
 pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<CopyRow>> {
-    let sealed = crate::policy::coverage::eligible("v");
+    let eligible = crate::policy::coverage::eligible("v");
+    // Issue #236 finding 2: this label is "tapes holding any version", the
+    // same physical-inventory question `policy::escrow`'s coverage query
+    // asks of the SAME volume (`in_service`, not `eligible`) -- so a volume
+    // that is `active`/`full` but not yet `sealed` still shows up here,
+    // exactly where the escrow line three lines below already names it.
+    // Using `eligible` (sealed-only) here silently dropped those volumes,
+    // producing `[tapes holding any version: -]` directly above an escrow
+    // line naming the tape that holds it. A label not currently `eligible`
+    // (ADR-0004 -- it does not count as a COPY) is marked `*` so the two
+    // numbers above never look like they agree when they do not.
+    let in_service = crate::policy::coverage::in_service("v");
     let scope = crate::policy::coverage::CoverageQuery::current_unit("u.id");
     // Copies/locations/deposits come from the shared deposit-aware
     // expressions (issue #73). The LEFT JOIN chain survives only for
@@ -549,7 +560,9 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
         "SELECT u.name,
                 {} as copies,
                 {} as locations,
-                GROUP_CONCAT(DISTINCT CASE WHEN {sealed} THEN v.label END) as volumes,
+                GROUP_CONCAT(DISTINCT CASE WHEN {in_service} THEN
+                    v.label || CASE WHEN {eligible} THEN '' ELSE '*' END
+                END) as volumes,
                 {} as deposits
          FROM units u",
         crate::policy::coverage::copy_count_expr(&scope),
@@ -615,12 +628,27 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
             // unit with two singly-copied versions rendered as
             // "1 copies ... [L6-0001,L6-0002]" — self-contradicting at a
             // glance. The list is labelled for what it is.
+            //
+            // Issue #236 finding 2: the label promises "any version", so the
+            // query behind it (`copies_rows`) uses the same `in_service`
+            // predicate `policy::escrow`'s coverage line below uses for the
+            // SAME volume, not the narrower `eligible` (sealed-only) this
+            // used to filter through. A label suffixed `*` is in the list
+            // but not currently ADR-0004-eligible (not sealed), so it does
+            // not count toward `copies` above -- called out once, after the
+            // list, rather than silently dropped.
+            let vols_str = vols.as_deref().unwrap_or("-");
             println!(
-                "  {name}: {copies} {}{}, {locs} {} [tapes holding any version: {}]",
+                "  {name}: {copies} {}{}, {locs} {} [tapes holding any version: {}]{}",
                 if *copies == 1 { "copy" } else { "copies" },
                 warehouse_note(*deposits),
                 if *locs == 1 { "location" } else { "locations" },
-                vols.as_deref().unwrap_or("-")
+                vols_str,
+                if vols_str.contains('*') {
+                    " (* not sealed -- does not count toward copies)"
+                } else {
+                    ""
+                }
             );
             // A copy the current escrow key cannot open still counts as a
             // copy — it is real data on a real cartridge — so this is a note
@@ -2171,6 +2199,38 @@ mod tests {
             assert!(
                 !volumes.contains("rep-label-list-OTHER"),
                 "the quarantined volume must not be listed: {volumes}"
+            );
+        }
+
+        /// Issue #236 finding 2: the label promises "tapes holding ANY
+        /// version", but the query used to filter that list through
+        /// `eligible` (sealed-only) -- the SAME narrower predicate `copies`
+        /// itself already uses, not the wider `in_service` question the
+        /// escrow line three lines below asks of the SAME volume. A `full`
+        /// volume (ADR-0011's legacy sealed-equivalent: `in_service` but not
+        /// `eligible`) genuinely holds a version and must appear, marked so
+        /// it is visibly not counted -- not be silently dropped the way a
+        /// `quarantined`/`retired`/`erased` volume correctly still is
+        /// (`copies_rows_volume_label_list_excludes_a_non_sealed_volume`
+        /// above pins that those stay excluded under `in_service` too).
+        #[test]
+        fn copies_rows_volume_label_list_includes_a_full_volume_marked_not_eligible() {
+            let conn = setup_unit_with_two_volumes("rep-full", "full");
+            let rows = copies_rows(&conn, Some("rep-full")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].1, 1,
+                "a `full` second volume must not count as a copy"
+            );
+            let volumes = rows[0].3.as_deref().unwrap_or("");
+            assert!(
+                volumes.contains("rep-full-SEALED"),
+                "the sealed volume must still be listed: {volumes}"
+            );
+            assert!(
+                volumes.contains("rep-full-OTHER*"),
+                "the `full` volume must be listed too, marked `*` since it is not \
+                 eligible: {volumes}"
             );
         }
 
