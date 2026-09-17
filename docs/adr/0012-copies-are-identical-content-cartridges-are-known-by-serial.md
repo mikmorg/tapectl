@@ -246,10 +246,25 @@ volume stop counting as a copy, a false quarantine silently takes real coverage 
 A bad drive could condemn a library one cartridge at a time.
 
 **Ruled:** a failed verify quarantines **only** on a failure that proves the medium is
-bad — a checksum mismatch, or an unreadable block at a position the layout says carries
-data. Drive and transport errors are reported and do **not** quarantine; they leave the
-volume exactly as it was, because "we could not read it today" is not "the bytes are
-gone". The distinction must be visible in what `volume verify` prints and in its
+bad — **a checksum mismatch: bytes that came back and hashed wrong.** Drive and
+transport errors are reported and do **not** quarantine; they leave the volume exactly as
+it was, because "we could not read it today" is not "the bytes are gone".
+
+*Correction 2026-09-17, same day, during implementation (issue #239).* This sentence
+originally read "a checksum mismatch, **or an unreadable block at a position the layout
+says carries data**" — which contradicts the sentence immediately after it, because an
+unreadable block at a data position is precisely how a drive or transport error
+manifests. The two clauses gave opposite answers for the same event, and the worker
+implementing the rule found the contradiction rather than silently picking a side.
+
+The resolution keeps the sentence that expresses the DECISION's purpose. `chain_walk`
+produces the same `ContentHashMismatch` from three different situations: a genuine hash
+disagreement, a raw `Err` from the read, and a short read. Only the first is evidence
+about the medium. The other two are now `ContentUnreadable`, which does not quarantine —
+matching the reasoning already written on the `FrontIndexUnreadable` arm, which rules on
+the identical event at a different tape position: neither a read error nor a short read
+distinguishes a bad tape from a dirty drive, a wrong block size, or a transient SCSI
+error. The distinction must be visible in what `volume verify` prints and in its
 `--json`, so an operator can tell "this tape is bad" from "this drive could not read
 it".
 
