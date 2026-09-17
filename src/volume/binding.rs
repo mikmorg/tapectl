@@ -1027,28 +1027,23 @@ pub(crate) fn mount_and_record(
 ///   serial there is nothing to bind to and the volume is written unbound.
 /// - `generation` — used only when auto-registering, and only to record the
 ///   detected generation's OWN native capacity onto the new row's
-///   `nominal_capacity` (ADR-0010 decision 3, issue #183) — never the
-///   caller's resolved `capacity_bytes`, which is `volumes.capacity_bytes`'s
-///   value alone.
-/// - `capacity_bytes` — the caller's already-resolved capacity (the one
-///   [`crate::media::resolve_capacity`] returned, which may be a drive
-///   `capacity_override`). Kept as a parameter for call-site stability; it
-///   no longer feeds anything binding.rs writes.
+///   `nominal_capacity` (ADR-0010 decision 3, issue #183) — never any
+///   caller-resolved figure; `volumes.capacity_bytes` is written by
+///   `volume_write` alone, from a value this function never sees (its own
+///   dead `capacity_bytes` parameter was dropped, issue #202).
 ///
 /// A thin composition of [`resolve_or_register_cartridge`] +
 /// [`mount_and_record`] (issue #165 item 2): resolve or auto-register, then
 /// mount with `displaced_by = "volume init"` and `update_status = true`,
 /// unconditionally — `bind_late` calls this too, so its own late binding also
-/// reports as `` `volume init` ``, exactly as it always has. Signature and
-/// behaviour are unchanged by the split; every test below still drives this
-/// one function.
+/// reports as `` `volume init` ``, exactly as it always has. Behaviour is
+/// unchanged by the split; every test below still drives this one function.
 pub(crate) fn bind_cartridge(
     conn: &Connection,
     volume_id: i64,
     row: Option<&CartridgeRow>,
     serial: Option<&str>,
     generation: Generation,
-    _capacity_bytes: i64,
     mam: &MamInfo,
 ) -> Result<BindOutcome> {
     let Some(resolved) = resolve_or_register_cartridge(conn, row, serial, generation, mam)? else {
@@ -2053,7 +2048,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2098,7 +2092,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2142,7 +2135,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2217,7 +2209,6 @@ mod tests {
             found.row.as_ref(),
             serial,
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2362,7 +2353,6 @@ mod tests {
             found.row.as_ref(),
             None,
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2438,7 +2428,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .expect("a witnessed binding must never refuse (ADR-0010)");
@@ -2468,7 +2457,6 @@ mod tests {
             None,
             None,
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2495,7 +2483,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2513,7 +2500,6 @@ mod tests {
             found.row.as_ref(),
             None,
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2538,7 +2524,6 @@ mod tests {
             None,
             Some("E01001L8_1775794348"),
             Generation::Lto8,
-            12_000_000_000_000,
             &mam,
         )
         .unwrap();
@@ -2586,14 +2571,15 @@ mod tests {
         // ADR-0010 decision 3's precedence ladder puts a drive
         // `capacity_override` ABOVE the cartridge row — "the drive lies, as
         // mhvtl does" — precisely so `resolve_capacity` can hand `volume
-        // init` a fiction for THAT VOLUME. `capacity_bytes` here is exactly
-        // what `volume_write` passes to `bind_cartridge`: the RESOLVED
-        // figure, which with an override in force is the override, not the
-        // generation table. Auto-registering a brand-new cartridge row must
-        // not copy that resolved figure into `nominal_capacity` — the row
-        // describes the plastic, and the next init on a drive with no
-        // override at all must not read the first drive's lie back as an
-        // operator declaration (issue #183).
+        // init` a fiction for THAT VOLUME. That resolved figure never
+        // reaches `bind_cartridge` at all (its dead `capacity_bytes`
+        // parameter was removed, issue #202): auto-registering a brand-new
+        // cartridge row must not copy a drive's resolved/overridden figure
+        // into `nominal_capacity` — the row describes the plastic, and the
+        // next init on a drive with no override at all must not read the
+        // first drive's lie back as an operator declaration (issue #183).
+        // `override_bytes` below stands in for that never-passed resolved
+        // figure purely as a comparison value.
         let conn = db::open_memory().unwrap();
         let vol = new_volume(&conn, "L8-0001");
         let mam = MamInfo {
@@ -2608,7 +2594,6 @@ mod tests {
             None,
             Some("E01001L8_1775794348"),
             Generation::Lto8,
-            override_bytes,
             &mam,
         )
         .unwrap();
@@ -2658,7 +2643,6 @@ mod tests {
             None,
             Some("E01001L8_1775794348"),
             Generation::Lto8,
-            override_bytes,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2690,7 +2674,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2732,7 +2715,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &mam,
         )
         .unwrap();
@@ -2762,7 +2744,6 @@ mod tests {
             None,
             Some("E01001L8_1775794348"),
             Generation::Lto8,
-            12_000_000_000_000,
             &MamInfo::default(), // no load_count -- this drive/read did not report one
         )
         .unwrap();
@@ -2801,7 +2782,6 @@ mod tests {
             row1.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo {
                 load_count: Some(3),
                 ..MamInfo::default()
@@ -2820,7 +2800,6 @@ mod tests {
             row2.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo {
                 load_count: Some(5),
                 ..MamInfo::default()
@@ -2865,7 +2844,6 @@ mod tests {
             row1.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo {
                 load_count: Some(9),
                 ..MamInfo::default()
@@ -2881,7 +2859,6 @@ mod tests {
             row2.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(), // this contact's read reported none
         )
         .unwrap();
@@ -2926,7 +2903,6 @@ mod tests {
                 found.row.as_ref(),
                 Some("SER-1"),
                 Generation::Lto6,
-                2_500_000_000_000,
                 &MamInfo::default(),
             )
             .expect("binding must never refuse (ADR-0010)");
@@ -2961,7 +2937,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -2997,7 +2972,6 @@ mod tests {
             None,
             Some("E01001L8_1775794348"),
             Generation::Lto8,
-            12_000_000_000_000,
             &mam,
         ) {
             Ok(_) => panic!("a barcode collision must be refused, not silently bound"),
@@ -3056,7 +3030,6 @@ mod tests {
             Some(&row),
             Some("SER-2"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -3132,7 +3105,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();
@@ -3145,7 +3117,6 @@ mod tests {
             found.row.as_ref(),
             Some("SER-1"),
             Generation::Lto6,
-            2_500_000_000_000,
             &MamInfo::default(),
         )
         .unwrap();

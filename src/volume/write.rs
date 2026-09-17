@@ -352,7 +352,6 @@ pub fn volume_init(
         lookup.row.as_ref(),
         serial,
         generation,
-        nominal_capacity,
         &det.mam,
     )?;
     events::log_created(&tx, "volume", volume_id, label, None)?;
@@ -589,7 +588,6 @@ fn bind_late(
         lookup.row.as_ref(),
         Some(serial),
         generation,
-        nominal_capacity,
         &det.mam,
     )?;
     tx.commit()?;
