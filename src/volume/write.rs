@@ -518,7 +518,6 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
 /// half of the ladder: match a registered row by serial, else auto-register
 /// one whose barcode IS the serial. ADR-0011's `refuse_retired` applies
 /// here for the same reason it applies at init.
-#[allow(clippy::too_many_arguments)] // conn + volume identity + the three ADR-0010 facts
 fn bind_late(
     conn: &Connection,
     volume_id: i64,
@@ -526,7 +525,6 @@ fn bind_late(
     det: &crate::tape::media_detect::Detected,
     volume_media_type: Option<&str>,
     drive_generation: &str,
-    nominal_capacity: i64,
 ) -> Result<()> {
     let Some(serial) = det.mam.serial.as_deref() else {
         return Ok(());
@@ -1116,7 +1114,6 @@ pub fn volume_write(
         &det,
         volume_media_type.as_deref(),
         &backend.generation,
-        nominal_capacity,
     )?;
 
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
@@ -6219,15 +6216,7 @@ mod tests {
         }
 
         fn call(conn: &Connection, vol_id: i64, det: &Detected) -> Result<()> {
-            bind_late(
-                conn,
-                vol_id,
-                "L6-0001",
-                det,
-                Some("LTO-6"),
-                "LTO-6",
-                2_500_000_000_000,
-            )
+            bind_late(conn, vol_id, "L6-0001", det, Some("LTO-6"), "LTO-6")
         }
 
         /// The headline: a serial readable now auto-registers a cartridge
@@ -6438,7 +6427,6 @@ mod tests {
                 &det_with_serial(Some("SER-1")),
                 Some("LTO-6"),
                 "LTO-6",
-                2_500_000_000_000,
             )
             .unwrap();
 
