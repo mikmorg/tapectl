@@ -222,3 +222,71 @@ record would then disagree with the row forever); **`--force` passing the retire
 scarier prompt** (ADR-0008 already ruled that a flag cannot resolve an incoherence); and **one
 size parser with a unit flag** (would make `2.5T` mean two things depending on a switch the
 operator has to remember).
+
+---
+
+**Amendment, 2026-09-17 — a failed verify quarantines only when it proves the MEDIUM is
+bad (issue #234).** The Tier-3 paragraph above says "a failed verify quarantines the
+volume", and §"the write target" below it relies on the same claim ("overwriting an
+operator's `quarantined` would destroy a fact a failed verify established"). **No verify
+path ever wrote that status.** Every production writer of `quarantined` was on the
+write/resume confirm path (`volume::session`), reached through `log_quarantine`;
+`volume_verify` recorded a `verification_sessions` row and left `volumes.status`
+untouched. So the escape hatch this ADR names from an absolute refusal did not exist: an
+operator with a tape they had *proved* unreadable, holding the only copy, met the Tier-3
+refusal — which names no flag, by construction — and had no command that changed
+anything.
+
+The blanket wording was also too strong, and that is the substance of this amendment
+rather than a wording fix. A verify can fail for reasons that say nothing about the
+medium: a dirty drive, a wrong block size, a transient SCSI error, a tape not loaded.
+`layout-session.md` states the hazard in terms — quarantining a good tape is "silent
+corruption, not a loud failure" — and because `quarantined` is precisely what makes a
+volume stop counting as a copy, a false quarantine silently takes real coverage to zero.
+A bad drive could condemn a library one cartridge at a time.
+
+**Ruled:** a failed verify quarantines **only** on a failure that proves the medium is
+bad — a checksum mismatch, or an unreadable block at a position the layout says carries
+data. Drive and transport errors are reported and do **not** quarantine; they leave the
+volume exactly as it was, because "we could not read it today" is not "the bytes are
+gone". The distinction must be visible in what `volume verify` prints and in its
+`--json`, so an operator can tell "this tape is bad" from "this drive could not read
+it".
+
+This requires classifying verify failures, which `VerifyReport` does not currently
+support; that classification is the work, not the status write. Considered and rejected:
+**an explicit `volume quarantine` command** (smaller and it cannot misfire, but it makes
+the operator assert a fact the tool just measured, and leaves the catalog unable to
+record "the operator tried to read this and it failed" — the very fact §"the write
+target" says must not be overwritten); and **correcting this ADR to name a different
+resolution** (there is none — `read-slices` needs a readable tape, and
+`snapshot mark-reclaimable --force` gives up the *version*, a different act with
+different consequences).
+
+**Amendment, 2026-09-17 — `collection run` takes ONE destination label (issue #229).**
+§11 of `v2-open-questions.md` describes batch execution as "session on cartridge A →
+seal + confirm → session on cartridge B → seal + confirm → release staging. Stage once,
+write N times." It settles the shape and is silent on how cartridge B reaches the drive.
+`execute_batch` looped `volume_write` over every `--label` against a single `device`,
+with no prompt, eject, pause or changer call anywhere in the tree — so copy 2 always met
+the wrong-tape refusal with copy 1's cartridge still loaded, and the documented primary
+route to `min_copies = 2` could never complete. It had never run: the lifecycle suite
+passes exactly one `--label`.
+
+**Ruled:** `collection run` accepts one destination label and **refuses more than one**,
+naming the per-copy `tapectl volume write <label>` invocations to run between cartridge
+swaps. §11's stage-once/write-N-times is preserved, because staging survives the first
+copy — `staging clean`'s non-force guard retains a set while any `writes` row is
+non-`completed` — so the per-copy invocations consume the same staged bytes and do not
+re-stage.
+
+The reasoning is that tapectl drives no changer. `CONTEXT.md` says the changer is "an
+autoloader **or a human hand** otherwise", and a human hand needs a point at which to
+act. Refusing is honest about that; it also keeps every write path scriptable and
+non-interactive. Considered and rejected: **pausing between copies** for an operator to
+swap cartridges — closest to §11's literal wording, but a blocking prompt inside a
+multi-hour batch is a new failure mode of its own, and it would make `collection run`
+the only write path that cannot be scripted.
+
+`destination_budget`'s minimum-across-destinations rule is unaffected either way and
+stays: the batch must fit the smallest planned destination.
