@@ -35,6 +35,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::{CollectionConfig, Config};
 use crate::error::{Result, TapectlError};
+use crate::policy::coverage;
 
 use super::selector::{self, Batch};
 
@@ -157,6 +158,24 @@ pub struct DestinationBudget {
 /// size that fits every copy is one sized to the smallest destination — the
 /// largest or the first-named would silently overflow a smaller one.
 ///
+/// Each `--label` is also checked here for write-targetness (issue #224),
+/// not just existence: `policy::coverage::is_write_target` is the declared
+/// sole owner of "may this volume be written?" (the issue #96/#187
+/// derivation-discipline rule), and a bare existence check let a `sealed`,
+/// `retired`, `erased` or `quarantined` label pass, only for
+/// `batch::execute_batch` to stage the whole batch — hours of dar plus age,
+/// a tape's worth of staging disk — before `volume write` finally refused
+/// it. Both halves of `volume_write`'s own guard are applied here, in the
+/// same order (`volume::write::volume_write`, right after its own `SELECT
+/// id, status ...`): the status check ([`coverage::is_write_target`]) AND
+/// the recorded-write check ([`coverage::has_completed_write`]) for the
+/// ADR-0012 2026-09-16 amendment (issue #199) case where a status of
+/// `initialized` alone is not sufficient (a `catalog rebuild --from-volume`
+/// row can hold a completed write while never leaving `initialized`).
+/// Checking both is deliberately NOT stricter than `volume_write` itself —
+/// it is the same predicate pair, in the same order — so no label that
+/// would pass `volume_write` can be refused here.
+///
 /// The usable-capacity factor and ENOSPC buffer still come from the DRIVE
 /// (ADR-0010, "Read paths stay usable without a configured drive": write
 /// paths "genuinely need the drive's factor, ENOSPC buffer" — only the
@@ -184,14 +203,31 @@ pub fn destination_budget(
 
     let mut smallest: Option<(String, i64)> = None;
     for label in labels {
-        let capacity_bytes: i64 = conn
+        let (volume_id, status, capacity_bytes): (i64, String, i64) = conn
             .query_row(
-                "SELECT capacity_bytes FROM volumes WHERE label = ?1",
+                "SELECT id, status, capacity_bytes FROM volumes WHERE label = ?1",
                 [label.as_str()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
             .ok_or_else(|| TapectlError::VolumeNotFound(label.clone()))?;
+
+        // ADR-0012 (issue #224): refuse a non-write-target label HERE,
+        // before a single unit is staged — the same two-part guard
+        // `volume_write` applies, in the same order, so this can never
+        // reject a label `volume_write` itself would accept.
+        if !coverage::is_write_target(&status) {
+            return Err(TapectlError::VolumeNotWriteTarget {
+                label: label.clone(),
+                status,
+            });
+        }
+        if coverage::has_completed_write(conn, volume_id)? {
+            return Err(TapectlError::VolumeHasRecordedWrite {
+                label: label.clone(),
+            });
+        }
+
         let replace = match &smallest {
             None => true,
             Some((_, current)) => capacity_bytes < *current,
@@ -242,6 +278,7 @@ mod tests {
     use super::*;
     use crate::config::{LtoBackendConfig, TapectlPaths};
     use crate::db;
+    use rusqlite::params;
 
     fn config_with_tiny_backend() -> Config {
         let mut config = Config::default();
@@ -540,6 +577,248 @@ mod tests {
             before, after,
             "an unknown label must fail before staging ever touches snapshots"
         );
+    }
+
+    /// Issue #224: `destination_budget` resolved a `--label` with a bare
+    /// existence check (`SELECT capacity_bytes FROM volumes WHERE label =
+    /// ?1`) and never asked whether the row was a write target at all.
+    /// `policy::coverage::is_write_target` is the declared sole owner of
+    /// that question (issue #96/#187's derivation-discipline rule) and this
+    /// is a REGRESSION test for the fix: every non-`initialized` status
+    /// `volumes.status` permits must be refused here, before
+    /// `batches_for_budget` ever runs `pending_units_for_collection`'s
+    /// filesystem walk, let alone before `batch::execute_batch` stages
+    /// anything. Modelled directly on `volume::write`'s own
+    /// `volume_write_refuses_every_non_initialized_status_before_touching_the_device`
+    /// so the pinned status set can never drift between the two call sites.
+    #[test]
+    fn run_refuses_a_non_write_target_destination_label_before_staging() {
+        let statuses = [
+            "sealed",
+            "quarantined",
+            "retired",
+            "erased",
+            "active",
+            "full",
+            "blank",
+            "missing",
+        ];
+        for status in statuses {
+            let conn = db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+                 VALUES ('L1', 'lto', 'p', ?1, ?2)",
+                params![10 * 1024 * 1024_i64, status],
+            )
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let dir = root.path().join("alpha");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+            let lib = CollectionConfig {
+                name: "testlib".into(),
+                root: root.path().to_string_lossy().to_string(),
+                tenant: "media".into(),
+                unit_depth: 1,
+                exclude: vec![],
+                archive_set: None,
+                dotfiles: true,
+            };
+            let paths = TapectlPaths::new(home.path().to_path_buf());
+            super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+            let before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+                .unwrap();
+
+            let config = config_with_tiny_backend();
+            let err =
+                plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap_err();
+
+            match &err {
+                TapectlError::VolumeNotWriteTarget {
+                    label,
+                    status: got_status,
+                } => {
+                    assert_eq!(label, "L1", "status {status}");
+                    assert_eq!(got_status, status, "status {status}");
+                }
+                other => panic!("status {status}: expected VolumeNotWriteTarget, got: {other:?}"),
+            }
+            let msg = err.to_string();
+            assert!(
+                msg.contains("L1"),
+                "status {status}: message must name the label: {msg}"
+            );
+            assert!(
+                msg.contains(status),
+                "status {status}: message must name the status: {msg}"
+            );
+
+            let after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "status {status}: a non-write-target label must fail before staging \
+                 ever touches snapshots"
+            );
+        }
+    }
+
+    /// Issue #224, the sibling half (ADR-0012's 2026-09-16 amendment, issue
+    /// #199): a volume whose `status` still reads `initialized` but which
+    /// already has a `completed` write recorded (as `catalog rebuild
+    /// --from-volume` can leave one, per `policy::coverage::
+    /// has_completed_write`'s doc comment) must also be refused here, not
+    /// just by `is_write_target`'s status test. This is intentionally NOT
+    /// stricter than `volume_write` itself: `volume_write` checks exactly
+    /// this same fact, in exactly this order, right after its own status
+    /// check -- so a label refused here would also be refused there, never
+    /// the other way around.
+    #[test]
+    fn run_refuses_a_destination_label_with_a_recorded_write_before_staging() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status) \
+             VALUES ('u1', 'u1', (SELECT id FROM tenants WHERE name = 'media'), \
+                     'mtime_size', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, \
+                                    total_size) VALUES (?1, 1, 'staged', '/tmp', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1-REBUILT', 'lto', 'p', ?1, 'initialized')",
+            [10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified, \
+                                 completed_at, notes) \
+             VALUES (?1, ?2, ?3, 'completed', 0, datetime('now'), \
+                     'rebuilt from the volume itself; never verified by a read-back')",
+            params![stage_set_id, snap_id, volume_id],
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+
+        let config = config_with_tiny_backend();
+        let err = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1-REBUILT".to_string()],
+        )
+        .unwrap_err();
+
+        match &err {
+            TapectlError::VolumeHasRecordedWrite { label } => {
+                assert_eq!(label, "L1-REBUILT");
+            }
+            other => panic!("expected VolumeHasRecordedWrite, got: {other:?}"),
+        }
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a recorded-write label must fail before staging ever touches snapshots"
+        );
+    }
+
+    /// Issue #224: the negative-space check for the fix above -- a label
+    /// that IS a legitimate write target (`initialized`, no completed write
+    /// recorded) must still pass `destination_budget` and reach batch
+    /// planning, so the new gate cannot be so strict it rejects runs that
+    /// `volume_write` itself would accept.
+    #[test]
+    fn run_accepts_an_initialized_destination_label_with_no_recorded_write() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', ?1, 'initialized')",
+            [10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let config = config_with_tiny_backend();
+        let (batches, budget) =
+            plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "one 3 MiB unit fits the 10 MiB destination"
+        );
+        assert_eq!(budget.binding_label, "L1");
     }
 
     #[test]
