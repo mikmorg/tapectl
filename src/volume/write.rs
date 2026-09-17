@@ -1759,9 +1759,51 @@ fn finish_session(
     }
 }
 
-/// The one place a quarantine is recorded and reported — reached from
-/// `confirm`'s failure (either path) and from `resume`'s own divergence
-/// findings (the resume-only arm).
+/// The one place a quarantine is recorded — every `events` row that says a
+/// volume was quarantined is written here, whichever act established it.
+///
+/// Two acts reach it, and they are different rules answering to different
+/// ADRs, which is why the action name is a parameter rather than a constant:
+///
+/// - `write_quarantined` — ADR-0001 contact-time divergence, from
+///   [`log_quarantine`] (the write/resume confirm path). `status_change` is
+///   `None` there: `session.rs` owns that status write and this only reports
+///   it.
+/// - `verify_quarantined` — ADR-0012's 2026-09-17 amendment, from
+///   [`quarantine_on_medium_evidence`]. That one owns both halves, so it
+///   passes the transition it just made.
+fn record_quarantine_event(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    action: &str,
+    status_change: Option<(&str, &str)>,
+    reason: &str,
+) -> Result<()> {
+    let (field, old, new) = match status_change {
+        Some((old, new)) => (Some("status"), Some(old), Some(new)),
+        None => (None, None, None),
+    };
+    events::log_event(
+        conn,
+        "volume",
+        volume_id,
+        Some(label),
+        action,
+        field,
+        old,
+        new,
+        Some(reason),
+        None,
+    )?;
+    Ok(())
+}
+
+/// The write path's quarantine report — reached from `confirm`'s failure
+/// (either path) and from `resume`'s own divergence findings (the
+/// resume-only arm). `session.rs` has already written
+/// `volumes.status = 'quarantined'` by the time this runs; this records the
+/// event and turns the outcome into the `Err` the command exits on.
 fn log_quarantine(
     conn: &Connection,
     volume_id: i64,
@@ -1769,21 +1811,118 @@ fn log_quarantine(
     reason: &QuarantineReason,
 ) -> Result<()> {
     let reason = describe_quarantine(reason);
-    events::log_event(
-        conn,
-        "volume",
-        volume_id,
-        Some(label),
-        "write_quarantined",
-        None,
-        None,
-        Some(&reason),
-        None,
-        None,
-    )?;
+    record_quarantine_event(conn, volume_id, label, "write_quarantined", None, &reason)?;
     Err(TapectlError::Other(format!(
         "volume \"{label}\" quarantined: {reason}"
     )))
+}
+
+/// What a failed verify did to `volumes.status`, when it did anything
+/// (ADR-0012's 2026-09-17 amendment, issue #234).
+///
+/// Carries the status it replaced, not just "quarantined happened": a
+/// volume that was ALREADY quarantined is a different fact from one this
+/// verify took out of service, and a report that said `quarantined: true`
+/// for both would be lying about one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineEffect {
+    /// `volumes.status` immediately before this verify wrote `quarantined`.
+    pub previous_status: String,
+    /// The mismatches that proved the medium is bad — a subset of
+    /// [`VerifyReport::mismatches`], so an operator reads the reason next to
+    /// the consequence rather than having to re-derive it.
+    pub proof: Vec<crate::store::Mismatch>,
+}
+
+impl QuarantineEffect {
+    /// Whether this verify actually changed the volume's status. `false`
+    /// when it was already `quarantined` — the evidence is fresh, the
+    /// status is not new.
+    pub fn status_changed(&self) -> bool {
+        self.previous_status != "quarantined"
+    }
+}
+
+/// One sentence naming the failures that prove the medium is bad, for the
+/// `events` row and the operator-facing message.
+fn describe_medium_evidence(proof: &[&crate::store::Mismatch]) -> String {
+    let named = proof
+        .iter()
+        .map(|m| format!("position {} {}", m.position, m.kind.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "verify found {} failure(s) proving the medium is bad: {named}",
+        proof.len()
+    )
+}
+
+/// **ADR-0012, amendment of 2026-09-17 (issue #234): quarantine a volume a
+/// verify PROVED unreadable — and only then.**
+///
+/// The ADR names a failed verify twice as the escape from its own Tier-3
+/// refusal (`cli::operations::refuse_last_eligible_copy`, which takes no
+/// flag by construction), and from the rule that an operator's
+/// `quarantined` is never overwritten. No verify path ever wrote the
+/// status, so the escape did not exist: an operator holding the only copy
+/// of a tape they had proved unreadable met a refusal that named no flag
+/// and had no command that changed anything.
+///
+/// The predicate is [`crate::store::Evidence::medium_evidence`], never
+/// "the verify failed": a dirty drive, a wrong block size, a transient SCSI
+/// error or a tape not loaded must leave the volume exactly as it was,
+/// because `quarantined` is precisely what makes a volume stop counting as
+/// a copy and a false one silently takes real coverage to zero.
+///
+/// **Never returns `Err` for the quarantine itself.** A propagated error
+/// from `volume_verify` means verify did not complete, which is not
+/// evidence about the medium; and `volume verify` reports failure through
+/// [`VerifyReport`], never through `Err` (the mhvtl corruption-parity test
+/// pins that). Only a database failure can error here.
+///
+/// The `UPDATE` is unconditional on the volume's current status, matching
+/// `session.rs`'s three quarantine writers. The status it replaced is
+/// recorded in the `events` row and returned, so nothing is lost: the
+/// catalog carries "the operator tried to read this and it failed", which
+/// is the fact the amendment says must exist.
+pub(crate) fn quarantine_on_medium_evidence(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    evidence: &crate::store::Evidence,
+) -> Result<Option<QuarantineEffect>> {
+    let proof = evidence.medium_evidence();
+    if proof.is_empty() {
+        return Ok(None);
+    }
+    let previous_status: String = conn.query_row(
+        "SELECT status FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+        params![volume_id],
+    )?;
+    let reason = describe_medium_evidence(&proof);
+    record_quarantine_event(
+        conn,
+        volume_id,
+        label,
+        "verify_quarantined",
+        Some((previous_status.as_str(), "quarantined")),
+        &reason,
+    )?;
+    warn!(
+        label = label,
+        previous_status = %previous_status,
+        reason = %reason,
+        "volume quarantined by a failed verify"
+    );
+    Ok(Some(QuarantineEffect {
+        previous_status,
+        proof: proof.into_iter().cloned().collect(),
+    }))
 }
 
 /// Best-effort sg_logs health collection. Never lets a collection failure
@@ -2286,6 +2425,13 @@ pub(crate) fn volume_verify_with_store(
     )?;
     let session_id = tx.last_insert_rowid();
     record_verification_results(&tx, session_id, volume_id, &evidence)?;
+    // Issue #234, in the SAME transaction and for the same reason the
+    // comment above gives: a `quarantined` status with no
+    // `verification_sessions` row justifying it — or a session row claiming
+    // a proven-bad medium with the volume still counting as a copy — is the
+    // same defect, one level up. They describe one verify; a crash must
+    // leave neither.
+    let quarantine = quarantine_on_medium_evidence(&tx, volume_id, label, &evidence)?;
     tx.commit()?;
 
     for m in &evidence.mismatches {
@@ -2303,6 +2449,7 @@ pub(crate) fn volume_verify_with_store(
         passed: (evidence.files_checked as usize).saturating_sub(evidence.mismatches.len()),
         failed: evidence.mismatches.len(),
         mismatches: evidence.mismatches,
+        quarantine,
         // Set by `volume_verify`, which is the only caller with a device and
         // a backend to resolve; this store-injectable half has neither.
         drive_health_note: None,
@@ -3009,6 +3156,20 @@ pub struct VerifyReport {
     /// so it is reportable here and not storable there. See
     /// [`record_verification_results`].
     pub mismatches: Vec<crate::store::Mismatch>,
+    /// What this verify did to `volumes.status` (issue #234), and why.
+    ///
+    /// `Some` exactly when at least one mismatch PROVES the medium is bad
+    /// (ADR-0012's 2026-09-17 amendment,
+    /// [`crate::store::Evidence::medium_evidence`]) — so it is the report's
+    /// answer to "is this tape bad, or could this drive just not read it
+    /// today?", which the amendment requires be visible in both the human
+    /// output and `--json`.
+    ///
+    /// `None` on a clean verify AND on a failed one whose every mismatch is
+    /// a read or transport failure. The second case is a failure — `failed`
+    /// is non-zero and the exit code is still `EXIT_ERROR` — that left the
+    /// volume exactly as it was.
+    pub quarantine: Option<QuarantineEffect>,
     /// Set when drive-health (`sg_logs`) collection was SKIPPED rather than
     /// attempted (issue #187): no backend resolves for the device verify was
     /// given, so there is no sg node to read. `None` means collection was

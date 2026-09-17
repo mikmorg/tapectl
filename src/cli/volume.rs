@@ -2098,8 +2098,7 @@ mod tests {
             checked: 10,
             passed: 10,
             failed: 0,
-            mismatches: Vec::new(),
-            drive_health_note: None,
+            ..Default::default()
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
     }
@@ -2110,8 +2109,7 @@ mod tests {
             checked: 10,
             passed: 9,
             failed: 1,
-            mismatches: Vec::new(),
-            drive_health_note: None,
+            ..Default::default()
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
     }
@@ -2122,8 +2120,7 @@ mod tests {
             checked: 3,
             passed: 0,
             failed: 3,
-            mismatches: Vec::new(),
-            drive_health_note: None,
+            ..Default::default()
         };
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
     }
