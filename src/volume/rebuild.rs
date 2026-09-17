@@ -181,13 +181,19 @@ pub struct RebuildReport {
     /// *is* that other cartridge". `None` in every other case, including
     /// every `mam`-identity rebuild (there is no barcode to supersede).
     pub cartridge_barcode_superseded: Option<String>,
-    /// Labels of volumes displaced from the bound cartridge this run — the
-    /// same ADR-0010 record-don't-refuse displacement `volume init` performs,
+    /// Volumes displaced from the bound cartridge this run — the same
+    /// ADR-0010 record-don't-refuse displacement `volume init` performs,
     /// reachable here only when a chip serial proves the medium (a `mam`
     /// identity match, or an `operator` identity the observed serial
     /// superseded); an unwitnessed displacement is refused before any write
     /// (ADR-0012, issue #155's rule, rebuild's own version of it).
-    pub displaced: Vec<String>,
+    ///
+    /// Carries the ADR-0004 impact evidence, not just the label (issue
+    /// #235). This was `Vec<String>`, and the impacts `mount_and_record`
+    /// computes BEFORE it flips the row were dropped in the same statement
+    /// that received them — so a unit could reach ZERO copies during an
+    /// irreversible step on the disaster-recovery path and nothing said so.
+    pub displaced: Vec<DisplacedVolume>,
     /// The bound cartridge's status was (and remains) `retired_permanent`.
     /// Rebuild records the mount as a physical fact — the tape IS on that
     /// cartridge — but never calls anything resembling `refuse_retired`, and
@@ -202,6 +208,51 @@ pub struct RebuildReport {
     /// `None` whenever a cartridge WAS resolved (bound, registered, or
     /// refused outright).
     pub unbound_reason: Option<String>,
+}
+
+/// One unit with a completed write on a volume this rebuild displaced, and
+/// how many ADR-0004-eligible copies it still has ELSEWHERE — the count
+/// `cli::operations::retire_impacts` derives, taken BEFORE the displaced
+/// volume flipped to `erased`. `other_copies == 0` means this displacement
+/// took the unit to zero.
+#[derive(Debug, Clone)]
+pub struct DisplacedUnit {
+    pub unit_name: String,
+    pub unit_status: String,
+    pub other_copies: i64,
+}
+
+/// One volume displaced from the bound cartridge by this rebuild, with the
+/// evidence `binding::mount_and_record` computed for it.
+///
+/// A public mirror of `binding::Displaced` rather than that type itself:
+/// `Displaced` and `RetireImpact` are `pub(crate)`, and [`RebuildReport`] is
+/// a public type integration tests read, so carrying them directly would put
+/// a crate-private type in a public interface.
+#[derive(Debug, Clone)]
+pub struct DisplacedVolume {
+    pub label: String,
+    /// Every unit with a completed write on the displaced volume, in
+    /// `retire_impacts` order (by unit name). Empty when the displaced
+    /// volume held no completed write — a displacement that costs nothing.
+    pub units: Vec<DisplacedUnit>,
+    /// The warning, already rendered — the SAME lines `volume init` prints,
+    /// from `binding::render_displacement` (issue #235). Rendered once, in
+    /// the library, so the CLI only has to choose a stream and an indent.
+    pub warning: Vec<String>,
+}
+
+impl DisplacedVolume {
+    /// The units this displacement left with no eligible copy anywhere —
+    /// ADR-0004 Tier 1's "the one fact that matters at the irreversible
+    /// moment".
+    pub fn zero_copy_units(&self) -> Vec<&str> {
+        self.units
+            .iter()
+            .filter(|u| u.other_copies == 0)
+            .map(|u| u.unit_name.as_str())
+            .collect()
+    }
 }
 
 impl RebuildReport {
@@ -1245,13 +1296,42 @@ fn record_event(
         (None, Some(reason)) => format!("; left unbound ({reason})"),
         (None, None) => String::new(),
     };
+    // Issue #235: the units, not just the labels. The events row is a ledger
+    // of claims (ADR-0001), and "unit X now has ZERO copies" is the claim a
+    // displacement actually makes — an operator reading `report events` after
+    // a disaster-recovery run should not have to re-derive it from a label.
     let displaced_clause = if report.displaced.is_empty() {
         String::new()
     } else {
-        format!(
-            "; displaced from that cartridge: {}",
-            report.displaced.join(", ")
-        )
+        let each: Vec<String> = report
+            .displaced
+            .iter()
+            .map(|d| {
+                let units: Vec<String> = d
+                    .units
+                    .iter()
+                    .map(|u| {
+                        if u.other_copies == 0 {
+                            format!(
+                                "unit \"{}\" [{}] now has ZERO copies",
+                                u.unit_name, u.unit_status
+                            )
+                        } else {
+                            format!(
+                                "unit \"{}\" [{}]: {} other copy/copies remain",
+                                u.unit_name, u.unit_status, u.other_copies
+                            )
+                        }
+                    })
+                    .collect();
+                if units.is_empty() {
+                    d.label.clone()
+                } else {
+                    format!("{} ({})", d.label, units.join("; "))
+                }
+            })
+            .collect();
+        format!("; displaced from that cartridge: {}", each.join(", "))
     };
 
     let detail = format!(
@@ -1545,7 +1625,29 @@ fn resolve_and_bind_cartridge(
         !is_retired,
     )?;
     report.cartridge_bound = true;
-    report.displaced = outcome.displaced.into_iter().map(|d| d.label).collect();
+    // Issue #235: the impacts travel with the label. This line used to be
+    // `.map(|d| d.label)` — discarding, in the statement that received it,
+    // the one fact ADR-0004 Tier 1 requires at an irreversible moment.
+    // Rendering goes through the same `binding::render_displacement` that
+    // `volume init` uses, so the two paths cannot diverge again.
+    let now = chrono::Utc::now().naive_utc();
+    report.displaced = outcome
+        .displaced
+        .iter()
+        .map(|d| DisplacedVolume {
+            label: d.label.clone(),
+            units: d
+                .impacts
+                .iter()
+                .map(|i| DisplacedUnit {
+                    unit_name: i.unit_name.clone(),
+                    unit_status: i.unit_status.clone(),
+                    other_copies: i.other_copies,
+                })
+                .collect(),
+            warning: crate::volume::binding::render_displacement(&resolved.barcode, d, now),
+        })
+        .collect();
     Ok(())
 }
 

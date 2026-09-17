@@ -596,7 +596,17 @@ pub fn run(
                         "serial_learned": report.serial_learned,
                         "serial_checked": report.serial_checked,
                         "cartridge_barcode_superseded": report.cartridge_barcode_superseded,
-                        "displaced": report.displaced,
+                        "displaced": report
+                            .displaced
+                            .iter()
+                            .map(|d| d.label.as_str())
+                            .collect::<Vec<_>>(),
+                        // Issue #235: the ADR-0004 impact evidence
+                        // `mount_and_record` computes and `catalog rebuild`
+                        // used to discard. A sibling key rather than a new
+                        // shape for `displaced` above, which stays exactly
+                        // the array of labels issue #165 shipped.
+                        "displacements": displacements_json(&report),
                         "cartridge_retired": report.cartridge_retired,
                         "unbound_reason": report.unbound_reason,
                     })
@@ -657,11 +667,17 @@ pub fn run(
                          serial matching a different registered cartridge"
                     );
                 }
-                if !report.displaced.is_empty() {
-                    println!(
-                        "  warning: displaced from that cartridge (now erased): {}",
-                        report.displaced.join(", ")
-                    );
+                // Issue #235: the SAME lines `volume init` prints, from the
+                // one renderer (`binding::render_displacement`, already run
+                // in `volume::rebuild`). This used to print the label alone,
+                // so a unit could reach ZERO copies during a rebuild — an
+                // irreversible step, ungated by design (ADR-0012) — with
+                // nothing saying so. ADR-0004 Tier 1 names withholding that
+                // as the option it rejects.
+                for d in &report.displaced {
+                    for line in &d.warning {
+                        println!("  {line}");
+                    }
                 }
                 if report.cartridge_retired {
                     println!(
@@ -795,6 +811,36 @@ fn short_hash(s: &str) -> String {
         Some(head) => format!("{head}..."),
         None => s.to_string(),
     }
+}
+
+/// `catalog rebuild --json`'s `displacements` array (issue #235): one object
+/// per displaced volume, carrying the ADR-0004 impact evidence the text
+/// rendering names.
+///
+/// A function rather than an inline `json!` block so the JSON path is
+/// testable without a device — the text path already is, through
+/// `RebuildReport::displaced[..].warning`. Both read the same
+/// `report.displaced`, which is the point of issue #235.
+fn displacements_json(report: &crate::volume::rebuild::RebuildReport) -> serde_json::Value {
+    serde_json::Value::Array(
+        report
+            .displaced
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "label": d.label,
+                    "units": d.units.iter().map(|u| serde_json::json!({
+                        "unit": u.unit_name,
+                        "status": u.unit_status,
+                        "other_copies": u.other_copies,
+                    })).collect::<Vec<_>>(),
+                    // Denormalised on purpose: the one fact ADR-0004 Tier 1
+                    // is about should not need a filter to find.
+                    "zero_copy_units": d.zero_copy_units(),
+                })
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -1274,5 +1320,55 @@ mod tests {
             "locate's serviceable count must equal the gates' copy count"
         );
         assert_eq!(gate_count, 1, "only the sealed volume counts");
+    }
+
+    // --- issue #235: `catalog rebuild --json` carries the zero-copy
+    // evidence, not just the displaced label ---
+
+    use crate::volume::rebuild;
+
+    fn report_with_displacement(units: Vec<(&str, &str, i64)>) -> rebuild::RebuildReport {
+        rebuild::RebuildReport {
+            displaced: vec![rebuild::DisplacedVolume {
+                label: "L6-STALE".to_string(),
+                units: units
+                    .into_iter()
+                    .map(|(name, status, other_copies)| rebuild::DisplacedUnit {
+                        unit_name: name.to_string(),
+                        unit_status: status.to_string(),
+                        other_copies,
+                    })
+                    .collect(),
+                warning: vec!["warning: ...".to_string()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rebuild_json_names_the_unit_a_displacement_takes_to_zero_copies() {
+        let report = report_with_displacement(vec![("archive", "tape_only", 1), ("photos", "tape_only", 0)]);
+        let json = displacements_json(&report);
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "label": "L6-STALE",
+                "units": [
+                    {"unit": "archive", "status": "tape_only", "other_copies": 1},
+                    {"unit": "photos", "status": "tape_only", "other_copies": 0},
+                ],
+                "zero_copy_units": ["photos"],
+            }])
+        );
+    }
+
+    /// The discrimination: a displaced volume whose units all keep coverage
+    /// elsewhere reports an EMPTY `zero_copy_units`, not every unit on it.
+    #[test]
+    fn rebuild_json_leaves_zero_copy_units_empty_when_nothing_went_to_zero() {
+        let report = report_with_displacement(vec![("archive", "tape_only", 1), ("photos", "active", 2)]);
+        let json = displacements_json(&report);
+        assert_eq!(json[0]["zero_copy_units"], serde_json::json!([]));
+        assert_eq!(json[0]["units"].as_array().unwrap().len(), 2);
     }
 }

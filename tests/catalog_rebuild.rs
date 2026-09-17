@@ -953,7 +953,15 @@ fn a_rebuild_records_the_displacement_the_serial_proves() {
 
     let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
 
-    assert_eq!(report.displaced, vec!["L6-STALE".to_string()], "{report:?}");
+    assert_eq!(
+        report
+            .displaced
+            .iter()
+            .map(|d| d.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["L6-STALE"],
+        "{report:?}"
+    );
     let stale_status: String = conn
         .query_row(
             "SELECT status FROM volumes WHERE id = ?1",
@@ -1869,5 +1877,256 @@ fn rebuild_refuses_when_the_catalog_binds_that_volume_to_another_cartridge() {
     assert!(
         err.contains("SER-DRIVE"),
         "must name what the drive holds: {err}"
+    );
+}
+
+/// Seed one unit whose single stage set has a completed write on every
+/// volume in `volume_ids` — the shape `retire_impacts` counts (unit →
+/// snapshot → stage_set → writes.status = 'completed', and the OTHER
+/// volume's own `status` decides whether it still contributes a copy).
+fn seed_unit_written_to(
+    conn: &rusqlite::Connection,
+    tenant_id: i64,
+    name: &str,
+    volume_ids: &[i64],
+) {
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+         VALUES (?1, ?2, ?3, ?4, 'tape_only')",
+        rusqlite::params![
+            format!("displaced-uuid-{name}"),
+            name,
+            tenant_id,
+            format!("/src/{name}")
+        ],
+    )
+    .unwrap();
+    let unit_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+         VALUES (?1, 1, 'current', ?2, 1, 10)",
+        rusqlite::params![unit_id, format!("/src/{name}")],
+    )
+    .unwrap();
+    let snapshot_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, slice_size, status)
+         VALUES (?1, 524288, 'staged')",
+        rusqlite::params![snapshot_id],
+    )
+    .unwrap();
+    let stage_set_id = conn.last_insert_rowid();
+    for vid in volume_ids {
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            rusqlite::params![stage_set_id, snapshot_id, vid],
+        )
+        .unwrap();
+    }
+}
+
+/// The fixture both issue #235 tests share: a cartridge the tape's own
+/// serial matches, already bound to a live sealed volume `L6-STALE` that
+/// this rebuild will displace. `photos` has its ONLY completed write there;
+/// `archive` has a second one on another sealed volume, so it still has a
+/// copy when `L6-STALE` is erased. Returns the stale volume's row id.
+fn seed_displaced_volume_with_units(conn: &rusqlite::Connection) -> i64 {
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('L6-0001', 'LTO-6', 2400000000, 'REBUILDSERIAL', 'in_use')",
+        [],
+    )
+    .unwrap();
+    let cartridge_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES ('L6-STALE', 'lto', 'lto0', 'LTO-6', 2400000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let stale_vol = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, 'mam')",
+        rusqlite::params![cartridge_id, stale_vol],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES ('L6-ELSEWHERE', 'lto', 'lto0', 'LTO-6', 2400000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let other_vol = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('displaced-op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tenant_id = conn.last_insert_rowid();
+
+    seed_unit_written_to(conn, tenant_id, "photos", &[stale_vol]);
+    seed_unit_written_to(conn, tenant_id, "archive", &[stale_vol, other_vol]);
+    stale_vol
+}
+
+fn rebuild_event_detail(conn: &rusqlite::Connection) -> String {
+    conn.query_row(
+        "SELECT details FROM events
+         WHERE entity_type = 'volume' AND action = 'catalog_rebuild'",
+        [],
+        |r| r.get(0),
+    )
+    .expect("a catalog_rebuild event")
+}
+
+/// Issue #235, the ADR-0004 Tier-1 promise on the disaster-recovery path:
+/// `mount_and_record` computes, BEFORE it flips the row, which units the
+/// displacement leaves at zero copies — and `catalog rebuild` discarded it
+/// in the same statement that received it, keeping only the label. A unit
+/// could reach ZERO copies during an irreversible step and nothing said so.
+///
+/// Two units on the displaced volume on purpose: naming both would be as
+/// wrong as naming neither.
+#[test]
+fn a_rebuild_names_the_unit_a_displacement_takes_to_zero_copies() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    seed_displaced_volume_with_units(&conn);
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    // --- the structured evidence the report now carries ------------------
+    assert_eq!(report.displaced.len(), 1, "{report:?}");
+    let d = &report.displaced[0];
+    assert_eq!(d.label, "L6-STALE");
+    assert_eq!(
+        d.units
+            .iter()
+            .map(|u| (u.unit_name.as_str(), u.other_copies))
+            .collect::<Vec<_>>(),
+        vec![("archive", 1), ("photos", 0)],
+        "`archive` keeps its copy on L6-ELSEWHERE; `photos` has none left"
+    );
+    assert_eq!(d.zero_copy_units(), vec!["photos"]);
+
+    // --- the text `catalog rebuild` prints, from the one renderer --------
+    // Exactly the lines `volume init` prints for the same displacement.
+    assert_eq!(
+        d.warning,
+        vec![
+            "warning: cartridge L6-0001 previously held volume \"L6-STALE\"; it is now marked \
+             erased because these bytes are being overwritten (ADR-0010)."
+                .to_string(),
+            "         unit \"archive\" [tape_only]: 1 other copy/copies remain (coverage for \
+             unit \"archive\" rests on L6-ELSEWHERE, never verified)"
+                .to_string(),
+            "         *** unit \"photos\" [tape_only] now has ZERO copies ***".to_string(),
+        ]
+    );
+
+    // The events row is the ledger of claims (ADR-0001): it must record the
+    // zero-copy fact, not merely the displaced label.
+    let detail = rebuild_event_detail(&conn);
+    assert!(
+        detail.contains("L6-STALE"),
+        "the events detail must still name the displaced volume: {detail}"
+    );
+    assert!(
+        detail.contains("unit \"photos\"") && detail.contains("ZERO copies"),
+        "the events detail must name the unit this displacement took to zero: {detail}"
+    );
+    assert!(
+        !detail.contains("unit \"archive\" [tape_only] now has ZERO copies"),
+        "`archive` still has a copy on L6-ELSEWHERE; it must not be called zero: {detail}"
+    );
+}
+
+/// The other half of #235, and the reason the fixture stages two units: a
+/// displaced volume whose units still have coverage elsewhere must NOT be
+/// called zero. A warning that names every unit is as useless as one that
+/// names none — ADR-0004 Tier 1 is about the fact that matters, not about
+/// volume of output.
+#[test]
+fn a_rebuild_does_not_call_a_still_covered_unit_zero() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let stale_vol = seed_displaced_volume_with_units(&conn);
+    // `photos` gets a second completed write on the same eligible sealed
+    // volume `archive` already uses, so NOTHING on L6-STALE is at zero.
+    let other_vol: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = 'L6-ELSEWHERE'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let photos_stage_set: i64 = conn
+        .query_row(
+            "SELECT ss.id FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE u.name = 'photos'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let photos_snapshot: i64 = conn
+        .query_row(
+            "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+            rusqlite::params![photos_stage_set],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![photos_stage_set, photos_snapshot, other_vol],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    // The displacement still happened and is still reported — this test is
+    // about the CLASSIFICATION, not about suppressing the warning.
+    assert_eq!(report.displaced.len(), 1, "{report:?}");
+    let d = &report.displaced[0];
+    assert_eq!(d.label, "L6-STALE");
+    let stale_status: String = conn
+        .query_row(
+            "SELECT status FROM volumes WHERE id = ?1",
+            rusqlite::params![stale_vol],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_status, "erased");
+
+    assert!(
+        d.zero_copy_units().is_empty(),
+        "both units still have a copy on L6-ELSEWHERE: {:?}",
+        d.units
+    );
+    assert!(
+        !d.warning.iter().any(|l| l.contains("ZERO copies")),
+        "{:?}",
+        d.warning
+    );
+    let detail = rebuild_event_detail(&conn);
+    assert!(detail.contains("L6-STALE"), "{detail}");
+    assert!(
+        !detail.contains("ZERO copies"),
+        "nothing went to zero here: {detail}"
     );
 }
