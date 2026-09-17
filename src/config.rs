@@ -168,16 +168,20 @@ pub struct LtoBackendConfig {
     ///
     /// Decimal, as printed on the cartridge (`K`=10^3 ... `T`=10^12;
     /// ADR-0012), parsed by [`crate::media::parse_capacity_to_bytes`] — not
-    /// the binary unit `enospc_buffer` uses. **Known gap (issue #168):**
-    /// only [`LtoBackendConfig::planning_capacity_bytes`] (the `volume
-    /// plan`/`collection plan`/`run` planning path, and
-    /// `policy::depth_check`) reads this field decimally; `volume init`
-    /// (`volume::write::volume_init`, the path that actually decides and
-    /// stores `volumes.capacity_bytes`) still parses it with the binary
-    /// `staging::parse_size_to_bytes` — out of #168's scope ("no write-path
-    /// source changes"). Until that is fixed too, the SAME string means two
-    /// different byte counts depending on which of those two paths reads
-    /// it.
+    /// the binary unit `enospc_buffer` uses.
+    ///
+    /// **All three readers agree** (closed by issue #200, verified by
+    /// `volume_init_parses_capacity_override_decimally`):
+    /// [`LtoBackendConfig::planning_capacity_bytes`], `Config::validate_sizes`
+    /// and `volume::write::volume_init` — the last being the one that actually
+    /// decides and stores `volumes.capacity_bytes` under ADR-0010 decision 3.
+    ///
+    /// This comment described the opposite until 2026-09-17 (issue #216): it
+    /// still carried #168's "known gap", where init parsed this field with the
+    /// binary `staging::parse_size_to_bytes` and the same string meant two
+    /// different byte counts. #200 fixed that and this text was not updated —
+    /// worth noting because a stale "known gap" reads as a live warning and
+    /// invites someone to re-fix what is already fixed.
     #[serde(default)]
     pub capacity_override: Option<String>,
     #[serde(default = "default_usable_capacity_factor")]

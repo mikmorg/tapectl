@@ -12,7 +12,7 @@ tapectl manages the full lifecycle of archiving data to LTO tape: directory scan
 - **Policy engine**: archive sets with 3-level resolution (unit dotfile > archive set > system defaults), compliance audit with action plans
 - **Compaction workflow**: read live slices from underutilized tapes, rewrite to new tapes, retire old ones
 - **Full audit trail**: every state change logged with old/new values
-- **12 report types**: summary, fire-risk, copies, tape-only, dirty, pending, verify-status, health, capacity, age, events, compaction-candidates
+- **13 report types**: summary, fire-risk, copies, tape-only, dirty, pending, verify-status, health, capacity, age, events, compaction-candidates, supersedable
 - **FTS5 catalog search**: fast full-text search across all archived file paths
 
 ## Prerequisites
@@ -95,8 +95,9 @@ tapectl snapshot                create, list, diff, delete, mark-reclaimable, pu
 tapectl stage                   create, list, info
 tapectl staging                 status, clean
 tapectl volume                  init, write, resume, abort, verify, identify,
-                                move, retire, read-slices, plan, deposit,
-                                compact-read, compact-write, compact-finish, compact
+                                list, info, move, retire, read-slices, plan,
+                                deposit, compact-read, compact-write,
+                                compact-finish, compact
 tapectl cartridge               register, edit, relabel, list, info, move, retire,
                                 unretire, mark-erased
 tapectl archive-set             create, edit, list, info, sync
@@ -105,7 +106,7 @@ tapectl catalog                 ls, search, locate, stats, rebuild
 tapectl location                add, list, info, rename
 tapectl report                  summary, fire-risk, copies, tape-only, dirty,
                                 pending, verify-status, health, capacity, age,
-                                events, compaction-candidates
+                                events, compaction-candidates, supersedable
 tapectl restore                 unit, file, raw-volume
 tapectl export                  Encrypted slices to directory
 tapectl import                  Pre-existing volume into DB
@@ -121,18 +122,27 @@ All commands support `--json` for machine-readable output.
 
 ## Volume Layout
 
-Each tape contains a self-describing 10-file layout:
+Each tape is self-describing. **Layout Version 2** (ADR-0007) is the current
+format; the normative description is `docs/design/volume-format-v2.md` and this
+table is a summary of it, not a second source of truth.
 
 | Position | Contents | Encrypted? |
 |----------|----------|-----------|
-| 0 | ID thunk (label, layout, metadata) | No |
+| 0 | ID thunk (label, uuid, layout pointers, `[media]`) | No |
 | 1 | System guide (recovery manual) | No |
 | 2 | RESTORE.sh (automated recovery) | No |
-| 3 | Planning header | Operator |
-| 4..N | Data slices (dar + age) | Tenant+Operator |
-| N+1 | Mini-index (position map) | No |
-| N+2..K | Tenant envelopes (shuffled) | Per-tenant |
-| K+1,K+2 | Operator envelopes (dual) | Operator |
+| 3 | **Front index** — every file's position, type, size, ciphertext sha256 | No |
+| 4..M | Envelopes: tenant (shuffled), then dual operator | Per-tenant / Operator |
+| M+1..N | Data slices (dar + age) | Tenant+Operator |
+| N+1 | **Seal marker** — binds the front index; written only at seal | No |
+
+Two v2 properties the v1 table above it used to obscure, and both are load-bearing:
+**envelopes come before slices**, and a plaintext front index at position 3 plus a
+trailing seal marker replace v1's mini-index. End-of-tape salvage does not exist —
+a real EOT is a clean abort to an unsealed tape (ADR-0007 rejected §2.9/Appendix C).
+
+*This section documented the superseded v1 10-file layout until 2026-09-17
+(issue #216), roughly fourteen months after the v2 regear replaced it.*
 
 ## Configuration
 

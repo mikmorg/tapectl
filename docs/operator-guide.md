@@ -224,10 +224,10 @@ this sitting** — and since 2026-09-16 it says so before it touches the drive:
 
 ```
 about to write to volume "L6-0001":
-  tv/breaking-bad/s01 v1: 3 slices, 42 MB
-  photos/2019 v2: 1 slices, 8 MB
+  tv/breaking-bad/s01 v1: 3 slices, 42.0 MiB
+  photos/2019 v2: 1 slices, 8.0 MiB
 
-total: 4 slices, 50 MB
+total: 4 slices, 50.0 MiB
 ```
 
 That is by design, not a bug: staging happens once and a stage set stays
@@ -651,7 +651,7 @@ tapectl report verify-status
 
 ### Weekly — cheap, no tape
 
-Run `tapectl audit`. It implements all six compliance checks, including copy
+Run `tapectl audit`. It implements all eleven compliance checks (`cli::audit::CHECKS`), including copy
 count, location presence, and **verification age against each unit's resolved
 `verify_interval_days`**. That last check is what produces your "what is overdue"
 list — you do not track it yourself. Per ADR-0004 it is advisory: it warns, it
@@ -912,9 +912,9 @@ the cartridge.
 > registers a *second* cartridge. You end up with this:
 >
 > ```
-> | Barcode             | Type  | Status    | Location | Loads | Volume  |
-> | E01001L8_1775794348 | LTO-8 | in_use    |          | 0     | L6-0009 |
-> | L6-0009             | LTO-8 | available |          | 0     |         |
+> | Barcode             | Type  | Status    | Location | Loads   | Volume  |
+> | E01001L8_1775794348 | LTO-8 | in_use    |          | 3       | L6-0009 |
+> | L6-0009             | LTO-8 | available |          | unknown |         |
 > ```
 >
 > Two rows for one physical tape — and the barcode you chose is on the one the
@@ -1178,9 +1178,15 @@ A rebuild registers the cartridge and records the mount, so `cartridge list`,
 reporting "not found". What it will *not* do is guess: a File 0 that names a
 barcode rather than a chip serial proves only that somebody typed that label,
 so a rebuild refuses to displace a live volume on that evidence — retire the
-volume, or `cartridge mark-erased` it, and run the rebuild again. A tape older
-than this field binds nothing and says so in the report; a later run that can
-read the drive's serial finishes the job.
+volume, or `cartridge mark-erased` it, and run the rebuild again. A tape older than this field binds nothing and says so in
+the report, and **re-running the rebuild will never change that** — on any
+drive, however well it reads the medium serial. `classify_media` returns
+`Unknown` for a File 0 with no `[media]` table, and the Unknown arm returns
+before the live serial is ever consulted; a legacy File 0 will never gain that
+table, and the tape is sealed so `volume init` can never bind it either
+(ADR-0003). Record the cartridge by hand instead — `cartridge register`, then
+`volume move` to place the volume — or accept the volume as unbound and expect
+`audit`'s location check to keep saying so.
 
 **Escrow coverage on rebuilt rows.** A tape written after 2026-09-11 carries
 each stage set's recipient list, so its rebuilt rows are covered like any

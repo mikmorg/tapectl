@@ -2622,10 +2622,13 @@ mod tests {
     fn binding_never_touches_the_volumes_own_resolved_capacity() {
         // The other half of issue #183's acceptance: the fix above must not
         // stop the override reaching the VOLUME. `volumes.capacity_bytes` is
-        // written by `volume_write` before `bind_cartridge` is ever called
-        // (ADR-0010 decision 3 — decided once at init, from the same
-        // resolved figure); this asserts binding leaves that column alone,
-        // whatever it auto-registers onto the cartridge row.
+        // written by `volume_INIT` -- not `volume_write`, as this comment
+        // said until 2026-09-17 (issue #216). ADR-0010 decision 3 is explicit
+        // that capacity is decided ONCE at init and every later gate reads the
+        // stored row, so naming the wrong command here pointed a reader at a
+        // path that does not write this column. The assertion itself was
+        // always right: binding leaves that column alone, whatever it
+        // auto-registers onto the cartridge row.
         let conn = db::open_memory().unwrap();
         let override_bytes: i64 = 2_400_000_000; // mhvtl's 2400 MB fiction
         conn.execute(
