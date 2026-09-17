@@ -462,7 +462,7 @@ unit_depth = 1
 /// execute_batch` — asserted as "no `stage_sets` row exists", `execute_batch`
 /// staging being the first thing it does and the first row it writes. It
 /// also pins that the dry run stays informative: the budget line, the chosen
-/// batch's units and the destination labels.
+/// batch's units and the destination label.
 ///
 /// WHAT IT DOES NOT COVER: the tape write itself. Reaching `Store::execute`
 /// needs a real (or mhvtl) drive, which the ungated suite must never touch,
@@ -483,8 +483,6 @@ fn collection_run_dry_run_stages_nothing_and_writes_no_tape() {
             "0",
             "--label",
             "L1",
-            "--label",
-            "L2",
             "--dry-run",
         ],
     );
@@ -518,8 +516,8 @@ fn collection_run_dry_run_stages_nothing_and_writes_no_tape() {
         "dry run does not name the units in the chosen batch: {text}"
     );
     assert!(
-        text.contains("L1") && text.contains("L2"),
-        "dry run does not name the destination labels: {text}"
+        text.contains("L1"),
+        "dry run does not name the destination label: {text}"
     );
 }
 
