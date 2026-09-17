@@ -327,3 +327,114 @@ the only write path that cannot be scripted.
 
 `destination_budget`'s minimum-across-destinations rule is unaffected either way and
 stays: the batch must fit the smallest planned destination.
+
+---
+
+## Amendment, 2026-09-17 — the status column is the operator's; a medium's condition is its own fact
+
+**Raised by:** issue #242, flagged twice (by #234's worker and again by #239's) and left
+undecided by both, correctly, because it is a policy question rather than an
+implementation detail.
+
+**The behaviour.** `volume_verify`'s quarantine `UPDATE` is unconditional on the
+volume's current status, matching the three existing writers in `src/volume/session.rs`
+(`:744`, `:760`, `:1050`). Verifying a `retired` volume therefore overwrites the
+operator's deliberate terminal status with `quarantined`.
+
+Verifying a retired tape is a **reasonable thing to do** — before physically disposing
+of a cartridge, before trusting a warehouse deposit recorded against it, or simply to
+learn whether a condemned tape is still readable. Doing so today silently rewrites *why*
+the volume is out of service: from "the operator retired this" to "a verify found the
+medium bad". Those are different facts with different remedies. And under ADR-0011 a
+`retired` volume is unfit to write but **not unreadable**, so the catalog losing that
+distinction is exactly the conflation ADR-0011 was written to prevent.
+
+**Ruled: `volumes.status` is operator-owned, and what a verify observes about the medium
+moves to a column of its own.** The two facts stop competing for one slot instead of
+being ordered against each other.
+
+This is deliberately *not* the narrower fix that was recommended (verify declines to
+overwrite a terminal status, recording the evidence only in the `events` row and the
+`verification_sessions` row). That fix keeps both facts but leaves them asymmetric: the
+medium's condition is recoverable only by reading the audit trail, so every surface that
+wants to ask "is this tape known bad?" must either re-derive it from events or go
+without. The same question is already asked in several places, and a fact that several
+callers need is a column, not an inference.
+
+It is the same shape as this ADR's 2026-09-16 ruling on #197, and worth naming as a
+recurring pattern: when a question presents as *"which of these two values wins this
+field"*, check first whether they can simply **stop sharing the field**. Two values that
+never occupy one slot need no precedence rule, and the fork dissolves rather than being
+decided.
+
+### What follows from it, and what must not be got wrong
+
+1. **`policy::coverage` owns the consequence.** `eligible` is `status = 'sealed'` today,
+   and quarantine removes a copy *by moving the status out of `sealed`*. Once the
+   condition is a separate column that mechanism is gone, so `eligible` must consult
+   both — a sealed volume whose medium is known bad is **not** a copy. This is the
+   load-bearing change: miss it and every quarantine silently stops reducing the copy
+   count, which is the coverage-misstatement class #153 was. `coverage.rs` is the
+   declared sole owner of every `volumes.status` predicate (#96); the condition
+   predicate belongs there too, beside the others, and is never inlined.
+2. **`is_write_target` likewise** (#199's ruling): `retired`/`erased` stay status facts,
+   a bad medium becomes a condition fact, and both must still refuse a write.
+3. **The three `session.rs` writers move with the fourth.** They quarantine on the same
+   evidence and are unconditional for the same reason; leaving them writing `status`
+   while verify writes the new column would reintroduce the divergence this fixes. One
+   writer, one meaning — the rule that produced `render_displacement` (#235).
+4. **`quarantined` as a `status` value is retired, not repurposed.** Existing rows
+   carrying it must migrate to the new column with their status restored to what it was
+   before quarantine where the `events` row records it, and to `sealed` where it does
+   not — a quarantine only ever fired on a volume that was otherwise in service.
+5. **Only a medium-proving failure sets the condition** — unchanged from this ADR's
+   2026-09-17 ruling on #234 (`MismatchKind::proves_medium_bad`). Drive and transport
+   errors still set nothing.
+
+**Severity is unchanged by this ruling: low.** No data is at risk today and every fact is
+already recorded somewhere. The cost of the larger fix is a migration, a predicate
+change and a display change across every volume-listing surface; it is taken because the
+model is right, not because the symptom is urgent.
+
+---
+
+## Amendment, 2026-09-17 — `staging clean` refuses to release a stage set below its policy
+
+**Raised by:** issue #244, found while writing #226's `collection-second-copy` scenario.
+
+#238 established that `clean_staging`'s non-force guard passes **vacuously** after a
+single copy: it requires a `writes` row to exist and none to be non-`completed`, but a
+row is created per volume only when that copy is attempted, so one completed copy
+satisfies it. #238 fixed the one caller it named, `collection::batch::execute_batch`,
+which now gates release on `under_copied_units`. **The CLI caller was not touched**, and
+`src/cli/staging.rs` passes `*force` straight through with no policy lookup at all.
+
+The defect is *more* reachable after #238, not less, because #238's fix prints the
+recipe an operator is meant to follow — "swap in the next cartridge and run
+`tapectl volume write <label>`" — and #229's refusal names the same one. That defines a
+window in which staged bytes are deliberately being kept alive, and `tapectl staging
+clean` is routine housekeeping run without ceremony. Inside that window it destroys
+exactly the material the printed recipe depends on. Recovery is a full re-stage from
+source, and impossible for a `mark-tape-only` unit whose source is gone.
+
+**Ruled: `staging clean` names the under-copied units and refuses, unless `--force`.**
+
+`--force` already exists on this command and is already documented as the override for a
+stage set stuck behind a copy that will never complete — which is precisely this
+situation when the operator means it. No new flag, no new vocabulary.
+
+The alternative considered was warn-and-proceed, consistent with ADR-0004's advisory
+posture. Rejected here because ADR-0004 governs *policy compliance* reporting, not the
+deletion of the only cheap route to a copy the operator's own policy requires: a warning
+printed after the unlink is not advice, it is a receipt.
+
+Two constraints on the implementation:
+
+- The count routes through `policy::coverage::copy_count_expr` against
+  `policy::resolve(...).min_copies` — the same derivation `execute_batch` uses, never a
+  second one (#96).
+- `clean_staging` itself stays policy-free and its existing test
+  (`default_guard_cleans_when_the_only_planned_copy_completed`) stays correct: it
+  describes that function in isolation, and the gate belongs in the callers, which is
+  what #238 already concluded. Pushing the check down would make `execute_batch`'s gate
+  redundant and put policy inside a function deliberately without it.
