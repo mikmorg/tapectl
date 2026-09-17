@@ -74,14 +74,24 @@ fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
 /// the printing so it is assertable in tests without capturing stdout --
 /// the same discipline `cartridge_rows` uses in `src/cli/cartridge.rs`.
 fn location_rows(conn: &Connection) -> Result<Vec<LocationRow>> {
-    let mut stmt = conn.prepare(
+    // Issue #231 (finding 3): `cartridge mark-erased` never clears
+    // `volumes.location_id` (nothing does -- see move_together's doc
+    // comment), so an unfiltered count over a stale row makes a shelf that
+    // physically holds nothing report a volume anyway. Routed through
+    // `policy::coverage::in_service`, the sole owner of every
+    // `volumes.status` predicate, rather than inlining a status list here.
+    // Deliberately UNLIKE the cartridges count two lines below, which is
+    // documented as counting every status on purpose.
+    let sql = format!(
         "SELECT l.name, l.description,
-                (SELECT COUNT(*) FROM volumes v WHERE v.location_id = l.id) as vol_count,
+                (SELECT COUNT(*) FROM volumes v WHERE v.location_id = l.id AND {}) as vol_count,
                 l.kind,
                 (SELECT COUNT(*) FROM volume_deposits d WHERE d.location_id = l.id),
                 (SELECT COUNT(*) FROM cartridges c WHERE c.location_id = l.id)
          FROM locations l ORDER BY l.name",
-    )?;
+        crate::policy::coverage::in_service("v")
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map([], |row| {
             Ok(LocationRow {
@@ -254,9 +264,16 @@ pub fn run(
             // cartridge from them.
             let cartridges = cartridges_at(conn, id)?;
 
-            let mut stmt = conn.prepare(
-                "SELECT label, status FROM volumes WHERE location_id = ?1 ORDER BY label",
-            )?;
+            // Issue #231 (finding 3): same predicate as `location_rows`'s
+            // Volumes count, so this view's own "Volumes: N" header and the
+            // rows printed under it cannot disagree with each other, and a
+            // stale (erased) `location_id` cannot inflate either.
+            let volumes_sql = format!(
+                "SELECT label, status FROM volumes WHERE location_id = ?1 AND {} \
+                 ORDER BY label",
+                crate::policy::coverage::in_service("volumes")
+            );
+            let mut stmt = conn.prepare(&volumes_sql)?;
             let volumes: Vec<(String, String)> = stmt
                 .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
