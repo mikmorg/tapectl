@@ -68,7 +68,25 @@ pub enum MismatchKind {
     /// (Integrity tier) a content file's on-tape bytes, truncated to the
     /// front index's claimed size, hash to something other than the front
     /// index's `sha256_encrypted` for that position.
+    ///
+    /// **The bytes came back and they were wrong.** Only that — a read that
+    /// never delivered the bytes at all is [`Self::ContentUnreadable`]
+    /// (issue #239).
     ContentHashMismatch,
+    /// (Integrity tier) a content file could not be read back in full: the
+    /// read itself failed, or fewer bytes came back than the front index
+    /// claims. **No hash comparison happened**, so this says nothing about
+    /// what the bytes ARE.
+    ///
+    /// Split out of [`Self::ContentHashMismatch`] by issue #239, which is
+    /// also why the two sit next to each other: one `MismatchKind` covered
+    /// both "the tape's bytes are wrong" and "this drive could not read
+    /// them", and the single kind was classified medium-proving. A drive
+    /// that clears File 0, the seal marker and the front index and then
+    /// faults partway through a slice — a dirty head, a marginal cable —
+    /// therefore quarantined a sound cartridge, which is the exact outcome
+    /// ADR-0012's amendment exists to prevent.
+    ContentUnreadable,
 }
 
 impl MismatchKind {
@@ -87,6 +105,7 @@ impl MismatchKind {
             MismatchKind::FrontIndexDivergesFromSeal => "front_index_diverges_from_seal",
             MismatchKind::NavigationDisagreement => "navigation_disagreement",
             MismatchKind::ContentHashMismatch => "content_hash_mismatch",
+            MismatchKind::ContentUnreadable => "content_unreadable",
         }
     }
 
@@ -97,6 +116,14 @@ impl MismatchKind {
     /// `verification_results.expected_sha256` / `.actual_sha256` would make
     /// those columns lie about their own type — the exact defect issue #142
     /// exists to end, reintroduced one level down.
+    ///
+    /// [`Self::ContentUnreadable`] is deliberately NOT here, and that is a
+    /// correction rather than a new rule (issue #239): its `expected`/
+    /// `actual` are `"file readable"` / `"read failed: …"` and
+    /// `"{n} on-tape bytes"` / `"only {n} bytes read back"`. Those strings
+    /// were being written into the two sha256 columns for as long as the
+    /// read-failure producers shared [`Self::ContentHashMismatch`] — the
+    /// #142 lie, on both the verify and the confirm path.
     pub fn compares_hashes(self) -> bool {
         matches!(
             self,
@@ -120,12 +147,31 @@ impl MismatchKind {
     /// The ruling: quarantine only on "a checksum mismatch, or an unreadable
     /// block at a position the layout says carries data". Arm by arm:
     ///
-    /// - `ContentHashMismatch` — **yes**, and it is both halves of the
-    ///   ruling at once. The on-tape bytes hash to something other than the
-    ///   front index promises (a checksum mismatch), and `chain_walk` also
-    ///   raises this kind for a read error or a short read at a CONTENT
-    ///   position — "an unreadable block at a position the layout says
-    ///   carries data", named by the amendment in as many words.
+    /// - `ContentHashMismatch` — **yes**. The on-tape bytes hash to
+    ///   something other than the front index promises: a checksum
+    ///   mismatch, the first half of the ruling verbatim. The bytes came
+    ///   back and they were wrong, which no drive fault produces — a drive
+    ///   that cannot read returns nothing, not a different sha256.
+    /// - `ContentUnreadable` — **no** (issue #239), and this arm overrides
+    ///   ADR-0012's own second clause, so read this before changing it.
+    ///   The amendment's ruling reads "a checksum mismatch, **or an
+    ///   unreadable block at a position the layout says carries data**",
+    ///   and until #239 this was one kind with `ContentHashMismatch` on the
+    ///   strength of that clause. But the ruling's very next sentence says
+    ///   "drive and transport errors are reported and do **not**
+    ///   quarantine", and the two clauses contradict each other for exactly
+    ///   this event: `chain_walk` raises this kind from a raw `Err` out of
+    ///   `read_file` and from a short read, neither of which distinguishes
+    ///   a bad tape from a dirty head, a marginal cable, a wrong block size
+    ///   or a transient SCSI error. Issue #239 rules the second clause
+    ///   controls, for the reason the amendment itself gives: `quarantined`
+    ///   is what makes a volume stop counting as a copy, so the cost of
+    ///   being wrong is asymmetric — a missed quarantine is found by the
+    ///   next verify, a false one silently takes real coverage to zero and
+    ///   nothing un-quarantines a volume. The short-read half rides along
+    ///   on `FrontIndexUnreadable`'s reasoning below: same event, different
+    ///   position, same epistemics. **The ADR text has not been amended to
+    ///   match; do not "fix" this arm back without one.**
     /// - `FrontIndexDivergesFromSeal` — **yes**. The tape's two ends
     ///   disagree about bytes both of them recorded; its own doc has said
     ///   "(quarantine-grade)" since the chain walk was written.
@@ -145,15 +191,17 @@ impl MismatchKind {
     ///   tape, "never an error".
     ///
     /// Written as an exhaustive `match` with **no wildcard arm** on purpose:
-    /// a seventh variant must fail to compile until someone decides which
+    /// an eighth variant must fail to compile until someone decides which
     /// side of this line it falls on. The decision is a CTO one (ADR-0012),
-    /// not a default.
+    /// not a default. That is what surfaced issue #239 — splitting
+    /// `ContentUnreadable` out could not be done silently.
     pub fn proves_medium_bad(self) -> bool {
         match self {
             MismatchKind::ContentHashMismatch => true,
             MismatchKind::FrontIndexDivergesFromSeal => true,
             MismatchKind::FrontIndexInconsistent => true,
             MismatchKind::NavigationDisagreement => true,
+            MismatchKind::ContentUnreadable => false,
             MismatchKind::FrontIndexUnreadable => false,
             MismatchKind::SealUnreadable => false,
         }
@@ -590,9 +638,12 @@ where
             let n_read = match read_result {
                 Ok(n) => n,
                 Err(e) => {
+                    // Issue #239: a raw I/O or transport error. NOT a hash
+                    // disagreement — no hash was ever computed — so it is
+                    // not `ContentHashMismatch` and does not quarantine.
                     mismatches.push(Mismatch {
                         position,
-                        kind: MismatchKind::ContentHashMismatch,
+                        kind: MismatchKind::ContentUnreadable,
                         expected: "file readable".to_string(),
                         actual: format!("read failed: {e}"),
                     });
@@ -602,9 +653,14 @@ where
             files_checked += 1;
 
             if want_size > n_read {
+                // Issue #239: a short read. Ambiguous between a truncated
+                // write and a drive giving up early, and the count alone
+                // cannot separate them, so it takes the same side
+                // `FrontIndexUnreadable` already takes for the identical
+                // event one position over.
                 mismatches.push(Mismatch {
                     position,
-                    kind: MismatchKind::ContentHashMismatch,
+                    kind: MismatchKind::ContentUnreadable,
                     expected: format!("{want_size} on-tape bytes"),
                     actual: format!("only {n_read} bytes read back"),
                 });
@@ -1311,16 +1367,55 @@ mod tests {
     /// this test is where that shows up as a deliberate edit.
     #[test]
     fn proves_medium_bad_classifies_every_kind_as_adr_0012_ruled() {
-        // Medium evidence: the bytes on the tape are wrong or gone.
-        assert!(MismatchKind::ContentHashMismatch.proves_medium_bad());
-        assert!(MismatchKind::FrontIndexDivergesFromSeal.proves_medium_bad());
-        assert!(MismatchKind::FrontIndexInconsistent.proves_medium_bad());
-        assert!(MismatchKind::NavigationDisagreement.proves_medium_bad());
+        let ratified: &[(MismatchKind, bool)] = &[
+            // Medium evidence: the bytes on the tape are wrong or gone.
+            (MismatchKind::ContentHashMismatch, true),
+            (MismatchKind::FrontIndexDivergesFromSeal, true),
+            (MismatchKind::FrontIndexInconsistent, true),
+            (MismatchKind::NavigationDisagreement, true),
+            // NOT medium evidence: "we could not read it today" is not "the
+            // bytes are gone" (issue #239 for the content position), and an
+            // absent seal is the normal unsealed signal.
+            (MismatchKind::ContentUnreadable, false),
+            (MismatchKind::FrontIndexUnreadable, false),
+            (MismatchKind::SealUnreadable, false),
+        ];
+        for (kind, expected) in ratified {
+            assert_eq!(
+                kind.proves_medium_bad(),
+                *expected,
+                "{} is classified on the wrong side of ADR-0012's line",
+                kind.label()
+            );
+        }
 
-        // NOT medium evidence: "we could not read it today" is not "the
-        // bytes are gone", and an absent seal is the normal unsealed signal.
-        assert!(!MismatchKind::FrontIndexUnreadable.proves_medium_bad());
-        assert!(!MismatchKind::SealUnreadable.proves_medium_bad());
+        // COMPLETENESS, so a future variant cannot slip through
+        // unclassified. `slot` is exhaustive with no wildcard arm, exactly
+        // like `proves_medium_bad` itself: an eighth variant fails to
+        // COMPILE here (a new arm is required), a slot past `N` panics, and
+        // a variant that has an arm but is missing from `ratified` above
+        // fails the assertion. A green run therefore means every variant
+        // that exists was ratified one line at a time.
+        fn slot(kind: MismatchKind) -> usize {
+            match kind {
+                MismatchKind::SealUnreadable => 0,
+                MismatchKind::FrontIndexUnreadable => 1,
+                MismatchKind::FrontIndexInconsistent => 2,
+                MismatchKind::FrontIndexDivergesFromSeal => 3,
+                MismatchKind::NavigationDisagreement => 4,
+                MismatchKind::ContentHashMismatch => 5,
+                MismatchKind::ContentUnreadable => 6,
+            }
+        }
+        const N: usize = 7;
+        let mut covered = [false; N];
+        for (kind, _) in ratified {
+            covered[slot(*kind)] = true;
+        }
+        assert!(
+            covered.iter().all(|c| *c),
+            "every MismatchKind must be classified above, by hand: {covered:?}"
+        );
     }
 
     fn mismatch_of(kind: MismatchKind) -> Mismatch {
@@ -1412,6 +1507,114 @@ mod tests {
         assert_eq!(full.mismatches.len(), 1);
         assert_eq!(full.mismatches[0].position, 4);
         assert_eq!(full.mismatches[0].kind, MismatchKind::ContentHashMismatch);
+    }
+
+    /// ISSUE #239, producer mapping. The chain walk's three content-file
+    /// failure paths used to raise ONE kind, classified medium-proving.
+    /// Only the third is evidence about the medium, so only the third may
+    /// still carry `ContentHashMismatch`.
+    ///
+    /// A `MemStore` whose read fails at one position — the partially failing
+    /// drive that clears File 0, the seal marker and the front index and
+    /// then faults on a slice.
+    struct ReadFaultStore {
+        inner: MemStore,
+        fault_at: u32,
+    }
+
+    impl Store for ReadFaultStore {
+        fn capacity(&mut self) -> Result<CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            if position == self.fault_at {
+                // The shape `TapeDevice::read_file_streaming` produces from
+                // a kernel read error (`src/tape/ioctl.rs`).
+                return Err(TapectlError::TapeIo(
+                    "read: Input/output error (os error 5)".to_string(),
+                ));
+            }
+            self.inner.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    #[test]
+    fn a_content_read_error_is_content_unreadable_not_a_hash_mismatch() {
+        let (layout, mem) = build_confirm_fixture(None);
+        let mut store = ReadFaultStore {
+            inner: mem,
+            fault_at: 4,
+        };
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(evidence.mismatches.len(), 1, "{:?}", evidence.mismatches);
+        assert_eq!(evidence.mismatches[0].position, 4);
+        assert_eq!(
+            evidence.mismatches[0].kind,
+            MismatchKind::ContentUnreadable,
+            "no hash was ever computed, so this cannot be a hash mismatch"
+        );
+        assert!(
+            !evidence.proves_medium_bad(),
+            "a drive fault must not condemn the cartridge"
+        );
+        assert!(
+            !evidence.mismatches[0].kind.compares_hashes(),
+            "`expected`/`actual` are prose here, not sha256 hex"
+        );
+    }
+
+    #[test]
+    fn a_short_content_read_is_content_unreadable_not_a_hash_mismatch() {
+        let (layout, mut store) = build_confirm_fixture(None);
+        let true_len = layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .unwrap()
+            .size_bytes
+            .unwrap() as usize;
+        // Fewer bytes come back than the front index claims, with the
+        // claimed hash untouched so nothing else can be what failed.
+        store.files[4].truncate(true_len - 1);
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(evidence.mismatches.len(), 1, "{:?}", evidence.mismatches);
+        assert_eq!(evidence.mismatches[0].position, 4);
+        assert_eq!(
+            evidence.mismatches[0].kind,
+            MismatchKind::ContentUnreadable
+        );
+        assert!(!evidence.proves_medium_bad());
+    }
+
+    /// The complement of the two above, and the guard on issue #234: a
+    /// genuine hash disagreement keeps the medium-proving kind. Distinct
+    /// from `confirm_detects_content_hash_mismatch_only_at_integrity_tier`
+    /// in what it asserts — that one pins the tier gate, this one pins that
+    /// the #239 split did not take the checksum case with it.
+    #[test]
+    fn a_genuine_hash_disagreement_still_proves_the_medium_is_bad() {
+        let (layout, mut store) = build_confirm_fixture(None);
+        store.files[4][100] ^= 0xFF;
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(evidence.mismatches.len(), 1, "{:?}", evidence.mismatches);
+        assert_eq!(
+            evidence.mismatches[0].kind,
+            MismatchKind::ContentHashMismatch
+        );
+        assert!(evidence.proves_medium_bad());
+        assert!(
+            evidence.mismatches[0].kind.compares_hashes(),
+            "both sides really are sha256 hex here"
+        );
     }
 
     #[test]

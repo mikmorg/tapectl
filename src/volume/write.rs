@@ -2165,12 +2165,18 @@ pub(crate) fn record_verification_results(
 /// result` vocabulary (`001_initial.sql`: passed / failed_checksum /
 /// failed_read / failed_decrypt / skipped).
 ///
-/// The v2 chain walk has six failure kinds and the column has five values,
+/// The v2 chain walk has seven failure kinds and the column has five values,
 /// none of them added for it, so this is a lossy projection by construction.
 /// It is lossy in the SAFE direction — the true kind is always written to
 /// `notes` — and the split follows what the disagreement actually IS: two
-/// kinds compare sha256 hashes (`failed_checksum`), the other four are the
+/// kinds compare sha256 hashes (`failed_checksum`), the other five are the
 /// bytes not being readable or not being what the map said (`failed_read`).
+///
+/// Issue #239 moved a case across this line on BOTH paths, deliberately: a
+/// content read error or short read used to arrive as `ContentHashMismatch`
+/// and so recorded `failed_checksum` with `"read failed: …"` sitting in
+/// `expected_sha256`. As `ContentUnreadable` it records `failed_read` with
+/// both hash columns NULL, which is what actually happened.
 /// `failed_decrypt` is never produced: the chain walk is KEYLESS by design
 /// (ADR-0007), so it never attempts a decryption that could fail.
 fn mismatch_result(kind: crate::store::MismatchKind) -> &'static str {
@@ -4482,6 +4488,9 @@ mod tests {
             (FrontIndexDivergesFromSeal, "quarantined"),
             (FrontIndexInconsistent, "quarantined"),
             (NavigationDisagreement, "quarantined"),
+            // Issue #239: the kind that used to be folded into
+            // `ContentHashMismatch` and so reached the status write.
+            (ContentUnreadable, "sealed"),
             (FrontIndexUnreadable, "sealed"),
             (SealUnreadable, "sealed"),
         ] {
@@ -4518,6 +4527,209 @@ mod tests {
                 kind.label()
             );
         }
+    }
+
+    /// A `MemStore` whose read fails at exactly one position — the issue
+    /// #239 drive: it reads File 0, the seal marker and the front index
+    /// cleanly, then faults partway through a data slice.
+    ///
+    /// Deliberately a `Store` wrapper rather than a `MemStore` flag: the
+    /// fault has to be seen by the DEFAULT `confirm` (the real `chain_walk`),
+    /// which reaches the medium only through `read_file`.
+    struct ReadFaultStore {
+        inner: MemStore,
+        fault_at: u32,
+    }
+
+    impl Store for ReadFaultStore {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+            if position == self.fault_at {
+                // The shape `TapeDevice::read_file_streaming` produces from a
+                // kernel read error (`src/tape/ioctl.rs`).
+                return Err(TapectlError::TapeIo(
+                    "read: Input/output error (os error 5)".to_string(),
+                ));
+            }
+            self.inner.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    /// ISSUE #239. A raw read/transport error at a content position is NOT
+    /// evidence about the medium — "we could not read it today" is not "the
+    /// bytes are gone" (ADR-0012's 2026-09-17 amendment). A dirty head or a
+    /// marginal cable that gets through File 0, the seal and the front index
+    /// and then faults on a slice must leave a sound cartridge exactly as it
+    /// was, because `quarantined` is what makes a volume stop counting as a
+    /// copy.
+    ///
+    /// Asserted against the `volumes` ROW, not the report: the report is the
+    /// thing that would be re-derived, and the row is the fact that silently
+    /// takes real coverage to zero.
+    #[test]
+    fn a_read_error_at_a_content_position_does_not_quarantine() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the bytes the front index promises. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "Q-DIRTY",
+            "q-dirty-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-DIRTY'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-DIRTY'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = ReadFaultStore {
+            inner: mem_store_v2_tape("Q-DIRTY", &good, &good),
+            fault_at: 4,
+        };
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-DIRTY",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+        assert_eq!(report.mismatches[0].position, 4);
+        assert_eq!(
+            volume_status(&conn, "Q-DIRTY"),
+            "sealed",
+            "a drive fault must leave volumes.status exactly as it was"
+        );
+        assert!(
+            !report.mismatches[0].kind.proves_medium_bad(),
+            "a read error says nothing about the tape: {:?}",
+            report.mismatches[0]
+        );
+        assert!(
+            report.quarantine.is_none(),
+            "nothing was quarantined: {:?}",
+            report.quarantine
+        );
+        assert!(
+            !volume_events(&conn, "Q-DIRTY")
+                .iter()
+                .any(|(action, _, _)| action.contains("quarantined")),
+            "no quarantine event either: {:?}",
+            volume_events(&conn, "Q-DIRTY")
+        );
+
+        // Issue #142's columns stop lying as a consequence of the #239
+        // split: no hash was compared, so the row is `failed_read` with both
+        // sha256 columns NULL — not `failed_checksum` with "read failed: …"
+        // sitting in `expected_sha256`, which is what the shared kind
+        // produced. Pinned here because it is the same correction on the
+        // confirm path, which has no test of its own for this shape.
+        let rows = verification_result_rows(&conn);
+        assert_eq!(rows.len(), 1, "expected exactly one recorded row: {rows:?}");
+        assert_eq!(rows[0].0, "4", "the row must name the failing position");
+        assert_eq!(rows[0].1, "failed_read");
+        assert!(
+            rows[0].2.contains("content_unreadable"),
+            "notes must carry the true MismatchKind: {}",
+            rows[0].2
+        );
+        let (expected_sha, actual_sha): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT expected_sha256, actual_sha256 FROM verification_results",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(expected_sha, None, "nothing was hashed, so nothing to say");
+        assert_eq!(actual_sha, None, "nothing was hashed, so nothing to say");
+    }
+
+    /// ISSUE #239, the short-read half. Fewer bytes came back than the front
+    /// index claims. Ambiguous by construction — a truncated write, or a
+    /// drive giving up early — and the enum already rules on exactly this
+    /// event one position over: `FrontIndexUnreadable`'s arm says "a genuine
+    /// I/O or transport error becomes this variant, and so does a short
+    /// read; neither distinguishes a bad tape from a dirty drive". Same
+    /// event, different position, same epistemics, so the conservative side
+    /// applies here too.
+    #[test]
+    fn a_short_read_at_a_content_position_does_not_quarantine() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the bytes the front index promises. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "Q-SHORT",
+            "q-short-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-SHORT'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-SHORT'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("Q-SHORT", &good, &good);
+        // The slice comes back SHORT of the size the front index claims —
+        // `chain_walk`'s `want_size > n_read` arm, with the claimed hash
+        // left untouched so nothing else can be what failed.
+        store.files[4].truncate(good.len() - 1);
+
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-SHORT",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+        assert_eq!(report.mismatches[0].position, 4);
+        assert_eq!(
+            volume_status(&conn, "Q-SHORT"),
+            "sealed",
+            "a short read must leave volumes.status exactly as it was"
+        );
+        assert!(
+            !report.mismatches[0].kind.proves_medium_bad(),
+            "a short read says nothing conclusive about the tape: {:?}",
+            report.mismatches[0]
+        );
+        assert!(
+            report.quarantine.is_none(),
+            "nothing was quarantined: {:?}",
+            report.quarantine
+        );
     }
 
     /// A volume that was ALREADY quarantined reports the fact honestly:
