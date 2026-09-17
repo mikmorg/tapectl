@@ -2314,8 +2314,19 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 hits = [f for f in d.get("findings", []) if f["check"] == "escrow_identity_mismatch"]
 assert len(hits) == 1, ("expected exactly one escrow_identity_mismatch", [f["check"] for f in d.get("findings", [])])
-assert "key import --escrow age1" in hits[0]["action"], hits[0]
-' "$alog3" || { echo "audit did not diagnose the replaced escrow identity once, naming the key:"; cat "$alog3"; return 1; }
+action = hits[0]["action"]
+# The REMEDY ADR-0005 allows, and the one it forbids. This used to assert
+# `key import --escrow age1`, which commit 9b42828 correctly stopped
+# recommending: this home already minted a replacement escrow identity at
+# `init`, so importing over it would REPLACE a registered identity, and
+# ADR-0005 says no command does that. The recipe is a fresh home adopting the
+# original key at init (#139). Asserting both halves pins the ADR rather than
+# whichever sentence currently expresses it -- a string pin is what let this
+# check go stale unnoticed in the first place.
+assert "init --escrow-public-key age1" in action, action
+assert "key import --escrow" not in action, (
+    "audit recommends a key import that ADR-0005 refuses", action)
+' "$alog3" || { echo "audit did not diagnose the replaced escrow identity once, naming the ADR-0005 recipe:"; cat "$alog3"; return 1; }
 }
 
 # (c) The pure heir path: a directory holding ONLY RESTORE.sh and the
@@ -2436,11 +2447,20 @@ scenario_escrow_ordering() {
 # real source, single-file restore for the awkward cases (nested unicode,
 # 0-byte, symlink), and `unit check-integrity` clean vs. after a mutation.
 #
-# `catalog ls --json` bakes a literal "d " prefix onto directory paths
-# before .trim() (src/cli/catalog.rs: `format!("{}{}", if is_dir {"d "}
-# else {"  "}, path)` — trim only strips the two-space file prefix, not
-# the letter 'd'), so file/link entries are exactly the ones NOT starting
-# with "d ".
+# File/link entries are the rows whose raw `is_directory` is false.
+#
+# This used to discriminate on a literal "d " prefix baked into the JSON
+# `path`, because it once was: `catalog ls --json` emitted a display marker
+# inside a raw fact. Issue #236 finding 5 removed it (commit f7f2431) --
+# correctly, per the C2b rule that a `--json` value is the raw fact and
+# `display_with` renders it for the table only -- and this check silently
+# started counting directories as files, because nothing starts with "d "
+# any more. Measured 2026-09-17: 10 counted against 9 found, the difference
+# being the one directory.
+#
+# So it now reads the boolean, and asserts the prefix is really gone rather
+# than merely not matching -- a discriminator that matches nothing looks
+# exactly like a discriminator that is stale.
 rfc_catalog_ls_matches_find() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog ls photos --json; compare non-directory entry count to find \$SRC/photos -type f -o -type l"; return 0; }
     local logf="$RUN/log-rfc.catalog_ls.json"
@@ -2450,8 +2470,10 @@ rfc_catalog_ls_matches_find() {
     actual="$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
-print(sum(1 for r in d if not r.get("path", "").startswith("d ")))
-' "$logf")"
+assert not any(r.get("path", "").startswith("d ") for r in d), (
+    "a display marker is baked into the raw JSON path again (issue #236 finding 5)", d)
+print(sum(1 for r in d if not r.get("is_directory")))
+' "$logf")" || { echo "catalog ls --json is not the shape this check reads:"; cat "$logf"; return 1; }
     [ "$expect" = "$actual" ] || { echo "catalog ls photos: expected $expect file/link entries (find), got $actual (catalog)"; cat "$logf"; return 1; }
 }
 
