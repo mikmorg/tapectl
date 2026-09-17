@@ -330,6 +330,36 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-17 (evening) — the review-of-the-review is what is left.**
+  The 21 issues filed from the 2026-09-17 audit (#206-#226) are all closed except
+  #226. What is open now came from the FOLLOW-UP passes over the gaps that audit did
+  not reach, so the label is growing rather than shrinking. That is the process
+  working; do not read it as regression.
+  **Open: #226, #227, #228, #229 (PARKED), #230, #231, #232.**
+  - **#229 is PARKED and is the only pending CTO decision.** `collection run --label
+    L1 --label L2` cannot complete: `execute_batch`'s write-N-copies loop
+    (`src/collection/batch.rs:148-152`) runs `volume_write` against ONE `device` with
+    no prompt, eject, pause or changer anywhere in `src/`, so copy 2 always meets
+    `claim_mismatch_label` with copy 1's cartridge still loaded. §11 of
+    `v2-open-questions.md` settles the SHAPE ("stage once, write N times, cartridge A
+    then cartridge B") but not how cartridge B reaches the drive. Options and a
+    recommendation (refuse >1 label rather than prompt) are on the issue.
+    **It blocks half of #226** — the multi-label on-media scenario cannot be written
+    until the feature can complete, which is precisely WHY that test never existed.
+  - **#227 and #228 are follow-up review findings**, not audit findings: #227 is
+    critic gap 9 (migration 012's rebuild + four CLI modules read narrowly by two or
+    three dimensions each and by none as a subsystem); #228 is `main.rs`'s startup
+    path.
+  - **#230 is a CLASS, not an instance** — `--dry-run` is global and documented,
+    honoured by `volume retire`/`cartridge relabel`/`db`, silently ignored by
+    `collection run`, `cartridge move`, `volume move` and all of `location`. Two
+    reviewers hit it independently in unrelated subsystems, which is what identified
+    it. The worst instance stages a whole batch and seals a real cartridge under a
+    flag whose help says "without making changes".
+  **Ordering note:** #230 touches `main.rs`, `collection.rs` and `location.rs`, so it
+  conflicts with #228 (`main.rs`), #231 (`location.rs`) and #232 (`collection.rs`).
+  Run it alone on the code side; review passes are read-only and always ride along.
+
 - **THE 2026-09-17 REVIEW'S CRITIC GAPS ARE NOW FULLY RECONCILED (2026-09-17).**
   The completeness critic listed NINE gaps; the queue only ever carried issues
   for eight of them, and nothing recorded which. Reconciled at the #214 pickup:
