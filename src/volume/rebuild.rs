@@ -102,6 +102,26 @@ pub struct RebuildReport {
     /// Rebuilt stage sets on this volume still without a receipt after this
     /// run — the ones that read `escrow: ?` until attested.
     pub unknown_remaining: i64,
+    /// Issue #236 finding 1: `attest_escrow` leaves a stage set unattested
+    /// on three distinct arms, and printing the SAME sentence for all three
+    /// collapses `Unknown` into `Gap` at exactly the moment #137 invented
+    /// the distinction for. This counts the one arm that IS actually a Gap
+    /// statement: the escrow key was read successfully and demonstrably is
+    /// not a recipient of the slice (`age::DecryptError::NoMatchingKeys`) --
+    /// permanent, no re-run changes it.
+    pub escrow_attest_not_recipient: usize,
+    /// A stage set left unattested because its slice header could not be
+    /// READ at all (`Store::read_file_head` errored -- a damaged patch of
+    /// tape, an I/O error). This is `Unknown`, not `Gap`: the bytes may be
+    /// perfectly escrow-covered and merely unreadable at this position, a
+    /// different problem with a different remedy (`volume verify`, another
+    /// copy, a different block size).
+    pub escrow_attest_unreadable: usize,
+    /// A stage set left unattested because the bytes were read but did not
+    /// parse as an age header (any `age::DecryptError` other than
+    /// `NoMatchingKeys`). Also `Unknown`, not `Gap` -- a parse failure says
+    /// nothing about whether the escrow key is a recipient.
+    pub escrow_attest_unparseable: usize,
     /// Units whose tenant could not be read from any tenant envelope on this
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
@@ -576,6 +596,7 @@ fn attest_escrow(
         {
             tracing::warn!(unit = %unit.name, position = first.tape_position, error = %e,
                 "attest: could not read the slice header; leaving coverage unknown");
+            report.escrow_attest_unreadable += 1;
             continue;
         }
         let opened = age::Decryptor::new(Cursor::new(head))
@@ -593,10 +614,12 @@ fn attest_escrow(
                 tracing::warn!(unit = %unit.name, position = first.tape_position,
                     "attest: the escrow key is not a recipient of this slice — the #115 shape; \
                      coverage stays unknown");
+                report.escrow_attest_not_recipient += 1;
             }
             Err(e) => {
                 tracing::warn!(unit = %unit.name, position = first.tape_position, error = %e,
                     "attest: slice header did not parse; leaving coverage unknown");
+                report.escrow_attest_unparseable += 1;
             }
         }
     }
@@ -2010,6 +2033,114 @@ mod tests {
             nominal_capacity_bytes: 2_500_000_000_000,
             mam_capacity_bytes: 2_500_000_000_000,
         }
+    }
+
+    /// Issue #236 finding 1: `attest_escrow` leaves a stage set unattested
+    /// on THREE different arms -- a slice this key demonstrably is NOT a
+    /// recipient of (`NoMatchingKeys`, the permanent Gap statement), a slice
+    /// whose header could not be READ at all (an I/O error -- Unknown, not
+    /// Gap: the bytes may be perfectly covered and merely unreadable at this
+    /// position), and a slice whose header did not PARSE as age at all (also
+    /// Unknown). The pre-fix code counted only `report.attested` and folded
+    /// all three failure arms into nothing more specific than "not attested
+    /// this run" -- `cli::catalog` then asserted the Gap sentence for all
+    /// three. This proves the three counters this fix adds move
+    /// independently, one per arm, on one run.
+    #[test]
+    fn attest_escrow_counts_each_unattested_arm_separately() {
+        let conn = crate::db::open_memory().unwrap();
+        let escrow = crate::crypto::keys::generate_keypair();
+        let other = crate::crypto::keys::generate_keypair();
+        let op_id = crate::db::queries::insert_tenant(&conn, "op", None, true).unwrap();
+        crate::db::queries::insert_escrow_key(&conn, op_id, "escrow", "fp", &escrow.public_key, None)
+            .unwrap();
+
+        let slice_at = |position: i64| envelope::ManifestSlice {
+            number: 1,
+            tape_position: position,
+            size_bytes: 100,
+            encrypted_bytes: 200,
+            sha256_plain: "a".repeat(64),
+            sha256_encrypted: "b".repeat(64),
+        };
+        let unit_at = |name: &str, position: i64| envelope::ManifestUnit {
+            name: name.to_string(),
+            uuid: format!("{name}-uuid"),
+            snapshot_version: 1,
+            stage_set_id: 0,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![slice_at(position)],
+        };
+        let manifest = EnvelopeManifest {
+            manifest: envelope::ManifestHeader {
+                volume: "TEST-VOL".to_string(),
+                tenant: "operator".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            units: vec![
+                unit_at("attested-unit", 0),
+                unit_at("gap-unit", 1),
+                unit_at("garbage-unit", 2),
+                unit_at("unreadable-unit", 99), // never written to the store
+            ],
+        };
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut report = RebuildReport::default();
+        insert_all(
+            &tx,
+            "TEST-VOL",
+            "vol-uuid",
+            &mam_drill_meta(),
+            &manifest,
+            &HashMap::new(),
+            "recovered",
+            None,
+            &Supplement::default(),
+            &mut report,
+        )
+        .unwrap();
+
+        let mut store = crate::store::MemStore::new(512 * 1024);
+        // Position 0: encrypted to the escrow recipient -- attests.
+        let escrow_ct =
+            crate::staging::encrypt_data(b"payload", std::slice::from_ref(&escrow.public_key))
+                .unwrap();
+        store
+            .execute(&mut Cursor::new(escrow_ct.clone()), escrow_ct.len() as u64, false)
+            .unwrap();
+        // Position 1: a real age header, but for a DIFFERENT recipient --
+        // NoMatchingKeys, the permanent Gap arm.
+        let other_ct =
+            crate::staging::encrypt_data(b"payload", std::slice::from_ref(&other.public_key))
+                .unwrap();
+        store
+            .execute(&mut Cursor::new(other_ct.clone()), other_ct.len() as u64, false)
+            .unwrap();
+        // Position 2: not an age file at all -- the header fails to parse.
+        let garbage = b"not an age file at all".to_vec();
+        store
+            .execute(&mut Cursor::new(garbage.clone()), garbage.len() as u64, false)
+            .unwrap();
+        // Position 99 is never written -- `read_file_head` errors outright.
+
+        let escrow_id: age::x25519::Identity = escrow.secret_key.parse().unwrap();
+        attest_escrow(&tx, &mut store, &[escrow_id], &manifest, &mut report).unwrap();
+
+        assert_eq!(report.attested, 1, "the escrow-recipient slice must attest");
+        assert_eq!(
+            report.escrow_attest_not_recipient, 1,
+            "a slice encrypted to someone else is the permanent Gap arm"
+        );
+        assert_eq!(
+            report.escrow_attest_unreadable, 1,
+            "a slice this store cannot read at all is Unknown, not Gap"
+        );
+        assert_eq!(
+            report.escrow_attest_unparseable, 1,
+            "a slice whose header will not parse is Unknown, not Gap"
+        );
     }
 
     /// The post-disaster shape issue #214 is about, built DIRECTLY rather
