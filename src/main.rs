@@ -264,7 +264,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::unit::run(&conn, &paths, &cfg, command, cli.json)?;
         }
         Commands::Collection { ref command } => {
-            cli::collection::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::collection::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Snapshot { ref command } => {
             cli::snapshot::run(&conn, &paths, &cfg, command, cli.json)?;

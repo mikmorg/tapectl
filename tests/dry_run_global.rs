@@ -371,3 +371,217 @@ fn location_rename_dry_run_keeps_the_old_name() {
         "a dry-run rename must still refuse an unknown location"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Instance 1: `collection run`
+// ---------------------------------------------------------------------------
+
+/// A home with one two-unit collection, one configured drive, and two
+/// `initialized` destination volumes — everything `collection run` needs to
+/// get as far as `execute_batch` and no further.
+///
+/// The drive's `device_tape` is a path that is not a tape device, so if the
+/// dry-run gate ever regresses the run fails at the tape open instead of
+/// writing somewhere real. That failure is not what this test asserts on
+/// (the `stage_sets` row is), it is only a backstop: these tests must never
+/// touch `/dev/nst*`.
+fn home_with_a_collection_ready_to_run() -> (TempDir, TempDir) {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "media"]);
+
+    let root = TempDir::new().unwrap();
+    for name in ["alpha", "beta"] {
+        let dir = root.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 64 * 1024]).unwrap();
+    }
+
+    let cfg = home.path().join(".tapectl").join("config.toml");
+    let written = std::fs::read_to_string(&cfg).unwrap();
+    // `init` writes a root-level `collections = []`; the array-of-tables
+    // form below would be a duplicate key on top of it.
+    let mut text = written.replace("collections = []\n", "");
+    assert_ne!(
+        text, written,
+        "fixture assumption broken — init no longer writes `collections = []`"
+    );
+    text.push_str(&format!(
+        r#"
+[[backends.lto]]
+name = "p"
+device_tape = "{dev}"
+device_sg = "{dev}"
+generation = "LTO-6"
+capacity_override = "10M"
+usable_capacity_factor = 1.0
+enospc_buffer = "0"
+
+[[collections]]
+name = "microlib"
+root = "{root}"
+tenant = "media"
+unit_depth = 1
+"#,
+        dev = home.path().join("not-a-tape").display(),
+        root = root.path().display(),
+    ));
+    std::fs::write(&cfg, &text).unwrap();
+
+    // Register the two units for real — the dry run under test is
+    // `collection run`'s, not `collection sync`'s.
+    ok(home.path(), &["collection", "sync"]);
+
+    let conn = db(home.path());
+    for label in ["L1", "L2"] {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES (?1, 'lto', 'p', 'LTO-6', 10000000, 'initialized')",
+            rusqlite::params![label],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM units"),
+        2,
+        "fixture assumption broken — collection sync registered no units"
+    );
+    drop(conn);
+    (home, root)
+}
+
+/// Instance 1 of issue #230, and the worst of the four: `main.rs` never
+/// handed `cli::collection::run` the global flag, so `collection run
+/// --dry-run` staged an entire batch (dar + age, hours and a tape's worth of
+/// staging disk) and then WROTE A REAL TAPE. ADR-0003 makes a sealed volume
+/// immutable, so the cartridge is consumed and nothing about it is
+/// reversible.
+///
+/// WHAT THIS COVERS: that the run returns before `collection::batch::
+/// execute_batch` — asserted as "no `stage_sets` row exists", `execute_batch`
+/// staging being the first thing it does and the first row it writes. It
+/// also pins that the dry run stays informative: the budget line, the chosen
+/// batch's units and the destination labels.
+///
+/// WHAT IT DOES NOT COVER: the tape write itself. Reaching `Store::execute`
+/// needs a real (or mhvtl) drive, which the ungated suite must never touch,
+/// so the tape half of the promise is proved transitively — staging strictly
+/// precedes it in `execute_batch`, so a run that never stages never writes.
+#[test]
+fn collection_run_dry_run_stages_nothing_and_writes_no_tape() {
+    let (home, _root) = home_with_a_collection_ready_to_run();
+
+    let out = ok(
+        home.path(),
+        &[
+            "collection",
+            "run",
+            "--collection",
+            "microlib",
+            "--batch",
+            "0",
+            "--label",
+            "L1",
+            "--label",
+            "L2",
+            "--dry-run",
+        ],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM stage_sets"),
+        0,
+        "--dry-run staged a batch: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM writes"),
+        0,
+        "--dry-run recorded a write"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM snapshots"),
+        0,
+        "--dry-run snapshotted a unit"
+    );
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("budget"),
+        "dry run dropped the budget line: {text}"
+    );
+    assert!(
+        text.contains("microlib/alpha") && text.contains("microlib/beta"),
+        "dry run does not name the units in the chosen batch: {text}"
+    );
+    assert!(
+        text.contains("L1") && text.contains("L2"),
+        "dry run does not name the destination labels: {text}"
+    );
+}
+
+/// The `--json` half, and the one field a scripted caller needs to tell a
+/// rehearsal from a real tape write.
+#[test]
+fn collection_run_dry_run_json_carries_the_marker() {
+    let (home, _root) = home_with_a_collection_ready_to_run();
+
+    let out = ok(
+        home.path(),
+        &[
+            "--json",
+            "collection",
+            "run",
+            "--collection",
+            "microlib",
+            "--label",
+            "L1",
+            "--dry-run",
+        ],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "collection run --json --dry-run must emit one JSON object: {e}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    assert_eq!(parsed["dry_run"], serde_json::json!(true), "{parsed}");
+    assert_eq!(
+        parsed["collection"],
+        serde_json::json!("microlib"),
+        "{parsed}"
+    );
+
+    let conn = db(home.path());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM stage_sets"), 0);
+}
+
+/// A dry run must still refuse what the real run would refuse — an unknown
+/// `--label` here — rather than report a plan the operator cannot execute.
+/// `plan_for_run` resolves the destination budget before planning anything,
+/// so that refusal already sits ahead of the dry-run return.
+#[test]
+fn a_dry_run_collection_run_still_refuses_an_unknown_label() {
+    let (home, _root) = home_with_a_collection_ready_to_run();
+
+    let out = run_tapectl(
+        home.path(),
+        &[
+            "collection",
+            "run",
+            "--collection",
+            "microlib",
+            "--label",
+            "NOSUCH",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a dry run must still refuse an unknown destination label"
+    );
+}

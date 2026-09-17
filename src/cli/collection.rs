@@ -94,16 +94,30 @@ pub enum CollectionCommands {
     },
 }
 
+/// Run a collection subcommand.
+///
+/// `global_dry_run` is the process-wide `--dry-run` (issue #230). `main.rs`
+/// never handed it to this dispatcher, so `collection run --dry-run` staged
+/// a whole batch and wrote a real tape — the worst instance of the gap,
+/// since ADR-0003 makes a sealed volume immutable and the cartridge is
+/// consumed. `Status`/`Plan` are reads with nothing to suppress.
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
     command: &CollectionCommands,
     json_output: bool,
+    global_dry_run: bool,
 ) -> Result<()> {
     match command {
+        // `Sync` declares its OWN `--dry-run`, which shadows the global one
+        // on this subcommand, so the two are OR-ed: `tapectl --dry-run
+        // collection sync` meant the same thing as `collection sync
+        // --dry-run` to every operator reading the global flag's help, and
+        // did not behave like it. Neither spelling can now turn a dry run
+        // back into a real one.
         CollectionCommands::Sync { dry_run } => {
-            cmd_sync(conn, paths, config, *dry_run, json_output)
+            cmd_sync(conn, paths, config, *dry_run || global_dry_run, json_output)
         }
         CollectionCommands::Status => cmd_status(conn, config, json_output),
         CollectionCommands::Plan {
@@ -132,6 +146,7 @@ pub fn run(
             labels,
             &crate::cli::write_device(config, device.as_deref())?,
             json_output,
+            global_dry_run,
         ),
     }
 }
@@ -321,6 +336,7 @@ fn cmd_run(
     labels: &[String],
     device: &str,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let lib = collection::find_collection(config, collection_name)?;
     // No `--generation` here: `collection run` writes to volumes that are
@@ -357,6 +373,47 @@ fn cmd_run(
             batches.len()
         ))
     })?;
+
+    // Issue #230. Everything above is planning: `plan_for_run` resolved the
+    // destination budget and refused an unknown or non-write-target label,
+    // and the batch index was bounds-checked — so a dry run has already
+    // surfaced every reason this run would fail, and is not merely silent.
+    // `execute_batch` below is where it stops being reversible: it stages
+    // the whole batch (dar + age, hours and a tape's worth of staging disk)
+    // and then writes and SEALS a volume, which ADR-0003 makes immutable.
+    // The cartridge is consumed; there is no undo. So the return goes here,
+    // printing the plan the run would have executed: the budget line above,
+    // the units in the chosen batch, and the destinations they would be
+    // written to.
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "collection": collection_name,
+                    "batch": batch_idx,
+                    "budget_bytes": budget.bytes,
+                    "budget_from": budget.binding_label,
+                    "units": batch.unit_names(),
+                    "labels": labels,
+                    "dry_run": true,
+                })
+            );
+        } else {
+            println!(
+                "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) would be staged \
+                 and written to {} destination{} (DRY RUN — nothing staged, no tape written)",
+                batch.units.len(),
+                labels.len(),
+                if labels.len() == 1 { "" } else { "s" },
+            );
+            for u in batch.unit_names() {
+                println!("    {u}");
+            }
+            println!("  destination(s): {}", labels.join(", "));
+        }
+        return Ok(());
+    }
 
     let report = collection::batch::execute_batch(
         conn,
