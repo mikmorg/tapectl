@@ -860,7 +860,13 @@ fn a_rebuild_registers_the_cartridge_file_0_names_and_binds_the_volume_to_it() {
     assert_eq!(serial.as_deref(), Some("REBUILDSERIAL"));
     assert_eq!(status, "in_use");
     assert_eq!(media_type, "LTO-6");
-    assert_eq!(capacity, 2_400_000_000);
+    // Issue #210: the generation table's native LTO-6 figure, never the
+    // volume's resolved capacity (2_400_000_000, mhvtl's fiction) that File
+    // 0's `nominal_capacity_bytes` carries here.
+    assert_eq!(
+        capacity,
+        tapectl::media::Generation::Lto6.native_capacity_bytes() as i64
+    );
     assert_eq!(cartridge_count(&conn), 1);
     assert_eq!(
         open_mount_cartridge(&conn, LABEL).as_deref(),
@@ -1177,6 +1183,46 @@ fn a_rebuild_registers_under_the_operator_barcode_and_learns_the_serial() {
     assert!(report.cartridge_registered, "{report:?}");
     assert!(report.cartridge_bound, "{report:?}");
     assert_eq!(report.cartridge_barcode.as_deref(), Some("OPBARCODE"));
+}
+
+/// Issue #210: the cartridge row a rebuild auto-registers must record the
+/// GENERATION TABLE's native figure for the medium (`media::Generation`),
+/// never File 0's `nominal_capacity_bytes` — which is whatever
+/// `resolve_capacity` decided at write time, drive `capacity_override`
+/// first (ADR-0010 decision 3, issue #183). This is the `operator`-identity
+/// auto-register arm (`resolve_operator_identity`'s `None` match on
+/// `select_cartridge(tx, "barcode", ...)`) — the practically reachable one,
+/// since the documented override case is mhvtl, which exposes no medium
+/// serial and so takes `--cartridge` at init, landing here rather than in
+/// `resolve_mam_identity`.
+///
+/// The fixture's `BuildInputs.nominal_capacity` (2_400_000_000 — mhvtl's
+/// 2400 MB fiction; `binding.rs`'s own issue #183 tests use the identical
+/// stand-in) is nowhere near LTO-6's real native capacity, so the two
+/// figures are trivially distinguishable.
+#[test]
+fn a_rebuild_registers_the_cartridge_at_the_generation_table_capacity_not_the_resolved_one() {
+    let mut vol = build_sealed_volume_full(CatalogDb::New, "OPBARCODE", Some("operator"));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let (_, _, _, media_type, capacity) = cartridge_row(&conn, "OPBARCODE");
+    assert_eq!(media_type, "LTO-6");
+    assert_eq!(
+        capacity,
+        tapectl::media::Generation::Lto6.native_capacity_bytes() as i64,
+        "the cartridge row must record the generation table's native capacity for LTO-6, \
+         never the volume's resolved figure"
+    );
+    assert_ne!(
+        capacity, 2_400_000_000,
+        "the resolved (possibly override-inflated) figure File 0 carries must not leak onto \
+         the cartridge row"
+    );
 }
 
 /// Issue #221: a SECOND contact is where a serial is often learnt, not the

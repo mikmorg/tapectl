@@ -1506,6 +1506,46 @@ fn resolve_and_bind_cartridge(
     Ok(())
 }
 
+/// The capacity to record on a `cartridges` row this module auto-registers
+/// (issue #210): the GENERATION TABLE's native figure for the medium File 0
+/// names, never `meta.nominal_capacity_bytes` — that field is whatever
+/// `media::resolve_capacity` decided at write time, drive
+/// `capacity_override` first (ADR-0010 decision 3, issue #183). A
+/// `capacity_override` sits ABOVE the cartridge row in that decision's
+/// precedence ladder precisely so it can lie about ONE volume on ONE drive
+/// (mhvtl's 2400 MB fiction); writing that resolved figure onto a brand-new
+/// row would make the next `volume init` — on any drive, override or none —
+/// read the drive's lie back as an operator's declaration. The row
+/// describes the plastic — exactly the rule `binding.rs`'s own auto-register
+/// arm states and applies for `volume init`; this is that same rule, applied
+/// here because `binding.rs` is not the caller on this path.
+///
+/// `cartridges.nominal_capacity` is `NOT NULL` (`001_initial.sql`), so an
+/// unparseable `media_type` cannot fall back to NULL as the issue's own text
+/// suggests. In practice this branch is unreachable from any tape tapectl
+/// itself wrote: File 0's `media_type` is always `Generation::as_str()`
+/// (`write.rs`'s `generate_id_thunk_v2` call), which always round-trips
+/// through `Generation::parse`. Only a hand-edited or foreign tape could
+/// reach it, and refusing the whole rebuild over one unparseable string
+/// would make a worse trade than recording the volume's own resolved figure
+/// (the pre-#210 behavior) with a warning — the same "ignore and say so"
+/// convention `write.rs`'s own generation resolution already uses for a
+/// `media_type` it cannot arbitrate.
+fn cartridge_capacity_bytes(meta: &format::IdThunkVolumeMeta) -> i64 {
+    match crate::media::Generation::parse(&meta.media_type) {
+        Some(g) => g.native_capacity_bytes() as i64,
+        None => {
+            tracing::warn!(
+                media_type = %meta.media_type,
+                "rebuild: File 0's media_type is not a recognised LTO generation; \
+                 recording the volume's resolved capacity onto the new cartridge row \
+                 rather than the unknowable generation-table figure"
+            );
+            meta.nominal_capacity_bytes
+        }
+    }
+}
+
 /// The `mam`-identity resolve: find by `serial_number`, else auto-register
 /// with `barcode = serial_number = S` — the same convention
 /// `binding::resolve_or_register_cartridge`'s auto-register uses, but never
@@ -1569,7 +1609,7 @@ fn resolve_mam_identity(
             manufacturer,
             serial,
             length,
-            meta.nominal_capacity_bytes,
+            cartridge_capacity_bytes(meta),
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -1667,7 +1707,7 @@ fn resolve_operator_identity(
                     media.and_then(|m| m.cartridge_manufacturer.as_deref()),
                     observed_serial,
                     media.and_then(|m| m.tape_length_meters),
-                    meta.nominal_capacity_bytes,
+                    cartridge_capacity_bytes(meta),
                 ],
             )?;
             let id = tx.last_insert_rowid();
