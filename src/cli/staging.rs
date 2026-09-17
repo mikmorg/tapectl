@@ -182,6 +182,187 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
+    use rusqlite::params;
+
+    /// Local to this file (scope fence: `src/collection/batch.rs` is owned
+    /// by another worker and is not edited here). Mirrors
+    /// `collection::batch::tests::seed_unit_with_one_completed_copy` +
+    /// `..._and_staged_file`: one active unit with exactly one `completed`
+    /// write on a `sealed` volume, its lone `stage_set` still `'staged'`
+    /// with a real `.age` file on disk and a `stage_slices` row pointing at
+    /// it. This is the exact vacuous-pass shape
+    /// `default_guard_cleans_when_the_only_planned_copy_completed`
+    /// (`src/staging/clean.rs`) pins as CORRECT for `clean_staging` in
+    /// isolation — the defect (issue #244) is this file's caller invoking
+    /// it unconditionally. Returns `(conn, staged_file_path, TempDir
+    /// guard)`; the guard must outlive the assertions.
+    fn seed_unit_needing_a_second_copy(
+        unit_name: &str,
+    ) -> (Connection, std::path::PathBuf, tempfile::TempDir) {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES (?1, ?1, ?2, '/tmp/u', 'active')",
+            params![unit_name, tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        // 'current', not 'staged': `policy::coverage::CoverageQuery::current_unit`
+        // (what `under_copied_release_candidates` uses, same as
+        // `collection::batch::under_copied_units`) only counts a unit's
+        // CURRENT snapshot(s) — matching what `volume::session` actually
+        // promotes a just-sealed snapshot to.
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'current', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slice_1.age");
+        std::fs::write(&path, b"staged slice bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 19, 19, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_id, path.to_string_lossy()],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V1', 'lto', 'lto0', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snap_id, volume_id],
+        )
+        .unwrap();
+
+        (conn, path, dir)
+    }
+
+    fn config_with_staging_dir_and_min_copies(dir: &std::path::Path, min_copies: i32) -> Config {
+        let mut config = Config {
+            staging: crate::config::StagingConfig {
+                directory: dir.to_string_lossy().to_string(),
+            },
+            ..Default::default()
+        };
+        config.defaults.min_copies_for_tape_only = min_copies;
+        config
+    }
+
+    /// **The failing test, before the fix (issue #244).** `min_copies`
+    /// resolves to 2 and exactly ONE copy has completed — `staging clean`
+    /// (no `--force`) must refuse, not release. Before this fix,
+    /// `StagingCommands::Clean` called `clean::clean_staging` with no
+    /// policy lookup at all, and `clean_staging`'s own non-force guard
+    /// (`EXISTS a writes row AND NOT EXISTS a non-completed one`) passes
+    /// vacuously on exactly this shape, so the `.age` file was deleted and
+    /// the stage_set moved to `'cleaned'` — discarding the only cheap route
+    /// to the second copy the operator's own policy requires.
+    #[test]
+    fn clean_refuses_when_a_unit_is_under_copied() {
+        let (conn, staged_file, dir) = seed_unit_needing_a_second_copy("testlib/alpha");
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean { force: false },
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "staging clean must refuse when a unit is below its policy's min_copies"
+        );
+
+        let status: String = conn
+            .query_row("SELECT status FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status, "staged",
+            "the under-copied unit's stage_set must NOT be released"
+        );
+        assert!(
+            staged_file.exists(),
+            "the staged .age file must survive the refused clean"
+        );
+    }
+
+    /// Trap 5: `--force` must still override the new gate exactly as it
+    /// already overrides `clean_staging`'s own guard — no change to what
+    /// `--force` does, only to when the gate is reached at all.
+    #[test]
+    fn clean_force_overrides_the_under_copied_refusal() {
+        let (conn, staged_file, dir) = seed_unit_needing_a_second_copy("testlib/alpha");
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean { force: true },
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        let status: String = conn
+            .query_row("SELECT status FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cleaned");
+        assert!(!staged_file.exists());
+    }
+
+    /// Negative control: a unit whose resolved `min_copies = 1` is already
+    /// met by the one completed copy must still auto-release exactly as it
+    /// did before this fix — the behaviour the new gate could most easily
+    /// break.
+    #[test]
+    fn clean_still_releases_when_min_copies_is_already_met() {
+        let (conn, staged_file, dir) = seed_unit_needing_a_second_copy("testlib/alpha");
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 1);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean { force: false },
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        let status: String = conn
+            .query_row("SELECT status FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cleaned");
+        assert!(!staged_file.exists());
+    }
 
     /// `staging status --json` shape (issue: C2 row-listing drift). One row
     /// has every optional field populated with a byte count that is NOT an
