@@ -45,14 +45,17 @@ pub struct ResolvedPolicy {
 /// 3. System defaults (from config.toml)
 ///
 /// Returns `Err` if the unit dotfile's own `[policy]` section (the only
-/// layer parsed at USE time, not at config load — see below) is not valid:
-/// an invalid `slice_size` string (issue #59), or an unrecognized `[policy]`
-/// key (issue #211 — `PolicySection`'s `#[serde(deny_unknown_fields)]`
-/// refuses a misspelled key by name instead of silently deferring upward
-/// forever). `config.defaults.slice_size` and any `archive_sets.slice_size`
-/// are already validated at config load / archive-set write time
-/// respectively, so in practice this can only fail on a bad operator-
-/// authored dotfile value.
+/// layer parsed at USE time, not at config load — see below) is not valid.
+/// `config.defaults.slice_size`/`compression`/`checksum_mode` and any
+/// `archive_sets` equivalents are already validated at config load /
+/// archive-set write time respectively, so in practice this can only fail on
+/// a bad operator-authored dotfile value: an invalid `slice_size` string
+/// (issue #59), a `compression`/`checksum_mode` outside the closed set
+/// `config::validate_compression`/`validate_checksum_mode` accept (issue
+/// #213 — the same rule ADR-0012 states for every other closed-set field,
+/// applied here for the first time), or an unrecognized `[policy]` key
+/// (issue #211 — `PolicySection`'s `#[serde(deny_unknown_fields)]` refuses a
+/// misspelled key by name instead of silently deferring upward forever).
 ///
 /// **Every layer now fails loudly rather than falling through (issue #105.)**
 /// Each layer used to be wrapped in `if let Ok(..)`, so a database error, a
@@ -262,10 +265,39 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         ),
                     })?;
 
+                // Issue #213: `checksum_mode`/`compression` used to be
+                // assigned straight through with no validation, so a typo
+                // surfaced hours later as a raw `dar` failure (compression)
+                // or an opaque SQLite CHECK-constraint rejection (checksum
+                // mode) at stage time. Closed-set-validated here, at the
+                // same boundary `config.toml`'s `[defaults]` and
+                // `archive-set create/edit` already use the same two
+                // validators for (ADR-0012) -- one rule stated once, not
+                // three times.
                 if let Some(v) = section.checksum_mode {
+                    crate::config::validate_checksum_mode(&v).map_err(|e| {
+                        TapectlError::PolicyUnresolvable {
+                            layer: PolicyLayer::Dotfile,
+                            detail: format!(
+                                "unit \"{}\" has an invalid [policy] checksum_mode in {} ({e})",
+                                unit.name,
+                                dotfile_path.display()
+                            ),
+                        }
+                    })?;
                     policy.checksum_mode = v;
                 }
                 if let Some(v) = section.compression {
+                    crate::config::validate_compression(&v).map_err(|e| {
+                        TapectlError::PolicyUnresolvable {
+                            layer: PolicyLayer::Dotfile,
+                            detail: format!(
+                                "unit \"{}\" has an invalid [policy] compression in {} ({e})",
+                                unit.name,
+                                dotfile_path.display()
+                            ),
+                        }
+                    })?;
                     policy.compression = v;
                 }
                 if let Some(v) = section.slice_size {
@@ -398,7 +430,7 @@ mod tests {
             tmp.path().join(".tapectl-unit.toml"),
             r#"
 [policy]
-checksum_mode = "full_hash"
+checksum_mode = "sha256_on_archive"
 compression = "gzip"
 slice_size = "500M"
 "#,
@@ -409,8 +441,11 @@ slice_size = "500M"
         let unit = make_unit(Some(as_id), Some(unit_path));
         let p = resolve(&conn, &config, &unit).unwrap();
 
-        // Dotfile wins
-        assert_eq!(p.checksum_mode, "full_hash");
+        // Dotfile wins. `sha256_on_archive` is deliberately a DIFFERENT
+        // valid value from the archive set's `sha256` (issue #213 closed-set
+        // validation would now reject the old placeholder `"full_hash"`,
+        // which was never a real checksum_mode to begin with).
+        assert_eq!(p.checksum_mode, "sha256_on_archive");
         assert_eq!(p.compression, "gzip");
         assert_eq!(p.slice_size, 500 * 1024 * 1024);
     }
@@ -650,5 +685,52 @@ slice_size = "500M"
             p.warehouse_copies, 3,
             "the ABSENT warehouse_copies key must defer to the archive set too"
         );
+    }
+
+    /// Issue #213: an invalid `[policy] compression` must be refused at
+    /// resolve time -- the same closed-set validation ADR-0012 already
+    /// requires for `config.toml [defaults]` and `archive-set create/edit`
+    /// -- rather than assigned straight through to surface hours later as a
+    /// raw `dar -z` failure mid-`stage create`.
+    #[test]
+    fn resolve_rejects_an_invalid_dotfile_compression_value() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\ncompression = \"banana\"\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        let err = resolve(&conn, &config, &unit).expect_err(
+            "an invalid [policy] compression must be refused at resolve time (issue #213), \
+             not assigned straight through to surface later as a raw dar failure",
+        );
+        assert!(err.to_string().contains("compression"), "got: {err}");
+    }
+
+    /// Issue #213, the `checksum_mode` half: today this surfaces as an
+    /// opaque SQLite CHECK-constraint rejection when the unit is finally
+    /// written with it -- ADR-0012's other named motivating case.
+    #[test]
+    fn resolve_rejects_an_invalid_dotfile_checksum_mode_value() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\nchecksum_mode = \"not_a_real_mode\"\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        let err = resolve(&conn, &config, &unit).expect_err(
+            "an invalid [policy] checksum_mode must be refused at resolve time (issue #213), \
+             not assigned straight through to surface later as an opaque CHECK-constraint \
+             failure",
+        );
+        assert!(err.to_string().contains("checksum_mode"), "got: {err}");
     }
 }
