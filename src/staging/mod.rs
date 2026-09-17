@@ -3146,6 +3146,76 @@ mod tests {
         assert_eq!(count, 1, "no second snapshot row must be created");
     }
 
+    /// Issue #206 / the 2026-09-17 pre-production review: this pins what the
+    /// minting rule actually guarantees, which is NARROWER than ADR-0012's
+    /// concluding sentence claims.
+    ///
+    /// ADR-0012's rule is scoped to "its latest CURRENT snapshot", and that is
+    /// exactly what `snapshot_create_detailed` implements. Its next sentence
+    /// then generalises to "two versions of a unit never hold identical
+    /// content" — which does not follow. Revert a unit's bytes to those of an
+    /// older, superseded version and a fresh version is minted holding content
+    /// byte-identical to that old one.
+    ///
+    /// Recorded as a PIN, not a bug report: the consequence is an under-count
+    /// (the new version genuinely has no slices of its own, and
+    /// `copy_count_expr`'s minimum is over CURRENT snapshots, so the dead
+    /// sibling is correctly not credited). ADR-0012 itself calls an under-count
+    /// "the safe direction, but still wrong". Whether the rule should widen to
+    /// compare against every live version is a design question, not something
+    /// to decide by changing this test.
+    #[test]
+    fn reverting_to_a_superseded_versions_content_mints_an_identical_sibling() {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, b"content-A").unwrap();
+        let unit_name = seed_snapshot_test_unit(&conn, tmp.path(), "mtime_size");
+
+        let v1 = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(v1.minted);
+
+        std::fs::write(&file, b"content-B-which-differs-in-size").unwrap();
+        let v2 = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+        assert!(v2.minted);
+        assert_eq!(v2.version, 2);
+
+        // v1 is now superseded; put the source back to exactly v1's bytes.
+        std::fs::write(&file, b"content-A").unwrap();
+        let v3 = snapshot_create_detailed(&conn, &unit_name, &Config::default()).unwrap();
+
+        assert!(
+            v3.minted,
+            "a fresh version IS minted -- the short-circuit only ever compares \
+             against the LATEST snapshot, and that is v2, which differs"
+        );
+        assert_eq!(v3.version, 3);
+        assert_ne!(
+            v3.snapshot_id, v1.snapshot_id,
+            "v1 is not resurrected; v3 is a distinct row holding identical content"
+        );
+
+        // The two rows really do record the same content.
+        let stamps = |sid: i64| -> Vec<(String, i64)> {
+            let mut st = conn
+                .prepare(
+                    "SELECT path, size_bytes FROM files
+                     WHERE snapshot_id = ?1 AND is_directory = 0 ORDER BY path",
+                )
+                .unwrap();
+            st.query_map(params![sid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            stamps(v1.snapshot_id),
+            stamps(v3.snapshot_id),
+            "v1 and v3 hold byte-identical content, which ADR-0012's concluding \
+             sentence says cannot happen"
+        );
+    }
+
     #[test]
     fn snapshot_create_detailed_mints_a_new_version_when_a_file_changes() {
         let conn = crate::db::open_memory().unwrap();

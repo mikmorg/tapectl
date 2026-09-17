@@ -28,6 +28,25 @@ current snapshot — by the unit's own `checksum_mode`, the predicate that alrea
 *Dirty* — reports the existing version and creates nothing. Two versions of a unit never hold
 identical content, and a version number names content.
 
+*Correction 2026-09-17 (issue #206): that last sentence claims more than the rule beside it
+delivers, and the gap is now pinned by a test rather than left as an assumption.* The rule is
+scoped to **the latest current snapshot**, and the code implements exactly that. It therefore
+does not prevent a new version matching an OLDER, superseded one: revert a unit's bytes to a
+previous version's and `snapshot create` mints a fresh version holding byte-identical content,
+because the only row it compares against is the latest — which differs.
+`staging::tests::reverting_to_a_superseded_versions_content_mints_an_identical_sibling`
+demonstrates it. So "a version number names content" is true of the live sequence and not of
+the full history.
+
+The consequence is bounded and in the safe direction, which is why this is a correction to the
+text rather than an emergency: `copy_count_expr`'s minimum is over **current** snapshots, so the
+dead sibling is not credited and the fresh version reports the copies it actually has — zero.
+The operator is told to write bytes that already sit on a cartridge under a superseded version,
+which wastes a cartridge rather than losing data, and every deletion gate stays conservative
+because a shortfall blocks. Whether the rule should widen to compare against every live version
+— making the original sentence true — is a **decision the CTO has not been asked**, and is
+parked on #206 rather than settled here.
+
 **The retire family has an absolute floor, and the code had the tiers inverted.** ADR-0008
 puts degraded-but-nonzero coverage in Tier 2 (evidence shown, prompt, `--force`/`--yes`
 passes) and zero coverage in Tier 3 (refused, no flag). `volume retire`, `cartridge retire`
