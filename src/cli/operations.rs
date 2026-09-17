@@ -1347,9 +1347,15 @@ fn mark_erased_consent_facts(barcode: &str, status: &str, volume_labels: &[Strin
 ///
 /// `cartridge unretire` — not this command — is the way out of
 /// `retired_permanent` (ADR-0011, corrected 2026-09-14): the operator
-/// saying they were wrong about the medium being unfit. This command's own
-/// job is unchanged either way: it is the separate statement that the
-/// bytes are gone.
+/// saying they were wrong about the medium being unfit. The lifecycle
+/// diagram in that correction draws NO edge from `retired_permanent`
+/// through `mark-erased` at all, so this command REFUSES a
+/// `retired_permanent` cartridge outright, before the consent branch
+/// below and with no `force`/`--yes` parameter reaching it — structurally
+/// like `binding::refuse_retired` on the write path (issue #207). Writing
+/// `status = 'available'` here, even under consent, would silently reverse
+/// the operator's "never write this medium again" declaration; no amount
+/// of consent makes a medium declared permanently unfit fit again.
 ///
 /// Issue #163 audit finding: the ADR-0008 Tier-2 consent facts named only
 /// the cartridge's status, never the volumes about to be recorded erased —
@@ -1372,6 +1378,24 @@ pub fn cartridge_mark_erased(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+
+    // ADR-0011 (corrected 2026-09-14): `cartridge unretire` REPLACED
+    // mark-erased as the way back from `retired_permanent` -- the
+    // lifecycle diagram draws no edge from that state through this
+    // command. This is a fact about the medium, not a risk to accept, so
+    // -- structurally like `binding::refuse_retired` on the write path --
+    // it takes no `force`/`--yes` parameter at all and is checked before
+    // the consent branch below (issue #207).
+    if status == "retired_permanent" {
+        return Err(TapectlError::Other(format!(
+            "cartridge \"{barcode}\" is retired_permanent and cannot be marked erased: \
+             that would also return it to available, and no amount of consent makes a \
+             medium declared permanently unfit fit again (ADR-0011) -- there is no \
+             --force/--yes for this. If the cartridge is in fact usable, say so with \
+             `tapectl cartridge unretire {barcode}`, \
+             which is the way back."
+        )));
+    }
 
     // Currently-mounted volume(s), if any -- these physically lose their
     // data the instant the cartridge is bulk-erased, so they move to
@@ -5988,6 +6012,53 @@ mod tests {
             let err = cartridge_mark_erased(&conn, "BC001", false, false, false, false)
                 .expect_err("non-interactive with no consent must refuse");
             assert!(err.to_string().contains("BC001"));
+        }
+
+        /// Issue #207: `cartridge_mark_erased` read the cartridge's status
+        /// only to decide whether consent was needed, then wrote
+        /// `status = 'available'` UNCONDITIONALLY -- including over
+        /// `retired_permanent`. ADR-0011's dated correction (2026-09-14) is
+        /// explicit that `cartridge unretire` REPLACED mark-erased as the
+        /// way back from that state, and the lifecycle diagram draws no
+        /// edge from `retired_permanent` through this command at all: one
+        /// `cartridge mark-erased BC --yes` silently un-condemned a medium
+        /// the operator had declared permanently unfit. This must FAIL
+        /// against the unmodified code and pass once the guard mirrors
+        /// `binding::refuse_retired`, which takes no `force` parameter for
+        /// exactly this reason.
+        #[test]
+        fn retired_permanent_is_refused_and_never_becomes_available() {
+            let (conn, cart_id, vol_id) = setup_cartridge("retired_permanent", true);
+            let err = cartridge_mark_erased(&conn, "BC001", false, false, false, false)
+                .expect_err("a retired_permanent cartridge must refuse mark-erased outright");
+            assert_eq!(
+                cartridge_status(&conn, cart_id),
+                "retired_permanent",
+                "must not silently un-condemn a medium declared permanently unfit"
+            );
+            assert_eq!(
+                volume_status(&conn, vol_id.unwrap()),
+                "full",
+                "a refused mark-erased must not touch the mounted volume either"
+            );
+            assert!(
+                err.to_string().contains("cartridge unretire"),
+                "the refusal must name `cartridge unretire` (ADR-0011's correction), \
+                 not mark-erased, as the way back: {err}"
+            );
+        }
+
+        /// Not defeatable by `--force`/`--yes` -- like
+        /// `binding::refuse_retired`, this guard takes no force parameter
+        /// at all: no amount of consent makes a permanently unfit medium
+        /// fit again.
+        #[test]
+        fn retired_permanent_is_refused_even_with_force_and_global_yes() {
+            let (conn, cart_id, _vol_id) = setup_cartridge("retired_permanent", false);
+            let err = cartridge_mark_erased(&conn, "BC001", true, true, false, false)
+                .expect_err("--force/--yes must not defeat the retired_permanent refusal");
+            assert_eq!(cartridge_status(&conn, cart_id), "retired_permanent");
+            assert!(err.to_string().contains("unretire"));
         }
     }
 

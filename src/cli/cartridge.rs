@@ -97,11 +97,18 @@ pub enum CartridgeCommands {
         force: bool,
     },
     /// Mark a cartridge as erased (available for reuse)
+    ///
+    /// Refused outright on a `retired_permanent` cartridge — no `--force`, no
+    /// `--yes`, no exception (ADR-0011, corrected 2026-09-14; issue #207):
+    /// this command's own mutation is the cartridge returning to `available`,
+    /// and no amount of consent makes a medium declared permanently unfit fit
+    /// again. `cartridge unretire` is the way back.
     MarkErased {
         /// Barcode
         barcode: String,
         /// Override the pending_erase lifecycle precondition (ADR-0008
-        /// Tier 2 — see cli::consent)
+        /// Tier 2 — see cli::consent). Does NOT reach a `retired_permanent`
+        /// cartridge (issue #207) — `cartridge unretire` is the way back.
         #[arg(long)]
         force: bool,
     },

@@ -7,10 +7,12 @@ tapectl\-cartridge\-mark\-erased \- Mark a cartridge as erased (available for re
 \fBtapectl cartridge mark\-erased\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
 .SH DESCRIPTION
 Mark a cartridge as erased (available for reuse)
+.PP
+Refused outright on a `retired_permanent` cartridge — no `\-\-force`, no `\-\-yes`, no exception (ADR\-0011, corrected 2026\-09\-14; issue #207): this command\*(Aqs own mutation is the cartridge returning to `available`, and no amount of consent makes a medium declared permanently unfit fit again. `cartridge unretire` is the way back.
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Override the pending_erase lifecycle precondition (ADR\-0008 Tier 2 — see cli::consent)
+Override the pending_erase lifecycle precondition (ADR\-0008 Tier 2 — see cli::consent). Does NOT reach a `retired_permanent` cartridge (issue #207) — `cartridge unretire` is the way back
 .TP
 \fB\-\-json\fR
 Output in JSON format
