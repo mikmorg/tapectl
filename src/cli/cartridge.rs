@@ -80,16 +80,24 @@ pub enum CartridgeCommands {
     /// wrong about the medium; `cartridge mark-erased` is a different
     /// statement, that the bytes are gone (ADR-0011, corrected 2026-09-14).
     ///
-    /// ADR-0008 Tier 2: the coverage impact is displayed first, and
-    /// `--force`/`--yes` is required when a unit is left below its policy.
+    /// ADR-0008 Tier 2: the coverage impact is displayed first, and consent
+    /// is asked EVERY time — retiring a medium permanently is a declaration
+    /// worth confirming even when no unit loses coverage by it, which is
+    /// what `cartridge_retire` does deliberately. `--force`/`--yes` supplies
+    /// that consent.
+    ///
+    /// This said consent was "required when a unit is left below its policy"
+    /// until 2026-09-17 (issue #219), which read as "not required otherwise"
+    /// — so a script retiring a fully-covered cartridge without `--yes` was
+    /// refused by a non-interactive session for a reason the help denied.
     Retire {
         /// Barcode
         barcode: String,
         /// Why (appended to the cartridge's notes, never overwriting them)
         #[arg(long)]
         reason: Option<String>,
-        /// Waive the ADR-0008 Tier-2 prompt: proceed when the retirement
-        /// leaves a live version below its policy but above zero. It does
+        /// Supply the ADR-0008 Tier-2 consent this command asks on every
+        /// run, including when no unit is left below its policy. It does
         /// NOT defeat the Tier-3 refusal (issue #147) — a cartridge holding
         /// the last eligible copy of a live version is refused outright and
         /// no flag reaches it. See cli::consent.
