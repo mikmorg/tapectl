@@ -24,10 +24,64 @@ pub struct ShadowingDotfile {
     pub compression_set: bool,
 }
 
+/// A unit whose dotfile could not be READ at all — malformed TOML, or
+/// (since issue #211) a `[policy]` key `PolicySection` does not declare.
+///
+/// Separate from [`ShadowingDotfile`] because it is a different statement:
+/// that one says "this file sets something it need not"; this one says
+/// "this file cannot be understood, so every command that resolves policy
+/// for this unit will fail."
+///
+/// This exists because #211 changed what "unreadable" means. Before it, an
+/// unrecognised `[policy]` key was silently ignored, so skipping such a
+/// file cost nothing. After it, that file is a hard `PolicyUnresolvable`
+/// for `audit`, `stage create` and `unit status` — while `config check`,
+/// the one command an operator runs precisely to find bad configuration,
+/// went on saying nothing. Being loud everywhere except the place people
+/// look is worse than being quiet everywhere (issue #211's residual).
+#[derive(Debug, Clone)]
+pub struct UnreadableDotfile {
+    pub unit_name: String,
+    pub dotfile_path: PathBuf,
+    pub reason: String,
+}
+
+/// Scan for dotfiles that cannot be read. Advisory, like every other scan
+/// here: `config check` reports these and does NOT change its exit code —
+/// the commands that actually resolve policy already refuse.
+pub fn scan_unreadable(conn: &Connection) -> Vec<UnreadableDotfile> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT name, current_path FROM units WHERE current_path IS NOT NULL")
+    else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return out;
+    };
+    for (unit_name, current_path) in rows.flatten() {
+        let dotfile_path = std::path::Path::new(&current_path).join(".tapectl-unit.toml");
+        if !dotfile_path.exists() {
+            continue;
+        }
+        if let Err(e) = dotfile::read_dotfile(&dotfile_path) {
+            out.push(UnreadableDotfile {
+                unit_name,
+                dotfile_path,
+                reason: e.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// Scan every unit with a known `current_path` for a `.tapectl-unit.toml`
 /// whose `[policy]` table sets `checksum_mode` and/or `compression`.
-/// Unreadable or malformed dotfiles are skipped silently — this is
-/// advisory, like the policy audit, never a hard error.
+/// Unreadable or malformed dotfiles are skipped here — [`scan_unreadable`]
+/// reports those — and this stays advisory, like the policy audit, never a
+/// hard error.
 pub fn scan(conn: &Connection) -> Vec<ShadowingDotfile> {
     let mut out = Vec::new();
 
@@ -70,6 +124,49 @@ pub fn scan(conn: &Connection) -> Vec<ShadowingDotfile> {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #211's residual: `config check` must not be the one place that
+    /// stays quiet about a dotfile every other command now refuses.
+    #[test]
+    fn scan_unreadable_reports_a_dotfile_with_an_unrecognised_policy_key() {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "uuid = \"u1\"\nname = \"photos\"\ntenant = \"alice\"\n\
+             [policy]\nmin_copiez = 2\n",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status, current_path)
+             VALUES ('u1', 'photos', 1, 'mtime_size', 1, 'active', ?1)",
+            rusqlite::params![tmp.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let hits = scan_unreadable(&conn);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the misspelled key must be reported: {hits:?}"
+        );
+        assert_eq!(hits[0].unit_name, "photos");
+        assert!(
+            hits[0].reason.contains("min_copiez"),
+            "the reason must name the offending key, not just say 'unreadable': {}",
+            hits[0].reason
+        );
+        assert!(
+            scan(&conn).is_empty(),
+            "an unreadable dotfile is not a SHADOWING dotfile -- the two scans \
+             answer different questions"
+        );
+    }
+
     use super::*;
     use crate::unit::dotfile::UnitDotfile;
     use tempfile::TempDir;

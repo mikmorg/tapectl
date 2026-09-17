@@ -82,6 +82,17 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
         Vec::new()
     };
 
+    // Dotfiles that cannot be READ (issue #211's residual). Since #211 an
+    // unrecognised `[policy]` key is a hard `PolicyUnresolvable` for `audit`,
+    // `stage create` and `unit status` — so `config check`, the command run
+    // precisely to find bad configuration, must not be the one place that
+    // stays silent about it. Advisory: reported, never an exit-code change.
+    let unreadable_dotfiles = if paths.db_file.exists() {
+        crate::policy::shadowing::scan_unreadable(conn)
+    } else {
+        Vec::new()
+    };
+
     // Unknown-key advisory (issue #129), scoped to `[defaults]`. Reads the
     // raw text directly, so it too always runs regardless of whether the
     // rest of the file loads. Issue #173: with every section now denying
@@ -159,6 +170,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
         print_human(
             &report,
             &shadowing_hits,
+            &unreadable_dotfiles,
             &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
@@ -333,6 +345,7 @@ fn print_json(
 fn print_human(
     report: &crate::policy::lenient_config::LenientReport,
     shadowing_hits: &[crate::policy::shadowing::ShadowingDotfile],
+    unreadable_dotfiles: &[crate::policy::shadowing::UnreadableDotfile],
     subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
@@ -369,6 +382,21 @@ fn print_human(
     if !shadowing_hits.is_empty() {
         println!(
             "  hint: remove the shadowing key(s) from each dotfile's [policy] table to defer to the archive set"
+        );
+    }
+    for hit in unreadable_dotfiles {
+        println!(
+            "warning: unit '{}' dotfile cannot be read, so every command that resolves \
+             policy for this unit will refuse: {} ({})",
+            hit.unit_name,
+            hit.reason,
+            hit.dotfile_path.display()
+        );
+    }
+    if !unreadable_dotfiles.is_empty() {
+        println!(
+            "  hint: an unrecognised key under [policy] is refused by name (issue #211); \
+             an ABSENT key is always fine and defers to the archive set or defaults"
         );
     }
     for hit in subsumed_hits {

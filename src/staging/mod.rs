@@ -900,11 +900,22 @@ fn resolve_slice_size_string(
     unit: &models::Unit,
     resolved_bytes: i64,
 ) -> String {
-    // Layer 1 (highest priority): the unit dotfile's own [policy]
-    // slice_size, read the same raw-TOML-table way `policy::resolve` does.
-    // This key isn't part of the structured `UnitDotfile`/`PolicySection`
-    // model (only checksum_mode/compression are), so it has to be read the
-    // same ad-hoc way `policy::resolve` reads it, not via `dotfile::read_dotfile`.
+    // Layer 1 (highest priority): the unit dotfile's own [policy] slice_size.
+    //
+    // Still read as raw TOML here, but NOT for the reason this comment gave
+    // until 2026-09-17 (issue #212 residual). It claimed `slice_size` "isn't
+    // part of the structured `UnitDotfile`/`PolicySection` model" — it is,
+    // since #212 added it so `unit rename`'s read/write round trip stopped
+    // silently dropping it. The raw read is now merely redundant, not
+    // required.
+    //
+    // It is also harmless: `policy::resolve` runs first (see the caller) and
+    // its `?` means a dotfile with a bad `[policy]` never reaches here at all
+    // (#211). Left as-is rather than rewired, because `slice_arg_for_dar`'s
+    // doc explains at length why this function hands dar the operator's RAW
+    // string, and changing how the string is obtained is a different, riskier
+    // change than correcting a comment: it moves real on-tape slice
+    // boundaries for every unit.
     if let Some(ref path) = unit.current_path {
         let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
         if let Ok(contents) = fs::read_to_string(&dotfile_path) {
