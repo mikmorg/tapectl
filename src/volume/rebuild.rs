@@ -144,20 +144,26 @@ pub struct RebuildReport {
     pub cartridge_bound: bool,
     /// The bound cartridge row had no `serial_number` recorded, and this
     /// contact separately observed one and recorded it (`NULL` → value,
-    /// once — ADR-0012). Set on the `operator`-identity path and (issue #221) by the pre-transaction `corroborate_volume` contact: the
-    /// `mam`-identity path only ever finds a row BY its serial, so it always
-    /// already has one.
+    /// once — ADR-0012).
     ///
-    /// Set from either of two sources (issue #221): `resolve_operator_identity`'s
-    /// own learn branch, when the row is still found by BARCODE and only then
-    /// discovered to lack a serial; or the pre-transaction
-    /// `binding::corroborate_volume` contact check in `rebuild_from_store`,
-    /// when this same tape's label already names a bound cartridge and this
-    /// contact is the first to observe its serial — which happens BEFORE the
-    /// transaction, so it can teach the row its serial and make
-    /// `resolve_operator_identity` find it BY that serial instead, skipping
-    /// its own learn branch entirely. Either way the row changed, so this
-    /// field must be true.
+    /// Set from any of THREE sources. Two are the `operator`-identity ones
+    /// (issue #221): `resolve_operator_identity`'s own learn branch, when the
+    /// row is still found by BARCODE and only then discovered to lack a
+    /// serial; or the pre-transaction `binding::corroborate_volume` contact
+    /// check in `rebuild_from_store`, when this same tape's label already
+    /// names a bound cartridge and this contact is the first to observe its
+    /// serial — which happens BEFORE the transaction, so it can teach the row
+    /// its serial and make `resolve_operator_identity` find it BY that serial
+    /// instead, skipping its own learn branch entirely.
+    ///
+    /// The third is on the `mam`-identity path (issue #214):
+    /// `resolve_mam_identity` finding the row by the operator's unconfirmed
+    /// CLAIM (`operator_serial`) and promoting it. That path used to be
+    /// unreachable — the note that once stood here, "the `mam`-identity path
+    /// only ever finds a row BY its serial, so it always already has one",
+    /// was exactly the asymmetry #214 closed.
+    ///
+    /// Either way the row changed, so this field must be true.
     pub serial_learned: bool,
     /// Whether THIS contact observed a medium serial at all (a real drive
     /// read returned `Some`, whether or not it matched anything) — distinct
@@ -1334,13 +1340,20 @@ struct ResolvedCartridge {
     id: i64,
     barcode: String,
     prior_status: String,
-    /// A serial match PROVES this is the right physical cartridge — always
-    /// true for a `mam` identity (the row was found BY that serial, which
-    /// was itself corroborated against any live drive read before the
-    /// transaction opened, or the row is brand new) and for an `operator`
-    /// identity a live serial match SUPERSEDED; false for an `operator`
-    /// identity resolved by barcode alone with no live serial to corroborate
-    /// it against.
+    /// A serial match PROVES this is the right physical cartridge.
+    ///
+    /// True for a `mam` identity resolved by a `serial_number` the catalog
+    /// ALREADY held (the row was found BY that serial, which was itself
+    /// corroborated against any live drive read before the transaction
+    /// opened) or freshly registered, and for an `operator` identity a live
+    /// serial match SUPERSEDED.
+    ///
+    /// False for an `operator` identity resolved by barcode alone with no
+    /// live serial to corroborate it against — and, since issue #214, for a
+    /// `mam` identity resolved by the operator's unconfirmed CLAIM
+    /// (`operator_serial`): that serial is learned by THIS contact, and a
+    /// value written for the first time by the very contact now weighing a
+    /// displacement witnesses nothing.
     witnessed: bool,
 }
 
@@ -1562,7 +1575,9 @@ fn cartridge_capacity_bytes(meta: &format::IdThunkVolumeMeta) -> i64 {
     }
 }
 
-/// The `mam`-identity resolve: find by `serial_number`, else auto-register
+/// The `mam`-identity resolve, in three probes: find by `serial_number`;
+/// else find by the operator's unconfirmed CLAIM, `operator_serial` (issue
+/// #214); else, if nothing already wears S as a barcode, auto-register
 /// with `barcode = serial_number = S` — the same convention
 /// `binding::resolve_or_register_cartridge`'s auto-register uses, but never
 /// calling it directly: that function only ever auto-registers FROM a
@@ -1585,12 +1600,85 @@ fn resolve_mam_identity(
         });
     }
 
+    // The operator's own CLAIM (issue #214), probed between the
+    // chip-confirmed hit above and the barcode-collision refusal below.
+    //
+    // `resolve_mam_identity` was the ONE of `record_medium_serial`'s call
+    // paths that could not find a row by operator claim at all:
+    // `binding::lookup_cartridge` (issue #197's own work),
+    // `binding::corroborate_contact` and `resolve_operator_identity` all
+    // promote a claim once they have FOUND the row, while this function
+    // consulted `serial_number` and then `barcode` and nothing else. That
+    // asymmetry is what made the refusal below a dead end on the one path an
+    // heir has — its remediation named a command ADR-0003 structurally
+    // refuses on the sealed tape a rebuild is by construction reading. This
+    // arm closes it, and is what makes that refusal's new recipe executable.
+    //
+    // Ordered BEFORE the collision check deliberately, not incidentally: it
+    // mirrors `binding.rs`, where the claim lookup in `lookup_cartridge`
+    // likewise precedes `bind_cartridge`'s barcode-collision arm. A row that
+    // CLAIMS this serial is a positive identification; a row merely wearing
+    // it as a sticker is not.
+    let claimants = crate::volume::binding::select_cartridges_by_operator_serial(tx, serial)?;
+    match claimants.len() {
+        // Nothing claims it — fall through to the collision refusal below.
+        0 => {}
+        1 => {
+            let row = claimants
+                .into_iter()
+                .next()
+                .expect("length checked to be exactly one");
+            // `record_medium_serial` is the one writer of `serial_number`,
+            // and the one place the confirm/contradict rule lives. It cannot
+            // contradict here (this row was SELECTed BY a claim equal to
+            // `serial`), but it is still the only way this column is written
+            // — which is exactly what keeps that rule structural.
+            crate::volume::binding::record_medium_serial(tx, row.id, &row.barcode, serial)?;
+            report.serial_learned = true;
+            return Ok(ResolvedCartridge {
+                id: row.id,
+                barcode: row.barcode,
+                prior_status: row.status,
+                // NOT `true`, unlike the `serial_number` arm above. Computed
+                // the way `resolve_operator_identity` computes it and for the
+                // same stated reason: this serial was recorded for the FIRST
+                // TIME by this very contact, and proves nothing about a
+                // displacement this same contact is about to consider. The
+                // arm above may say `true` because the row was found BY a
+                // serial the catalog already held; this row was found by an
+                // unconfirmed claim.
+                witnessed: false,
+            });
+        }
+        _ => {
+            // `operator_serial` carries no UNIQUE index, so two hand-typed
+            // claims can name one serial. Same shape `lookup_cartridge`
+            // raises — count, barcodes, name one — except that `catalog
+            // rebuild` has no flag for naming one, so the way out is to
+            // correct the claims instead.
+            let barcodes: Vec<&str> = claimants.iter().map(|r| r.barcode.as_str()).collect();
+            return Err(TapectlError::Other(format!(
+                "this tape's File 0 reports medium serial {serial}, which matches no \
+                 registered cartridge's serial_number — and matches the operator-claimed \
+                 serial of {} pre-registered cartridges ({}), none of them chip-confirmed \
+                 yet. `catalog rebuild` cannot tell which one holds this tape, and has no \
+                 flag for being told.\n\
+                 \n\
+                 Correct the claim on each row that is NOT this cartridge, leaving exactly \
+                 one claiming {serial}, then re-run this rebuild:\n    \
+                 tapectl cartridge edit <barcode> --serial <that cartridge's own serial>",
+                claimants.len(),
+                barcodes.join(", ")
+            )));
+        }
+    }
+
     // Same collision `bind_cartridge`'s own auto-register arm refuses: a row
     // already registered under barcode = S (an operator who hand-registered
     // a cartridge using the serial printed on its shell, before it was ever
-    // loaded). Refuse by name rather than surface the raw UNIQUE constraint
-    // failure, or silently adopt a row that might be a different physical
-    // cartridge.
+    // loaded) and NOT claiming S above. Refuse by name rather than surface
+    // the raw UNIQUE constraint failure, or silently adopt a row that might
+    // be a different physical cartridge.
     if crate::volume::binding::select_cartridge(tx, "barcode", serial)?.is_some() {
         return Err(TapectlError::Other(format!(
             "this tape's File 0 reports medium serial {serial}, which matches no registered \
@@ -1599,9 +1687,13 @@ fn resolve_mam_identity(
              physical cartridge, registered by hand before it was ever loaded, or a \
              different one whose sticker happens to read the same. It will not guess.\n\
              \n\
-             If it IS this cartridge, bind the serial onto it by hand, then re-run this \
-             rebuild:\n    \
-             tapectl volume init <a throwaway label> --device <dev> --cartridge {serial}\n\
+             If it IS this cartridge, record that on the row, then re-run this rebuild:\n    \
+             tapectl cartridge edit \"{serial}\" --serial {serial}\n\
+             That writes the OPERATOR's claim (`operator_serial`) — the only serial column \
+             an operator command may write — and this rebuild then finds the row by that \
+             claim and lets the chip's own reading confirm it. Nothing need be written to \
+             the tape: it is already sealed, and a fresh-write contact with a sealed tape \
+             is refused regardless of --force (ADR-0003).\n\
              \n\
              If it is a DIFFERENT cartridge, give the registered one a barcode of its own:\n    \
              tapectl cartridge relabel {serial} <new-barcode>"
@@ -1774,6 +1866,157 @@ mod tests {
             matches!(no, Err(age::DecryptError::NoMatchingKeys)),
             "the wrong identity must be refused at the header: {:?}",
             no.as_ref().err()
+        );
+    }
+
+    /// The File 0 `[volume]` meta every `resolve_mam_identity` drill below
+    /// needs — none of them look at it, but the auto-register arm binds it
+    /// into the `cartridges` INSERT, so it has to be real.
+    fn mam_drill_meta() -> format::IdThunkVolumeMeta {
+        format::IdThunkVolumeMeta {
+            media_type: "LTO-6".to_string(),
+            nominal_capacity_bytes: 2_500_000_000_000,
+            mam_capacity_bytes: 2_500_000_000_000,
+        }
+    }
+
+    /// The post-disaster shape issue #214 is about, built DIRECTLY rather
+    /// than through `volume init`: a fresh catalog in which the heir
+    /// hand-registered a cartridge under the serial printed on its shell
+    /// (`barcode = S`), nothing has ever chip-confirmed it
+    /// (`serial_number IS NULL`), and `operator_serial` carries whatever
+    /// claim (if any) has been recorded since.
+    ///
+    /// Deliberately NOT built by the route the issue's prose sketches
+    /// ("hand-register barcode = S, then `volume init` binds it by MAM"):
+    /// that sequence is refused EARLIER, by `binding.rs`'s own
+    /// barcode-collision check in `bind_cartridge`'s auto-register arm, so a
+    /// test following it would never reach `resolve_mam_identity` at all and
+    /// would pass against unfixed code.
+    fn hand_registered(conn: &Connection, barcode: &str, operator_serial: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO cartridges
+                (barcode, media_type, nominal_capacity, serial_number, operator_serial, status)
+             VALUES (?1, 'LTO-6', 2500000000000, NULL, ?2, 'available')",
+            params![barcode, operator_serial],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn chip_serial(conn: &Connection, id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT serial_number FROM cartridges WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #214: with NOTHING claiming this serial the refusal stands —
+    /// but it must name a command that can actually RUN. `volume init` is
+    /// structurally refused on the tape a rebuild is reading (it is sealed
+    /// by construction, and `decide_fresh_write_contact` refuses an
+    /// `AlreadySealed` contact regardless of `--force`, ADR-0003), so the
+    /// substring must not appear.
+    #[test]
+    fn mam_identity_collision_names_cartridge_edit_not_volume_init() {
+        let conn = crate::db::open_memory().unwrap();
+        hand_registered(&conn, "HU1234ABCD", None);
+
+        let mut report = RebuildReport::default();
+        let err = resolve_mam_identity(&conn, "HU1234ABCD", &mam_drill_meta(), None, &mut report);
+        let err = match err {
+            Ok(r) => panic!(
+                "expected a refusal, but it resolved to cartridge \"{}\" (id {})",
+                r.barcode, r.id
+            ),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            err.contains("tapectl cartridge edit"),
+            "the refusal must name the command that actually repairs this: {err}"
+        );
+        assert!(
+            !err.contains("volume init"),
+            "`volume init` is refused on the sealed tape being rebuilt from (ADR-0003), \
+             so naming it leaves the heir with no executable step: {err}"
+        );
+        assert!(
+            err.contains("tapectl cartridge relabel"),
+            "the different-cartridge branch must survive: {err}"
+        );
+    }
+
+    /// Issue #214: once the operator's claim is on the row,
+    /// `resolve_mam_identity` finds it and promotes the claim to
+    /// chip-confirmed — the arm that makes the refusal above a repairable
+    /// state rather than a dead end.
+    ///
+    /// `witnessed` must be FALSE: the serial was learned by THIS contact, so
+    /// it proves nothing about a displacement this same contact is about to
+    /// consider (the rule `resolve_operator_identity` already states).
+    #[test]
+    fn mam_identity_binds_a_row_whose_operator_claim_names_this_serial() {
+        let conn = crate::db::open_memory().unwrap();
+        let id = hand_registered(&conn, "HU1234ABCD", Some("HU1234ABCD"));
+
+        let mut report = RebuildReport::default();
+        let resolved =
+            resolve_mam_identity(&conn, "HU1234ABCD", &mam_drill_meta(), None, &mut report)
+                .unwrap();
+
+        assert_eq!(resolved.id, id, "it must adopt the hand-registered row");
+        assert_eq!(resolved.barcode, "HU1234ABCD");
+        assert!(
+            !resolved.witnessed,
+            "a serial learned by THIS contact witnesses nothing"
+        );
+        assert!(report.serial_learned, "the promotion must be reported");
+        assert!(
+            !report.cartridge_registered,
+            "it must adopt the existing row, never register a second one"
+        );
+        assert_eq!(
+            chip_serial(&conn, id).as_deref(),
+            Some("HU1234ABCD"),
+            "the claim must be promoted to the chip-confirmed column"
+        );
+    }
+
+    /// Issue #214: two rows claiming the same serial is the one case the new
+    /// arm must NOT guess at. `catalog rebuild` has no `--cartridge` flag, so
+    /// the remediation named has to be one that exists.
+    #[test]
+    fn mam_identity_refuses_when_two_rows_claim_the_same_serial() {
+        let conn = crate::db::open_memory().unwrap();
+        hand_registered(&conn, "BC-ONE", Some("HU1234ABCD"));
+        hand_registered(&conn, "BC-TWO", Some("HU1234ABCD"));
+
+        let mut report = RebuildReport::default();
+        let err = resolve_mam_identity(&conn, "HU1234ABCD", &mam_drill_meta(), None, &mut report);
+        let err = match err {
+            Ok(r) => panic!(
+                "expected a refusal, but it resolved to cartridge \"{}\" (id {})",
+                r.barcode, r.id
+            ),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(err.contains("BC-ONE") && err.contains("BC-TWO"), "{err}");
+        assert!(
+            err.contains("tapectl cartridge edit"),
+            "the way out has to be a command that exists — `catalog rebuild` has no \
+             --cartridge: {err}"
+        );
+        assert!(
+            !err.contains("--cartridge"),
+            "`catalog rebuild` has no --cartridge flag: {err}"
+        );
+        assert!(
+            !report.cartridge_registered,
+            "an ambiguous claim must never auto-register a third row: {err}"
         );
     }
 }
