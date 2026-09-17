@@ -4003,6 +4003,158 @@ mod tests {
         assert_eq!(failed, 1);
     }
 
+    // ── issue #234: a failed verify quarantines, but only on medium evidence ──
+
+    /// The volume's `volumes.status`, read straight from the row rather than
+    /// from a report — the whole point of issue #234 is what the CATALOG
+    /// says afterwards, not what the command printed.
+    fn volume_status(conn: &Connection, label: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM volumes WHERE label = ?1",
+            params![label],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Every `events` row recorded against a volume, as `(action, old, new)`.
+    fn volume_events(conn: &Connection, label: &str) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT action, COALESCE(old_value, ''), COALESCE(new_value, '')
+             FROM events WHERE entity_type = 'volume' AND entity_label = ?1
+             ORDER BY id",
+        )
+        .unwrap()
+        .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    /// ADR-0012's 2026-09-17 amendment: a checksum mismatch PROVES the medium
+    /// is bad, so the verify that found it must leave the volume
+    /// `quarantined` — and the catalog must carry the fact that an operator
+    /// tried to read this tape and it failed.
+    ///
+    /// Before issue #234 `volume_verify` recorded a `verification_sessions`
+    /// row and left `volumes.status` alone, so the escape hatch ADR-0012
+    /// names twice from its own Tier-3 refusal did not exist.
+    #[test]
+    fn a_content_hash_mismatch_quarantines_the_volume() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the bytes the front index promises. ".repeat(4);
+        let rotted = b"the bytes the tape actually holds!! ".repeat(4);
+        seed_one_slice_fixture(&conn, "Q-ROT", "q-rot-unit", 4, &good, "completed", "current");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-ROT'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-ROT'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("Q-ROT", &good, &rotted);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-ROT",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+
+        assert_eq!(
+            volume_status(&conn, "Q-ROT"),
+            "quarantined",
+            "a proven-bad medium must leave the volume quarantined"
+        );
+        let events = volume_events(&conn, "Q-ROT");
+        assert!(
+            events.iter().any(|(action, old, new)| action
+                .contains("quarantined")
+                && old == "sealed"
+                && new == "quarantined"),
+            "the catalog must record the status transition: {events:?}"
+        );
+    }
+
+    /// THE point of issue #234, end to end. ADR-0012's Tier-3 floor refuses
+    /// to retire the last eligible copy of a live version and takes no flag
+    /// by construction; the ADR names a failed verify as the one way out.
+    /// `versions_at_stake`'s third condition (the volume passes `eligible`
+    /// RIGHT NOW) is what makes the escape work — so quarantining is what
+    /// converts the refusal into an ordinary Tier-2 retirement.
+    #[test]
+    fn a_medium_proving_verify_failure_unblocks_retiring_the_last_copy() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the only copy of this version, on one tape. ".repeat(4);
+        let rotted = b"what the drive actually read back today!!!! ".repeat(4);
+        assert_eq!(good.len(), rotted.len());
+        seed_one_slice_fixture(
+            &conn,
+            "Q-LAST",
+            "q-last-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE label = 'Q-LAST'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-LAST'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // BEFORE: the floor refuses — otherwise the "after" assertion below
+        // would be green for the wrong reason.
+        let impacts = crate::cli::operations::retire_impacts(&conn, volume_id).unwrap();
+        assert!(
+            crate::cli::operations::refuse_last_eligible_copy(
+                &conn,
+                "retire volume \"Q-LAST\"",
+                "Q-LAST",
+                &impacts,
+            )
+            .is_err(),
+            "fixture must actually trip the Tier-3 floor before the verify"
+        );
+
+        let mut store = mem_store_v2_tape("Q-LAST", &good, &rotted);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "Q-LAST",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
+        assert_eq!(volume_status(&conn, "Q-LAST"), "quarantined");
+
+        // AFTER: the same floor, on the same volume, no longer refuses.
+        let impacts = crate::cli::operations::retire_impacts(&conn, volume_id).unwrap();
+        crate::cli::operations::refuse_last_eligible_copy(
+            &conn,
+            "retire volume \"Q-LAST\"",
+            "Q-LAST",
+            &impacts,
+        )
+        .expect("a quarantined volume is no longer the last eligible copy of anything");
+    }
+
     fn mem_store_with_slice_at(position: u32, bytes: &[u8]) -> MemStore {
         let mut store = MemStore::new(4096);
         for p in 0..=position {
