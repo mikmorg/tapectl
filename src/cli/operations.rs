@@ -737,9 +737,13 @@ pub(crate) fn refuse_last_eligible_copy(
          \n\
          If you are retiring this tape BECAUSE it no longer reads, say that with the drive \
          rather than with the catalog: `tapectl volume verify {volume_label}` quarantines \
-         the volume when it fails, a quarantined volume counts for nothing, and retiring it \
-         is then Tier 2 at most. A catalog saying \"one copy, unverified\" is telling the \
-         truth; \"no copy\" for data nobody has tried to read is not."
+         the volume when the failure PROVES the medium is bad — a checksum mismatch, or a \
+         block it cannot read where the layout says data lives. A quarantined volume counts \
+         for nothing, and retiring it is then Tier 2 at most. If it instead reports a read \
+         or transport failure the volume is left untouched on purpose (ADR-0012): that is \
+         the drive talking, not the tape, so clean it, check the block size and the cabling, \
+         and verify again. A catalog saying \"one copy, unverified\" is telling the truth; \
+         \"no copy\" for data nobody has tried to read is not."
     )))
 }
 
