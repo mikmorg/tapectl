@@ -96,8 +96,8 @@ pub struct PendingUnit {
 /// uses — same predicate, same source, same combination logic, so the two
 /// walks cannot independently disagree about the same fact (issues
 /// #33/#36/#48's shared failure shape).
-fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Vec<FileStamp> {
-    let exclude_compiled = crate::staging::exclude::effective_compiled(unit_path, global_excludes);
+fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Result<Vec<FileStamp>> {
+    let exclude_compiled = crate::staging::exclude::effective_compiled(unit_path, global_excludes)?;
     let mut out = Vec::new();
     for entry in WalkDir::new(unit_path)
         .follow_links(false)
@@ -136,7 +136,7 @@ fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Vec<FileSta
         });
     }
     out.sort();
-    out
+    Ok(out)
 }
 
 /// Classify one unit: `None` if it has a snapshot whose recorded content
@@ -165,7 +165,7 @@ pub fn classify(
         return Ok(None);
     }
 
-    let fresh = walk_fingerprint(Path::new(path), global_excludes);
+    let fresh = walk_fingerprint(Path::new(path), global_excludes)?;
     let estimated_bytes: u64 = fresh.iter().map(|f| f.size_bytes.max(0) as u64).sum();
 
     let Some((snapshot_id, _version, _status)) = content_match::latest_snapshot(conn, unit.id)?
@@ -730,6 +730,7 @@ mod tests {
         from_directory.sort();
 
         let from_fingerprint: Vec<String> = walk_fingerprint(tmp.path(), &global_excludes)
+            .unwrap()
             .into_iter()
             .map(|f| f.path)
             .collect(); // walk_fingerprint's own output is already sorted
@@ -786,7 +787,7 @@ mod tests {
         )
         .unwrap();
 
-        let fresh = walk_fingerprint(tmp.path(), &[]);
+        let fresh = walk_fingerprint(tmp.path(), &[]).unwrap();
         let paths: Vec<&str> = fresh.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"a.txt"));
         assert!(
@@ -807,7 +808,7 @@ mod tests {
         std::fs::write(tmp.path().join("Thumbs.db"), b"thumbnail cache junk").unwrap();
 
         let global_excludes = vec!["Thumbs.db".to_string()];
-        let fresh = walk_fingerprint(tmp.path(), &global_excludes);
+        let fresh = walk_fingerprint(tmp.path(), &global_excludes).unwrap();
         let paths: Vec<&str> = fresh.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"a.txt"), "non-excluded file must remain");
         assert!(

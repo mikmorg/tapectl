@@ -451,7 +451,7 @@ fn stage_create_inner(
     // (contrast walk_directory/walk_fingerprint's dotfile-only interim
     // state; see exclude::dotfile_patterns's doc comment for why).
     let mut dar_exclude_patterns = config.defaults.global_excludes.clone();
-    dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&snapshot.source_path)));
+    dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&snapshot.source_path))?);
 
     let dar_result = dar::create::create_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
@@ -911,11 +911,14 @@ fn resolve_slice_size_string(
     //
     // It is also harmless: `policy::resolve` runs first (see the caller) and
     // its `?` means a dotfile with a bad `[policy]` never reaches here at all
-    // (#211). Left as-is rather than rewired, because `slice_arg_for_dar`'s
-    // doc explains at length why this function hands dar the operator's RAW
-    // string, and changing how the string is obtained is a different, riskier
-    // change than correcting a comment: it moves real on-tape slice
-    // boundaries for every unit.
+    // (#211) — including, since issue #263, a misspelled TOP-LEVEL table
+    // name (`[polcy]` instead of `[policy]`), which `policy::resolve` now
+    // refuses by name too rather than letting it look like an absent
+    // `[policy]` section. Left as-is rather than rewired, because
+    // `slice_arg_for_dar`'s doc explains at length why this function hands
+    // dar the operator's RAW string, and changing how the string is
+    // obtained is a different, riskier change than correcting a comment: it
+    // moves real on-tape slice boundaries for every unit.
     if let Some(ref path) = unit.current_path {
         let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
         if let Ok(contents) = fs::read_to_string(&dotfile_path) {
@@ -1418,7 +1421,7 @@ fn walk_directory(
     // never tested against these (see `exclude::is_excluded`'s doc comment
     // — this mirrors dar's own `-X`, which cannot exclude directories
     // either).
-    let exclude_compiled = exclude::effective_compiled(base, global_excludes);
+    let exclude_compiled = exclude::effective_compiled(base, global_excludes)?;
     let mut entries = Vec::new();
     let mut total_size: i64 = 0;
     let mut file_count: i64 = 0;
@@ -2017,6 +2020,85 @@ mod tests {
     }
 
     // ── issue #47: stage_create must resolve policy, not read config.defaults directly ──
+
+    /// Negative control / regression guard for issue #263's headline
+    /// defect: `[excludes] pattern = [...]` (singular — the real key is
+    /// `patterns`) parses cleanly today because `ExcludesSection` carries
+    /// no `#[serde(deny_unknown_fields)]`, so `read_dotfile` silently
+    /// returns `exclude_patterns: []`. `stage_create` then hands dar zero
+    /// `-X` masks, and the material the operator meant to exclude is
+    /// archived, encrypted, and written to write-once media — inside a
+    /// valid sha256, so nothing downstream ever notices. This must now
+    /// fail LOUDLY instead: the whole point is that silently including the
+    /// material is unacceptable, so refusing the stage (not quietly
+    /// excluding it after the fact) is the only safe outcome once the
+    /// dotfile cannot be trusted.
+    #[test]
+    fn stage_create_refuses_a_dotfile_with_a_misspelled_excludes_key() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+
+        let conn = crate::db::open(&paths.db_file).unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let mut config = Config::default();
+        config.dar.binary = "dar".to_string();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        register_test_escrow(&conn);
+
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("keep.txt"), b"keep me").unwrap();
+        fs::write(src.join("secret.env"), b"do not archive me").unwrap();
+
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        // Hand-edit the dotfile the way an operator actually would — there
+        // is no CLI for `[excludes] patterns` — replacing the correctly
+        // spelled empty array `init_unit` wrote with the singular typo,
+        // while leaving `[unit]` (uuid/created/tenant) untouched.
+        let dotfile_path = src.join(".tapectl-unit.toml");
+        let content = std::fs::read_to_string(&dotfile_path).unwrap();
+        assert!(
+            content.contains("patterns = []"),
+            "test assumption: init_unit writes an empty patterns array, got: {content}"
+        );
+        let content = content.replace("patterns = []", "pattern = [\"*.env\"]");
+        std::fs::write(&dotfile_path, content).unwrap();
+
+        // `snapshot_create` walks the source directory too (`walk_directory`
+        // -> `exclude::effective_compiled` -> `dotfile_patterns`, the same
+        // shared helper `stage_create`'s dar `-X` masks use), so the fix
+        // actually closes this gap even earlier than `stage_create` — at
+        // manifest-build time. Either stage failing loudly satisfies this
+        // test; the one thing that must NOT happen is the whole pipeline
+        // reaching a successful stage_set with secret.env silently included.
+        let result = snapshot_create(&conn, "unit1", &Config::default())
+            .and_then(|snap_id| stage_create(&conn, &paths, &config, snap_id));
+
+        assert!(
+            result.is_err(),
+            "a dotfile with a misspelled [excludes] key must be refused, not silently \
+             yield zero excludes and archive secret.env onto write-once media (issue #263)"
+        );
+    }
 
     /// The core claim of issue #47: `stage_create` must resolve
     /// `slice_size` through `policy::resolve` (dotfile > archive_set >

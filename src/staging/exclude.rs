@@ -45,6 +45,8 @@ use std::path::Path;
 
 use glob::{MatchOptions, Pattern};
 
+use crate::error::Result;
+
 /// The one `MatchOptions` value every match in this module uses, so a
 /// future tweak can't accidentally diverge between call sites. See the
 /// module doc comment for why `case_sensitive: false`.
@@ -96,15 +98,26 @@ pub fn is_excluded(path: &Path, compiled: &[Pattern]) -> bool {
 /// `collection::fingerprint::walk_fingerprint` can call this with just the
 /// directory they are already walking — neither needs a new parameter.
 ///
-/// Returns an empty Vec — never an error — if the dotfile is absent,
-/// unreadable, or fails to parse: a directory with no unit dotfile yet (or
-/// one that predates `unit init`) must behave exactly as before this fix,
-/// and one malformed dotfile must never abort a walk.
-pub fn dotfile_patterns(dir_path: &Path) -> Vec<String> {
+/// Returns an empty Vec if the dotfile is ABSENT: a directory with no unit
+/// dotfile yet (or one that predates `unit init`) must behave exactly as
+/// before this fix (issue #92's absent-vs-present split — `exists()` is
+/// the whole test, matching `policy::resolve`'s identical treatment).
+///
+/// Issue #263: a dotfile that IS present but cannot be read or parsed used
+/// to collapse to the same empty Vec via `unwrap_or_default()` — silently
+/// indistinguishable from "no excludes configured." That is exactly how a
+/// misspelled `[excludes] pattern` (singular) key let material an operator
+/// meant to exclude reach dar's `-X` masks as zero entries, get archived
+/// and encrypted, and land on write-once media anyway. A dotfile present
+/// but unparseable is now a loud, named `Err` that reaches the caller —
+/// including the TOCTOU case where it is removed between the `exists()`
+/// check and the read, which is a real failure, not "never existed."
+pub fn dotfile_patterns(dir_path: &Path) -> Result<Vec<String>> {
     let dotfile_path = dir_path.join(".tapectl-unit.toml");
-    crate::unit::dotfile::read_dotfile(&dotfile_path)
-        .map(|d| d.exclude_patterns)
-        .unwrap_or_default()
+    if !dotfile_path.exists() {
+        return Ok(Vec::new());
+    }
+    crate::unit::dotfile::read_dotfile(&dotfile_path).map(|d| d.exclude_patterns)
 }
 
 /// The full, compiled "effective excludes" set for `dir_path`: the caller's
@@ -126,10 +139,10 @@ pub fn dotfile_patterns(dir_path: &Path) -> Vec<String> {
 /// lets production and test paths diverge — the caller already has
 /// `Config` (or the test already has whatever list it wants to assert on)
 /// and passes the slice in explicitly.
-pub fn effective_compiled(dir_path: &Path, global_excludes: &[String]) -> Vec<Pattern> {
+pub fn effective_compiled(dir_path: &Path, global_excludes: &[String]) -> Result<Vec<Pattern>> {
     let mut patterns = global_excludes.to_vec();
-    patterns.extend(dotfile_patterns(dir_path));
-    compile(&patterns)
+    patterns.extend(dotfile_patterns(dir_path)?);
+    Ok(compile(&patterns))
 }
 
 #[cfg(test)]
@@ -179,7 +192,7 @@ mod tests {
     #[test]
     fn dotfile_patterns_is_empty_when_no_dotfile_exists() {
         let tmp = TempDir::new().unwrap();
-        assert!(dotfile_patterns(tmp.path()).is_empty());
+        assert!(dotfile_patterns(tmp.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -202,14 +215,31 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(dotfile_patterns(tmp.path()), vec!["*.secret".to_string()]);
+        assert_eq!(
+            dotfile_patterns(tmp.path()).unwrap(),
+            vec!["*.secret".to_string()]
+        );
     }
 
+    /// Was `a_malformed_dotfile_yields_no_patterns_rather_than_erroring`,
+    /// asserting `dotfile_patterns` swallowed a parse failure into an empty
+    /// Vec. That was pinning issue #263's own defect: a PRESENT-but-
+    /// unparseable dotfile is indistinguishable from "no excludes
+    /// configured," which is exactly how a misspelled `[excludes] pattern`
+    /// key let material reach dar's `-X` masks as zero entries and get
+    /// archived onto write-once media. Inverted to assert the loud `Err`
+    /// this function must now return instead — absent still stays silent
+    /// (`dotfile_patterns_is_empty_when_no_dotfile_exists`, unchanged
+    /// above), but present-and-broken no longer does.
     #[test]
-    fn a_malformed_dotfile_yields_no_patterns_rather_than_erroring() {
+    fn a_malformed_dotfile_is_refused_rather_than_silently_dropped() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".tapectl-unit.toml"), b"not valid toml [[[").unwrap();
-        assert!(dotfile_patterns(tmp.path()).is_empty());
+        assert!(
+            dotfile_patterns(tmp.path()).is_err(),
+            "a dotfile present but not valid TOML must be a loud error, not a silent \
+             empty Vec indistinguishable from \"no excludes configured\" (issue #263)"
+        );
     }
 
     #[test]
@@ -217,7 +247,7 @@ mod tests {
         // Issue #49 trap: the no-excludes case must behave exactly as
         // today — empty globals, no dotfile, nothing excluded.
         let tmp = TempDir::new().unwrap();
-        let compiled = effective_compiled(tmp.path(), &[]);
+        let compiled = effective_compiled(tmp.path(), &[]).unwrap();
         assert!(!is_excluded(Path::new("Thumbs.db"), &compiled));
         assert!(!is_excluded(Path::new("anything.tmp"), &compiled));
     }
@@ -244,7 +274,7 @@ mod tests {
         .unwrap();
 
         let global_excludes = vec!["Thumbs.db".to_string()];
-        let compiled = effective_compiled(tmp.path(), &global_excludes);
+        let compiled = effective_compiled(tmp.path(), &global_excludes).unwrap();
 
         assert!(
             is_excluded(Path::new("Thumbs.db"), &compiled),
@@ -263,7 +293,7 @@ mod tests {
         // must still have config.defaults.global_excludes applied.
         let tmp = TempDir::new().unwrap();
         let global_excludes = vec!["Thumbs.db".to_string(), "*.tmp".to_string()];
-        let compiled = effective_compiled(tmp.path(), &global_excludes);
+        let compiled = effective_compiled(tmp.path(), &global_excludes).unwrap();
         assert!(is_excluded(Path::new("Thumbs.db"), &compiled));
         assert!(is_excluded(Path::new("junk.tmp"), &compiled));
         assert!(!is_excluded(Path::new("keep.txt"), &compiled));
