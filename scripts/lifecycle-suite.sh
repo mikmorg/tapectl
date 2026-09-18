@@ -1803,11 +1803,31 @@ cp_write_photos_v2_on_volf() {
 # than as a cascade: docs/big DID have a copy off VOL-E, so compact-finish
 # had nothing to refuse.
 #
-# No coverage gate is involved: `clean_staging` (src/staging/clean.rs)
-# releases a 'staged' set once it has at least one `writes` row and every
-# one of them is 'completed'. That is true of v1 here the moment VOL-E is
-# written.
-cp_release_staging() { TCTL staging clean; }
+# A coverage gate IS involved, since issue #244. `clean_staging`
+# (src/staging/clean.rs) is still policy-free -- it releases a 'staged' set
+# once it has at least one `writes` row and every one of them is
+# 'completed', which is true of v1 the moment VOL-E is written -- but the
+# CLI caller now refuses first when any unit's staged data sits below its
+# policy's `min_copies`, and here all three do:
+#
+#     error: staging clean refused: ... (issue #244). Pass --force ...
+#       big: 1/2 copies
+#       docs: 1/2 copies
+#       photos: 1/2 copies
+#
+# `--force` is the honest answer for THIS scenario rather than a way around
+# the gate. v1 is deliberately left at one copy because it is about to be
+# superseded by v2 and then reclaimed (`cp.reclaim_v1_photos` below) --
+# which is precisely the case #244's `--force` exists for: the operator
+# saying "I am giving up the cheap second copy of this version on purpose."
+# Writing a second copy of v1 instead would make the scenario stop
+# modelling supersession, and dropping the release would put the scenario
+# back in the state issue #198 found it in.
+#
+# The refusal itself is asserted by `tor.staging_clean`
+# (tape-only-and-reclaim), which owns that rule and fails if the gate ever
+# stops holding. This is a setup step; it does not re-assert it.
+cp_release_staging() { TCTL staging clean --force; }
 
 # A second COPY of photos v2 — not a new version, and the reason this
 # scenario was RED on master (issue #198).
@@ -2890,7 +2910,16 @@ pm_capture_staged() { # pm_capture_staged <unit>
 pm_op_check_integrity() { TCTL unit check-integrity "$1"; }
 pm_op_key_rotate()      { TCTL key rotate --tenant alice; }
 pm_op_audit()           { local rc; TCTL audit; rc=$?; [ "$rc" -le 2 ]; }
-pm_op_staging_clean()   { TCTL staging clean; }
+# `--force` because this is a RANDOMISED walk: whether the staged data is
+# below `min_copies` when this operation fires depends on where the RNG
+# placed the preceding writes, so a bare `staging clean` passes or fails by
+# seed after issue #244. A seed-dependent check proves nothing on the seed
+# it passes and blocks the run on the seed it does not -- the same trap the
+# `permute` copy_count assertion already hit. The walk is not testing
+# #244's gate (`tor.staging_clean` is); it is testing that a long random
+# sequence of operations leaves the archive restorable, and "release
+# whatever is staged" is the operator intent at this step.
+pm_op_staging_clean()   { TCTL staging clean --force; }
 pm_op_db_fsck()         { TCTL db fsck; }
 pm_op_report_random()   { TCTL report "$1"; }
 
