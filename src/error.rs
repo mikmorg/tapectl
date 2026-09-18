@@ -22,6 +22,27 @@ pub enum TapectlError {
     #[error("migration error: {0}")]
     Migration(String),
 
+    /// Issue #233: `db::migrate` catches specifically
+    /// `rusqlite_migration::Error::ForeignKeyCheck` — never any other
+    /// migration failure, and never a match on `e.to_string()` — and
+    /// surfaces this instead of the generic [`TapectlError::Migration`]
+    /// above. `.foreign_key_check()` (migrations 003/012/013/017) runs
+    /// `PRAGMA foreign_key_check` with no table argument, i.e.
+    /// whole-database, so a pre-existing orphan ANYWHERE — hand-edited,
+    /// partially restored, recovered from a damaged file, or written by an
+    /// older tapectl — trips it the instant any pending migration carrying
+    /// the check runs. Left as the generic `Migration` variant, this made
+    /// `db::open` fail with no path forward: `db fsck --repair`, the one
+    /// tool that deletes orphans, could not open the very database that
+    /// needed it (chicken and egg). `db::open_for_repair` is the way in —
+    /// it never calls `migrate()`, so it is unaffected by this check.
+    #[error(
+        "database has foreign-key violations that block migration: {0}\n\
+         run `tapectl db fsck --repair` to remove the orphaned rows, then retry the command \
+         that failed."
+    )]
+    DatabaseNeedsRepair(String),
+
     // Configuration
     #[error("configuration error: {0}")]
     Config(String),

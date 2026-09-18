@@ -9,7 +9,7 @@ pub mod queries;
 use std::path::Path;
 
 use rusqlite::Connection;
-use rusqlite_migration::{Migrations, M};
+use rusqlite_migration::{Error as MigrationError, Migrations, M};
 use tracing::warn;
 
 use crate::error::{Result, TapectlError};
@@ -210,11 +210,66 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // Table Schema Changes" procedure (step 10, the pre-commit foreign_key_check, is covered by
     // `.foreign_key_check()` on the 003 and 012 migrations above).
     conn.pragma_update(None, "foreign_keys", "OFF")?;
-    let result = migrations()
-        .to_latest(conn)
-        .map_err(|e| TapectlError::Migration(e.to_string()));
+    let result = migrations().to_latest(conn).map_err(|e| {
+        // Issue #233: the message is computed before matching on `e` by
+        // value below (matching moves it), and the match is on the typed
+        // `rusqlite_migration::Error::ForeignKeyCheck` variant, never on
+        // this string — a corrupt schema must not get repair advice that
+        // does not apply to it.
+        let msg = e.to_string();
+        match e {
+            MigrationError::ForeignKeyCheck(_) => TapectlError::DatabaseNeedsRepair(msg),
+            _ => TapectlError::Migration(msg),
+        }
+    });
     conn.pragma_update(None, "foreign_keys", "ON")?;
     result
+}
+
+/// Open the database WITHOUT running migrations — for `db fsck --repair`
+/// only (issue #233).
+///
+/// `.foreign_key_check()` (migrations 003/012/013/017) runs an explicit
+/// `PRAGMA foreign_key_check` inside `migrate()`'s transaction, unaffected
+/// by the `foreign_keys` enforcement pragma — so there is no way to
+/// disable the check and still call `migrate()`. The only way in is to
+/// skip `migrate()` entirely and repair against whatever schema is
+/// actually on disk. That is safe: `pragma_foreign_key_check` and the
+/// repair it drives (`cli::operations::repair_foreign_key_violations`) are
+/// schema-agnostic — both read exactly what SQLite itself reports, never a
+/// hardcoded table list — so they work identically whether the database
+/// is at the latest migration or several behind it (proven in this
+/// module's `issue_233_*` tests). The very next ordinary `db::open()` call
+/// then migrates the now-clean data forward; `schema_is_current` is how a
+/// caller tells whether that still needs to happen.
+///
+/// Deliberately narrow: no `configure()` (no WAL, no `foreign_keys = ON`
+/// — repair wants enforcement OFF, which is `Connection::open`'s own
+/// default, and does its own `defer_foreign_keys` inside one transaction
+/// regardless), no `recover_orphaned_sessions` (those tables may not exist
+/// yet on a pre-migration schema), no permission tightening (the next
+/// ordinary open already does that). This connection exists to repair and
+/// exit — never hand it to any other command body.
+pub fn open_for_repair(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    Ok(conn)
+}
+
+/// Whether `conn`'s schema is already at the latest migration (issue
+/// #233). `open_for_repair`'s connection never calls `migrate()`, so a
+/// database repaired through it stays wherever it started — behind head,
+/// possibly several migrations short — until the very next ordinary
+/// `db::open()` call completes the migration. `cli::db::run`'s `Fsck` arm
+/// uses this to tell the operator that explicitly, rather than let
+/// "repaired N rows" read as fully done when a migration is still
+/// pending.
+pub fn schema_is_current(conn: &Connection) -> Result<bool> {
+    let pending = migrations()
+        .pending_migrations(conn)
+        .map_err(|e| TapectlError::Migration(e.to_string()))?;
+    Ok(pending <= 0)
 }
 
 /// On startup: detect write sessions orphaned by a crash and mark them
@@ -1635,6 +1690,122 @@ mod tests {
         assert!(
             err.is_err(),
             "an unknown observed_condition must be rejected"
+        );
+    }
+
+    // --- Issue #233: an orphan blocks ordinary open; repair must still run ---
+
+    /// Build a FILE-backed (not `:memory:`) database at exactly the 002
+    /// schema — one migration short of 003, the first
+    /// `.foreign_key_check()`-decorated migration — carrying one orphan
+    /// row planted the way #104's fsck tests do: FK enforcement OFF for
+    /// the insert, back ON afterward (re-enabling the pragma does not
+    /// retroactively validate rows already there). File-backed because the
+    /// whole point of these tests is reopening it as a fresh connection,
+    /// the way a real process invocation does — `open`/`open_for_repair`
+    /// both take a `&Path`.
+    fn write_orphaned_pre_003_db(db_path: &std::path::Path) {
+        let mut conn = Connection::open(db_path).unwrap();
+        configure(&conn).unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-orphan', 'orphan-unit', 99999, 'mtime_size', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    }
+
+    /// THE shape this whole fix depends on, verified directly per issue
+    /// #233's own instruction ("verify this shape works before building on
+    /// it"): a database that never migrated past 002 and already carries a
+    /// dangling `units.tenant_id` makes ordinary `open()` fail outright —
+    /// migration 003's whole-database FK check finds it the instant it
+    /// runs — and `open()` must name this specific, repairable condition
+    /// (`DatabaseNeedsRepair`) rather than the generic `Migration` variant.
+    /// `open_for_repair` must nonetheless be able to open that same file,
+    /// and `cli::operations::db_fsck(..., true)` must repair it — proving
+    /// the repair mechanics (`pragma_foreign_key_check` /
+    /// `defer_foreign_keys`) are schema-agnostic and do not depend on being
+    /// at the latest migration. The very next ordinary `open()` must then
+    /// migrate the now-clean database all the way to head.
+    #[test]
+    fn issue_233_repair_can_open_and_fix_a_database_ordinary_open_refuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("orphaned.db");
+        write_orphaned_pre_003_db(&db_path);
+
+        let open_err = open(&db_path).expect_err(
+            "a pre-existing orphan must block ordinary open — this is the defect's premise, \
+             not the part under test",
+        );
+        assert!(
+            matches!(open_err, TapectlError::DatabaseNeedsRepair(_)),
+            "open() must name this specific, repairable condition rather than a generic \
+             migration failure: got {open_err:?}"
+        );
+
+        let repair_conn = open_for_repair(&db_path).expect(
+            "db fsck --repair must be able to open a database ordinary open refuses, or \
+             repair can never run",
+        );
+        assert!(
+            !schema_is_current(&repair_conn).unwrap(),
+            "the repair connection must still read as behind head — it never migrated"
+        );
+        let report = crate::cli::operations::db_fsck(&repair_conn, true)
+            .expect("repair must succeed against the unmigrated (002) schema");
+        assert_eq!(
+            report.repaired, 1,
+            "exactly the one planted orphan row should have been deleted"
+        );
+        drop(repair_conn);
+
+        // After repair, ordinary open must migrate the now-clean database
+        // all the way to head.
+        let conn = open(&db_path)
+            .expect("after repair, ordinary open must migrate the now-clean database to head");
+        assert!(schema_is_current(&conn).unwrap());
+        assert!(
+            table_info(&conn, "volumes")
+                .iter()
+                .any(|(name, ..)| name == "observed_condition"),
+            "migration must have run all the way through 017"
+        );
+    }
+
+    /// `db::open`'s error for a genuinely corrupt schema (as opposed to a
+    /// repairable orphan) must stay the generic `Migration` variant, never
+    /// `DatabaseNeedsRepair` — issue #233's own trap: matching every
+    /// migration failure the same way would hand an operator with a broken
+    /// schema misleading advice about orphan rows.
+    #[test]
+    fn issue_233_a_non_fk_migration_failure_is_not_reported_as_repairable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("corrupt.db");
+
+        // A schema-version claim of 1 with nothing actually migrated: the
+        // next `to_latest()` tries to run migration 002's SQL against a
+        // database that never ran 001, which fails on a missing table --
+        // a real migration-definition problem, not a foreign key.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let err = open(&db_path).expect_err("a corrupt/inconsistent schema must fail to open");
+        assert!(
+            matches!(err, TapectlError::Migration(_)),
+            "a non-FK migration failure must stay the generic variant, not \
+             DatabaseNeedsRepair: got {err:?}"
         );
     }
 }
