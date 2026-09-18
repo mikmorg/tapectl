@@ -242,6 +242,35 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                             dotfile_path.display()
                         ),
                     })?;
+
+            // Issue #263 route 1: a misspelled top-level table name
+            // (`[polcy]` instead of `[policy]`) means `toml.get("policy")`
+            // below returns `None`, so this whole layer would silently
+            // defer upward as though the operator never wrote a `[policy]`
+            // section — the exact same silent-downgrade shape #211 already
+            // closed for a misspelled KEY *inside* a correctly-named
+            // `[policy]` table, just one level up. Checked against
+            // `dotfile::DOTFILE_TOP_LEVEL_TABLES` rather than deserializing
+            // the whole document into `DotfileToml` (which would also
+            // require a fully valid `[unit]` table this function has no
+            // other use for — it never reads `[unit]`, only `[policy]`).
+            if let Some(bad_key) = toml
+                .keys()
+                .find(|k| !crate::unit::dotfile::DOTFILE_TOP_LEVEL_TABLES.contains(&k.as_str()))
+            {
+                return Err(TapectlError::PolicyUnresolvable {
+                    layer: PolicyLayer::Dotfile,
+                    detail: format!(
+                        "unit \"{}\" has an unrecognized top-level table [{}] in {} \
+                         — a .tapectl-unit.toml may only declare [unit], [policy], \
+                         and [excludes]",
+                        unit.name,
+                        bad_key,
+                        dotfile_path.display()
+                    ),
+                });
+            }
+
             if let Some(pol_value) = toml.get("policy") {
                 // Issue #211: deserialize straight into `PolicySection`
                 // instead of hand-picking keys off the raw table. That
@@ -611,6 +640,34 @@ slice_size = "500M"
         assert!(
             msg.contains(".tapectl-unit.toml"),
             "the error must name the file the operator has to fix; got: {msg}"
+        );
+    }
+
+    /// Negative control / regression guard for issue #263 route 1: a
+    /// misspelled TOP-LEVEL table name (`[polcy]` instead of `[policy]`)
+    /// means `toml.get("policy")` below returns `None`, so this whole
+    /// layer silently defers upward as though the operator never wrote a
+    /// `[policy]` section at all — the exact same silent-downgrade shape
+    /// issue #211 already closed for a misspelled KEY *inside* a
+    /// correctly-named `[policy]` table, just one level up. A one-letter
+    /// slip here today reverts the unit to the default slice size, and
+    /// that "moves real on-tape slice boundaries for every unit"
+    /// (`resolve_slice_size_string`'s own doc comment).
+    #[test]
+    fn resolve_rejects_a_misspelled_top_level_table_name() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[polcy]\nslice_size = \"500M\"\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+
+        resolve(&conn, &config, &unit).expect_err(
+            "a misspelled top-level table name must not silently defer upward as though \
+             the operator never wrote a [policy] section (issue #263)",
         );
     }
 

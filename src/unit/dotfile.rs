@@ -57,7 +57,17 @@ pub const DEFAULT_CHECKSUM_MODE: &str = "mtime_size";
 // [excludes]
 // patterns = [...]
 
+/// Issue #263 / ADR-0012 line 185 ("One rule: `deny_unknown_fields` on
+/// every section"): this is the top-level document shape `read_dotfile`
+/// parses into, and until now it was the one section of the three
+/// (`DotfileToml`, `UnitSection`, `ExcludesSection`) that had NO
+/// `deny_unknown_fields` at all -- only `PolicySection` did (issue #211).
+/// A misspelled top-level table name (`[polcy]` instead of `[policy]`) is
+/// now refused by name here too, the same way an unknown key inside a
+/// correctly-named `[policy]` table already is. This attribute is
+/// deserialize-only: it does not change what `write_dotfile` serializes.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DotfileToml {
     unit: UnitSection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,7 +76,14 @@ struct DotfileToml {
     excludes: ExcludesSection,
 }
 
+/// Issue #263: no `deny_unknown_fields` here meant `archive_sett = "x"`
+/// (a one-letter typo of `archive_set`) deserialized cleanly to
+/// `archive_set: None`, silently detaching a unit from the archive set
+/// supplying its `min_copies` (`collection::sync::adopt_dotfile`,
+/// `unit::discovery::sync_discovered_unit` both store `read_dotfile`'s
+/// `archive_set` straight into `units.archive_set_id`).
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnitSection {
     uuid: String,
     name: String,
@@ -101,11 +118,35 @@ pub(crate) struct PolicySection {
     pub(crate) warehouse_copies: Option<i64>,
 }
 
+/// Issue #263 -- the headline defect this issue exists to close:
+/// `[excludes] pattern = [...]` (singular; the real key is `patterns`)
+/// parsed cleanly with no `deny_unknown_fields`, so `read_dotfile` silently
+/// returned `exclude_patterns: []` and the material an operator meant to
+/// exclude via this dotfile got archived, encrypted, and written to
+/// write-once media anyway -- inside a valid sha256, so nothing downstream
+/// ever noticed. Hand-editing this table is the DESIGNED workflow (there
+/// is no CLI for `[excludes] patterns`), so this is the one place a typo
+/// is most likely and least likely to be caught by any other layer.
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExcludesSection {
     #[serde(default)]
     patterns: Vec<String>,
 }
+
+/// The complete set of top-level tables a `.tapectl-unit.toml` may declare
+/// (see the format comment above `DotfileToml`). `policy::resolve` and
+/// `staging::resolve_slice_size_string` parse a dotfile as a raw
+/// `toml::Table` rather than deserializing into `DotfileToml` (they only
+/// ever need the `[policy]` sub-table, and requiring a fully valid `[unit]`
+/// table to reach it would be a needless coupling) — so `DotfileToml`'s own
+/// `#[serde(deny_unknown_fields)]` above never runs for them. This constant
+/// is the ONE definition of what a dotfile's top-level shape may contain,
+/// checked directly against the raw table's keys, so a misspelled table
+/// name (`[polcy]`, `[policies]`) is refused by name there too instead of
+/// looking exactly like an absent `[policy]` section and silently
+/// deferring upward forever (issue #263 / ADR-0012 line 185).
+pub(crate) const DOTFILE_TOP_LEVEL_TABLES: [&str; 3] = ["unit", "policy", "excludes"];
 
 /// Write dotfile to disk in the design-specified TOML format.
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
@@ -328,6 +369,36 @@ compression = "gzip"
         assert!(
             !raw.contains("archive_set"),
             "archive_set should be omitted when None, got: {raw}"
+        );
+    }
+
+    /// Regression guard for issue #263 route 2: `archive_sett = "x"` (a
+    /// one-letter typo of `archive_set`) under `[unit]` must be refused by
+    /// name, not silently deserialize to `archive_set: None` and detach the
+    /// unit from the archive set supplying its `min_copies`.
+    /// `collection::sync::adopt_dotfile` and
+    /// `unit::discovery::sync_discovered_unit` both store `read_dotfile`'s
+    /// `archive_set` straight into `units.archive_set_id`.
+    #[test]
+    fn read_rejects_a_misspelled_archive_set_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        std::fs::write(
+            &path,
+            r#"
+[unit]
+uuid = "u-1"
+name = "docs"
+created = "2026-01-01T00:00:00Z"
+tenant = "alice"
+archive_sett = "cold"
+"#,
+        )
+        .unwrap();
+        assert!(
+            read_dotfile(&path).is_err(),
+            "a misspelled archive_set key must be refused, not silently yield \
+             archive_set: None (issue #263)"
         );
     }
 

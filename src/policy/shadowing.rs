@@ -132,7 +132,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".tapectl-unit.toml"),
-            "uuid = \"u1\"\nname = \"photos\"\ntenant = \"alice\"\n\
+            // Issue #263: `uuid`/`name`/`tenant` must live under `[unit]`,
+            // not bare at the top level — before `DotfileToml` carried its
+            // own `#[serde(deny_unknown_fields)]`, those stray top-level
+            // keys were silently ignored and this fixture reached the
+            // `[policy]` table's own `min_copiez` error anyway; now they
+            // would be caught first (correctly) as an unrecognized
+            // top-level shape, which is not what this test is about.
+            "[unit]\nuuid = \"u1\"\nname = \"photos\"\n\
+             created = \"2026-01-01T00:00:00Z\"\ntenant = \"alice\"\n\n\
              [policy]\nmin_copiez = 2\n",
         )
         .unwrap();
