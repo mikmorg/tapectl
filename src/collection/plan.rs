@@ -267,11 +267,12 @@ pub fn destination_budget(
 
     let mut smallest: Option<(String, i64)> = None;
     for label in labels {
-        let (volume_id, status, capacity_bytes): (i64, String, i64) = conn
-            .query_row(
-                "SELECT id, status, capacity_bytes FROM volumes WHERE label = ?1",
+        let (volume_id, status, observed_condition, capacity_bytes): (i64, String, String, i64) =
+            conn.query_row(
+                "SELECT id, status, observed_condition, capacity_bytes FROM volumes \
+                 WHERE label = ?1",
                 [label.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
             .ok_or_else(|| TapectlError::VolumeNotFound(label.clone()))?;
@@ -280,10 +281,18 @@ pub fn destination_budget(
         // before a single unit is staged — the same two-part guard
         // `volume_write` applies, in the same order, so this can never
         // reject a label `volume_write` itself would accept.
-        if !coverage::is_write_target(&status) {
-            return Err(TapectlError::VolumeNotWriteTarget {
+        //
+        // ADR-0012's 2026-09-17 amendment (issue #242): same distinguishable
+        // two-part refusal as `volume_write` -- see its comment for why.
+        if !coverage::is_write_target(&status, &observed_condition) {
+            if status != "initialized" {
+                return Err(TapectlError::VolumeNotWriteTarget {
+                    label: label.clone(),
+                    status,
+                });
+            }
+            return Err(TapectlError::VolumeQuarantined {
                 label: label.clone(),
-                status,
             });
         }
         if coverage::has_completed_write(conn, volume_id)? {
@@ -704,17 +713,16 @@ mod tests {
     /// anything. Modelled directly on `volume::write`'s own
     /// `volume_write_refuses_every_non_initialized_status_before_touching_the_device`
     /// so the pinned status set can never drift between the two call sites.
+    ///
+    /// `quarantined` is deliberately absent (issue #242): it left the
+    /// `status` CHECK entirely when it became a value of
+    /// `observed_condition` instead. See
+    /// `run_refuses_a_quarantined_destination_label_before_staging` for
+    /// that dimension's own regression test.
     #[test]
     fn run_refuses_a_non_write_target_destination_label_before_staging() {
         let statuses = [
-            "sealed",
-            "quarantined",
-            "retired",
-            "erased",
-            "active",
-            "full",
-            "blank",
-            "missing",
+            "sealed", "retired", "erased", "active", "full", "blank", "missing",
         ];
         for status in statuses {
             let conn = db::open_memory().unwrap();
@@ -783,6 +791,71 @@ mod tests {
                  ever touches snapshots"
             );
         }
+    }
+
+    /// Issue #242's `is_write_target` regression, for this call site: an
+    /// `initialized` destination label whose `observed_condition` is
+    /// `quarantined` must be refused here too, before a single unit is
+    /// staged -- the same third gate `volume_write` applies (see
+    /// `volume::write::volume_write_refuses_an_initialized_volume_with_a_quarantined_condition`).
+    #[test]
+    fn run_refuses_a_quarantined_destination_label_before_staging() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status, \
+             observed_condition) VALUES ('L1', 'lto', 'p', ?1, 'initialized', 'quarantined')",
+            params![10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+
+        let config = config_with_tiny_backend();
+        let err = plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap_err();
+
+        match &err {
+            TapectlError::VolumeQuarantined { label } => {
+                assert_eq!(label, "L1");
+            }
+            other => panic!("expected VolumeQuarantined, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("L1"), "message must name the label: {msg}");
+        assert!(
+            msg.contains("ADR-0012"),
+            "message must cite ADR-0012: {msg}"
+        );
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a quarantined destination label must fail before staging ever touches snapshots"
+        );
     }
 
     /// Issue #224, the sibling half (ADR-0012's 2026-09-16 amendment, issue

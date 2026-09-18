@@ -355,8 +355,13 @@ pub enum DepositCommands {
     },
 }
 
-/// `volumes.status`'s CHECK constraint (`src/db/migrations/003_v2_lifecycle.sql`,
-/// which extended 001's original set and is the schema's current word on it).
+/// `volumes.status`'s CHECK constraint
+/// (`src/db/migrations/017_volume_observed_condition.sql`, which last
+/// rewrote it and is the schema's current word on it). `quarantined` is
+/// deliberately absent: ADR-0012's 2026-09-17 amendment ("the status column
+/// is the operator's; a medium's condition is its own fact", issue #242)
+/// moved it to `volumes.observed_condition` — it left this CHECK entirely,
+/// it was not merely renamed within it.
 const VOLUME_STATUSES: &[&str] = &[
     "blank",
     "initialized",
@@ -366,7 +371,6 @@ const VOLUME_STATUSES: &[&str] = &[
     "missing",
     "erased",
     "sealed",
-    "quarantined",
 ];
 
 /// `volume list --status` is a usage error when it names anything other
@@ -374,7 +378,21 @@ const VOLUME_STATUSES: &[&str] = &[
 /// never had an `offsite` value (a volume's place has always been
 /// `location_id`, since `007_warehouse_locations.sql`), so this needs no
 /// ADR-0011 special case the way `cartridge list --status` does.
+///
+/// `quarantined` gets its own message rather than the bare "unknown value"
+/// `validate_closed_set` would otherwise give it (issue #242): operators
+/// have typed it here for a long time, and it is not simply unknown — it
+/// moved to a different fact entirely.
 fn validate_volume_status(value: &str) -> Result<()> {
+    if value == "quarantined" {
+        return Err(TapectlError::Other(
+            "--status quarantined: \"quarantined\" is a medium condition now, not a status \
+             (ADR-0012, the 2026-09-17 amendment) -- it moved to `volumes.observed_condition` \
+             and cannot be used to filter `--status`. `volume list`/`volume info` show it in \
+             their own CONDITION field/line alongside status."
+                .to_string(),
+        ));
+    }
     crate::config::validate_closed_set("--status", value, VOLUME_STATUSES)
         .map_err(TapectlError::Other)
 }
@@ -544,20 +562,38 @@ pub fn run(
                         "failed": report.failed,
                         "mismatches": mismatches,
                         // Issue #234: `quarantined` is the headline answer;
-                        // `quarantine` carries what the status WAS, because
-                        // a volume that was already quarantined is a
-                        // different fact from one this verify took out of
-                        // service. `null` on a clean verify and on a failed
-                        // one that proved nothing about the medium.
+                        // `quarantine` carries what the condition WAS,
+                        // because a volume whose medium was already known
+                        // bad is a different fact from one this verify took
+                        // out of service. `null` on a clean verify and on a
+                        // failed one that proved nothing about the medium.
                         "quarantined": report.quarantine.is_some(),
-                        "quarantine": report.quarantine.as_ref().map(|q| serde_json::json!({
-                            "previous_status": q.previous_status,
-                            "status_changed": q.status_changed(),
-                            "proof": q.proof.iter().map(|m| serde_json::json!({
-                                "position": m.position,
-                                "kind": m.kind.label(),
-                            })).collect::<Vec<_>>(),
-                        })),
+                        "quarantine": report.quarantine.as_ref().map(|q| {
+                            // Issue #242: a verify no longer touches
+                            // `status` at all -- `previous_status`/
+                            // `status_changed` are kept (additive-JSON
+                            // rule) but now honestly report a status that
+                            // never moves; `previous_condition`/
+                            // `condition_changed` are the new, accurate
+                            // pair the ADR's amendment is actually about.
+                            let current_status: String = conn
+                                .query_row(
+                                    "SELECT status FROM volumes WHERE label = ?1",
+                                    [label.as_str()],
+                                    |r| r.get(0),
+                                )
+                                .unwrap_or_default();
+                            serde_json::json!({
+                                "previous_status": current_status,
+                                "status_changed": false,
+                                "previous_condition": q.previous_condition,
+                                "condition_changed": q.condition_changed(),
+                                "proof": q.proof.iter().map(|m| serde_json::json!({
+                                    "position": m.position,
+                                    "kind": m.kind.label(),
+                                })).collect::<Vec<_>>(),
+                            })
+                        }),
                         "drive_health_note": report.drive_health_note,
                     })
                 );
@@ -588,16 +624,17 @@ pub fn run(
                 // new; a failure always says which of the two it was.
                 match (&report.quarantine, report.failed) {
                     (Some(q), _) => {
-                        if q.status_changed() {
+                        if q.condition_changed() {
                             println!(
-                                "volume \"{label}\" QUARANTINED (was {}): {} of {} failure(s) \
-                                 prove the medium is bad. It no longer counts as a copy, so \
-                                 `volume retire` will no longer refuse it as the last one — \
-                                 salvage what still reads off it first \
-                                 (`volume read-slices --from {label} --unit <UNIT>`).",
-                                q.previous_status,
+                                "volume \"{label}\" QUARANTINED: {} of {} failure(s) prove the \
+                                 medium is bad. Its status is untouched (ADR-0012, 2026-09-17) — \
+                                 only its condition changed, from \"{}\" to \"quarantined\" — but \
+                                 it no longer counts as a copy, so `volume retire` will no longer \
+                                 refuse it as the last one — salvage what still reads off it \
+                                 first (`volume read-slices --from {label} --unit <UNIT>`).",
                                 q.proof.len(),
                                 report.failed,
+                                q.previous_condition,
                             );
                         } else {
                             println!(
@@ -1342,6 +1379,12 @@ struct VolumeRow {
     label: String,
     #[tabled(rename = "STATUS")]
     status: String,
+    /// `volumes.observed_condition` (ADR-0012's 2026-09-17 amendment, issue
+    /// #242): "ok" or "quarantined". Since that amendment a quarantined
+    /// volume can read `STATUS = "sealed"`, so this column carries the fact
+    /// STATUS alone can no longer show.
+    #[tabled(rename = "CONDITION")]
+    condition: String,
     /// The cartridge this volume is bound to, by barcode
     /// (`cartridge_volumes`, ADR-0010). `None` for a volume `volume init`
     /// left unbound (no readable medium serial) — rendered "(unbound)",
@@ -1447,7 +1490,7 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
     // outer `MIN` here takes the worst across the (possibly several) units
     // bin-packed onto this one volume.
     let mut sql = format!(
-        "SELECT v.label, v.status, c.barcode, l.name,
+        "SELECT v.label, v.status, v.observed_condition, c.barcode, l.name,
                 (SELECT MIN(per.copies) FROM (
                     SELECT DISTINCT cu.id, ({copy_expr}) AS copies
                     FROM writes cw2
@@ -1478,10 +1521,11 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
             Ok(VolumeRow {
                 label: row.get(0)?,
                 status: row.get(1)?,
-                cartridge: row.get(2)?,
-                location: row.get(3)?,
-                copies: row.get(4)?,
-                verified: row.get(5)?,
+                condition: row.get(2)?,
+                cartridge: row.get(3)?,
+                location: row.get(4)?,
+                copies: row.get(5)?,
+                verified: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1554,6 +1598,10 @@ struct DepositRow {
 struct VolumeInfo {
     label: String,
     status: String,
+    /// `volumes.observed_condition` (ADR-0012's 2026-09-17 amendment, issue
+    /// #242): "ok" or "quarantined" — see `VolumeRow::condition`'s doc for
+    /// why `status` alone can no longer show this fact.
+    condition: String,
     backend_type: String,
     backend_name: String,
     media_type: Option<String>,
@@ -1597,6 +1645,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
     let (
         vol_id,
         status,
+        condition,
         backend_type,
         backend_name,
         media_type,
@@ -1611,6 +1660,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         cartridge_serial,
     ): (
         i64,
+        String,
         String,
         String,
         String,
@@ -1630,9 +1680,9 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
             // cartridge_volumes/location row yet, and it must still be
             // inspectable (mirrors `cartridge info`'s LEFT JOIN for the
             // same reason).
-            "SELECT v.id, v.status, v.backend_type, v.backend_name, v.media_type,
-                    v.capacity_bytes, v.bytes_written, v.created_at, v.first_write,
-                    v.last_write, v.notes, l.name, c.barcode, c.serial_number
+            "SELECT v.id, v.status, v.observed_condition, v.backend_type, v.backend_name,
+                    v.media_type, v.capacity_bytes, v.bytes_written, v.created_at,
+                    v.first_write, v.last_write, v.notes, l.name, c.barcode, c.serial_number
              FROM volumes v
              LEFT JOIN locations l ON l.id = v.location_id
              LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
@@ -1655,6 +1705,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
                     row.get(11)?,
                     row.get(12)?,
                     row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
@@ -1795,6 +1846,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
     Ok(VolumeInfo {
         label: label.to_string(),
         status,
+        condition,
         backend_type,
         backend_name,
         media_type,
@@ -1823,6 +1875,10 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
 fn print_volume_info(info: &VolumeInfo) {
     println!("Volume: {}", info.label);
     println!("  Status:      {}", info.status);
+    // Issue #242: since a quarantined volume can read Status "sealed", the
+    // condition is a separate, always-shown line rather than folded into
+    // Status's text.
+    println!("  Condition:   {}", info.condition);
     println!(
         "  Backend:     {} ({})",
         info.backend_type, info.backend_name
@@ -2500,7 +2556,20 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("seald"), "{msg}");
             assert!(msg.contains("sealed"), "{msg}");
-            assert!(msg.contains("quarantined"), "{msg}");
+            // Issue #242: 'quarantined' left the accepted-status set
+            // entirely -- an ordinary typo's error must not name it.
+            assert!(!msg.contains("quarantined"), "{msg}");
+        }
+
+        /// Issue #242: 'quarantined' is not an ordinary unknown value -- it
+        /// used to be a real `--status`, and an operator typing it deserves
+        /// to be told where the fact went, not just "unknown value".
+        #[test]
+        fn validate_volume_status_names_where_quarantined_went() {
+            let err = validate_volume_status("quarantined").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("ADR-0012"), "{msg}");
+            assert!(msg.contains("observed_condition"), "{msg}");
         }
 
         #[test]
@@ -2625,6 +2694,7 @@ mod tests {
             let no_data = VolumeRow {
                 label: "L6-BLANK".into(),
                 status: "initialized".into(),
+                condition: "ok".into(),
                 cartridge: None,
                 location: None,
                 copies: None,
@@ -2633,6 +2703,7 @@ mod tests {
             let has_data_never_verified = VolumeRow {
                 label: "L6-DATA".into(),
                 status: "sealed".into(),
+                condition: "ok".into(),
                 cartridge: None,
                 location: None,
                 copies: Some(1),

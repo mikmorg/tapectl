@@ -25,8 +25,9 @@
 //! SealedPending::confirm(store, tier)     -> SessionEnd
 //!     store.confirm (chain walk, §10); verification_sessions row (verify_type =
 //!     full|quick); pass => ONE transaction: writes 'completed', snapshots
-//!     'current', volumes 'sealed'. fail => volumes 'quarantined', session
-//!     aborted, staging kept.
+//!     'current', volumes 'sealed'. fail => volumes.observed_condition
+//!     'quarantined' (status untouched, ADR-0012's 2026-09-17 amendment,
+//!     issue #242), session aborted, staging kept.
 //! ```
 //!
 //! Each phase's operations exist only on its type, so an invalid order is
@@ -740,8 +741,13 @@ impl InterruptedSession {
         ) {
             ContactOutcome::Blank | ContactOutcome::Matches => {}
             ContactOutcome::IdentityMismatch { found } => {
+                // ADR-0012's 2026-09-17 amendment (issue #242): this is a
+                // catalog fact tapectl OBSERVED, never one the operator
+                // chose -- so it moves `observed_condition`, not `status`.
+                // The operator's own status (e.g. a terminal `retired`) is
+                // never overwritten by this write.
                 conn.execute(
-                    "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
                     params![self.volume_id],
                 )?;
                 mark_writes(conn, &self.write_ids, "aborted")?;
@@ -756,8 +762,10 @@ impl InterruptedSession {
                 }));
             }
             ContactOutcome::AlreadySealed { seal_position } => {
+                // Same reasoning as the `IdentityMismatch` arm just above
+                // (issue #242): an observed fact, not an operator choice.
                 conn.execute(
-                    "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
                     params![self.volume_id],
                 )?;
                 mark_writes(conn, &self.write_ids, "aborted")?;
@@ -1046,8 +1054,12 @@ impl SealedPending {
                 label: self.built.layout.label.clone(),
             }))
         } else {
+            // Issue #242: the chain-walk's own quarantine finding is an
+            // observed fact too -- `observed_condition`, not `status`. This
+            // volume never reached the transaction above, so `status` is
+            // left exactly where it was (never 'sealed').
             conn.execute(
-                "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
                 params![self.volume_id],
             )?;
             mark_writes(conn, &self.write_ids, "aborted")?;
@@ -2121,15 +2133,22 @@ mod tests {
             other => panic!("expected AlreadySealed, got {other:?}"),
         }
 
-        let status: String = f
+        let (status, condition): (String, String) = f
             .conn
             .query_row(
-                "SELECT status FROM volumes WHERE id = ?1",
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
                 params![f.volume_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(status, "quarantined");
+        // ADR-0012's 2026-09-17 amendment (issue #242): this is an OBSERVED
+        // fact, not an operator choice, so it moves `observed_condition`;
+        // `status` is left exactly where the fixture put it ('active').
+        assert_eq!(
+            status, "active",
+            "the resume writer must never touch status"
+        );
+        assert_eq!(condition, "quarantined");
     }
 
     #[test]
@@ -2204,15 +2223,22 @@ mod tests {
             other => panic!("expected IdentityMismatch, got {other:?}"),
         }
 
-        let volume_status: String = f
+        let (volume_status, volume_condition): (String, String) = f
             .conn
             .query_row(
-                "SELECT status FROM volumes WHERE id = ?1",
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
                 params![f.volume_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(volume_status, "quarantined");
+        // ADR-0012's 2026-09-17 amendment (issue #242): the identity check's
+        // finding is observed, not chosen -- it moves `observed_condition`
+        // only, leaving `status` exactly as the fixture set it ('active').
+        assert_eq!(
+            volume_status, "active",
+            "the resume writer must never touch status"
+        );
+        assert_eq!(volume_condition, "quarantined");
 
         let write_status: String = f
             .conn
@@ -2289,15 +2315,23 @@ mod tests {
             other => panic!("expected ConfirmFailed, got {other:?}"),
         }
 
-        let volume_status: String = f
+        let (volume_status, volume_condition): (String, String) = f
             .conn
             .query_row(
-                "SELECT status FROM volumes WHERE id = ?1",
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
                 params![f.volume_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(volume_status, "quarantined");
+        // ADR-0012's 2026-09-17 amendment (issue #242): the chain walk's
+        // finding is observed, not chosen -- `status` is never touched by a
+        // failed confirm (only the passing branch's transaction flips it to
+        // 'sealed'), so it stays exactly what the fixture set ('active').
+        assert_eq!(
+            volume_status, "active",
+            "the confirm writer must never touch status"
+        );
+        assert_eq!(volume_condition, "quarantined");
 
         // ALL writes rows abort, not just the one touching the corrupted
         // slice — confirm operates per-volume, not per-write.

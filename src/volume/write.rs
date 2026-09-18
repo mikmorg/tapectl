@@ -784,11 +784,11 @@ pub fn volume_write(
     force: bool,
     allow_missing_escrow: bool,
 ) -> Result<()> {
-    let (volume_id, volume_status): (i64, String) = conn
+    let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
-            "SELECT id, status FROM volumes WHERE label = ?1",
+            "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
             params![label],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
@@ -802,10 +802,24 @@ pub fn volume_write(
     // `TapeStore::open`, `check_fresh_write_contact`, `bind_late` -- ever
     // runs for a non-target row, which is what keeps a closed binding
     // permanent (#154).
-    if !coverage::is_write_target(&volume_status) {
-        return Err(TapectlError::VolumeNotWriteTarget {
+    //
+    // ADR-0012's 2026-09-17 amendment (issue #242): `is_write_target` now
+    // also consults `observed_condition`, so a genuine refusal can be
+    // either half. Re-checked separately here (a cheap string compare, not
+    // a second query) purely so the two halves get DISTINGUISHABLE
+    // messages -- `VolumeNotWriteTarget`'s wording asserts the status is
+    // the problem, which would be actively misleading for a volume that
+    // reads `initialized` (the one legal write-target status) and was
+    // refused on its condition instead.
+    if !coverage::is_write_target(&volume_status, &observed_condition) {
+        if volume_status != "initialized" {
+            return Err(TapectlError::VolumeNotWriteTarget {
+                label: label.to_string(),
+                status: volume_status,
+            });
+        }
+        return Err(TapectlError::VolumeQuarantined {
             label: label.to_string(),
-            status: volume_status,
         });
     }
 
@@ -1171,11 +1185,11 @@ pub fn volume_resume(
     device: &str,
     block_size: usize,
 ) -> Result<()> {
-    let (volume_id, volume_status): (i64, String) = conn
+    let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
-            "SELECT id, status FROM volumes WHERE label = ?1",
+            "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
             params![label],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
@@ -1183,10 +1197,18 @@ pub fn volume_resume(
     // the same reason it must come before anything else -- a `quarantined`
     // volume must be named by its status, not answered with
     // `nothing_to_resume`'s message about `writes` rows.
-    if !coverage::is_write_target(&volume_status) {
-        return Err(TapectlError::VolumeNotWriteTarget {
+    //
+    // ADR-0012's 2026-09-17 amendment (issue #242): same distinguishable
+    // two-part refusal as `volume_write` -- see its comment for why.
+    if !coverage::is_write_target(&volume_status, &observed_condition) {
+        if volume_status != "initialized" {
+            return Err(TapectlError::VolumeNotWriteTarget {
+                label: label.to_string(),
+                status: volume_status,
+            });
+        }
+        return Err(TapectlError::VolumeQuarantined {
             label: label.to_string(),
-            status: volume_status,
         });
     }
 
@@ -1760,9 +1782,10 @@ fn finish_session(
 /// The one place a WRITE-path quarantine is recorded and reported — reached
 /// from `confirm`'s failure (either path) and from `resume`'s own divergence
 /// findings (the resume-only arm). ADR-0001 contact-time divergence;
-/// `session.rs` has already written `volumes.status = 'quarantined'` by the
-/// time this runs, so this only reports it and turns the outcome into the
-/// `Err` the command exits on.
+/// `session.rs` has already written `volumes.observed_condition =
+/// 'quarantined'` (ADR-0012's 2026-09-17 amendment, issue #242 — `status` is
+/// left untouched) by the time this runs, so this only reports it and turns
+/// the outcome into the `Err` the command exits on.
 ///
 /// **Deliberately not factored together with
 /// [`quarantine_on_medium_evidence`]'s event**, issue #234's peer under
@@ -1799,17 +1822,23 @@ fn log_quarantine(
     )))
 }
 
-/// What a failed verify did to `volumes.status`, when it did anything
-/// (ADR-0012's 2026-09-17 amendment, issue #234).
+/// What a failed verify did to `volumes.observed_condition`, when it did
+/// anything (ADR-0012's 2026-09-17 amendment "the status column is the
+/// operator's; a medium's condition is its own fact", issue #242; the
+/// verify path's OWN quarantine ruling is the earlier 2026-09-17 amendment,
+/// issue #234). Before issue #242, this recorded `volumes.status`; a verify
+/// never writes `status` at all now.
 ///
-/// Carries the status it replaced, not just "quarantined happened": a
-/// volume that was ALREADY quarantined is a different fact from one this
-/// verify took out of service, and a report that said `quarantined: true`
-/// for both would be lying about one of them.
+/// Carries the condition it replaced, not just "quarantined happened": a
+/// volume whose medium was ALREADY known bad is a different fact from one
+/// this verify took out of service, and a report that said `quarantined:
+/// true` for both would be lying about one of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineEffect {
-    /// `volumes.status` immediately before this verify wrote `quarantined`.
-    pub previous_status: String,
+    /// `volumes.observed_condition` immediately before this verify wrote
+    /// `quarantined` — always `"ok"` or `"quarantined"` (the column's own
+    /// closed set, migration 017).
+    pub previous_condition: String,
     /// The mismatches that proved the medium is bad — a subset of
     /// [`VerifyReport::mismatches`], so an operator reads the reason next to
     /// the consequence rather than having to re-derive it.
@@ -1817,11 +1846,11 @@ pub struct QuarantineEffect {
 }
 
 impl QuarantineEffect {
-    /// Whether this verify actually changed the volume's status. `false`
+    /// Whether this verify actually changed the volume's condition. `false`
     /// when it was already `quarantined` — the evidence is fresh, the
-    /// status is not new.
-    pub fn status_changed(&self) -> bool {
-        self.previous_status != "quarantined"
+    /// condition is not new.
+    pub fn condition_changed(&self) -> bool {
+        self.previous_condition != "quarantined"
     }
 }
 
@@ -1844,11 +1873,11 @@ fn describe_medium_evidence(proof: &[&crate::store::Mismatch]) -> String {
 ///
 /// The ADR names a failed verify twice as the escape from its own Tier-3
 /// refusal (`cli::operations::refuse_last_eligible_copy`, which takes no
-/// flag by construction), and from the rule that an operator's
-/// `quarantined` is never overwritten. No verify path ever wrote the
-/// status, so the escape did not exist: an operator holding the only copy
-/// of a tape they had proved unreadable met a refusal that named no flag
-/// and had no command that changed anything.
+/// flag by construction), and from the rule that an operator's `status` is
+/// never overwritten by anything tapectl merely observes. No verify path
+/// wrote a status at all before issue #234, so the escape did not exist: an
+/// operator holding the only copy of a tape they had proved unreadable met
+/// a refusal that named no flag and had no command that changed anything.
 ///
 /// The predicate is [`crate::store::Evidence::medium_evidence`], never
 /// "the verify failed": a dirty drive, a wrong block size, a transient SCSI
@@ -1862,8 +1891,17 @@ fn describe_medium_evidence(proof: &[&crate::store::Mismatch]) -> String {
 /// [`VerifyReport`], never through `Err` (the mhvtl corruption-parity test
 /// pins that). Only a database failure can error here.
 ///
-/// The `UPDATE` is unconditional on the volume's current status, matching
-/// `session.rs`'s three quarantine writers. The status it replaced is
+/// **The column, since ADR-0012's later 2026-09-17 amendment ("the status
+/// column is the operator's; a medium's condition is its own fact", issue
+/// #242): `observed_condition`, never `status`.** Verifying a `retired`
+/// volume is a reasonable thing to do (before disposal, before trusting a
+/// warehouse deposit, or simply to learn whether a condemned tape is still
+/// readable), and under ADR-0011 `retired` means unfit-to-write, not
+/// unreadable — so a verify that overwrote it would destroy the operator's
+/// own fact for one tapectl merely observed. The `UPDATE` is unconditional
+/// on the volume's current CONDITION (matching `session.rs`'s three
+/// quarantine writers, which target the same column for the same reason),
+/// but `status` itself is never touched here. The condition it replaced is
 /// recorded in the `events` row and returned, so nothing is lost: the
 /// catalog carries "the operator tried to read this and it failed", which
 /// is the fact the amendment says must exist.
@@ -1877,40 +1915,41 @@ pub(crate) fn quarantine_on_medium_evidence(
     if proof.is_empty() {
         return Ok(None);
     }
-    let previous_status: String = conn.query_row(
-        "SELECT status FROM volumes WHERE id = ?1",
+    let previous_condition: String = conn.query_row(
+        "SELECT observed_condition FROM volumes WHERE id = ?1",
         params![volume_id],
         |r| r.get(0),
     )?;
     conn.execute(
-        "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+        "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
         params![volume_id],
     )?;
     let reason = describe_medium_evidence(&proof);
     // A genuine field change, recorded as one: this function owns BOTH the
-    // status write and the row that explains it, so `old_value` -> `new_value`
-    // is the transition it just made and `details` carries why. That is a
-    // different row shape from [`log_quarantine`]'s, on purpose — see its doc.
+    // condition write and the row that explains it, so `old_value` ->
+    // `new_value` is the transition it just made and `details` carries why.
+    // That is a different row shape from [`log_quarantine`]'s, on purpose —
+    // see its doc.
     events::log_event(
         conn,
         "volume",
         volume_id,
         Some(label),
         "verify_quarantined",
-        Some("status"),
-        Some(previous_status.as_str()),
+        Some("observed_condition"),
+        Some(previous_condition.as_str()),
         Some("quarantined"),
         Some(&reason),
         None,
     )?;
     warn!(
         label = label,
-        previous_status = %previous_status,
+        previous_condition = %previous_condition,
         reason = %reason,
         "volume quarantined by a failed verify"
     );
     Ok(Some(QuarantineEffect {
-        previous_status,
+        previous_condition,
         proof: proof.into_iter().cloned().collect(),
     }))
 }
@@ -4174,6 +4213,18 @@ mod tests {
         .unwrap()
     }
 
+    /// `volumes.observed_condition`, read straight from the row — companion
+    /// to `volume_status` for ADR-0012's 2026-09-17 amendment (issue #242):
+    /// a verify's quarantine finding moves this column now, never `status`.
+    fn volume_condition(conn: &Connection, label: &str) -> String {
+        conn.query_row(
+            "SELECT observed_condition FROM volumes WHERE label = ?1",
+            params![label],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     /// Every `events` row recorded against a volume, as `(action, old, new)`.
     fn volume_events(conn: &Connection, label: &str) -> Vec<(String, String, String)> {
         conn.prepare(
@@ -4234,14 +4285,22 @@ mod tests {
         .unwrap();
         assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
 
+        // ADR-0012's 2026-09-17 amendment (issue #242): `status` is the
+        // operator's and is never moved by a verify; the medium's condition
+        // is its own fact.
         assert_eq!(
             volume_status(&conn, "Q-ROT"),
+            "sealed",
+            "a verify must never move volumes.status (issue #242)"
+        );
+        assert_eq!(
+            volume_condition(&conn, "Q-ROT"),
             "quarantined",
-            "a proven-bad medium must leave the volume quarantined"
+            "a proven-bad medium must leave the volume's condition quarantined"
         );
         let effect = report.quarantine.as_ref().expect("the report must say so");
-        assert_eq!(effect.previous_status, "sealed");
-        assert!(effect.status_changed());
+        assert_eq!(effect.previous_condition, "ok");
+        assert!(effect.condition_changed());
         assert_eq!(effect.proof.len(), 1);
         assert_eq!(
             effect.proof[0].kind,
@@ -4252,9 +4311,9 @@ mod tests {
             events
                 .iter()
                 .any(|(action, old, new)| action.contains("quarantined")
-                    && old == "sealed"
+                    && old == "ok"
                     && new == "quarantined"),
-            "the catalog must record the status transition: {events:?}"
+            "the catalog must record the condition transition: {events:?}"
         );
     }
 
@@ -4316,7 +4375,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
-        assert_eq!(volume_status(&conn, "Q-LAST"), "quarantined");
+        assert_eq!(
+            volume_status(&conn, "Q-LAST"),
+            "sealed",
+            "a verify must never move volumes.status (issue #242)"
+        );
+        assert_eq!(volume_condition(&conn, "Q-LAST"), "quarantined");
 
         // AFTER: the same floor, on the same volume, no longer refuses.
         let impacts = crate::cli::operations::retire_impacts(&conn, volume_id).unwrap();
@@ -4363,6 +4427,7 @@ mod tests {
         assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
         assert!(report.quarantine.is_none());
         assert_eq!(volume_status(&conn, "Q-OK"), "sealed");
+        assert_eq!(volume_condition(&conn, "Q-OK"), "ok");
         assert!(volume_events(&conn, "Q-OK").is_empty());
     }
 
@@ -4422,6 +4487,11 @@ mod tests {
             volume_status(&conn, "Q-SEAL"),
             "sealed",
             "the volume's status must be exactly what it was"
+        );
+        assert_eq!(
+            volume_condition(&conn, "Q-SEAL"),
+            "ok",
+            "the volume's condition must be exactly what it was"
         );
         assert!(
             volume_events(&conn, "Q-SEAL").is_empty(),
@@ -4485,6 +4555,7 @@ mod tests {
 
         assert!(effect.is_none(), "\"could not read it today\" is not proof");
         assert_eq!(volume_status(&conn, "Q-FI"), "sealed");
+        assert_eq!(volume_condition(&conn, "Q-FI"), "ok");
         assert!(volume_events(&conn, "Q-FI").is_empty());
     }
 
@@ -4495,16 +4566,16 @@ mod tests {
     #[test]
     fn the_seam_quarantines_exactly_the_medium_proving_kinds() {
         use crate::store::MismatchKind::*;
-        for (kind, expected) in [
-            (ContentHashMismatch, "quarantined"),
-            (FrontIndexDivergesFromSeal, "quarantined"),
-            (FrontIndexInconsistent, "quarantined"),
-            (NavigationDisagreement, "quarantined"),
+        for (kind, expect_quarantine) in [
+            (ContentHashMismatch, true),
+            (FrontIndexDivergesFromSeal, true),
+            (FrontIndexInconsistent, true),
+            (NavigationDisagreement, true),
             // Issue #239: the kind that used to be folded into
-            // `ContentHashMismatch` and so reached the status write.
-            (ContentUnreadable, "sealed"),
-            (FrontIndexUnreadable, "sealed"),
-            (SealUnreadable, "sealed"),
+            // `ContentHashMismatch` and so reached the condition write.
+            (ContentUnreadable, false),
+            (FrontIndexUnreadable, false),
+            (SealUnreadable, false),
         ] {
             let conn = crate::db::open_memory().unwrap();
             let good = b"fixture bytes. ".repeat(4);
@@ -4532,10 +4603,23 @@ mod tests {
                 .unwrap();
 
             quarantine_on_medium_evidence(&conn, volume_id, label, &evidence_of(kind)).unwrap();
+            // Issue #242: `status` never moves here, regardless of kind --
+            // only `observed_condition` can.
             assert_eq!(
                 volume_status(&conn, label),
-                expected,
-                "{} must leave the volume {expected}",
+                "sealed",
+                "{}: a verify must never move volumes.status",
+                kind.label()
+            );
+            let expected_condition = if expect_quarantine {
+                "quarantined"
+            } else {
+                "ok"
+            };
+            assert_eq!(
+                volume_condition(&conn, label),
+                expected_condition,
+                "{} must leave the volume's condition {expected_condition}",
                 kind.label()
             );
         }
@@ -4631,6 +4715,11 @@ mod tests {
             volume_status(&conn, "Q-DIRTY"),
             "sealed",
             "a drive fault must leave volumes.status exactly as it was"
+        );
+        assert_eq!(
+            volume_condition(&conn, "Q-DIRTY"),
+            "ok",
+            "a drive fault must leave volumes.observed_condition exactly as it was"
         );
         assert!(
             !report.mismatches[0].kind.proves_medium_bad(),
@@ -4732,6 +4821,11 @@ mod tests {
             "sealed",
             "a short read must leave volumes.status exactly as it was"
         );
+        assert_eq!(
+            volume_condition(&conn, "Q-SHORT"),
+            "ok",
+            "a short read must leave volumes.observed_condition exactly as it was"
+        );
         assert!(
             !report.mismatches[0].kind.proves_medium_bad(),
             "a short read says nothing conclusive about the tape: {:?}",
@@ -4745,10 +4839,10 @@ mod tests {
     }
 
     /// A volume that was ALREADY quarantined reports the fact honestly:
-    /// there is fresh evidence, but the status is not new. A report that
-    /// said "QUARANTINED (was sealed)" here would be lying.
+    /// there is fresh evidence, but the condition is not new. A report that
+    /// said "QUARANTINED (was ok)" here would be lying.
     #[test]
-    fn re_verifying_an_already_quarantined_volume_reports_no_status_change() {
+    fn re_verifying_an_already_quarantined_volume_reports_no_condition_change() {
         let conn = crate::db::open_memory().unwrap();
         let good = b"the bytes the front index promises. ".repeat(4);
         let rotted = b"the bytes the tape actually holds!! ".repeat(4);
@@ -4761,8 +4855,12 @@ mod tests {
             "completed",
             "current",
         );
+        // Issue #242: an already-quarantined volume stays `sealed` (an
+        // operator's status is never overwritten by an observation) with
+        // `observed_condition = 'quarantined'` already set.
         conn.execute(
-            "UPDATE volumes SET status = 'quarantined' WHERE label = 'Q-AGAIN'",
+            "UPDATE volumes SET status = 'sealed', observed_condition = 'quarantined' \
+             WHERE label = 'Q-AGAIN'",
             [],
         )
         .unwrap();
@@ -4787,12 +4885,13 @@ mod tests {
         let effect = report
             .quarantine
             .expect("the evidence is still medium-proving");
-        assert_eq!(effect.previous_status, "quarantined");
+        assert_eq!(effect.previous_condition, "quarantined");
         assert!(
-            !effect.status_changed(),
-            "the evidence is fresh; the status is not new"
+            !effect.condition_changed(),
+            "the evidence is fresh; the condition is not new"
         );
-        assert_eq!(volume_status(&conn, "Q-AGAIN"), "quarantined");
+        assert_eq!(volume_status(&conn, "Q-AGAIN"), "sealed");
+        assert_eq!(volume_condition(&conn, "Q-AGAIN"), "quarantined");
     }
 
     fn mem_store_with_slice_at(position: u32, bytes: &[u8]) -> MemStore {
@@ -5472,17 +5571,16 @@ mod tests {
     /// directly on `force_does_not_bypass_the_escrow_check_and_never_reaches_the_device`:
     /// a nonexistent device path, so reaching it at all is itself the
     /// failure this test looks for.
+    ///
+    /// `quarantined` is deliberately absent from this array (issue #242): it
+    /// left the `status` CHECK entirely when it became a value of
+    /// `observed_condition` instead. See
+    /// `volume_write_refuses_an_initialized_volume_with_a_quarantined_condition`
+    /// for that dimension's own regression test.
     #[test]
     fn volume_write_refuses_every_non_initialized_status_before_touching_the_device() {
         let statuses = [
-            "sealed",
-            "quarantined",
-            "retired",
-            "erased",
-            "active",
-            "full",
-            "blank",
-            "missing",
+            "sealed", "retired", "erased", "active", "full", "blank", "missing",
         ];
         for status in statuses {
             let conn = crate::db::open_memory().unwrap();
@@ -5578,6 +5676,74 @@ mod tests {
                 "status {status}: cartridge_volumes must be untouched"
             );
         }
+    }
+
+    /// THE negative control for issue #242's `is_write_target` regression
+    /// (ADR-0012's 2026-09-17 amendment, point 5, "is_write_target is the
+    /// trap"), driven through the real `volume_write` entry point rather
+    /// than the bare predicate. Modelled on the loop test just above: a
+    /// nonexistent device path, so reaching it at all is itself the
+    /// failure this test looks for.
+    ///
+    /// Before the fix landed, this reached the device (or some later
+    /// check) instead of refusing here, because `status = 'initialized'`
+    /// alone used to be sufficient -- a write-path quarantine used to move
+    /// `status` OFF `initialized` as a side effect of recording the
+    /// quarantine, and once that side effect stopped happening (this
+    /// issue's own fix), an `initialized`-but-quarantined volume would
+    /// silently become writable again without this test.
+    #[test]
+    fn volume_write_refuses_an_initialized_volume_with_a_quarantined_condition() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, observed_condition)
+             VALUES ('L6-QCOND', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', \
+             'quarantined')",
+            [],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &config,
+            "L6-QCOND",
+            "/nonexistent/tapectl-quarantined-condition-test-nst",
+            512 * 1024,
+            false, // force
+            false, // allow_missing_escrow
+        )
+        .unwrap_err();
+
+        match &err {
+            TapectlError::VolumeQuarantined { label } => {
+                assert_eq!(label, "L6-QCOND");
+            }
+            other => panic!("expected VolumeQuarantined, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("L6-QCOND"),
+            "message must name the label: {msg}"
+        );
+        assert!(
+            msg.contains("ADR-0012"),
+            "message must cite ADR-0012: {msg}"
+        );
+        assert!(
+            !msg.contains("tapectl-quarantined-condition-test-nst"),
+            "the device path must never be reached: {msg}"
+        );
+
+        let writes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes, 0, "a refused write must plan nothing");
     }
 
     /// ADR-0012 amendment, issue #199: the rebuild scenario the issue was
@@ -6041,11 +6207,17 @@ mod tests {
         );
     }
 
-    /// ADR-0012 (issue #161): `volume resume` must refuse a non-target
-    /// status BEFORE `rehydrate` -- a `quarantined` volume must be named by
-    /// its status, not answered with `nothing_to_resume`'s message about
-    /// `writes` rows, and the seeded `interrupted` row must be left alone
-    /// (a refused resume attempts nothing).
+    /// ADR-0012 (issue #161, amended 2026-09-17 for issue #242): `volume
+    /// resume` must refuse a quarantined volume BEFORE `rehydrate` -- named
+    /// by its condition, not answered with `nothing_to_resume`'s message
+    /// about `writes` rows, and the seeded `interrupted` row must be left
+    /// alone (a refused resume attempts nothing).
+    ///
+    /// The fixture's `status` stays `initialized` deliberately: a
+    /// write-path quarantine fires only on a volume that never sealed, and
+    /// since issue #242 it moves `observed_condition`, never `status` --
+    /// this is the realistic shape a crashed, quarantined-mid-write session
+    /// leaves behind.
     #[test]
     fn volume_resume_refuses_by_status_not_by_nothing_to_resume() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
@@ -6059,8 +6231,9 @@ mod tests {
 
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type,
-                                  capacity_bytes, status)
-             VALUES ('L6-QUAR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+                                  capacity_bytes, status, observed_condition)
+             VALUES ('L6-QUAR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', \
+             'quarantined')",
             [],
         )
         .unwrap();
@@ -6089,16 +6262,15 @@ mod tests {
         .unwrap_err();
 
         match &err {
-            TapectlError::VolumeNotWriteTarget { label, status } => {
+            TapectlError::VolumeQuarantined { label } => {
                 assert_eq!(label, "L6-QUAR");
-                assert_eq!(status, "quarantined");
             }
-            other => panic!("expected VolumeNotWriteTarget, got: {other:?}"),
+            other => panic!("expected VolumeQuarantined, got: {other:?}"),
         }
         let msg = err.to_string();
         assert!(
             !msg.contains("nothing to resume"),
-            "must be refused by status, not fall through to nothing_to_resume: {msg}"
+            "must be refused by condition, not fall through to nothing_to_resume: {msg}"
         );
         assert!(
             msg.contains("ADR-0012"),

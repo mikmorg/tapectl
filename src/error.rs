@@ -120,6 +120,33 @@ pub enum TapectlError {
     )]
     VolumeHasRecordedWrite { label: String },
 
+    /// ADR-0012's 2026-09-17 amendment ("the status column is the
+    /// operator's; a medium's condition is its own fact", issue #242): the
+    /// THIRD half of the write-target check, alongside
+    /// [`TapectlError::VolumeNotWriteTarget`]'s status test and
+    /// [`TapectlError::VolumeHasRecordedWrite`]'s attached-write test.
+    ///
+    /// A separate variant rather than folding this into
+    /// `VolumeNotWriteTarget` for the same reason `VolumeHasRecordedWrite`
+    /// is its own variant: that variant's message asserts the STATUS is the
+    /// problem ("volume X is {status} and is not a write target"), which
+    /// would be actively misleading here — a volume a write-time contact
+    /// check quarantined mid-session still reads `status = 'initialized'`
+    /// (it never sealed), so the status genuinely IS the one value that
+    /// admits a write. `observed_condition` is what refuses it. Not a
+    /// Tier-2 risk judgement and not `--force`-overridable, for the same
+    /// reason as its siblings: this is a fact the catalog recorded, not a
+    /// risk call.
+    #[error(
+        "volume \"{label}\" is quarantined (ADR-0012, the 2026-09-17 amendment) and is not a \
+         write target: a prior contact check found evidence this medium cannot be trusted, and \
+         recorded it in `observed_condition` rather than `status`. `--force` does not apply — \
+         this is a fact the catalog recorded, not a risk judgement. To write this cartridge \
+         again, run `tapectl volume init <new-label>` on it; the File 0 check is the consent \
+         point (ADR-0010)."
+    )]
+    VolumeQuarantined { label: String },
+
     #[error("tape I/O error: {0}")]
     TapeIo(String),
 
