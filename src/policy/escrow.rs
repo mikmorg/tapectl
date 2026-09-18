@@ -501,11 +501,20 @@ mod tests {
             )
             .unwrap();
             let ss_id = conn.last_insert_rowid();
+            // Issue #242: 'quarantined' is a condition now, not a status --
+            // translate it onto `observed_condition`, leaving `status` at
+            // 'sealed'.
+            let (status_value, condition_value) = if status == "quarantined" {
+                ("sealed", "quarantined")
+            } else {
+                (status, "ok")
+            };
             conn.execute(
                 "INSERT INTO volumes
-                    (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                 VALUES ('VOL1', 'lto', 'lto0', 'LTO-6', 2500000000000, ?1)",
-                params![status],
+                    (label, backend_type, backend_name, media_type, capacity_bytes, status,
+                     observed_condition)
+                 VALUES ('VOL1', 'lto', 'lto0', 'LTO-6', 2500000000000, ?1, ?2)",
+                params![status_value, condition_value],
             )
             .unwrap();
             let vol_id = conn.last_insert_rowid();

@@ -296,10 +296,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         let vol1_id = conn.last_insert_rowid();
+        // Issue #242: 'quarantined' is a condition now, not a status --
+        // translate it onto `observed_condition`, leaving `status` at
+        // 'sealed' (the value a real write-path quarantine would leave a
+        // volume that had already sealed, exactly the shape this fixture
+        // exists to test).
+        let (status_value, condition_value) = if second_volume_status == "quarantined" {
+            ("sealed", "quarantined")
+        } else {
+            (second_volume_status, "ok")
+        };
         conn.execute(
             &format!(
-                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                 VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition)
+                 VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{status_value}', '{condition_value}')"
             ),
             [],
         )

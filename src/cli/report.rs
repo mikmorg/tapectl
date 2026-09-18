@@ -2192,10 +2192,18 @@ mod tests {
             )
             .unwrap();
 
+            // Issue #242: 'quarantined' is a condition now, not a status --
+            // translate it onto `observed_condition`, leaving `status` at
+            // 'sealed'.
+            let (status_value, condition_value) = if second_volume_status == "quarantined" {
+                ("sealed", "quarantined")
+            } else {
+                (second_volume_status, "ok")
+            };
             conn.execute(
                 &format!(
-                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition)
+                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{status_value}', '{condition_value}')"
                 ),
                 [],
             )

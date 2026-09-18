@@ -695,8 +695,10 @@ mod tests {
     #[test]
     fn per_volume_verification_keeps_an_ineligible_volume_that_remaining_coverage_drops() {
         let (conn, unit_id, v1_id, _v2_id) = setup_two_volume_unit();
+        // Issue #242: quarantine is a condition now, not a status move — the
+        // volume stays `sealed` and only `observed_condition` records it.
         conn.execute(
-            "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
             params![v1_id],
         )
         .unwrap();
