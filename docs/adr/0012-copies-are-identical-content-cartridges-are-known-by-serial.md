@@ -450,3 +450,89 @@ Two constraints on the implementation:
   describes that function in isolation, and the gate belongs in the callers, which is
   what #238 already concluded. Pushing the check down would make `execute_batch`'s gate
   redundant and put policy inside a function deliberately without it.
+
+---
+
+## Amendment, 2026-09-18 — a readback that did not succeed is not a verdict about the medium
+
+**Raised by:** issues #260, #267 and #268, found by the second pre-production adversarial
+review (`docs/audits/2026-09-18-preproduction-review-2.md`) and its write-path impact
+triage. Three rulings from one question, taken together because each is unsafe without
+the others.
+
+**The behaviour.** This ADR's 2026-09-17 amendment (point 5) says only a medium-proving
+failure sets the condition, and drive and transport errors set nothing. That was applied
+to `volume verify` and not to `SealedPending::confirm`, which is `let passed =
+evidence.mismatches.is_empty()` — it never consults `MismatchKind::proves_medium_bad`.
+Because `Tier::default()` is `Tier::Integrity`, confirm reads back the **whole cartridge**:
+on a 2.5 TB LTO-6 that is an hours-long window in which one transient SCSI error condemns
+a tape that is physically fine.
+
+Two consequences make it worse than a misclassification. Confirm's failure arm marks its
+`writes` rows `aborted`, and `retire_impacts` only considers `completed` rows — so a
+confirm-failed volume yields **no impacts at all** and `volume retire` proceeds with no
+ADR-0008 Tier-3 refusal, leaving the zero-coverage floor blind to exactly the tape it
+exists to protect. And `scripts/first-run.sh`'s ADR-0003 branch then walks the operator
+through retiring the volume and bulk-erasing the cartridge.
+
+### Ruled: confirm gains a third outcome, `Inconclusive`
+
+`ConfirmOutcome` has exactly two variants, which is *why* the code had to choose between
+two wrong answers. Neither was acceptable: sealing on an unproven readback makes the
+catalog assert a copy it did not verify, which is the claim ADR-0001 forbids; quarantining
+on a transport error condemns a sound cartridge.
+
+So the fork is dissolved rather than decided, the same move as #197's two columns and
+#242's two fields. An `Inconclusive` confirm:
+
+- does **not** seal — the readback did not succeed, so the durability claim is unproven;
+- does **not** write `observed_condition` — nothing was learned about the medium;
+- leaves the session **resumable and re-confirmable**, because confirm is idempotent and
+  the tape is physically unchanged by a failed read.
+
+`proves_medium_bad` decides which arm: true ⇒ `Quarantined`, false ⇒ `Inconclusive`,
+no mismatches ⇒ `Sealed`. That makes the four quarantine writers genuinely identical in
+meaning, which is what point 3 of the 2026-09-17 amendment asked for and did not get.
+
+`docs/design/layout-session.md`'s confirm section is normative for the state machine and
+moves with this.
+
+### Ruled: a passing full verify clears the condition
+
+Nothing in the tree ever set `observed_condition` back to `'ok'` — twelve write sites, all
+writing `'quarantined'` — and `catalog rebuild` only records the mismatch. Every
+quarantine was therefore permanent regardless of cause, which is what made a false one
+expensive enough to argue about.
+
+A `volume verify --full` that completes with **zero** mismatches sets the condition back
+to `'ok'` and records the transition in `events`. The reasoning is definitional: the
+column holds what tapectl *observed* about the medium, so a later and better observation
+is precisely the thing entitled to update it. No new command and no new consent surface —
+the operator instinct this serves (clean the drive, verify again) is one the tool should
+simply reward.
+
+This is deliberately **not** an operator override. A `clear-condition` command was
+considered and rejected for now: the condition is evidence, and the way to replace
+evidence is to gather better evidence. If a tape genuinely cannot be re-verified — drive
+gone, cartridge offsite — the remedy is the existing one, copy the data elsewhere and
+retire the volume.
+
+*Partial verifies do not clear it.* Only a full readback can license the claim that the
+medium is sound, so a tier below `Integrity` leaves the condition exactly as it found it.
+
+### Correction to this ADR's own point 4 (2026-09-17 amendment), issue #256
+
+Point 4 says an existing `quarantined` row migrates with its status restored from the
+`events` row, "and to `sealed` where it does not — a quarantine only ever fired on a
+volume that was otherwise in service."
+
+**That premise is false for three of the four writers.** The `session.rs` writers fire
+mid-write, on a volume that never reached `seal`; there is no sealed state to restore to.
+Migration 017 therefore restores `'initialized'` in the no-events case and argues it in
+its header. **The code is right and this ADR was wrong**; the text is corrected here
+rather than the migration being changed to match it.
+
+The verify-path half of point 4 stands unaltered: where an `events` row records the prior
+status, that value is restored — constrained to the statuses the post-017 CHECK still
+admits, because the trail was written under the old rules and can legally contain
+`'quarantined'` itself.

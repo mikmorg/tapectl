@@ -207,8 +207,17 @@ Rules that hold in every path:
   against the front index's `sha256_encrypted` (integrity tier). The exact
   cryptographic chain is fixed in `volume-format-v2.md` §4–5. Record a
   `verification_sessions` row stating **which tier** ran (ADR-0001). Match →
-  mark `sealed`. Mismatch → the tape lies about itself: quarantine the volume
-  (`observed_condition`, never `status` — issue #242), abort the session. Crash mid-confirm leaves `in_progress` → swept to
+  mark `sealed`. Mismatch → **three outcomes, not two** (ADR-0012's 2026-09-18
+  amendment, issues #260/#267): a mismatch that `MismatchKind::proves_medium_bad`
+  rules TRUE quarantines the volume (`observed_condition`, never `status` —
+  issue #242) and aborts the session; a mismatch it rules FALSE — a drive or
+  transport error, which says nothing about the medium — is **`Inconclusive`**:
+  do not seal (the readback did not succeed, so the durability claim is
+  unproven), do not write `observed_condition` (nothing was learned about the
+  medium), and leave the session resumable so confirm can be retried. Before
+  that amendment confirm was `evidence.mismatches.is_empty()` and had only two
+  outcomes, so one transient SCSI error inside an hours-long full-cartridge
+  readback condemned a sound tape. Crash mid-confirm leaves `in_progress` → swept to
   Interrupted → resume revalidates and re-confirms (confirm is idempotent; no
   dedicated state needed).
 - **Snapshot lifecycle transitions happen only at Sealed**, inside the same
