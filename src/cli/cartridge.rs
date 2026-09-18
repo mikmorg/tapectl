@@ -387,6 +387,25 @@ pub fn run(
             // false "zero loads" that a later bind with no readable load
             // count (`bind_cartridge`'s `COALESCE`) would otherwise make
             // permanent.
+            // Issue #241: every refusal above is a fact about the request
+            // (barcode taken, serial collision, bad generation/capacity)
+            // and stays ahead of this return — a dry run must still refuse
+            // what the real run would refuse.
+            if dry_run {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"barcode": barcode, "generation": canonical_generation,
+                                           "capacity": capacity_display, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "would register cartridge \"{barcode}\" ({canonical_generation}, \
+                         {capacity_display}) (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
             // `operator_serial`, never `serial_number` (ADR-0012 amendment,
             // 2026-09-16; issue #197): this command records only the
             // operator's claim. `serial_number` is left NULL and is written

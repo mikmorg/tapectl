@@ -394,6 +394,25 @@ pub(crate) fn read_device(
     Ok(crate::config::resolve_device(config, device)?.0)
 }
 
+/// The one place every "`--dry-run` is not supported here" refusal is
+/// worded (issue #241, #230's rule: "where a real dry-run is too large a
+/// change, refuse the flag rather than ignore it — a refusal is honest;
+/// silently writing a tape is not").
+///
+/// `command` is the full invocation as an operator would type it (e.g.
+/// `"volume write"`), `why` is the one-clause, actionable reason a real
+/// preview isn't offered here — what the command would otherwise have to
+/// DO to produce one, and, where there is one, the alternative that gets
+/// the operator most of the way there (e.g. `volume plan`). Called as the
+/// FIRST statement of the arm, before any resource is touched, so the
+/// refusal is never itself a side effect.
+pub(crate) fn refuse_dry_run(command: &str, why: &str) -> crate::error::TapectlError {
+    crate::error::TapectlError::Other(format!(
+        "--dry-run is not supported by `tapectl {command}`: {why} Drop the flag to run it \
+         for real."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

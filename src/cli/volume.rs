@@ -421,6 +421,18 @@ pub fn run(
             generation,
             cartridge,
         } => {
+            // Issue #241: a meaningful preview would have to open the
+            // drive and read the MAM/density register to detect the
+            // medium (ADR-0010) — most of the write path with none of its
+            // safety. Checked before `write_device` so the refusal is not
+            // itself a side effect.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume init",
+                    "a real preview would have to open the drive and detect the loaded \
+                     medium's generation (ADR-0010) to know what would be written.",
+                ));
+            }
             let device = write_device(config, device.as_deref())?;
             let vol_id = write::volume_init(
                 conn,
@@ -448,6 +460,19 @@ pub fn run(
             force,
             allow_missing_escrow,
         } => {
+            // Issue #241: a real preview would have to open the drive and
+            // re-derive the whole layout (session build/validate/plan) —
+            // most of the write path with none of its safety. Checked
+            // before `write_device` so the refusal is not itself a side
+            // effect. `volume plan` gives an estimate with no drive needed.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume write",
+                    "a real preview would have to open the drive and re-derive the layout \
+                     session (build/validate/plan) to know what would be written. \
+                     `volume plan` estimates tapes needed with no drive required.",
+                ));
+            }
             let device = write_device(config, device.as_deref())?;
             write::volume_write(
                 conn,
@@ -470,6 +495,17 @@ pub fn run(
         }
 
         VolumeCommands::Resume { label, device } => {
+            // Issue #241: same reasoning as `volume write` — resuming
+            // reopens the drive and revalidates the frozen staging files
+            // against it before anything is known about what remains to
+            // write.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume resume",
+                    "a real preview would have to open the drive and revalidate the \
+                     interrupted session's staged slices against it.",
+                ));
+            }
             let device = write_device(config, device.as_deref())?;
             write::volume_resume(conn, paths, config, label, &device, DEFAULT_BLOCK_SIZE)?;
             if json_output {
@@ -498,6 +534,20 @@ pub fn run(
         // load-bearing there only because `force` is a genuinely different
         // arg id -- a resemblance that has already produced one false issue.
         VolumeCommands::Abort { label } => {
+            // Issue #241: `volume_abort` (src/volume/write.rs) is outside
+            // this fix's file scope, and its own ADR-0008 Tier-2 consent
+            // prompt already IS the preview an operator would ask a dry
+            // run for — it names exactly what a real run would change
+            // before doing so. Refusing here is honest rather than
+            // reimplementing that prompt as a second code path.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume abort",
+                    "run it interactively (without --yes) to see the confirmation prompt, \
+                     which already names every session row that would be marked aborted \
+                     before anything changes.",
+                ));
+            }
             write::volume_abort(conn, label, yes)?;
             if json_output {
                 println!(
@@ -519,6 +569,19 @@ pub fn run(
             full: _,
             quick,
         } => {
+            // Issue #241: not read-only the way it looks — a verify writes
+            // a `verification_sessions` row and, on qualifying failures,
+            // flips `observed_condition` to `quarantined` (ADR-0012,
+            // 2026-09-17). The read IS the check; there is nothing left to
+            // preview once the tape has not been read.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume verify",
+                    "the verify IS the read — it records a verification_sessions row and \
+                     can quarantine the medium's observed_condition, so there is nothing \
+                     meaningful to preview without actually reading the tape.",
+                ));
+            }
             let tier = if *quick {
                 Tier::Navigable
             } else {
@@ -761,6 +824,17 @@ pub fn run(
         }
 
         VolumeCommands::ReadSlices { from, unit, device } => {
+            // Issue #241: same reasoning as `volume compact-read` — a real
+            // preview would have to open the drive and chain-walk the
+            // volume to know what would be staged, which is the entire
+            // operation.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume read-slices",
+                    "a real preview would have to open the drive and chain-walk the source \
+                     volume to know what would be read.",
+                ));
+            }
             let device = read_device(config, device.as_deref())?;
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
@@ -870,6 +944,16 @@ pub fn run(
         }
 
         VolumeCommands::CompactRead { label, device } => {
+            // Issue #241: a real preview would have to open the drive and
+            // chain-walk the volume to know which slices are live — most
+            // of this step's own work.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume compact-read",
+                    "a real preview would have to open the drive and chain-walk the volume \
+                     to know which slices are still live.",
+                ));
+            }
             let device = read_device(config, device.as_deref())?;
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
@@ -897,6 +981,16 @@ pub fn run(
             device,
             allow_missing_escrow,
         } => {
+            // Issue #241: same reasoning as `volume write` — a real
+            // preview would have to open the drive and re-derive the
+            // write-session layout for the staged compaction slices.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume compact-write",
+                    "a real preview would have to open the drive and re-derive the write \
+                     session layout for the staged compaction slices.",
+                ));
+            }
             let device = write_device(config, device.as_deref())?;
             write::compact_write(
                 conn,
@@ -918,6 +1012,21 @@ pub fn run(
         }
 
         VolumeCommands::CompactFinish { label, force } => {
+            // Issue #241: `compact_finish` (src/volume/write.rs) is
+            // outside this fix's file scope, and it already shows its
+            // ADR-0008 Tier-2 coverage facts and asks consent before
+            // mutating anything (see its own doc comment on gate
+            // ordering) — that IS the preview a dry run would offer.
+            // Refusing here is honest rather than a second, easily
+            // divergent implementation of the same gate.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume compact-finish",
+                    "when retiring the source would leave a unit below policy or at zero \
+                     copies, this command already shows that impact and asks consent before \
+                     mutating anything; run it interactively (without --force/--yes) to see it.",
+                ));
+            }
             let report = write::compact_finish(conn, config, label, *force || yes)?;
             if json_output {
                 println!(
@@ -941,6 +1050,19 @@ pub fn run(
             allow_missing_escrow,
             force,
         } => {
+            // Issue #241: the interactive 3-step flow opens the drive
+            // twice (read, then write) and only its own step-3 prompt
+            // (compact-finish) previews anything — refuse for the whole
+            // command rather than half-honour it. `volume compact-read`
+            // done for real, then `volume compact-finish --force`, is the
+            // way to inspect each step without committing further.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume compact",
+                    "this runs all three compaction steps, two of which open the drive to \
+                     read then write; there is no cheap preview of the whole flow.",
+                ));
+            }
             // Interactive: run all 3 steps. Strict resolution (ADR-0010):
             // step 2 writes, so this needs a real backend even though step 1
             // only reads.
@@ -1036,7 +1158,7 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Deposit { command } => run_deposit(conn, command, json_output)?,
+        VolumeCommands::Deposit { command } => run_deposit(conn, command, json_output, dry_run)?,
 
         VolumeCommands::List { status } => {
             if let Some(s) = status {
@@ -1079,7 +1201,12 @@ pub fn run(
 /// 2. The volume must pass `coverage::eligible` (sealed). You cannot have
 ///    deposited bytes that were never sealed -- an unsealed volume's bytes
 ///    are not final, so a copy of them is a copy of nothing durable.
-fn run_deposit(conn: &Connection, command: &DepositCommands, json_output: bool) -> Result<()> {
+fn run_deposit(
+    conn: &Connection,
+    command: &DepositCommands,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
     use crate::error::TapectlError;
     use rusqlite::params;
 
@@ -1119,6 +1246,26 @@ fn run_deposit(conn: &Connection, command: &DepositCommands, json_output: bool) 
                     "volume \"{label}\" is {status}, not sealed; only a sealed volume's bytes \
                      are final, so there is nothing durable to have deposited"
                 )));
+            }
+
+            // Issue #241: both refusals above are facts about the request,
+            // not the mutation, so they stay ahead of this return — a dry
+            // run must still refuse what the real run would refuse.
+            if dry_run {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"volume": label, "location": to,
+                                           "receipt": receipt, "storage_class": storage_class,
+                                           "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "would record a warehouse deposit of \"{label}\" at \"{to}\" \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
             }
 
             conn.execute(
@@ -1195,6 +1342,34 @@ fn run_deposit(conn: &Connection, command: &DepositCommands, json_output: bool) 
         }
 
         DepositCommands::Remove { label, from } => {
+            if dry_run {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM volume_deposits
+                      WHERE volume_id = (SELECT id FROM volumes WHERE label = ?1)
+                        AND location_id = (SELECT id FROM locations WHERE name = ?2))",
+                    params![label, from],
+                    |row| row.get(0),
+                )?;
+                // A dry run must still refuse what the real run would
+                // refuse (no recorded deposit to remove).
+                if !exists {
+                    return Err(TapectlError::Other(format!(
+                        "no recorded deposit of \"{label}\" at \"{from}\""
+                    )));
+                }
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"volume": label, "location": from, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "would remove the recorded deposit of \"{label}\" at \"{from}\" \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
             let deleted = conn.execute(
                 "DELETE FROM volume_deposits
                   WHERE volume_id = (SELECT id FROM volumes WHERE label = ?1)
@@ -2103,6 +2278,7 @@ mod tests {
                     notes: None,
                 },
                 true,
+                false,
             )
         }
 
@@ -2163,6 +2339,7 @@ mod tests {
                     from: "glacier".into(),
                 },
                 true,
+                false,
             )
             .expect("a recorded deposit must be removable");
 
@@ -2185,6 +2362,7 @@ mod tests {
                     from: "glacier".into(),
                 },
                 true,
+                false,
             )
             .expect_err("nothing was recorded there");
             assert!(err.to_string().contains("no recorded deposit"), "{err}");
@@ -2236,6 +2414,7 @@ mod tests {
                     volume: Some("L6-0003".into()),
                 },
                 true,
+                false,
             )
             .unwrap();
         }
