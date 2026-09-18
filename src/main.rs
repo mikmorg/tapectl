@@ -156,6 +156,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             no_escrow,
             escrow_public_key.as_deref(),
             cli.json,
+            cli.dry_run,
         );
     }
 
@@ -287,7 +288,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::report::run(&conn, &cfg, command, cli.json)?;
         }
         Commands::Export { ref unit, ref to } => {
-            cli::operations::export_unit(&conn, unit, to, cli.json)?;
+            cli::operations::export_unit(&conn, unit, to, cli.json, cli.dry_run)?;
         }
         Commands::Import {
             ref label,
@@ -307,6 +308,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 device.as_deref(),
                 notes.as_deref(),
                 cli.json,
+                cli.dry_run,
             )?;
         }
         Commands::QuickArchive {
@@ -326,6 +328,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 tag,
                 device.as_deref(),
                 cli.json,
+                cli.dry_run,
             )?;
         }
         Commands::Backend { ref command } => {
@@ -359,6 +362,7 @@ fn cmd_init(
     no_escrow: bool,
     escrow_public_key_arg: Option<&str>,
     json_output: bool,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     if paths.is_initialized() {
         bail!("tapectl is already initialized at {}", paths.home.display());
@@ -373,6 +377,57 @@ fn cmd_init(
         .map(tapectl::crypto::keys::read_or_parse_public_key)
         .transpose()
         .context("invalid --escrow-public-key")?;
+
+    // Pure — reads only the CLI arg / $USER env var, no side effect — so it
+    // is safe to compute ahead of the dry-run branch below even though the
+    // real path does not need it until the tenant is created, later.
+    let op_name = operator_name
+        .map(String::from)
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "operator".to_string()));
+
+    // Issue #247: `init` writes config, keys and the database — a dry run
+    // must report all three and create NONE of them (never a half-created
+    // home), so this sits above `paths.ensure_dirs()`, the first side
+    // effect, exactly the way #139's escrow-key parse above it stays pure.
+    if dry_run {
+        let staging_dir = paths.home.join("staging");
+        let escrow_desc = if no_escrow {
+            "not created (--no-escrow)".to_string()
+        } else if let Some(ref value) = adopted_escrow_public_key {
+            format!("would adopt the supplied key ({value})")
+        } else {
+            "would mint a new escrow identity (its secret is shown once, at real init time)"
+                .to_string()
+        };
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "home": paths.home.display().to_string(),
+                    "operator": op_name,
+                    "config": paths.config_file.display().to_string(),
+                    "database": paths.db_file.display().to_string(),
+                    "staging": staging_dir.display().to_string(),
+                    "escrow": escrow_desc,
+                    "dry_run": true,
+                })
+            );
+        } else {
+            println!(
+                "tapectl would be initialized at {} (DRY RUN — no changes made)",
+                paths.home.display()
+            );
+            println!("  operator: {op_name}");
+            println!("  database: {} (would be created)", paths.db_file.display());
+            println!(
+                "  config:   {} (would be created)",
+                paths.config_file.display()
+            );
+            println!("  staging:  {} (would be created)", staging_dir.display());
+            println!("  escrow:   {escrow_desc}");
+        }
+        return Ok(());
+    }
 
     // Create directory structure
     paths.ensure_dirs()?;
@@ -406,11 +461,6 @@ fn cmd_init(
 
     // Create database with schema
     let conn = db::open(&paths.db_file).context("failed to create database")?;
-
-    // Determine operator name
-    let op_name = operator_name
-        .map(String::from)
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "operator".to_string()));
 
     // Create operator tenant with keypairs
     let tenant_id = tenant::add_tenant(&conn, paths, &op_name, Some("System operator"), true)?;

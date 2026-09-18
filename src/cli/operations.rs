@@ -1980,6 +1980,7 @@ pub fn export_unit(
     unit_name: &str,
     dest_dir: &str,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
@@ -2022,6 +2023,32 @@ pub fn export_unit(
         return Err(TapectlError::Other(format!(
             "no staged slices for unit \"{unit_name}\" — run `tapectl stage create` first"
         )));
+    }
+
+    // Issue #247: checked after both refusals above (so a dry run still
+    // refuses a unit with nothing staged, the same shape `location add`'s
+    // duplicate-name check keeps ahead of its own dry branch) but before
+    // `fs::create_dir_all` — the first side effect. No half-written export:
+    // not even an empty destination directory.
+    if dry_run {
+        let total: i64 = slices.iter().map(|(_, _, size, _)| size).sum();
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "unit": unit_name, "slices": slices.len(), "total_bytes": total,
+                    "destination": dest_dir, "dry_run": true,
+                })
+            );
+        } else {
+            println!(
+                "would export {} slices ({}) from \"{unit_name}\" to {dest_dir} (DRY RUN — \
+                 no changes made)",
+                slices.len(),
+                crate::util::format_bytes_binary(total),
+            );
+        }
+        return Ok(());
     }
 
     fs::create_dir_all(dest_dir)?;
@@ -2599,7 +2626,38 @@ fn get_file_map(
 }
 
 /// DB backup using SQLite backup API.
-pub fn db_backup(paths: &TapectlPaths, dest: &str, include_keys: bool) -> Result<()> {
+///
+/// `dry_run` (issue #247) is checked before EITHER `Connection::open` call
+/// below: `rusqlite`/SQLite creates its target file the instant `open` is
+/// called, before a single page is copied, so even opening `dest` would
+/// already be the side effect a dry run promises not to have — a half-built
+/// or zero-byte backup file is worse than none.
+pub fn db_backup(
+    paths: &TapectlPaths,
+    dest: &str,
+    include_keys: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "backup": dest, "keys_included": include_keys, "dry_run": true,
+                })
+            );
+        } else if include_keys {
+            println!("would back up database and keys to {dest} (DRY RUN — no changes made)");
+        } else {
+            println!(
+                "would back up database to {dest} (DRY RUN — no changes made; private keys \
+                 not included — pass --include-keys to copy them)"
+            );
+        }
+        return Ok(());
+    }
+
     let src_conn = rusqlite::Connection::open(&paths.db_file)?;
     let mut dst_conn = rusqlite::Connection::open(dest)?;
 
@@ -2742,7 +2800,16 @@ pub fn db_import(
 ///
 /// `repaired` counts deleted **rows**, not categories (it is rendered as
 /// "repaired=N", where a category count is close to meaningless).
-pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
+///
+/// `dry_run` (issue #247) only changes anything when `repair` is also true:
+/// the violation report above is computed either way (it is itself the
+/// "genuinely useful preview" issue #247 asks for), and a dry run simply
+/// stops there instead of calling `repair_foreign_key_violations` — no
+/// transaction is even opened, so there is nothing to roll back and no
+/// `db_fsck_repair` audit event is written. `report.dry_run` records which
+/// happened so `cli::db::run` can word "would repair" instead of
+/// "repaired".
+pub fn db_fsck(conn: &Connection, repair: bool, dry_run: bool) -> Result<FsckReport> {
     let mut report = FsckReport::default();
 
     // Run integrity check — collect every row, not just the first.
@@ -2762,7 +2829,9 @@ pub fn db_fsck(conn: &Connection, repair: bool) -> Result<FsckReport> {
     // #177). Run regardless of the integrity_check outcome above.
     report.issues.extend(foreign_key_check_issues(conn)?);
 
-    if repair {
+    if repair && dry_run {
+        report.dry_run = true;
+    } else if repair {
         match repair_foreign_key_violations(conn) {
             Ok((repaired, _by_table)) => report.repaired = repaired,
             Err(e) => {
@@ -2910,8 +2979,15 @@ fn repair_foreign_key_violations(
 pub struct FsckReport {
     pub integrity_ok: bool,
     pub issues: Vec<String>,
-    /// Number of rows deleted by `--repair` (0 when `--repair` was not passed).
+    /// Number of rows deleted by `--repair` (0 when `--repair` was not
+    /// passed, and always 0 when `dry_run` is true — see below).
     pub repaired: usize,
+    /// Issue #247: `--repair --dry-run` stopped at the violation report
+    /// (`issues`, above) rather than calling `repair_foreign_key_violations`
+    /// — `repaired` stays 0 the way it does for a plain `fsck` with no
+    /// `--repair` at all, so this is the one field that tells `cli::db::run`
+    /// which of those two zero-repair cases it is looking at.
+    pub dry_run: bool,
 }
 
 /// Recursively copy `src` into `dst`, creating `dst` and every directory
@@ -2975,6 +3051,7 @@ pub fn volume_import(
     device: Option<&str>,
     notes: Option<&str>,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let parsed = crate::media::parse_generation_or_error(generation)?;
     let canonical_generation = parsed.as_str();
@@ -2998,6 +3075,42 @@ pub fn volume_import(
             .unwrap_or_else(|| backend.to_string()),
         _ => backend.to_string(),
     };
+    // Issue #247: `volumes.label` is UNIQUE, and pre-existing behaviour let
+    // that surface as a raw `UNIQUE constraint failed` from the INSERT below
+    // — checked explicitly here, ahead of BOTH paths (same discipline
+    // `location add`'s duplicate-name check documents: "done for both the
+    // dry run and the real path... so a dropped `--dry-run` behaves
+    // identically"), so a dry run cannot claim a label would import when the
+    // real run would refuse it.
+    let taken: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if taken.is_some() {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\" already exists; choose a different label"
+        )));
+    }
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "label": label, "generation": canonical_generation,
+                    "capacity_bytes": cap_bytes, "dry_run": true,
+                })
+            );
+        } else {
+            println!(
+                "would import volume \"{label}\" ({canonical_generation}, {capacity_display}) \
+                 (DRY RUN — no changes made)"
+            );
+        }
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, notes)
          VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
@@ -3114,7 +3227,25 @@ pub fn quick_archive(
     tag: &[String],
     device: Option<&str>,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
+    // Issue #247: quick-archive is unit init -> snapshot -> stage -> `volume
+    // write`. A real preview would have to stage the unit for real and
+    // re-derive the write-session layout to know what would land on tape —
+    // most of the work with none of the safety, the identical reasoning
+    // `volume write`'s own refusal gives (`cli::volume::run`). Checked as
+    // the FIRST statement, above `write_device`, so the refusal can never
+    // itself resolve a backend or open the drive — the exact ordering
+    // `catalog rebuild`'s refusal uses ahead of `resolve_device`.
+    if dry_run {
+        return Err(crate::cli::refuse_dry_run(
+            "quick-archive",
+            "it ends in `volume write`, and a real preview would have to stage the unit for \
+             real and re-derive the write-session layout to know what would be written. \
+             Stage it yourself (`unit init`, `snapshot create`, `stage create`) and run \
+             `volume plan` for an estimate with no drive required.",
+        ));
+    }
     // quick-archive ends in `volume write`, so `--device` resolves STRICTLY
     // (ADR-0010, "Backends resolve by device"): the drive must be a
     // configured backend, because the write path needs its usable-capacity
@@ -3597,6 +3728,7 @@ mod tests {
                 Some("/dev/zero"),
                 None,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto-b");
@@ -3618,6 +3750,7 @@ mod tests {
                 Some("2500G"),
                 None,
                 None,
+                false,
                 false,
             )
             .unwrap();
@@ -3645,6 +3778,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(backend_name_of(&conn, "L6-IMP"), "lto");
@@ -3667,6 +3801,7 @@ mod tests {
                 Some("2500G"),
                 Some("/dev/nst9"),
                 None,
+                false,
                 false,
             )
             .unwrap();
@@ -3704,6 +3839,7 @@ mod tests {
                 Some("2.5T"),
                 None,
                 None,
+                false,
                 false,
             )
             .unwrap();
@@ -3760,6 +3896,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
             )
             .unwrap_err();
             let msg = err.to_string();
@@ -3788,6 +3925,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(media_type_of(&conn, "LC-IMP"), "LTO-6");
@@ -3800,7 +3938,7 @@ mod tests {
             let conn = crate::db::open_memory().unwrap();
             let config = Config::default();
             volume_import(
-                &conn, &config, "L6-DEF", "lto", "LTO-6", None, None, None, false,
+                &conn, &config, "L6-DEF", "lto", "LTO-6", None, None, None, false, false,
             )
             .unwrap();
             assert_eq!(capacity_bytes_of(&conn, "L6-DEF"), 2_500_000_000_000);
@@ -3811,7 +3949,7 @@ mod tests {
             let conn = crate::db::open_memory().unwrap();
             let config = Config::default();
             volume_import(
-                &conn, &config, "L7-DEF", "lto", "LTO-7", None, None, None, false,
+                &conn, &config, "L7-DEF", "lto", "LTO-7", None, None, None, false, false,
             )
             .unwrap();
             assert_eq!(capacity_bytes_of(&conn, "L7-DEF"), 6_000_000_000_000);
@@ -3830,7 +3968,7 @@ mod tests {
             {
                 let label = format!("INV-{i}");
                 volume_import(
-                    &conn, &config, &label, "lto", spelling, None, None, None, false,
+                    &conn, &config, &label, "lto", spelling, None, None, None, false, false,
                 )
                 .unwrap();
                 let stored = media_type_of(&conn, &label);
@@ -6245,7 +6383,7 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            db_backup(&paths, dest.to_str().unwrap(), false).unwrap();
+            db_backup(&paths, dest.to_str().unwrap(), false, false, false).unwrap();
 
             assert!(dest.exists(), "the database copy itself must still happen");
             let keys_backup = dest.with_extension("keys");
@@ -6261,7 +6399,7 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            db_backup(&paths, dest.to_str().unwrap(), true).unwrap();
+            db_backup(&paths, dest.to_str().unwrap(), true, false, false).unwrap();
 
             let keys_backup = dest.with_extension("keys");
             assert!(keys_backup.is_dir(), ".keys directory should be created");
@@ -6303,7 +6441,7 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            db_backup(&paths, dest.to_str().unwrap(), true)
+            db_backup(&paths, dest.to_str().unwrap(), true, false, false)
                 .expect("a missing keys_dir must not turn --include-keys into an error");
 
             assert!(dest.exists());
@@ -6864,7 +7002,7 @@ mod tests {
 
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
 
-        let report = db_fsck(&conn, false).unwrap();
+        let report = db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok);
         assert_eq!(report.repaired, 0, "a dry run must delete nothing");
 
@@ -7015,7 +7153,7 @@ mod tests {
 
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
 
-        let report = db_fsck(&conn, true).unwrap();
+        let report = db_fsck(&conn, true, false).unwrap();
         assert!(report.integrity_ok);
         assert_eq!(
             report.repaired, 5,
@@ -7109,12 +7247,12 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
 
         // Without --repair: reported, not touched.
-        let dry = db_fsck(&conn, false).unwrap();
+        let dry = db_fsck(&conn, false, false).unwrap();
         assert!(dry.integrity_ok, "in-memory db must pass integrity_check");
         assert_eq!(dry.issues.len(), 4, "issues: {:?}", dry.issues);
         assert_eq!(dry.repaired, 0, "a dry run must delete nothing");
 
-        let report = db_fsck(&conn, true).unwrap();
+        let report = db_fsck(&conn, true, false).unwrap();
         assert!(report.integrity_ok);
         assert_eq!(
             report.repaired, 3,
@@ -7139,7 +7277,7 @@ mod tests {
         assert_eq!(events, 1, "a repair must leave exactly one audit event");
 
         // A repair that finds nothing must not log an event.
-        let noop = db_fsck(&conn, true).unwrap();
+        let noop = db_fsck(&conn, true, false).unwrap();
         assert_eq!(noop.repaired, 0);
         let events_after: i64 = conn
             .query_row(
@@ -7160,7 +7298,7 @@ mod tests {
     #[test]
     fn fsck_integrity_ok_on_a_clean_database() {
         let conn = crate::db::open_memory().unwrap();
-        let report = db_fsck(&conn, false).unwrap();
+        let report = db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok);
         assert!(report.issues.is_empty(), "issues: {:?}", report.issues);
     }

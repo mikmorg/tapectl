@@ -1908,7 +1908,8 @@ fn test_export_selects_single_stage_set() {
     let ss2 = mk_stage_set(2, "new");
 
     let dest = tmp.path().join("export-out");
-    tapectl::cli::operations::export_unit(&conn, "unit1", dest.to_str().unwrap(), false).unwrap();
+    tapectl::cli::operations::export_unit(&conn, "unit1", dest.to_str().unwrap(), false, false)
+        .unwrap();
 
     let manifest = std::fs::read_to_string(dest.join("MANIFEST.toml")).unwrap();
     let parsed: toml::Value = manifest.parse().expect("MANIFEST.toml must be valid TOML");

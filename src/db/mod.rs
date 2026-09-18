@@ -813,7 +813,7 @@ mod tests {
             .unwrap();
         assert_eq!(hl_count, 1);
 
-        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok, "db fsck integrity check failed");
         assert!(
             report.issues.is_empty(),
@@ -1013,7 +1013,7 @@ mod tests {
             ]
         );
 
-        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok, "db fsck integrity check failed");
     }
 
@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(target.as_deref(), Some("../a.txt"));
         assert_eq!(groupname.as_deref(), Some("mike"));
 
-        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok, "db fsck integrity check failed");
     }
 
@@ -1578,7 +1578,7 @@ mod tests {
             "'quarantined' must be rejected as a status value after the rebuild (issue #242)"
         );
 
-        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok, "db fsck integrity check failed");
     }
 
@@ -1761,7 +1761,7 @@ mod tests {
             !schema_is_current(&repair_conn).unwrap(),
             "the repair connection must still read as behind head — it never migrated"
         );
-        let report = crate::cli::operations::db_fsck(&repair_conn, true)
+        let report = crate::cli::operations::db_fsck(&repair_conn, true, false)
             .expect("repair must succeed against the unmigrated (002) schema");
         assert_eq!(
             report.repaired, 1,

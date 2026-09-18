@@ -29,22 +29,34 @@ pub fn run(
     let mut exit_code = crate::error::EXIT_SUCCESS;
     match command {
         DbCommands::Backup { to, include_keys } => {
-            crate::cli::operations::db_backup(paths, to, *include_keys)?;
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"backup": to, "keys_included": include_keys})
-                );
-            } else if *include_keys {
-                println!("database and keys backed up to {to}");
-            } else {
-                println!(
-                    "database backed up to {to} (private keys not included — pass --include-keys to copy them)"
-                );
+            // Issue #247: `db_backup` itself checks `dry_run` FIRST, before
+            // either `Connection::open` call — so on the dry path it has
+            // already printed its own preview and returned, and the success
+            // lines below must not print a second, contradictory message.
+            crate::cli::operations::db_backup(paths, to, *include_keys, dry_run, json_output)?;
+            if !dry_run {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"backup": to, "keys_included": include_keys})
+                    );
+                } else if *include_keys {
+                    println!("database and keys backed up to {to}");
+                } else {
+                    println!(
+                        "database backed up to {to} (private keys not included — pass --include-keys to copy them)"
+                    );
+                }
             }
         }
         DbCommands::Fsck { repair } => {
-            let report = crate::cli::operations::db_fsck(conn, *repair)?;
+            // Issue #247: `dry_run` only changes behaviour when `--repair`
+            // is also set — `db_fsck` computes the SAME violation report
+            // either way and only skips the DELETE loop, so this arm's own
+            // job is just to word "would repair" instead of "repaired" via
+            // `report.dry_run`. A plain `fsck` (no `--repair`) already never
+            // mutates, matching every other `Verdict::ReadOnly` leaf.
+            let report = crate::cli::operations::db_fsck(conn, *repair, dry_run)?;
             // Issue #233: `conn` here may be `db::open_for_repair`'s
             // connection — opened deliberately WITHOUT running `migrate()`,
             // so a repair against it leaves the schema exactly where it
@@ -53,18 +65,30 @@ pub fn run(
             // then hits a schema error on the next command must not think
             // the tool is broken, so say so here. Cheap to check
             // unconditionally: on the ordinary (already-migrated) path this
-            // is always `false`, so it changes nothing there.
+            // is always `false`, so it changes nothing there. Meaningful on
+            // a dry run too: the preview still ran against the unmigrated
+            // connection issue #233 opened.
             let schema_pending = !crate::db::schema_is_current(conn)?;
             if json_output {
+                let mut obj = serde_json::json!({
+                    "integrity_ok": report.integrity_ok,
+                    "issues": report.issues,
+                    "repaired": report.repaired,
+                    "schema_pending": schema_pending,
+                });
+                if report.dry_run {
+                    obj["dry_run"] = serde_json::json!(true);
+                }
+                println!("{obj}");
+            } else if report.dry_run {
                 println!(
-                    "{}",
-                    serde_json::json!({
-                        "integrity_ok": report.integrity_ok,
-                        "issues": report.issues,
-                        "repaired": report.repaired,
-                        "schema_pending": schema_pending,
-                    })
+                    "fsck: integrity={}, issues={} (DRY RUN — would repair; no changes made)",
+                    if report.integrity_ok { "ok" } else { "FAIL" },
+                    report.issues.len(),
                 );
+                for issue in &report.issues {
+                    println!("  {issue}");
+                }
             } else {
                 println!(
                     "fsck: integrity={}, issues={}, repaired={}",
@@ -86,7 +110,11 @@ pub fn run(
             // issue #45/H10: fsck must not exit 0 when it found real
             // problems. The CODE is computed here; ACTING on it (i.e.
             // terminating the process) stays in `main.rs` — see
-            // `fsck_exit_code` there for the exact rule.
+            // `fsck_exit_code` there for the exact rule. Unaffected by
+            // `dry_run`: a preview that finds issues is exactly as much a
+            // warning as a real run that finds and leaves the same issues
+            // (i.e. `fsck` with no `--repair` at all) — see
+            // `fsck_exit_code_issues_found_but_not_repaired_is_still_warning`.
             exit_code = fsck_exit_code(&report);
         }
         DbCommands::Export => {
@@ -161,6 +189,7 @@ mod tests {
             integrity_ok: true,
             issues: vec![],
             repaired: 0,
+            dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_SUCCESS);
     }
@@ -171,6 +200,7 @@ mod tests {
             integrity_ok: false,
             issues: vec!["integrity_check: corrupted".to_string()],
             repaired: 0,
+            dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_ERROR);
     }
@@ -183,6 +213,7 @@ mod tests {
             integrity_ok: false,
             issues: vec!["integrity_check: corrupted".to_string(), "1 orphan".into()],
             repaired: 1,
+            dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_ERROR);
     }
@@ -193,6 +224,7 @@ mod tests {
             integrity_ok: true,
             issues: vec!["3 orphaned write records".to_string()],
             repaired: 1,
+            dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_WARNING);
     }
@@ -205,6 +237,7 @@ mod tests {
             integrity_ok: true,
             issues: vec!["3 orphaned write records".to_string()],
             repaired: 0,
+            dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_WARNING);
     }
