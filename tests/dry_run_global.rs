@@ -661,3 +661,706 @@ fn a_global_dry_run_before_collection_sync_registers_nothing() {
         "a global --dry-run wrote a dotfile into the source tree"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #241 — the class-wide sweep. Each test below proves one
+// `Verdict::Honours` entry from `tests/dry_run_contract.rs`'s TABLE actually
+// leaves every row untouched, the same DB-row discipline as the #230 tests
+// above. `tests/dry_run_contract.rs` proves the CLASS (every leaf has a
+// verdict, every `Refuses` leaf actually refuses); these prove the CONTENT
+// of specific `Honours` verdicts, which a static contract test cannot see.
+// ---------------------------------------------------------------------------
+
+/// `cartridge register` (issue #241's own easiest-fix example): every
+/// refusal (bad generation, duplicate barcode/serial) already ran before
+/// the dry-run branch, so this only needs the happy path.
+#[test]
+fn cartridge_register_dry_run_inserts_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    let out = ok(
+        home.path(),
+        &[
+            "cartridge",
+            "register",
+            "--barcode",
+            "A100L6",
+            "--generation",
+            "LTO-6",
+            "--dry-run",
+        ],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cartridges WHERE barcode = 'A100L6'"
+        ),
+        0,
+        "--dry-run registered the cartridge: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("A100L6"),
+        "dry-run output does not name the cartridge"
+    );
+
+    // A dry run must still refuse a barcode already taken.
+    ok(
+        home.path(),
+        &[
+            "cartridge",
+            "register",
+            "--barcode",
+            "A100L6",
+            "--generation",
+            "LTO-6",
+        ],
+    );
+    let dup = run_tapectl(
+        home.path(),
+        &[
+            "cartridge",
+            "register",
+            "--barcode",
+            "A100L6",
+            "--generation",
+            "LTO-6",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        !dup.status.success(),
+        "a dry run must still refuse a barcode already taken"
+    );
+}
+
+/// `tenant add`: the interesting side effects (two key files on disk, two
+/// `encryption_keys` rows) must not happen under `--dry-run`.
+#[test]
+fn tenant_add_dry_run_creates_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    let out = ok(home.path(), &["tenant", "add", "acme", "--dry-run"]);
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM tenants WHERE name = 'acme'"),
+        0,
+        "--dry-run created the tenant: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM encryption_keys e JOIN tenants t ON t.id = e.tenant_id
+             WHERE t.name = 'acme'"
+        ),
+        0,
+        "--dry-run generated a keypair (the operator's own keys from `init` are excluded \
+         by this query, on purpose)"
+    );
+    // `init` itself already populates `keys/` with the operator tenant's
+    // own primary/backup files, so the directory is not expected to be
+    // empty — only free of anything named for "acme".
+    let acme_key_files: Vec<_> = std::fs::read_dir(home.path().join(".tapectl").join("keys"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("acme-"))
+        .collect();
+    assert!(
+        acme_key_files.is_empty(),
+        "--dry-run wrote a key file to disk: {acme_key_files:?}"
+    );
+
+    // A dry run must still refuse a name already taken.
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let dup = run_tapectl(home.path(), &["tenant", "add", "acme", "--dry-run"]);
+    assert!(
+        !dup.status.success(),
+        "a dry run must still refuse a tenant name already taken"
+    );
+}
+
+/// `tenant delete`: the soft-delete UPDATE and its event must not run.
+#[test]
+fn tenant_delete_dry_run_leaves_the_tenant_active() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+
+    ok(home.path(), &["tenant", "delete", "acme", "--dry-run"]);
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM tenants WHERE name = 'acme' AND status = 'active'"
+        ),
+        1,
+        "--dry-run deleted the tenant"
+    );
+}
+
+/// `tenant reassign`: no unit's `tenant_id` may move.
+#[test]
+fn tenant_reassign_dry_run_moves_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    ok(home.path(), &["tenant", "add", "other"]);
+
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+
+    let out = ok(
+        home.path(),
+        &["tenant", "reassign", "acme", "--to", "other", "--dry-run"],
+    );
+
+    let conn = db(home.path());
+    let tenant_name: String = conn
+        .query_row(
+            "SELECT t.name FROM units u JOIN tenants t ON t.id = u.tenant_id
+             WHERE u.name = 'u1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tenant_name, "acme", "--dry-run reassigned the unit");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains('1'),
+        "dry-run output does not name how many unit(s) would move"
+    );
+}
+
+/// `archive-set create`: no row, no event.
+#[test]
+fn archive_set_create_dry_run_inserts_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    ok(
+        home.path(),
+        &[
+            "archive-set",
+            "create",
+            "cold",
+            "--min-copies",
+            "2",
+            "--dry-run",
+        ],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM archive_sets WHERE name = 'cold'"
+        ),
+        0,
+        "--dry-run created the archive set"
+    );
+
+    // A dry run must still refuse a name already taken.
+    ok(home.path(), &["archive-set", "create", "cold"]);
+    let dup = run_tapectl(home.path(), &["archive-set", "create", "cold", "--dry-run"]);
+    assert!(
+        !dup.status.success(),
+        "a dry run must still refuse an archive-set name already taken"
+    );
+}
+
+/// `archive-set edit`: no field may change.
+#[test]
+fn archive_set_edit_dry_run_changes_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(
+        home.path(),
+        &["archive-set", "create", "cold", "--min-copies", "2"],
+    );
+
+    ok(
+        home.path(),
+        &[
+            "archive-set",
+            "edit",
+            "cold",
+            "--min-copies",
+            "5",
+            "--dry-run",
+        ],
+    );
+
+    let conn = db(home.path());
+    let min_copies: i64 = conn
+        .query_row(
+            "SELECT min_copies FROM archive_sets WHERE name = 'cold'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(min_copies, 2, "--dry-run changed min_copies");
+}
+
+/// `backend add`: `config.toml` must be byte-for-byte unchanged.
+#[test]
+fn backend_add_dry_run_does_not_touch_config_file() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    let cfg_path = home.path().join(".tapectl").join("config.toml");
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+    ok(
+        home.path(),
+        &[
+            "backend",
+            "add",
+            "--name",
+            "p1",
+            "--device-tape",
+            "/dev/tapectl-dry-run-contract-nonexistent",
+            "--device-sg",
+            "/dev/tapectl-dry-run-contract-nonexistent-sg",
+            "--generation",
+            "LTO-6",
+            "--dry-run",
+        ],
+    );
+
+    let after = std::fs::read_to_string(&cfg_path).unwrap();
+    assert_eq!(before, after, "--dry-run modified config.toml");
+}
+
+/// `unit tag`: the tag set must not change.
+#[test]
+fn unit_tag_dry_run_changes_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+
+    let out = ok(
+        home.path(),
+        &["unit", "tag", "u1", "--add", "hot", "--dry-run"],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM unit_tags t JOIN units u ON u.id = t.unit_id
+             WHERE u.name = 'u1'"
+        ),
+        0,
+        "--dry-run added a tag: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `unit rename`: the old name must survive.
+#[test]
+fn unit_rename_dry_run_keeps_the_old_name() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+
+    ok(home.path(), &["unit", "rename", "u1", "u2", "--dry-run"]);
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM units WHERE name = 'u1'"),
+        1
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM units WHERE name = 'u2'"),
+        0
+    );
+
+    // A dry run must still refuse a name already taken.
+    std::fs::create_dir_all(root.path().join("u3")).unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            root.path().join("u3").to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u3",
+        ],
+    );
+    let dup = run_tapectl(home.path(), &["unit", "rename", "u1", "u3", "--dry-run"]);
+    assert!(
+        !dup.status.success(),
+        "a dry run must still refuse a unit name already taken"
+    );
+}
+
+/// `snapshot delete`: the row must survive.
+#[test]
+fn snapshot_delete_dry_run_keeps_the_snapshot() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(unit_dir.join("f.txt"), b"hello").unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+    ok(home.path(), &["snapshot", "create", "u1"]);
+
+    ok(
+        home.path(),
+        &["snapshot", "delete", "u1", "--version", "1", "--dry-run"],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM snapshots WHERE version = 1"),
+        1,
+        "--dry-run deleted the snapshot"
+    );
+}
+
+/// `snapshot purge`: same shape as `delete` above, against a `reclaimable`
+/// snapshot the real `purge` requires.
+#[test]
+fn snapshot_purge_dry_run_keeps_the_row() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(unit_dir.join("f.txt"), b"hello").unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+    ok(home.path(), &["snapshot", "create", "u1"]);
+    {
+        let conn = db(home.path());
+        conn.execute(
+            "UPDATE snapshots SET status = 'reclaimable' WHERE version = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    ok(
+        home.path(),
+        &["snapshot", "purge", "u1", "--version", "1", "--dry-run"],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM snapshots WHERE version = 1 AND status = 'reclaimable'"
+        ),
+        1,
+        "--dry-run purged the snapshot"
+    );
+}
+
+/// `volume deposit add`/`remove`: neither may write or erase a row.
+#[test]
+fn volume_deposit_add_and_remove_dry_run_change_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(
+        home.path(),
+        &["location", "add", "glacier", "--kind", "warehouse"],
+    );
+    let conn = db(home.path());
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                              capacity_bytes, status)
+         VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    ok(
+        home.path(),
+        &[
+            "volume",
+            "deposit",
+            "add",
+            "L6-0001",
+            "--to",
+            "glacier",
+            "--dry-run",
+        ],
+    );
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM volume_deposits"),
+        0,
+        "--dry-run recorded a deposit"
+    );
+    drop(conn);
+
+    ok(
+        home.path(),
+        &["volume", "deposit", "add", "L6-0001", "--to", "glacier"],
+    );
+    ok(
+        home.path(),
+        &[
+            "volume",
+            "deposit",
+            "remove",
+            "L6-0001",
+            "--from",
+            "glacier",
+            "--dry-run",
+        ],
+    );
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM volume_deposits"),
+        1,
+        "--dry-run removed the deposit"
+    );
+}
+
+/// `key import` (non-`--escrow`): no key row, no `.age.pub` file.
+#[test]
+fn key_import_dry_run_inserts_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let keyfile = home.path().join("imported.pub");
+    std::fs::write(
+        &keyfile,
+        "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n",
+    )
+    .unwrap();
+
+    ok(
+        home.path(),
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "acme",
+            "--alias",
+            "imported",
+            keyfile.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM encryption_keys WHERE alias = 'acme-imported'"
+        ),
+        0,
+        "--dry-run imported the key"
+    );
+    assert!(
+        !home
+            .path()
+            .join(".tapectl")
+            .join("keys")
+            .join("acme-imported.age.pub")
+            .exists(),
+        "--dry-run wrote the public key file"
+    );
+}
+
+/// `restore unit`'s LOCAL `dry_run` field shares clap's arg id with the
+/// GLOBAL `--dry-run` (both fields are literally named `dry_run`), so clap
+/// unifies them by id and the global flag reaches it with no extra
+/// plumbing in `cli::restore::run` — the same mechanism
+/// `a_global_dry_run_before_collection_sync_registers_nothing` above pins
+/// for `collection sync`. This is a characterisation, not a regression
+/// guard for a bug that existed.
+///
+/// Fabricates the minimal write-position chain `restore_unit`'s query
+/// joins across (`write_positions` -> `writes` -> `stage_slices` ->
+/// `stage_sets` -> `snapshots` -> `volumes`) directly, the same way
+/// `home_with_a_bound_cartridge` above fabricates `volumes`/
+/// `cartridge_volumes` rather than running a real `volume write` — a real
+/// write needs a tape this suite must never touch, and `restore_unit`'s
+/// dry branch returns before opening one anyway, so nothing but the
+/// catalog rows it reads is exercised.
+#[test]
+fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(unit_dir.join("f.txt"), b"hello").unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+    ok(home.path(), &["snapshot", "create", "u1"]);
+
+    let conn = db(home.path());
+    let unit_id: i64 = conn
+        .query_row("SELECT id FROM units WHERE name = 'u1'", [], |r| r.get(0))
+        .unwrap();
+    let snapshot_id: i64 = conn
+        .query_row(
+            "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = 1",
+            rusqlite::params![unit_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                              capacity_bytes, status)
+         VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+        [],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+        rusqlite::params![snapshot_id],
+    )
+    .unwrap();
+    let stage_set_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                    sha256_plain, sha256_encrypted)
+         VALUES (?1, 1, 100, 116, ?2, ?3)",
+        rusqlite::params![stage_set_id, "a".repeat(64), "b".repeat(64)],
+    )
+    .unwrap();
+    let stage_slice_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+         VALUES (?1, ?2, ?3, 'completed')",
+        rusqlite::params![stage_set_id, snapshot_id, volume_id],
+    )
+    .unwrap();
+    let write_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+         VALUES (?1, ?2, '0', 'written')",
+        rusqlite::params![write_id, stage_slice_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // `--device` is required here for a reason unrelated to this test:
+    // `restore` resolves its device LENIENTLY (`cli::read_device`, ADR-0005's
+    // DR path) but still needs SOME value when no `[[backends.lto]]` is
+    // configured, which this home never does (this suite must never touch
+    // `/dev/nst*`). The value need not exist — `restore_unit`'s dry branch
+    // returns before any device is opened.
+    //
+    // The GLOBAL flag in front position — the spelling clap accepts
+    // because `--dry-run` is `global = true`, same as the `collection
+    // sync` precedent — must still reach `restore unit`'s own local field.
+    let out = ok(
+        home.path(),
+        &[
+            "--dry-run",
+            "restore",
+            "unit",
+            "--unit",
+            "u1",
+            "--from",
+            "L6-0001",
+            "--to",
+            root.path().join("out").to_str().unwrap(),
+            "--device",
+            "/dev/tapectl-dry-run-contract-nonexistent",
+        ],
+    );
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("would restore") && text.contains('1'),
+        "dry-run output does not name the preview or the slice count: {text}"
+    );
+    assert!(
+        !root.path().join("out").exists(),
+        "--dry-run created the destination directory or restored into it"
+    );
+}
