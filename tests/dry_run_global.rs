@@ -1364,3 +1364,464 @@ fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
         "--dry-run created the destination directory or restored into it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #247 — the ten leaves fenced off from #241 (`src/cli/operations.rs`
+// and `src/cli/db.rs`, both assigned to the concurrently-running issue #233).
+// Same DB-row/filesystem discipline as the #230/#241 tests above.
+// ---------------------------------------------------------------------------
+
+/// `db backup`: no destination file, and no `<dest>.keys` sidecar directory
+/// either. `rusqlite::Connection::open` creates its target file the instant
+/// it is called — even before any table is written — so the pre-fix defect
+/// here is not "wrote a wrong backup", it is "created a zero-byte one".
+#[test]
+fn db_backup_dry_run_creates_no_file() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    let dest = home.path().join("backup.db");
+    let out = ok(
+        home.path(),
+        &["db", "backup", "--to", dest.to_str().unwrap(), "--dry-run"],
+    );
+    assert!(
+        !dest.exists(),
+        "--dry-run created the backup file: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(dest.to_str().unwrap()),
+        "dry-run output does not name the destination"
+    );
+
+    let dest_wk = home.path().join("backup-with-keys.db");
+    ok(
+        home.path(),
+        &[
+            "db",
+            "backup",
+            "--to",
+            dest_wk.to_str().unwrap(),
+            "--include-keys",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        !dest_wk.exists(),
+        "--dry-run (--include-keys) created the backup file"
+    );
+    assert!(
+        !dest_wk.with_extension("keys").exists(),
+        "--dry-run (--include-keys) created the keys backup directory"
+    );
+}
+
+/// `db fsck --repair --dry-run`: the violation report still names the
+/// orphan, but the row must survive — this is the "genuinely useful
+/// preview" issue #247 calls out, not a repair with the DELETE skipped
+/// silently. `fsck`'s exit code is 1 (warning) whenever issues are found,
+/// dry run or not (see `cli::db::fsck_exit_code`), so this uses
+/// `run_tapectl` directly rather than `ok()`, which demands a 0.
+#[test]
+fn db_fsck_repair_dry_run_does_not_repair() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    // Plant one orphan the way issue #104's/#177's own fsck fixtures do:
+    // FK enforcement OFF for the insert, back ON afterward (re-enabling the
+    // pragma does not retroactively validate rows already there).
+    {
+        let conn = db(home.path());
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, source_path)
+             VALUES (99999, 1, '/nonexistent')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    }
+
+    let out = run_tapectl(home.path(), &["db", "fsck", "--repair", "--dry-run"]);
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "db fsck --repair --dry-run on a database with one warning-level finding must exit \
+         0 or 1: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("snapshots") && text.contains("units"),
+        "dry-run fsck did not report the planted orphan: {text}"
+    );
+    assert!(
+        !text.contains("repaired=1"),
+        "a dry run must not claim to have repaired anything: {text}"
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM snapshots WHERE unit_id = 99999"
+        ),
+        1,
+        "--dry-run deleted the orphan row"
+    );
+}
+
+/// `db fsck --repair --dry-run` must still be REACHABLE on a database
+/// ordinary `db::open` refuses (issue #233's `DatabaseNeedsRepair` gate in
+/// `main.rs` matches on the command SHAPE `Fsck { repair: true }`, not on
+/// `--dry-run`) — a preview that only works on an already-healthy database
+/// is useless for the exact case the repair path exists to serve. Builds
+/// the identical fixture `tests/cli_smoke.rs`'s
+/// `issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open`
+/// uses: a database stopped two migrations short of head, carrying one
+/// dangling `units.tenant_id`.
+#[test]
+fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+
+    {
+        use rusqlite_migration::{Migrations, M};
+        let mut conn = rusqlite::Connection::open(&db_path).expect("open fixture db");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        Migrations::new(vec![
+            M::up(include_str!("../src/db/migrations/001_initial.sql")),
+            M::up(include_str!("../src/db/migrations/002_fts5_catalog.sql")),
+        ])
+        .to_latest(&mut conn)
+        .expect("migrate fixture db to 002");
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-orphan', 'orphan-unit', 99999, 'mtime_size', 1, 'active')",
+            [],
+        )
+        .expect("plant the orphan row");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    }
+
+    let out = run_tapectl(home.path(), &["db", "fsck", "--repair", "--dry-run"]);
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "a dry run must still be reachable on a database ordinary `db::open` refuses: \
+         stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("repaired=1"),
+        "a dry run must not repair even on the orphan-blocked path: {text}"
+    );
+
+    // Bypass `tapectl::db::open` deliberately — this database is still two
+    // migrations short of head, and re-opening it the ordinary way could
+    // itself run `migrate()`, which is exactly what this fixture must NOT
+    // have happened.
+    let raw = rusqlite::Connection::open(&db_path).expect("reopen fixture db raw");
+    let n: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE uuid = 'u-orphan'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "a dry run repaired (deleted) the orphan row it should only have previewed"
+    );
+}
+
+/// `db import`: this one was already correct before issue #247 —
+/// `cli::db::run` forwarded `dry_run` to `operations::db_import`, which
+/// reports a preview and returns before any consent prompt or
+/// `Connection::open`. It was fenced alongside its siblings only because
+/// `src/cli/db.rs` as a whole sat outside issue #241's file scope. This is
+/// a characterisation test (green from the first run), not a regression
+/// guard for a bug that existed — the same status
+/// `a_global_dry_run_before_collection_sync_registers_nothing` above notes
+/// for `collection sync`.
+#[test]
+fn db_import_dry_run_does_not_overwrite() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+
+    let export_path = home.path().join("exported.db");
+    ok(
+        home.path(),
+        &["db", "backup", "--to", export_path.to_str().unwrap()],
+    );
+
+    // Added AFTER the export, so it exists only in the live database — the
+    // one row that proves an import did or did not actually run.
+    ok(home.path(), &["tenant", "add", "post-export"]);
+
+    ok(
+        home.path(),
+        &["db", "import", export_path.to_str().unwrap(), "--dry-run"],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM tenants WHERE name = 'post-export'"
+        ),
+        1,
+        "--dry-run overwrote the live database with the imported one"
+    );
+}
+
+/// Top-level `export` (`main.rs`'s `Commands::Export` -> `operations::
+/// export_unit`): no destination directory, no MANIFEST.toml/SHA256SUMS/
+/// RECOVERY.md. The `stage_sets`/`stage_slices` chain is fabricated
+/// directly, the same way `restore_unit_dry_run_reports_a_preview_via_the_
+/// shared_arg_id` above fabricates its write-position chain — a real `dar`
+/// stage is not needed because the dry branch returns before the encrypted
+/// slice at `staging_path` is ever opened.
+#[test]
+fn export_dry_run_creates_no_destination_directory() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    ok(
+        home.path(),
+        &[
+            "unit",
+            "init",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "u1",
+        ],
+    );
+
+    let conn = db(home.path());
+    let unit_id: i64 = conn
+        .query_row("SELECT id FROM units WHERE name = 'u1'", [], |r| r.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, source_path) VALUES (?1, 1, ?2)",
+        rusqlite::params![unit_id, unit_dir.to_str().unwrap()],
+    )
+    .unwrap();
+    let snapshot_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+        rusqlite::params![snapshot_id],
+    )
+    .unwrap();
+    let stage_set_id = conn.last_insert_rowid();
+    // A REAL file, not a fake path: pre-fix (dry_run ignored), `export_unit`
+    // reaches its `fs::copy` unconditionally, and a nonexistent source would
+    // fail that copy with an unrelated I/O error instead of demonstrating
+    // the actual defect (a real destination directory and its contents
+    // getting written under `--dry-run`).
+    let slice_path = root.path().join("slice.1.dar.age");
+    std::fs::write(&slice_path, vec![0u8; 116]).unwrap();
+    conn.execute(
+        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                    sha256_plain, sha256_encrypted, staging_path)
+         VALUES (?1, 1, 100, 116, ?2, ?3, ?4)",
+        rusqlite::params![
+            stage_set_id,
+            "a".repeat(64),
+            "b".repeat(64),
+            slice_path.to_str().unwrap()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dest = root.path().join("export-out");
+    let out = ok(
+        home.path(),
+        &[
+            "export",
+            "--unit",
+            "u1",
+            "--to",
+            dest.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+
+    assert!(
+        !dest.exists(),
+        "--dry-run created the export destination directory: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("u1"),
+        "dry-run output does not name the unit: {text}"
+    );
+}
+
+/// Top-level `import` (`main.rs`'s `Commands::Import` -> `operations::
+/// volume_import`): no `volumes` row.
+#[test]
+fn import_dry_run_inserts_no_volume() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+
+    let out = ok(
+        home.path(),
+        &[
+            "import",
+            "--label",
+            "VOL-IMP",
+            "--generation",
+            "LTO-6",
+            "--dry-run",
+        ],
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM volumes WHERE label = 'VOL-IMP'"
+        ),
+        0,
+        "--dry-run imported the volume: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("VOL-IMP"),
+        "dry-run output does not name the volume"
+    );
+
+    // A dry run must still refuse a label already taken.
+    ok(
+        home.path(),
+        &["import", "--label", "VOL-IMP", "--generation", "LTO-6"],
+    );
+    let dup = run_tapectl(
+        home.path(),
+        &[
+            "import",
+            "--label",
+            "VOL-IMP",
+            "--generation",
+            "LTO-6",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        !dup.status.success(),
+        "a dry run must still refuse a volume label already taken"
+    );
+}
+
+/// `init`: no `.tapectl` home at all — not a half-created one. Deliberately
+/// does not call `db()` (which itself runs `tapectl::db::open` and would
+/// CREATE the database), and checks stderr never carries the one-time
+/// escrow secret banner, since a dry run must not mint an escrow identity
+/// it then has to keep secret.
+#[test]
+fn init_dry_run_creates_nothing() {
+    let home = TempDir::new().unwrap();
+
+    let out = ok(home.path(), &["init", "--dry-run"]);
+
+    assert!(
+        !home.path().join(".tapectl").exists(),
+        "--dry-run created the tapectl home: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("would"),
+        "dry-run output does not read as a preview: {text}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("ESCROW IDENTITY GENERATED"),
+        "a dry run must not print a one-time escrow secret it never generated: {stderr}"
+    );
+
+    // A dry run against an already-initialized home must still refuse.
+    ok(home.path(), &["init"]);
+    let dup = run_tapectl(home.path(), &["init", "--dry-run"]);
+    assert!(
+        !dup.status.success(),
+        "a dry run must still refuse re-initializing an existing home"
+    );
+}
+
+/// `quick-archive`: the worst of the ten (issue #247) — `operations::
+/// quick_archive` took no `dry_run` parameter at all and ended in `volume
+/// write`, so `--dry-run` staged a whole unit and sealed a real cartridge.
+/// This is the exact negative control the issue names: a home with NO
+/// `[[backends.lto]]` configured, so a refusal that fires after even one
+/// lookup surfaces `config::no_lto_backend_error`'s text instead of the
+/// `--dry-run` refusal — which is what the pre-fix run of this test showed.
+#[test]
+fn quick_archive_dry_run_refuses_before_resolving_a_backend() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "acme"]);
+    let root = TempDir::new().unwrap();
+    let unit_dir = root.path().join("u1");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(unit_dir.join("f.txt"), b"hello").unwrap();
+
+    let out = run_tapectl(
+        home.path(),
+        &[
+            "quick-archive",
+            unit_dir.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--volume",
+            "NOSUCHVOL",
+            "--dry-run",
+        ],
+    );
+
+    assert!(
+        !out.status.success(),
+        "quick-archive --dry-run must refuse, not run: stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dry-run"),
+        "refusal must name --dry-run: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no LTO backend configured"),
+        "the refusal must fire before backend resolution, not surface the backend error: \
+         {stderr}"
+    );
+
+    let conn = db(home.path());
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM units"),
+        0,
+        "--dry-run created a unit"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM stage_sets"),
+        0,
+        "--dry-run staged anything"
+    );
+}

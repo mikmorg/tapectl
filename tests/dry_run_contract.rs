@@ -47,10 +47,15 @@
 //!   to perform no write, so accepting `--dry-run` and doing exactly what
 //!   they always do already satisfies the promise — asserting that a
 //!   read-only command doesn't write is circular, not a contract.
-//! - [`Verdict::Excluded`] entries are leaves this branch is not permitted
-//!   to fix (see each entry's inline comment) — they are named here so the
-//!   completeness check does not silently drop them, and reported to the
-//!   coordinator as residual gaps, never claimed as fixed.
+//!
+//! Issue #247 closed the last nine leaves that issue #241 had to fence off
+//! to a concurrent worker (`db backup`/`export`/`fsck`/`import`/`stats` and
+//! the four top-level `main.rs` dispatchers `export`/`import`/`init`/
+//! `quick-archive`) — [`TABLE`] carries no "fenced off, not fixed" verdict
+//! any more, and the enum variant that spelled one has been removed
+//! entirely so it cannot silently regrow: a future leaf this branch cannot
+//! fix must invent its own documented escape hatch, not resurrect this one
+//! by habit.
 
 use clap::CommandFactory;
 use std::collections::HashSet;
@@ -72,9 +77,6 @@ enum Verdict {
     /// Runs its own preview and makes no change — proven in
     /// `tests/dry_run_global.rs`, not here.
     Honours,
-    /// Named so the completeness check accounts for it, but neither
-    /// fixed nor asserted by this branch — see the inline reason.
-    Excluded,
 }
 
 /// Every clap leaf, one verdict apiece. Order follows the clap tree
@@ -124,28 +126,27 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["completions"], Verdict::ReadOnly),
     (&["config", "check"], Verdict::ReadOnly),
     (&["config", "show"], Verdict::ReadOnly),
-    // db: `cli::db::run`'s dispatch and everything behind it belongs to a
-    // concurrent worker fixing issue #233 (the `db::open` failure path) —
-    // this branch's SCOPE FENCE forbids touching it. `db backup` and
-    // `db fsck --repair` were read during this audit and carry the exact
-    // same defect (accept `--dry-run`, ignore it, mutate anyway); reported
-    // to the coordinator rather than fixed here or claimed fixed here.
-    (&["db", "backup"], Verdict::Excluded),
-    (&["db", "export"], Verdict::Excluded),
-    (&["db", "fsck"], Verdict::Excluded),
-    (&["db", "import"], Verdict::Excluded),
-    (&["db", "stats"], Verdict::Excluded),
+    // db: fixed by issue #247, which closed the fence issue #241 had to
+    // draw around `src/cli/db.rs` while issue #233 (the `db::open` failure
+    // path) ran concurrently.
+    (&["db", "backup"], Verdict::Honours),
+    (&["db", "export"], Verdict::ReadOnly),
+    (&["db", "fsck"], Verdict::Honours),
+    // `db import` was ALREADY correct — `cli::db::run` forwarded `dry_run`
+    // to `operations::db_import` before this branch started, which reports
+    // a preview and returns before any consent prompt or `Connection::open`.
+    // It was fenced with its siblings anyway (`db.rs` as a whole was outside
+    // #241's file scope), never fixed here, only moved out of `Excluded`.
+    (&["db", "import"], Verdict::Honours),
+    (&["db", "stats"], Verdict::ReadOnly),
     // export/import/init/quick-archive: top-level `Commands::*` arms in
-    // `main.rs` that call `cli::operations::*`/`cmd_init` directly, never
-    // a `cli::<mod>::run(...)` dispatch — outside the ONE line of `main.rs`
-    // this branch's SCOPE FENCE grants ("the argument lists of the
-    // `cli::<mod>::run(...)` dispatch calls"). `quick-archive` in
-    // particular has the identical, worse defect `collection run` had
-    // before #230 (it stages and writes a real tape under `--dry-run`).
-    // Reported to the coordinator, not fixed here.
-    (&["export"], Verdict::Excluded),
-    (&["import"], Verdict::Excluded),
-    (&["init"], Verdict::Excluded),
+    // `main.rs` that call `cli::operations::*`/`cmd_init` directly, never a
+    // `cli::<mod>::run(...)` dispatch — fixed by issue #247, which extended
+    // its scope past #241's "the argument lists of the `cli::<mod>::run(...)`
+    // dispatch calls" fence to cover these four call sites too.
+    (&["export"], Verdict::Honours),
+    (&["import"], Verdict::Honours),
+    (&["init"], Verdict::Honours),
     (
         &["key", "escrow-kit"],
         Verdict::Refuses {
@@ -179,7 +180,23 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["location", "info"], Verdict::ReadOnly),
     (&["location", "list"], Verdict::ReadOnly),
     (&["location", "rename"], Verdict::Honours),
-    (&["quick-archive"], Verdict::Excluded),
+    // Issue #247: the worst of the ten — `operations::quick_archive` took no
+    // `dry_run` parameter at all and ended in `volume write`, so
+    // `--dry-run` staged a whole unit and sealed a real cartridge. Refused
+    // the same way `volume write` is: before `write_device`, so the
+    // refusal can never itself open the drive.
+    (
+        &["quick-archive"],
+        Verdict::Refuses {
+            probe_args: &[
+                "/tmp/tapectl-dry-run-contract-nonexistent",
+                "--tenant",
+                "nonexistent-tenant",
+                "--volume",
+                "NOSUCHVOL",
+            ],
+        },
+    ),
     (&["report", "age"], Verdict::ReadOnly),
     (&["report", "capacity"], Verdict::ReadOnly),
     (&["report", "compaction-candidates"], Verdict::ReadOnly),
@@ -404,7 +421,7 @@ fn every_clap_leaf_has_exactly_one_table_verdict() {
     assert!(
         undecided.is_empty(),
         "issue #241's contract has no verdict for: {undecided:?} — every clap leaf must \
-         appear in TABLE (dry_run_contract.rs) as ReadOnly, Refuses, Honours or Excluded"
+         appear in TABLE (dry_run_contract.rs) as ReadOnly, Refuses or Honours"
     );
 
     let stale: Vec<String> = table_paths
