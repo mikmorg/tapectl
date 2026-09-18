@@ -47,7 +47,37 @@ use rusqlite::{params, Connection};
 /// ignore NULLs, so the row survives (copies stays visibly 0) while a
 /// non-sealed volume's write no longer counts.
 pub fn eligible(volume_alias: &str) -> String {
-    format!("{volume_alias}.status = 'sealed'")
+    format!(
+        "({alias}.status = 'sealed' AND {cond})",
+        alias = volume_alias,
+        cond = condition_ok(volume_alias)
+    )
+}
+
+/// The condition half of every occupancy/eligibility predicate in this
+/// module (ADR-0012's 2026-09-17 amendment, "the status column is the
+/// operator's; a medium's condition is its own fact", issue #242):
+/// `true` only when tapectl has not observed a reason to distrust this
+/// volume's medium (`observed_condition = 'ok'`).
+///
+/// Before this amendment, quarantine worked by moving `status` OFF
+/// `sealed` — so [`eligible`] alone used to be sufficient. Now that the
+/// four quarantine writers (three in `volume::session`, one in
+/// `volume::write`'s `quarantine_on_medium_evidence`) target
+/// `observed_condition` instead and leave `status` untouched, `eligible`
+/// must consult BOTH columns or a quarantine silently stops reducing the
+/// copy count — the exact coverage-misstatement class issue #153 was.
+/// [`in_service`] and [`in_service_or_provisioned`] need the same half for
+/// the same reason: "untrusted" media was always excluded from both
+/// (see their own doc comments), and that exclusion used to ride on the
+/// same `status` move.
+///
+/// Never inlined outside this module — [`eligible`]'s own doc already
+/// states the rule this function exists to enforce: `coverage.rs` is the
+/// declared sole owner of every `volumes.status`/`observed_condition`
+/// predicate (issue #96).
+fn condition_ok(volume_alias: &str) -> String {
+    format!("{volume_alias}.observed_condition = 'ok'")
 }
 
 /// The inventory predicate (issue #96), rendered as a SQL boolean
@@ -66,11 +96,18 @@ pub fn eligible(volume_alias: &str) -> String {
 ///   under-report physical media — trading one under-report for another.
 ///
 /// Both exclude `retired`/`erased`/`missing`/`quarantined`: media that is
-/// gone, wiped, or untrusted is neither a copy nor live inventory.
+/// gone, wiped, or untrusted is neither a copy nor live inventory. Since
+/// issue #242, "quarantined" is a value of `observed_condition`, not
+/// `status` — [`condition_ok`] carries that exclusion now, alongside the
+/// status list.
 ///
 /// Pass the table name (`"volumes"`) when the query has no alias.
 pub fn in_service(volume_alias: &str) -> String {
-    status_in(volume_alias, &["active", "full", "sealed"])
+    format!(
+        "({} AND {})",
+        status_in(volume_alias, &["active", "full", "sealed"]),
+        condition_ok(volume_alias)
+    )
 }
 
 /// [`in_service`] widened to include `initialized` — media that is
@@ -86,7 +123,11 @@ pub fn in_service(volume_alias: &str) -> String {
 /// utilization percentage would dilute that number with media nothing has
 /// been asked to fill yet.
 pub fn in_service_or_provisioned(volume_alias: &str) -> String {
-    status_in(volume_alias, &["active", "full", "sealed", "initialized"])
+    format!(
+        "({} AND {})",
+        status_in(volume_alias, &["active", "full", "sealed", "initialized"]),
+        condition_ok(volume_alias)
+    )
 }
 
 /// ADR-0012: the one status `volume write`/`volume resume` may target.
@@ -106,11 +147,24 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
 /// `volume_write`: the row never leaves `initialized` between `plan` and
 /// `confirm`.
 ///
-/// This is HALF of the write-target check as of ADR-0012's 2026-09-16
-/// amendment (issue #199) — see [`has_completed_write`] for the other
-/// half, and why a status alone stopped being sufficient.
-pub fn is_write_target(status: &str) -> bool {
-    status == "initialized"
+/// This is one third of the write-target check. [`has_completed_write`] is
+/// the second (ADR-0012's 2026-09-16 amendment, issue #199) — see its doc
+/// for why a status alone stopped being sufficient. The third is the
+/// `condition` parameter itself (ADR-0012's 2026-09-17 amendment, "the
+/// status column is the operator's; a medium's condition is its own fact",
+/// issue #242):
+///
+/// A write-path quarantine (`volume::session`'s three writers) used to move
+/// `volumes.status` OFF `initialized` as a side effect of recording the
+/// quarantine, so a quarantined volume automatically failed this predicate
+/// without the predicate ever having to know why. Now that quarantine
+/// writes `observed_condition` instead and leaves `status` alone, that side
+/// effect is gone — a volume a write-time contact check quarantined
+/// mid-session would silently become a legal write target again the moment
+/// nothing else changed its status. This predicate checks BOTH columns
+/// directly so that regression cannot reopen.
+pub fn is_write_target(status: &str, condition: &str) -> bool {
+    status == "initialized" && condition == "ok"
 }
 
 /// ADR-0012, amendment 2026-09-16 (issue #199): the second half of the
@@ -624,8 +678,11 @@ pub(crate) mod tests {
     #[test]
     fn a_deposit_of_an_ineligible_volume_does_not_count() {
         let (conn, unit_id, vol) = setup_unit_with_deposit("active");
+        // Issue #242: quarantine is now a condition, not a status move — the
+        // volume stays `sealed` (as `setup_unit_with_deposit` left it) and
+        // only `observed_condition` records the fact.
         conn.execute(
-            "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
             params![vol],
         )
         .unwrap();
@@ -714,15 +771,52 @@ pub(crate) mod tests {
 
     #[test]
     fn renders_the_predicate_against_the_given_alias() {
-        assert_eq!(eligible("v"), "v.status = 'sealed'");
-        assert_eq!(eligible("v2"), "v2.status = 'sealed'");
+        assert_eq!(
+            eligible("v"),
+            "(v.status = 'sealed' AND v.observed_condition = 'ok')"
+        );
+        assert_eq!(
+            eligible("v2"),
+            "(v2.status = 'sealed' AND v2.observed_condition = 'ok')"
+        );
+    }
+
+    /// THE negative control for issue #242 (ADR-0012's 2026-09-17 amendment
+    /// "the status column is the operator's; a medium's condition is its
+    /// own fact"): a `sealed` volume whose `observed_condition` is
+    /// `quarantined` must contribute ZERO copies. Written and run BEFORE
+    /// `eligible` gained the condition half — this must fail red first (see
+    /// the worker's report for the captured failure), because `eligible`
+    /// used to be `status = 'sealed'` alone and a quarantine no longer moves
+    /// `status` off `sealed` at all now that the writers target the new
+    /// column. Miss this and every quarantine silently stops reducing the
+    /// copy count — exactly the coverage-misstatement class issue #153 was.
+    #[test]
+    fn a_sealed_volume_with_a_quarantined_condition_contributes_zero_copies() {
+        let (conn, unit_id, vol) = setup_unit_with_deposit("active");
+        // The deposit is gated on its source volume's eligibility too (see
+        // `a_deposit_of_an_ineligible_volume_does_not_count` above), so
+        // dropping it here isolates exactly the tape-eligibility half this
+        // test is about.
+        conn.execute("DELETE FROM volume_deposits", []).unwrap();
+        conn.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+            params![vol],
+        )
+        .unwrap();
+        let q = CoverageQuery::current_unit("?1");
+        assert_eq!(
+            scalar(&conn, &copy_count_expr(&q), unit_id),
+            0,
+            "a sealed-but-quarantined volume must not count as a copy"
+        );
     }
 
     #[test]
     fn in_service_keeps_legacy_full_and_adds_sealed() {
         assert_eq!(
             in_service("v"),
-            "v.status IN ('active','full','sealed')",
+            "(v.status IN ('active','full','sealed') AND v.observed_condition = 'ok')",
             "dropping legacy 'full' would under-report physical media"
         );
     }
@@ -731,7 +825,7 @@ pub(crate) mod tests {
     fn in_service_takes_a_bare_table_name_for_unaliased_queries() {
         assert_eq!(
             in_service("volumes"),
-            "volumes.status IN ('active','full','sealed')"
+            "(volumes.status IN ('active','full','sealed') AND volumes.observed_condition = 'ok')"
         );
     }
 
@@ -739,7 +833,35 @@ pub(crate) mod tests {
     fn in_service_or_provisioned_adds_initialized_and_nothing_else() {
         assert_eq!(
             in_service_or_provisioned("volumes"),
-            "volumes.status IN ('active','full','sealed','initialized')"
+            "(volumes.status IN ('active','full','sealed','initialized') AND \
+             volumes.observed_condition = 'ok')"
+        );
+    }
+
+    /// Issue #242: `in_service` must exclude a quarantined-but-otherwise-live
+    /// volume, not just one whose status names it directly. Before the
+    /// 2026-09-17 amendment this rode on `status` leaving `sealed`; now
+    /// quarantine leaves `status` alone.
+    #[test]
+    fn in_service_excludes_a_sealed_volume_with_a_quarantined_condition() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, observed_condition)
+             VALUES ('L6-INSVC', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 'quarantined')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM volumes v WHERE {}", in_service("v")),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a quarantined medium is untrusted; it must not count as live inventory"
         );
     }
 
@@ -1038,14 +1160,23 @@ pub(crate) mod tests {
     }
 
     /// ADR-0012 (issue #161): `is_write_target` must admit exactly
-    /// `initialized`, and this must be re-checked against the schema's own
-    /// status set every time it changes — a status added later to the
-    /// CHECK constraint without a corresponding classification here would
-    /// otherwise silently fall through as "not a write target" (or worse,
-    /// silently become one) with nothing failing to say so.
+    /// `initialized` (with `observed_condition = 'ok'`), and this must be
+    /// re-checked against the schema's own status set every time it
+    /// changes — a status added later to the CHECK constraint without a
+    /// corresponding classification here would otherwise silently fall
+    /// through as "not a write target" (or worse, silently become one) with
+    /// nothing failing to say so.
+    ///
+    /// Repointed to migration 017 (issue #242): `quarantined` left the
+    /// `status` CHECK entirely when it became a value of
+    /// `observed_condition` instead, so the schema-set pin below must read
+    /// the CURRENT authority, not 003 — reading the superseded file would
+    /// keep passing with 'quarantined' still in `statuses`, silently
+    /// pinning a status set the live schema no longer has.
     #[test]
     fn is_write_target_admits_exactly_initialized() {
-        const LIFECYCLE_SQL: &str = include_str!("../db/migrations/003_v2_lifecycle.sql");
+        const LIFECYCLE_SQL: &str =
+            include_str!("../db/migrations/017_volume_observed_condition.sql");
         let statuses = [
             "blank",
             "initialized",
@@ -1055,19 +1186,18 @@ pub(crate) mod tests {
             "missing",
             "erased",
             "sealed",
-            "quarantined",
         ];
 
         // Pull the literal set out of `CHECK(status IN (...))` and pin it
         // against `statuses` by SET EQUALITY, not mere containment -- a
-        // one-directional "does each of my nine appear somewhere in the
-        // file" check would keep passing after a tenth status was added to
+        // one-directional "does each of my eight appear somewhere in the
+        // file" check would keep passing after a ninth status was added to
         // the CHECK and never classified here, which is exactly the drift
         // this pin exists to catch.
         let marker = "CHECK(status IN (";
         let start = LIFECYCLE_SQL
             .find(marker)
-            .expect("003_v2_lifecycle.sql must still define the status CHECK")
+            .expect("017_volume_observed_condition.sql must still define the status CHECK")
             + marker.len();
         let end = LIFECYCLE_SQL[start..]
             .find(')')
@@ -1082,7 +1212,7 @@ pub(crate) mod tests {
         pinned_statuses.sort_unstable();
         assert_eq!(
             schema_statuses, pinned_statuses,
-            "the `volumes.status` CHECK in db/migrations/003_v2_lifecycle.sql no \
+            "the `volumes.status` CHECK in db/migrations/017_volume_observed_condition.sql no \
              longer matches the set `is_write_target_admits_exactly_initialized` \
              classifies -- a status was added or removed without updating \
              is_write_target (and this test) to account for it"
@@ -1091,11 +1221,35 @@ pub(crate) mod tests {
         for status in statuses {
             let expected = status == "initialized";
             assert_eq!(
-                is_write_target(status),
+                is_write_target(status, "ok"),
                 expected,
-                "is_write_target({status:?}) should be {expected}"
+                "is_write_target({status:?}, \"ok\") should be {expected}"
             );
         }
+    }
+
+    /// THE negative control for issue #242's `is_write_target` regression
+    /// (ADR-0012's 2026-09-17 amendment, point 5, "is_write_target is the
+    /// trap"): an `initialized` volume whose `observed_condition` is
+    /// `quarantined` must NOT be a write target. Run BEFORE the condition
+    /// parameter was wired into the body (it was, at first, accepted and
+    /// ignored) -- see the worker's report for the captured red failure.
+    /// Without this, the write-path quarantine writers moving off `status`
+    /// (rather than off `observed_condition`) makes a mid-write-quarantined
+    /// volume a legal write target again the instant nothing else changes
+    /// its status -- a live regression this change would otherwise
+    /// introduce.
+    #[test]
+    fn is_write_target_refuses_an_initialized_volume_with_a_quarantined_condition() {
+        assert!(
+            !is_write_target("initialized", "quarantined"),
+            "a quarantined medium must never be a write target, even while status reads \
+             'initialized'"
+        );
+        assert!(
+            is_write_target("initialized", "ok"),
+            "precondition: an ordinary initialized/ok volume must still be a write target"
+        );
     }
 
     /// ADR-0012 amendment, issue #199: `has_completed_write` must
@@ -1338,11 +1492,22 @@ pub(crate) mod tests {
     /// the command useless exactly when an operator needs it most.
     fn at_stake_is_empty_for_volume_status(status: &str) {
         let (conn, unit_id, here) = setup_at_stake(false);
-        conn.execute(
-            "UPDATE volumes SET status = ?1 WHERE id = ?2",
-            params![status, here],
-        )
-        .unwrap();
+        // Issue #242: 'quarantined' is a condition now, not a status --
+        // translate it onto `observed_condition`, leaving `status` at
+        // whatever `setup_at_stake` gave it ('sealed').
+        if status == "quarantined" {
+            conn.execute(
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                params![here],
+            )
+            .unwrap();
+        } else {
+            conn.execute(
+                "UPDATE volumes SET status = ?1 WHERE id = ?2",
+                params![status, here],
+            )
+            .unwrap();
+        }
         let rows = versions_at_stake(&conn, unit_id, here).unwrap();
         assert!(
             rows.is_empty(),
