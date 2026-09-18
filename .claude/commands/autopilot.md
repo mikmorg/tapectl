@@ -330,6 +330,40 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-18 — #242 LANDED; TWO ITEMS LEFT (#233, #241), both dispatched.**
+  Master `96b0a1a`. Gate 1589 tests / 0 failed, clippy 0, fmt clean; mhvtl gate GREEN (0
+  expected failures); **lifecycle `--all` GREEN 383 / 372 passed / 0 failed / 11 skipped**;
+  CI green. Nothing parked.
+  **#242 shipped ADR-0012's "the status column is the operator's" amendment:** migration 017
+  adds `volumes.observed_condition` (`ok`|`quarantined`) and rebuilds `volumes` to drop
+  `quarantined` from the `status` CHECK; all four quarantine writers target the new column;
+  `eligible`/`in_service` consult both; `is_write_target` takes the condition as a second
+  argument. **Two mechanics decided by the coordinator and recorded in the migration header,
+  not to be re-litigated:** the column is `observed_condition` (not `medium_condition` — the
+  two resume-path contact failures routed through it are not medium facts), and the
+  no-events fallback is `initialized` (not the ADR's blanket `sealed` — the three
+  `session.rs` writers quarantine sessions that never sealed).
+  **THE REVIEW CATCH WORTH CARRYING: a migration that restores a value out of an audit
+  trail must constrain that value to what its own new constraint permits.** 017 restored a
+  quarantined volume's prior status from the `events` row recording the transition into
+  quarantine — but the pre-017 writer had no guard, so re-verifying an already-quarantined
+  tape recorded `quarantined -> quarantined`, and restoring that wrote a value the new CHECK
+  forbids: migration aborts, `db::open` fails, **every command fails including
+  `db fsck --repair`** — #233's bricked-database shape, manufactured by the fix for #242.
+  The audit trail was written under the old rules and is not obliged to satisfy the new
+  ones.
+  **AND THE PROCESS RULE #244 EARNED: when a change GATES a command, grep the harness for
+  EVERY invocation of that command** — not just the site a worker reported. The first
+  `--all` after #244 came back 2 RED in `compaction` (one failure, one cascade its own
+  comment predicted); enumerating properly found a third in `permute` that PASSED and was
+  worth nothing, since a randomised walk's result depends on the seed. Fixed at `96b0a1a`.
+  **Ordering for the last two:** #233 (`src/db/mod.rs`, `src/cli/operations.rs`) and #241
+  (`src/cli/mod.rs` + the command modules) are NOT file-disjoint — every dispatcher is a
+  `cli::<mod>::run(...)` call in **`src/main.rs`**, not in `cli/mod.rs`, and #233's fix
+  lands in that same file. They run concurrently under a line-level fence: #241 owns the
+  dispatch argument lists, #233 owns the `db::open` call sites and the `Commands::Db` arm.
+  Also corrected on the issue: it is **thirteen** dispatchers ignoring `--dry-run`, not ten.
+
 - **QUEUE STATE 2026-09-17 (late) — #226 LANDED; the first write is no longer gated by a
   missing test.** Master `ef48cf6`. **Lifecycle `--all` is GREEN at 383 checks / 372
   passed / 0 failed / 11 skipped** (was 338/329/0/9 on `b865764`); gate 1570 tests, 0
