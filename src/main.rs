@@ -231,25 +231,25 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Tenant { ref command } => {
-            cli::tenant::run(&conn, &paths, command, cli.json)?;
+            cli::tenant::run(&conn, &paths, command, cli.json, cli.dry_run)?;
         }
         Commands::Key { ref command } => {
-            cli::key::run(&conn, &paths, command, cli.json)?;
+            cli::key::run(&conn, &paths, command, cli.json, cli.dry_run)?;
         }
         Commands::Unit { ref command } => {
-            cli::unit::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::unit::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Collection { ref command } => {
             cli::collection::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Snapshot { ref command } => {
-            cli::snapshot::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::snapshot::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Stage { ref command } => {
-            cli::stage::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::stage::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Staging { ref command } => {
-            cli::staging::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::staging::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Volume { ref command } => {
             // issue #45/H10: `volume::run` now returns a process exit code
@@ -260,10 +260,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             exit_if_nonzero(exit_code);
         }
         Commands::Restore { ref command } => {
-            cli::restore::run(&conn, &paths, &cfg, command, cli.json)?;
+            cli::restore::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Catalog { ref command } => {
-            cli::catalog::run(&conn, &cfg, command, cli.json)?;
+            cli::catalog::run(&conn, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Location { ref command } => {
             cli::location::run(&conn, command, cli.json, cli.dry_run)?;
@@ -272,7 +272,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::cartridge::run(&conn, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
         }
         Commands::ArchiveSet { ref command } => {
-            cli::archive_set::run(&conn, &cfg, command, cli.json)?;
+            cli::archive_set::run(&conn, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Audit {
             action_plan,
@@ -329,7 +329,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Commands::Backend { ref command } => {
-            cli::backend::run(&paths, command, cli.json)?;
+            cli::backend::run(&paths, command, cli.json, cli.dry_run)?;
         }
         Commands::Db { ref command } => {
             // Body lives in `cli::db` (issue #112). The exit CODE comes back

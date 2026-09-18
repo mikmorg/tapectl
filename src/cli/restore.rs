@@ -73,6 +73,13 @@ pub fn run(
     config: &Config,
     command: &RestoreCommands,
     json_output: bool,
+    // Issue #241: `Unit` already honours the global flag on its own —
+    // its local `dry_run` field shares clap's arg id with the global one
+    // (same mechanism as `collection sync`'s characterisation test), so
+    // it shadows this parameter inside that arm and this value is unused
+    // there. `File`/`RawVolume` have no local field of their own and read
+    // this parameter directly to refuse.
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         RestoreCommands::Unit {
@@ -126,6 +133,19 @@ pub fn run(
             to,
             device,
         } => {
+            // Issue #241: unlike `restore unit`, this has no cheap
+            // preview yet — a faithful one would need to confirm the
+            // specific file exists inside the unit's archived contents,
+            // which `restore_file` currently does by restoring to a temp
+            // dir first (see its own doc comment).
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "restore file",
+                    "there is no cheap preview yet — confirming the file exists means \
+                     restoring the whole unit to a temp directory first. `restore unit \
+                     --dry-run` previews the containing unit at no cost.",
+                ));
+            }
             let device = crate::cli::read_device(config, device.as_deref())?;
             volume::restore::restore_file(
                 conn,
@@ -150,6 +170,18 @@ pub fn run(
         }
 
         RestoreCommands::RawVolume { device, to, from } => {
+            // Issue #241: the emergency/heir path — there is no catalog
+            // to consult, so knowing what would be dumped means opening
+            // the drive and reading the tape's own front index, which is
+            // most of this command's own work.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "restore raw-volume",
+                    "this uses only what is on the tape itself, so a preview would have to \
+                     open the drive and read the tape's own front index to know what would \
+                     be dumped.",
+                ));
+            }
             let dest = std::path::Path::new(to);
             let device = crate::cli::read_device(config, device.as_deref())?;
             // Issue #166: refuse before the store is opened if this drive

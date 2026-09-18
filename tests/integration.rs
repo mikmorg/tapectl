@@ -910,7 +910,7 @@ fn test_key_rotate_twice_keeps_tenant_active() {
         description: None,
         escrow: true,
     };
-    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap();
+    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false, false).unwrap();
 
     let active = |name: &str| -> i64 {
         conn.query_row(
@@ -935,7 +935,7 @@ fn test_key_rotate_twice_keeps_tenant_active() {
     let rotate = KeyCommands::Rotate {
         tenant: "alice".to_string(),
     };
-    tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap();
+    tapectl::cli::key::run(&conn, &paths, &rotate, false, false).unwrap();
     assert_eq!(
         active("alice"),
         2,
@@ -943,7 +943,7 @@ fn test_key_rotate_twice_keeps_tenant_active() {
     );
 
     // The H13 reproduction: a second rotation must not strand the tenant.
-    tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap();
+    tapectl::cli::key::run(&conn, &paths, &rotate, false, false).unwrap();
     assert_eq!(
         active("alice"),
         2,
@@ -1024,7 +1024,7 @@ fn key_rotate_refuses_without_escrow() {
     let rotate = KeyCommands::Rotate {
         tenant: "alice".to_string(),
     };
-    let err = tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap_err();
+    let err = tapectl::cli::key::run(&conn, &paths, &rotate, false, false).unwrap_err();
     assert!(
         format!("{err}").contains("escrow"),
         "expected an escrow-related refusal, got: {err}"
@@ -1059,7 +1059,7 @@ fn key_rotate_with_escrow_present_leaves_escrow_row_untouched() {
         description: None,
         escrow: true,
     };
-    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap();
+    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false, false).unwrap();
 
     let (escrow_id, escrow_pubkey_before): (i64, String) = conn
         .query_row(
@@ -1075,7 +1075,7 @@ fn key_rotate_with_escrow_present_leaves_escrow_row_untouched() {
     let rotate = KeyCommands::Rotate {
         tenant: "op".to_string(),
     };
-    tapectl::cli::key::run(&conn, &paths, &rotate, false).unwrap();
+    tapectl::cli::key::run(&conn, &paths, &rotate, false, false).unwrap();
 
     let (escrow_active, escrow_pubkey_after): (bool, String) = conn
         .query_row(
@@ -1134,9 +1134,9 @@ fn second_escrow_registration_refuses() {
         description: None,
         escrow: true,
     };
-    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap();
+    tapectl::cli::key::run(&conn, &paths, &gen_escrow, false, false).unwrap();
 
-    let err = tapectl::cli::key::run(&conn, &paths, &gen_escrow, false).unwrap_err();
+    let err = tapectl::cli::key::run(&conn, &paths, &gen_escrow, false, false).unwrap_err();
     assert!(
         format!("{err}").contains("already registered"),
         "expected an already-registered refusal, got: {err}"
@@ -1162,7 +1162,7 @@ fn second_escrow_registration_refuses() {
         key_type: "primary".to_string(),
         escrow: true,
     };
-    let err2 = tapectl::cli::key::run(&conn, &paths, &import, false).unwrap_err();
+    let err2 = tapectl::cli::key::run(&conn, &paths, &import, false, false).unwrap_err();
     assert!(
         format!("{err2}").contains("already registered"),
         "expected an already-registered refusal, got: {err2}"

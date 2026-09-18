@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tabled::{Table, Tabled};
 
@@ -219,6 +219,7 @@ pub fn run(
     config: &Config,
     command: &ArchiveSetCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         ArchiveSetCommands::Create {
@@ -251,6 +252,31 @@ pub fn run(
                 .as_ref()
                 .map(|s| crate::staging::parse_size_to_bytes(s))
                 .transpose()?;
+
+            // Issue #241: pure precheck-then-INSERT with no policy gate —
+            // both validations above already ran, so this only adds the
+            // name-collision check the UNIQUE constraint would otherwise
+            // catch (and stays ahead of the dry-run return, as always).
+            if dry_run {
+                let taken: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM archive_sets WHERE name = ?1",
+                        params![name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if taken.is_some() {
+                    return Err(TapectlError::Other(format!(
+                        "archive set \"{name}\" already exists"
+                    )));
+                }
+                if json_output {
+                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                } else {
+                    println!("would create archive set \"{name}\" (DRY RUN — no changes made)");
+                }
+                return Ok(());
+            }
 
             conn.execute(
                 "INSERT INTO archive_sets (name, description, min_copies, required_locations,
@@ -305,6 +331,19 @@ pub fn run(
                     |row| row.get(0),
                 )
                 .map_err(|_| TapectlError::Other(format!("archive set \"{name}\" not found")))?;
+
+            // Issue #241: both validations above and the existence lookup
+            // just above already refuse what the real edit would refuse;
+            // a dry run stops here rather than running any of the
+            // per-field UPDATEs below.
+            if dry_run {
+                if json_output {
+                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                } else {
+                    println!("would edit archive set \"{name}\" (DRY RUN — no changes made)");
+                }
+                return Ok(());
+            }
 
             // Snapshot old values BEFORE any UPDATE runs, so every per-field
             // event below records a real old value instead of `None`
@@ -673,6 +712,17 @@ pub fn run(
         }
 
         ArchiveSetCommands::Sync => {
+            // Issue #241: a config-to-DB reconciliation (like `unit
+            // discover`/`collection sync`) — created/updated/unchanged is
+            // decided per entry as it walks `config.archive_sets`, so a
+            // faithful preview would duplicate that logic.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "archive-set sync",
+                    "created/updated/unchanged is decided per entry while walking \
+                     config.toml; a faithful preview would duplicate that reconciliation.",
+                ));
+            }
             let mut created = 0;
             let mut updated = 0;
 
@@ -922,6 +972,7 @@ mod tests {
             &config,
             &create_cmd("cold", None, Some("not-a-real-codec")),
             false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -955,7 +1006,7 @@ mod tests {
         } else {
             unreachable!("create_cmd always returns Create");
         }
-        let err = run(&conn, &config, &cmd, false).unwrap_err();
+        let err = run(&conn, &config, &cmd, false, false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not-a-real-mode"),
@@ -1024,6 +1075,7 @@ fi
             &config,
             &create_cmd("cold", None, Some("lzo")),
             false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1059,6 +1111,7 @@ fi
             &config,
             &create_cmd("cold", None, Some("bogus")),
             false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1078,6 +1131,7 @@ fi
             &conn,
             &config,
             &create_cmd("cold", None, Some("gzip")),
+            false,
             false,
         )
         .unwrap();
@@ -1109,7 +1163,14 @@ fi
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
 
         let config = Config::default();
-        run(&conn, &config, &create_cmd("cold", Some(3), None), false).unwrap();
+        run(
+            &conn,
+            &config,
+            &create_cmd("cold", Some(3), None),
+            false,
+            false,
+        )
+        .unwrap();
 
         // The identical shape of subquery `List`/`Info` run, against the
         // pre-link state — proven to read 0, the pre-#48 behavior this fix
@@ -1149,7 +1210,7 @@ fi
         // The real CLI handlers must also run cleanly end-to-end against
         // this now-linked state (List and Info both run the identical
         // shape of subquery just proven above).
-        run(&conn, &config, &ArchiveSetCommands::List, true).unwrap();
+        run(&conn, &config, &ArchiveSetCommands::List, true, false).unwrap();
         run(
             &conn,
             &config,
@@ -1157,6 +1218,7 @@ fi
                 name: "cold".to_string(),
             },
             true,
+            false,
         )
         .unwrap();
     }
@@ -1172,6 +1234,7 @@ fi
             &conn,
             &config,
             &create_cmd("cold", Some(2), Some("none")),
+            false,
             false,
         )
         .unwrap();
@@ -1191,6 +1254,7 @@ fi
                 warehouse_copies: None,
                 description: None,
             },
+            false,
             false,
         )
         .unwrap();
@@ -1235,7 +1299,14 @@ fi
     fn edit_rolls_back_every_field_when_one_update_fails_partway_through() {
         let conn = fresh_conn();
         let config = Config::default();
-        run(&conn, &config, &create_cmd("cold", Some(2), None), false).unwrap();
+        run(
+            &conn,
+            &config,
+            &create_cmd("cold", Some(2), None),
+            false,
+            false,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE archive_sets SET checksum_mode = 'mtime_size' WHERE name = 'cold'",
             [],
@@ -1269,6 +1340,7 @@ fi
                 warehouse_copies: None,
                 description: None,
             },
+            false,
             false,
         );
         assert!(

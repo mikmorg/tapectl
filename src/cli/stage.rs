@@ -104,6 +104,7 @@ pub fn run(
     config: &Config,
     command: &StageCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         StageCommands::List { status } => {
@@ -279,6 +280,17 @@ pub fn run(
         }
 
         StageCommands::Create { name, version } => {
+            // Issue #241: the dar archive + age encryption pipeline IS
+            // the work (hours and a tape's worth of staging disk, per
+            // `collection run`'s own dry-run comment) — most of the
+            // command with none of the safety if run "dry".
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "stage create",
+                    "the dar archive, sha256 validation and age encryption pipeline IS the \
+                     work — there is no cheaper way to know what would be staged.",
+                ));
+            }
             let unit = crate::db::queries::get_unit_by_name(conn, name)?
                 .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
 
@@ -510,6 +522,7 @@ mod tests {
                 version: None,
             },
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -528,6 +541,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: None,
             },
+            false,
             false,
         )
         .unwrap();
@@ -556,6 +570,7 @@ mod tests {
                 version: Some(99),
             },
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -577,6 +592,7 @@ mod tests {
                 version: None,
             },
             false,
+            false,
         )
         .unwrap();
 
@@ -590,6 +606,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
         )
         .unwrap_err();
@@ -615,6 +632,7 @@ mod tests {
                 version: None,
             },
             false,
+            false,
         )
         .unwrap();
 
@@ -637,6 +655,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
         )
         .unwrap();
@@ -672,6 +691,7 @@ mod tests {
                 version: None,
             },
             false,
+            false,
         )
         .unwrap();
 
@@ -699,6 +719,7 @@ mod tests {
                 version: 1,
             },
             false,
+            false,
         )
         .unwrap();
         run(
@@ -710,6 +731,7 @@ mod tests {
                 version: 1,
             },
             true,
+            false,
         )
         .unwrap();
 
@@ -722,6 +744,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
         )
         .unwrap();
@@ -752,6 +775,7 @@ mod tests {
                 version: 1,
             },
             false,
+            false,
         )
         .unwrap();
         run(
@@ -763,6 +787,7 @@ mod tests {
                 version: 1,
             },
             true,
+            false,
         )
         .unwrap();
     }

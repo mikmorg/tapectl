@@ -141,6 +141,7 @@ pub fn run(
     config: &Config,
     command: &UnitCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         UnitCommands::Init {
@@ -150,6 +151,18 @@ pub fn run(
             tag,
             archive_set,
         } => {
+            // Issue #241: `init_unit` writes `.tapectl-unit.toml` into the
+            // operator's OWN source tree and resolves auto-generated-name
+            // collisions as it goes; reproducing that safely without
+            // writing would duplicate its logic in two places that could
+            // drift.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "unit init",
+                    "it writes `.tapectl-unit.toml` into the source directory and resolves \
+                     name collisions as it goes; a faithful preview would duplicate that logic.",
+                ));
+            }
             let unit_id = crate::unit::init_unit(
                 conn,
                 paths,
@@ -170,6 +183,15 @@ pub fn run(
         }
 
         UnitCommands::InitBulk { path, tenant, tag } => {
+            // Issue #241: same reasoning as `unit init`, multiplied over
+            // every subdirectory.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "unit init-bulk",
+                    "it writes `.tapectl-unit.toml` into every subdirectory it registers; a \
+                     faithful preview would duplicate `unit init`'s own logic.",
+                ));
+            }
             let results = crate::unit::init_bulk(conn, paths, path, tenant, tag)?;
             let mut success = 0;
             let mut failed = 0;
@@ -306,6 +328,29 @@ pub fn run(
 
         UnitCommands::Tag { name, add, remove } => {
             let unit = resolve_unit(conn, name)?;
+            // Issue #241: pure precheck-then-UPDATE with no policy gate —
+            // compute the resulting set in memory instead of writing it.
+            if dry_run {
+                let mut tags = queries::get_tags_for_unit(conn, unit.id)?;
+                for tag in add {
+                    if !tags.contains(tag) {
+                        tags.push(tag.clone());
+                    }
+                }
+                tags.retain(|t| !remove.contains(t));
+                if json_output {
+                    let mut obj = serde_json::json!({"name": unit.name, "tags": tags});
+                    obj["dry_run"] = serde_json::json!(true);
+                    println!("{obj}");
+                } else {
+                    println!(
+                        "unit \"{}\": tags would become [{}] (DRY RUN — no changes made)",
+                        unit.name,
+                        tags.join(", ")
+                    );
+                }
+                return Ok(());
+            }
             for tag in add {
                 queries::add_tag_to_unit(conn, unit.id, tag)?;
             }
@@ -321,6 +366,29 @@ pub fn run(
         }
 
         UnitCommands::Rename { current, new } => {
+            // Issue #241: reproduces `rename_unit`'s own preconditions
+            // (unit exists, new name valid and free) so a dry run refuses
+            // exactly what the real rename would refuse.
+            if dry_run {
+                queries::get_unit_by_name(conn, current)?
+                    .ok_or_else(|| TapectlError::UnitNotFound(current.clone()))?;
+                crate::naming::validate_unit_name(new)?;
+                if queries::get_unit_by_name(conn, new)?.is_some() {
+                    return Err(TapectlError::UnitAlreadyExists(new.clone()));
+                }
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"old_name": current, "new_name": new, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "unit \"{current}\" would be renamed to \"{new}\" (DRY RUN — no \
+                         changes made)"
+                    );
+                }
+                return Ok(());
+            }
             crate::unit::rename_unit(conn, current, new)?;
             if json_output {
                 println!(
@@ -333,6 +401,17 @@ pub fn run(
         }
 
         UnitCommands::Discover => {
+            // Issue #241: a filesystem-to-DB reconciliation (like
+            // `archive_set sync`/`collection sync`) — the scan itself
+            // decides created/updated/unchanged as it walks, so a faithful
+            // preview would duplicate `discovery::discover`'s own logic.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "unit discover",
+                    "the watch-root scan decides created/updated/unchanged as it walks; a \
+                     faithful preview would duplicate that reconciliation logic.",
+                ));
+            }
             let report = crate::unit::discovery::discover(conn, &config.discovery.watch_roots)?;
             if json_output {
                 println!(
@@ -363,6 +442,18 @@ pub fn run(
         }
 
         UnitCommands::MarkTapeOnly { name, force } => {
+            // Issue #241: `unit_mark_tape_only` (cli::operations, outside
+            // this fix's file scope) enforces min_copies/min_locations —
+            // a gate a dry run must reproduce exactly or it lies about
+            // what the real run would refuse. Refuse rather than risk
+            // that divergence.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "unit mark-tape-only",
+                    "it enforces the resolved policy's min_copies/min_locations, a gate a \
+                     preview would have to reproduce exactly or risk being wrong.",
+                ));
+            }
             crate::cli::operations::unit_mark_tape_only(conn, config, name, *force, json_output)?;
         }
     }

@@ -143,9 +143,21 @@ pub fn run(
     config: &Config,
     command: &SnapshotCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         SnapshotCommands::Create { name } => {
+            // Issue #241: the sha256 directory walk IS the work — the
+            // only way to know whether content changed (and so whether a
+            // new version would be minted) is to run it, so there is
+            // nothing cheaper to offer as a preview.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "snapshot create",
+                    "the directory walk and hash comparison that decide whether a new \
+                     version would be minted ARE the command's own work.",
+                ));
+            }
             // ADR-0012 / issue #159: `snapshot_create_detailed` may report
             // an existing version instead of minting one — `outcome.minted`
             // says which. Exit 0 either way; this is success, not a
@@ -201,10 +213,91 @@ pub fn run(
             version,
             force,
         } => {
+            // Issue #241: reproduces `snapshot_delete`'s two refusals
+            // (completed writes; staged data without --force) so a dry
+            // run refuses exactly what the real delete would refuse,
+            // without touching a row or a staged file.
+            if dry_run {
+                let unit = crate::db::queries::get_unit_by_name(conn, name)?
+                    .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
+                let (snap_id, _status): (i64, String) = conn
+                    .query_row(
+                        "SELECT id, status FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+                        params![unit.id, version],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| {
+                        TapectlError::Other(format!("snapshot v{version} not found for \"{name}\""))
+                    })?;
+                let write_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM writes w
+                     JOIN stage_sets ss ON ss.id = w.stage_set_id
+                     WHERE ss.snapshot_id = ?1 AND w.status = 'completed'",
+                    params![snap_id],
+                    |row| row.get(0),
+                )?;
+                if write_count > 0 {
+                    return Err(TapectlError::Other(format!(
+                        "snapshot v{version} has {write_count} completed write(s) — cannot \
+                         delete"
+                    )));
+                }
+                let staged_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND status = \
+                     'staged'",
+                    params![snap_id],
+                    |row| row.get(0),
+                )?;
+                if staged_count > 0 && !force {
+                    return Err(TapectlError::Other(format!(
+                        "snapshot v{version} has staged data — use --force to delete anyway"
+                    )));
+                }
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"unit": name, "version": version, "dry_run": true})
+                    );
+                } else {
+                    println!("would delete snapshot {name} v{version} (DRY RUN — no changes made)");
+                }
+                return Ok(());
+            }
             crate::cli::operations::snapshot_delete(conn, name, *version, *force, json_output)?;
         }
 
         SnapshotCommands::Purge { name, version } => {
+            // Issue #241: reproduces `snapshot_purge`'s own precondition
+            // (status must be 'reclaimable') so a dry run refuses exactly
+            // what the real purge would refuse.
+            if dry_run {
+                let unit = crate::db::queries::get_unit_by_name(conn, name)?
+                    .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+                        params![unit.id, version],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| {
+                        TapectlError::Other(format!("snapshot v{version} not found for \"{name}\""))
+                    })?;
+                if status != "reclaimable" {
+                    return Err(TapectlError::Other(format!(
+                        "snapshot v{version} status is \"{status}\", must be \"reclaimable\" \
+                         to purge"
+                    )));
+                }
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"unit": name, "version": version, "dry_run": true})
+                    );
+                } else {
+                    println!("would purge snapshot {name} v{version} (DRY RUN — no changes made)");
+                }
+                return Ok(());
+            }
             crate::cli::operations::snapshot_purge(conn, name, *version, json_output)?;
         }
 
@@ -213,6 +306,18 @@ pub fn run(
             version,
             force,
         } => {
+            // Issue #241: enforces policy preconditions including the
+            // tape-only 2x copy multiplier (Milestone 6) — a gate a dry
+            // run must reproduce exactly or it lies about what the real
+            // run would refuse. Refuse rather than risk that divergence.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "snapshot mark-reclaimable",
+                    "it enforces the resolved policy's coverage preconditions (including the \
+                     tape-only 2x copy multiplier), a gate a preview would have to reproduce \
+                     exactly or risk being wrong.",
+                ));
+            }
             crate::cli::operations::snapshot_mark_reclaimable(
                 conn,
                 config,

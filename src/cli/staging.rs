@@ -168,6 +168,7 @@ pub fn run(
     config: &Config,
     command: &StagingCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         StagingCommands::Status => {
@@ -198,6 +199,17 @@ pub fn run(
         }
 
         StagingCommands::Clean { force } => {
+            // Issue #241: the #244 min_copies gate right below must
+            // reproduce exactly, or a dry run would claim a release is
+            // safe when the real run refuses it (or vice versa) — "a dry
+            // run that hides a refusal is worse than no dry run".
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "staging clean",
+                    "it enforces the #244 min_copies release gate, which a preview would \
+                     have to reproduce exactly or risk being wrong.",
+                ));
+            }
             // Issue #244, ADR-0012's 2026-09-17 amendment: refuse to
             // release a stage set whose unit is below its own resolved
             // min_copies, unless the operator passes --force. This gate
@@ -421,6 +433,7 @@ mod tests {
             &config,
             &StagingCommands::Clean { force: false },
             false,
+            false,
         );
 
         let err = result
@@ -459,6 +472,7 @@ mod tests {
             &config,
             &StagingCommands::Clean { force: true },
             false,
+            false,
         );
         assert!(result.is_ok(), "{result:?}");
 
@@ -484,6 +498,7 @@ mod tests {
             &paths,
             &config,
             &StagingCommands::Clean { force: false },
+            false,
             false,
         );
         assert!(result.is_ok(), "{result:?}");

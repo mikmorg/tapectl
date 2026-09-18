@@ -9,7 +9,12 @@ use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use std::io::Write;
 
-pub fn run(paths: &TapectlPaths, command: &BackendCommands, json_output: bool) -> Result<()> {
+pub fn run(
+    paths: &TapectlPaths,
+    command: &BackendCommands,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
     match command {
         BackendCommands::Add {
             name,
@@ -27,6 +32,7 @@ pub fn run(paths: &TapectlPaths, command: &BackendCommands, json_output: bool) -
             capacity_override.as_deref(),
             enospc_buffer.as_deref(),
             json_output,
+            dry_run,
         ),
     }
 }
@@ -98,6 +104,7 @@ fn add(
     capacity_override: Option<&str>,
     enospc_buffer: Option<&str>,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     crate::naming::validate_backend_name(name)?;
 
@@ -173,6 +180,30 @@ fn add(
                  for the sg node) if that is not deliberate."
             );
         }
+    }
+
+    // Issue #241: every refusal above (bad name/generation/capacity,
+    // duplicate name, duplicate device_tape) is a fact about the request
+    // and stays ahead of this return — a dry run must still refuse what
+    // the real run would refuse. The device-missing warning above is
+    // informational, not a mutation, so it is harmless to have already
+    // printed it.
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({"backend": name, "device_tape": device_tape,
+                                   "device_sg": device_sg, "generation": generation,
+                                   "dry_run": true})
+            );
+        } else {
+            println!(
+                "would add backend \"{name}\" to {} ({generation}, tape={device_tape}, \
+                 sg={device_sg}) (DRY RUN — no changes made)",
+                paths.config_file.display()
+            );
+        }
+        return Ok(());
     }
 
     // Appended as text, never re-serialized. `Config::save` round-trips
@@ -384,6 +415,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -419,6 +451,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("drive-a"), "{err}");
@@ -446,6 +479,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("drive-a"), "{err}");
@@ -468,6 +502,7 @@ mod tests {
             "LTO-6",
             None,
             None,
+            false,
             false,
         )
         .unwrap();
@@ -492,6 +527,7 @@ mod tests {
             "LTO-6",
             None,
             None,
+            false,
             false,
         )
         .unwrap();
@@ -528,6 +564,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -558,6 +595,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap();
 
@@ -582,6 +620,7 @@ mod tests {
             "not-a-generation",
             None,
             None,
+            false,
             false,
         )
         .unwrap_err();

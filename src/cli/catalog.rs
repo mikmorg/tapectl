@@ -393,6 +393,7 @@ pub fn run(
     config: &crate::config::Config,
     command: &CatalogCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         CatalogCommands::Ls { unit, version } => {
@@ -555,6 +556,16 @@ pub fn run(
                     "catalog rebuild needs a source: pass --from-volume to rebuild \
                      from a sealed tape"
                         .to_string(),
+                ));
+            }
+            // Issue #241: a real preview would have to open the drive
+            // and chain-walk the whole volume — the exact set of rows a
+            // real run would insert is not known any other way.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "catalog rebuild",
+                    "a real preview would have to open the drive and chain-walk the whole \
+                     volume to know what rows would be inserted.",
                 ));
             }
             // LENIENT (ADR-0010): rebuild is the disaster-recovery read

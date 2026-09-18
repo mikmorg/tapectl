@@ -72,9 +72,31 @@ pub fn run(
     paths: &TapectlPaths,
     command: &TenantCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         TenantCommands::Add { name, description } => {
+            // Issue #241: the same two facts `add_tenant` itself checks
+            // first, reproduced here rather than inside it, so a dry run
+            // never generates key material or touches disk. Refuses ahead
+            // of the preview, exactly as the real add does.
+            if dry_run {
+                crate::naming::validate_tenant_name(name)?;
+                if queries::get_tenant_by_name(conn, name)?.is_some() {
+                    return Err(crate::error::TapectlError::TenantAlreadyExists(
+                        name.clone(),
+                    ));
+                }
+                if json_output {
+                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                } else {
+                    println!(
+                        "would create tenant \"{name}\" with primary and backup keys \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
             let id = crate::tenant::add_tenant(conn, paths, name, description.as_deref(), false)?;
             if json_output {
                 println!(
@@ -146,6 +168,29 @@ pub fn run(
         TenantCommands::Reassign { source, to } => {
             let src = crate::tenant::require_tenant(conn, source)?;
             let dst = crate::tenant::require_tenant(conn, to)?;
+            // Issue #241: both lookups above already refuse an unknown
+            // tenant on either side; a dry run counts what would move
+            // instead of running the UPDATE.
+            if dry_run {
+                let would_move: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
+                    rusqlite::params![src.id],
+                    |r| r.get(0),
+                )?;
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({"from": source, "to": to,
+                                           "units_moved": would_move, "dry_run": true})
+                    );
+                } else {
+                    println!(
+                        "would reassign {would_move} unit(s) from \"{source}\" to \"{to}\" \
+                         (DRY RUN — no changes made)"
+                    );
+                }
+                return Ok(());
+            }
             let moved: usize = conn.execute(
                 "UPDATE units SET tenant_id = ?1 WHERE tenant_id = ?2",
                 rusqlite::params![dst.id, src.id],
@@ -177,6 +222,22 @@ pub fn run(
             }
         }
         TenantCommands::Delete { name } => {
+            // Issue #241: reproduces `delete_tenant`'s own precondition
+            // (no active units) so a dry run refuses exactly what the
+            // real delete would refuse, without writing the soft-delete.
+            if dry_run {
+                let tenant = crate::tenant::require_tenant(conn, name)?;
+                let active_count = queries::count_active_units_for_tenant(conn, tenant.id)?;
+                if active_count > 0 {
+                    return Err(crate::error::TapectlError::TenantHasActiveUnits);
+                }
+                if json_output {
+                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                } else {
+                    println!("would delete tenant \"{name}\" (DRY RUN — no changes made)");
+                }
+                return Ok(());
+            }
             crate::tenant::delete_tenant(conn, name)?;
             if json_output {
                 println!("{}", serde_json::json!({"name": name, "status": "deleted"}));
@@ -241,6 +302,7 @@ mod tests {
                 source: "acme".to_string(),
                 to: "othertenant".to_string(),
             },
+            false,
             false,
         )
         .unwrap();

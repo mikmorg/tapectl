@@ -127,6 +127,7 @@ pub fn run(
     paths: &TapectlPaths,
     command: &KeyCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<()> {
     match command {
         KeyCommands::Generate {
@@ -136,6 +137,20 @@ pub fn run(
             description,
             escrow,
         } => {
+            // Issue #241: the interesting output — the fingerprint — does
+            // not exist until real key material is generated, so a preview
+            // could either lie by omission or do the generation anyway.
+            // `--escrow` additionally mints the one-and-only escrow
+            // identity and prints its secret exactly once; there is no
+            // safe rehearsal of that.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "key generate",
+                    "the fingerprint a real run reports does not exist until the keypair is \
+                     actually generated, and generating one to preview it would not be a dry \
+                     run.",
+                ));
+            }
             if *escrow {
                 generate_escrow_key(conn, paths, description.as_deref(), json_output)?;
             } else {
@@ -211,6 +226,16 @@ pub fn run(
             println!("{}", key.public_key);
         }
         KeyCommands::Rotate { tenant } => {
+            // Issue #241: same reasoning as `key generate` — the new
+            // fingerprints do not exist until the new keypairs are
+            // actually generated and saved to disk.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "key rotate",
+                    "the new keys' fingerprints do not exist until they are actually \
+                     generated and saved to disk.",
+                ));
+            }
             // ADR-0005: escrow presence is a precondition for rotation — a
             // rotated tenant key with no escrow recipient in its future
             // encryptions would defeat the whole point of having one.
@@ -300,6 +325,16 @@ pub fn run(
             escrow,
         } => {
             if *escrow {
+                // Issue #241: same reasoning as `key generate --escrow` —
+                // registering the one-and-only escrow identity is
+                // singular and irreversible; refuse rather than rehearse.
+                if dry_run {
+                    return Err(crate::cli::refuse_dry_run(
+                        "key import --escrow",
+                        "registering the escrow identity is a singular, irreversible action \
+                         (ADR-0005) — there is only ever one, for the life of the archive.",
+                    ));
+                }
                 import_escrow_key(conn, paths, path, json_output)?;
             } else {
                 let (tenant, alias) = require_tenant_and_alias(tenant, alias)?;
@@ -309,6 +344,27 @@ pub fn run(
                 let fingerprint = pub_key.clone();
 
                 let full_alias = format!("{tenant}-{alias}");
+
+                // Issue #241: importing only reads a public key already
+                // given to us, so a faithful preview costs nothing extra
+                // — the read above already happened, and this just checks
+                // the alias is free before skipping the insert/file write.
+                if dry_run {
+                    if queries::get_key_by_alias(conn, &full_alias)?.is_some() {
+                        return Err(TapectlError::KeyAlreadyExists(full_alias));
+                    }
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({"alias": full_alias, "fingerprint": fingerprint,
+                                               "dry_run": true})
+                        );
+                    } else {
+                        println!("would import key \"{full_alias}\" (DRY RUN — no changes made)");
+                    }
+                    return Ok(());
+                }
+
                 let key_id = queries::insert_key(
                     conn,
                     t.id,
@@ -339,6 +395,17 @@ pub fn run(
         }
 
         KeyCommands::EscrowKit { out } => {
+            // Issue #241: building a real preview would mean reading and
+            // summarising the whole catalog (the same work `generate`
+            // does to build `catalog.db.age`) for no benefit over just
+            // running it — this writes only local files, never a tape.
+            if dry_run {
+                return Err(crate::cli::refuse_dry_run(
+                    "key escrow-kit",
+                    "a preview would have to read and summarise the whole catalog, which is \
+                     most of the command's own work.",
+                ));
+            }
             let report = crate::crypto::escrow_kit::generate(
                 conn,
                 &paths.db_file,
