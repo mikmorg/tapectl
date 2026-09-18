@@ -530,12 +530,23 @@ fn a_rebuilt_catalog_satisfies_the_query_restore_actually_uses() {
     }
 }
 
-/// Issue #158: a label that already exists in the catalog with a non-sealed
-/// status (an imported `active` row, or a `quarantined` one a failed
-/// `volume verify` produced deliberately) must not be silently reused as if
-/// it were `sealed`, and must not be silently rewritten to `sealed` either.
-/// The rebuild still has to attach every row it can — the mismatch is
-/// reported, not treated as a reason to stop short.
+/// Issue #158 (revisited for #242): a label that already exists in the
+/// catalog with a non-sealed status (an imported `active` row) must not be
+/// silently reused as if it were `sealed`, and must not be silently
+/// rewritten to `sealed` either. The rebuild still has to attach every row
+/// it can — the mismatch is reported, not treated as a reason to stop
+/// short.
+///
+/// This test now covers the `observed_condition` half specifically (ADR-0012's
+/// 2026-09-17 amendment, issue #242): a `quarantined` condition a failed
+/// `volume verify` produced deliberately, before the database that recorded
+/// WHY was lost. Since that amendment a verify-quarantined row's `status`
+/// stays `sealed` — so this scenario no longer trips
+/// `volume_status_mismatch` at all; `volume_condition_mismatch` is the field
+/// that must catch it. See
+/// `rebuild_onto_an_active_row_reports_the_status_mismatch_and_leaves_it_alone`
+/// just below for the `status` half this test used to cover as a side
+/// effect of using `quarantined` as its vehicle.
 #[test]
 fn rebuild_onto_a_quarantined_row_reports_the_mismatch_and_leaves_the_status_alone() {
     let mut vol = build_sealed_volume(true);
@@ -544,12 +555,79 @@ fn rebuild_onto_a_quarantined_row_reports_the_mismatch_and_leaves_the_status_alo
     let scratch = tempfile::tempdir().unwrap();
     let secret = vol.operator_secret.clone();
 
-    // The destination catalog already knows this label, and quarantined it —
-    // a fact an operator established on purpose (e.g. a prior failed
-    // `volume verify`), before the database that recorded WHY was lost.
+    // The destination catalog already knows this label, and quarantined its
+    // CONDITION — a fact an operator established on purpose (e.g. a prior
+    // failed `volume verify`), before the database that recorded WHY was
+    // lost. `status` stays `sealed`, per the 2026-09-17 amendment.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, \
+         status, observed_condition)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'sealed', 'quarantined')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+
+    let report =
+        rebuild(&conn, &mut vol, &secret, scratch.path()).expect("rebuild onto an existing row");
+
+    assert!(
+        !report.volume_inserted,
+        "the row already existed — rebuild must not insert a second one"
+    );
+    assert_eq!(
+        report.volume_status_mismatch, None,
+        "status genuinely did not mismatch here -- it stayed 'sealed' (issue #242)"
+    );
+    assert_eq!(
+        report.volume_condition_mismatch,
+        Some("quarantined".to_string()),
+        "the pre-existing non-ok condition must be surfaced on the report"
+    );
+
+    let (status, condition): (String, String) = conn
+        .query_row(
+            "SELECT status, observed_condition FROM volumes WHERE label = ?1",
+            rusqlite::params![LABEL],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "sealed");
+    assert_eq!(
+        condition, "quarantined",
+        "the ratified minimum is report-only: rebuild must never overwrite an \
+         operator-established condition on the strength of its own evidence"
+    );
+
+    // The mismatch is reported, but the rebuild still did its job: every
+    // unit's slices resolve through the exact join `restore_unit` uses.
+    for (unit_name, expected) in &vol.expected_positions {
+        let rows = restore_resolution_query(&conn, unit_name);
+        assert_eq!(
+            rows.len(),
+            expected.len(),
+            "unit {unit_name}: a status mismatch must not stop the rebuild short"
+        );
+    }
+}
+
+/// The `status` half of issue #158, isolated from `observed_condition`
+/// entirely: an imported `active` row is exactly the OTHER pre-existing
+/// non-sealed shape the doc comment above names, and it must still be
+/// surfaced via `volume_status_mismatch` and left alone, the same as before
+/// issue #242 split the two facts apart.
+#[test]
+fn rebuild_onto_an_active_row_reports_the_status_mismatch_and_leaves_it_alone() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    // The destination catalog already knows this label as an IMPORTED
+    // volume (`tapectl import`), never sealed by a v2 write session here.
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'quarantined')",
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'active')",
         rusqlite::params![LABEL],
     )
     .unwrap();
@@ -563,25 +641,28 @@ fn rebuild_onto_a_quarantined_row_reports_the_mismatch_and_leaves_the_status_alo
     );
     assert_eq!(
         report.volume_status_mismatch,
-        Some("quarantined".to_string()),
+        Some("active".to_string()),
         "the pre-existing non-sealed status must be surfaced on the report"
     );
+    assert_eq!(
+        report.volume_condition_mismatch, None,
+        "the condition genuinely did not mismatch here -- it stayed 'ok'"
+    );
 
-    let status: String = conn
+    let (status, condition): (String, String) = conn
         .query_row(
-            "SELECT status FROM volumes WHERE label = ?1",
+            "SELECT status, observed_condition FROM volumes WHERE label = ?1",
             rusqlite::params![LABEL],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(
-        status, "quarantined",
+        status, "active",
         "the ratified minimum is report-only: rebuild must never overwrite an \
          operator-established status on the strength of its own evidence"
     );
+    assert_eq!(condition, "ok");
 
-    // The mismatch is reported, but the rebuild still did its job: every
-    // unit's slices resolve through the exact join `restore_unit` uses.
     for (unit_name, expected) in &vol.expected_positions {
         let rows = restore_resolution_query(&conn, unit_name);
         assert_eq!(

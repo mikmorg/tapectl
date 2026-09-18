@@ -126,17 +126,35 @@ pub struct RebuildReport {
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
     /// Set (to the status found) when this label already had a `volumes` row
-    /// and that row's status was not `sealed` — an imported `active` row, or
-    /// a `quarantined` one a failed `volume verify` produced on purpose.
-    /// `None` when the row was freshly inserted here (always `sealed`, see
-    /// `insert_all`) or was already `sealed`.
+    /// and that row's status was not `sealed` — an imported `active` row, for
+    /// instance. `None` when the row was freshly inserted here (always
+    /// `sealed`, see `insert_all`) or was already `sealed`.
     ///
     /// This is report-only (issue #158): the rebuild proved the tape
     /// readable and complete, but it never edits a row it merely finds — see
     /// this module's "What it deliberately does not do". Overwriting a
     /// status an operator established on purpose would destroy a fact,
     /// not a mistake, so the fix is to surface the mismatch, not repair it.
+    ///
+    /// Since ADR-0012's 2026-09-17 amendment (issue #242) this field no
+    /// longer catches a verify-quarantined row: that row's status now stays
+    /// `sealed` (only `observed_condition` moves), so it passes THIS check.
+    /// [`RebuildReport::volume_condition_mismatch`] is the sibling that
+    /// catches it — additive, not a replacement, because a write-path
+    /// quarantine (never sealed) can still leave a non-`sealed` status here
+    /// too, and both facts can in principle be true of the same row at once.
     pub volume_status_mismatch: Option<String>,
+    /// Set (to the condition found) when this label already had a `volumes`
+    /// row and that row's `observed_condition` was not `ok` — most often a
+    /// `quarantined` one a failed `volume verify` produced on purpose,
+    /// before the database that recorded why was lost. `None` when the row
+    /// was freshly inserted here (always `ok`, see `insert_all`) or was
+    /// already `ok`.
+    ///
+    /// Same report-only discipline as [`RebuildReport::volume_status_mismatch`]
+    /// (issue #158): a condition an operator's own verify established is a
+    /// fact, not a mistake, so this surfaces it rather than repairing it.
+    pub volume_condition_mismatch: Option<String>,
 
     // --- cartridge identity (issue #165) -----------------------------------
     //
@@ -909,24 +927,31 @@ fn insert_all(
     // back to the type string — never an invented name like "rebuilt", which
     // would put a backend in the catalog that no config declares.
     let backend_name = backend_name.unwrap_or("lto");
-    let existing: Option<(i64, String)> = tx
+    let existing: Option<(i64, String, String)> = tx
         .query_row(
-            "SELECT id, status FROM volumes WHERE label = ?1",
+            "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
             params![label],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     let volume_id = match existing {
-        Some((id, status)) => {
+        Some((id, status, condition)) => {
             // Same tape, same evidence — but a row this rebuild merely
-            // FOUND is never edited (issue #158). `sealed` is what the
+            // FOUND is never edited (issue #158). `sealed`/`ok` is what the
             // `None` arm below would have inserted, so anything else is a
-            // fact worth surfacing: an imported `active` row, or a
-            // `quarantined` one a failed `volume verify` produced on
-            // purpose. Reported, not repaired — see `RebuildReport::
+            // fact worth surfacing: an imported `active` row, for instance.
+            // Reported, not repaired — see `RebuildReport::
             // volume_status_mismatch`.
             if status != "sealed" {
                 report.volume_status_mismatch = Some(status);
+            }
+            // Issue #242: the sibling check for `observed_condition` — most
+            // often a `quarantined` one a failed `volume verify` produced
+            // on purpose. Independent of the status check above: since the
+            // 2026-09-17 amendment a verify-quarantined row stays `sealed`,
+            // so only THIS check catches it.
+            if condition != "ok" {
+                report.volume_condition_mismatch = Some(condition);
             }
             id
         }

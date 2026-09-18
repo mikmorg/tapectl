@@ -207,11 +207,11 @@ pub fn volume_retire(
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
-    let (vol_id, status): (i64, String) = conn
+    let (vol_id, status, condition): (i64, String, String) = conn
         .query_row(
-            "SELECT id, status FROM volumes WHERE label = ?1",
+            "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
             params![label],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
@@ -235,7 +235,7 @@ pub fn volume_retire(
             obj["dry_run"] = serde_json::json!(true);
             println!("{obj}");
         } else {
-            print_retire_impact(label, &status, &impacts, &at_risk);
+            print_retire_impact(label, &status, &condition, &impacts, &at_risk);
             println!("\n  DRY RUN — no changes made.");
         }
         return Ok(());
@@ -258,7 +258,7 @@ pub fn volume_retire(
             // error handler prints it to stderr on the way out; echoing it
             // here too would give the operator the same three paragraphs
             // twice at the one moment they most need to read them once.
-            print_retire_impact(label, &status, &impacts, &at_risk);
+            print_retire_impact(label, &status, &condition, &impacts, &at_risk);
         }
         return Err(e);
     }
@@ -306,7 +306,7 @@ pub fn volume_retire(
                 // Impact analysis only, same as the Tier-3 path above: the
                 // refusal now carries its facts (`cli::consent`), and
                 // `main` prints it to stderr on the way out. One copy.
-                print_retire_impact(label, &status, &impacts, &at_risk);
+                print_retire_impact(label, &status, &condition, &impacts, &at_risk);
             }
             return Err(e);
         }
@@ -318,7 +318,7 @@ pub fn volume_retire(
             serde_json::json!({"volume": label, "affected_units": retire_impacts_json(&impacts)})
         );
     } else {
-        print_retire_impact(label, &status, &impacts, &at_risk);
+        print_retire_impact(label, &status, &condition, &impacts, &at_risk);
     }
 
     // Actually retire. ONE transaction: the volume's status and the
@@ -893,9 +893,18 @@ fn retire_refusal_json(
     })
 }
 
-fn print_retire_impact(label: &str, status: &str, impacts: &[RetireImpact], at_risk: &[String]) {
+fn print_retire_impact(
+    label: &str,
+    status: &str,
+    condition: &str,
+    impacts: &[RetireImpact],
+    at_risk: &[String],
+) {
     println!("Retiring volume \"{label}\"");
     println!("  Current status: {status}");
+    // Issue #242: a quarantined volume can read status "sealed" -- shown
+    // before this destructive command runs, not just after.
+    println!("  Current condition: {condition}");
     println!("  Affected units:");
     let now = chrono::Utc::now().naive_utc();
     for impact in impacts {
@@ -3986,11 +3995,13 @@ mod tests {
             // `volume_retire_consent`) warns every other test away from.
             let (conn, vol_id) = setup_volume_with_one_unit("L6-QUAR", true);
             // The fixture's OTHER-VOL is 'sealed' by default (so the
-            // pre-existing tests above still see a real second copy);
-            // flip it to 'quarantined' here, after setup, to isolate
-            // exactly this test's point without changing that default.
+            // pre-existing tests above still see a real second copy); flip
+            // its CONDITION to 'quarantined' here, after setup, to isolate
+            // exactly this test's point without changing that default
+            // (issue #242: quarantine is a condition now, not a status
+            // move).
             conn.execute(
-                "UPDATE volumes SET status = 'quarantined' WHERE label = 'OTHER-VOL'",
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = 'OTHER-VOL'",
                 [],
             )
             .unwrap();
@@ -4330,11 +4341,22 @@ mod tests {
         /// is the documented escape, and it works by quarantining.
         fn tier3_does_not_fire_for_status(status: &str, label: &str) {
             let (conn, vol_id) = setup_sealed(label, 0);
-            conn.execute(
-                "UPDATE volumes SET status = ?1 WHERE id = ?2",
-                params![status, vol_id],
-            )
-            .unwrap();
+            // Issue #242: 'quarantined' is a condition now, not a status --
+            // translate it onto `observed_condition`, leaving `status` at
+            // whatever `setup_sealed` gave it ('sealed').
+            if status == "quarantined" {
+                conn.execute(
+                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                    params![vol_id],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "UPDATE volumes SET status = ?1 WHERE id = ?2",
+                    params![status, vol_id],
+                )
+                .unwrap();
+            }
             // assume_yes: this is a Tier-2 case (the unit reads zero-copy),
             // and Tier 2 is exactly what a flag is allowed to waive.
             volume_retire(&conn, &Config::default(), label, true, false, false).unwrap_or_else(
@@ -4578,10 +4600,18 @@ mod tests {
             )
             .unwrap();
 
+            // Issue #242: 'quarantined' is a condition now, not a status --
+            // translate it onto `observed_condition`, leaving `status` at
+            // 'sealed'.
+            let (status_value, condition_value) = if second_volume_status == "quarantined" {
+                ("sealed", "quarantined")
+            } else {
+                (second_volume_status, "ok")
+            };
             conn.execute(
                 &format!(
-                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition)
+                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{status_value}', '{condition_value}')"
                 ),
                 [],
             )
@@ -4688,8 +4718,11 @@ mod tests {
             // unit_even_with_force` (above) proves is absolute.
             let name = "mto-zero-eligible";
             let (conn, _unit_id) = setup_unit_with_two_volumes(name, "quarantined");
+            // Issue #242: quarantine is a condition now, not a status move.
             conn.execute(
-                &format!("UPDATE volumes SET status = 'quarantined' WHERE label = '{name}-SEALED'"),
+                &format!(
+                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = '{name}-SEALED'"
+                ),
                 [],
             )
             .unwrap();
@@ -4770,10 +4803,18 @@ mod tests {
             )
             .unwrap();
 
+            // Issue #242: 'quarantined' is a condition now, not a status --
+            // translate it onto `observed_condition`, leaving `status` at
+            // 'sealed'.
+            let (status_value, condition_value) = if second_volume_status == "quarantined" {
+                ("sealed", "quarantined")
+            } else {
+                (second_volume_status, "ok")
+            };
             conn.execute(
                 &format!(
-                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_volume_status}')"
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition)
+                     VALUES ('{name}-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{status_value}', '{condition_value}')"
                 ),
                 [],
             )
@@ -5468,8 +5509,9 @@ mod tests {
         #[test]
         fn tier3_does_not_fire_for_a_quarantined_volume_on_the_cartridge() {
             let (conn, cart_id, vol_id) = setup_sealed_cartridge();
+            // Issue #242: quarantine is a condition now, not a status move.
             conn.execute(
-                "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
                 params![vol_id],
             )
             .unwrap();

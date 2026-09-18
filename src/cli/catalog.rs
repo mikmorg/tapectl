@@ -184,11 +184,19 @@ struct LocationRow {
     #[tabled(rename = "Volume")]
     volume: String,
     /// The volume's CURRENT lifecycle status (issue #57). Without this, a
-    /// retired, quarantined, or erased volume was indistinguishable from a
-    /// sealed one, so `catalog locate` could send an operator to fetch a
-    /// cartridge that cannot serve a restore.
+    /// retired or erased volume was indistinguishable from a sealed one, so
+    /// `catalog locate` could send an operator to fetch a cartridge that
+    /// cannot serve a restore.
     #[tabled(rename = "Status")]
     status: String,
+    /// The volume's `observed_condition` (ADR-0012's 2026-09-17 amendment,
+    /// issue #242): "ok" or "quarantined". Since that amendment, a
+    /// quarantined tape can still read `status = "sealed"` — a `Serviceable
+    /// = NO` row whose `Status` column alone read "sealed" would be
+    /// unexplained, exactly the fact-goes-invisible failure the amendment's
+    /// "What follows from it" point 1 warns against.
+    #[tabled(rename = "Condition")]
+    condition: String,
     /// Physical whereabouts — the whole point of "locate". `volumes` has
     /// carried `location_id` since 001_initial.sql; this query never joined
     /// it, so the command answered "which volume" but not "where is it".
@@ -294,7 +302,7 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     let escrow = crate::db::queries::escrow_public_key(conn)?;
     let sealed = crate::policy::coverage::eligible("v");
     let sql = format!(
-        "SELECT v.label, v.status, COALESCE(l.name, 'unknown'),
+        "SELECT v.label, v.status, v.observed_condition, COALESCE(l.name, 'unknown'),
                 s.version, ss.num_slices, w.completed_at,
                 CASE WHEN {sealed} THEN 1 ELSE 0 END,
                 (SELECT GROUP_CONCAT(dl.name)
@@ -346,18 +354,19 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
     let rows = stmt
         .query_map(params![unit_id], |row| {
             let volume: String = row.get(0)?;
-            let serviceable: i64 = row.get(6)?;
-            let stage_set_id: i64 = row.get(8)?;
+            let serviceable: i64 = row.get(7)?;
+            let stage_set_id: i64 = row.get(9)?;
             let last_verified = verification.get(&volume).cloned().flatten();
             Ok(LocationRow {
                 status: row.get(1)?,
-                location: row.get(2)?,
-                version: row.get(3)?,
-                slices: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                written: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                condition: row.get(2)?,
+                location: row.get(3)?,
+                version: row.get(4)?,
+                slices: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                written: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 serviceable: serviceable == 1,
                 warehouse: row
-                    .get::<_, Option<String>>(7)?
+                    .get::<_, Option<String>>(8)?
                     .map(|s| s.split(',').map(str::to_string).collect())
                     .unwrap_or_default(),
                 escrow: match coverage.get(&stage_set_id) {
@@ -631,6 +640,12 @@ pub fn run(
                         "displacements": displacements_json(&report),
                         "cartridge_retired": report.cartridge_retired,
                         "unbound_reason": report.unbound_reason,
+                        // Issue #242: additive, every key above unchanged.
+                        // Since the 2026-09-17 amendment a verify-quarantined
+                        // row's `status` stays 'sealed', so it no longer
+                        // trips `volume_status_mismatch` above -- this is
+                        // the sibling that still surfaces it.
+                        "volume_condition_mismatch": report.volume_condition_mismatch,
                     })
                 );
             } else {
@@ -718,6 +733,20 @@ pub fn run(
                          status alone; until it is sealed, nothing on it counts as a copy. Run \
                          `tapectl volume verify {}` to check the tape; the status itself will \
                          not change automatically",
+                        report.label, report.label
+                    );
+                }
+                // Issue #242: the sibling warning. Since the 2026-09-17
+                // amendment a verify-quarantined row's `status` stays
+                // 'sealed', so the warning above never fires for it -- this
+                // is the fact that would otherwise go silently invisible.
+                if let Some(condition) = &report.volume_condition_mismatch {
+                    println!(
+                        "  warning: volume \"{}\" was already in this catalog with \
+                         observed_condition \"{condition}\" — the rebuild attached its units to \
+                         that row and left the condition alone; until it reads \"ok\" again, \
+                         nothing on it counts as a copy. Run `tapectl volume verify {}` to check \
+                         the tape; the condition itself will not change automatically",
                         report.label, report.label
                     );
                 }
@@ -1226,18 +1255,21 @@ mod tests {
     }
 
     /// Pins the WHOLE `--json` shape, including `last_verified` (issue
-    /// #196). Every key present before this change keeps its exact prior
-    /// value and position (`serde_json::Value`'s map is a `BTreeMap`, so
-    /// keys sort alphabetically) -- `last_verified` is the only addition,
-    /// per the C2b additive-JSON discipline. One row is aged, the other
-    /// `null` (never verified), so the pin also proves the two render as
-    /// different JSON values, not just different table text.
+    /// #196) and `condition` (issue #242). Every key present before this
+    /// change keeps its exact prior value and position (`serde_json::
+    /// Value`'s map is a `BTreeMap`, so keys sort alphabetically) --
+    /// `condition` is additive alongside them, per the C2b discipline. One
+    /// row is aged, the other `null` (never verified), and one row's
+    /// condition is quarantined while its status still reads "sealed" (the
+    /// exact shape the amendment is about), so the pin also proves the two
+    /// render as different JSON values, not just different table text.
     #[test]
     fn pin_location_rows_json_shape() {
         let rows = vec![
             LocationRow {
                 volume: "L6-0001".to_string(),
                 status: "sealed".to_string(),
+                condition: "ok".to_string(),
                 location: "unknown".to_string(),
                 version: 1,
                 slices: 3,
@@ -1249,7 +1281,8 @@ mod tests {
             },
             LocationRow {
                 volume: "L6-0002".to_string(),
-                status: "quarantined".to_string(),
+                status: "sealed".to_string(),
+                condition: "quarantined".to_string(),
                 location: "parents-house".to_string(),
                 version: 2,
                 slices: 0,
@@ -1263,7 +1296,7 @@ mod tests {
         let value = location_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"escrow":"-","last_verified":"2026-06-01 00:00:00","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"escrow":"?","last_verified":null,"location":"parents-house","serviceable":false,"slices":0,"status":"quarantined","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
+            r#"[{"condition":"ok","escrow":"-","last_verified":"2026-06-01 00:00:00","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"condition":"quarantined","escrow":"?","last_verified":null,"location":"parents-house","serviceable":false,"slices":0,"status":"sealed","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
         );
     }
 
@@ -1275,6 +1308,7 @@ mod tests {
         let rows = vec![LocationRow {
             volume: "L6-0001".to_string(),
             status: "sealed".to_string(),
+            condition: "ok".to_string(),
             location: "unknown".to_string(),
             version: 1,
             slices: 3,
@@ -1300,8 +1334,9 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(obj.get("escrow").unwrap(), "-");
-        // The new key.
+        // The new keys (issue #196's last_verified, issue #242's condition).
         assert_eq!(obj.get("last_verified").unwrap(), "2026-06-01 00:00:00");
+        assert_eq!(obj.get("condition").unwrap(), "ok");
     }
 
     /// A unit with completed writes to two volumes: one `sealed`, one in
@@ -1359,11 +1394,19 @@ mod tests {
         )
         .unwrap();
 
-        // Volume 2: the status under test, WITH a location recorded.
+        // Volume 2: the status/condition under test, WITH a location
+        // recorded. Issue #242: 'quarantined' is a condition now, not a
+        // status -- translate it onto `observed_condition`, leaving
+        // `status` at 'sealed'.
+        let (status_value, condition_value) = if second_status == "quarantined" {
+            ("sealed", "quarantined")
+        } else {
+            (second_status, "ok")
+        };
         conn.execute(
             &format!(
-                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, location_id)
-                 VALUES ('L6-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{second_status}', {loc_id})"
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition, location_id)
+                 VALUES ('L6-OTHER', 'lto', 'lto0', 'LTO-6', 2500000000000, '{status_value}', '{condition_value}', {loc_id})"
             ),
             [],
         )
@@ -1399,10 +1442,25 @@ mod tests {
             .iter()
             .find(|r| r.volume == "L6-OTHER")
             .expect("the non-sealed volume must still appear");
-        assert_eq!(
-            other.status, status,
-            "status column must show the real state"
-        );
+        // Issue #242: 'quarantined' shows up in the CONDITION column now,
+        // with `status` reading 'sealed' underneath it -- the status column
+        // alone must show the real state for every OTHER status, unchanged.
+        if status == "quarantined" {
+            assert_eq!(
+                other.status, "sealed",
+                "status column must show the real state"
+            );
+            assert_eq!(
+                other.condition, "quarantined",
+                "condition column must show the real state"
+            );
+        } else {
+            assert_eq!(
+                other.status, status,
+                "status column must show the real state"
+            );
+            assert_eq!(other.condition, "ok");
+        }
         assert!(
             !other.serviceable,
             "a {status} volume cannot serve a restore (ADR-0004)"
