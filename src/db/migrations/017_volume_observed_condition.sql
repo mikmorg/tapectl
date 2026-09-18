@@ -63,6 +63,24 @@
 -- in 012's header) and takes the MOST RECENT such event by `id` (events.id
 -- is an autoincrement primary key, so `ORDER BY id DESC` is "most recent"
 -- without depending on `timestamp`'s string collation).
+--
+-- It ALSO requires `old_value` to be one of the statuses this migration
+-- still permits, which is load-bearing and not belt-and-braces. Pre-017
+-- `quarantine_on_medium_evidence` had no guard: it read whatever `status`
+-- held, wrote 'quarantined' over it, and logged `old_value =
+-- previous_status`. Verifying an already-quarantined tape is a supported
+-- path -- and a likely one, since a tape that failed a verify is exactly
+-- the tape someone verifies again -- so the most recent transition INTO
+-- quarantine can legally be 'quarantined' -> 'quarantined'. Restoring
+-- that value would write 'quarantined' back into `status`, which the CHECK
+-- three dozen lines above has just made illegal: the INSERT fails, the
+-- migration aborts, `db::open` fails, and EVERY command fails with it --
+-- including the `db fsck --repair` that is meant to be the way out
+-- (issue #233). Filtering to the legal set makes that unreachable by
+-- construction rather than by argument, and incidentally handles a NULL or
+-- hand-edited `old_value` the same way: fall through to the default.
+-- Pinned by `test_migration_017_restores_a_twice_quarantined_volume_not_to_quarantined`,
+-- which fails with `CHECK constraint failed: status IN (...)` without it.
 
 CREATE TABLE volumes_new (
     id                     INTEGER PRIMARY KEY,
@@ -104,6 +122,8 @@ SELECT
             (SELECT e.old_value FROM events e
               WHERE e.entity_type = 'volume' AND e.entity_id = v.id
                 AND e.field = 'status' AND e.new_value = 'quarantined'
+                AND e.old_value IN ('blank','initialized','active','full',
+                                    'retired','missing','erased','sealed')
               ORDER BY e.id DESC LIMIT 1),
             'initialized'
         )

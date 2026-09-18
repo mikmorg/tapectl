@@ -1527,6 +1527,77 @@ mod tests {
         assert!(report.integrity_ok, "db fsck integrity check failed");
     }
 
+    /// **The migration's own CHECK must survive a volume quarantined TWICE.**
+    ///
+    /// Pre-017 `quarantine_on_medium_evidence` had no guard: it read whatever
+    /// `status` held, wrote `'quarantined'` over it, and logged `old_value =
+    /// previous_status`. Re-verifying an already-quarantined volume is a
+    /// supported path — `volume verify` has always been runnable twice, and
+    /// `re_verifying_an_already_quarantined_volume_reports_no_condition_change`
+    /// exists precisely because it is — so a pre-017 database can legally hold
+    /// `field = 'status'`, `new_value = 'quarantined'`, `old_value =
+    /// 'quarantined'` as the MOST RECENT such event.
+    ///
+    /// A restore query that took simply the most recent event would then write
+    /// `'quarantined'` back into `status`, which this very migration has just
+    /// made illegal. The INSERT fails the new CHECK, the migration aborts,
+    /// `db::open` fails — and every command fails with it, including the
+    /// `db fsck --repair` that is supposed to be the way out. That is issue
+    /// #233's bricked-database shape, manufactured by the fix for #242, on a
+    /// database whose only sin was having a tape verified twice.
+    ///
+    /// So the restore takes the most recent transition into quarantine **from
+    /// a legal status**, never merely the most recent transition into
+    /// quarantine.
+    #[test]
+    fn test_migration_017_restores_a_twice_quarantined_volume_not_to_quarantined() {
+        let mut conn = open_memory_at_016();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('Q-TWICE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+            [],
+        )
+        .unwrap();
+        let q_twice_id = conn.last_insert_rowid();
+
+        // First quarantine: sealed -> quarantined, the ordinary verify shape.
+        conn.execute(
+            "INSERT INTO events (entity_type, entity_id, entity_label, action, field, old_value, new_value)
+             VALUES ('volume', ?1, 'Q-TWICE', 'verify_quarantined', 'status', 'sealed', 'quarantined')",
+            rusqlite::params![q_twice_id],
+        )
+        .unwrap();
+        // Second verify of the same already-quarantined tape. The pre-017
+        // writer recorded the no-op transition verbatim, so `old_value` is
+        // itself 'quarantined' and this row has the higher `events.id`.
+        conn.execute(
+            "INSERT INTO events (entity_type, entity_id, entity_label, action, field, old_value, new_value)
+             VALUES ('volume', ?1, 'Q-TWICE', 'verify_quarantined', 'status', 'quarantined', 'quarantined')",
+            rusqlite::params![q_twice_id],
+        )
+        .unwrap();
+
+        migrate(&mut conn).expect(
+                "migration 017 must not restore a status its own CHECK forbids: a volume \
+                 quarantined twice carries 'quarantined' as the most recent old_value, and \
+                 writing that back aborts the migration and bricks the database (issues #242, #233)",
+            );
+
+        let (status, condition): (String, String) = conn
+            .query_row(
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
+                rusqlite::params![q_twice_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), condition.as_str()),
+            ("sealed", "quarantined"),
+            "the restore must reach past the no-op re-quarantine event to the real transition"
+        );
+    }
+
     /// `observed_condition` itself is a closed set of exactly two values,
     /// defaulting to `'ok'` for a row that never mentions it — the negative
     /// half matters most, matching the discipline every other CHECK test in
