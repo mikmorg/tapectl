@@ -76,14 +76,32 @@ volume + started_at, driven as a unit; `write_positions` rows are the cursor):
 | Aborted | `aborted` | Operator explicitly abandoned an interrupted session; resume revalidation failed unrecoverably; **or** a real EOT was hit mid-write (MAM over-reported capacity — clean abort, no salvage). Terminal; the tape is not a copy. |
 | Failed | `failed` | Store error other than EOT/interrupt (device gone, I/O error) with no transition available. Terminal unless operator retries → new validation → resume semantics. |
 
-Volume status: migration 003 adds **`sealed`** and **`quarantined`** to
-`volumes.status`. Lifecycle as the code actually walks it: `volume init`
+Volume status: migration 003 added **`sealed`** and **`quarantined`** to
+`volumes.status`; **migration 017 removed `quarantined` again** — see the note
+below. Lifecycle as the code actually walks it: `volume init`
 inserts `initialized`, and the row stays there for the whole write session —
 **no code makes an `initialized → active` transition.** Session progress lives
 entirely in `writes.status` (the table above), never in `volumes.status`. From
 `initialized` the row moves `→ sealed` (confirm passed; ADR-0003: never written
-again), `→ quarantined` (divergence at contact, ADR-0001), or `→ erased` when a
-re-initialised cartridge displaces it (ADR-0010).
+again) or `→ erased` when a re-initialised cartridge displaces it (ADR-0010).
+
+**Corrected 2026-09-18 (issue #242), per ADR-0012's amendment "the status
+column is the operator's; a medium's condition is its own fact".** Quarantine
+is no longer a `status` at all. `volumes.status` is operator-owned; what a
+session or a verify OBSERVES about the medium lives in
+`volumes.observed_condition` (`'ok'` | `'quarantined'`, migration 017), and
+the two no longer compete for one slot. Divergence at contact therefore sets
+the CONDITION and leaves the status where the operator put it — which is what
+makes verifying a `retired` tape safe, ADR-0011 having established that
+`retired` means unfit-to-write and not unreadable.
+
+The consequence to keep in mind when reading the rest of this document: a
+quarantine used to remove a volume from coverage *by* moving its status out of
+`sealed`. That mechanism is gone. `policy::coverage::eligible` and
+`in_service` now consult both columns, and `is_write_target` takes the
+condition as a second argument — because a write-path quarantine no longer
+moves the status off `initialized`, and without that second argument a
+quarantined volume would silently become a legal write target again.
 
 `active` and `full` are read-only holdovers: `active` is written only by
 `tapectl import`, describing a tape written elsewhere, and `full` is the
@@ -154,7 +172,8 @@ Rules that hold in every path:
 - **Resume** (same session, same tape): revalidate the Layout (staged slices
   unchanged; frozen generated zones re-hash byte-identical), rewind, read
   file 0, require ID-thunk identity match (label + uuid) — mismatch =
-  divergence = quarantine, not overwrite (#27). Then the **two-case cursor
+  divergence = quarantine, not overwrite (#27; since migration 017 the
+  quarantine is written to `observed_condition`, not `status`). Then the **two-case cursor
   rule** (`write_positions.stage_slice_id` is NOT NULL, so only slices have
   cursor rows — metadata files never do): if **zero slices** are recorded
   `written`, restart from BOT — the front zone is pennies and regenerates
@@ -188,8 +207,8 @@ Rules that hold in every path:
   against the front index's `sha256_encrypted` (integrity tier). The exact
   cryptographic chain is fixed in `volume-format-v2.md` §4–5. Record a
   `verification_sessions` row stating **which tier** ran (ADR-0001). Match →
-  mark `sealed`. Mismatch → the tape lies about itself: quarantine the volume,
-  abort the session. Crash mid-confirm leaves `in_progress` → swept to
+  mark `sealed`. Mismatch → the tape lies about itself: quarantine the volume
+  (`observed_condition`, never `status` — issue #242), abort the session. Crash mid-confirm leaves `in_progress` → swept to
   Interrupted → resume revalidates and re-confirms (confirm is idempotent; no
   dedicated state needed).
 - **Snapshot lifecycle transitions happen only at Sealed**, inside the same

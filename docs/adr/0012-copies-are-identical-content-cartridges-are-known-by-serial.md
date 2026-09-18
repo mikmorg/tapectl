@@ -142,7 +142,19 @@ operator's `quarantined` would destroy a fact a failed verify established). So a
 rebuild could attach a whole tape's contents to a row that the catalog still
 called a write target. Bytes were never at risk: the tape carries a seal marker,
 `check_fresh_write_contact` refuses, and ADR-0003 means `--force` cannot
-override it. What was lost is the *ordering* #161 exists to guarantee — the
+override it.
+
+*Correction 2026-09-18 (issue #242): the parenthetical above is superseded by
+this ADR's own later amendment, "the status column is the operator's; a
+medium's condition is its own fact". A failed verify no longer establishes its
+fact in `status` — `quarantined` ceased to be a legal `status` value at
+migration 017 and lives in `volumes.observed_condition` — so there is no
+operator `quarantined` for a rebuild to overwrite. The reasoning that follows
+is unaffected: the gap this ruling closed was that a status alone could call a
+row a write target while it already held a tape's contents, and the fix
+(`has_completed_write`) is unchanged. `is_write_target` now takes the
+condition as a second argument for a related but distinct reason, given in
+that amendment.* What was lost is the *ordering* #161 exists to guarantee — the
 refusal arrived from the tape side after `find_staged_data`, the
 `mam_capacity_bytes` UPDATE and `TapeStore::open` had already run.
 

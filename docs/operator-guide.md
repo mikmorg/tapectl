@@ -624,7 +624,9 @@ manifest says you need — see "Getting the bytes back" above.
 > See "The Heir Kit" below.
 
 **A deposit stops counting when its source volume does.** Deposits are gated
-on the source volume still being `sealed`, so quarantining or retiring the
+on the source volume still being an eligible copy — `sealed`, and not
+quarantined by a failed verify (since issue #242 those are two columns,
+`status` and `observed_condition`) — so quarantining or retiring the
 cartridge also removes its deposit from every count — even though the cloud
 object itself is unaffected. That is the conservative reading, chosen so a
 deposit can never be the thing that keeps a unit looking covered after its
