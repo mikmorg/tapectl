@@ -172,6 +172,21 @@ fn migrations() -> Migrations<'static> {
         // migration header for why existing `serial_number` values are left
         // exactly where they are.
         M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
+        // 017 rebuilds `volumes` (create/copy/drop/rename) to add
+        // `observed_condition` and to drop 'quarantined' from the `status`
+        // CHECK (ADR-0012's 2026-09-17 amendment "the status column is the
+        // operator's; a medium's condition is its own fact", issue #242):
+        // four writers set `volumes.status = 'quarantined'` unconditionally,
+        // overwriting a terminal operator status like `retired`, and
+        // `policy::coverage::eligible` silently stopped counting a copy by
+        // moving `status` OFF `sealed` rather than by any dedicated
+        // predicate. `.foreign_key_check()` for the same reason as 003 and
+        // 012 -- five tables hold a `REFERENCES volumes(id)` FK, and a
+        // rebuild that renumbered rows would orphan every one of them
+        // silently. See the migration header for the full rationale and the
+        // deliberate narrowing of this ADR's own "restore to `sealed`"
+        // fallback for rows a write-path (never-sealed) quarantine produced.
+        M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
     ])
 }
 
@@ -756,14 +771,28 @@ mod tests {
     #[test]
     fn test_migration_003_new_statuses_insertable() {
         let conn = open_memory().unwrap();
-        for status in ["sealed", "quarantined"] {
-            conn.execute(
-                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
-                 VALUES (?1, 'lto', 'lto0', 2500000000000, ?2)",
-                rusqlite::params![format!("V-{status}"), status],
-            )
-            .unwrap_or_else(|e| panic!("status '{status}' should be insertable: {e}"));
-        }
+        // 'sealed' is still legal against the LIVE schema. 'quarantined' is
+        // deliberately excluded from the insertable set here (issue #242,
+        // migration 017): it left `status`'s CHECK entirely and is legal
+        // now only as a value of `observed_condition` — see
+        // `test_migration_017_observed_condition_is_closed_and_defaults_ok`.
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V-sealed', 'lto', 'lto0', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap_or_else(|e| panic!("status 'sealed' should be insertable: {e}"));
+
+        let err = conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V-quarantined', 'lto', 'lto0', 2500000000000, 'quarantined')",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "'quarantined' is a condition now (issue #242), not a status -- the live \
+             schema must reject it as a status value"
+        );
     }
 
     /// The CHECK constraint still rejects unknown values -- proof it wasn't dropped or
@@ -1258,6 +1287,283 @@ mod tests {
             err.is_err(),
             "the FK must be ENFORCED after the rebuild, not merely declared: \
              a cartridge cannot sit at a location that does not exist (ADR-0011)"
+        );
+    }
+
+    // --- Migration 017 (ADR-0012's 2026-09-17 amendment: `observed_condition`) ---
+
+    /// A connection migrated to exactly the 016 schema — the last point at
+    /// which `volumes.status = 'quarantined'` is still legal and
+    /// `observed_condition` does not exist yet, so rows carrying the old
+    /// shape can be seeded and watched through the rebuild.
+    fn open_memory_at_016() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+            M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
+            M::up(include_str!(
+                "migrations/014_cartridge_binding_identity_source.sql"
+            )),
+            M::up(include_str!(
+                "migrations/015_cartridge_load_count_unknown.sql"
+            )),
+            M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
+        ];
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    /// THE test for this migration. Three volumes, each pinning one of the
+    /// three data-migration paths issue #242 specifies:
+    ///
+    /// - `Q-EVENT`: `status = 'quarantined'` with an `events` row recording
+    ///   the transition into quarantine (`field = 'status'`, `new_value =
+    ///   'quarantined'`, `old_value = 'sealed'`) — the verify path's shape
+    ///   (`quarantine_on_medium_evidence`). Must come out `status =
+    ///   'sealed'`, `observed_condition = 'quarantined'`.
+    /// - `Q-NOEVENT`: `status = 'quarantined'` with NO such event — the
+    ///   write-path writers' shape (`session.rs`, which never sealed). Must
+    ///   come out `status = 'initialized'` (the deliberate narrowing of this
+    ///   ADR's own "restore to sealed" fallback — see the migration
+    ///   header), `observed_condition = 'quarantined'`.
+    /// - `Q-SEALED`: an ordinary `sealed` volume, untouched by any of this.
+    ///   Must come out unchanged, `observed_condition = 'ok'`.
+    ///
+    /// `Q-SEALED` also carries a `writes` row and a `cartridge_volumes` row
+    /// — the one table holding a `REFERENCES volumes(id)` FK the rebuild
+    /// must not renumber (mirrors 011->012's own id-preservation
+    /// discriminator).
+    #[test]
+    fn test_migrate_016_populated_db_to_017_migrates_quarantine_data_and_preserves_ids_and_fk() {
+        let mut conn = open_memory_at_016();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('Q-EVENT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+            [],
+        )
+        .unwrap();
+        let q_event_id = conn.last_insert_rowid();
+        // An older, irrelevant event first, so the "most recent" ordering is
+        // a real discriminator and not vacuously the only row.
+        conn.execute(
+            "INSERT INTO events (entity_type, entity_id, entity_label, action, field, old_value, new_value)
+             VALUES ('volume', ?1, 'Q-EVENT', 'created', NULL, NULL, NULL)",
+            rusqlite::params![q_event_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (entity_type, entity_id, entity_label, action, field, old_value, new_value)
+             VALUES ('volume', ?1, 'Q-EVENT', 'verify_quarantined', 'status', 'sealed', 'quarantined')",
+            rusqlite::params![q_event_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('Q-NOEVENT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+            [],
+        )
+        .unwrap();
+        let q_noevent_id = conn.last_insert_rowid();
+
+        conn.execute("INSERT INTO locations (name) VALUES ('home-rack')", [])
+            .unwrap();
+        let loc_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, location_id)
+             VALUES ('Q-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', ?1)",
+            rusqlite::params![loc_id],
+        )
+        .unwrap();
+        let q_sealed_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status, location_id)
+             VALUES ('BC-Q', 'LTO-6', 2500000000000, 'in_use', ?1)",
+            rusqlite::params![loc_id],
+        )
+        .unwrap();
+        let cart_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+            rusqlite::params![cart_id, q_sealed_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-q', 'q-unit', ?1, 'mtime_size', 1, 'active')",
+            rusqlite::params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            rusqlite::params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            rusqlite::params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            rusqlite::params![ss_id, snap_id, q_sealed_id],
+        )
+        .unwrap();
+
+        // The real production migrate(), with its real FK off/on wrapping.
+        migrate(&mut conn).unwrap();
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "PRAGMA foreign_key_check found violations after the volumes rebuild"
+        );
+
+        let read = |id: i64| -> (String, String) {
+            conn.query_row(
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            read(q_event_id),
+            ("sealed".to_string(), "quarantined".to_string()),
+            "the events row's old_value must restore status; observed_condition carries the fact forward"
+        );
+        assert_eq!(
+            read(q_noevent_id),
+            ("initialized".to_string(), "quarantined".to_string()),
+            "no events row -> the write-path fallback is 'initialized', never 'sealed' \
+             (this ADR's point 4, deliberately narrowed -- see the migration header)"
+        );
+        assert_eq!(
+            read(q_sealed_id),
+            ("sealed".to_string(), "ok".to_string()),
+            "an ordinary sealed volume must be untouched by the migration"
+        );
+
+        // The join still names the SAME volume -- proof the ids survived,
+        // not merely that they still resolve to something.
+        let joined: String = conn
+            .query_row(
+                "SELECT v.label FROM cartridge_volumes cv
+                 JOIN volumes v ON v.id = cv.volume_id
+                 WHERE cv.cartridge_id = ?1",
+                rusqlite::params![cart_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            joined, "Q-SEALED",
+            "the rebuild renumbered volumes and silently re-pointed the join"
+        );
+
+        let write_volume_label: String = conn
+            .query_row(
+                "SELECT v.label FROM writes w JOIN volumes v ON v.id = w.volume_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_volume_label, "Q-SEALED");
+
+        assert_eq!(
+            index_names(&conn, "volumes"),
+            vec![
+                "idx_volumes_location",
+                "idx_volumes_status",
+                "idx_volumes_uuid",
+                // the implicit UNIQUE(label) autoindex
+                "sqlite_autoindex_volumes_1",
+            ]
+        );
+
+        let err = conn.execute(
+            "UPDATE volumes SET status = 'quarantined' WHERE id = ?1",
+            rusqlite::params![q_sealed_id],
+        );
+        assert!(
+            err.is_err(),
+            "'quarantined' must be rejected as a status value after the rebuild (issue #242)"
+        );
+
+        let report = crate::cli::operations::db_fsck(&conn, false).unwrap();
+        assert!(report.integrity_ok, "db fsck integrity check failed");
+    }
+
+    /// `observed_condition` itself is a closed set of exactly two values,
+    /// defaulting to `'ok'` for a row that never mentions it — the negative
+    /// half matters most, matching the discipline every other CHECK test in
+    /// this file follows (`test_migration_012_offsite_rejected_...`).
+    #[test]
+    fn test_migration_017_observed_condition_is_closed_and_defaults_ok() {
+        let conn = open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes)
+             VALUES ('L6-DEFAULT', 'lto', 'lto0', 'LTO-6', 2500000000000)",
+            [],
+        )
+        .unwrap();
+        let default_condition: String = conn
+            .query_row(
+                "SELECT observed_condition FROM volumes WHERE label = 'L6-DEFAULT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(default_condition, "ok");
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, observed_condition)
+             VALUES ('L6-QUAR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+            [],
+        )
+        .unwrap_or_else(|e| panic!("'quarantined' should be a legal observed_condition: {e}"));
+
+        let err = conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, observed_condition)
+             VALUES ('L6-BAD', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sketchy')",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "an unknown observed_condition must be rejected"
         );
     }
 }

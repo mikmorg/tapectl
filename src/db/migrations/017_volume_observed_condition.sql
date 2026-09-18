@@ -1,0 +1,121 @@
+-- 017: `volumes.status` is the operator's; a medium's condition is its own
+-- fact (ADR-0012, amendment "the status column is the operator's; a
+-- medium's condition is its own fact", 2026-09-17, issue #242).
+--
+-- Four writers set `volumes.status = 'quarantined'` unconditionally,
+-- overwriting whatever the operator had put there -- including a terminal
+-- `retired`. Two of them (`session.rs`'s `IdentityMismatch`/`AlreadySealed`
+-- resume-contact failures) are not even facts about the MEDIUM; they are a
+-- session-level divergence finding. `observed_condition` is named for that
+-- reason rather than `medium_condition`: this column means "this volume is
+-- out of service for something tapectl OBSERVED, never for something the
+-- operator CHOSE" -- exactly what `quarantined` has always meant. The
+-- operator-facing word stays `quarantined`; it moves columns, it is not
+-- renamed.
+--
+-- `quarantined` is retired as a legal `status` value, not merely
+-- deprecated: leaving it in the CHECK would let a future writer silently
+-- reintroduce the very defect this migration exists to close. SQLite
+-- cannot ALTER a CHECK constraint in place, so `volumes` is rebuilt the
+-- same way 003_v2_lifecycle.sql rebuilt it the first time (and the way
+-- 012_cartridge_lifecycle.sql rebuilt `cartridges`): create/copy/drop/
+-- rename, per SQLite's documented 12-step "Making Other Kinds Of Table
+-- Schema Changes" procedure. `.foreign_key_check()` is registered on this
+-- migration below for the same reason as 003 and 012 -- five tables hold a
+-- `REFERENCES volumes(id)` foreign key (cartridge_volumes, volume_movements,
+-- writes, verification_sessions, health_logs), and a rebuild that
+-- renumbered rows would orphan every one of them silently. Every column,
+-- type, default and constraint below is otherwise byte-for-byte identical
+-- to the table as 004_volume_uuid.sql and 008_drop_volume_storage_class.sql
+-- left it (SELECT-* is not used because the status CASE below needs an
+-- explicit column list on both sides) -- only the status CHECK loses
+-- 'quarantined', and `observed_condition` is a new column appended after
+-- `uuid`, matching where 004's own `ALTER TABLE ... ADD COLUMN` landed it
+-- in the live schema.
+--
+-- MIGRATING EXISTING ROWS
+-- ------------------------
+-- For a row already `status = 'quarantined'`: `observed_condition` becomes
+-- 'quarantined', and `status` is restored to the most recent `events.old_value`
+-- where that event recorded the transition INTO quarantine --
+-- `quarantine_on_medium_evidence` (the verify path, `src/volume/write.rs`)
+-- writes exactly that row: `entity_type = 'volume'`, `field = 'status'`,
+-- `new_value = 'quarantined'`, `old_value` the prior status. Where no such
+-- event exists, the quarantine came from one of the three `session.rs`
+-- write-path writers, which fire only mid-write on a volume that never
+-- sealed -- so the fallback is `'initialized'`, NOT `'sealed'`.
+--
+-- This deliberately narrows this ADR's own point 4 ("status restored to
+-- what it was before quarantine where the events row records it, and to
+-- 'sealed' where it does not -- a quarantine only ever fired on a volume
+-- that was otherwise in service"). That blanket 'sealed' fallback is right
+-- for the verify path (a verify only ever runs against an already-sealed
+-- volume) but wrong for the three write-path writers, which by
+-- construction quarantine a session that never reached `seal`/`confirm`'s
+-- success arm -- there is no sealed tape to restore to. `'initialized'` is
+-- the honest value for that case, and it is safe post-migration because
+-- `observed_condition` (not `status`) is what now blocks the write path
+-- (`policy::coverage::is_write_target`) -- a write-path-quarantined row
+-- reverting to `initialized` does not silently become writable again.
+--
+-- The correlated subquery below reads `events` by `entity_id` (the
+-- volume's id, preserved verbatim across this rebuild -- see the trap note
+-- in 012's header) and takes the MOST RECENT such event by `id` (events.id
+-- is an autoincrement primary key, so `ORDER BY id DESC` is "most recent"
+-- without depending on `timestamp`'s string collation).
+
+CREATE TABLE volumes_new (
+    id                     INTEGER PRIMARY KEY,
+    label                  TEXT NOT NULL UNIQUE,
+    backend_type           TEXT NOT NULL,
+    backend_name           TEXT NOT NULL,
+    media_type             TEXT,
+    capacity_bytes         INTEGER NOT NULL,
+    mam_capacity_bytes     INTEGER,
+    mam_remaining_at_start INTEGER,
+    bytes_written          INTEGER NOT NULL DEFAULT 0,
+    num_data_files         INTEGER NOT NULL DEFAULT 0,
+    has_manifest           INTEGER NOT NULL DEFAULT 0,
+    location_id            INTEGER REFERENCES locations(id),
+    status                 TEXT NOT NULL DEFAULT 'blank'
+                           CHECK(status IN ('blank','initialized','active','full',
+                                            'retired','missing','erased','sealed')),
+    observed_condition     TEXT NOT NULL DEFAULT 'ok'
+                           CHECK(observed_condition IN ('ok','quarantined')),
+    first_write            TEXT,
+    last_write             TEXT,
+    notes                  TEXT,
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    uuid                   TEXT
+);
+
+INSERT INTO volumes_new (
+    id, label, backend_type, backend_name, media_type, capacity_bytes,
+    mam_capacity_bytes, mam_remaining_at_start, bytes_written, num_data_files,
+    has_manifest, location_id, status, observed_condition, first_write,
+    last_write, notes, created_at, uuid
+)
+SELECT
+    v.id, v.label, v.backend_type, v.backend_name, v.media_type, v.capacity_bytes,
+    v.mam_capacity_bytes, v.mam_remaining_at_start, v.bytes_written, v.num_data_files,
+    v.has_manifest, v.location_id,
+    CASE WHEN v.status = 'quarantined' THEN
+        COALESCE(
+            (SELECT e.old_value FROM events e
+              WHERE e.entity_type = 'volume' AND e.entity_id = v.id
+                AND e.field = 'status' AND e.new_value = 'quarantined'
+              ORDER BY e.id DESC LIMIT 1),
+            'initialized'
+        )
+    ELSE v.status END,
+    CASE WHEN v.status = 'quarantined' THEN 'quarantined' ELSE 'ok' END,
+    v.first_write, v.last_write, v.notes, v.created_at, v.uuid
+FROM volumes v;
+
+DROP TABLE volumes;
+
+ALTER TABLE volumes_new RENAME TO volumes;
+
+CREATE INDEX idx_volumes_location ON volumes(location_id);
+CREATE INDEX idx_volumes_status   ON volumes(status);
+CREATE UNIQUE INDEX idx_volumes_uuid ON volumes(uuid);
