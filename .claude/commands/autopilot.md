@@ -330,6 +330,40 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-18 (late) — THE LABEL IS EMPTY. Master `c4b3d53`.**
+  #233, #241, #242 and #247 all landed and closed. **Zero open issues under
+  `review-2026-09-13`, nothing parked**; gate 1616 tests / 0 failed, clippy 0, fmt clean;
+  mhvtl gate GREEN with `EXPECTED_FAIL=()`; lifecycle `--all` GREEN 383 / 372 passed / 0
+  failed / 11 skipped; CI green. The only open issues are the three excluded by standing
+  ruling: #182 (`needs:cto`, settled by the rehearsal) and #143/#144 (unlabelled, not this
+  queue).
+  **THE RULE THIS ROUND EARNED — a fence is a promise to come back.** #241 was fenced away
+  from `operations.rs`/`db.rs` so it could run beside #233 on `main.rs`. It recorded TEN
+  leaves as `Verdict::Excluded` in `tests/dry_run_contract.rs` — "not permitted to fix,
+  reported to the coordinator" — and then stalled before reporting. One of them,
+  `quick-archive`, took no `dry_run` parameter at all and ends in `volume write`: under
+  `--dry-run` it staged a unit and sealed a real cartridge. Filed as #247 and fixed.
+  **A fenced-off defect is invisible to the issue tracker by construction.** So before
+  declaring any queue empty, grep the TREE for what workers recorded as out of scope
+  (`Excluded`, "not fixed here", "reported to the coordinator"), not just the tracker. Third
+  variant of one lesson: audit filed-against-found (#222), reconcile critic gaps (#227),
+  now reconcile fences.
+  **Workers stall after committing** — twice this round (#241, #247), both at the
+  post-commit verify/report step, both with complete and gated commits. Recovery is
+  TaskStop, then verify and integrate yourself. **What is lost is the report, and the report
+  is where residuals live** — so read what a worker wrote into the tree, not only what it
+  says. Also: when a worker stalls mid-negative-control, RUN THE CONTROL YOURSELF. Doing so
+  for #241 (red confirmed at pre-fix code) is what surfaced the `Excluded` list, because one
+  of its two tests passed and I chased why instead of accepting the red.
+  **WHAT REMAINS IS A CTO DECISION, NOT WORK.** Policy rule 7's adversarial review fired
+  once (2026-09-17, `docs/audits/2026-09-17-preproduction-review.md`) and its findings were
+  worked to closure. Since that review's recorded point `c309509`, **105 commits and ~15,100
+  non-doc insertions across 56 files have landed** (24 label issues closed), with
+  `src/volume/write.rs` alone moving >1000 lines. Whether a SECOND adversarial pass is owed
+  over that delta before the first production write is the open question, and it is the
+  CTO's. It does **not** block the home2 rehearsal — the 2026-09-15 ruling decoupled those
+  deliberately, and autopilot never starts a rehearsal itself.
+
 - **QUEUE STATE 2026-09-18 — #242 LANDED; TWO ITEMS LEFT (#233, #241), both dispatched.**
   Master `96b0a1a`. Gate 1589 tests / 0 failed, clippy 0, fmt clean; mhvtl gate GREEN (0
   expected failures); **lifecycle `--all` GREEN 383 / 372 passed / 0 failed / 11 skipped**;
