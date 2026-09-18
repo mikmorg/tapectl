@@ -835,10 +835,18 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
 /// stdout.
 pub(crate) struct DirtyRow {
     pub(crate) name: String,
-    pub(crate) state: &'static str, // "clean" | "new" | "dirty"
+    pub(crate) state: &'static str, // "clean" | "new" | "dirty" | "unreadable"
     pub(crate) added: Vec<String>,
     pub(crate) removed: Vec<String>,
     pub(crate) modified: Vec<String>,
+    /// Set only when `state == "unreadable"` (issue #263): why
+    /// `fingerprint::classify`'s walk failed for this unit — a dotfile
+    /// present but not valid TOML, or one `deny_unknown_fields` now
+    /// refuses (`[excludes] pattern` singular, an unrecognized `[policy]`
+    /// key, a misspelled top-level table). `audit`'s `check_dirty` turns
+    /// this into a named violation instead of the unit silently vanishing
+    /// from the scan.
+    pub(crate) error: Option<String>,
 }
 
 /// The scan behind `report dirty`: reuses `fingerprint::classify` — the
@@ -848,6 +856,16 @@ pub(crate) struct DirtyRow {
 /// scan should second-guess), optionally narrowed to one unit by name.
 /// `global_excludes` is `config.defaults.global_excludes` (issue #49),
 /// kept in lockstep with those other callers.
+///
+/// Issue #263: `classify` can now fail per-unit (a dotfile present but
+/// unparseable propagates instead of silently degrading — see
+/// `staging::exclude::dotfile_patterns`). This function is shared by
+/// `report dirty` (informational) AND `audit`'s `collect_findings`, which
+/// is documented there as advisory and MUST NOT abort the whole run over
+/// one unit's bad dotfile (that invariant predates this issue and is not
+/// renegotiable here) — so a per-unit failure is recorded as an
+/// `"unreadable"` row, never propagated with `?`, exactly mirroring how
+/// `collect_findings` already treats a per-unit `policy::resolve` failure.
 pub(crate) fn dirty_rows(
     conn: &Connection,
     unit_filter: Option<&str>,
@@ -865,12 +883,17 @@ pub(crate) fn dirty_rows(
 
     let mut rows = Vec::with_capacity(units.len());
     for unit in &units {
-        let (state, changes) = match fingerprint::classify(conn, unit, global_excludes)? {
-            None => ("clean", fingerprint::FingerprintDiff::default()),
-            Some(p) if p.reason == PendingReason::New => {
-                ("new", fingerprint::FingerprintDiff::default())
+        let (state, changes, error) = match fingerprint::classify(conn, unit, global_excludes) {
+            Ok(None) => ("clean", fingerprint::FingerprintDiff::default(), None),
+            Ok(Some(p)) if p.reason == PendingReason::New => {
+                ("new", fingerprint::FingerprintDiff::default(), None)
             }
-            Some(p) => ("dirty", p.changes),
+            Ok(Some(p)) => ("dirty", p.changes, None),
+            Err(e) => (
+                "unreadable",
+                fingerprint::FingerprintDiff::default(),
+                Some(e.to_string()),
+            ),
         };
         rows.push(DirtyRow {
             name: unit.name.clone(),
@@ -878,6 +901,7 @@ pub(crate) fn dirty_rows(
             added: changes.added,
             removed: changes.removed,
             modified: changes.modified,
+            error,
         });
     }
     Ok(rows)
@@ -898,6 +922,7 @@ fn report_dirty(
                 serde_json::json!({
                     "unit": r.name, "state": r.state,
                     "added": r.added, "removed": r.removed, "modified": r.modified,
+                    "error": r.error,
                 })
             })
             .collect();
@@ -914,6 +939,11 @@ fn report_dirty(
             match r.state {
                 "clean" => println!("  {}: clean", r.name),
                 "new" => println!("  {}: new — never archived", r.name),
+                "unreadable" => println!(
+                    "  {}: UNREADABLE — dirty scan could not run ({})",
+                    r.name,
+                    r.error.as_deref().unwrap_or("unknown error")
+                ),
                 _ => println!(
                     "  {}: dirty ({} added, {} removed, {} modified)",
                     r.name,

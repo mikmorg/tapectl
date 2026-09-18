@@ -964,6 +964,24 @@ fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> 
                     unit.name, unit.name
                 ),
             });
+        } else if row.state == "unreadable" {
+            // Issue #263: the dirty scan itself failed for this unit — a
+            // dotfile present but not valid TOML, or one `deny_unknown_fields`
+            // now refuses by name (`[excludes] pattern` singular, an
+            // unrecognized `[policy]` key, a misspelled top-level table).
+            // `policy::resolve` may have succeeded for this same unit (it
+            // validates a different, narrower slice of the same file), so
+            // this can fire even when `policy_unresolvable` did not — the
+            // dotfile is still unusable and must not read as clean.
+            f.violations.push(AuditFinding {
+                unit: unit.name.clone(),
+                check: "dirty".into(),
+                message: format!(
+                    "dirty scan could not run ({})",
+                    row.error.as_deref().unwrap_or("unknown error")
+                ),
+                action: crate::error::PolicyLayer::Dotfile.remedy(unit.current_path.as_deref()),
+            });
         }
     }
     Ok(f)
@@ -2361,6 +2379,107 @@ mod tests {
             // (c): run()'s exit code must be 2 (violation), not 0 (clean)
             // or an early Err from resolve() aborting the whole audit.
             let exit_code = run(&conn, &config, Some("bad_policy_unit"), false, false).unwrap();
+            assert_eq!(exit_code, 2);
+        }
+
+        /// Issue #263, one layer under #211's dotfile validation:
+        /// `policy::resolve` only ever looks at the dotfile's `[policy]`
+        /// sub-table (plus, since #263, the SET of top-level table names)
+        /// — it never looks inside `[unit]` or `[excludes]`. So a dotfile
+        /// with no `[policy]` table at all, but an unparseable `[excludes]`
+        /// section (`pattern` singular — the real key is `patterns`),
+        /// resolves policy just fine. `stage_create` would still refuse
+        /// this unit outright (`dotfile_patterns` propagates the same
+        /// parse failure), but `audit`'s dirty scan
+        /// (`report::dirty_rows` -> `fingerprint::classify` ->
+        /// `exclude::effective_compiled` -> the same `dotfile_patterns`)
+        /// is the only other place that ever reads this section — and it
+        /// must name this unit, not read it as clean because the policy
+        /// layer alone was satisfied.
+        #[test]
+        fn dirty_scan_unresolvable_is_a_violation_even_when_policy_resolves_fine() {
+            let root = TempDir::new().unwrap();
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+
+            let dir = root.path().join("excludes_typo_unit");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".tapectl-unit.toml"),
+                "[unit]\nuuid = \"u-1\"\nname = \"excludes_typo_unit\"\n\
+                 created = \"2026-01-01T00:00:00Z\"\ntenant = \"t\"\n\n\
+                 [excludes]\npattern = [\"*.env\"]\n",
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES ('u-1', 'excludes_typo_unit', ?1, ?2, 'mtime_size', 1, 'active')",
+                params![tid, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+
+            // A real, encrypted, in-service copy — same shape
+            // `setup_unit_with_stage_set` builds — so `no_archive`
+            // (never archived), `encryption` (plaintext on tape), and
+            // `copy_count` (via `config_without_min_copies` below) all
+            // stay silent, and the ONLY finding left is the one this test
+            // is actually about.
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', ?2)",
+                params![unit_id, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
+                 VALUES (?1, 'staged', 524288, 1)",
+                params![snap_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('TYPO-VOL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol_id],
+            )
+            .unwrap();
+
+            let config = config_without_min_copies();
+
+            let (violations, warnings) =
+                collect_findings(&conn, &config, Some("excludes_typo_unit")).unwrap();
+
+            assert_eq!(
+                warnings.len(),
+                0,
+                "an unreadable dirty scan must not be downgraded to a warning"
+            );
+            assert_eq!(
+                violations.len(),
+                1,
+                "policy::resolve succeeds for this dotfile (it has no [policy] table at \
+                 all), so the [excludes] typo must be caught by the dirty-scan check \
+                 instead of the whole unit silently reading as clean: {violations:?}"
+            );
+            assert_eq!(violations[0].unit, "excludes_typo_unit");
+            assert_eq!(violations[0].check, "dirty");
+
+            let exit_code = run(&conn, &config, Some("excludes_typo_unit"), false, false).unwrap();
             assert_eq!(exit_code, 2);
         }
 
