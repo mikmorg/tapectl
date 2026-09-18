@@ -206,7 +206,28 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // `main()` built from them. See `tests/cli_smoke.rs`'s
     // `logging_level_debug_surfaces_this_line`.
     tracing::debug!(config = %paths.config_file.display(), "loaded config");
-    let conn = db::open(&paths.db_file).context("failed to open database")?;
+    // Issue #233: a pre-existing orphan anywhere in the database makes
+    // `.foreign_key_check()`'s whole-database check abort `migrate()` the
+    // instant any pending migration carrying it runs (003/012/013/017),
+    // which otherwise made `db::open` fail for every command — including
+    // `db fsck --repair`, the one command that can fix it. Only that exact
+    // invocation, and only for this named, repairable condition (never a
+    // generic migration failure — see `db::migrate`), is let in through
+    // `db::open_for_repair`, a connection that never calls `migrate()`.
+    let conn = match db::open(&paths.db_file) {
+        Ok(conn) => conn,
+        Err(error::TapectlError::DatabaseNeedsRepair(_))
+            if matches!(
+                cli.command,
+                Commands::Db {
+                    command: cli::DbCommands::Fsck { repair: true }
+                }
+            ) =>
+        {
+            db::open_for_repair(&paths.db_file).context("failed to open database for repair")?
+        }
+        Err(e) => return Err(e).context("failed to open database"),
+    };
 
     match cli.command {
         Commands::Tenant { ref command } => {

@@ -45,10 +45,25 @@ pub fn run(
         }
         DbCommands::Fsck { repair } => {
             let report = crate::cli::operations::db_fsck(conn, *repair)?;
+            // Issue #233: `conn` here may be `db::open_for_repair`'s
+            // connection — opened deliberately WITHOUT running `migrate()`,
+            // so a repair against it leaves the schema exactly where it
+            // started (behind head) until the very next ordinary
+            // `db::open()` call. An operator who sees "repaired N rows" and
+            // then hits a schema error on the next command must not think
+            // the tool is broken, so say so here. Cheap to check
+            // unconditionally: on the ordinary (already-migrated) path this
+            // is always `false`, so it changes nothing there.
+            let schema_pending = !crate::db::schema_is_current(conn)?;
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"integrity_ok": report.integrity_ok, "issues": report.issues, "repaired": report.repaired})
+                    serde_json::json!({
+                        "integrity_ok": report.integrity_ok,
+                        "issues": report.issues,
+                        "repaired": report.repaired,
+                        "schema_pending": schema_pending,
+                    })
                 );
             } else {
                 println!(
@@ -59,6 +74,13 @@ pub fn run(
                 );
                 for issue in &report.issues {
                     println!("  {issue}");
+                }
+                if schema_pending {
+                    println!(
+                        "note: this repair ran against a database that has not finished \
+                         migrating (issue #233) — the next tapectl command will complete the \
+                         migration."
+                    );
                 }
             }
             // issue #45/H10: fsck must not exit 0 when it found real
