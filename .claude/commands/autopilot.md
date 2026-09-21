@@ -333,7 +333,14 @@ the normative design set named in the Policy block below.
 - **QUEUE STATE 2026-09-21 — the second review's queue is being worked; 2 highs left and BOTH
   are parked on one CTO decision.** Master is past `89fb001`; gate 1625 tests / 0 failed,
   clippy 0, fmt clean; mhvtl gate GREEN **now with a sixth leg, `rust_e2e`**; lifecycle `--all`
-  GREEN 383/372/0/11; CI green.
+  GREEN **410 / 400 passed / 0 failed / 10 skipped**; CI green.
+  **THE MEASURED-GREEN NUMBER CHANGED ON 2026-09-21: it is 410/400/0/10, not 383/372/0/11.**
+  Issue #252 found that `permute`'s end-of-walk restore matrix had been SKIPPED on every run
+  since it was written — it read a `catalog locate --json` key (`label`) the command does not
+  emit (`volume`), so no candidate ever matched and the skip branch fired, which looks
+  legitimate because skipping a never-written unit is a real outcome. Turning it on added 27
+  on-media checks, including the full ten-method restore matrix for all three permute units.
+  Older entries below still quote 383; they are correct for their date and superseded here.
   **Closed this round:** #233, #241, #242, #247, #248, #256, #259, #263, #265, #266, #268.
   **Open: 15** (2 high, 9 medium, 4 low). Newly filed: #267/#268/#269 (uncovered write-path
   risks the triage found) and **#270**.
