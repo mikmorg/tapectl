@@ -160,8 +160,26 @@ converts "use judgment" into "don't do X".}}
 
    - WRONG: `run_in_background: true`, then polling the output file; arming
      a Monitor or an `until` loop; waiting for a "completion notification".
-   - RIGHT: `cd <worktree> && CARGO_TARGET_DIR=… flock /scratch/tapectl-build.lock cargo test 2>&1 | tail -40`
+   - RIGHT: `cd <worktree> && CARGO_TARGET_DIR=… flock /scratch/tapectl-build.lock cargo test > /tmp/<branch>.log 2>&1; grep -E '^test result' /tmp/<branch>.log`
      — one call, it blocks, it returns the answer.
+
+   **Do NOT pipe a test run through `tail`.** This example said `| tail -40`
+   until 2026-09-21, and `tail` truncates away the per-binary `test result:`
+   lines — the very totals you are asked to record. Two workers that day
+   ended up reconciling the count by arithmetic afterwards and saying so,
+   which is honest but was the template's fault, not theirs. Redirect to a
+   log and grep it.
+
+   **Run the gate as three separate invocations, not one chained
+   `bash -c 'fmt && clippy && test'`.** The chained form routinely exceeds
+   the 120s foreground timeout and gets auto-backgrounded — which is the
+   exact stall this rule exists to prevent. Give each its own call.
+
+   **Never `pgrep -f` or `pkill -f` a pattern your own command line
+   contains.** It matches itself, so any wait-loop built on it spins
+   forever. A worker did this on 2026-09-21 and left three orphaned
+   processes to hunt down. You need no wait-loop at all: run it in the
+   foreground and it returns when it is done.
 
    **No completion notification is coming — the coordinator sends none.**
    Every attempt to make this asynchronous costs a full turn and produces
