@@ -10,7 +10,7 @@ Clean staged files from disk
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Clean all staged sets, not just those with completed writes; also overrides the refusal to release a stage set whose unit is below its policy\*(Aqs resolved min_copies (issue #244)
+Clean all staged sets, not just those with completed writes; also releases a unit\*(Aqs staged data that a bare `staging clean` would otherwise retain for being below its policy\*(Aqs resolved min_copies (issue #244, #262)
 .TP
 \fB\-\-json\fR
 Output in JSON format
