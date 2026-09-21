@@ -930,48 +930,66 @@ impl Config {
         }
     }
 
-    /// Reject two `[[backends.lto]]` entries that make `resolve_lto_backend`
-    /// (STRICT, ADR-0010) and `resolve_device` (lenient) silently pick
-    /// "whichever happened to be first" (issue #222) — both resolvers are
-    /// `.find(...)`, so a hand-edited config that never went through
-    /// `cli::backend::add` (which already refuses this exact shape,
-    /// `src/cli/backend.rs`) loaded, and passed `config check`, cleanly.
-    /// Compared pairwise: `name` by string equality (how every lookup by
-    /// name works), `device_tape` via [`device_matches`] (string-equality-
-    /// then-canonicalize — the same comparison `resolve_lto_backend`,
-    /// `resolve_device` and `backend::add` already use), so a `/dev/nstN`
-    /// target and a by-id symlink to it are caught as the same drive, not
-    /// just a literal string match.
-    fn backend_problems(&self, path: &Path) -> Vec<String> {
+    /// The single definition (issue #96, and issue #272 by name) of what
+    /// makes two `[[backends.lto]]` entries ambiguous: whatever makes
+    /// `resolve_lto_backend` (STRICT, ADR-0010) and `resolve_device`
+    /// (lenient) silently pick "whichever happened to be first" (issue
+    /// #222) — both resolvers are `.find(...)`, so a hand-edited config
+    /// that never went through `cli::backend::add` (which already refuses
+    /// this exact shape, `src/cli/backend.rs`) loaded, and passed `config
+    /// check`, cleanly. Compared pairwise: `name` by string equality (how
+    /// every lookup by name works), `device_tape` via [`device_matches`]
+    /// (string-equality-then-canonicalize — the same comparison
+    /// `resolve_lto_backend`, `resolve_device` and `backend::add` already
+    /// use), so a `/dev/nstN` target and a by-id symlink to it are caught
+    /// as the same drive, not just a literal string match.
+    ///
+    /// Deliberately path-free: this is the ONLY thing [`backend_problems`]
+    /// (which prefixes each message with the config's source path, for
+    /// `Config::load` and `config check`) and [`resolve_lto_backend`]
+    /// (issue #272 — which has no path, because `Config` does not retain
+    /// where it was loaded from, and must refuse an ambiguous set
+    /// regardless of which loader produced the `Config` it was handed)
+    /// share. A second, hand-written pairwise comparison in either caller
+    /// is exactly the drift issue #96 exists to prevent — extend the loop
+    /// here, never add another one.
+    fn backend_ambiguity_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
         let backends = &self.backends.lto;
         for i in 0..backends.len() {
             for j in (i + 1)..backends.len() {
                 if backends[i].name == backends[j].name {
                     problems.push(format!(
-                        "{}: backends.lto[{i}] and backends.lto[{j}] share name \"{}\" — \
+                        "backends.lto[{i}] and backends.lto[{j}] share name \"{}\" — \
                          names must be unique, or lookups by name resolve to whichever \
                          entry happens to be first",
-                        path.display(),
                         backends[i].name
                     ));
                 }
                 if device_matches(&backends[i].device_tape, &backends[j].device_tape) {
                     problems.push(format!(
-                        "{}: backends.lto[{i}] (\"{}\") and backends.lto[{j}] (\"{}\") both \
+                        "backends.lto[{i}] (\"{}\") and backends.lto[{j}] (\"{}\") both \
                          resolve to device_tape \"{}\" — two backends on the same drive make \
                          --device resolution ambiguous (resolve_lto_backend/resolve_device \
                          would silently pick the first); edit one block or point it at a \
                          different device",
-                        path.display(),
-                        backends[i].name,
-                        backends[j].name,
-                        backends[i].device_tape
+                        backends[i].name, backends[j].name, backends[i].device_tape
                     ));
                 }
             }
         }
         problems
+    }
+
+    /// [`backend_ambiguity_problems`] with each message prefixed by the
+    /// config's source path, for callers that have one (`Config::load`,
+    /// `config check`) — see that function's doc for why the ambiguity
+    /// rule itself lives there and not here.
+    fn backend_problems(&self, path: &Path) -> Vec<String> {
+        self.backend_ambiguity_problems()
+            .into_iter()
+            .map(|msg| format!("{}: {msg}", path.display()))
+            .collect()
     }
 
     fn validate_backends(&self, path: &Path) -> Result<()> {
@@ -1310,10 +1328,32 @@ pub(crate) fn device_matches(configured: &str, requested: &str) -> bool {
 /// - `device` absent: the sole configured backend; zero is
 ///   [`no_lto_backend_error`]; more than one is an error naming every
 ///   backend and asking for `--device`.
+///
+/// Issue #272: refuses an ambiguous `[[backends.lto]]` set
+/// ([`Config::backend_ambiguity_problems`]) FIRST, before either branch
+/// above runs — with two entries colliding on the same drive, an explicit
+/// `--device` does not disambiguate them either, both still match and
+/// `.find` would still silently return whichever is first. Before this,
+/// that guarantee rested entirely on `main.rs`'s dispatch never routing a
+/// write command through `Config::load_tolerating_backend_ambiguity`
+/// (issue #261's lenient loader for the named read/repair set); this
+/// makes it hold regardless of which loader produced the `Config` this
+/// function was handed, so a later write-resolving command added under
+/// that lenient set inherits the refusal structurally rather than by
+/// `main.rs` staying correct. `Config::load` still refuses this same
+/// config at load time (unchanged) — this is a second, independent gate,
+/// not a replacement for that one.
 pub fn resolve_lto_backend<'a>(
     config: &'a Config,
     device: Option<&str>,
 ) -> Result<&'a LtoBackendConfig> {
+    if let Some(msg) = config.backend_ambiguity_problems().into_iter().next() {
+        return Err(TapectlError::Config(format!(
+            "refusing to resolve an LTO backend for a write: {msg} (this config was \
+             loaded via a path that tolerates the collision for read-only use; run \
+             `tapectl config check` and fix it before writing)"
+        )));
+    }
     if let Some(dev) = device {
         return config
             .backends
@@ -1974,6 +2014,74 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains('a') && msg.contains('b'), "{msg}");
         assert!(msg.contains("--device"), "{msg}");
+    }
+
+    /// Issue #272: the #261 leniency invariant was purely positional — a
+    /// `matches!` gate in `main.rs` keeps every command that CAN reach
+    /// `resolve_lto_backend` off `Config::load_tolerating_backend_ambiguity`,
+    /// but `resolve_lto_backend` itself never re-checked, so a future
+    /// caller of the lenient loader that also resolves a write backend
+    /// would silently inherit the ambiguity (issue #222's shape, on a
+    /// write path). This is exactly the case `main.rs`'s `matches!` gate
+    /// cannot express: build a `Config` via the lenient loader directly
+    /// and hand it straight to `resolve_lto_backend`, bypassing `main.rs`
+    /// entirely.
+    ///
+    /// Confirmed red against unfixed code (2026-09-21): both assertions
+    /// below failed with `resolve_lto_backend(&config, None)` returning
+    /// `Ok(&config.backends.lto[0])` ("a") instead of refusing — the
+    /// `.find(...)` silently picked whichever backend happened to be
+    /// first, never noticing the collision.
+    #[test]
+    fn resolve_lto_backend_refuses_an_ambiguous_config_from_the_lenient_loader() {
+        let dev_dir = TempDir::new().unwrap();
+        let real = dev_dir.path().join("nst0");
+        std::fs::File::create(&real).unwrap();
+        let by_id = dev_dir.path().join("scsi-XYZZY-nst");
+        std::os::unix::fs::symlink(&real, &by_id).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[backends.lto]]\nname = \"a\"\ndevice_tape = \"{}\"\n\
+                 device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
+                 \n[[backends.lto]]\nname = \"b\"\ndevice_tape = \"{}\"\n\
+                 device_sg = \"/dev/sg1\"\ngeneration = \"LTO-6\"\n",
+                real.display(),
+                by_id.display(),
+            ),
+        )
+        .unwrap();
+
+        // #272 must not weaken this: the strict loader still refuses
+        // outright.
+        Config::load(&path).expect_err("Config::load must still refuse this collision");
+
+        // Issue #261's lenient door survives it, as designed.
+        let config = Config::load_tolerating_backend_ambiguity(&path)
+            .expect("the lenient loader must survive the collision (issue #261)");
+
+        // resolve_lto_backend must refuse it too — with no --device, where
+        // the bare `.find` would otherwise pick the first entry silently —
+        let err_no_device = resolve_lto_backend(&config, None).unwrap_err();
+        assert!(
+            err_no_device
+                .to_string()
+                .contains("both resolve to device_tape"),
+            "{err_no_device}"
+        );
+        // — and with an explicit --device naming the colliding drive,
+        // where two entries both match it.
+        let err_with_device =
+            resolve_lto_backend(&config, Some(real.to_str().unwrap())).unwrap_err();
+        assert!(
+            err_with_device
+                .to_string()
+                .contains("both resolve to device_tape"),
+            "{err_with_device}"
+        );
     }
 
     // ---- issue #168: `capacity_override` is decimal, matching the
