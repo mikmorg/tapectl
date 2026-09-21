@@ -15,11 +15,13 @@ pub enum StageCommands {
         name: String,
 
         /// Re-stage a specific snapshot version instead of the latest
-        /// unstaged one — for when `staging clean` already released the
-        /// first stage set's slices and another copy is wanted (issue #53).
-        /// Refuses if a stage set for that version already has live
-        /// slices; use `volume write` to consume them, or `staging clean`
-        /// to release them first.
+        /// unstaged one — for when `tapectl staging clean --unit <name>`
+        /// already released the first stage set's slices and another copy
+        /// is wanted (issue #53). Refuses if a stage set for that version
+        /// already has live slices; use `volume write` to consume them, or
+        /// `staging clean --unit <name>` to release them first (retained
+        /// by default when the unit is below its policy's min_copies —
+        /// add `--force` to release it anyway).
         #[arg(long)]
         version: Option<i64>,
     },
@@ -338,7 +340,9 @@ pub fn run(
                         return Err(TapectlError::Other(format!(
                             "unit \"{name}\" v{v} already has a stage set with live slices — \
                              use `tapectl volume write` to consume them, or \
-                             `tapectl staging clean` to release them first"
+                             `tapectl staging clean --unit {name}` to release them first \
+                             (retained by default if \"{name}\" is below its policy's \
+                             min_copies — add --force to release it anyway)"
                         )));
                     }
 

@@ -13,7 +13,7 @@ Create staged slices (validate → dar → encrypt → checksums)
 Output in JSON format
 .TP
 \fB\-\-version\fR \fI<VERSION>\fR
-Re\-stage a specific snapshot version instead of the latest unstaged one — for when `staging clean` already released the first stage set\*(Aqs slices and another copy is wanted (issue #53). Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `staging clean` to release them first
+Re\-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl staging clean \-\-unit <name>` already released the first stage set\*(Aqs slices and another copy is wanted (issue #53). Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `staging clean \-\-unit <name>` to release them first (retained by default when the unit is below its policy\*(Aqs min_copies — add `\-\-force` to release it anyway)
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
