@@ -6168,6 +6168,68 @@ mod tests {
             assert_eq!(unretired_events, 0, "dry-run must not write an audit event");
         }
 
+        /// The recovered-quarantine branch (issue #250) adds a SECOND write
+        /// on the real-run path -- `observed_condition` plus its own
+        /// `unretired` event -- alongside the existing `status` write.
+        /// `dry_run_mutates_nothing` above never seeds a legacy
+        /// `'quarantined'` old_value, so nothing pinned that this second
+        /// write is ALSO gated by `dry_run`'s early return. A refactor that
+        /// hoisted it above that check would pass every other test here.
+        #[test]
+        fn dry_run_mutates_nothing_for_a_recovered_quarantine_case() {
+            let (conn, cart_id, vol_id) = setup_retired();
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "quarantined",
+                Some("status"),
+                Some("sealed"),
+                Some("quarantined"),
+                None,
+                None,
+            )
+            .unwrap();
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "retired",
+                Some("status"),
+                Some("quarantined"),
+                Some("retired"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            cartridge_unretire(&conn, "BC-RET", true, false).expect("dry-run must succeed");
+
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "retired_permanent");
+            assert_eq!(status_of(&conn, "volumes", vol_id), "retired");
+            let condition: String = conn
+                .query_row(
+                    "SELECT observed_condition FROM volumes WHERE id = ?1",
+                    params![vol_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                condition, "ok",
+                "dry-run must not recover the condition either"
+            );
+            let unretired_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = 'unretired'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unretired_events, 0, "dry-run must not write an audit event");
+        }
+
         #[test]
         fn an_unknown_barcode_says_so() {
             let conn = crate::db::open_memory().unwrap();
