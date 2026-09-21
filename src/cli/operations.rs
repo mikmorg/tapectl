@@ -473,12 +473,22 @@ pub(crate) struct RetireImpact {
 }
 
 /// The impact analysis behind `volume_retire`: one [`RetireImpact`] per
-/// unit with a completed write on `vol_id`. Split out from the call site
+/// unit with a write that REACHED THE TAPE
+/// (`policy::coverage::write_reaches_tape` — `completed`, `in_progress`, or
+/// `interrupted`, issue #276) on `vol_id`. Split out from the call site
 /// (same reasoning as `report::copies_rows`/`audit::copy_count_for_unit`)
 /// so the `other_copies` derivation is directly testable without going
 /// anywhere near `volume_retire`'s consent gate — which reads real stdin
 /// when `assume_yes` is false and a unit is genuinely at risk, exactly the
 /// hazard `volume_retire_consent`'s tests are written to avoid.
+///
+/// Widened past plain `'completed'` for the same reason
+/// `policy::coverage::versions_at_stake` was (issue #276): a volume whose
+/// `seal()` succeeded but whose confirm went `Inconclusive` (or crashed
+/// before confirm ran at all) leaves its `writes` row `in_progress` or
+/// `interrupted`, never `completed` — and this DISPLAY must not be
+/// narrower than that GATE, or an operator sees "no units impacted"
+/// immediately above a refusal that names units.
 ///
 /// `other_copies` is the ADR-0004 coverage derivation: does this unit
 /// have a claim on some OTHER volume that is currently eligible (sealed,
@@ -498,7 +508,7 @@ pub(crate) fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<Retir
          JOIN snapshots s ON s.unit_id = u.id
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
-         WHERE w.volume_id = ?1 AND w.status = 'completed'
+         WHERE w.volume_id = ?1 AND {}
          ORDER BY u.name",
         crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
             scope: crate::policy::coverage::CoverageScope::Unit {
@@ -506,7 +516,8 @@ pub(crate) fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<Retir
                 current_only: false,
             },
             exclude_volume: Some("?1"),
-        })
+        }),
+        crate::policy::coverage::write_reaches_tape("w")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<(i64, String, String, i64)> = stmt
@@ -715,10 +726,36 @@ pub(crate) fn refuse_last_eligible_copy(
         (true, true) => String::new(),
     };
 
+    // Issue #276: when `volume_label` itself is sealed-but-unconfirmed, the
+    // cheapest correct first act is neither copying out nor releasing the
+    // version — it is re-entering the readback that never completed.
+    // `volume resume` either seals the tape (it then counts as a copy and
+    // this refusal is re-judged from an ordinary last-copy state),
+    // quarantines it (Tier 2 at most, the `volume verify` escape below), or
+    // goes inconclusive again (a drive problem, said with the drive per
+    // ADR-0012) — every outcome is strictly more informative than accepting
+    // this refusal at face value. Additive: every existing paragraph below
+    // stays, this one is prepended before them.
+    let resume_para = if crate::policy::coverage::is_sealed_but_unconfirmed(conn, volume_label)? {
+        format!(
+            "\"{volume_label}\" IS physically sealed already — the seal marker is on the \
+             tape — but its confirm readback never completed, so the catalog cannot yet \
+             count it as a copy. The cheapest thing to try first is re-entering that \
+             readback: `tapectl volume resume {volume_label}`. A pass makes it an ordinary \
+             sealed copy and this refusal is re-evaluated from there; a quarantine (a \
+             drive-proven medium fault) makes it Tier 2 at most; going inconclusive again \
+             means the drive, not the tape.\n\
+             \n"
+        )
+    } else {
+        String::new()
+    };
+
     Err(TapectlError::Other(format!(
         "cannot {act}: \"{volume_label}\" holds the LAST eligible copy of {count} \
          — {named}.\n\
          \n\
+         {resume_para}\
          Retiring it leaves {those} at all: nothing else sealed, unquarantined and \
          unretired carries the content, and no recorded warehouse deposit stands in for \
          it. That is not a thinner safety margin to accept — it is the data ceasing to \
@@ -4557,6 +4594,60 @@ mod tests {
                 "the STAGED version must not get one -- it would be refused: {msg}"
             );
             assert!(msg.contains("slices in staging"), "{msg}");
+        }
+
+        /// Issue #276: a volume whose `seal()` succeeded but whose confirm
+        /// never completed (migration 018's case (b) -- `sealed_at` set,
+        /// `status` still `'initialized'`, its `writes` row swept to
+        /// `'interrupted'` by `db::open`'s `recover_orphaned_sessions`)
+        /// still physically holds the unit's only copy. Before this fix
+        /// `retire_impacts` filtered on `w.status = 'completed'` alone, so
+        /// this state yielded ZERO impacts and the Tier-3 floor never fired
+        /// at all -- the exact defect this issue exists to close.
+        #[test]
+        fn retire_impacts_and_the_tier3_floor_both_see_a_sealed_but_unconfirmed_volume() {
+            let (conn, vol_id) = setup_sealed("L6-UNCONF", 0);
+            conn.execute(
+                "UPDATE volumes SET status = 'initialized', sealed_at = datetime('now') \
+                 WHERE id = ?1",
+                params![vol_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                params![vol_id],
+            )
+            .unwrap();
+
+            let impacts = retire_impacts(&conn, vol_id).unwrap();
+            assert_eq!(
+                impacts.len(),
+                1,
+                "the display must not be narrower than the gate: got {} impact(s)",
+                impacts.len()
+            );
+            assert_eq!(
+                impacts[0].at_stake.len(),
+                1,
+                "got {} at-stake version(s)",
+                impacts[0].at_stake.len()
+            );
+            assert_eq!(impacts[0].at_stake[0].copies_after, 0);
+
+            let err = refuse_last_eligible_copy(
+                &conn,
+                "retire volume \"L6-UNCONF\"",
+                "L6-UNCONF",
+                &impacts,
+            )
+            .expect_err("a sealed-but-unconfirmed volume holding the only copy must still refuse");
+            let msg = err.to_string();
+            assert!(msg.contains("unitA"), "{msg}");
+            assert!(msg.contains("v1"), "{msg}");
+            assert!(
+                msg.contains("volume resume"),
+                "the cheapest first act is re-entering confirm, not copying out: {msg}"
+            );
         }
 
         /// THE headline of issue #147: the last eligible copy of a current
