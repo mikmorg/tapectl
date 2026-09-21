@@ -3053,7 +3053,18 @@ try:
 except Exception:
     print(-1); raise SystemExit
 vols = d if isinstance(d, list) else d.get("volumes", [])
-labels = {(v.get("label") if isinstance(v, dict) else v) for v in vols}
+# Issue #253: `v.get("label")` was always None -- `catalog locate --json`
+# keys its label as "volume" -- so this set was {None}, the intersection
+# with the written labels was always empty, and the "honest copy count"
+# check compared the audit answer against a structurally-zero expectation.
+# It could only ever have passed when the true count was zero too.
+labels = set()
+for v in vols:
+    if not isinstance(v, dict):
+        labels.add(v); continue
+    if "volume" not in v:
+        print(-1); raise SystemExit
+    labels.add(v["volume"])
 print(len(labels & written))
 ')"
         [ "$expected" = "-1" ] && { echo "catalog locate --json unparseable for $u"; rc=1; continue; }
@@ -3124,7 +3135,8 @@ scenario_permute() {
     # some written volume this walk — "the latest version" here means
     # whichever written volume most recently carried that unit, found via
     # `catalog locate` rather than re-deriving it from the walk.
-    local u tenant locate_json labels last
+    local u tenant locate_json labels last pm_sd
+    pm_sd="$(dirname "$HOME_DIR")"
     for u in photos docs big; do
         case "$u" in photos|big) tenant=alice ;; docs) tenant=bob ;; esac
         if [ "${#PM_WRITTEN[@]}" -eq 0 ]; then
@@ -3137,14 +3149,40 @@ import json, sys
 d = json.load(sys.stdin)
 vols = d if isinstance(d, list) else d.get("volumes", [])
 for v in vols:
-    print(v.get("label", v) if isinstance(v, dict) else v)
+    if not isinstance(v, dict):
+        print(v); continue
+    # Issue #252: this read `v.get("label", v)`. `catalog locate --json`
+    # emits its volume label under "volume" (src/cli/catalog.rs pins the
+    # shape), so "label" was always absent, the default returned the whole
+    # dict, no candidate ever matched, and the end-of-walk restore matrix
+    # was SKIPPED on every run of `permute` -- silently, because the skip
+    # branch is a legitimate outcome for a never-written unit.
+    # Raise rather than fall back to a second key name: a fallback would let
+    # the same drift go quiet again, and this check exists precisely because
+    # it went quiet once.
+    if "volume" not in v:
+        raise SystemExit("catalog locate --json row has no 'volume' key: %r" % (v,))
+    print(v["volume"])
 ' 2>/dev/null)"
         last=""
         for cand in "${PM_WRITTEN[@]}"; do
             echo "$labels" | grep -qx "$cand" && last="$cand"
         done
         if [ -n "$last" ]; then
-            restore_matrix "$last" "$u" "$tenant" "$SRC/$u" "pm-final-$u"
+            # Issue #252, second half. Compare against the baseline FROZEN
+            # for that volume, never the live source: this is a randomised
+            # walk that mutates $SRC between writes, so a tape written at
+            # step 3 cannot match a source tree edited at step 7, and the
+            # matrix would fail by construction on every seed. The harness
+            # already freezes it -- `pm_write_next_volume` does
+            # `cp -a "$sd/pm-staged/." "$sd/pm-snapshot-$label/"` under the
+            # comment "Freeze the baseline for THIS volume from what was
+            # staged, not from the live source".
+            #
+            # This line said `$SRC/$u` and nobody saw it, because the
+            # `v.get("label")` bug above meant `last` was always empty and
+            # this branch never ran. A skip was hiding a wrong comparison.
+            restore_matrix "$last" "$u" "$tenant" "$pm_sd/pm-snapshot-$last/$u" "pm-final-$u"
         else
             check "pm-final-$u.unit" pm_skip_never_written "$u"
         fi
