@@ -287,8 +287,10 @@ pub enum VolumeCommands {
     /// hidden without it.
     List {
         /// Only volumes in this status (blank, initialized, active, full,
-        /// retired, missing, erased, sealed, quarantined). Every status is
-        /// shown when omitted.
+        /// retired, missing, erased, sealed). Every status is shown when
+        /// omitted. A medium's CONDITION (e.g. quarantined) is its own fact
+        /// now (ADR-0012, the 2026-09-17 amendment) and is shown in its own
+        /// column/line, not filterable here.
         #[arg(long)]
         status: Option<String>,
     },
