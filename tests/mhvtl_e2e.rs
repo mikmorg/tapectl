@@ -1529,6 +1529,63 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
         "volume_verify must report a failure on the corrupted tape: {report:?}"
     );
 
+    // Issue #259: this is the ONLY place in the tree that produces medium
+    // evidence on real media, and until now it asserted the REPORT and not
+    // the irreversible thing the report describes. A `ContentHashMismatch`
+    // proves the medium bad (`src/store.rs`, `proves_medium_bad`), so
+    // `quarantine_on_medium_evidence` has just written the catalog. Assert
+    // the write, not the intention -- ADR-0012's 2026-09-17 amendment makes
+    // this the fact that stops the volume counting as a copy, and the
+    // 2026-09-18 amendment makes it reversible only by a clean full verify.
+    let q = report
+        .quarantine
+        .as_ref()
+        .expect("a ContentHashMismatch proves the medium bad, so verify must quarantine");
+    assert!(
+        q.proof
+            .iter()
+            .any(|m| m.position == corrupted_position as u32),
+        "the quarantine's proof must name the corrupted position {corrupted_position}, got {:?}",
+        q.proof
+    );
+    let condition: String = h
+        .conn
+        .query_row(
+            "SELECT observed_condition FROM volumes WHERE label = ?1",
+            rusqlite::params![label],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        condition, "quarantined",
+        "the volume must be out of service in the CATALOG, not merely in the report"
+    );
+    let status: String = h
+        .conn
+        .query_row(
+            "SELECT status FROM volumes WHERE label = ?1",
+            rusqlite::params![label],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status, "active",
+        "issue #242: a verify never touches the operator's status column"
+    );
+    let events: i64 = h
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE entity_type = 'volume' \
+             AND action = 'verify_quarantined' AND field = 'observed_condition'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        events > 0,
+        "the quarantine must be recorded in the audit trail"
+    );
+
     // (b) bash: RESTORE.sh --verify must ALSO fail and print a FAIL line at
     // the SAME position.
     let script_path = h.root.path().join("RESTORE.sh");
@@ -1560,5 +1617,85 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
         fail_positions.contains(&corrupted_position),
         "expected a FAIL line for position {corrupted_position}, got FAIL lines at \
          {fail_positions:?}\nfull output:\n{stdout}"
+    );
+}
+
+/// **A clean full verify returns a quarantined volume to service, on real
+/// media** (ADR-0012's 2026-09-18 amendment, issue #268; the on-media half
+/// of issue #259).
+///
+/// Until that amendment nothing in the tree ever wrote `observed_condition`
+/// back to `'ok'` — every one of the twelve write sites wrote
+/// `'quarantined'` — so a quarantine was permanent whatever caused it. The
+/// unit tests pin the seam; this pins that a real readback of a real
+/// cartridge drives it, which is the direction an operator actually takes
+/// after cleaning a drive.
+#[test]
+#[ignore]
+fn mhvtl_a_clean_full_verify_returns_a_quarantined_volume_to_service() {
+    if !mhvtl_enabled() {
+        eprintln!("skip: TAPECTL_MHVTL not set or {} missing", tape_dev());
+        return;
+    }
+    let _g = tape_lock();
+    let label = "MHVTLBACK";
+    let h = write_volume(
+        "verify-returns-to-service",
+        label,
+        &[("alice", "alice-u", 2)],
+    );
+
+    // Put the volume where a failed verify would have put it. Seeded rather
+    // than produced by corrupting the tape, because the point here is the
+    // CLEAN readback: the bytes must genuinely be good for the clear to be
+    // the thing under test.
+    h.conn
+        .execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = ?1",
+            rusqlite::params![label],
+        )
+        .unwrap();
+
+    let report = volume::write::volume_verify(
+        &h.conn,
+        &h.config,
+        label,
+        &tape_dev(),
+        BLOCK_SIZE,
+        Tier::Integrity,
+    )
+    .expect("a clean full verify must not error");
+    assert_eq!(report.failed, 0, "the tape is good: {report:?}");
+
+    let cleared = report
+        .cleared
+        .as_ref()
+        .expect("a clean FULL verify of a quarantined volume must return it to service");
+    assert_eq!(cleared.previous_condition, "quarantined");
+
+    let condition: String = h
+        .conn
+        .query_row(
+            "SELECT observed_condition FROM volumes WHERE label = ?1",
+            rusqlite::params![label],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        condition, "ok",
+        "the catalog must show the volume back in service, not just the report"
+    );
+    let events: i64 = h
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE entity_type = 'volume' \
+             AND action = 'verify_cleared' AND field = 'observed_condition'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        events > 0,
+        "the return to service is a fact and must be recorded"
     );
 }

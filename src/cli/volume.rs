@@ -631,6 +631,15 @@ pub fn run(
                         // out of service. `null` on a clean verify and on a
                         // failed one that proved nothing about the medium.
                         "quarantined": report.quarantine.is_some(),
+                        // Issue #268, additive: the inverse of `quarantined`.
+                        // True only when this verify actually returned the
+                        // volume to service, never on the ordinary clean
+                        // verify of a healthy one.
+                        "returned_to_service": report.cleared.is_some(),
+                        "cleared": report.cleared.as_ref().map(|c| serde_json::json!({
+                            "previous_condition": c.previous_condition,
+                            "condition_changed": true,
+                        })),
                         "quarantine": report.quarantine.as_ref().map(|q| {
                             // Issue #242: a verify no longer touches
                             // `status` at all -- `previous_status`/
@@ -717,7 +726,23 @@ pub fn run(
                              size, cabling, the right tape loaded) and verify again."
                         );
                     }
-                    (None, _) => {}
+                    // Issue #268: the clean-pass arm is no longer silent when
+                    // this verify RETURNED the volume to service. That is a
+                    // real change to the catalog -- the volume starts counting
+                    // as a copy again -- and an operator who cleaned the drive
+                    // and re-verified needs to be told it worked, in the same
+                    // place they were told it failed.
+                    (None, _) => {
+                        if let Some(c) = &report.cleared {
+                            println!(
+                                "volume \"{label}\" RETURNED TO SERVICE: a full verify read \
+                                 every file back and found no mismatch, so its condition moves \
+                                 from \"{}\" to \"ok\" and it counts as a copy again \
+                                 (ADR-0012, 2026-09-18). Its status was never touched.",
+                                c.previous_condition,
+                            );
+                        }
+                    }
                 }
                 // Issue #187: said out loud, not silently omitted.
                 if let Some(note) = &report.drive_health_note {

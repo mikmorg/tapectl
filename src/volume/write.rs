@@ -1905,6 +1905,82 @@ fn describe_medium_evidence(proof: &[&crate::store::Mismatch]) -> String {
 /// recorded in the `events` row and returned, so nothing is lost: the
 /// catalog carries "the operator tried to read this and it failed", which
 /// is the fact the amendment says must exist.
+/// What a clean full verify did to `volumes.observed_condition`
+/// (ADR-0012's 2026-09-18 amendment, issue #268).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionCleared {
+    /// The condition this verify replaced — always `"quarantined"`, since a
+    /// volume already `"ok"` is left alone and reported as no change.
+    pub previous_condition: String,
+}
+
+/// **Return a volume to service when a FULL verify finds nothing wrong**
+/// (ADR-0012's 2026-09-18 amendment, issue #268) — the inverse of
+/// [`quarantine_on_medium_evidence`], and until that amendment it did not
+/// exist. Every one of the twelve `SET observed_condition` sites wrote
+/// `'quarantined'`; none wrote `'ok'`, and `catalog rebuild` only records a
+/// mismatch rather than clearing it. So a quarantine was permanent whatever
+/// produced it, which is exactly what made a FALSE one worth arguing about.
+///
+/// The justification is definitional rather than a policy preference: the
+/// column holds what tapectl *observed* about the medium, so a later and
+/// better observation is the thing entitled to update it. That is also why
+/// this is not an operator override — a `clear-condition` command was
+/// considered and rejected in the same ruling, because the condition is
+/// evidence and evidence is replaced by gathering more of it.
+///
+/// **Only [`Tier::Integrity`] clears it.** A navigable verify checks the
+/// map, not the bytes, so it cannot license the claim that the medium is
+/// sound; a lesser tier leaves the condition exactly as it found it. That
+/// asymmetry is the whole reason this takes `tier` rather than inferring
+/// "clean" from an empty mismatch list, which a quick verify also produces.
+///
+/// `status` is never touched here, for the same reason the quarantine half
+/// does not touch it: it is the operator's column.
+pub(crate) fn clear_condition_on_clean_full_verify(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    tier: Tier,
+    evidence: &crate::store::Evidence,
+) -> Result<Option<ConditionCleared>> {
+    if tier != Tier::Integrity || !evidence.mismatches.is_empty() {
+        return Ok(None);
+    }
+    let previous_condition: String = conn.query_row(
+        "SELECT observed_condition FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if previous_condition == "ok" {
+        // Nothing to report: a clean verify of a healthy volume is the
+        // ordinary case and must not write an events row on every run.
+        return Ok(None);
+    }
+    conn.execute(
+        "UPDATE volumes SET observed_condition = 'ok' WHERE id = ?1",
+        params![volume_id],
+    )?;
+    events::log_event(
+        conn,
+        "volume",
+        volume_id,
+        Some(label),
+        "verify_cleared",
+        Some("observed_condition"),
+        Some(previous_condition.as_str()),
+        Some("ok"),
+        Some("a full verify read every file back and found no mismatch"),
+        None,
+    )?;
+    warn!(
+        label = label,
+        previous_condition = %previous_condition,
+        "volume returned to service by a clean full verify"
+    );
+    Ok(Some(ConditionCleared { previous_condition }))
+}
+
 pub(crate) fn quarantine_on_medium_evidence(
     conn: &Connection,
     volume_id: i64,
@@ -2467,6 +2543,13 @@ pub(crate) fn volume_verify_with_store(
     // same defect, one level up. They describe one verify; a crash must
     // leave neither.
     let quarantine = quarantine_on_medium_evidence(&tx, volume_id, label, &evidence)?;
+    // The inverse half (ADR-0012's 2026-09-18 amendment, issue #268), in the
+    // SAME transaction and for the same reason the comment above gives: the
+    // session row and the condition it justifies describe one verify, so a
+    // crash must leave neither. Exactly one of these two can do anything on
+    // any given run -- `quarantine_on_medium_evidence` needs a mismatch that
+    // proves the medium bad, this one needs no mismatches at all.
+    let cleared = clear_condition_on_clean_full_verify(&tx, volume_id, label, tier, &evidence)?;
     tx.commit()?;
 
     for m in &evidence.mismatches {
@@ -2485,6 +2568,7 @@ pub(crate) fn volume_verify_with_store(
         failed: evidence.mismatches.len(),
         mismatches: evidence.mismatches,
         quarantine,
+        cleared,
         // Set by `volume_verify`, which is the only caller with a device and
         // a backend to resolve; this store-injectable half has neither.
         drive_health_note: None,
@@ -3212,6 +3296,15 @@ pub struct VerifyReport {
     /// is non-zero and the exit code is still `EXIT_ERROR` — that left the
     /// volume exactly as it was.
     pub quarantine: Option<QuarantineEffect>,
+    /// What a clean FULL verify did to `volumes.observed_condition` — the
+    /// inverse of [`VerifyReport::quarantine`] (ADR-0012's 2026-09-18
+    /// amendment, issue #268).
+    ///
+    /// `Some` only when this verify found no mismatches at all, ran at
+    /// [`Tier::Integrity`], AND the volume was quarantined beforehand — so
+    /// it reports a real return to service and is `None` on the ordinary
+    /// clean verify of a healthy volume, which must not look like an event.
+    pub cleared: Option<ConditionCleared>,
     /// Set when drive-health (`sg_logs`) collection was SKIPPED rather than
     /// attempted (issue #187): no backend resolves for the device verify was
     /// given, so there is no sg node to read. `None` means collection was
@@ -4564,6 +4657,119 @@ mod tests {
         assert_eq!(volume_status(&conn, "Q-FI"), "sealed");
         assert_eq!(volume_condition(&conn, "Q-FI"), "ok");
         assert!(volume_events(&conn, "Q-FI").is_empty());
+    }
+
+    /// **A passing FULL verify returns the volume to service** (ADR-0012's
+    /// 2026-09-18 amendment, issue #268). Nothing in the tree ever wrote
+    /// `observed_condition` back to `'ok'` — twelve write sites, all writing
+    /// `'quarantined'` — so every quarantine was permanent whatever caused
+    /// it, which is what made a false one expensive enough to argue about.
+    ///
+    /// The column holds what tapectl OBSERVED about the medium, so a later
+    /// and better observation is precisely the thing entitled to update it.
+    /// The operator instinct this serves — clean the drive, verify again —
+    /// is one the tool should reward.
+    #[test]
+    fn a_clean_full_verify_returns_a_quarantined_volume_to_service() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"bytes that verify cleanly. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "Q-BACK",
+            "q-back-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed', observed_condition = 'quarantined' \
+             WHERE label = 'Q-BACK'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-BACK'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let cleared = clear_condition_on_clean_full_verify(
+            &conn,
+            volume_id,
+            "Q-BACK",
+            Tier::Integrity,
+            &crate::store::Evidence {
+                tier: Tier::Integrity,
+                files_checked: 1,
+                mismatches: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(
+            cleared.is_some(),
+            "a clean full verify must clear the condition it found"
+        );
+        assert_eq!(cleared.unwrap().previous_condition, "quarantined");
+        assert_eq!(volume_condition(&conn, "Q-BACK"), "ok");
+        assert_eq!(
+            volume_status(&conn, "Q-BACK"),
+            "sealed",
+            "clearing the condition must not touch the operator's status"
+        );
+        assert!(
+            !volume_events(&conn, "Q-BACK").is_empty(),
+            "the return to service is a fact and must be recorded"
+        );
+    }
+
+    /// A NAVIGABLE verify is not enough. Only a full readback can license
+    /// the claim that the medium is sound, so a lesser tier leaves the
+    /// condition exactly as it found it (ADR-0012, same amendment).
+    #[test]
+    fn a_quick_verify_does_not_clear_the_condition() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"bytes. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "Q-QUICK",
+            "q-quick-unit",
+            4,
+            &good,
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed', observed_condition = 'quarantined' \
+             WHERE label = 'Q-QUICK'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'Q-QUICK'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let cleared = clear_condition_on_clean_full_verify(
+            &conn,
+            volume_id,
+            "Q-QUICK",
+            Tier::Navigable,
+            &crate::store::Evidence {
+                tier: Tier::Navigable,
+                files_checked: 1,
+                mismatches: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(
+            cleared.is_none(),
+            "a quick verify proves nothing about the medium"
+        );
+        assert_eq!(volume_condition(&conn, "Q-QUICK"), "quarantined");
     }
 
     /// The other three medium-proving kinds reach the status write through

@@ -627,6 +627,28 @@ check resume_verify     step_resume_verify
 check resume_restore    step_resume_restore
 check resume_after_crash step_resume_after_crash
 
+# ---------- leg 6: the Rust on-media suite (issue #259) ----------
+# This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
+# the only place in the tree that produces medium evidence on real media. So
+# "GATE GREEN 26/26" was a true statement about the bash legs and said nothing
+# whatever about the Rust suite, whose 12 tests had gone unrun by anything
+# routine for 105 commits. Asserting a destructive catalog effect in a file
+# nothing executes is not coverage.
+#
+# It runs LAST, after leg 5 has finished with the tape, because it manages its
+# own cartridge state (mhvtl_load + its own volumes) and must not interleave
+# with the bash legs' positioning. It costs ~38s.
+#
+# The build lock is taken here for the same reason line 79 takes it and for no
+# other: `cargo test` compiles. It is NOT wrapped around the whole leg -- the
+# tape work links nothing and must not hold the lock while a worker waits.
+step_rust_e2e() {
+    flock -w 1200 -E 99 /scratch/tapectl-build.lock \
+        env TAPECTL_GATE_TAPE="$TAPE_DEV" TAPECTL_MHVTL=1 \
+        cargo test --test mhvtl_e2e -- --ignored --nocapture
+}
+check rust_e2e          step_rust_e2e
+
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
 echo "== gate verdict =="
