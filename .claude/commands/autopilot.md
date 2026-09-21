@@ -330,6 +330,53 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-21 (NEWEST) — REVIEW-3 RAN AND REFILLED THE QUEUE. 12 open:
+  2 high, 8 medium, 2 low (#276-#287). Master `bf6f57d`.**
+  Record: `docs/audits/2026-09-21-preproduction-review-3.md`. 31-agent workflow over
+  `057a6591..HEAD` (45 commits, ~5,385 insertions): ten dimension finders, one adversarial
+  verifier PER FINDING, plus the completeness critic. **20 raw, 8 confirmed, 12 refuted** —
+  a 60% refutation rate, in line with both prior rounds.
+
+  **Work #277 and #276 first, in that order; both are data-loss class.**
+  - **#277 (high, `consent-path`)** — an `Inconclusive` confirm whose cause is an unreadable
+    seal makes `check_tape_contact` return `Matches` (both seal probes go through
+    `seal_marker_parses_at`, which returns false on a READ ERROR and so cannot tell
+    unreadable from absent). `session.rs:868`'s arm is empty, so resume falls through to
+    `reposition_for_resume` and `seal()` — **a write to a physically sealed cartridge with
+    ADR-0003 bypassed**, and if the seal file is genuinely bad the overwrite converts a
+    drive-side read failure into medium-side destruction. `8b061b7`'s own commit message
+    asserts the false premise it rests on. **STOP AND ASK before changing what gets
+    written** — this is the arm that lost a cartridge once already (#208).
+  - **#276 (high)** — `retire_impacts` filters `writes.status = 'completed'`
+    (`operations.rs:501`), so a confirm-failed volume yields ZERO impacts and
+    `refuse_last_eligible_copy` never fires. `volume retire` + `cartridge mark-erased`
+    then destroys the only copy of a sealed, restorable tape. **ADR-0012 names this defect
+    verbatim and the diff does not close it.** Same fix shape as #199's `is_write_target`
+    change — stop answering "does this volume hold bytes?" with a status.
+
+  **THE CRITIC'S VERDICT IS THAT THIS DIFF MUST NOT PRECEDE A FIRST PRODUCTION WRITE** until
+  #277 is fixed and re-read, with #276 and #285 also examined. Do not treat the rehearsal as
+  unblocked on the strength of a green gate.
+
+  **Three of the eight confirmed findings are in code landed the same day** (#278/#279 in
+  #274's fix, #282 in #252's). Reviewing a range that includes the morning's own work is
+  the point of reviewing the whole range.
+
+  **#278 corrects a claim I made to the CTO** while presenting #274's options: that scoping
+  `--force` to one unit made it "no longer wider than the gate it overrides". True ACROSS
+  units, false WITHIN the named one — `clean_staging`'s force branch has no `EXISTS writes`
+  guard at all, so the auto-emitted recipe also discards that unit's never-written staged
+  sets. **When arguing that a narrowing makes a dangerous flag safe, state which axis it
+  narrows.**
+
+  **Review-design lesson that did NOT transfer.** Dimensions were drawn from this session's
+  own misses, per the 2026-09-17 rule, and the highest-hope brief was **vacuous assertions**,
+  written straight off #275. It produced three findings and **all three were refuted, all
+  three correctly.** A brief aimed at a shape you just got burned by over-fires. The
+  dimensions that paid this round were the ordinary ones — the session state machine,
+  operator text, harness scripts — plus the critic, which again found the single
+  highest-severity item by asking what NOBODY was assigned to look at.
+
 - **QUEUE STATE 2026-09-21 (LATEST) — THE LABEL IS EMPTY AND PUSHED. Master `223f20b`.
   REVIEW-3 IS RUNNING; DO NOT DECLARE DONE UNTIL IT REPORTS.**
   #274 and #275 closed. Gate **1656 tests / 0 failed**, clippy 0, fmt clean; **mhvtl gate
