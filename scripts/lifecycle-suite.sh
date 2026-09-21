@@ -1688,27 +1688,52 @@ tor_purge_v1_photos() {
 # instead. Without that, this check would have gone PASS -> FAIL on the next
 # --all with the fix looking like the culprit.
 tor_staging_clean() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean (expect REFUSED naming solo at 1/2 copies), then tapectl staging clean --force (expect success)"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean (expect SUCCESS, retaining solo at 1/2 copies and naming --force), assert solo still 'staged', then tapectl staging clean --force"; return 0; }
     local out rc
     out="$(TCTL staging clean 2>&1)"; rc=$?
-    [ "$rc" -ne 0 ] || {
-        echo "staging clean released staged bytes while \"solo\" is at 1 copy against min_copies 2 — issue #244's gate is not holding: $out"
+    # ADR-0012's 2026-09-21 amendment (issue #262) corrected #244's ruling from
+    # "the command refuses" to "the command retains the under-copied units and
+    # succeeds". The protection is unchanged -- solo's staged bytes must still
+    # be there afterwards, and that is what this check now proves directly
+    # rather than inferring it from an exit code.
+    #
+    # The refusal was whole-command, so one stuck unit blocked every COVERED
+    # unit's release until staging filled; and --force, the only escape, has a
+    # wider candidate set than the gate it bypasses.
+    [ "$rc" -eq 0 ] || {
+        echo "staging clean must now SUCCEED while retaining the under-copied unit (issue #262), got rc=$rc: $out"
         return 1
     }
     echo "$out" | grep -q "solo" || {
-        echo "staging clean refused, but did not name the under-copied unit, so an operator cannot tell which one: $out"
+        echo "staging clean retained data but did not name the under-copied unit, so an operator cannot tell which one: $out"
         return 1
     }
     echo "$out" | grep -q -- "--force" || {
-        echo "staging clean refused without naming --force as the override: $out"
+        echo "staging clean retained data without naming --force as the override: $out"
         return 1
     }
-    # Put the refusal in the report. Without this the log shows only the
-    # --force call's "cleaned N stage set(s)" line, and a reader cannot tell a
-    # real refusal from a check that passed for some other reason -- the
-    # assertions above would be the only evidence, and evidence you cannot see
-    # is how this suite produced five greens for the wrong reason.
-    echo "the refusal, verbatim:"
+    # The load-bearing assertion, and the reason the exit code was never the
+    # real subject: solo's staged data must SURVIVE a bare clean. Asserted
+    # against the catalog, not against the message.
+    local still
+    still="$(TCTL stage list --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rows = d if isinstance(d, list) else d.get("stage_sets", [])
+print(sum(1 for r in rows if isinstance(r, dict)
+          and r.get("status") == "staged"
+          and "solo" in str(r.get("unit", ""))))
+' 2>/dev/null || echo 0)"
+    [ "${still:-0}" -ge 1 ] || {
+        echo "solo is at 1/2 copies and its staged data was released by a bare \`staging clean\` -- issue #244's protection is not holding: $out"
+        return 1
+    }
+    # Put the retention notice in the report. Without this the log shows only
+    # the --force call's "cleaned N stage set(s)" line, and a reader cannot
+    # tell a real retention from a check that passed for some other reason --
+    # the assertions above would be the only evidence, and evidence you cannot
+    # see is how this suite produced five greens for the wrong reason.
+    echo "the retention notice, verbatim:"
     echo "$out" | sed 's/^/    /'
     TCTL staging clean --force
 }
