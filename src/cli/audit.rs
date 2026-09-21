@@ -122,6 +122,20 @@ struct Ctx<'a> {
     /// `report::dirty_rows`'s scan, computed once for all units.
     dirty_rows: &'a [crate::cli::report::DirtyRow],
     unit_filter: Option<&'a str>,
+    /// The CURRENT unit's resolved policy (issue #274), while
+    /// `collect_findings`'s per-unit loop is running -- `None` outside it
+    /// (the archive-wide `Scope::Archive` checks never resolve any single
+    /// unit's policy, so they never read this). Always `Some` for every
+    /// `Scope::PerUnit` check, regardless of that check's own
+    /// `needs_policy`: a `policy::resolve` failure already `continue`s past
+    /// the whole unit before any `CHECKS` row runs (see below), so the
+    /// value exists whether or not a given check's own trigger condition
+    /// depends on it. This exists so `check_escrow_coverage` -- whose own
+    /// firing condition genuinely does not depend on policy, hence
+    /// `needs_policy: false` -- can still pass the resolved `min_copies`
+    /// through to `restage_action`'s remedy wording without a second
+    /// `policy::resolve` call (issue #96).
+    resolved: Option<&'a ResolvedPolicy>,
 }
 
 /// One check's contribution to the audit's finding lists.
@@ -332,6 +346,10 @@ fn collect_findings(
         escrow: escrow_pubkey.as_deref(),
         dirty_rows: &dirty_rows,
         unit_filter,
+        // Set per-unit below, inside the loop -- see `Ctx::resolved`'s doc.
+        // The archive-wide checks after the loop read this same base `ctx`
+        // unshadowed, so `resolved` stays `None` for them, correctly.
+        resolved: None,
     };
 
     for unit in &units {
@@ -383,6 +401,16 @@ fn collect_findings(
                 });
                 continue;
             }
+        };
+
+        // Issue #274: rebind `ctx` for this unit's checks only, carrying
+        // its just-resolved policy -- see `Ctx::resolved`'s doc. Every
+        // field here is `Copy` (references / `Option<&str>`), so this is a
+        // cheap repackaging, not a second `policy::resolve` or a mutation
+        // of the outer `ctx` the archive-wide checks read after the loop.
+        let ctx = Ctx {
+            resolved: Some(&resolved),
+            ..ctx
         };
 
         for check in CHECKS {
@@ -590,19 +618,30 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
 /// volume, one version) and `encryption` (every current version still
 /// carrying an unencrypted stage set). Never offers `read-slices`: it
 /// would reproduce the exact ciphertext/recipient list the finding says
-/// is wrong. `tapectl staging clean` is prefixed, un-scoped, exactly once
-/// when any named version still has live slices blocking a re-stage —
-/// every stage set that can reach this function already has a completed
-/// write (that is how the finding fired), so a bare `staging clean` (no
-/// `--force`) reclaims it -- **provided the unit already meets its own
-/// resolved `min_copies`.** Since ADR-0012's 2026-09-21 amendment (issue
-/// #262), a bare `staging clean` RETAINS an under-copied unit's staged
-/// bytes instead of releasing them (it names the unit in the retention
-/// notice and exits 0, it does not error). This function does not check
-/// copy count before prefixing the clean, so for an under-copied unit the
-/// printed recipe's first step is a no-op for that unit's own data and the
-/// following `stage create` still refuses on the still-live stage set.
-fn restage_action(conn: &Connection, unit: &Unit, versions: &[i64], extra: &str) -> Result<String> {
+/// is wrong.
+///
+/// `tapectl staging clean --unit <name>` is prefixed exactly once when any
+/// named version still has live slices blocking a re-stage — every stage
+/// set that can reach this function already has a completed write (that is
+/// how the finding fired), so releasing it is always safe for the write
+/// this same recipe ends with. Issue #274: the clean is scoped to this
+/// unit alone, so a pasted recipe can never reach past it into another
+/// unit's staged data, and it is `--force`d exactly when this unit is
+/// itself below its own resolved `min_copies` — the one case where a bare
+/// `staging clean` would retain rather than release (ADR-0012's
+/// 2026-09-21 amendment, issue #262), which would otherwise leave the
+/// following `stage create --version` refusing on a still-live stage set.
+/// Forcing it here is deliberately narrower than the archive-wide
+/// `--force`: it can only ever touch the one unit named in scope, and the
+/// copy this recipe's final `volume write` step produces is exactly the
+/// copy that shortfall requires — so releasing early costs nothing.
+fn restage_action(
+    conn: &Connection,
+    unit: &Unit,
+    versions: &[i64],
+    extra: &str,
+    resolved: &ResolvedPolicy,
+) -> Result<String> {
     if unit.status != "active" {
         let vs = versions
             .iter()
@@ -622,16 +661,38 @@ fn restage_action(conn: &Connection, unit: &Unit, versions: &[i64], extra: &str)
         .iter()
         .any(|v| live_by_version.get(v).copied().unwrap_or(false));
 
+    // Issue #274: the same `copy_count_for_unit` derivation
+    // `check_copy_count`/`under_copied_release_candidates` use (issue
+    // #96) — never a second count.
+    let under_copied = copy_count_for_unit(conn, unit.id)? < resolved.min_copies;
+
     let mut steps: Vec<String> = Vec::new();
     if any_live {
-        steps.push("tapectl staging clean".to_string());
+        if under_copied {
+            steps.push(format!(
+                "tapectl staging clean --unit {} --force",
+                unit.name
+            ));
+        } else {
+            steps.push(format!("tapectl staging clean --unit {}", unit.name));
+        }
     }
     for v in versions {
         steps.push(format!("tapectl stage create {} --version {v}", unit.name));
     }
     steps.push("tapectl volume init <OTHER-LABEL>".to_string());
     steps.push(format!("tapectl volume write <OTHER-LABEL>{extra}"));
-    Ok(steps.join(" && "))
+    let mut action = steps.join(" && ");
+
+    if any_live && under_copied {
+        action.push_str(&format!(
+            " (\"{}\" is below its policy's min_copies, so a bare clean would retain \
+             its staged bytes -- --force releases them here because the write below \
+             creates the required copy)",
+            unit.name
+        ));
+    }
+    Ok(action)
 }
 
 // Check copy count. Routes through the same ADR-0004 eligibility predicate
@@ -826,7 +887,15 @@ fn check_escrow_coverage(
                     params![stage_set_id],
                     |row| row.get(0),
                 )?;
-                let action = restage_action(ctx.conn, unit, &[version], "")?;
+                // Issue #274: `escrow_coverage`'s own trigger never depends
+                // on policy (hence `needs_policy: false` in `CHECKS`), but
+                // `restage_action`'s remedy needs the resolved min_copies
+                // -- `Ctx::resolved` carries it in without a second
+                // `policy::resolve` call.
+                let resolved = ctx.resolved.expect(
+                    "collect_findings sets Ctx::resolved for every per-unit check before running it",
+                );
+                let action = restage_action(ctx.conn, unit, &[version], "", resolved)?;
                 f.warnings.push(AuditFinding {
                     unit: unit.name.clone(),
                     check: "escrow_coverage".into(),
@@ -1064,7 +1133,7 @@ fn check_encryption(
                 message: format!(
                     "{unencrypted_count} unencrypted stage set(s) on tape, policy requires encryption"
                 ),
-                action: restage_action(ctx.conn, unit, &versions, "")?,
+                action: restage_action(ctx.conn, unit, &versions, "", resolved)?,
             });
         }
     }
@@ -2714,26 +2783,17 @@ mod tests {
         );
     }
 
-    /// `escrow_coverage`/`encryption`'s shared remedy (`restage_action`,
-    /// issue #209): the flagged stage set is still LIVE (`staged`), so a
-    /// version-scoped re-stage would be refused
-    /// (`cli/stage.rs`'s live-slices gate) until it is released.
-    ///
-    /// **This test used to claim** that a bare, un-scoped `tapectl staging
-    /// clean` is "guaranteed to release it because it already carries a
-    /// completed write". That is false (issue #251): this fixture has
-    /// exactly one completed write, and `Config::default()`'s resolved
-    /// `min_copies` is 2 (`default_min_copies` in `src/config.rs`), so
-    /// "reels" is under-copied -- the identical shape
-    /// `cli::staging::tests::seed_unit_needing_a_second_copy` builds, whose
-    /// `clean_retains_the_under_copied_unit_without_refusing_the_command`
-    /// proves it is RETAINED, not released, by ADR-0012's 2026-09-21
-    /// amendment (issue #262). This test now runs that same bare clean
-    /// against this fixture below and pins the retained outcome directly,
-    /// instead of only asserting the recipe *string* and trusting a
-    /// guarantee about what running it does.
-    #[test]
-    fn restage_action_cleans_before_restaging_a_still_live_version() {
+    /// Seeds the exact "reels" fixture both `restage_action` tests below
+    /// share: one `active` unit, one `current` snapshot, one `staged`
+    /// stage_set (still live -- a completed write does not by itself
+    /// release staging, so this is the ordinary post-write state, not a
+    /// contrived one) with exactly ONE completed write. Against
+    /// `Config::default()`'s resolved `min_copies` of 2
+    /// (`default_min_copies` in `src/config.rs`), this makes "reels"
+    /// under-copied -- the identical shape
+    /// `cli::staging::tests::seed_unit_needing_a_second_copy` builds.
+    /// Returns `(conn, unit_id, stage_set_id)`.
+    fn seed_reels_under_copied_and_still_live() -> (Connection, i64, i64) {
         let conn = crate::db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
@@ -2755,9 +2815,6 @@ mod tests {
         )
         .unwrap();
         let snap_id = conn.last_insert_rowid();
-        // Still `staged` -- a completed write does not by itself release
-        // staging (that is `staging clean`'s job), so this is the
-        // ordinary post-write state, not a contrived one.
         conn.execute(
             "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
              VALUES (?1, 'staged', 524288, 0)",
@@ -2778,15 +2835,40 @@ mod tests {
             params![stage_set_id, snap_id, vol_id],
         )
         .unwrap();
+        (conn, unit_id, stage_set_id)
+    }
+
+    /// `escrow_coverage`/`encryption`'s shared remedy (`restage_action`,
+    /// issue #209): the flagged stage set is still LIVE (`staged`), so a
+    /// version-scoped re-stage would be refused
+    /// (`cli/stage.rs`'s live-slices gate) until it is released.
+    ///
+    /// **This test used to pin the BROKEN recipe (issue #274).** A bare,
+    /// un-scoped `tapectl staging clean` prefixed onto this exact
+    /// under-copied fixture would only ever RETAIN "reels"'s staged bytes
+    /// (ADR-0012's 2026-09-21 amendment, issue #262), leaving the very next
+    /// `stage create --version 1` step refusing on the still-live stage
+    /// set -- a two-step recipe whose first step guaranteed the second
+    /// could not run. The recipe now scopes the clean to this one unit and
+    /// forces it release, since "reels" is exactly the under-copied case;
+    /// `restage_action_scoped_clean_actually_frees_the_stage_set` below
+    /// proves running that scoped clean really does free it.
+    #[test]
+    fn restage_action_cleans_before_restaging_a_still_live_version() {
+        let (conn, _unit_id, _stage_set_id) = seed_reels_under_copied_and_still_live();
 
         let unit = crate::db::queries::get_unit_by_name(&conn, "reels")
             .unwrap()
             .unwrap();
-        let action = restage_action(&conn, &unit, &[1], "").unwrap();
+        let resolved = crate::policy::resolve(&conn, &Config::default(), &unit).unwrap();
+        let action = restage_action(&conn, &unit, &[1], "", &resolved).unwrap();
         assert_eq!(
             action,
-            "tapectl staging clean && tapectl stage create reels --version 1 && \
-             tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>"
+            "tapectl staging clean --unit reels --force && tapectl stage create reels --version 1 && \
+             tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> \
+             (\"reels\" is below its policy's min_copies, so a bare clean would retain \
+             its staged bytes -- --force releases them here because the write below \
+             creates the required copy)"
         );
 
         // Full path: `check_encryption` fires on exactly this fixture
@@ -2799,44 +2881,123 @@ mod tests {
             .find(|f| f.check == "encryption" && f.unit == "reels")
             .expect("an unencrypted stage set with policy.encrypt=true must violate");
         assert_eq!(finding.action, action);
+    }
 
-        // Issue #251: the recipe's first step, actually run, does not
-        // "guarantee" reclamation -- this unit has one completed write
-        // against `Config::default()`'s resolved `min_copies` of 2, so it
-        // is under-copied and a bare `staging clean` RETAINS its staged
-        // bytes instead of releasing them (ADR-0012's 2026-09-21
-        // amendment, issue #262). It does not refuse the command, so
-        // `action` above is still the correct string to print -- but
-        // running it does not by itself make `tapectl stage create reels
-        // --version 1` (the next step) succeed, because the stage_set is
-        // still `staged`.
+    /// The acceptance criterion for issue #274, end-to-end and asserted on
+    /// DB state, not on the printed recipe string: running the EXACT clean
+    /// `restage_action` now names for an under-copied, still-live unit
+    /// (`clean_staging` with `CleanScope::Units(&[unit_id])` and
+    /// `force = true`) must actually free the stage set, i.e.
+    /// `stage_set_has_live_slices` must be false for its resulting status
+    /// -- the precondition `stage create --version N`'s live-slices gate
+    /// (`src/cli/stage.rs`) checks before refusing.
+    #[test]
+    fn restage_action_scoped_clean_actually_frees_the_stage_set() {
+        let (conn, unit_id, stage_set_id) = seed_reels_under_copied_and_still_live();
         let tmp = tempfile::tempdir().unwrap();
-        let paths = crate::config::TapectlPaths::new(tmp.path().to_path_buf());
-        let clean_result = crate::cli::staging::run(
+        let config = Config {
+            staging: crate::config::StagingConfig {
+                directory: tmp.path().to_string_lossy().to_string(),
+            },
+            ..Default::default()
+        };
+
+        let report = crate::staging::clean::clean_staging(
             &conn,
-            &paths,
-            &Config::default(),
-            &crate::cli::staging::StagingCommands::Clean { force: false },
-            false,
-            false,
+            &config,
+            true,
+            crate::staging::clean::CleanScope::Units(&[unit_id]),
+        )
+        .unwrap();
+        assert_eq!(
+            report.sets_cleaned, 1,
+            "the scoped, forced clean must release it"
         );
-        assert!(
-            clean_result.is_ok(),
-            "issue #262: a bare `staging clean` must not refuse the whole \
-             command just because one unit is under-copied: {clean_result:?}"
-        );
-        let stage_set_status: String = conn
+
+        let status: String = conn
             .query_row(
                 "SELECT status FROM stage_sets WHERE id = ?1",
                 params![stage_set_id],
                 |r| r.get(0),
             )
             .unwrap();
+        assert!(
+            !crate::staging::stage_set_has_live_slices(&status),
+            "after the recipe's own clean step, the stage set must no longer be \
+             live -- `stage create --version 1`'s gate checks exactly this, and \
+             it must no longer refuse: status is \"{status}\""
+        );
+    }
+
+    /// The other half of the covered/under-copied split: a unit that
+    /// ALREADY meets its resolved `min_copies` (two completed writes, on
+    /// two distinct in-service volumes, against `Config::default()`'s
+    /// `min_copies` of 2) but whose stage set is still live gets the
+    /// scoped clean WITHOUT `--force` -- releasing it needs no override,
+    /// and this recipe must never claim one is needed.
+    #[test]
+    fn restage_action_scopes_the_clean_without_force_for_a_covered_unit() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'reels', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted)
+             VALUES (?1, 'staged', 524288, 0)",
+            params![snap_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        for label in ["REELS-A", "REELS-B"] {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![stage_set_id, snap_id, vol_id],
+            )
+            .unwrap();
+        }
+
+        let unit = crate::db::queries::get_unit_by_name(&conn, "reels")
+            .unwrap()
+            .unwrap();
+        let resolved = crate::policy::resolve(&conn, &Config::default(), &unit).unwrap();
         assert_eq!(
-            stage_set_status, "staged",
-            "the under-copied \"reels\" stage_set must be RETAINED, not \
-             reclaimed, by the bare `staging clean` this action's doc \
-             comment used to call a guarantee"
+            copy_count_for_unit(&conn, unit_id).unwrap(),
+            2,
+            "fixture must actually meet Config::default()'s min_copies of 2"
+        );
+        let action = restage_action(&conn, &unit, &[1], "", &resolved).unwrap();
+        assert!(
+            action.contains("tapectl staging clean --unit reels"),
+            "must scope the clean to this unit: {action}"
+        );
+        assert!(
+            !action.contains("--force"),
+            "a covered unit's clean must never be forced: {action}"
         );
     }
 
