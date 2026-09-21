@@ -21,17 +21,19 @@
 -- 012_cartridge_lifecycle.sql rebuilt `cartridges`): create/copy/drop/
 -- rename, per SQLite's documented 12-step "Making Other Kinds Of Table
 -- Schema Changes" procedure. `.foreign_key_check()` is registered on this
--- migration below for the same reason as 003 and 012 -- five tables hold a
+-- migration below for the same reason as 003 and 012 -- six tables hold a
 -- `REFERENCES volumes(id)` foreign key (cartridge_volumes, volume_movements,
--- writes, verification_sessions, health_logs), and a rebuild that
--- renumbered rows would orphan every one of them silently. Every column,
--- type, default and constraint below is otherwise byte-for-byte identical
--- to the table as 004_volume_uuid.sql and 008_drop_volume_storage_class.sql
--- left it (SELECT-* is not used because the status CASE below needs an
--- explicit column list on both sides) -- only the status CHECK loses
--- 'quarantined', and `observed_condition` is a new column appended after
--- `uuid`, matching where 004's own `ALTER TABLE ... ADD COLUMN` landed it
--- in the live schema.
+-- writes, verification_sessions, health_logs, volume_deposits -- the last
+-- added by 007_warehouse_locations.sql, after 003's header above was
+-- written), and a rebuild that renumbered rows would orphan every one of
+-- them silently. Every column, type, default and constraint below is
+-- otherwise byte-for-byte identical to the table as 004_volume_uuid.sql and
+-- 008_drop_volume_storage_class.sql left it (SELECT-* is not used because
+-- the status CASE below needs an explicit column list on both sides) --
+-- only the status CHECK loses 'quarantined', and `observed_condition` is a
+-- new column placed right after `status`, before `first_write` -- adjacent
+-- to the column whose CHECK it complements, not appended at the end where
+-- 004's own `ALTER TABLE ... ADD COLUMN` landed `uuid` in the live schema.
 --
 -- MIGRATING EXISTING ROWS
 -- ------------------------
