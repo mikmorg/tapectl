@@ -330,6 +330,54 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-21 (LATEST) — THE LABEL IS EMPTY AND PUSHED. Master `223f20b`.
+  REVIEW-3 IS RUNNING; DO NOT DECLARE DONE UNTIL IT REPORTS.**
+  #274 and #275 closed. Gate **1656 tests / 0 failed**, clippy 0, fmt clean; **mhvtl gate
+  GREEN 27/27**; **lifecycle `--all` GREEN 412 / 402 / 0 failed / 10 skipped**, run as
+  `TAPECTL_MHVTL=1 bash scripts/lifecycle-suite.sh --all --device /dev/nst1 --erase short`.
+  All ten skips are documented precondition skips and their NAMES were checked, not just the
+  total. Only open issues are the three excluded by standing ruling (#182 `needs:cto`,
+  #143/#144 unlabelled).
+
+  **Policy rule 7's third review is IN FLIGHT** over `057a6591..HEAD` — 45 commits, 36
+  non-doc files, ~5,385 insertions that no review has seen, including migration 017, the
+  session state machine (`ConfirmOutcome::Inconclusive`, resume re-confirm), the quarantine
+  clear, and all three harness scripts. Both prior rounds refilled the queue with real
+  defects, so **expect this one to as well** — that is the process working. Ten dimensions,
+  one adversarial refute-by-default verifier per finding, plus the completeness critic.
+
+  **#275 was found by the residual sweep, not by the queue, and is the shape to keep
+  hunting.** The mhvtl gate's `no_plaintext_leak` check **could not fail**: it grepped
+  `/opt/mhvtl/$LOADED_TAG`, a directory that is `0750 mhvtl:mhvtl`, while the gate runs
+  unprivileged and contains no `sudo`. Every `grep -a -rq` exited 2 (permission error,
+  never a match), both guards skipped, and it fell through to `return 0` — PASS on every
+  green run, for 100+ commits, without reading a byte. **A negative assertion with no
+  positive control cannot distinguish "searched and found nothing" from "searched
+  nothing".** Both scans now read the tape DEVICE and must first find the volume label
+  (which `volume-format-v2.md` puts in the ID thunk in plaintext by design) before they are
+  allowed to report a needle absent; grep rc 1 (no match) is the pass, rc >= 2 is
+  inconclusive and fails. The lifecycle suite had the same scaffolding and no scan at all.
+  **Before adding a scan, check the needle is actually present on the target** — I nearly
+  wired one onto VOL-G, where `compaction` reclaims v1 photos before compacting so the
+  canary is not there, which would have been a new vacuous check inside the fix for vacuous
+  checks.
+
+  **Two operational facts about this VM, both cost time this session:**
+  1. **The harness's low-memory reaper kills the WRAPPER, not the work.** A backgrounded
+     `--all` run was reported "killed" twice; the first was still alive, orphaned to init,
+     and finished GREEN. Check `ps` and whether the log is still growing before believing a
+     run died, and never start a second — the tape lock (`/tmp/tapectl-tape.lock`) refuses
+     it anyway, which is how I learned the first was still running.
+  2. **`/scratch/tapectl-build.lock` only serializes tapectl's builds.** The `homorg`
+     project builds into `/scratch/homorg-target` without taking it; 16 concurrent rustc on
+     this 9.7 GB box is what triggered the reaper. Cross-repo contention is invisible to
+     this lock. Long suites are better run in the FOREGROUND, or accepted as orphans.
+
+  **Worktree hygiene drifted again** — pm-a and pm-b were left behind by the previous wave,
+  leaking ~7.8 GB. After cherry-pick integration `git merge-base --is-ancestor` is the WRONG
+  safety test (the SHAs differ by construction); use `git cherry -v master <branch>` and
+  require every line to be marked `-`.
+
 - **QUEUE STATE 2026-09-21 — the second review's queue is being worked; 2 highs left and BOTH
   are parked on one CTO decision.** Master is past `89fb001`; gate 1625 tests / 0 failed,
   clippy 0, fmt clean; mhvtl gate GREEN **now with a sixth leg, `rust_e2e`**; lifecycle `--all`
