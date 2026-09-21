@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use serde::Serialize;
 use tabled::{Table, Tabled};
 
@@ -20,6 +20,18 @@ pub enum StagingCommands {
         /// min_copies (issue #244, #262)
         #[arg(long)]
         force: bool,
+
+        /// Narrow which staged sets are considered for release to this
+        /// unit (repeatable) -- issue #274. Without `--force`, the same
+        /// min_copies split still applies within the named unit(s): one
+        /// below its own resolved min_copies keeps its staged bytes
+        /// retained (pass `--force` to release it too, exactly as for the
+        /// whole-archive form). A `'failed'` stage_set is always swept
+        /// regardless of this scope -- see `CleanScope::Units`'s own
+        /// contract in `src/staging/clean.rs`. An unknown unit name is an
+        /// error, not a silent no-op.
+        #[arg(long = "unit")]
+        unit: Vec<String>,
     },
 }
 
@@ -49,12 +61,29 @@ struct UnderCopiedUnit {
 /// reclaims those unconditionally regardless of scope (issue #262), so
 /// they carry no min_copies question for this function to answer.
 ///
+/// `unit_filter`, when `Some`, narrows the candidate set to just those unit
+/// ids (issue #274's `--unit`) -- the SAME query, not a second one, so a
+/// `--unit`-scoped `staging clean` and the whole-archive form can never
+/// disagree about what counts as a release candidate (issue #96). `None`
+/// reproduces the unfiltered, whole-archive query verbatim.
+///
 /// Returns `(unit id, unit name)` pairs. Shared by
 /// [`under_copied_release_candidates`] (which unit_names to check) and
 /// `StagingCommands::Clean`'s non-force path (the full candidate set, so it
 /// can compute "covered" = candidates minus under-copied).
-fn staged_release_candidate_units(conn: &Connection) -> Result<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare(
+fn staged_release_candidate_units(
+    conn: &Connection,
+    unit_filter: Option<&[i64]>,
+) -> Result<Vec<(i64, String)>> {
+    let filter_ids: &[i64] = unit_filter.unwrap_or(&[]);
+    let filter_predicate = match unit_filter {
+        None => String::new(),
+        Some(ids) => format!(
+            "AND u.id IN ({})",
+            ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+        ),
+    };
+    let sql = format!(
         "SELECT DISTINCT u.id, u.name
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
@@ -65,10 +94,14 @@ fn staged_release_candidate_units(conn: &Connection) -> Result<Vec<(i64, String)
                SELECT 1 FROM writes w
                WHERE w.stage_set_id = ss.id AND w.status <> 'completed'
            )
-         ORDER BY u.name",
-    )?;
+           {filter_predicate}
+         ORDER BY u.name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map(params_from_iter(filter_ids.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -87,8 +120,9 @@ fn staged_release_candidate_units(conn: &Connection) -> Result<Vec<(i64, String)
 fn under_copied_release_candidates(
     conn: &Connection,
     config: &Config,
+    unit_filter: Option<&[i64]>,
 ) -> Result<Vec<UnderCopiedUnit>> {
-    let candidates = staged_release_candidate_units(conn)?;
+    let candidates = staged_release_candidate_units(conn, unit_filter)?;
 
     let mut under = Vec::new();
     for (_, name) in candidates {
@@ -235,7 +269,7 @@ pub fn run(
             }
         }
 
-        StagingCommands::Clean { force } => {
+        StagingCommands::Clean { force, unit } => {
             // Issue #241: the #244 min_copies gate right below must
             // reproduce exactly, or a dry run would claim a release is
             // safe when the real run refuses it (or vice versa) — "a dry
@@ -247,13 +281,36 @@ pub fn run(
                      have to reproduce exactly or risk being wrong.",
                 ));
             }
+
+            // Issue #274: resolve every named `--unit` up front, eagerly --
+            // an unknown name is an error naming the unit, never silently
+            // ignored (it would otherwise just vanish from the narrowed
+            // candidate set below and look like "nothing to clean").
+            let named_ids: Vec<i64> = unit
+                .iter()
+                .map(|name| {
+                    crate::db::queries::get_unit_by_name(conn, name)?
+                        .map(|u| u.id)
+                        .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            // `None` here is exactly the pre-#274 unscoped path -- every
+            // branch below falls back to `CleanScope::Whole` in that case,
+            // reproducing today's output and `CleanScope::Whole`/
+            // covered-ids calls verbatim for a bare `staging clean`.
+            let unit_scope: Option<&[i64]> = if named_ids.is_empty() {
+                None
+            } else {
+                Some(named_ids.as_slice())
+            };
+
             // Issue #244, ADR-0012's 2026-09-17 amendment, revised by issue
             // #262: a unit below its own resolved min_copies must have its
             // staged bytes RETAINED, but that no longer refuses the WHOLE
             // command -- every other candidate unit that already meets its
             // own min_copies is released. `--force` is unaffected: it still
-            // releases everything, including under-copied units, exactly
-            // as before.
+            // releases everything in scope, including under-copied units,
+            // exactly as before.
             //
             // `clean_staging` itself stays policy-free (#238's conclusion
             // for `execute_batch`, restated by ADR-0012's amendment): this
@@ -264,18 +321,26 @@ pub fn run(
             // swept by `clean_staging` regardless of this scope (issue
             // #262's ruling on `CleanScope::Units`).
             let (mut report, retained): (clean::CleanReport, Vec<UnderCopiedUnit>) = if *force {
-                (
-                    clean::clean_staging(conn, config, true, clean::CleanScope::Whole)?,
-                    Vec::new(),
-                )
+                let scope = match unit_scope {
+                    Some(ids) => clean::CleanScope::Units(ids),
+                    None => clean::CleanScope::Whole,
+                };
+                (clean::clean_staging(conn, config, true, scope)?, Vec::new())
             } else {
-                let candidates = staged_release_candidate_units(conn)?;
-                let under_copied = under_copied_release_candidates(conn, config)?;
+                let candidates = staged_release_candidate_units(conn, unit_scope)?;
+                let under_copied = under_copied_release_candidates(conn, config, unit_scope)?;
                 if under_copied.is_empty() {
-                    // Nobody is under-copied -- identical to the pre-#262
-                    // behaviour, archive-wide, no scoping needed.
+                    // Nobody in scope is under-copied -- identical to the
+                    // pre-#262 behaviour when unscoped, and still narrowed
+                    // to exactly the named units when `--unit` was given
+                    // (never widened to `Whole` just because nothing here
+                    // needed retaining).
+                    let scope = match unit_scope {
+                        Some(ids) => clean::CleanScope::Units(ids),
+                        None => clean::CleanScope::Whole,
+                    };
                     (
-                        clean::clean_staging(conn, config, false, clean::CleanScope::Whole)?,
+                        clean::clean_staging(conn, config, false, scope)?,
                         Vec::new(),
                     )
                 } else {
@@ -494,7 +559,10 @@ mod tests {
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean { force: false },
+            &StagingCommands::Clean {
+                force: false,
+                unit: Vec::new(),
+            },
             false,
             false,
         );
@@ -548,7 +616,10 @@ mod tests {
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean { force: true },
+            &StagingCommands::Clean {
+                force: true,
+                unit: Vec::new(),
+            },
             false,
             false,
         );
@@ -663,7 +734,10 @@ mod tests {
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean { force: false },
+            &StagingCommands::Clean {
+                force: false,
+                unit: Vec::new(),
+            },
             false,
             false,
         );
@@ -743,7 +817,10 @@ mod tests {
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean { force: false },
+            &StagingCommands::Clean {
+                force: false,
+                unit: Vec::new(),
+            },
             false,
             false,
         );
@@ -782,7 +859,125 @@ mod tests {
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean { force: false },
+            &StagingCommands::Clean {
+                force: false,
+                unit: Vec::new(),
+            },
+            false,
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        let status: String = conn
+            .query_row("SELECT status FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cleaned");
+        assert!(!staged_file.exists());
+    }
+
+    // ── issue #274: `--unit` scoping ──
+
+    /// `--unit` naming a covered unit releases only that unit's staged
+    /// bytes and leaves a DIFFERENT covered unit's staged bytes untouched
+    /// -- the narrowing `CleanScope::Units` exists for, exercised through
+    /// the CLI's own `--unit` flag rather than the internal `CleanScope`
+    /// directly.
+    #[test]
+    fn unit_flag_releases_only_the_named_covered_unit() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let named_path = seed_staged_unit_with_completed_writes(
+            &conn,
+            dir.path(),
+            tenant_id,
+            "testlib/named",
+            2,
+        );
+        let other_path = seed_staged_unit_with_completed_writes(
+            &conn,
+            dir.path(),
+            tenant_id,
+            "testlib/other-covered",
+            2,
+        );
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: false,
+                unit: vec!["testlib/named".to_string()],
+            },
+            false,
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !named_path.exists(),
+            "the named unit's staged bytes must be released"
+        );
+        assert!(
+            other_path.exists(),
+            "an unrelated covered unit outside --unit's scope must survive"
+        );
+    }
+
+    /// `--unit` naming a unit the catalog has never heard of is an error
+    /// that names the unit -- not a silent no-op that quietly cleans
+    /// nothing.
+    #[test]
+    fn unit_flag_with_an_unknown_name_errors() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: false,
+                unit: vec!["testlib/ghost".to_string()],
+            },
+            false,
+            false,
+        );
+        let err = result.expect_err("an unknown --unit name must error, not silently no-op");
+        assert!(
+            err.to_string().contains("testlib/ghost"),
+            "the error must name the unknown unit: {err}"
+        );
+    }
+
+    /// `--unit` + `--force` on an under-copied unit releases it -- the
+    /// exact mechanism `restage_action`'s forced recipe (issue #274)
+    /// relies on, exercised here through the CLI flag rather than
+    /// `clean_staging` directly.
+    #[test]
+    fn unit_flag_with_force_releases_an_under_copied_unit() {
+        let (conn, staged_file, dir) = seed_unit_needing_a_second_copy("testlib/alpha");
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: true,
+                unit: vec!["testlib/alpha".to_string()],
+            },
             false,
             false,
         );
