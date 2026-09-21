@@ -527,16 +527,59 @@ fn move_together(
                 // `active` volume (what `volume init` inserts) or a
                 // `retired` one (what `cartridge retire` leaves, mount
                 // deliberately open) must get a hint that actually runs.
-                let status: String = conn.query_row(
-                    "SELECT status FROM volumes WHERE id = ?1",
+                //
+                // Issue #273: `run_deposit`'s OWN gate is
+                // `coverage::eligible` (`status = 'sealed' AND
+                // observed_condition = 'ok'`, issue #255) -- not `status`
+                // alone. Since #242 moved quarantine off `status` onto
+                // `observed_condition`, a verify-quarantined volume still
+                // reads `status = 'sealed'`, so a bare `status == "sealed"`
+                // check here told the operator "go ahead and deposit" for
+                // a volume `run_deposit` would then refuse. Query the same
+                // predicate `run_deposit` gates on -- not a second
+                // hand-written status/condition check (`coverage.rs` is
+                // the sole owner of every `volumes.status`/
+                // `observed_condition` predicate, issue #96).
+                //
+                // `eligible`, deliberately, not `in_service`: the question
+                // this hint answers is "would `volume deposit add` accept
+                // this volume", which is exactly what `eligible` decides
+                // (sealed-only). `in_service` also admits `active`/`full`,
+                // which `run_deposit` does not -- using it here would
+                // widen the "go ahead and deposit" branch to statuses
+                // `run_deposit` still refuses, regressing
+                // `move_refuses_a_warehouse_destination_for_an_active_volume`.
+                // The two predicates share `condition_ok`, so they agree on
+                // the quarantine case this issue is actually about; they
+                // diverge only on `active`/`full`, which is where the
+                // wrong choice would have shown up.
+                let eligible_expr = crate::policy::coverage::eligible("v");
+                let (status, condition, eligible): (String, String, bool) = conn.query_row(
+                    &format!(
+                        "SELECT v.status, v.observed_condition, {eligible_expr} \
+                         FROM volumes v WHERE v.id = ?1"
+                    ),
                     params![vol_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
-                if status == "sealed" {
+                if eligible {
                     format!(
                         "To record that a copy of this volume was uploaded to \
                          \"{location_name}\", use:\n    \
                          tapectl volume deposit add {label} --to {location_name}"
+                    )
+                } else if status == "sealed" {
+                    // Eligible is false but status is sealed: the only
+                    // other thing `coverage::eligible` checks is
+                    // `observed_condition` (issue #255) -- this medium was
+                    // quarantined, not merely unsealed.
+                    format!(
+                        "volume \"{label}\" is sealed but its observed_condition is \
+                         \"{condition}\" (ADR-0012, the 2026-09-17 amendment): a prior \
+                         verify or write-time contact check found evidence this medium \
+                         cannot be trusted, so a warehouse deposit must never be recorded \
+                         for it. Move the cartridge to a shelf location instead \
+                         (`tapectl location list` shows the shelves)."
                     )
                 } else {
                     // Not merely unrunnable for `retired` -- wrong: the
@@ -1314,6 +1357,43 @@ mod tests {
             !msg.contains("volume deposit add"),
             "an active volume's deposit would itself be refused by `run_deposit`, so the \
              hint must not recommend it; got: {msg}"
+        );
+    }
+
+    /// Issue #273: since #242, a verify-quarantined volume still reads
+    /// `status = 'sealed'` — the finding moved to `observed_condition`,
+    /// which this hint did not consult, so a status-only check read a
+    /// quarantined tape as ordinary and pointed the operator at
+    /// `volume deposit add`, a command `run_deposit` (gated on
+    /// `coverage::eligible`, issue #255) would then itself refuse. `setup`
+    /// seeds `observed_condition = 'ok'` (migration 017's column default),
+    /// so this is the same fixture as `move_refuses_a_warehouse_destination`
+    /// plus one `UPDATE`, isolating the quarantine as the only variable.
+    ///
+    /// Confirmed red against unfixed code (2026-09-21): the first
+    /// assertion below failed — the hint recommended `volume deposit add`
+    /// for a volume that command would refuse.
+    #[test]
+    fn move_refuses_a_warehouse_destination_for_a_quarantined_sealed_volume() {
+        let conn = setup();
+        conn.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = 'L6-0001'",
+            [],
+        )
+        .unwrap();
+
+        let err = move_volume(&conn, "L6-0001", "glacier", false)
+            .expect_err("a cartridge cannot be moved into cold cloud storage");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("volume deposit add"),
+            "a quarantined volume's deposit would itself be refused by `run_deposit` \
+             (issue #255), so `status = 'sealed'` alone must not be read as depositable; \
+             got: {msg}"
+        );
+        assert!(
+            msg.contains("quarantined"),
+            "the refusal should name why: quarantine, not merely 'not sealed'; got: {msg}"
         );
     }
 
