@@ -242,6 +242,14 @@ The announcement is display only. It does not prompt, and there is no flag to
 select a subset: if the list is not what you want, stop, run `staging clean` to
 release what is already safely on tape, and start again.
 
+`staging clean` releases every unit that has met its policy's `min_copies` and
+**retains** the ones that have not, naming them (ADR-0012, 2026-09-21, issue
+#262). So a unit still short of its second copy keeps its staged bytes — the
+release cannot quietly discard the cheap route to a copy your own policy
+requires — while everything already safely on tape is freed. `--force`
+releases the retained ones too, and is wider than the gate it overrides: it
+also drops staged data for sets never written to any tape.
+
 ### Check What's Pending
 
 ```bash

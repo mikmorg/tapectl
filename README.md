@@ -221,9 +221,10 @@ Two gated test suites exist for heavier validation:
 TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_e2e -- --ignored --nocapture
 
-# The two operator-level suites on mhvtl: the 26-leg verification gate, and
-# the lifecycle suite (years of use in minutes, 13 scenarios, a 10-way
-# restore matrix). Both are documented in docs/.
+# The two operator-level suites on mhvtl: the 27-check verification gate
+# (its sixth leg runs tests/mhvtl_e2e.rs, which nothing routine invoked until
+# issue #259), and the lifecycle suite (years of use in minutes, 16
+# scenarios, a 10-way restore matrix). Both are documented in docs/.
 TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 scripts/mhvtl-verify-gate.sh
 scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
 
