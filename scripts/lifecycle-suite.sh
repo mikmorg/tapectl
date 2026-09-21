@@ -3790,12 +3790,29 @@ PY2
     # property it exists to prove is false. Measured 2026-09-17 -- it passed,
     # in exactly that control, before this guard was added. A comparison is
     # only evidence if both sides are known to be non-vacuous.
-    grep -vq ' cleaned id=' "$out" || {
-        echo "csc_fingerprint: the stage sets are already 'cleaned' -- there are no live staged bytes left to consume, so comparing this fingerprint to another would prove nothing"
+    # Issue #258: this guard was `grep -vq ' cleaned id=' "$out" || fail`, and
+    # under GNU grep -- which is what a non-interactive bash resolves here --
+    # `-vq` exits 0 as soon as ANY line is not selected. The fingerprint always
+    # carries `info ...` and `  slice ...` lines, none of which can match
+    # ' cleaned id=', so the guard exited 0 unconditionally and never fired.
+    # The guard written to stop a vacuous comparison was itself vacuous.
+    #
+    # Written positively now, which is also flavour-independent: `grep -q PAT`
+    # exits 0 if and only if PAT matches, under every grep. (Worth knowing: an
+    # interactive shell on this box resolves `grep` to ugrep, whose `-vq`
+    # disagrees with GNU's on exactly this case -- so testing a `-v` assertion
+    # by hand can give the opposite answer to what the suite sees.)
+    if grep -q ' cleaned id=' "$out"; then
+        echo "csc_fingerprint: a stage set is already 'cleaned' -- there are no live staged bytes left to consume, so comparing this fingerprint to another would prove nothing"
         grep ' cleaned id=' "$out"
         return 1
+    fi
+    # And at least one set must actually be live, or the comparison has no
+    # subject at all. Positive assertion for the same reason.
+    grep -q ' staged id=' "$out" || {
+        echo "csc_fingerprint: no stage set is 'staged' -- the fingerprint has no live bytes to compare"
+        return 1
     }
-    grep -c ' staged id=' "$out" >/dev/null || return 1
 }
 
 csc_capture_staged() {
