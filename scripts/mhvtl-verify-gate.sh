@@ -304,11 +304,87 @@ PY
     fi
     return 0
 }
+# Read every file on the tape, BOT to EOD, concatenated into one file.
+# A read returning 0 bytes is a filemark; the st driver then advances past
+# it, so the next read starts the next file. Two consecutive empty reads is
+# EOD. The 64-file ceiling is a runaway guard, not a layout assumption -- a
+# v2 volume is ~12 files -- and hitting it is reported as a failure rather
+# than silently truncating the scan.
+dump_whole_tape() { # dump_whole_tape <outfile>
+    local out="$1" tmp="$RUN/.tapefile" got empty=0 n=0
+    mt -f "$TAPE_DEV" rewind || { echo "dump_whole_tape: rewind failed"; return 1; }
+    : > "$out"
+    while [ "$n" -lt 64 ]; do
+        dd if="$TAPE_DEV" bs=512k of="$tmp" 2>/dev/null
+        got="$(stat -c %s "$tmp" 2>/dev/null)" || return 1
+        if [ "$got" -eq 0 ]; then
+            empty=$((empty + 1))
+            [ "$empty" -ge 2 ] && break
+        else
+            empty=0
+            cat "$tmp" >> "$out"
+        fi
+        n=$((n + 1))
+    done
+    rm -f "$tmp"
+    [ "$n" -lt 64 ] || {
+        echo "dump_whole_tape: hit the 64-file ceiling without reaching EOD"
+        return 1
+    }
+    mt -f "$TAPE_DEV" rewind || return 1
+    echo "dump_whole_tape: $n file(s), $(stat -c %s "$out") bytes"
+}
+
+# The on-media plaintext scan. Reads the TAPE DEVICE, not mhvtl's backing
+# directory (issue #275). That directory is mode 0750 mhvtl:mhvtl and this
+# gate runs unprivileged with no sudo anywhere, so every `grep -rq` into it
+# exited 2 -- a permission error, never a match -- and the old
+# negative-only check fell through to `return 0` on every run. It reported
+# PASS because it could not read, for 100+ commits.
+#
+# The structural fix is the POSITIVE CONTROL below, not the device read: a
+# check that only asserts absence cannot distinguish "searched and found
+# nothing" from "searched nothing", which is the same shape as the
+# `csc_fingerprint` guard (issue #258) and the never-run `permute` restore
+# matrix. `volume-format-v2.md` puts the volume label in the ID thunk
+# (File 0) in plaintext by design, so if the label is NOT found then the
+# scan itself is broken, and this check must fail as loudly as a real leak
+# rather than report a clean tape.
+#
+# Reading the device rather than the directory also makes this check work
+# on a real LTO-6, which has no media directory at all -- it is no longer
+# mhvtl-only.
+#
+# The whole tape is scanned, encrypted slices included, rather than only
+# the plaintext positions the Rust `mhvtl_no_plaintext_tenant_metadata`
+# test parses out of the layout. That is deliberate: it is strictly
+# stricter (a leak anywhere fails) and keeps this check independent of the
+# layout parser it exists to cross-check. The cost is a chance of a short
+# needle appearing in ciphertext by coincidence -- for "unitA" in a
+# gate-sized volume that is ~1e-5, and the canary is long and unique.
 step_leakscan() {
-    local media="/opt/mhvtl/$LOADED_TAG"
-    [ -d "$media" ] || return 1
-    if grep -a -rq "$CANARY" "$media"; then return 1; fi
-    if grep -a -rq "unitA" "$media" ; then return 1; fi
+    local dump="$RUN/leakscan-tape.bin" needle rc
+    dump_whole_tape "$dump" || return 1
+
+    # Positive control FIRST: prove the scan can find what must be there
+    # before trusting it about what must not be.
+    grep -a -q "label = \"$LABEL\"" "$dump" || {
+        echo "leakscan: volume label $LABEL is NOT in the tape dump -- the scan is broken, not the tape clean"
+        return 1
+    }
+
+    # Negative needles. grep's rc 1 (no match) is the real pass; rc >= 2 is
+    # an error and must never be read as "clean" -- that read is exactly
+    # what issue #275 was.
+    for needle in "$CANARY" "unitA"; do
+        grep -a -q "$needle" "$dump"
+        rc=$?
+        case "$rc" in
+            0) echo "leakscan: PLAINTEXT LEAK -- \"$needle\" appears on tape"; return 1 ;;
+            1) ;;
+            *) echo "leakscan: grep failed (rc=$rc) looking for \"$needle\" -- inconclusive, not clean"; return 1 ;;
+        esac
+    done
     return 0
 }
 echo "gate: leg 3 — negative checks"
