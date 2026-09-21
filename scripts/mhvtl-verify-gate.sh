@@ -232,6 +232,34 @@ step_vol_verify() {
     TCTL volume verify "$LABEL" --device "$TAPE_DEV" --json | tee "$RUN/verify.json"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify.json"
 }
+# Issue #277's recording half, which NOTHING else covers. The `sealed_at`
+# UPDATE lives in `finish_session`, reachable only through
+# `volume write`/`volume resume` against a real device -- so every unit test
+# for #277 sets the column by raw SQL and none proves it is ever written.
+# Delete that one `conn.execute` and the whole Rust suite stays green while
+# `volume resume` silently returns to re-sealing already-sealed cartridges.
+# That is the revert-silent shape (issue #284) applied to a data-loss guard,
+# so the guard gets an on-media check rather than an argument.
+#
+# The row lookup is its own positive control: `fetchone()` returning None
+# means the volume is not in the catalog at all, which fails here rather
+# than passing vacuously the way `assert row[0] is not None` on a missing
+# row would.
+step_sealed_at() {
+    LABEL="$LABEL" python3 - "$HOME_DIR/tapectl.db" <<'PY'
+import os, sqlite3, sys
+label = os.environ["LABEL"]
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT sealed_at FROM volumes WHERE label = ?", (label,)
+).fetchone()
+assert row is not None, f"no volumes row for {label} -- the check cannot see what it is asserting about"
+assert row[0] is not None, (
+    f"volumes.sealed_at is NULL for {label} after a completed sealed write -- "
+    "finish_session did not record the seal (issue #277)"
+)
+print(f"{label}: sealed_at = {row[0]}")
+PY
+}
 step_evidence() {
     python3 - "$HOME_DIR/tapectl.db" <<'PY'
 import sqlite3, sys
@@ -273,6 +301,7 @@ check stage_symlink_unit step_stage_symlinks
 check erase_scratch   step_erase_scratch_tape
 check volume_init     step_vol_init
 check volume_write    step_vol_write
+check sealed_at_recorded step_sealed_at
 check volume_verify   step_vol_verify
 check evidence_row    step_evidence
 check restore_diff    step_restore_A

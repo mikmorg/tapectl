@@ -180,8 +180,19 @@ Rules that hold in every path:
   byte-identical from the frozen staging files; if **≥1 slice** is written,
   reposition to `front_zone_len + written_slices` (both terms exact: the front
   zone length is fixed by the Layout, the slice count by the cursor rows) and
-  continue. The absent seal marker confirms the tape is legitimately unsealed
-  (safe to resume, not an append to a sealed volume).
+  continue. **The absent seal marker does NOT confirm the tape is unsealed**
+  — corrected 2026-09-21 (issue #277, ADR-0012's "the seal is RECORDED, not
+  inferred"). `seal_marker_parses_at` returns false both when a position
+  holds no marker and when the read *errors*, and `MismatchKind::SealUnreadable`
+  is precisely what produces an `Inconclusive` confirm — so after one the seal
+  file this session wrote is exactly the file the resume cannot read. Inferring
+  "unsealed" there meant falling through to `reposition_for_resume` and `seal()`
+  against a physically sealed cartridge, with ADR-0003's refusal bypassed.
+  Resume now consults `volumes.sealed_at` (migration 018), written when this
+  session's own `seal()` returned `Ok`: set → re-enter `confirm`, never
+  reposition and never seal; NULL → the seal is genuinely still owed and the
+  cursor rule above applies unchanged. The tape-side probes remain as defence
+  in depth, not as the decision.
 - **Resume across a process restart** (#25): the rule above is scoped "same
   session", meaning the `InterruptedSession` value `execute` returned. When the
   process itself is gone, that value must be rebuilt — and it is **rehydrated,
