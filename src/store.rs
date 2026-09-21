@@ -170,8 +170,13 @@ impl MismatchKind {
     ///   next verify, a false one silently takes real coverage to zero and
     ///   nothing un-quarantines a volume. The short-read half rides along
     ///   on `FrontIndexUnreadable`'s reasoning below: same event, different
-    ///   position, same epistemics. **The ADR text has not been amended to
-    ///   match; do not "fix" this arm back without one.**
+    ///   position, same epistemics. **Ratified 2026-09-17 (issue #239):**
+    ///   `docs/adr/0012-...md` carries the correction, so this arm is the
+    ///   ADR's own position and not an unratified override — the sentence
+    ///   that used to stand here said the opposite and was read by the
+    ///   2026-09-18 review as an instruction to reinstate the defect
+    ///   (issue #266). Do not "fix" this arm back; the 2026-09-18
+    ///   amendment then extended the same rule to `confirm`.
     /// - `FrontIndexDivergesFromSeal` — **yes**. The tape's two ends
     ///   disagree about bytes both of them recorded; its own doc has said
     ///   "(quarantine-grade)" since the chain walk was written.

@@ -3191,7 +3191,14 @@ pub struct VerifyReport {
     /// so it is reportable here and not storable there. See
     /// [`record_verification_results`].
     pub mismatches: Vec<crate::store::Mismatch>,
-    /// What this verify did to `volumes.status` (issue #234), and why.
+    /// What this verify did to `volumes.observed_condition` (issue #234),
+    /// and why.
+    ///
+    /// **Not `status`** — issue #242 moved quarantine to its own column and
+    /// this doc said `status` until issue #266 caught it. The effect's field
+    /// is `previous_condition`, and `volumes.status` is never written here;
+    /// `--json`'s `previous_status`/`status_changed` are kept by the
+    /// additive-key rule and honestly report a status that does not move.
     ///
     /// `Some` exactly when at least one mismatch PROVES the medium is bad
     /// (ADR-0012's 2026-09-17 amendment,
