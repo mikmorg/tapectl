@@ -2983,6 +2983,9 @@ PM_VOL_SEQ=0
 PM_CHECK_NAME=""
 
 pm_skip_never_written() { skip "pm-final-$1.unit" "unit $1 never ended up on any volume this walk"; return $?; }
+# Issue #282: the end-of-walk matrix's own skip, for a unit whose latest
+# copy is on a cartridge this run cannot put back in the drive.
+pm_skip_unreachable() { skip "pm-final-$1.unit" "$2"; return $?; }
 
 pm_op_mutate() { mutate_source "$SRC/$2" "$SEED" "${1#mutate:}"; }
 pm_op_snapshot() {
@@ -3314,6 +3317,39 @@ for v in vols:
             # This line said `$SRC/$u` and nobody saw it, because the
             # `v.get("label")` bug above meant `last` was always empty and
             # this branch never ran. A skip was hiding a wrong comparison.
+            # Issue #282: this matrix read whatever cartridge happened to be
+            # in the drive -- it never loaded one. `last` is the most recent
+            # volume `catalog locate` names for THIS unit, which need not be
+            # the volume written last overall: a `staging-clean` op can
+            # release every stage set and the next `write-next-volume` carry
+            # a strict subset of the units. So whether the right tape was
+            # loaded was decided by the RNG -- red on the seeds where it was
+            # not, and green on the others for no reason this check
+            # controls. The scenario header two thousand lines up already
+            # names that as the worst property a gate can have; it was
+            # written about the copy_count assertion that was moved out for
+            # exactly this, and then the matrix was enabled (issue #252)
+            # with the same flaw.
+            pm_latest="${PM_WRITTEN[-1]}"
+            if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+                # One cartridge: `next_tape` erased it in place before each
+                # later write, so only the volume written LAST still has
+                # bytes. `load_volume_tape` refuses here unconditionally and
+                # is right to -- there is nothing to fetch.
+                if [ "$last" != "$pm_latest" ]; then
+                    check "pm-final-$u.unit" pm_skip_unreachable "$u" \
+                        "$last holds $u's latest copy but was erased in place by a later write under --single-cartridge"
+                    continue
+                fi
+            elif [ "$last" != "$pm_latest" ] && ! load_volume_tape "$last"; then
+                # Multi-cartridge: the cartridge is in a library slot, so it
+                # must be loaded before reading or `binding::corroborate_volume`
+                # refuses the contact. Only load when it is not already in the
+                # drive -- reloading the loaded volume is needless tape motion.
+                check "pm-final-$u.unit" pm_skip_unreachable "$u" \
+                    "could not load $last, the cartridge holding $u's latest copy"
+                continue
+            fi
             restore_matrix "$last" "$u" "$tenant" "$pm_sd/pm-snapshot-$last/$u" "pm-final-$u"
         else
             check "pm-final-$u.unit" pm_skip_never_written "$u"
