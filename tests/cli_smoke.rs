@@ -1524,6 +1524,151 @@ fn config_check_reports_all_three_problems_from_one_broken_config_at_once() {
     );
 }
 
+// --- issue #261: an ambiguous [[backends.lto]] section must not brick every
+// command --------------------------------------------------------------
+//
+// `Config::load`'s `validate_backends` refuses two `[[backends.lto]]`
+// entries whose `device_tape` values canonicalize to the same path
+// (`config::device_matches`, which falls back to `std::fs::canonicalize` on
+// both sides) — correctly, for a WRITE path: it is what keeps
+// `resolve_lto_backend`'s `.find(...)` (issue #222) from silently picking
+// whichever backend happens to be first, which on this VM could be the real
+// production drive after a reboot renumbers `/dev` (CLAUDE.md's own
+// warning). But before this fix `main.rs` ran that same strict check for
+// EVERY command, so the exact same transient collision bricked
+// `restore`/`catalog rebuild`/`report`/`audit`/`db backup`/`db fsck
+// --repair` too — none of which ever resolve an LTO backend for a write.
+//
+// `ambiguous_backend_config` builds the collision the portable way (a real
+// file plus a symlink to it, canonicalizing together) rather than touching
+// `/dev` — the same recipe `cli::backend::add`'s own collision tests use.
+
+/// Append two `[[backends.lto]]` entries to `home`'s freshly-`init`ed
+/// config whose `device_tape` values are DIFFERENT strings that
+/// canonicalize to the SAME path, and return that path (the target) and its
+/// by-id-style alias — exactly the shape `Config::validate_backends`
+/// refuses (`backend_problems`, `src/config.rs`).
+fn write_ambiguous_backend_config(home: &std::path::Path, dev_dir: &std::path::Path) {
+    let real = dev_dir.join("nst0");
+    std::fs::File::create(&real).unwrap();
+    let by_id = dev_dir.join("scsi-XYZZY-nst");
+    std::os::unix::fs::symlink(&real, &by_id).unwrap();
+
+    let cfg = config_toml_path(home);
+    let mut content = std::fs::read_to_string(&cfg).unwrap();
+    content.push_str(&format!(
+        "\n[[backends.lto]]\nname = \"a\"\ndevice_tape = \"{}\"\ndevice_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n",
+        real.display()
+    ));
+    content.push_str(&format!(
+        "\n[[backends.lto]]\nname = \"b\"\ndevice_tape = \"{}\"\ndevice_sg = \"/dev/sg1\"\ngeneration = \"LTO-6\"\n",
+        by_id.display()
+    ));
+    std::fs::write(&cfg, &content).unwrap();
+}
+
+/// The negative control, and the fix's acceptance test in one: a read-only
+/// command must survive the exact collision a write command must still
+/// refuse.
+///
+/// Before the fix this failed at the FIRST assertion — `report summary`
+/// exited 2 with the same `error: failed to load config: ...: backends.lto[0]
+/// ("a") and backends.lto[1] ("b") both resolve to device_tape ... — two
+/// backends on the same drive make --device resolution ambiguous` every
+/// other command got, because `main.rs` loaded the config strictly before
+/// any subcommand ran at all. See the issue for the recorded output.
+///
+/// `report summary` is `ReportCommands::Summary => report_summary(conn,
+/// json_output)` (`src/cli/report.rs`) — it does not even use the `Config`
+/// its own `run` signature takes, but `main.rs`'s common dispatch still had
+/// to build one to get there at all.
+///
+/// The write side (`volume init`, no `--device`) must refuse IDENTICALLY
+/// both before and after the fix, proving the lenient door
+/// (`Config::load_tolerating_backend_ambiguity`) is never reachable from a
+/// write path. The absence of `resolve_lto_backend`'s OWN ambiguity message
+/// ("pass --device to select one", which fires on a bare *count* > 1, with
+/// no collision involved) proves the refusal fires at config-load time,
+/// before `resolve_lto_backend` ever runs at all.
+#[test]
+fn ambiguous_backends_no_longer_brick_a_read_command_but_a_write_still_refuses() {
+    let home = TempDir::new().unwrap();
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let dev_dir = TempDir::new().unwrap();
+    write_ambiguous_backend_config(home.path(), dev_dir.path());
+
+    // Read path: must succeed.
+    let read_out = run_tapectl(home.path(), &["report", "summary"]);
+    assert!(
+        read_out.status.success(),
+        "report summary must survive an ambiguous [[backends.lto]] section \
+         (issue #261) — stdout={}\nstderr={}",
+        String::from_utf8_lossy(&read_out.stdout),
+        String::from_utf8_lossy(&read_out.stderr),
+    );
+
+    // Write path: must still refuse, and refuse at CONFIG LOAD.
+    let write_out = run_tapectl(home.path(), &["volume", "init", "TESTVOL"]);
+    let write_err = String::from_utf8_lossy(&write_out.stderr);
+    assert_eq!(
+        write_out.status.code(),
+        Some(2),
+        "write path must refuse; stderr={write_err}"
+    );
+    assert!(
+        write_err.contains("both resolve to device_tape"),
+        "write path must refuse with the load-time collision message; \
+         stderr={write_err}"
+    );
+    assert!(
+        !write_err.contains("pass --device to select one"),
+        "write path must never reach resolve_lto_backend's own ambiguity \
+         message — seeing it would mean the refusal did NOT fire at config \
+         load, i.e. this command got past the lenient door; stderr={write_err}"
+    );
+}
+
+/// The same collision, for the rest of the named set (issue #261): each of
+/// these must not fail with the collision message (or any "failed to load
+/// config" text) the way it did before the fix. Each command may still fail
+/// for an ORDINARY, unrelated reason on a freshly-`init`ed, empty catalog
+/// (e.g. "no such unit", "nothing to restore") — this only asserts that the
+/// failure, if any, is not the config-load refusal.
+#[test]
+fn ambiguous_backends_do_not_surface_as_a_config_load_failure_for_the_rest_of_the_named_set() {
+    let home = TempDir::new().unwrap();
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let dev_dir = TempDir::new().unwrap();
+    write_ambiguous_backend_config(home.path(), dev_dir.path());
+
+    let backup_dest = dev_dir.path().join("backup.db");
+    let backup_arg = backup_dest.to_str().unwrap().to_string();
+    for args in [
+        vec!["audit".to_string()],
+        vec!["catalog".to_string(), "stats".to_string()],
+        vec!["report".to_string(), "fire-risk".to_string()],
+        vec![
+            "db".to_string(),
+            "backup".to_string(),
+            "--to".to_string(),
+            backup_arg,
+        ],
+        vec!["db".to_string(), "fsck".to_string(), "--repair".to_string()],
+    ] {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_tapectl(home.path(), &arg_refs);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("both resolve to device_tape"),
+            "{arg_refs:?} must not see the backend-collision refusal; stderr={err}"
+        );
+        assert!(
+            !err.contains("failed to load config"),
+            "{arg_refs:?} must not fail at config load at all; stderr={err}"
+        );
+    }
+}
+
 // --- issue #228: the startup path's four defects ------------------------
 //
 // Every test here spawns the real binary, because that is the only place
