@@ -520,19 +520,86 @@ load_volume_tape() {
     devcmd mtx -f "$CHG_SG" load "$slot" "$DTE" || { echo "load_volume_tape: load $slot $DTE failed"; return 1; }
 }
 
-# ---------- leak-scan media path (mhvtl only; real drive -> caller SKIPs) ----------
-mhvtl_media_dir() {
-    [ "$MHVTL_DISCOVERY" = 1 ] || return 1
-    [ -n "${LOADED_TAG:-}" ] || return 1
-    local guess
-    for guess in "/scratch/mhvtl/$LOADED_TAG" "/opt/mhvtl/$LOADED_TAG"; do
-        [ -d "$guess" ] && { echo "$guess"; return 0; }
+# ---------- leak scan: the tape device, BOT to EOD ----------
+# This replaced `mhvtl_media_dir()`, which resolved mhvtl's backing
+# directory for a scan that was never written (issue #275). Two reasons
+# not to revive that shape: the directory is mode 0750 mhvtl:mhvtl and
+# this suite runs unprivileged with no sudo anywhere -- which is how the
+# GATE's equivalent check came to report PASS for 100+ commits without
+# being able to read a byte -- and a real LTO-6 has no media directory at
+# all, so a directory scan can never run on the drive that matters.
+#
+# A zero-length read is a filemark; the st driver then advances past it,
+# so the next read starts the next file. Two consecutive empty reads is
+# EOD. The 64-file ceiling is a runaway guard, not a layout assumption.
+lc_dump_whole_tape() { # lc_dump_whole_tape <outfile>
+    local out="$1" tmp="$RUN/.lc-tapefile" got empty=0 n=0
+    mt -f "$TAPE_DEV" rewind || { echo "lc_dump_whole_tape: rewind failed"; return 1; }
+    : > "$out"
+    while [ "$n" -lt 64 ]; do
+        dd if="$TAPE_DEV" bs=512k of="$tmp" 2>/dev/null
+        got="$(stat -c %s "$tmp" 2>/dev/null)" || return 1
+        if [ "$got" -eq 0 ]; then
+            empty=$((empty + 1))
+            [ "$empty" -ge 2 ] && break
+        else
+            empty=0
+            cat "$tmp" >> "$out"
+        fi
+        n=$((n + 1))
     done
-    return 1
+    rm -f "$tmp"
+    [ "$n" -lt 64 ] || { echo "lc_dump_whole_tape: hit the 64-file ceiling without reaching EOD"; return 1; }
+    mt -f "$TAPE_DEV" rewind || return 1
+    echo "lc_dump_whole_tape: $n file(s), $(stat -c %s "$out") bytes"
+}
+
+# Assert the volume just written carries no plaintext canary.
+#
+# The POSITIVE CONTROL is the point, not the scan: a check that only
+# asserts absence cannot distinguish "searched and found nothing" from
+# "searched nothing", which is how the gate's version of this check passed
+# for 100+ commits while reading nothing at all (issue #275), how
+# `csc_fingerprint` passed vacuously (#258), and how `permute`'s restore
+# matrix went unrun. `volume-format-v2.md` puts the volume label in the ID
+# thunk in plaintext by design, so if the label is not found the SCAN is
+# broken and this check must fail as loudly as a real leak.
+#
+# Only $CANARY is used as a negative needle, deliberately. Unit names
+# would be the obvious second needle -- the gate uses "unitA" -- but this
+# suite's units are "photos", "docs" and "big", short enough words that a
+# plaintext RESTORE.sh or system guide could contain one legitimately and
+# turn this into a flaky red. $CANARY is long, unique per run, and planted
+# in a real archived file's name AND content by `make_source`.
+#
+# Call this while the written cartridge is still loaded -- i.e. directly
+# after the `volume write` check, before any `next_tape`.
+lc_leak_scan() { # lc_leak_scan <label>
+    local label="$1" dump="$RUN/leakscan-$1.bin" rc
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: read $TAPE_DEV BOT..EOD and assert no plaintext canary on $label"
+        return 0
+    fi
+    lc_dump_whole_tape "$dump" || return 1
+
+    grep -a -q "label = \"$label\"" "$dump" || {
+        echo "lc_leak_scan: volume label $label is NOT in the tape dump -- the scan is broken, not the tape clean"
+        return 1
+    }
+
+    grep -a -q "$CANARY" "$dump"
+    rc=$?
+    case "$rc" in
+        0) echo "lc_leak_scan: PLAINTEXT LEAK -- the canary appears on $label"; return 1 ;;
+        1) return 0 ;;
+        *) echo "lc_leak_scan: grep failed (rc=$rc) -- inconclusive, not clean"; return 1 ;;
+    esac
 }
 
 # ---------- globals shared by fixtures / restore matrix ----------
-# CANARY: embedded in one file per unit (like the gate) for the leak scan.
+# CANARY: embedded by `make_source` in one file's NAME and CONTENT, for
+# `lc_leak_scan` (issue #275). Until that check existed the canary was
+# planted and never looked for by anything -- see lc_leak_scan's comment.
 # OPERATOR: the operator tenant name every scenario's `init --operator`
 # uses, so the restore-matrix's operator-envelope step knows which key to
 # reach for without threading it through every call.
@@ -1278,6 +1345,9 @@ scenario_first_year() {
     check fy.pending    fy_pending_is_three
     check fy.plan       fy_plan
     check fy.write      fy_write
+    # Directly after the write, while VOL-A's cartridge is still loaded and
+    # before fy_move: the scan reads the tape device (issue #275).
+    check fy.no_plaintext_leak lc_leak_scan VOL-A
     check fy.move       fy_move
     check fy.cartridge  fy_cartridge
 
