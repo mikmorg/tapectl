@@ -594,7 +594,14 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
 /// when any named version still has live slices blocking a re-stage —
 /// every stage set that can reach this function already has a completed
 /// write (that is how the finding fired), so a bare `staging clean` (no
-/// `--force`) is guaranteed to reclaim it.
+/// `--force`) reclaims it -- **provided the unit already meets its own
+/// resolved `min_copies`.** Since ADR-0012's 2026-09-21 amendment (issue
+/// #262), a bare `staging clean` RETAINS an under-copied unit's staged
+/// bytes instead of releasing them (it names the unit in the retention
+/// notice and exits 0, it does not error). This function does not check
+/// copy count before prefixing the clean, so for an under-copied unit the
+/// printed recipe's first step is a no-op for that unit's own data and the
+/// following `stage create` still refuses on the still-live stage set.
 fn restage_action(conn: &Connection, unit: &Unit, versions: &[i64], extra: &str) -> Result<String> {
     if unit.status != "active" {
         let vs = versions
@@ -2710,9 +2717,21 @@ mod tests {
     /// `escrow_coverage`/`encryption`'s shared remedy (`restage_action`,
     /// issue #209): the flagged stage set is still LIVE (`staged`), so a
     /// version-scoped re-stage would be refused
-    /// (`cli/stage.rs`'s live-slices gate) until it is released — and a
-    /// bare, un-scoped `tapectl staging clean` is guaranteed to release it
-    /// because it already carries a completed write.
+    /// (`cli/stage.rs`'s live-slices gate) until it is released.
+    ///
+    /// **This test used to claim** that a bare, un-scoped `tapectl staging
+    /// clean` is "guaranteed to release it because it already carries a
+    /// completed write". That is false (issue #251): this fixture has
+    /// exactly one completed write, and `Config::default()`'s resolved
+    /// `min_copies` is 2 (`default_min_copies` in `src/config.rs`), so
+    /// "reels" is under-copied -- the identical shape
+    /// `cli::staging::tests::seed_unit_needing_a_second_copy` builds, whose
+    /// `clean_retains_the_under_copied_unit_without_refusing_the_command`
+    /// proves it is RETAINED, not released, by ADR-0012's 2026-09-21
+    /// amendment (issue #262). This test now runs that same bare clean
+    /// against this fixture below and pins the retained outcome directly,
+    /// instead of only asserting the recipe *string* and trusting a
+    /// guarantee about what running it does.
     #[test]
     fn restage_action_cleans_before_restaging_a_still_live_version() {
         let conn = crate::db::open_memory().unwrap();
@@ -2780,6 +2799,45 @@ mod tests {
             .find(|f| f.check == "encryption" && f.unit == "reels")
             .expect("an unencrypted stage set with policy.encrypt=true must violate");
         assert_eq!(finding.action, action);
+
+        // Issue #251: the recipe's first step, actually run, does not
+        // "guarantee" reclamation -- this unit has one completed write
+        // against `Config::default()`'s resolved `min_copies` of 2, so it
+        // is under-copied and a bare `staging clean` RETAINS its staged
+        // bytes instead of releasing them (ADR-0012's 2026-09-21
+        // amendment, issue #262). It does not refuse the command, so
+        // `action` above is still the correct string to print -- but
+        // running it does not by itself make `tapectl stage create reels
+        // --version 1` (the next step) succeed, because the stage_set is
+        // still `staged`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::TapectlPaths::new(tmp.path().to_path_buf());
+        let clean_result = crate::cli::staging::run(
+            &conn,
+            &paths,
+            &Config::default(),
+            &crate::cli::staging::StagingCommands::Clean { force: false },
+            false,
+            false,
+        );
+        assert!(
+            clean_result.is_ok(),
+            "issue #262: a bare `staging clean` must not refuse the whole \
+             command just because one unit is under-copied: {clean_result:?}"
+        );
+        let stage_set_status: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stage_set_status, "staged",
+            "the under-copied \"reels\" stage_set must be RETAINED, not \
+             reclaimed, by the bare `staging clean` this action's doc \
+             comment used to call a guarantee"
+        );
     }
 
     // ── output contract (issue #56) ──
