@@ -2135,8 +2135,8 @@ fn seed_planned_write_session(home: &std::path::Path, label: &str) {
 /// that same fixture refuses when NO `--yes` is given at all, so a success
 /// here cannot be explained by the gate never being reached.
 ///
-/// **Issue #251's correction (issue #258): the local field described above
-/// no longer exists.** Issue #240 found the ONE thing the shared-id field
+/// **Issue #258's correction: the local field described above no longer
+/// exists.** Issue #240 found the ONE thing the shared-id field
 /// could not share -- clap's `short`, so `-y` parsed before the subcommand
 /// and failed after it -- and removed the local field outright rather than
 /// also redeclaring `short = 'y'` on it (`src/cli/volume.rs`'s `Abort`

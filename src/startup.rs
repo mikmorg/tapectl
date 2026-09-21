@@ -742,6 +742,24 @@ mod tests {
             ),
             // --home alone needs no HOME at all
             (Some("/mnt/a"), None, None, None, "/mnt/a", None),
+            // --home outranks TAPECTL_HOME too, not just --config
+            (
+                Some("/mnt/a"),
+                None,
+                Some(env.as_os_str()),
+                Some(home.as_os_str()),
+                "/mnt/a",
+                None,
+            ),
+            // TAPECTL_HOME outranks --config
+            (
+                None,
+                Some("/mnt/b/config.toml"),
+                Some(env.as_os_str()),
+                Some(home.as_os_str()),
+                "/mnt/from-env",
+                None,
+            ),
         ];
         for (home_flag, config_flag, tapectl_home, home_env, expected_home, expected_ambiguous) in
             rows
