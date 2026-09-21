@@ -1628,12 +1628,15 @@ fn ambiguous_backends_no_longer_brick_a_read_command_but_a_write_still_refuses()
     );
 }
 
-/// The same collision, for the rest of the named set (issue #261): each of
-/// these must not fail with the collision message (or any "failed to load
-/// config" text) the way it did before the fix. Each command may still fail
-/// for an ORDINARY, unrelated reason on a freshly-`init`ed, empty catalog
-/// (e.g. "no such unit", "nothing to restore") — this only asserts that the
-/// failure, if any, is not the config-load refusal.
+/// The same collision, for the rest of the named set (issue #261). Every
+/// one of these exits 0 on a freshly-`init`ed, empty catalog even WITHOUT
+/// the ambiguous backend config (none of them need any data to succeed —
+/// `audit`/`report fire-risk` on zero units, `catalog stats` on an empty
+/// catalog, `db backup`/`db fsck --repair` on a fresh database), so a bare
+/// success assertion is not vacuous here: anything other than exit 0 —
+/// the config-load refusal this issue is about, but equally a panic or a
+/// downstream break the tolerant `Config` might cause — is a genuine
+/// regression.
 #[test]
 fn ambiguous_backends_do_not_surface_as_a_config_load_failure_for_the_rest_of_the_named_set() {
     let home = TempDir::new().unwrap();
@@ -1657,14 +1660,12 @@ fn ambiguous_backends_do_not_surface_as_a_config_load_failure_for_the_rest_of_th
     ] {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = run_tapectl(home.path(), &arg_refs);
-        let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !err.contains("both resolve to device_tape"),
-            "{arg_refs:?} must not see the backend-collision refusal; stderr={err}"
-        );
-        assert!(
-            !err.contains("failed to load config"),
-            "{arg_refs:?} must not fail at config load at all; stderr={err}"
+            out.status.success(),
+            "{arg_refs:?} must exit 0 on an ambiguous [[backends.lto]] section \
+             (issue #261) — stdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
         );
     }
 }

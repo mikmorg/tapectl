@@ -222,7 +222,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     //     `Rebuild` touches `config` at all, and only via
     //     `config::resolve_device` + `tape::media_detect::check_read_contact`
     //     (itself `resolve_device`) — both lenient, both reads. It rebuilds
-    //     the DATABASE from tape, never writes one. `src/cli/catalog.rs`.
+    //     the DATABASE from tape; it never writes a TAPE. `src/cli/catalog.rs`.
     //   - `Report` (every subcommand): reads `config.defaults` /
     //     `config.compaction` for policy math only; no subcommand ever
     //     calls a device resolver. `src/cli/report.rs`.
