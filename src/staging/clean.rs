@@ -19,14 +19,27 @@ use crate::error::Result;
 #[derive(Debug, Clone, Copy)]
 pub enum CleanScope<'a> {
     /// Every stage_set in the database — `tapectl staging clean`'s
-    /// existing, deliberately archive-wide behaviour. Unaffected by issue
-    /// #248: the CLI keeps this scope.
+    /// original, archive-wide behaviour. The CLI still uses this scope, but
+    /// (since issue #262) only when its min_copies check finds nothing
+    /// under-copied; when something is, it uses `Units` below instead.
     Whole,
-    /// Only stage_sets whose snapshot belongs to one of these unit ids —
-    /// `collection::batch::execute_batch`'s scope: a batch's release must
-    /// never reach past its own units into a different batch's still-
-    /// staged data. An empty slice matches nothing (it does not widen back
-    /// to `Whole`).
+    /// Restricts the `'staged'` branch to stage_sets whose snapshot belongs
+    /// to one of these unit ids — `collection::batch::execute_batch`'s
+    /// scope (a batch's release must never reach past its own units into a
+    /// different batch's still-staged data) and `cli::staging::run`'s scope
+    /// since issue #262 (release covered units, retain under-copied ones).
+    /// An empty slice matches no `'staged'` set; it does not widen back to
+    /// `Whole`.
+    ///
+    /// The `'failed'` branch is NEVER restricted by this, regardless of the
+    /// unit ids given here or whether the slice is empty — issue #262's
+    /// ruling: a `'failed'` set carries no copy requirement at all, so no
+    /// unit-scoped selection can rationally narrow it, and retaining one
+    /// under a scope about copies would be exactly the collateral damage
+    /// issue #262 exists to remove. (#248's original implementation scoped
+    /// `'failed'` here too, contradicting `clean_staging`'s own doc below
+    /// that it is swept unconditionally — #262 is what made the code match
+    /// the doc.)
     Units(&'a [i64]),
 }
 
@@ -103,21 +116,28 @@ pub enum CleanScope<'a> {
 /// rather than a cleanup — which is what naming the path here already does,
 /// without a new scan that could race a writer.
 ///
-/// `scope` narrows *which* stage_sets the eligibility rule above is even
-/// allowed to consider — it is a SELECTION, not a policy decision (issue
-/// #248). Whether a given stage_set may be released is still decided
-/// entirely by the eligibility rule above (`force`, `writes` status) plus
-/// whatever gate the caller ran before ever calling this function
-/// (`cli::staging::run`'s min_copies refusal; `collection::batch::
+/// `scope` narrows *which* `'staged'` stage_sets the eligibility rule above
+/// is even allowed to consider — it is a SELECTION, not a policy decision
+/// (issue #248). Whether a given `'staged'` stage_set may be released is
+/// still decided entirely by the eligibility rule above (`force`, `writes`
+/// status) plus whatever gate the caller ran before ever calling this
+/// function (`cli::staging::run`'s min_copies split since issue #262:
+/// release covered units, retain under-copied ones; `collection::batch::
 /// execute_batch`'s own `under_copied_units`) — `clean_staging` itself
 /// stays exactly as policy-free as ADR-0012's #244 amendment requires.
 /// `CleanScope::Whole` reproduces this function's original, unscoped
-/// behaviour verbatim (`tapectl staging clean`'s archive-wide sweep, issue
-/// #244's own gate sits in front of it and is unaffected).
-/// `CleanScope::Units` additionally requires the stage_set's snapshot to
-/// belong to one of the given unit ids — `execute_batch`'s scope, so one
-/// batch's release can never reach into a different batch's still-staged
-/// data.
+/// behaviour verbatim (`tapectl staging clean`'s archive-wide sweep when
+/// nothing is under-copied). `CleanScope::Units` additionally requires the
+/// stage_set's snapshot to belong to one of the given unit ids —
+/// `execute_batch`'s scope, so one batch's release can never reach into a
+/// different batch's still-staged data; and `cli::staging::run`'s scope for
+/// the units its min_copies check found covered.
+///
+/// **The `'failed'` branch is exempt from `scope` entirely (issue #262).**
+/// A `'failed'` set never reached `'staged'`, so it carries no `writes` row
+/// and no copy requirement for any unit-scoped selection to protect —
+/// `scope` only ever narrows the `'staged'` branch below, on both the
+/// `force` and non-`force` SQL.
 pub fn clean_staging(
     conn: &Connection,
     config: &Config,
@@ -126,18 +146,15 @@ pub fn clean_staging(
 ) -> Result<CleanReport> {
     let mut report = CleanReport::default();
 
+    // NOTE: unlike the pre-#262 version of this function, an empty
+    // `CleanScope::Units(&[])` does NOT early-return here. It still runs
+    // the query below, because the `'failed'` branch must be swept
+    // regardless of scope (see `CleanScope::Units`'s doc) -- an empty unit
+    // list only means "match no `'staged'` set", never "match nothing at
+    // all".
     let unit_ids: &[i64] = match scope {
         CleanScope::Whole => &[],
-        CleanScope::Units(ids) => {
-            // Nothing in scope -- e.g. a batch driver called with an empty
-            // unit list. Match `Whole`'s "no candidates -> no-op" exit
-            // rather than falling through to a query with a `... IN ()`
-            // that some SQL dialects reject outright.
-            if ids.is_empty() {
-                return Ok(report);
-            }
-            ids
-        }
+        CleanScope::Units(ids) => ids,
     };
     let scope_join = match scope {
         CleanScope::Whole => "",
@@ -145,8 +162,16 @@ pub fn clean_staging(
             "JOIN snapshots __scope_sn ON __scope_sn.id = stage_sets.snapshot_id"
         }
     };
+    // Applies ONLY inside the `'staged'` arm of `candidate_sql` below --
+    // never to the `'failed'` arm, which `CleanScope` promises is always
+    // unconditional. `"AND 0"` for an empty `Units` slice is deliberately
+    // spelled out rather than emitting `IN ()`: SQLite treats an empty `IN
+    // ()` as always-false too, but that is not guaranteed portable and a
+    // literal `AND 0` needs no placeholder count to line up with `unit_ids`
+    // (which is empty here, so `params_from_iter` binds zero parameters).
     let scope_predicate = match scope {
         CleanScope::Whole => String::new(),
+        CleanScope::Units([]) => "AND 0".to_string(),
         CleanScope::Units(_) => format!(
             "AND __scope_sn.unit_id IN ({})",
             unit_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
@@ -156,19 +181,20 @@ pub fn clean_staging(
     let candidate_sql = if force {
         format!(
             "SELECT stage_sets.id, stage_sets.status FROM stage_sets {scope_join}
-             WHERE stage_sets.status IN ('staged', 'failed') {scope_predicate}"
+             WHERE stage_sets.status = 'failed'
+                OR (stage_sets.status = 'staged' {scope_predicate})"
         )
     } else {
         format!(
             "SELECT stage_sets.id, stage_sets.status FROM stage_sets {scope_join}
-             WHERE (stage_sets.status = 'failed'
+             WHERE stage_sets.status = 'failed'
                 OR (stage_sets.status = 'staged'
                     AND EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = stage_sets.id)
                     AND NOT EXISTS (
                         SELECT 1 FROM writes w
                         WHERE w.stage_set_id = stage_sets.id AND w.status <> 'completed'
-                    )))
-             {scope_predicate}"
+                    )
+                    {scope_predicate})"
         )
     };
 
@@ -836,9 +862,13 @@ mod tests {
         );
     }
 
-    /// An empty `CleanScope::Units` slice matches nothing — it must not
-    /// silently widen back to `Whole` (e.g. via a malformed `... IN ()`
-    /// that some SQL engines would treat as always-true).
+    /// An empty `CleanScope::Units` slice matches no `'staged'` set — it
+    /// must not silently widen back to `Whole` for that branch (e.g. via a
+    /// malformed `... IN ()` that some SQL engines would treat as
+    /// always-true). This seeds only a `'staged'` set, so it does not by
+    /// itself prove anything about the `'failed'` branch — see
+    /// `scope_units_empty_slice_still_sweeps_a_failed_set` below for that
+    /// (issue #262).
     #[test]
     fn scope_units_empty_slice_matches_nothing() {
         let (conn, _stage_set_id, path, dir) = seed_stage_set();
@@ -855,6 +885,133 @@ mod tests {
         assert!(
             path.exists(),
             "an empty scope must match nothing, not fall back to a whole-database sweep"
+        );
+    }
+
+    /// Issue #262: `CleanScope::Units` never restricts the `'failed'`
+    /// branch, not even with an empty unit slice — a `'failed'` set has no
+    /// copy requirement for any unit-scoped selection to protect. Before
+    /// #262 this was UNTRUE: `CleanScope::Units(&[])` short-circuited to a
+    /// no-op via an early return, so a `'failed'` set was silently retained
+    /// whenever a caller's scope happened to be empty (e.g. a batch with no
+    /// covered units at all).
+    #[test]
+    fn scope_units_empty_slice_still_sweeps_a_failed_set() {
+        let (conn, stage_set_id, path, dir) = seed_stage_set_with_status("failed");
+
+        let report = clean_staging(
+            &conn,
+            &config_for(dir.path()),
+            false,
+            CleanScope::Units(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            report.sets_cleaned, 1,
+            "the 'failed' set must still be swept"
+        );
+        assert!(!path.exists());
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cleaned");
+    }
+
+    /// Issue #262: `CleanScope::Units` restricted to unit A must still
+    /// sweep a `'failed'` set belonging to a DIFFERENT unit B, not named in
+    /// scope at all -- the direct pin, at this function's own level, of the
+    /// ruling that `'failed'` sets are exempt from `scope` entirely. The
+    /// integration-level pin (through the CLI) is
+    /// `cli::staging::tests::clean_sweeps_a_failed_set_even_while_another_unit_is_under_copied`.
+    #[test]
+    fn scope_units_sweeps_a_failed_set_outside_the_named_units() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(dir.path());
+
+        // Unit A: a 'staged' set, in scope.
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('a', 'a', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
+            params![unit_a],
+        )
+        .unwrap();
+        let snap_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_a],
+        )
+        .unwrap();
+        let stage_set_a = conn.last_insert_rowid();
+        let path_a = dir.path().join("a.age");
+        std::fs::write(&path_a, b"a bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 7, 7, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_a, path_a.to_string_lossy()],
+        )
+        .unwrap();
+        seed_write(&conn, stage_set_a, "V-A", "completed");
+
+        // Unit B: a 'failed' set, NOT named in scope.
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('b', 'b', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_b = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'created', '/tmp/u', 1, 10)",
+            params![unit_b],
+        )
+        .unwrap();
+        let snap_b = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'failed', 524288)",
+            params![snap_b],
+        )
+        .unwrap();
+        let stage_set_b = conn.last_insert_rowid();
+        let path_b = dir.path().join("b.age");
+        std::fs::write(&path_b, b"b bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 7, 7, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_b, path_b.to_string_lossy()],
+        )
+        .unwrap();
+
+        let report = clean_staging(&conn, &config, false, CleanScope::Units(&[unit_a])).unwrap();
+        assert_eq!(
+            report.sets_cleaned, 2,
+            "both A ('staged', in scope) and B ('failed', out of scope) must be swept"
+        );
+        assert!(!path_a.exists());
+        assert!(
+            !path_b.exists(),
+            "B's 'failed' set must be swept even though B was never named in scope"
         );
     }
 
