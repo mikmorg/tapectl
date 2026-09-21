@@ -163,6 +163,12 @@ converts "use judgment" into "don't do X".}}
    - RIGHT: `cd <worktree> && CARGO_TARGET_DIR=… flock /scratch/tapectl-build.lock cargo test > /tmp/<branch>.log 2>&1; grep -E '^test result' /tmp/<branch>.log`
      — one call, it blocks, it returns the answer.
 
+   **Use `cargo test --no-fail-fast` whenever a negative control is
+   deliberately red.** A plain `cargo test` stops at the first failing binary,
+   so the count you report is whatever it had reached — one worker saw 1516
+   and had to re-run to get the real 1646. The control being red is the point;
+   the run still has to finish.
+
    **Do NOT pipe a test run through `tail`.** This example said `| tail -40`
    until 2026-09-21, and `tail` truncates away the per-binary `test result:`
    lines — the very totals you are asked to record. Two workers that day
