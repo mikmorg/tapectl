@@ -1718,6 +1718,27 @@ fn finish_session(
     match outcome {
         ResumeOutcome::Ready(ready) => {
             let sealed_pending = ready.seal(store)?;
+            // ADR-0012's 2026-09-21 correction "the seal is RECORDED, not
+            // inferred" (issue #277, migration 018): the moment `seal()`
+            // returns `Ok`, that fact must become durable state, because
+            // `seal_marker_parses_at`'s read-error/no-marker conflation
+            // (correct and deliberate for a fresh write to a blank tape)
+            // cannot be un-inferred later on resume -- an unreadable seal
+            // position is exactly what an `Inconclusive` confirm leaves
+            // behind (`session.rs`'s `SealedPending::confirm`). Write-once
+            // (`COALESCE`, the same idiom `execute_checking` uses for
+            // `started_at`) and never cleared by any confirm outcome
+            // afterward, including `Inconclusive`'s own
+            // `mark_writes(..., "interrupted")` -- that survival is the
+            // entire point. This is the single production call site for
+            // `ReadyToSeal::seal` (`ReadyToSeal::seal` itself takes no
+            // `Connection`), serving both a fresh write and a resumed one,
+            // so recording it here covers both.
+            conn.execute(
+                "UPDATE volumes SET sealed_at = COALESCE(sealed_at, datetime('now')) \
+                 WHERE id = ?1",
+                params![volume_id],
+            )?;
             finish_confirm(
                 conn,
                 store,
