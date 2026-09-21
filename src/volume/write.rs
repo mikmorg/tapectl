@@ -1689,21 +1689,23 @@ fn assemble_session_keys(
 
 /// The post-execute tail, shared verbatim by [`volume_write`] and
 /// [`volume_resume`]: `seal` -> `confirm` -> bookkeeping/audit, plus the
-/// Interrupted/Aborted/Quarantined terminations. Factored rather than
-/// duplicated because this is where a copy-paste would silently drift — in
-/// particular the `Quarantined` arm, which only the resume path can reach
+/// Interrupted/Aborted/Quarantined/Confirming terminations. Factored rather
+/// than duplicated because this is where a copy-paste would silently drift —
+/// in particular the `Quarantined` arm, which only the resume path can reach
 /// from `resume` itself (the File-0 identity check / already-sealed refusal)
 /// and which a half-copied tail would drop.
 ///
 /// It takes a [`ResumeOutcome`] because that enum is the superset:
 /// `volume_write` converts its `ExecuteOutcome` via the existing
-/// `From<ExecuteOutcome>` impl, leaving `Quarantined` unreachable-but-handled
-/// on the fresh path. This shares the Interrupted and Aborted arms too, not
-/// just seal/confirm.
+/// `From<ExecuteOutcome>` impl, leaving `Quarantined`/`Confirming`
+/// unreachable-but-handled on the fresh path. This shares the Interrupted and
+/// Aborted arms too, not just seal/confirm.
 ///
 /// Sacred invariant 1 (`v2-implementation-plan.md`): the seal marker is
-/// written only inside `ReadyToSeal::seal`. This function calls it; it never
-/// constructs a seal entry of its own.
+/// written only inside `ReadyToSeal::seal`. This function calls it only for
+/// `ResumeOutcome::Ready`; it never constructs a seal entry of its own, and
+/// the `Confirming` arm below deliberately does NOT call it — the tape is
+/// already sealed (ADR-0012's 2026-09-21 amendment, issues #260/#267).
 fn finish_session(
     conn: &Connection,
     store: &mut dyn Store,
@@ -1716,27 +1718,32 @@ fn finish_session(
     match outcome {
         ResumeOutcome::Ready(ready) => {
             let sealed_pending = ready.seal(store)?;
-            match sealed_pending.confirm(conn, store, Tier::default())? {
-                ConfirmOutcome::Sealed(sealed) => {
-                    record_write_bookkeeping(conn, volume_id, layout, block_size)?;
-                    events::log_event(
-                        conn,
-                        "volume",
-                        volume_id,
-                        Some(label),
-                        "write_completed",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
-                    info!(label = sealed.label, volume_id, "volume write sealed");
-                    Ok(())
-                }
-                ConfirmOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
-            }
+            finish_confirm(
+                conn,
+                store,
+                volume_id,
+                label,
+                layout,
+                block_size,
+                sealed_pending,
+            )
         }
+        // ADR-0012's 2026-09-21 amendment (issues #260/#267): resume found
+        // the tape already sealed exactly where THIS session left it, all
+        // three of `resume_checking`'s (via `resume_reconfirm_eligible`)
+        // conjunctive conditions verified. `seal()` must NEVER be called
+        // here (sacred invariant 1) — the seal marker is already on the
+        // tape; re-enter confirm directly on the `SealedPending` resume
+        // already produced.
+        ResumeOutcome::Confirming(sealed_pending) => finish_confirm(
+            conn,
+            store,
+            volume_id,
+            label,
+            layout,
+            block_size,
+            sealed_pending,
+        ),
         ResumeOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
         ResumeOutcome::Interrupted(_) => {
             events::log_event(
@@ -1779,9 +1786,80 @@ fn finish_session(
     }
 }
 
+/// The seal->confirm tail shared by a fresh [`ReadyToSeal`] (which calls
+/// `seal()` first, in [`finish_session`]) and a resume that met
+/// [`ResumeOutcome::Confirming`] (which never does — the tape is already
+/// sealed). Factored out so the [`ConfirmOutcome`] three-way match exists in
+/// exactly one place — ADR-0012's 2026-09-18 amendment, issues #260/#267.
+fn finish_confirm(
+    conn: &Connection,
+    store: &mut dyn Store,
+    volume_id: i64,
+    label: &str,
+    layout: &Layout,
+    block_size: u64,
+    sealed_pending: session::SealedPending,
+) -> Result<()> {
+    match sealed_pending.confirm(conn, store, Tier::default())? {
+        ConfirmOutcome::Sealed(sealed) => {
+            record_write_bookkeeping(conn, volume_id, layout, block_size)?;
+            events::log_event(
+                conn,
+                "volume",
+                volume_id,
+                Some(label),
+                "write_completed",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            info!(label = sealed.label, volume_id, "volume write sealed");
+            Ok(())
+        }
+        ConfirmOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
+        // ADR-0012's 2026-09-18 amendment (issues #260/#267): nothing here
+        // proves the medium bad — confirm's readback simply did not
+        // succeed. The tape is physically unharmed and unchanged;
+        // `SealedPending::confirm` has already left the `writes` rows
+        // `interrupted` (never `aborted`), so `tapectl volume resume` can
+        // pick this session back up and re-enter confirm.
+        ConfirmOutcome::Inconclusive(inc) => {
+            let detail = format!(
+                "{} mismatch(es) during readback, none proving the medium itself is bad \
+                 (drive/transport evidence only)",
+                inc.evidence.mismatches.len()
+            );
+            events::log_event(
+                conn,
+                "volume",
+                volume_id,
+                Some(label),
+                "write_confirm_inconclusive",
+                None,
+                None,
+                Some(&detail),
+                None,
+                None,
+            )?;
+            Err(TapectlError::Other(format!(
+                "volume \"{label}\": confirm could not complete — {detail}. The tape is \
+                 physically unharmed and the write is not lost; run `tapectl volume resume \
+                 {label}` to retry the confirm readback."
+            )))
+        }
+    }
+}
+
 /// The one place a WRITE-path quarantine is recorded and reported — reached
-/// from `confirm`'s failure (either path) and from `resume`'s own divergence
-/// findings (the resume-only arm). ADR-0001 contact-time divergence;
+/// from `confirm`'s `Quarantined` outcome (either path: a fresh seal or a
+/// resume's re-confirm) and from `resume`'s own divergence findings (the
+/// resume-only arm). Confirm's OTHER non-Sealed outcome, `Inconclusive`
+/// (ADR-0012's 2026-09-18 amendment, issues #260/#267), is deliberately NOT
+/// routed here — it never touches `observed_condition`, so there is no
+/// quarantine fact to report; see `finish_confirm`'s own arm. ADR-0001
+/// contact-time divergence;
 /// `session.rs` has already written `volumes.observed_condition =
 /// 'quarantined'` (ADR-0012's 2026-09-17 amendment, issue #242 — `status` is
 /// left untouched) by the time this runs, so this only reports it and turns

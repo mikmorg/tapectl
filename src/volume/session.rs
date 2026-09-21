@@ -25,9 +25,13 @@
 //! SealedPending::confirm(store, tier)     -> SessionEnd
 //!     store.confirm (chain walk, §10); verification_sessions row (verify_type =
 //!     full|quick); pass => ONE transaction: writes 'completed', snapshots
-//!     'current', volumes 'sealed'. fail => volumes.observed_condition
-//!     'quarantined' (status untouched, ADR-0012's 2026-09-17 amendment,
-//!     issue #242), session aborted, staging kept.
+//!     'current', volumes 'sealed'. Three outcomes, not two, on a mismatch
+//!     (ADR-0012's 2026-09-18 amendment, issues #260/#267):
+//!     `Evidence::proves_medium_bad` true => volumes.observed_condition
+//!     'quarantined' (status untouched, issue #242), writes 'aborted', staging
+//!     kept; false => Inconclusive — nothing touched (no seal, no
+//!     observed_condition write), writes 'interrupted' so `volume resume` can
+//!     re-enter confirm (idempotent).
 //! ```
 //!
 //! Each phase's operations exist only on its type, so an invalid order is
@@ -36,15 +40,21 @@
 //! you actually hold. In particular, no code path other than
 //! [`ReadyToSeal::seal`] can ever produce a `SealMarker` write (sacred
 //! invariant 1, `v2-implementation-plan.md`): sealing is unreachable unless
-//! `execute` ran every non-seal entry to completion.
+//! `execute` ran every non-seal entry to completion. `SealedPending` now has
+//! a SECOND construction site (`InterruptedSession::resume_checking`'s
+//! `AlreadySealed` arm, ADR-0012's 2026-09-21 amendment) besides
+//! `ReadyToSeal::seal`'s return — this is still safe, because `SealedPending`
+//! asserts only "a seal marker exists at the Layout's seal position" and its
+//! one operation (`confirm`) only ever *reads* the store; the invariant this
+//! module protects is that nothing but `ReadyToSeal::seal` ever *writes* one.
 //!
 //! `ExecuteOutcome`/`ResumeOutcome` stand in for the flow block's single
 //! "SessionEnd" box: Rust has no single type for "one of several typed
 //! successor states," so each fan-out point (execute can end Ready,
-//! Interrupted, or Aborted; confirm can end Sealed or Quarantined; resume
-//! adds Quarantined to execute's three) is its own small enum. The state
-//! *names* match `layout-session.md`'s table exactly; only the Rust-level
-//! packaging is invented here.
+//! Interrupted, or Aborted; confirm can end Sealed, Inconclusive or
+//! Quarantined; resume adds Quarantined and Confirming to execute's three) is
+//! its own small enum. The state *names* match `layout-session.md`'s table
+//! exactly; only the Rust-level packaging is invented here.
 //!
 //! Status: all four T6-required behaviors landed test-first (happy path;
 //! hash-mismatch clean abort; ENOSPC clean abort; SIGINT interrupt +
@@ -205,12 +215,21 @@ pub enum ExecuteOutcome {
 }
 
 /// What `resume` ended with — everything `ExecuteOutcome` can, plus
-/// `Quarantined` (the File-0 identity check found a divergent tape).
+/// `Quarantined` (the File-0 identity check found a divergent tape) and
+/// `Confirming` (ADR-0012's 2026-09-21 amendment, issues #260/#267):
+/// `check_tape_contact` found the tape already sealed exactly where THIS
+/// session left it — File 0's identity matches, the recorded seal position
+/// agrees with this session's own Layout, and that position is the tape's
+/// own File-0 pointer, none of the three inferred (see
+/// `resume_reconfirm_eligible`). `seal()` must NEVER run on this path
+/// (sacred invariant 1) — the tape is already sealed; resume re-enters
+/// `confirm` directly on the `SealedPending` it already is.
 pub enum ResumeOutcome {
     Ready(ReadyToSeal),
     Interrupted(InterruptedSession),
     Aborted(AbortedSession),
     Quarantined(QuarantinedSession),
+    Confirming(SealedPending),
 }
 
 impl From<ExecuteOutcome> for ResumeOutcome {
@@ -266,12 +285,18 @@ pub enum QuarantineReason {
         /// ID thunk (still a mismatch — never overwrite on ambiguity).
         found: Option<format::IdThunkIdentity>,
     },
-    /// Resume found a parseable seal marker at the tape's last position: the
-    /// volume is already SEALED, and sealed volumes are immutable (ADR-0003 —
-    /// there is no append). Resuming would rewrite a finished tape, so the
-    /// session refuses. The catalog and the tape disagree about this volume's
-    /// state, which is a divergence (ADR-0001) — hence quarantine rather than
-    /// a plain abort.
+    /// Resume found a parseable seal marker at the tape's last position, and
+    /// [`resume_reconfirm_eligible`] found at least one of its three
+    /// conditions did not hold (ADR-0012's 2026-09-21 amendment, issues
+    /// #260/#267): either this isn't genuinely the same tape/position this
+    /// session left behind, or that could not be verified against the
+    /// tape's own File-0 pointer. Sealed volumes are immutable (ADR-0003 —
+    /// there is no append), so resuming would risk rewriting a finished
+    /// tape, and the session refuses. The catalog and the tape disagree
+    /// about this volume's state, which is a divergence (ADR-0001) — hence
+    /// quarantine rather than a plain abort. (When all three conditions DO
+    /// hold, resume does not reach this variant at all — it re-enters
+    /// `confirm` instead via `ResumeOutcome::Confirming`.)
     AlreadySealed {
         seal_position: u32,
     },
@@ -294,9 +319,33 @@ pub struct SealedSession {
     pub label: String,
 }
 
-/// What `confirm` ended with.
+/// Confirm's readback did not succeed, but nothing it saw proves the medium
+/// itself is bad (`Evidence::proves_medium_bad` is false — drive/transport
+/// evidence only, e.g. `MismatchKind::ContentUnreadable`). ADR-0012's
+/// 2026-09-18 amendment (issues #260/#267): sealing here would assert a
+/// durability claim confirm never verified (ADR-0001), and quarantining
+/// would condemn a tape that may well be sound. Neither `volumes.status` nor
+/// `observed_condition` is touched — nothing was learned about the medium —
+/// and `writes` rows are moved to `interrupted` (not `aborted`) so
+/// `tapectl volume resume` can pick the session back up and re-enter
+/// `confirm` (confirm is idempotent and the tape is physically unchanged by
+/// a failed read). Terminal for THIS confirm attempt only, not for the
+/// session.
+pub struct InconclusiveSession {
+    pub volume_id: i64,
+    pub label: String,
+    pub evidence: Evidence,
+}
+
+/// What `confirm` ended with. Three outcomes, not two (ADR-0012's 2026-09-18
+/// amendment, issues #260/#267) — `Evidence::proves_medium_bad` decides
+/// which of the last two applies: true => `Quarantined`, false =>
+/// `Inconclusive`. Matched exhaustively with no wildcard arm on purpose,
+/// same discipline as `MismatchKind::proves_medium_bad`'s own match: an
+/// eighth outcome is a decision this ADR makes, never a default.
 pub enum ConfirmOutcome {
     Sealed(SealedSession),
+    Inconclusive(InconclusiveSession),
     Quarantined(QuarantinedSession),
 }
 
@@ -453,6 +502,74 @@ fn seal_marker_parses_at(store: &mut dyn Store, position: u32) -> bool {
     } else {
         false
     }
+}
+
+/// Whether a resume that met [`ContactOutcome::AlreadySealed`] may skip the
+/// write phase and re-enter `confirm` directly, instead of quarantining —
+/// ADR-0012's 2026-09-21 amendment, "`volume resume` re-confirms a tape that
+/// is already sealed" (issues #260/#267).
+///
+/// All three of the ruling's conditions are re-derived HERE, from scratch,
+/// independently of whichever internal branch of [`check_tape_contact`]
+/// produced the `AlreadySealed` outcome — that function reports the exact
+/// same shape for a genuinely FOREIGN sealed tape (its seal probe runs
+/// "whether or not the identity matched", issue #208) and, even when the
+/// identity DOES match, can report a position it verified only via the
+/// CALLER's own guess rather than the tape's self-reported pointer (sound
+/// for THAT function's own contract — `resume_checking`'s layout is
+/// rehydrated from the very session that wrote this tape — but not a fact
+/// this decision may assume without checking independently):
+///
+/// 1. File 0's identity (label + uuid) matches `expected_label`/
+///    `expected_uuid` — checked here explicitly, never inferred from having
+///    reached this arm rather than `IdentityMismatch`.
+/// 2. File 0's OWN recorded `[layout] seal_marker` pointer equals
+///    `expected_seal_position` (this session's own Layout).
+/// 3. That exact position parses as a real seal marker.
+///
+/// Condition 3 is meaningless without condition 2 reading the pointer from
+/// File 0 itself rather than trusting a value `check_tape_contact` already
+/// decided — that trust is exactly what would let the caller-guess fallback
+/// (safe only inside `check_tape_contact`'s own broader contract) leak into
+/// a decision that must never rest on a guess. This is why this function
+/// never calls `check_tape_contact` and never accepts its returned
+/// `seal_position` as an argument: it re-reads File 0 and re-parses its
+/// `[layout]` table itself.
+///
+/// Any failure — File 0 unreadable, unparseable, a non-matching identity, no
+/// recorded pointer, a pointer that disagrees with this session's Layout, or
+/// a position that does not actually parse as a seal marker — returns
+/// `false`, and the caller keeps today's behaviour: quarantine, never
+/// proceed.
+fn resume_reconfirm_eligible(
+    store: &mut dyn Store,
+    expected_label: &str,
+    expected_uuid: &str,
+    expected_seal_position: Option<u32>,
+) -> bool {
+    let Some(expected_seal_position) = expected_seal_position else {
+        return false;
+    };
+    let mut id_thunk_bytes = Vec::new();
+    if store.read_file(0, &mut id_thunk_bytes).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&id_thunk_bytes);
+    let identity = match format::parse_id_thunk_identity(&text) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    if identity.label != expected_label || identity.uuid != expected_uuid {
+        return false;
+    }
+    let pointers = match format::parse_id_thunk_layout_pointers(&text) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if pointers.seal_marker < 0 || pointers.seal_marker as u32 != expected_seal_position {
+        return false;
+    }
+    seal_marker_parses_at(store, expected_seal_position)
 }
 
 impl PlannedSession {
@@ -660,6 +777,15 @@ impl InterruptedSession {
     /// staging files); if ≥1 slice is written, reposition to
     /// `front_zone_len + written_slices` (both terms exact) and continue.
     /// The absent seal marker confirms the tape is legitimately unsealed.
+    /// A PRESENT seal marker does not automatically mean divergence any
+    /// more (ADR-0012's 2026-09-21 amendment, issues #260/#267): if
+    /// [`resume_reconfirm_eligible`]'s three conditions all hold — File 0's
+    /// identity matches, its own recorded seal pointer agrees with this
+    /// session's Layout, and that pointer genuinely parses as a seal marker
+    /// — this is exactly what THIS session's own `seal()` left behind, and
+    /// resume skips straight to re-entering `confirm` instead of
+    /// quarantining. Any of the three failing keeps the original rule:
+    /// mismatch = divergence = quarantine, not overwrite.
     ///
     /// Caller note: this requires only that `self` carry a valid
     /// `BuiltLayout`, however it was sourced — either the same in-memory
@@ -761,9 +887,37 @@ impl InterruptedSession {
                     },
                 }));
             }
-            ContactOutcome::AlreadySealed { seal_position } => {
-                // Same reasoning as the `IdentityMismatch` arm just above
-                // (issue #242): an observed fact, not an operator choice.
+            ContactOutcome::AlreadySealed {
+                seal_position: found_seal_position,
+            } => {
+                // ADR-0012's 2026-09-21 amendment (issues #260/#267): an
+                // already-sealed tape at resume is not automatically
+                // divergence — it is exactly what THIS session's own
+                // `seal()` call left behind if confirm was interrupted or
+                // ended `Inconclusive`. Re-enter confirm instead of
+                // quarantining, but ONLY if all three of
+                // `resume_reconfirm_eligible`'s conditions hold, none
+                // inferred from merely reaching this arm:
+                // `check_tape_contact` reports this same shape for a
+                // genuinely FOREIGN sealed tape too (its own seal probe runs
+                // "whether or not the identity matched", issue #208).
+                if resume_reconfirm_eligible(
+                    store,
+                    &self.built.layout.label,
+                    &self.built.layout.volume_uuid,
+                    seal_position,
+                ) {
+                    return Ok(ResumeOutcome::Confirming(SealedPending {
+                        built: self.built,
+                        volume_id: self.volume_id,
+                        write_ids: self.write_ids,
+                    }));
+                }
+
+                // Any of the three conditions failing keeps today's
+                // behaviour exactly. Same reasoning as the
+                // `IdentityMismatch` arm just above (issue #242): an
+                // observed fact, not an operator choice.
                 conn.execute(
                     "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
                     params![self.volume_id],
@@ -772,7 +926,9 @@ impl InterruptedSession {
                 return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
                     volume_id: self.volume_id,
                     label: self.built.layout.label.clone(),
-                    reason: QuarantineReason::AlreadySealed { seal_position },
+                    reason: QuarantineReason::AlreadySealed {
+                        seal_position: found_seal_position,
+                    },
                 }));
             }
         }
@@ -924,10 +1080,15 @@ pub struct SealedPending {
 impl SealedPending {
     /// `SealedPending -> ConfirmOutcome`. Runs `store.confirm` (the §5 chain
     /// walk), records a `verification_sessions` row (`verify_type`:
-    /// Integrity -> 'full', Navigable -> 'quick', ADR-0001), then: pass => ONE
-    /// transaction flipping `writes` 'completed', `snapshots` 'current',
-    /// `volumes` 'sealed'; fail => `volumes` 'quarantined', `writes` 'aborted'
-    /// (staging kept either way — this method never touches staging).
+    /// Integrity -> 'full', Navigable -> 'quick', ADR-0001), then three
+    /// outcomes, not two (ADR-0012's 2026-09-18 amendment, issues
+    /// #260/#267): pass => ONE transaction flipping `writes` 'completed',
+    /// `snapshots` 'current', `volumes` 'sealed'; a mismatch that
+    /// `Evidence::proves_medium_bad` => `volumes.observed_condition`
+    /// 'quarantined', `writes` 'aborted'; a mismatch that does NOT => nothing
+    /// touched on `volumes`, `writes` 'interrupted' so `volume resume` can
+    /// re-enter this same method (staging kept in every case — this method
+    /// never touches staging).
     pub fn confirm(
         self,
         conn: &Connection,
@@ -947,6 +1108,12 @@ impl SealedPending {
 
         let evidence = store.confirm(&self.built.layout, tier)?;
         let passed = evidence.mismatches.is_empty();
+        // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
+        // quarantine verdict. `Tier::default()` is `Tier::Integrity`, so a
+        // routine confirm reads back the WHOLE cartridge — hours on a full
+        // LTO-6 — and one transient SCSI error in that window must not
+        // condemn a physically sound tape.
+        let proves_medium_bad = evidence.proves_medium_bad();
 
         conn.execute(
             "UPDATE verification_sessions
@@ -1053,7 +1220,7 @@ impl SealedPending {
                 volume_id: self.volume_id,
                 label: self.built.layout.label.clone(),
             }))
-        } else {
+        } else if proves_medium_bad {
             // Issue #242: the chain-walk's own quarantine finding is an
             // observed fact too -- `observed_condition`, not `status`. This
             // volume never reached the transaction above, so `status` is
@@ -1067,6 +1234,22 @@ impl SealedPending {
                 volume_id: self.volume_id,
                 label: self.built.layout.label.clone(),
                 reason: QuarantineReason::ConfirmFailed(evidence),
+            }))
+        } else {
+            // ADR-0012's 2026-09-18 amendment (issues #260/#267): nothing
+            // here proves the medium bad, so nothing is asserted about it
+            // either way -- `observed_condition` is left exactly as it was
+            // (and `status` was never touched by this branch to begin
+            // with). `writes` rows move to `interrupted`, NOT `aborted`:
+            // confirm is idempotent and the tape is physically unchanged by
+            // a failed read, so `tapectl volume resume` must be able to
+            // pick this session back up (`rehydrate` selects only
+            // `interrupted` rows) and re-enter confirm.
+            mark_writes(conn, &self.write_ids, "interrupted")?;
+            Ok(ConfirmOutcome::Inconclusive(InconclusiveSession {
+                volume_id: self.volume_id,
+                label: self.built.layout.label.clone(),
+                evidence,
             }))
         }
     }
@@ -1601,6 +1784,10 @@ mod tests {
                     other => format!("{other:?}"),
                 }
             ),
+            ConfirmOutcome::Inconclusive(inc) => panic!(
+                "expected Sealed on a happy-path MemStore run, got Inconclusive: {:?}",
+                inc.evidence.mismatches
+            ),
         };
         assert_eq!(sealed.volume_id, f.volume_id);
         assert_eq!(sealed.label, "SESSTEST");
@@ -1949,6 +2136,10 @@ mod tests {
         match outcome {
             ConfirmOutcome::Sealed(_) => {}
             ConfirmOutcome::Quarantined(_) => panic!("expected Sealed after a completed resume"),
+            ConfirmOutcome::Inconclusive(inc) => panic!(
+                "expected Sealed after a completed resume, got Inconclusive: {:?}",
+                inc.evidence.mismatches
+            ),
         }
 
         // Final DB state matches the ordinary happy path exactly.
@@ -2025,6 +2216,12 @@ mod tests {
         {
             ConfirmOutcome::Sealed(_) => {}
             ConfirmOutcome::Quarantined(_) => panic!("expected Sealed"),
+            ConfirmOutcome::Inconclusive(inc) => {
+                panic!(
+                    "expected Sealed, got Inconclusive: {:?}",
+                    inc.evidence.mismatches
+                )
+            }
         }
 
         let volume_status: String = f
@@ -2038,26 +2235,36 @@ mod tests {
         assert_eq!(volume_status, "sealed");
     }
 
-    /// Bonus coverage: the File-0 identity check's divergence path. Simulates
-    /// "wrong cartridge in the drive" — after an interruption, File 0 on the
-    /// (mock) tape disagrees with the Layout being resumed — and asserts
-    /// `docs/design/layout-session.md`'s "mismatch = divergence = quarantine,
-    /// not overwrite": the volume is quarantined, the session is aborted, and
-    /// critically the session never reaches `run_entries` at all (no risk of
-    /// silently overwriting the wrong tape).
+    /// ADR-0012's 2026-09-21 amendment ("`volume resume` re-confirms a tape
+    /// that is already sealed", issues #260/#267) — this test PINS THE
+    /// OPPOSITE of what it used to. Before that amendment,
+    /// `resume_checking` quarantined ANY already-sealed tape unconditionally
+    /// (see the superseded doc below, kept for context). Now: File 0's
+    /// identity matches AND the tape's own recorded seal pointer agrees with
+    /// this session's own Layout — the exact state `seal()` legitimately
+    /// leaves behind when confirm crashes or returns `Inconclusive` — so
+    /// resume must re-enter confirm (`ResumeOutcome::Confirming`), not
+    /// quarantine. `resume_quarantines_a_foreign_tape_that_happens_to_be_sealed`
+    /// below is this test's necessary twin: it proves a tape that merely
+    /// LOOKS sealed but fails the identity condition still quarantines
+    /// exactly as before — the guarantee narrowed from "any sealed tape" to
+    /// "any sealed tape that fails one of the three conditions", it was not
+    /// dropped.
+    ///
+    /// Original (now-superseded) rationale, kept because the physical
+    /// scenario it describes is still exactly what this test sets up:
+    /// layout-session.md's Resume rule: "The absent seal marker confirms the
+    /// tape is legitimately unsealed (safe to resume, not an append to a
+    /// sealed volume)." The live path: seal() writes the marker, confirm
+    /// crashes (or ends `Inconclusive`), then `recover_orphaned_sessions`
+    /// sweeps the `in_progress` row to `interrupted` (resumable) and resume
+    /// is handed an already-sealed tape. The File-0 identity check ALONE
+    /// cannot tell this apart from a genuinely divergent tape — the identity
+    /// matches either way — which is exactly why `resume_reconfirm_eligible`
+    /// checks the seal POSITION too, against the tape's own File-0 pointer,
+    /// never a guess.
     #[test]
-    fn resume_refuses_a_tape_that_already_carries_a_seal_marker() {
-        // layout-session.md's Resume rule: "The absent seal marker confirms
-        // the tape is legitimately unsealed (safe to resume, not an append to
-        // a sealed volume)." A seal marker that IS present means the tape is
-        // finished, and ADR-0003 forbids appending to a sealed volume.
-        //
-        // The live path: seal() writes the marker, confirm crashes, then
-        // recover_orphaned_sessions sweeps the in_progress row to
-        // 'interrupted' (resumable) and resume is handed an already-sealed
-        // tape. The File-0 identity check cannot catch this — the identity
-        // matches, because it genuinely IS the same tape. Only the seal
-        // marker distinguishes "crashed mid-write" from "already finished".
+    fn resume_reenters_confirm_when_already_sealed_tape_matches_this_sessions_layout() {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
@@ -2119,12 +2326,145 @@ mod tests {
         thunk_padded.resize(BS as usize, 0);
         store.files[0] = thunk_padded;
 
+        match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error on a matching already-sealed tape")
+        {
+            ResumeOutcome::Confirming(_) => {}
+            ResumeOutcome::Quarantined(q) => panic!(
+                "ADR-0012's 2026-09-21 amendment: a sealed tape whose identity AND seal \
+                 position match this session's own Layout must re-enter confirm, not \
+                 quarantine. Got Quarantined: {:?}",
+                q.reason
+            ),
+            ResumeOutcome::Ready(_) => panic!("expected Confirming, got Ready"),
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => {
+                panic!("expected Confirming, got Aborted: {}", a.reason)
+            }
+        };
+
+        // Neither `status` nor `observed_condition` is touched by taking the
+        // `Confirming` branch — nothing was learned yet (confirm has not run
+        // again), so nothing is asserted about the medium.
+        let (status, condition): (String, String) = f
+            .conn
+            .query_row(
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "active",
+            "resume's Confirming arm must never touch status"
+        );
+        assert_eq!(
+            condition, "ok",
+            "resume's Confirming arm must not write observed_condition — nothing was \
+             re-verified yet"
+        );
+
+        // `writes` rows are untouched by this arm too (still whatever the
+        // earlier interrupted execute left them at) — only a completed
+        // `confirm()` call moves them again.
+        let write_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_status, "interrupted");
+    }
+
+    /// The necessary twin of the test above: a tape that merely LOOKS
+    /// sealed — `check_tape_contact` reports the exact same
+    /// `ContactOutcome::AlreadySealed` shape (issue #208: its seal probe
+    /// runs "whether or not the identity matched") — but is a genuinely
+    /// FOREIGN, unrelated tape must still quarantine. Proves condition 1
+    /// (identity match) is load-bearing on the `resume_checking` path, not
+    /// just on `check_tape_contact`'s own unit tests.
+    #[test]
+    fn resume_quarantines_a_foreign_tape_that_happens_to_be_sealed() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let seal_pos = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("layout has a seal marker")
+            .position as u32;
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+
+        // A DIFFERENT volume's id thunk and a real seal marker at ITS OWN
+        // self-reported position — which happens to equal this session's
+        // seal position too, so a position-only check would wrongly let
+        // this through. Only the identity check (condition 1) catches it.
+        let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label: "WRONGVOL",
+            uuid: "00000000-0000-0000-0000-000000000000",
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: seal_pos as i32 + 1,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
+        });
+        let mut thunk_padded = thunk.into_bytes();
+        thunk_padded.resize(BS as usize, 0);
+        if store.files.is_empty() {
+            store.files.push(thunk_padded);
+            store.syncs.push(false);
+        } else {
+            store.files[0] = thunk_padded;
+        }
+
+        let seal_bytes = layout::generate_seal_marker("WRONGVOL", 1, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        if store.files.len() <= seal_pos as usize {
+            store.files.resize(seal_pos as usize + 1, Vec::new());
+            store.syncs.resize(seal_pos as usize + 1, false);
+        }
+        store.files[seal_pos as usize] = seal_padded;
+
         let quarantined = match interrupted
             .resume_checking(&f.conn, &f.keys, &mut store, || false)
-            .expect("resume must not hard-error on a sealed tape")
+            .expect("resume must not hard-error on a foreign sealed tape")
         {
             ResumeOutcome::Quarantined(q) => q,
-            _ => panic!("expected Quarantined — resume must refuse a sealed tape (ADR-0003)"),
+            other => {
+                let kind = match other {
+                    ResumeOutcome::Ready(_) => "Ready",
+                    ResumeOutcome::Interrupted(_) => "Interrupted",
+                    ResumeOutcome::Aborted(_) => "Aborted",
+                    ResumeOutcome::Confirming(_) => "Confirming",
+                    ResumeOutcome::Quarantined(_) => unreachable!(),
+                };
+                panic!(
+                    "expected Quarantined — a foreign sealed tape must never re-enter confirm, \
+                     got {kind}"
+                )
+            }
         };
         match quarantined.reason {
             QuarantineReason::AlreadySealed { seal_position } => {
@@ -2141,14 +2481,235 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        // ADR-0012's 2026-09-17 amendment (issue #242): this is an OBSERVED
-        // fact, not an operator choice, so it moves `observed_condition`;
-        // `status` is left exactly where the fixture put it ('active').
         assert_eq!(
             status, "active",
             "the resume writer must never touch status"
         );
         assert_eq!(condition, "quarantined");
+    }
+
+    /// Condition 2 alone failing: File 0's identity matches (condition 1
+    /// holds) and its OWN self-reported seal pointer parses as a real seal
+    /// marker (condition 3 holds in isolation), but that position DISAGREES
+    /// with this session's own Layout. `resume_reconfirm_eligible` must
+    /// refuse — a tape whose own map disagrees with what we planned is not
+    /// "exactly where we left it".
+    #[test]
+    fn resume_quarantines_when_the_tapes_own_seal_pointer_disagrees_with_our_layout() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let label = f.built.layout.label.clone();
+        let uuid = f.built.layout.volume_uuid.clone();
+        let our_seal_pos = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("layout has a seal marker")
+            .position as u32;
+        // A position that genuinely disagrees with our own Layout.
+        let foreign_seal_pos = our_seal_pos + 1;
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+
+        // File 0 claims (correctly, for ITSELF) that its own seal marker is
+        // at `foreign_seal_pos`, one past where OUR Layout puts it.
+        let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label: &label,
+            uuid: &uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: foreign_seal_pos as i32 + 1,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
+        });
+        let mut thunk_padded = thunk.into_bytes();
+        thunk_padded.resize(BS as usize, 0);
+        if store.files.is_empty() {
+            store.files.push(thunk_padded);
+            store.syncs.push(false);
+        } else {
+            store.files[0] = thunk_padded;
+        }
+
+        // A real, parseable seal marker genuinely sits at `foreign_seal_pos`
+        // — File 0 is telling the truth about ITSELF, just not about our plan.
+        let seal_bytes = layout::generate_seal_marker(&label, 1, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        if store.files.len() <= foreign_seal_pos as usize {
+            store
+                .files
+                .resize(foreign_seal_pos as usize + 1, Vec::new());
+            store.syncs.resize(foreign_seal_pos as usize + 1, false);
+        }
+        store.files[foreign_seal_pos as usize] = seal_padded;
+
+        let quarantined = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error")
+        {
+            ResumeOutcome::Quarantined(q) => q,
+            ResumeOutcome::Confirming(_) => panic!(
+                "expected Quarantined — the tape's own seal pointer disagrees with our \
+                 Layout, so this must NOT be treated as exactly where we left off"
+            ),
+            ResumeOutcome::Ready(_) => panic!("expected Quarantined, got Ready"),
+            ResumeOutcome::Interrupted(_) => panic!("expected Quarantined, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Quarantined, got Aborted: {}", a.reason),
+        };
+        match quarantined.reason {
+            QuarantineReason::AlreadySealed { seal_position } => {
+                assert_eq!(seal_position, foreign_seal_pos);
+            }
+            other => panic!("expected AlreadySealed, got {other:?}"),
+        }
+    }
+
+    /// Condition 3 in isolation: this is the test that proves
+    /// `resume_reconfirm_eligible` may never trust the position
+    /// [`check_tape_contact`] already decided — it must re-derive it from
+    /// File 0 itself. File 0's `[volume]` identity matches (condition 1
+    /// holds) and its `[layout]` section is UNPARSEABLE (so the tape's own
+    /// pointer cannot be read at all — condition 3 fails by construction),
+    /// yet a real seal marker genuinely sits at exactly the position OUR
+    /// Layout expects (condition 2 would look satisfied to anyone trusting
+    /// `check_tape_contact`'s return value, since its caller-guess fallback
+    /// finds it too — `check_tape_contact`'s own comment explains that
+    /// fallback is safe for ITS contract, not for this one). A
+    /// `resume_reconfirm_eligible` that trusted that returned position
+    /// instead of re-reading File 0 would wrongly say eligible here.
+    #[test]
+    fn resume_quarantines_when_the_tapes_own_layout_section_is_unparseable() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let label = f.built.layout.label.clone();
+        let uuid = f.built.layout.volume_uuid.clone();
+        let seal_pos = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("layout has a seal marker")
+            .position as u32;
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+
+        // A genuine, correctly-shaped thunk (identity matches, and its
+        // `[layout] seal_marker` value legitimately equals `seal_pos`) —
+        // then mangle ONLY that one value into something that fails to
+        // parse as the required integer, breaking `[layout]` alone. `[volume]`
+        // is untouched, so the identity check still legitimately passes.
+        let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label: &label,
+            uuid: &uuid,
+            media_type: "LTO-6",
+            tapectl_version: "0.1.0-test",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: seal_pos as i32 + 1,
+            mam_manufacturer: "",
+            mam_serial: "",
+            mam_length: 0,
+            mam_loads: 0,
+            created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
+        });
+        let needle = format!("seal_marker = {seal_pos}\n");
+        assert!(
+            thunk.contains(&needle),
+            "fixture assumption: the generator must emit `{needle:?}` verbatim"
+        );
+        let mangled = thunk.replacen(&needle, "seal_marker = \"oops\"\n", 1);
+        let mut thunk_padded = mangled.into_bytes();
+        thunk_padded.resize(BS as usize, 0);
+        if store.files.is_empty() {
+            store.files.push(thunk_padded);
+            store.syncs.push(false);
+        } else {
+            store.files[0] = thunk_padded;
+        }
+
+        // Sanity: `[layout]` really is unparseable now, and `[volume]`
+        // really does still parse — otherwise this test would not be
+        // exercising what it claims to.
+        let text_check = String::from_utf8_lossy(&store.files[0]);
+        assert!(format::parse_id_thunk_layout_pointers(&text_check).is_err());
+        assert!(format::parse_id_thunk_identity(&text_check).is_ok());
+
+        // A real seal marker genuinely sits at OUR Layout's own seal
+        // position — the caller-guess fallback inside `check_tape_contact`
+        // will find it, since File 0's own pointer could not be read.
+        let seal_bytes = layout::generate_seal_marker(&label, 1, "deadbeef", &[]).into_bytes();
+        let mut seal_padded = seal_bytes;
+        seal_padded.resize(BS as usize, 0);
+        if store.files.len() <= seal_pos as usize {
+            store.files.resize(seal_pos as usize + 1, Vec::new());
+            store.syncs.resize(seal_pos as usize + 1, false);
+        }
+        store.files[seal_pos as usize] = seal_padded;
+
+        // Confirm the premise: `check_tape_contact` itself, called exactly
+        // as `resume_checking` calls it, reports `AlreadySealed` at OUR
+        // position via its caller-guess fallback — proving this scenario
+        // really does reach the trap `resume_reconfirm_eligible` must not
+        // fall into.
+        match check_tape_contact(&mut store, &label, &uuid, Some(seal_pos)) {
+            ContactOutcome::AlreadySealed { seal_position } => {
+                assert_eq!(seal_position, seal_pos)
+            }
+            other => panic!(
+                "test premise broken: expected check_tape_contact to report AlreadySealed \
+                 via its caller-guess fallback, got {other:?}"
+            ),
+        }
+
+        let quarantined = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error")
+        {
+            ResumeOutcome::Quarantined(q) => q,
+            ResumeOutcome::Confirming(_) => panic!(
+                "expected Quarantined — the tape's own [layout] pointer could not be read, \
+                 so eligibility must never be inferred from check_tape_contact's caller-guess \
+                 fallback"
+            ),
+            ResumeOutcome::Ready(_) => panic!("expected Quarantined, got Ready"),
+            ResumeOutcome::Interrupted(_) => panic!("expected Quarantined, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Quarantined, got Aborted: {}", a.reason),
+        };
+        match quarantined.reason {
+            QuarantineReason::AlreadySealed { seal_position } => {
+                assert_eq!(seal_position, seal_pos);
+            }
+            other => panic!("expected AlreadySealed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2206,6 +2767,7 @@ mod tests {
                     ResumeOutcome::Ready(_) => "Ready",
                     ResumeOutcome::Interrupted(_) => "Interrupted",
                     ResumeOutcome::Aborted(_) => "Aborted",
+                    ResumeOutcome::Confirming(_) => "Confirming",
                     ResumeOutcome::Quarantined(_) => unreachable!(),
                 }
             ),
@@ -2302,6 +2864,17 @@ mod tests {
             ConfirmOutcome::Sealed(_) => {
                 panic!("expected Quarantined on a post-seal content mismatch, got Sealed")
             }
+            // Negative control (ADR-0012's 2026-09-18 amendment, issues
+            // #260/#267): a flipped content byte produces
+            // `MismatchKind::ContentHashMismatch`, which
+            // `proves_medium_bad()` rules TRUE — this path must stay
+            // `Quarantined`, unchanged by the `Inconclusive` amendment. If
+            // this ever fires, the amendment has been widened too far.
+            ConfirmOutcome::Inconclusive(inc) => panic!(
+                "a genuine content-hash mismatch must still quarantine (medium-proving), not \
+                 go Inconclusive: {:?}",
+                inc.evidence.mismatches
+            ),
         };
         assert_eq!(quarantined.volume_id, f.volume_id);
         match quarantined.reason {
@@ -2366,6 +2939,238 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vs_outcome, "failed");
+    }
+
+    /// Negative control 1 (ADR-0012's 2026-09-18 amendment, issues
+    /// #260/#267): a confirm whose ONLY mismatch is a short read
+    /// (`MismatchKind::ContentUnreadable` — drive/transport evidence, not a
+    /// medium-proving one) must go `Inconclusive`, not `Quarantined`: no
+    /// seal, no `observed_condition` write, and `writes` left `interrupted`
+    /// (never `aborted`) so `tapectl volume resume` can re-enter confirm.
+    ///
+    /// Contrast with `confirm_failure_quarantines_volume_and_aborts_writes_without_touching_staging`
+    /// just above (negative control 2): THAT test flips a byte in place (same
+    /// length), producing `ContentHashMismatch` (medium-proving) — unchanged,
+    /// still `Quarantined`. THIS test truncates the on-tape bytes to fewer
+    /// than the front index's declared size, producing a genuine short read.
+    #[test]
+    fn confirm_with_only_a_short_read_goes_inconclusive_not_quarantined() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+
+        // Truncate one slice's ON-TAPE bytes to fewer than its declared
+        // (true) size — a short read, never a hash disagreement (no hash is
+        // ever computed: `chain_walk` checks `want_size > n_read` BEFORE
+        // hashing). "first staged slice bytes" is 25 bytes; 5 is short.
+        let slice_position = sealed_pending
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .expect("fixture layout always has at least one slice entry");
+        store.files[slice_position].truncate(5);
+
+        let outcome = sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not hard-error on a short read");
+
+        let inconclusive = match outcome {
+            ConfirmOutcome::Inconclusive(inc) => inc,
+            ConfirmOutcome::Sealed(_) => {
+                panic!("expected Inconclusive on a short read, got Sealed")
+            }
+            ConfirmOutcome::Quarantined(q) => panic!(
+                "a short read (drive/transport evidence only) must NOT quarantine — that is \
+                 the exact false-quarantine this amendment exists to prevent. Got \
+                 Quarantined: {:?}",
+                match q.reason {
+                    QuarantineReason::ConfirmFailed(e) => format!("{:?}", e.mismatches),
+                    other => format!("{other:?}"),
+                }
+            ),
+        };
+        assert_eq!(inconclusive.volume_id, f.volume_id);
+        assert_eq!(
+            inconclusive.evidence.mismatches.len(),
+            1,
+            "exactly the one injected short read: {:?}",
+            inconclusive.evidence.mismatches
+        );
+        assert_eq!(
+            inconclusive.evidence.mismatches[0].kind,
+            crate::store::MismatchKind::ContentUnreadable
+        );
+        assert!(!inconclusive.evidence.proves_medium_bad());
+
+        // Does NOT seal: `volumes.status` is untouched (never 'sealed'), and
+        // `observed_condition` is untouched too (never 'quarantined') —
+        // nothing was learned about the medium.
+        let (volume_status, volume_condition): (String, String) = f
+            .conn
+            .query_row(
+                "SELECT status, observed_condition FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            volume_status, "active",
+            "Inconclusive must never touch status"
+        );
+        assert_eq!(
+            volume_condition, "ok",
+            "Inconclusive must never write observed_condition — nothing was learned"
+        );
+
+        // `writes` rows move to 'interrupted', NOT 'aborted' — this is what
+        // makes the session reachable again by `InterruptedSession::rehydrate`
+        // (`WHERE status = 'interrupted'`), i.e. by `tapectl volume resume`.
+        let write_statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!write_statuses.is_empty());
+        assert!(
+            write_statuses.iter().all(|s| s == "interrupted"),
+            "expected every writes row 'interrupted', got {write_statuses:?}"
+        );
+
+        // The session is genuinely reachable by resume: rehydrate must find
+        // it (this is the empirical proof, not just a status string).
+        let rehydrated = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .expect("rehydrate should not error")
+            .expect("an Inconclusive confirm must leave the session resumable");
+        // Rehydration reads the frozen Layout back from `session_dir`, so
+        // this alone proves resume has something real to work with.
+        assert_eq!(rehydrated.layout().label, "SESSTEST");
+
+        // The audit feedback loop closes even here: a 'failed'
+        // verification_sessions row is recorded (same convention `volume
+        // verify` uses for a non-medium-proving mismatch).
+        let vs_outcome: String = f
+            .conn
+            .query_row(
+                "SELECT outcome FROM verification_sessions WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vs_outcome, "failed");
+    }
+
+    /// The full lifecycle ADR-0012's 2026-09-21 amendment describes,
+    /// end-to-end with no status-string shortcuts: execute -> seal ->
+    /// confirm (Inconclusive, via a transient short read) -> the transient
+    /// cause resolves -> rehydrate -> resume_checking (re-enters confirm
+    /// instead of quarantining) -> confirm (Sealed). This is the empirical
+    /// proof that "resume re-confirms" actually delivers a sealed copy, not
+    /// just an outcome variant.
+    #[test]
+    fn inconclusive_confirm_is_resumed_to_a_genuine_seal() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+
+        let slice_position = sealed_pending
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .expect("fixture layout always has at least one slice entry");
+        // The transient fault: truncate the on-tape bytes below the front
+        // index's declared size. Saved so it can be "healed" below —
+        // standing in for a drive that reads fine on the next attempt.
+        let original_bytes = store.files[slice_position].clone();
+        store.files[slice_position].truncate(5);
+
+        match sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not hard-error on a short read")
+        {
+            ConfirmOutcome::Inconclusive(_) => {}
+            ConfirmOutcome::Sealed(_) => panic!("expected Inconclusive first, got Sealed"),
+            ConfirmOutcome::Quarantined(q) => {
+                panic!(
+                    "expected Inconclusive first, got Quarantined: {:?}",
+                    q.reason
+                )
+            }
+        }
+
+        // The transient fault resolves — the tape reads fine now (a real
+        // drive that had one bad pass, cleaned and retried).
+        store.files[slice_position] = original_bytes;
+
+        // Cross the same seam a real `tapectl volume resume` crosses:
+        // rehydrate from durable state alone, never the in-memory session.
+        let rehydrated = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("an Inconclusive confirm must leave the session resumable");
+
+        let sealed_pending_again = match rehydrated
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error")
+        {
+            ResumeOutcome::Confirming(pending) => pending,
+            ResumeOutcome::Quarantined(q) => panic!(
+                "expected Confirming — this is exactly the tape this session sealed, got \
+                 Quarantined: {:?}",
+                q.reason
+            ),
+            ResumeOutcome::Ready(_) => panic!("expected Confirming, got Ready"),
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        };
+
+        match sealed_pending_again
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not error on the healed tape")
+        {
+            ConfirmOutcome::Sealed(s) => assert_eq!(s.label, "SESSTEST"),
+            ConfirmOutcome::Quarantined(q) => {
+                panic!(
+                    "expected Sealed on the healed tape, got Quarantined: {:?}",
+                    q.reason
+                )
+            }
+            ConfirmOutcome::Inconclusive(inc) => panic!(
+                "expected Sealed on the healed tape, got Inconclusive again: {:?}",
+                inc.evidence.mismatches
+            ),
+        }
+
+        let (volume_status, write_status): (String, String) = f
+            .conn
+            .query_row(
+                "SELECT v.status, w.status FROM volumes v JOIN writes w ON w.volume_id = v.id \
+                 WHERE v.id = ?1",
+                params![f.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "sealed");
+        assert_eq!(write_status, "completed");
     }
 
     // --- check_tape_contact: the shared File-0 + seal-marker check (#27) ---
