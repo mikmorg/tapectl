@@ -494,6 +494,16 @@ pub fn check_tape_contact(
 /// (the caller-supplied position, and a foreign tape's own self-reported
 /// one) so there is exactly one "does this position hold a seal marker"
 /// check, not two copies that could drift.
+///
+/// That conflation is safe ONLY for a fresh write to a blank tape — it is
+/// exactly what made an unreadable-but-genuinely-sealed position on resume
+/// indistinguishable from "never sealed" (ADR-0012's 2026-09-21 correction
+/// "the seal is RECORDED, not inferred", issue #277). `resume_checking`
+/// no longer relies on this function's answer alone to decide whether IT
+/// owes a seal; it consults `volumes.sealed_at` (migration 018) first. This
+/// function itself is unchanged — the conflation remains correct for the
+/// fresh-write path (`write::check_fresh_write_contact`) and for
+/// [`resume_reconfirm_eligible`]'s defence-in-depth conditions.
 fn seal_marker_parses_at(store: &mut dyn Store, position: u32) -> bool {
     let mut bytes = Vec::new();
     if store.read_file(position, &mut bytes).is_ok() {
@@ -570,6 +580,30 @@ fn resume_reconfirm_eligible(
         return false;
     }
     seal_marker_parses_at(store, expected_seal_position)
+}
+
+/// Whether THIS volume's own `seal()` already ran — `volumes.sealed_at`
+/// (migration 018), ADR-0012's 2026-09-21 correction "the seal is RECORDED,
+/// not inferred" (issue #277).
+///
+/// `sealed_at` is set exactly once, at the single production `seal()` call
+/// site (`write::finish_session`, immediately after `ready.seal(store)`
+/// returns `Ok`), and is never cleared afterward by any confirm outcome —
+/// not even an `Inconclusive` confirm's `mark_writes(..., "interrupted")`
+/// (`SealedPending::confirm`). That is what makes its mere presence settle
+/// what `seal_marker_parses_at` cannot: whether an unreadable seal position
+/// means "never sealed" (this volume's `sealed_at` is still NULL — the seal
+/// is genuinely still owed) or "sealed, but this read attempt failed" (this
+/// volume's `sealed_at` is set — the seal must never be attempted again).
+/// [`InterruptedSession::resume_checking`] consults this before it will
+/// ever reposition the store or call `seal()` again.
+fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
+    let sealed_at: Option<String> = conn.query_row(
+        "SELECT sealed_at FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    Ok(sealed_at.is_some())
 }
 
 impl PlannedSession {
@@ -865,7 +899,34 @@ impl InterruptedSession {
             &self.built.layout.volume_uuid,
             seal_position,
         ) {
-            ContactOutcome::Blank | ContactOutcome::Matches => {}
+            ContactOutcome::Blank | ContactOutcome::Matches => {
+                // ADR-0012's 2026-09-21 correction "the seal is RECORDED,
+                // not inferred" (issue #277). Both `Blank` and `Matches`
+                // are reached whenever the seal position at the end of
+                // this session's own Layout does not read as a parseable
+                // seal marker — and that happens both when it genuinely
+                // never got one (a real resume of a still-unsealed tape)
+                // AND when THIS session's own `seal()` already wrote one
+                // but this read attempt failed (`MismatchKind::SealUnreadable`
+                // is exactly what produces an `Inconclusive` confirm, so a
+                // resume after that always meets this shape). Those two
+                // cases must never be told apart by guessing from the tape:
+                // `volumes.sealed_at` (migration 018) is the recorded fact.
+                // Sealed already → re-enter confirm; never reposition or
+                // seal again — the same terminal shape as the
+                // `AlreadySealed` arm's own `Confirming` outcome below, just
+                // reached without a readable seal marker to probe.
+                if seal_recorded(conn, self.volume_id)? {
+                    return Ok(ResumeOutcome::Confirming(SealedPending {
+                        built: self.built,
+                        volume_id: self.volume_id,
+                        write_ids: self.write_ids,
+                    }));
+                }
+                // sealed_at is NULL: the seal is still genuinely owed.
+                // Fall through to the two-case cursor rule exactly as
+                // before.
+            }
             ContactOutcome::IdentityMismatch { found } => {
                 // ADR-0012's 2026-09-17 amendment (issue #242): this is a
                 // catalog fact tapectl OBSERVED, never one the operator
@@ -3171,6 +3232,407 @@ mod tests {
             .unwrap();
         assert_eq!(volume_status, "sealed");
         assert_eq!(write_status, "completed");
+    }
+
+    // --- issue #277: the seal is RECORDED, not inferred -------------------
+    //
+    // ADR-0012's 2026-09-21 correction to its own preceding amendment. The
+    // preceding amendment's `resume_reconfirm_eligible` machinery (tested
+    // above) routes every one of its three conditions through
+    // `seal_marker_parses_at`, which cannot distinguish "no marker here"
+    // from "a read error at this position" — deliberately, for the
+    // fresh-write path. On resume that conflation is fatal: an `Inconclusive`
+    // confirm's own `MismatchKind::SealUnreadable` is exactly a read error at
+    // the seal position, so the very seal a session wrote is the one seal
+    // resume cannot see. These tests exercise the fixture detail none of
+    // commit 8b061b7's five resume tests cover: a seal position that
+    // outright ERRORS on read, not one that parses to something else or
+    // merely disagrees.
+
+    /// A `Store` wrapping a `MemStore` that panics if `execute` or
+    /// `reposition_for_resume` is called. Once `volumes.sealed_at` is
+    /// recorded, `resume_checking` must never attempt either — doing so
+    /// would be a write-path operation (a second seal marker, or a
+    /// reposition ahead of one) against a cartridge ADR-0003 says is already
+    /// immutable. `capacity` and `read_file` delegate normally: revalidation
+    /// and the contact/seal probes both need to read.
+    struct NoWriteStore(MemStore);
+
+    impl Store for NoWriteStore {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.0.capacity()
+        }
+        fn execute(&mut self, _src: &mut dyn std::io::Read, _len: u64, _sync: bool) -> Result<u64> {
+            panic!(
+                "issue #277: resume must never write once `volumes.sealed_at` is recorded — \
+                 this would write a second seal marker to a physically sealed cartridge"
+            );
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            self.0.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, _file_index: u32) -> Result<()> {
+            panic!(
+                "issue #277: resume must never reposition once `volumes.sealed_at` is \
+                 recorded — that is a write-path operation against an already-sealed tape"
+            );
+        }
+    }
+
+    /// THE headline regression for issue #277. Builds exactly the scenario
+    /// ADR-0012's 2026-09-21 correction names: execute finishes, `seal()`
+    /// succeeds (a real seal marker goes on tape, and — simulating what
+    /// `write::finish_session` does at its one call site — `sealed_at` is
+    /// recorded), then the seal position becomes UNREADABLE (an outright
+    /// read error, not a parseable-but-different marker and not a short
+    /// read — both of those are already covered elsewhere). Before Change 3,
+    /// `check_tape_contact` cannot tell "sealed but this read failed" apart
+    /// from "never sealed" (`seal_marker_parses_at` returns `false` for a
+    /// read error exactly as it does for "no marker here"), reports
+    /// `Matches`, and resume falls through the (until now empty)
+    /// `Blank | Matches` arm straight toward `reposition_for_resume` and a
+    /// second `seal()` — a write against a physically sealed cartridge,
+    /// ADR-0003 bypassed. `NoWriteStore` turns that fallthrough into an
+    /// immediate panic instead of a silent pass, so red is unambiguous.
+    #[test]
+    fn resume_never_rewrites_a_sealed_tape_when_the_seal_position_is_unreadable() {
+        let f = make_fixture();
+        let mut inner = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut inner).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut inner, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+
+        let seal_pos = ready
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("layout has a seal marker")
+            .position as u32;
+
+        let sealed_pending = ready.seal(&mut inner).expect("seal should succeed");
+
+        // Change 2's effect, simulated exactly where it happens in
+        // production (`write::finish_session`, immediately after
+        // `ready.seal` returns `Ok` — `ReadyToSeal::seal` itself takes no
+        // `Connection`).
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+
+        // Simulate the crash: a real `Inconclusive` confirm (or a crash
+        // mid-confirm swept by `recover_orphaned_sessions`) leaves `writes`
+        // 'interrupted' — the only status `InterruptedSession::rehydrate`
+        // will adopt.
+        mark_writes(&f.conn, &sealed_pending.write_ids, "interrupted").unwrap();
+
+        // The fixture's load-bearing premise, checked rather than assumed:
+        // the seal marker really is the last file on the (simulated) tape,
+        // so popping it below removes exactly the seal and nothing else.
+        assert_eq!(
+            inner.files.len() as u32 - 1,
+            seal_pos,
+            "fixture premise: the seal marker must be the last entry"
+        );
+        // The defect's trigger: the seal position becomes unreadable.
+        inner.files.pop();
+
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("an Inconclusive-confirm-shaped interruption must be resumable");
+
+        let mut store = NoWriteStore(inner);
+        let outcome = interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error, and must not panic via NoWriteStore either");
+
+        match outcome {
+            ResumeOutcome::Confirming(_) => {}
+            ResumeOutcome::Ready(_) => panic!(
+                "issue #277: an unreadable seal position must not be inferred as \"never \
+                 sealed\" when `sealed_at` says otherwise — expected Confirming, got Ready \
+                 (the shape that leads straight to a second seal() call in finish_session)"
+            ),
+            ResumeOutcome::Quarantined(q) => panic!(
+                "expected Confirming (sealed_at recorded), got Quarantined: {:?}",
+                q.reason
+            ),
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        }
+
+        // No side effect at all: this arm returns before touching `writes`
+        // again — only a completed confirm() moves it from here.
+        let write_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            write_status, "interrupted",
+            "the Confirming arm must not touch `writes` — only a completed confirm() does"
+        );
+    }
+
+    /// The `Blank`-half twin of the test above (issue #277): File 0 is ALSO
+    /// unreadable, so `check_tape_contact` reports `Blank` instead of
+    /// `Matches` — the ADR names this shape explicitly ("`Blank` reaches the
+    /// same line when File 0 is transiently unreadable"). A recorded
+    /// `sealed_at` must win here exactly as it does for `Matches`: resume
+    /// must re-enter confirm, never reposition or seal.
+    #[test]
+    fn resume_never_rewrites_a_sealed_tape_when_file_zero_is_also_unreadable() {
+        let f = make_fixture();
+        let mut inner = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut inner).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut inner, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut inner).expect("seal should succeed");
+
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        mark_writes(&f.conn, &sealed_pending.write_ids, "interrupted").unwrap();
+
+        // Both File 0 (position 0) and the seal marker (the last file) are
+        // now unreadable — `check_tape_contact` falls through its
+        // `file_zero_present` branch entirely and reports `Blank`.
+        inner.files.clear();
+
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("an Inconclusive-confirm-shaped interruption must be resumable");
+
+        let mut store = NoWriteStore(inner);
+        match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error, and must not panic via NoWriteStore either")
+        {
+            ResumeOutcome::Confirming(_) => {}
+            ResumeOutcome::Ready(_) => panic!(
+                "issue #277: a Blank contact reading must not override a recorded seal — \
+                 expected Confirming, got Ready"
+            ),
+            ResumeOutcome::Quarantined(q) => panic!(
+                "expected Confirming (sealed_at recorded), got Quarantined: {:?}",
+                q.reason
+            ),
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        }
+    }
+
+    /// The necessary contrast to the two tests above (issue #277): when
+    /// `sealed_at` is genuinely NULL — `seal()` never ran, only `execute`
+    /// finished before the crash — resume must still reach `Ready`, so the
+    /// caller (`write::finish_session`) goes on to call `seal()` for the
+    /// first time. A fix that made resume unconditionally re-confirm instead
+    /// of sealing would silently strand every session interrupted between
+    /// execute finishing and seal ever running — this is the case a naive
+    /// fix breaks.
+    #[test]
+    fn resume_still_seals_when_the_seal_was_never_recorded() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut store, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+
+        // The checked premise: execute really did finish (every slice is
+        // recorded 'written'), so this is genuinely case (a) — "execute
+        // finished, seal() never ran" — not an early interruption.
+        let total_slices = ready
+            .built
+            .layout
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .count();
+        assert_eq!(
+            count_written_slices(&f.conn, &ready.write_ids).unwrap(),
+            total_slices,
+            "fixture premise: execute must have written every slice"
+        );
+
+        // `seal()` is deliberately never called. Simulate the crash: a real
+        // crash here leaves `writes` 'in_progress', and
+        // `recover_orphaned_sessions` sweeps it to 'interrupted' before any
+        // command holds a `Connection`.
+        mark_writes(&f.conn, &ready.write_ids, "interrupted").unwrap();
+
+        let sealed_at: Option<String> = f
+            .conn
+            .query_row(
+                "SELECT sealed_at FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sealed_at.is_none(),
+            "seal() never ran in this test; sealed_at must be NULL"
+        );
+
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("resumable");
+
+        let ready_again = match interrupted
+            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .expect("resume must not hard-error")
+        {
+            ResumeOutcome::Ready(r) => r,
+            ResumeOutcome::Confirming(_) => panic!(
+                "issue #277: sealed_at is NULL — the seal is still owed. Expected Ready, got \
+                 Confirming"
+            ),
+            ResumeOutcome::Quarantined(q) => {
+                panic!("expected Ready, got Quarantined: {:?}", q.reason)
+            }
+            ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+        };
+
+        let sealed_pending = ready_again.seal(&mut store).expect("seal should succeed");
+        match sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not error")
+        {
+            ConfirmOutcome::Sealed(s) => assert_eq!(s.label, "SESSTEST"),
+            ConfirmOutcome::Quarantined(q) => {
+                panic!("expected Sealed, got Quarantined: {:?}", q.reason)
+            }
+            ConfirmOutcome::Inconclusive(inc) => panic!(
+                "expected Sealed, got Inconclusive: {:?}",
+                inc.evidence.mismatches
+            ),
+        }
+
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "sealed");
+    }
+
+    /// `sealed_at` is write-once and must NEVER be cleared by any confirm
+    /// outcome (issue #277) — in particular not by an `Inconclusive`
+    /// confirm's own `mark_writes(..., "interrupted")`, which is precisely
+    /// the transition that, without this column, erases the distinction
+    /// between "never sealed" and "sealed, but this readback failed".
+    #[test]
+    fn sealed_at_survives_an_inconclusive_confirms_mark_writes() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+
+        // Change 2's effect, simulated at the point `write::finish_session`
+        // records it.
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let sealed_at_before: String = f
+            .conn
+            .query_row(
+                "SELECT sealed_at FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // A short read -> Inconclusive, same fixture as
+        // `confirm_with_only_a_short_read_goes_inconclusive_not_quarantined`.
+        let slice_position = sealed_pending
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .expect("fixture layout always has at least one slice entry");
+        store.files[slice_position].truncate(5);
+
+        match sealed_pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not hard-error on a short read")
+        {
+            ConfirmOutcome::Inconclusive(_) => {}
+            ConfirmOutcome::Sealed(_) => panic!("expected Inconclusive, got Sealed"),
+            ConfirmOutcome::Quarantined(q) => {
+                panic!("expected Inconclusive, got Quarantined: {:?}", q.reason)
+            }
+        }
+
+        let write_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            write_status, "interrupted",
+            "confirm's Inconclusive branch moves writes to 'interrupted' via mark_writes"
+        );
+
+        let sealed_at_after: String = f
+            .conn
+            .query_row(
+                "SELECT sealed_at FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sealed_at_before, sealed_at_after,
+            "mark_writes(..., 'interrupted') must never clear sealed_at — that survival is \
+             the entire point of recording it"
+        );
     }
 
     // --- check_tape_contact: the shared File-0 + seal-marker check (#27) ---
