@@ -862,7 +862,7 @@ rm_step_raw_volume() {
         echo "PLAN: assert mismatched_count == 0 and all_verified from the JSON above"
         return 0
     fi
-    TCTL restore raw-volume --to "$to" --device "$TAPE_DEV" --json >"$RM_WORK/raw.json" 2>&1
+    TCTL restore raw-volume --to "$to" --device "$TAPE_DEV" --json >"$RM_WORK/raw.json" 2>"$RM_WORK/raw.json.err"
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -923,11 +923,11 @@ rm_step_verify() {
         echo "PLAN: tapectl volume verify $RM_LABEL --full/--quick --device $TAPE_DEV --json; tapectl report verify-status --json (assert $RM_LABEL listed)"
         return 0
     fi
-    TCTL volume verify "$RM_LABEL" --full --device "$TAPE_DEV" --json >"$RM_WORK/verify_full.json" 2>&1 || { cat "$RM_WORK/verify_full.json"; return 1; }
+    TCTL volume verify "$RM_LABEL" --full --device "$TAPE_DEV" --json >"$RM_WORK/verify_full.json" 2>"$RM_WORK/verify_full.json.err" || { cat "$RM_WORK/verify_full.json.err" "$RM_WORK/verify_full.json"; return 1; }
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RM_WORK/verify_full.json" || return 1
-    TCTL volume verify "$RM_LABEL" --quick --device "$TAPE_DEV" --json >"$RM_WORK/verify_quick.json" 2>&1 || { cat "$RM_WORK/verify_quick.json"; return 1; }
+    TCTL volume verify "$RM_LABEL" --quick --device "$TAPE_DEV" --json >"$RM_WORK/verify_quick.json" 2>"$RM_WORK/verify_quick.json.err" || { cat "$RM_WORK/verify_quick.json.err" "$RM_WORK/verify_quick.json"; return 1; }
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0, d' "$RM_WORK/verify_quick.json" || return 1
-    TCTL report verify-status --json >"$RM_WORK/verify_status.json" 2>&1 || return 1
+    TCTL report verify-status --json >"$RM_WORK/verify_status.json" 2>"$RM_WORK/verify_status.json.err" || return 1
     grep -q "\"$RM_LABEL\"" "$RM_WORK/verify_status.json" || { echo "volume $RM_LABEL not listed in report verify-status"; return 1; }
 }
 
@@ -1217,7 +1217,7 @@ PY
 fy_audit() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl audit --json (record exit code; 0 or 1 both PASS)"; return 0; }
     local fy_audit_json="$RUN/fy.audit.json"
-    TCTL audit --json >"$fy_audit_json" 2>&1
+    TCTL audit --json >"$fy_audit_json" 2>"$fy_audit_json.err"
     local rc=$?
     # first-year writes exactly one volume (fy.write), so every unit is
     # legitimately one copy short of min_copies in EVERY cartridge mode. That
@@ -1229,8 +1229,45 @@ fy_audit() {
 fy_fsck()      { TCTL db fsck; }
 fy_summary()   { TCTL report summary; }
 
+# Issue #270: proves the --json captures in this file keep stdout CLEAN.
+#
+# Every `--json` capture here used to be `>"$f" 2>&1`, merging stderr into the
+# file the next line parses. tapectl writes progress and diagnostics to stderr
+# ON PURPOSE so `--json` stdout stays parseable, so those captures were one
+# warning away from a JSONDecodeError that reads like a product bug. Three
+# instances of that trap had already been fixed one at a time (#226, #265's
+# run_capture_json, then these); this pins the property instead.
+#
+# `--verbose` is the lever because it is deterministic: it guarantees DEBUG
+# lines on stderr for any command, so the check cannot pass by the command
+# happening to be quiet. That matters -- a version of this assertion that
+# merely parsed a clean capture would be vacuous, which is the exact failure
+# mode this whole class is made of.
+fy_json_capture_keeps_stdout_clean() {
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl --verbose report copies --json, split streams, assert stdout parses and stderr is non-empty"; return 0; }
+    local d="$RUN/json-split"; mkdir -p "$d"
+    TCTL --verbose report copies --json >"$d/out.json" 2>"$d/out.err" || {
+        cat "$d/out.err" "$d/out.json"; return 1
+    }
+    [ -s "$d/out.err" ] || {
+        echo "--verbose produced no stderr, so this check proves nothing about stream separation (issue #270)"
+        return 1
+    }
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$d/out.json" || {
+        echo "stdout did not parse as JSON even with the streams split -- the capture is still contaminated:"
+        head -c 400 "$d/out.json"; return 1
+    }
+    grep -q "DEBUG" "$d/out.json" && {
+        echo "a DEBUG line reached the JSON file: stderr is still being merged into stdout (issue #270)"
+        return 1
+    }
+    echo "stdout parsed as JSON while stderr carried $(wc -c <"$d/out.err") bytes of diagnostics"
+    return 0
+}
+
 scenario_first_year() {
     check fy.init       fy_init
+    check fy.json_split fy_json_capture_keeps_stdout_clean
     check fy.locations  fy_locations
     check fy.tenants    fy_tenants
     check fy.escrow     fy_escrow
@@ -1284,7 +1321,7 @@ ev_mutate() {
 ev_dirty_lists_mutated() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report dirty --json (assert photos, docs, big all listed, including the touch-only unit)"; return 0; }
     local logf="$RUN/log-ev.dirty.json"
-    TCTL report dirty --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL report dirty --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -1363,7 +1400,7 @@ kr_rotate() { TCTL key rotate --tenant alice; }
 kr_keylist_shows_rotation() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl key list --tenant alice --json (assert 1 active + >=1 inactive primary key)"; return 0; }
     local logf="$RUN/log-kr.keylist.json"
-    TCTL key list --tenant alice --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL key list --tenant alice --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -1513,8 +1550,8 @@ tr_reassign() { TCTL tenant reassign --to bob alice; }
 tr_unit_list_shows_move() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit list --tenant bob --json (assert photos,big present); --tenant alice --json (assert absent)"; return 0; }
     local bobf="$RUN/log-tr.unitlist.bob.json" alicef="$RUN/log-tr.unitlist.alice.json"
-    TCTL unit list --tenant bob --json >"$bobf" 2>&1 || { cat "$bobf"; return 1; }
-    TCTL unit list --tenant alice --json >"$alicef" 2>&1 || { cat "$alicef"; return 1; }
+    TCTL unit list --tenant bob --json >"$bobf" 2>"$bobf.err" || { cat "$bobf.err" "$bobf"; return 1; }
+    TCTL unit list --tenant alice --json >"$alicef" 2>"$alicef.err" || { cat "$alicef.err" "$alicef"; return 1; }
     python3 -c '
 import json, sys
 bob = {u.get("name") for u in json.load(open(sys.argv[1]))}
@@ -1577,7 +1614,7 @@ tr_restore_sh_vola_alice_key() {
 tr_catalog_locate() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog locate photos --json (assert both VOL-A and VOL-D named)"; return 0; }
     local logf="$RUN/log-tr.locate.json"
-    TCTL catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL catalog locate photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos:"; cat "$logf"; return 1; }
     grep -q "VOL-D" "$logf" || { echo "VOL-D not named in catalog locate photos:"; cat "$logf"; return 1; }
 }
@@ -1892,7 +1929,7 @@ cp_reclaim_v1_photos() {
 cp_compaction_candidates_lists_vole() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report compaction-candidates --json (assert VOL-E listed)"; return 0; }
     local logf="$RUN/log-cp.candidates.json"
-    TCTL report compaction-candidates --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL report compaction-candidates --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     grep -q "VOL-E" "$logf" || { echo "VOL-E not listed as a compaction candidate:"; cat "$logf"; return 1; }
 }
 
@@ -2219,7 +2256,7 @@ dl_scenario_a_db_import() {
     mkdir -p "$newhome/keys"
     cp -a "$sd/backup.keys/." "$newhome/keys/" 2>/dev/null || { echo "could not copy backup.keys into the new home"; return 1; }
     local logf="$sd/dl.a.locate.json"
-    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos:"; cat "$logf"; return 1; }
     local to="$sd/dl.a.restore-photos"
     NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
@@ -2252,7 +2289,7 @@ dl_scenario_b_raw_and_import() {
     NEWHOME_TCTL "$newhome" init --operator "$OPERATOR" --no-escrow >"$sd/dl.b.init.txt" 2>&1 || { cat "$sd/dl.b.init.txt"; return 1; }
 
     local rawto="$sd/dl.b.raw" rawlog="$sd/dl.b.raw.json"
-    NEWHOME_TCTL "$newhome" restore raw-volume --to "$rawto" --device "$TAPE_DEV" --json >"$rawlog" 2>&1
+    NEWHOME_TCTL "$newhome" restore raw-volume --to "$rawto" --device "$TAPE_DEV" --json >"$rawlog" 2>"$rawlog.err"
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2315,7 +2352,7 @@ dl_scenario_d_catalog_rebuild() {
 
     local rlog="$sd/dl.d.rebuild.json"
     NEWHOME_TCTL "$newhome" catalog rebuild --from-volume --device "$TAPE_DEV" \
-        --key "$opkey" --label VOL-A --json >"$rlog" 2>&1 || { cat "$rlog"; return 1; }
+        --key "$opkey" --label VOL-A --json >"$rlog" 2>"$rlog.err" || { cat "$rlog.err" "$rlog"; return 1; }
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2328,7 +2365,7 @@ assert d["units_without_tenant_envelope"] == [], d
 ' "$rlog" || { echo "catalog rebuild did not report a real rebuild:"; cat "$rlog"; return 1; }
 
     local logf="$sd/dl.d.locate.json"
-    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos after rebuild:"; cat "$logf"; return 1; }
 
     mkdir -p "$newhome/keys"
@@ -2356,10 +2393,10 @@ assert d["units_without_tenant_envelope"] == [], d
     NEWHOME_TCTL "$newhome" key import --escrow "$HOME_DIR/keys/$OPERATOR-escrow.age.pub" >"$sd/dl.d.escrow-import.txt" 2>&1 \
         || { echo "could not import the original escrow key into the rebuilt home:"; cat "$sd/dl.d.escrow-import.txt"; return 1; }
     local llog2="$sd/dl.d.locate-after.json"
-    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$llog2" 2>&1 || { cat "$llog2"; return 1; }
+    NEWHOME_TCTL "$newhome" catalog locate photos --json >"$llog2" 2>"$llog2.err" || { cat "$llog2.err" "$llog2"; return 1; }
     grep -q '"escrow": *"yes"' "$llog2" || { echo "with the ORIGINAL escrow key registered, the rebuilt rows must be covered — the receipt rode the tape in catalog.db:"; cat "$llog2"; return 1; }
     local alog2="$sd/dl.d.audit-after.json"
-    NEWHOME_TCTL "$newhome" audit --json >"$alog2" 2>&1 || true   # advisory exit codes are fine
+    NEWHOME_TCTL "$newhome" audit --json >"$alog2" 2>"$alog2.err" || true   # advisory exit codes are fine
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2372,7 +2409,7 @@ assert "escrow_coverage" not in checks, ("coverage warning with the original key
     # pass must change nothing. This is what makes it safe to walk a shelf.
     local rlog2="$sd/dl.d.rebuild2.json"
     NEWHOME_TCTL "$newhome" catalog rebuild --from-volume --device "$TAPE_DEV" \
-        --key "$opkey" --label VOL-A --json >"$rlog2" 2>&1 || { cat "$rlog2"; return 1; }
+        --key "$opkey" --label VOL-A --json >"$rlog2" 2>"$rlog2.err" || { cat "$rlog2.err" "$rlog2"; return 1; }
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2388,12 +2425,12 @@ assert d["no_changes"], d
     NEWHOME_TCTL "$wrong" init --operator "$OPERATOR" >"$sd/dl.d2.init.txt" 2>&1 || { cat "$sd/dl.d2.init.txt"; return 1; }
     local rlog3="$sd/dl.d2.rebuild.json"
     NEWHOME_TCTL "$wrong" catalog rebuild --from-volume --device "$TAPE_DEV" \
-        --key "$opkey" --label VOL-A --json >"$rlog3" 2>&1 || { cat "$rlog3"; return 1; }
+        --key "$opkey" --label VOL-A --json >"$rlog3" 2>"$rlog3.err" || { cat "$rlog3.err" "$rlog3"; return 1; }
     local llog3="$sd/dl.d2.locate.json"
-    NEWHOME_TCTL "$wrong" catalog locate photos --json >"$llog3" 2>&1 || { cat "$llog3"; return 1; }
+    NEWHOME_TCTL "$wrong" catalog locate photos --json >"$llog3" 2>"$llog3.err" || { cat "$llog3.err" "$llog3"; return 1; }
     grep -q '"escrow": *"NO"' "$llog3" || { echo "with a replacement escrow identity registered, locate must say NO:"; cat "$llog3"; return 1; }
     local alog3="$sd/dl.d2.audit.json"
-    NEWHOME_TCTL "$wrong" audit --json >"$alog3" 2>&1 || true
+    NEWHOME_TCTL "$wrong" audit --json >"$alog3" 2>"$alog3.err" || true
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2549,7 +2586,7 @@ scenario_escrow_ordering() {
 rfc_catalog_ls_matches_find() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog ls photos --json; compare non-directory entry count to find \$SRC/photos -type f -o -type l"; return 0; }
     local logf="$RUN/log-rfc.catalog_ls.json"
-    TCTL catalog ls photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL catalog ls photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     local expect actual
     expect="$(find "$SRC/photos" \( -type f -o -type l \) | wc -l)"
     actual="$(python3 -c '
@@ -2565,14 +2602,14 @@ print(sum(1 for r in d if not r.get("is_directory")))
 rfc_catalog_search() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog search target --json (assert target.txt found)"; return 0; }
     local logf="$RUN/log-rfc.search.json"
-    TCTL catalog search target --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL catalog search target --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     grep -q "target" "$logf" || { echo "catalog search 'target' found nothing:"; cat "$logf"; return 1; }
 }
 
 rfc_catalog_locate() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog locate photos --json (assert VOL-A named)"; return 0; }
     local logf="$RUN/log-rfc.locate.json"
-    TCTL catalog locate photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL catalog locate photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     grep -q "VOL-A" "$logf" || { echo "VOL-A not named in catalog locate photos:"; cat "$logf"; return 1; }
 }
 
@@ -2624,7 +2661,7 @@ rfc_check_integrity_after_modify() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: mutate photos (modify); tapectl unit check-integrity photos --json (assert bitrot+size_mismatch > 0, naming the changed file)"; return 0; }
     mutate_source "$SRC/photos" "$SEED" modify || return 1
     local logf="$RUN/log-rfc.integrity_modify.json"
-    TCTL unit check-integrity photos --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL unit check-integrity photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2750,7 +2787,7 @@ PY
 col_sync_registers_four() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl collection sync --json; tapectl unit list --tenant alice --json (assert 4 units)"; return 0; }
     local logf="$RUN/log-col.sync.json"
-    TCTL collection sync --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL collection sync --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     local n
     n="$(TCTL unit list --tenant alice --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
     [ "$n" = 4 ] || { echo "expected 4 units after collection sync, got $n:"; cat "$logf"; return 1; }
@@ -2799,7 +2836,7 @@ col_status_shows_new_pending() {
         echo "media/echo was not registered by collection sync:"; cat "$units"; return 1; }
     local n; n="$(grep -cE 'media/[a-z]+' "$units")"
     [ "$n" -eq 5 ] || { echo "expected 5 units in collection media after add+rename, got $n:"; cat "$units"; return 1; }
-    TCTL collection status --json >"$logf" 2>&1 || { cat "$logf"; return 1; }
+    TCTL collection status --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     # `pending` moves as units get staged/written, so assert the collection is
     # tracked and still short of full coverage rather than pinning a count that
     # legitimately varies between a single- and multi-cartridge run.
@@ -3489,7 +3526,7 @@ cd_write_both_on_d1() {
 cd_preconditions() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report copies --json (assert kept=2, solo=1 BEFORE the erase)"; return 0; }
     local f="$RUN/log-cd.copies-before.json"
-    TCTL report copies --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL report copies --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { echo "copies before the erase are not 2/1:"; cat "$f"; return 1; }
 import json, sys
 d = {r["unit"]: r["copies"] for r in json.load(open(sys.argv[1]))}
@@ -3547,7 +3584,7 @@ cd_init_d2_displaces() {
 cd_catalog_records_the_displacement() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume list --json (VOL-D1 erased, VOL-D2 live, both on the SAME barcode, VOL-D0 on a different one)"; return 0; }
     local f="$RUN/log-cd.volumes.json"
-    TCTL volume list --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL volume list --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { cat "$f"; return 1; }
 import json, sys
 v = {r["label"]: r for r in json.load(open(sys.argv[1]))}
@@ -3565,7 +3602,7 @@ PY2
 cd_displaced_event() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report events --json (assert an action='displaced' row for VOL-D1)"; return 0; }
     local f="$RUN/log-cd.events.json"
-    TCTL report events --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL report events --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { echo "no displaced event for VOL-D1:"; cat "$f"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
@@ -3578,7 +3615,7 @@ PY2
 cd_copies_after() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report copies --json (assert kept=1, solo=0 after the displacement)"; return 0; }
     local f="$RUN/log-cd.copies-after.json"
-    TCTL report copies --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL report copies --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { echo "copy counts did not follow the displacement:"; cat "$f"; return 1; }
 import json, sys
 d = {r["unit"]: r["copies"] for r in json.load(open(sys.argv[1]))}
@@ -3668,7 +3705,7 @@ csc_multi_label_refused() {
     printf '%s\n' "$out" | grep -q "issue #229" || {
         echo "the refusal does not cite issue #229: $out"; return 1; }
     local f="$RUN/log-csc.staged-after-refusal.json"
-    TCTL stage list --json >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL stage list --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d == [], d' "$f" || {
         echo "the refusal happened AFTER staging -- a refused run must cost nothing:"; cat "$f"; return 1; }
 }
@@ -3720,7 +3757,7 @@ PY2
 # what makes this an assertion about BYTES rather than about row counts.
 csc_fingerprint() { # csc_fingerprint <outfile>
     local out="$1" listf="$1.list" units="$1.units"
-    TCTL stage list --json >"$listf" 2>&1 || { cat "$listf"; return 1; }
+    TCTL stage list --json >"$listf" 2>"$listf.err" || { cat "$listf.err" "$listf"; return 1; }
     python3 - "$listf" "$out" "$units" <<'PY2' || { cat "$listf"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
@@ -3732,7 +3769,7 @@ with open(sys.argv[2], "w") as f, open(sys.argv[3], "w") as u:
 PY2
     local unit ver
     while read -r unit ver; do
-        TCTL stage info "$unit" --version "$ver" --json >"$listf.info" 2>&1 \
+        TCTL stage info "$unit" --version "$ver" --json >"$listf.info" 2>"$listf.info.err" \
             || { cat "$listf.info"; return 1; }
         python3 - "$listf.info" "$out" <<'PY2' || return 1
 import json, sys
@@ -3784,7 +3821,7 @@ csc_same_staged_bytes() {
 csc_two_copies() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl collection status --json (under_copied=0) and report copies --json (every media/* unit at 2)"; return 0; }
     local sf="$RUN/log-csc.status2.json" cf="$RUN/log-csc.copies.json"
-    TCTL collection status --json >"$sf" 2>&1 || { cat "$sf"; return 1; }
+    TCTL collection status --json >"$sf" 2>"$sf.err" || { cat "$sf.err" "$sf"; return 1; }
     python3 - "$sf" <<'PY2' || { echo "collection status still reports media under-copied after two copies:"; cat "$sf"; return 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -3792,7 +3829,7 @@ media = next((c for c in d if c.get("collection") == "media"), None)
 assert media is not None, d
 assert media.get("under_copied", 1) == 0, media
 PY2
-    TCTL report copies --json >"$cf" 2>&1 || { cat "$cf"; return 1; }
+    TCTL report copies --json >"$cf" 2>"$cf.err" || { cat "$cf.err" "$cf"; return 1; }
     python3 - "$cf" <<'PY2' || { echo "policy::coverage does not see two copies:"; cat "$cf"; return 1; }
 import json, sys
 rows = [r for r in json.load(open(sys.argv[1])) if r["unit"].startswith("media/")]
@@ -3811,14 +3848,14 @@ csc_staging_released() {
     # Prove there is something to release before releasing it, so "everything
     # is cleaned afterwards" cannot be satisfied by "everything was already
     # cleaned beforehand" (same vacuity trap as csc_fingerprint's guard).
-    TCTL stage list --json >"$lf" 2>&1 || { cat "$lf"; return 1; }
+    TCTL stage list --json >"$lf" 2>"$lf.err" || { cat "$lf.err" "$lf"; return 1; }
     python3 - "$lf" <<'PY2' || { echo "nothing was still staged before staging clean ran -- the release happened earlier than the second copy:"; cat "$lf"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
 assert rows and all(r["status"] == "staged" for r in rows), rows
 PY2
     TCTL staging clean >"$f" 2>&1 || { cat "$f"; return 1; }
-    TCTL stage list --json >"$lf" 2>&1 || { cat "$lf"; return 1; }
+    TCTL stage list --json >"$lf" 2>"$lf.err" || { cat "$lf.err" "$lf"; return 1; }
     python3 - "$lf" <<'PY2' || { echo "stage sets are not 'cleaned' after both copies sealed:"; cat "$lf"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
