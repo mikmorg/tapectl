@@ -718,13 +718,42 @@ try:
 except Exception: pass' 2>/dev/null || true)"
   [ -n "$UNITS" ] || die "no units registered — run with --from 11"
   printf '   units:\n%s\n' "$(printf '%s\n' "$UNITS" | sed 's/^/     /')"
-  confirm "Snapshot and stage EVERY unit above?" || die "stopped"
+  # Issue #269: this used to be ONE confirm covering both phases, and then a
+  # single loop doing snapshot+stage per unit. Two problems on production day.
+  #
+  # The operator agreed to the EXPENSIVE phase (dar + hashing + encryption to
+  # every recipient, hours and a lot of staging disk) before anything had told
+  # them how much data that was -- and the authoritative capacity check is the
+  # pre-flight gate inside `volume write`, which runs AFTER all of it. Too much
+  # source for the cartridge meant discovering it at the end.
+  #
+  # And there was no way back out: with nothing yet written, `staging clean`'s
+  # non-force branch requires a completed `writes` row, so the staged bytes are
+  # not even cleanable without `--force`.
+  #
+  # So the phases are split. `snapshot create` is the cheap metadata walk and
+  # prints each unit's size as it goes; the operator sees those numbers and
+  # THEN decides about staging.
+  confirm "Snapshot EVERY unit above? (metadata only -- no archiving yet)" || die "stopped"
   while IFS= read -r u; do
     [ -z "$u" ] && continue
     run tc snapshot create "$u" || die "snapshot failed for $u"
+  done <<< "$UNITS"
+  explain <<'EOF'
+Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it runs dar over every unit, hashes, encrypts to every recipient and writes the slices to your staging directory. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13.
+EOF
+  confirm "Stage them now? (runs dar + encryption, writes to staging)" || die "stopped before staging"
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
     run tc stage create "$u" || die "stage failed for $u"
   done <<< "$UNITS"
   run tc staging status || true
+  # `volume plan` reads the staged stage_sets and totals their encrypted size
+  # against the drive -- the authoritative estimate, and the script never ran
+  # it. This is the last point before the destructive confirm at which the
+  # operator can see what is about to be written and how much of the tape it
+  # uses (issue #269).
+  run tc volume plan || true
   confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" || die "stopped before writing"
   # Capture init's output as well as logging it: two later steps read it back
   # -- the placeholder barcode it reports, and which refusal it gave.
