@@ -1,0 +1,62 @@
+-- 018: the seal is RECORDED, not inferred (ADR-0012, "The seal is RECORDED,
+-- not inferred -- correcting the amendment above", 2026-09-21, issue #277).
+--
+-- The 2026-09-21 amendment immediately above this one in the ADR ruled that
+-- `volume resume` re-confirms a tape it finds already sealed, on three
+-- conjunctive conditions, all of which route through `seal_marker_parses_at`.
+-- That function returns `false` both when a position holds no seal marker
+-- AND when the read itself errors -- deliberately, because a blank tape's
+-- positions do not read, and that must mean "not sealed" for a fresh write.
+--
+-- On resume the same conflation is fatal, because the one `MismatchKind`
+-- that produces an `Inconclusive` confirm in the first place is
+-- `SealUnreadable`: the seal file THIS session wrote is exactly the file
+-- resume cannot read back. The result: no `AlreadySealed`, identity
+-- matches, `ContactOutcome::Matches`, the (until now) empty arm, and
+-- execution falls through to `reposition_for_resume` and `seal()` -- a
+-- write attempt against a physically sealed cartridge, with ADR-0003
+-- bypassed and `resume_reconfirm_eligible` never even consulted (it is
+-- called only inside the `AlreadySealed` arm).
+--
+-- No cleverer probe fixes this: two states are indistinguishable to the
+-- tape, and without this column, to the catalog too --
+--   (a) execute finished, `seal()` never ran (interrupted between the
+--       two) -- resume MUST seal;
+--   (b) execute finished, `seal()` ran, confirm was `Inconclusive` --
+--       resume must NEVER seal.
+-- Both leave `writes.status = 'interrupted'`, `volumes.status =
+-- 'initialized'`, every `write_positions` row `'written'`, and a seal
+-- position that does not read. Any rule derived from the tape alone gets
+-- one of the two wrong.
+--
+-- So the fact is recorded rather than inferred. `sealed_at` is set exactly
+-- once, at the single production `seal()` call site
+-- (`volume::write::finish_session`, immediately after `ready.seal(store)`
+-- returns `Ok`), and is never cleared by any confirm outcome afterward --
+-- not even an `Inconclusive` confirm's `mark_writes(..., 'interrupted')`.
+-- That write-once, never-cleared property is the entire point: the fact
+-- that THIS session's `seal()` succeeded must survive the very
+-- `writes.status` transition that today erases the distinction between (a)
+-- and (b). `InterruptedSession::resume_checking` reads this column instead
+-- of inferring the answer from a read that cannot tell "nothing there" from
+-- "something there I could not read right now".
+--
+-- The three conjunctive conditions `resume_reconfirm_eligible` already
+-- checks (File 0's identity, the tape's own recorded `[layout] seal_marker`
+-- pointer, that pointer genuinely parsing as a seal marker) are NOT
+-- replaced by this column and remain in force as defence in depth for the
+-- case where the tape CAN be read -- see `session.rs`'s
+-- `InterruptedSession::resume_checking` and `resume_reconfirm_eligible`.
+--
+-- This column does not appear anywhere on tape: the operator envelope's
+-- on-tape catalog (`db::ontape_catalog`) carries its own independent,
+-- hand-written schema (tenants/units/snapshots/stage_sets/stage_slices/
+-- files) with no `volumes` table at all, so this migration changes no
+-- on-tape byte.
+--
+-- Plain ADD COLUMN, nullable, no table rebuild -- no `.foreign_key_check()`
+-- needed. There is no CHECK constraint to narrow, no restore-from-`events`
+-- logic, and no FK/index/trigger to preserve, unlike migration 017 (which
+-- rebuilt this same `volumes` table and very nearly bricked databases doing
+-- so). This column needs none of that.
+ALTER TABLE volumes ADD COLUMN sealed_at TEXT;

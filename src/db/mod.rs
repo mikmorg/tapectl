@@ -187,6 +187,23 @@ fn migrations() -> Migrations<'static> {
         // deliberate narrowing of this ADR's own "restore to `sealed`"
         // fallback for rows a write-path (never-sealed) quarantine produced.
         M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
+        // 018 adds `volumes.sealed_at` (ADR-0012's 2026-09-21 correction "the
+        // seal is RECORDED, not inferred", issue #277): the three-condition
+        // resume-reconfirm check the amendment above this one added all
+        // route through `seal_marker_parses_at`, which returns `false` both
+        // for "no marker" and for "the read errored" -- correct for a fresh
+        // write to a blank tape, fatal on resume, since the one
+        // `MismatchKind` that produces `Inconclusive` in the first place is
+        // `SealUnreadable`. Without a recorded fact, "execute finished,
+        // seal() never ran" (resume must seal) and "execute finished, seal()
+        // ran, confirm was Inconclusive" (resume must never seal) are
+        // indistinguishable, and a rule derived from the tape alone gets one
+        // of them wrong -- rewriting a physically sealed cartridge, ADR-0003
+        // bypassed. Set once, at the single `seal()` call site
+        // (`write::finish_session`), never cleared by any confirm outcome.
+        // Plain ADD COLUMN, no rebuild -- see the migration header for why
+        // none of 017's rebuild machinery is needed here.
+        M::up(include_str!("migrations/018_volume_sealed_at.sql")),
     ])
 }
 
@@ -1384,6 +1401,47 @@ mod tests {
         conn
     }
 
+    /// A connection migrated to exactly the 017 schema — the last point
+    /// before migration 018 (issue #277) adds `volumes.sealed_at`. Needed so
+    /// `test_migration_017_changes_no_volume_column` keeps pinning "017
+    /// changed nothing but `observed_condition`" on its own terms, rather
+    /// than against whatever migration happens to be latest — the same
+    /// reason `open_memory_at_016` exists rather than reusing `open_memory()`
+    /// for the 016 side of that comparison.
+    fn open_memory_at_017() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+            M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
+            M::up(include_str!(
+                "migrations/014_cartridge_binding_identity_source.sql"
+            )),
+            M::up(include_str!(
+                "migrations/015_cartridge_load_count_unknown.sql"
+            )),
+            M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
+            M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
+        ];
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
     /// THE test for this migration. Three volumes, each pinning one of the
     /// three data-migration paths issue #242 specifies:
     ///
@@ -1712,7 +1770,11 @@ mod tests {
         let before = open_memory_at_016();
         let cols_016 = table_info(&before, "volumes");
 
-        let after = open_memory().unwrap();
+        // Frozen at exactly 017 (issue #277's migration 018 adds
+        // `sealed_at` immediately after this one and must not be mistaken
+        // for something 017 itself did) — see `open_memory_at_017`'s doc
+        // comment.
+        let after = open_memory_at_017();
         let mut cols_017 = table_info(&after, "volumes");
 
         let observed_condition_pos = cols_017
