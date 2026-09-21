@@ -1693,6 +1693,166 @@ mod tests {
         );
     }
 
+    /// 012's own standard (issue #227), applied to 017: every column that
+    /// existed before the rebuild survives with its name, type, notnull,
+    /// default and pk unchanged. `observed_condition` is 017's whole point,
+    /// so it cannot be folded into a blanket "nothing changed" comparison
+    /// the way 012's analogous test does for `cartridges` — it is pulled out
+    /// and its own shape pinned explicitly, then the rest is compared as a
+    /// literal before/after equality.
+    ///
+    /// Note what this does NOT prove: `PRAGMA table_info` does not report
+    /// CHECK constraints, so this test would pass even if the rebuild had
+    /// dropped the `status` or `observed_condition` CHECK entirely. That half
+    /// is `test_migration_017_observed_condition_is_closed_and_defaults_ok`
+    /// (and the twice-quarantined / restores-quarantine-data tests for
+    /// `status`).
+    #[test]
+    fn test_migration_017_changes_no_volume_column() {
+        let before = open_memory_at_016();
+        let cols_016 = table_info(&before, "volumes");
+
+        let after = open_memory().unwrap();
+        let mut cols_017 = table_info(&after, "volumes");
+
+        let observed_condition_pos = cols_017
+            .iter()
+            .position(|c| c.0 == "observed_condition")
+            .expect("017 must add observed_condition");
+        let observed_condition = cols_017.remove(observed_condition_pos);
+        assert_eq!(
+            observed_condition,
+            (
+                "observed_condition".to_string(),
+                "TEXT".to_string(),
+                1,
+                Some("'ok'".to_string()),
+                0,
+            ),
+            "observed_condition must be NOT NULL DEFAULT 'ok'"
+        );
+
+        assert_eq!(
+            cols_016, cols_017,
+            "017's rebuild changed the name/type/notnull/default/pk of a \
+             column that already existed in 016"
+        );
+    }
+
+    /// 012's index standard (issue #227), applied to 017: every index the
+    /// pre-rebuild table carried is back, and `idx_volumes_uuid` still
+    /// ENFORCES uniqueness, not merely exists. This is the one most worth
+    /// pinning explicitly — a duplicate volume uuid breaks
+    /// `check_tape_contact`'s File 0 identity match
+    /// (`docs/design/layout-session.md`), and a create/copy/drop/rename
+    /// rebuild silently drops whatever its new DDL forgets to restate.
+    #[test]
+    fn test_migration_017_recreates_every_index_and_pins_uuid_uniqueness() {
+        let conn = open_memory().unwrap();
+        assert_eq!(
+            index_names(&conn, "volumes"),
+            vec![
+                "idx_volumes_location",
+                "idx_volumes_status",
+                "idx_volumes_uuid",
+                // the implicit UNIQUE(label) autoindex
+                "sqlite_autoindex_volumes_1",
+            ]
+        );
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, uuid)
+             VALUES ('V-1', 'lto', 'lto0', 'LTO-6', 2500000000000, '11111111-1111-1111-1111-111111111111')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, uuid)
+             VALUES ('V-2', 'lto', 'lto0', 'LTO-6', 2500000000000, '11111111-1111-1111-1111-111111111111')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "idx_volumes_uuid must remain UNIQUE after the rebuild — a duplicate \
+             uuid would break the resume/contact divergence check"
+        );
+    }
+
+    /// 012's FK standard (issue #227), applied to 017's one OUTBOUND edge:
+    /// `volumes.location_id REFERENCES locations(id)`. `PRAGMA table_info`
+    /// reports neither FK nor CHECK constraints, so
+    /// `test_migration_017_changes_no_volume_column` would pass just as
+    /// happily if the rebuild had dropped this reference. Two assertions,
+    /// and the second is the one that would actually catch a dropped
+    /// constraint: the enumeration proves the edge is declared, the insert
+    /// proves it is ENFORCED.
+    #[test]
+    fn test_migration_017_preserves_the_volumes_location_foreign_key() {
+        let before = open_memory_at_016();
+        let after = open_memory().unwrap();
+
+        let expected = vec![(
+            "locations".to_string(),
+            "location_id".to_string(),
+            "id".to_string(),
+        )];
+        assert_eq!(
+            foreign_keys_of(&before, "volumes"),
+            expected,
+            "precondition: 016 declares exactly the one outbound FK"
+        );
+        assert_eq!(
+            foreign_keys_of(&after, "volumes"),
+            expected,
+            "017's rebuild must restate `location_id REFERENCES locations(id)` — \
+             a rebuild drops any constraint its new DDL omits"
+        );
+
+        let err = after.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, location_id)
+             VALUES ('V-dangling', 'lto', 'lto0', 'LTO-6', 2500000000000, 99999)",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "the FK must be ENFORCED after the rebuild, not merely declared"
+        );
+    }
+
+    /// Makes explicit what
+    /// `test_migrate_016_populated_db_to_017_migrates_quarantine_data_and_preserves_ids_and_fk`
+    /// only shows indirectly (via a `cartridge_volumes` join that still
+    /// resolves): the rebuild's `INSERT ... SELECT v.id, ...` copies `id`
+    /// verbatim rather than letting SQLite assign fresh rowids. An explicit,
+    /// out-of-sequence id (500, not 1) makes this a real discriminator — a
+    /// rebuild that dropped `id` from the copy would renumber the sole row
+    /// to 1, not merely leave it unchanged by coincidence. Six tables hold a
+    /// `REFERENCES volumes(id)` foreign key (see the corrected migration
+    /// header); every one of them depends on this.
+    #[test]
+    fn test_migration_017_preserves_volume_ids_across_rebuild() {
+        let mut conn = open_memory_at_016();
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES (500, 'ID-PIN', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let after_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'ID-PIN'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            after_id, 500,
+            "the rebuild must preserve the row's original id, not let SQLite \
+             assign a fresh one"
+        );
+    }
+
     // --- Issue #233: an orphan blocks ordinary open; repair must still run ---
 
     /// Build a FILE-backed (not `:memory:`) database at exactly the 002
