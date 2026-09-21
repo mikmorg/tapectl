@@ -536,3 +536,83 @@ The verify-path half of point 4 stands unaltered: where an `events` row records 
 status, that value is restored — constrained to the statuses the post-017 CHECK still
 admits, because the trail was written under the old rules and can legally contain
 `'quarantined'` itself.
+
+---
+
+## Amendment, 2026-09-21 — two corrections from implementing the two amendments above
+
+**Raised by:** issues #262 and #260/#267, both found by implementing this ADR's own
+2026-09-17 and 2026-09-18 amendments and discovering each ruling's mechanism did not
+survive contact with the code.
+
+### `staging clean` retains per unit; it does not refuse per command (#262)
+
+The 2026-09-17 amendment ruled, verbatim: *"`staging clean` names the under-copied units
+and refuses, unless `--force`."* **That sentence is corrected here: the command names the
+under-copied units, RETAINS their staged data, releases everything else, and succeeds.**
+
+The ruling's purpose is untouched and is in fact better served — the at-risk unit's bytes
+are still kept, which is the whole of #244. What changes is the blast radius, and the
+blast radius was a defect the ruling did not foresee:
+
+- The refusal was whole-command, so one unit stuck below `min_copies` — a lost second
+  cartridge, a failed drive — blocked the release of **every fully covered unit**
+  indefinitely. Staging fills, and `stage create` starts failing on ENOSPC. The archive
+  stops making progress because one unit is stuck.
+- `--force`, the only documented escape, is **strictly less safe than the gate it
+  bypasses**. Its candidate set is `status IN ('staged','failed')` with no `writes`-row
+  condition at all, against the non-force branch's requirement of a completed write — so
+  it also discards staged ciphertext for sets never written to **any** tape. The
+  operator's only way past a gate protecting one unit was an act endangering all of them.
+  That extra reach looks like an accident rather than a decision, and is worth revisiting
+  on its own.
+- The repo's own harness is primary-source evidence: `scripts/lifecycle-suite.sh` carries
+  two `staging clean --force` call sites whose comments exist solely to explain why the
+  bare command now refuses.
+
+The two implementation constraints of the original ruling are unchanged and still bind:
+the count routes through `policy::coverage::copy_count_expr` against
+`policy::resolve(...).min_copies`, never a second derivation (#96); and `clean_staging`
+stays policy-free, with the decision in the callers. `CleanScope` (#248) is a
+**selection** parameter and does not breach that line.
+
+**A related contradiction, fixed with it:** `clean_staging`'s doc says `'failed'` stage
+sets are swept unconditionally because they carry no copy requirement — and its SQL did
+not. A `'failed'` set was collateral to a refusal it could never be the cause of. The
+scope now applies to the `'staged'` branch only; `'failed'` sweeps regardless, including
+under an empty unit slice.
+
+### `volume resume` re-confirms a tape that is already sealed (#260, #267)
+
+The 2026-09-18 amendment ruled that `confirm` gains an `Inconclusive` outcome which
+leaves the session "resumable and re-confirmable". **The mechanism is ruled here, because
+the obvious one does not work.**
+
+`InterruptedSession::rehydrate` selects only `writes.status = 'interrupted'`, so that is
+the only state `volume resume` can reach. But `confirm` runs *after* `seal`, so the tape
+is physically sealed at that moment: a resume re-enters `check_tape_contact`, meets
+`AlreadySealed`, and quarantines — reproducing the exact false quarantine the
+`Inconclusive` ruling exists to prevent, one command later.
+
+**Ruled: `resume` re-confirms.** When `check_tape_contact` returns `AlreadySealed` **and**
+the File 0 identity matches **and** the recorded seal position agrees with the session's
+own layout, the tape is exactly where this session left it. Resume then skips the write
+phase and re-enters `confirm`, which is already idempotent. No migration, no new
+`writes.status` value, no new command — and `volume resume` comes to mean what its name
+says for every interruption rather than only mid-write ones.
+
+**The cost is named rather than discovered later.** This makes `session.rs`'s
+`AlreadySealed` arm conditional, and that arm is the ADR-0003 guard whose failure mode is
+rewriting a sealed cartridge. This project has got that exact path wrong once: the v2
+regear shipped a resume that would have rewritten a sealed tape, it passed
+fmt/clippy/test, and it was caught only by reading a flagged residual. So the three
+conditions above are conjunctive and none may be inferred: identity from File 0, seal
+position from the session's own layout, and the tape's own seal pointer — never the
+caller's guess, which is why #208 hoisted that probe in the first place. Anything short
+of all three keeps today's behaviour.
+
+The alternatives considered and rejected: a new `writes.status = 'unconfirmed'` with a
+migration and a dedicated command (safest for the ADR-0003 arm, but adds a schema value
+and a command on the eve of first production use); and making `volume verify --full` the
+promotion path (attractive now that verify already clears the condition, but it gives a
+command operators run casually the power to mutate `volumes.status`).
