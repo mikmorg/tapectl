@@ -225,6 +225,116 @@ pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::R
     )?)
 }
 
+// ── The retire family's zero-copy floor sees a sealed tape (issue #276) ──
+
+/// A THIRD question, distinct from both [`eligible`] ("is this a copy
+/// right now?") and [`in_service`] ("does this count as inventory?"):
+/// does this volume PHYSICALLY hold restorable bytes right now?
+///
+/// A strict SUPERSET of [`eligible`], widened by exactly one state:
+/// sealed-but-unconfirmed — `sealed_at` set (migration 018) while `status`
+/// is still `'initialized'`. That is migration 018's case (b): `seal()`
+/// succeeded (the seal marker binding the front index is physically on the
+/// tape) but `SealedPending::confirm` has not yet passed — an `Inconclusive`
+/// confirm, or a crash between `seal()` returning and `confirm` running.
+/// Migration 018's header names both states verbatim; read it before
+/// touching this function again.
+///
+/// `{alias}.sealed_at IS NOT NULL` is the line, and it is drawn there
+/// deliberately: an execute that finished WITHOUT a successful `seal()`
+/// (migration 018's case (a) — interrupted between execute and seal) leaves
+/// a tape with slices on it but no seal marker binding the front index, and
+/// `docs/design/layout-session.md` is explicit that such a tape "is not a
+/// copy" — `sealed_at` unset correctly leaves that case excluded.
+/// `sealed_at` SET means the seal marker itself is on the tape, which is
+/// exactly the fact this predicate exists to recognise.
+///
+/// Still consults [`condition_ok`] — this is the deliberate escape hatch
+/// ADR-0012 requires: an operator retiring a tape BECAUSE it no longer
+/// reads says so with `volume verify`, which quarantines
+/// (`observed_condition = 'quarantined'`), and a quarantined volume is then
+/// Tier 2 at most, exactly as it is for [`eligible`].
+///
+/// The "not gone" half is written as an EXCLUSION of
+/// `retired`/`missing`/`erased` ([`status_not_in`]), not an inclusion list,
+/// so a future `volumes.status` value cannot silently drop out of the
+/// Tier-3 floor by omission — migration 017's full legal set is `blank`,
+/// `initialized`, `active`, `full`, `retired`, `missing`, `erased`,
+/// `sealed` (`017_volume_observed_condition.sql`).
+///
+/// **Must NOT be used for copy counting.** An unconfirmed volume is not a
+/// Copy (ADR-0004) and must not contribute to `min_copies`,
+/// [`copy_count_expr`], [`location_count_expr`], `report copies`, `audit`,
+/// or `unit mark-tape-only` — only [`versions_at_stake`] (the retire
+/// family's Tier-3 floor) consults this function, and deliberately does not
+/// let it anywhere near `copies_after`/`locations_after`.
+pub fn holds_sealed_bytes(volume_alias: &str) -> String {
+    format!(
+        "(({alias}.status = 'sealed' OR {alias}.sealed_at IS NOT NULL) AND {not_gone} AND {cond})",
+        alias = volume_alias,
+        not_gone = status_not_in(volume_alias, &["retired", "missing", "erased"]),
+        cond = condition_ok(volume_alias)
+    )
+}
+
+/// A write's status set that means "this write's bytes are physically ON
+/// the tape right now", regardless of whether confirm has yet recorded an
+/// outcome for it (issue #276).
+///
+/// `completed` is confirm's `passed` branch. `in_progress` is the window
+/// `volume::write::finish_session` occupies between `seal()` returning
+/// (where `sealed_at` is recorded) and `SealedPending::confirm` landing an
+/// outcome — `writes.status` only moves to `completed` inside confirm's
+/// `passed` branch, so a row sits `in_progress` for the whole of that
+/// window. A crash in exactly that window is swept to `interrupted` by
+/// `db::open`'s `recover_orphaned_sessions`. All three names are the SAME
+/// physical fact: bytes `seal()`ed onto tape whose confirm outcome the
+/// catalog has not (yet, or ever again) recorded either way. `aborted`
+/// (confirm's proves-medium-bad branch — already excluded downstream by
+/// [`condition_ok`]/[`holds_sealed_bytes`]) and `planned` (never reached
+/// the tape) are deliberately excluded.
+///
+/// One `pub fn`, not a hand-copy at each call site, for the reason
+/// [`status_in`] itself exists: [`versions_at_stake`] (the gate) and
+/// `cli::operations::retire_impacts` (its own display) must never drift on
+/// what "physically on tape" means — issue #276's own requirement is that
+/// the display is never narrower than the gate.
+pub fn write_reaches_tape(write_alias: &str) -> String {
+    status_in(write_alias, &["completed", "in_progress", "interrupted"])
+}
+
+/// True when `volume_label` is sealed-but-unconfirmed right now: the seal
+/// marker is physically on the tape (`sealed_at IS NOT NULL`) but confirm
+/// has not (yet, or ever again) flipped `status` to `'sealed'` (issue
+/// #276). Owned here rather than in `cli::operations`, per this module's
+/// header: `coverage.rs` is the declared sole owner of every
+/// `volumes.status` predicate (issue #96).
+///
+/// Purely a MESSAGING helper — `cli::operations::refuse_last_eligible_copy`
+/// uses it to decide whether to name `tapectl volume resume <label>` as the
+/// cheapest first act in its refusal text. It answers a narrower question
+/// than [`holds_sealed_bytes`] (which also excludes
+/// `retired`/`missing`/`erased` and consults [`condition_ok`]): this
+/// function does not need those exclusions, because by the time
+/// `refuse_last_eligible_copy` runs, `volume_label` is already the specific
+/// volume the operator is trying to retire, not a candidate being filtered
+/// from a set. Concretely: `refuse_last_eligible_copy` only reaches this
+/// call when `volume_label` produced an `at_stake` row in the first place,
+/// which means [`holds_sealed_bytes`] already admitted it — so
+/// [`condition_ok`] is already established for it and this predicate does
+/// not need to re-check it.
+pub fn is_sealed_but_unconfirmed(
+    conn: &Connection,
+    volume_label: &str,
+) -> crate::error::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM volumes \
+         WHERE label = ?1 AND status <> 'sealed' AND sealed_at IS NOT NULL)",
+        params![volume_label],
+        |row| row.get(0),
+    )?)
+}
+
 // ── Deposit-aware copy / location derivations (issue #73, ADR-0006) ──
 
 /// Which slice of a unit's coverage a derivation is asking about.
@@ -497,16 +607,23 @@ pub struct VersionAtStake {
 ///    been released by the operator (`snapshot mark-reclaimable`, whose own
 ///    `--force` is that statement in so many words) and the floor does not
 ///    protect what has been given up.
-/// 2. The volume carries a COMPLETED write of that snapshot. Coverage it
-///    never held cannot be coverage it removes.
-/// 3. The volume itself passes [`eligible`] RIGHT NOW. A quarantined,
-///    unsealed or already-retired volume counts as nothing in every
-///    derivation in this module, so retiring it removes nothing — ADR-0012
-///    says so in as many words, and it is the escape the hard case needs: a
-///    tape with read errors is quarantined by a failed `volume verify`, and
-///    retiring it is then Tier 2 at most. Getting this wrong in the "safe"
-///    direction would make the command useless exactly when an operator
-///    needs it most.
+/// 2. The volume carries a write of that snapshot that REACHED THE TAPE
+///    ([`write_reaches_tape`]: `completed`, `in_progress`, or
+///    `interrupted` — issue #276. `in_progress`/`interrupted` are the same
+///    physical fact as `completed` here: bytes `seal()`ed onto tape whose
+///    confirm outcome the catalog has not recorded either way, see
+///    [`write_reaches_tape`]'s own doc for why). Coverage it never held
+///    cannot be coverage it removes.
+/// 3. The volume itself HOLDS SEALED BYTES right now
+///    ([`holds_sealed_bytes`], issue #276 — a strict superset of
+///    [`eligible`], widened by exactly the sealed-but-unconfirmed state).
+///    A quarantined, never-sealed or already-retired volume counts as
+///    nothing in every derivation in this module, so retiring it removes
+///    nothing — ADR-0012 says so in as many words, and it is the escape the
+///    hard case needs: a tape with read errors is quarantined by a failed
+///    `volume verify`, and retiring it is then Tier 2 at most. Getting this
+///    wrong in the "safe" direction would make the command useless exactly
+///    when an operator needs it most.
 ///
 /// Those three together mean excluding the volume reduces each returned
 /// version's count by exactly one, so `copies_after == 0` is precisely "this
@@ -514,6 +631,16 @@ pub struct VersionAtStake {
 /// reading of "last one" (issue #153: a unit with v1 elsewhere and v2 only
 /// here has ZERO remaining for v2, and that is the case the floor exists
 /// for), not a question about the unit as a whole.
+///
+/// **`copies_after`/`locations_after` do NOT widen with condition 3.** They
+/// stay on [`copy_count_expr`]/[`location_count_expr`], which route through
+/// [`eligible`] — never [`holds_sealed_bytes`] — because an unconfirmed
+/// volume is not a Copy and must not inflate the remaining count. This
+/// asymmetry (widen the SUBJECT of the floor, never the COUNT the floor
+/// measures against) is the entire correctness of issue #276's fix. One
+/// deliberate, conservative consequence: a unit whose only holdings are TWO
+/// sealed-but-unconfirmed volumes now refuses retiring EITHER one, because
+/// neither counts as a copy that rescues the other.
 ///
 /// Counted through [`copy_count_expr`] and [`location_count_expr`] at
 /// `Snapshot` scope, never hand-written: a warehouse deposit of some other
@@ -542,9 +669,10 @@ pub fn versions_at_stake(
          JOIN writes w ON w.stage_set_id = ss.id
          JOIN volumes v ON v.id = w.volume_id
          WHERE s.unit_id = ?1 AND s.status = 'current'
-           AND w.volume_id = ?2 AND w.status = 'completed' AND {}
+           AND w.volume_id = ?2 AND {} AND {}
          ORDER BY s.version",
-        eligible("v")
+        write_reaches_tape("w"),
+        holds_sealed_bytes("v")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -568,6 +696,18 @@ fn status_in(volume_alias: &str, statuses: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{volume_alias}.status IN ({list})")
+}
+
+/// `{alias}.status NOT IN ('a','b',...)`. Sibling to [`status_in`] for an
+/// EXCLUSION list (issue #276's [`holds_sealed_bytes`]), so the quoting
+/// discipline stays written in exactly one place for both directions.
+fn status_not_in(volume_alias: &str, statuses: &[&str]) -> String {
+    let list = statuses
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{volume_alias}.status NOT IN ({list})")
 }
 
 #[cfg(test)]
@@ -1623,5 +1763,138 @@ pub(crate) mod tests {
             .unwrap();
         let rows = versions_at_stake(&conn, unit_id, away).unwrap();
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    // ── the floor sees a sealed-but-unconfirmed volume (issue #276) ──
+    //
+    // Migration 018's case (b) verbatim: `seal()` succeeded (`sealed_at`
+    // set) but confirm never passed, so `status` stayed `'initialized'`
+    // and the write's own row was swept to `'interrupted'`.
+
+    /// Rewrites `HERE` (built `sealed`/`completed` by [`setup_at_stake`])
+    /// into migration 018's case (b): still holds v1's only write, but as
+    /// a physically sealed tape whose confirm never completed.
+    fn make_sealed_but_unconfirmed(conn: &Connection, vol_id: i64) {
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized', sealed_at = datetime('now') \
+             WHERE id = ?1",
+            params![vol_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+            params![vol_id],
+        )
+        .unwrap();
+    }
+
+    /// Test 1: the floor must see this state at all -- before issue #276's
+    /// fix, `w.status = 'completed'` and `eligible("v")` both excluded it,
+    /// so retiring HERE showed NO version at stake despite HERE holding the
+    /// unit's only copy.
+    #[test]
+    fn at_stake_sees_a_sealed_but_unconfirmed_volume_as_the_last_copy() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        make_sealed_but_unconfirmed(&conn, here);
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a sealed-but-unconfirmed volume still physically holds the bytes: {rows:?}"
+        );
+        assert_eq!(rows[0].version, 1);
+        assert_eq!(
+            rows[0].copies_after, 0,
+            "nothing else carries v1, so retiring HERE would take it to zero"
+        );
+    }
+
+    /// Test 2, the negative half of the pair above: `sealed_at` NULL means
+    /// `seal()` never ran (migration 018's case (a)) -- execute finished but
+    /// the tape is "not a copy" (`docs/design/layout-session.md`). This
+    /// must stay excluded, or the check above would be vacuous (anything
+    /// with an `interrupted` write would pass, not just a sealed one).
+    #[test]
+    fn at_stake_excludes_an_interrupted_volume_that_never_reached_seal() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        // Same as `make_sealed_but_unconfirmed` except `sealed_at` stays
+        // NULL.
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized' WHERE id = ?1",
+            params![here],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+            params![here],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert!(
+            rows.is_empty(),
+            "sealed_at is NULL -- this tape is not a copy, and must not be treated as \
+             one: {rows:?}"
+        );
+    }
+
+    /// Test 3: the escape hatch still works. A sealed-but-unconfirmed
+    /// volume the operator has since PROVED bad (`volume verify` ->
+    /// `observed_condition = 'quarantined'`) counts for nothing, exactly
+    /// as it does for an ordinary sealed volume.
+    #[test]
+    fn at_stake_excludes_a_sealed_but_unconfirmed_volume_that_is_quarantined() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        make_sealed_but_unconfirmed(&conn, here);
+        conn.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+            params![here],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a quarantined volume counts for nothing even when sealed-but-unconfirmed: \
+             {rows:?}"
+        );
+    }
+
+    /// Test 4: an already-retired volume counts for nothing regardless of
+    /// `sealed_at` -- `holds_sealed_bytes`'s exclusion list must win over
+    /// its `sealed_at IS NOT NULL` half.
+    #[test]
+    fn at_stake_excludes_a_sealed_but_unconfirmed_volume_that_is_retired() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        make_sealed_but_unconfirmed(&conn, here);
+        conn.execute(
+            "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+            params![here],
+        )
+        .unwrap();
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert!(
+            rows.is_empty(),
+            "a retired volume counts for nothing, sealed_at notwithstanding: {rows:?}"
+        );
+    }
+
+    /// Test 5: the asymmetry that is the entire correctness of issue #276's
+    /// fix. `holds_sealed_bytes` widens who the Tier-3 floor considers at
+    /// stake, but `copy_count_expr` (what `audit`/`report copies`/
+    /// `min_copies` all read) must NOT widen with it -- an unconfirmed
+    /// volume is not a Copy (ADR-0004).
+    #[test]
+    fn a_sealed_but_unconfirmed_volume_does_not_inflate_copy_count_expr() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        make_sealed_but_unconfirmed(&conn, here);
+        let q = CoverageQuery::current_unit("?1");
+        let sql = format!("SELECT {}", copy_count_expr(&q));
+        let count: i64 = conn
+            .query_row(&sql, params![unit_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "an unconfirmed volume must not count as a copy, or `audit`/`report copies` \
+             would overstate coverage this unit does not have"
+        );
     }
 }
