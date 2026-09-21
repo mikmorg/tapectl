@@ -340,6 +340,12 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
         ConfirmOutcome::Quarantined(q) => {
             panic!("harness must end Sealed, got Quarantined: {:?}", q.reason)
         }
+        ConfirmOutcome::Inconclusive(inc) => {
+            panic!(
+                "harness must end Sealed, got Inconclusive: {:?}",
+                inc.evidence.mismatches
+            )
+        }
     }
 
     Harness {

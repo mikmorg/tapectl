@@ -362,6 +362,10 @@ fn build_sealed_volume_full(
     {
         ConfirmOutcome::Sealed(_) => {}
         ConfirmOutcome::Quarantined(q) => panic!("harness must seal, got {:?}", q.reason),
+        ConfirmOutcome::Inconclusive(inc) => panic!(
+            "harness must seal, got Inconclusive: {:?}",
+            inc.evidence.mismatches
+        ),
     }
 
     // The positions the REAL plan chose, read back from the source catalog —

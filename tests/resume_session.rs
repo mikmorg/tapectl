@@ -396,6 +396,10 @@ fn resume_after_restart_seals_rather_than_quarantines() {
         ),
         ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
         ResumeOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+        ResumeOutcome::Confirming(_) => panic!(
+            "expected Ready — this fixture's tape is not yet sealed, so `resume` must not \
+             think it already is"
+        ),
     };
 
     let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
@@ -411,6 +415,11 @@ fn resume_after_restart_seals_rather_than_quarantines() {
                 QuarantineReason::ConfirmFailed(e) => format!("{:?}", e.mismatches),
                 other => format!("{other:?}"),
             }
+        ),
+        ConfirmOutcome::Inconclusive(inc) => panic!(
+            "confirm went Inconclusive on a tape written by this very session — the \
+             rehydrated Layout does not reproduce the on-tape bytes: {:?}",
+            inc.evidence.mismatches
         ),
     }
 
@@ -493,6 +502,10 @@ fn resume_with_zero_slices_written_restarts_from_bot() {
         ResumeOutcome::Quarantined(q) => panic!("unexpected quarantine: {:?}", q.reason),
         ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
         ResumeOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+        ResumeOutcome::Confirming(_) => panic!(
+            "expected Ready — this fixture's tape is not yet sealed, so `resume` must not \
+             think it already is"
+        ),
     };
     let sealed_pending = ready.seal(&mut store).unwrap();
     match sealed_pending
@@ -501,6 +514,10 @@ fn resume_with_zero_slices_written_restarts_from_bot() {
     {
         ConfirmOutcome::Sealed(_) => {}
         ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got quarantine: {:?}", q.reason),
+        ConfirmOutcome::Inconclusive(inc) => panic!(
+            "expected Sealed, got Inconclusive: {:?}",
+            inc.evidence.mismatches
+        ),
     }
 
     assert_eq!(
@@ -620,6 +637,10 @@ fn revalidation_failure_leaves_the_session_resumable() {
         ResumeOutcome::Quarantined(q) => panic!("unexpected quarantine: {:?}", q.reason),
         ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
         ResumeOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+        ResumeOutcome::Confirming(_) => panic!(
+            "expected Ready — this fixture's tape is not yet sealed, so `resume` must not \
+             think it already is"
+        ),
     };
     let sealed_pending = ready.seal(&mut store).unwrap();
     match sealed_pending
@@ -628,6 +649,10 @@ fn revalidation_failure_leaves_the_session_resumable() {
     {
         ConfirmOutcome::Sealed(s) => assert_eq!(s.label, "RESUMETEST"),
         ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got quarantine: {:?}", q.reason),
+        ConfirmOutcome::Inconclusive(inc) => panic!(
+            "expected Sealed, got Inconclusive: {:?}",
+            inc.evidence.mismatches
+        ),
     }
 }
 
