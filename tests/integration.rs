@@ -3361,3 +3361,64 @@ fn test_compact_finish_shows_coverage_evidence() {
         .expect("unit1 must carry a non-null evidence_summary");
     assert!(summary.contains("L6-DST"), "summary: {summary}");
 }
+
+// ── Volume Deposit Eligibility Test (issue #255) ──
+
+/// Migration 017 moved quarantine off `volumes.status` onto
+/// `observed_condition`, so a volume a failed `volume verify` (or write-time
+/// contact check) proved unreadable still reads `status = 'sealed'`.
+/// `volume deposit add` used to gate on `status != "sealed"` alone, which no
+/// longer sees the quarantine at all — it must route through
+/// `policy::coverage::eligible` (both columns), the way every other copy/
+/// location derivation does (issue #96).
+#[test]
+fn volume_deposit_add_refuses_a_sealed_but_quarantined_volume() {
+    use tapectl::cli::volume::{DepositCommands, VolumeCommands};
+    use tapectl::config::{Config, TapectlPaths};
+
+    let (tmp, conn, _home) = setup();
+
+    conn.execute(
+        "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+        [],
+    )
+    .unwrap();
+
+    // Sealed (so the OLD, single-column predicate would have let this
+    // through) but quarantined by a prior verify/contact check.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                              capacity_bytes, status, observed_condition)
+         VALUES ('L6-0007', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 'quarantined')",
+        [],
+    )
+    .unwrap();
+
+    let config = Config::default();
+    let paths = TapectlPaths::new(tmp.path().to_path_buf());
+    let command = VolumeCommands::Deposit {
+        command: DepositCommands::Add {
+            label: "L6-0007".into(),
+            to: "glacier".into(),
+            receipt: None,
+            storage_class: None,
+            notes: None,
+        },
+    };
+
+    let err = tapectl::cli::volume::run(&conn, &paths, &config, &command, false, false, false)
+        .expect_err(
+            "a verify-quarantined volume (status='sealed', observed_condition='quarantined') \
+             must refuse a warehouse deposit",
+        );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("quarantined") || msg.contains("observed_condition"),
+        "expected the refusal to name the quarantine, got: {msg}"
+    );
+
+    let deposits: i64 = conn
+        .query_row("SELECT COUNT(*) FROM volume_deposits", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(deposits, 0, "a refused deposit must not be recorded");
+}

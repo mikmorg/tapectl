@@ -1225,9 +1225,13 @@ pub fn run(
 /// 1. The target location must be a `warehouse`. Recording a deposit at a
 ///    shelf would claim a copy exists in a place nothing was copied to,
 ///    and it would then be counted as one by every derivation.
-/// 2. The volume must pass `coverage::eligible` (sealed). You cannot have
-///    deposited bytes that were never sealed -- an unsealed volume's bytes
-///    are not final, so a copy of them is a copy of nothing durable.
+/// 2. The volume must pass `coverage::eligible` (sealed AND
+///    `observed_condition = 'ok'`). You cannot have deposited bytes that
+///    were never sealed -- an unsealed volume's bytes are not final, so a
+///    copy of them is a copy of nothing durable -- and a volume tapectl has
+///    observed to be quarantined is not durable either, sealed or not
+///    (issue #255): routed through `coverage::eligible` itself, not a
+///    second hand-written `status`-only predicate (issue #96).
 fn run_deposit(
     conn: &Connection,
     command: &DepositCommands,
@@ -1245,11 +1249,26 @@ fn run_deposit(
             storage_class,
             notes,
         } => {
-            let (vol_id, status): (i64, String) = conn
+            // Issue #255: route the refusal through `coverage::eligible`
+            // (both `status` AND `observed_condition`) rather than a
+            // hand-written `status != "sealed"` check -- migration 017
+            // moved quarantine off `status` onto `observed_condition`, so
+            // a verify-quarantined volume still reads `status = 'sealed'`
+            // and a status-only check no longer catches it (`coverage.rs`
+            // is the declared sole owner of every `volumes.status`/
+            // `observed_condition` predicate, issue #96). `status`/
+            // `condition` are fetched too, but only to WORD the refusal
+            // below -- `eligible_expr`, evaluated by SQLite itself, is
+            // what actually decides.
+            let eligible_expr = crate::policy::coverage::eligible("v");
+            let (vol_id, status, condition, eligible): (i64, String, String, bool) = conn
                 .query_row(
-                    "SELECT id, status FROM volumes WHERE label = ?1",
+                    &format!(
+                        "SELECT v.id, v.status, v.observed_condition, {eligible_expr} \
+                         FROM volumes v WHERE v.label = ?1"
+                    ),
                     params![label],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(|_| TapectlError::VolumeNotFound(label.clone()))?;
 
@@ -1268,10 +1287,25 @@ fn run_deposit(
                      tapectl location add <NAME> --kind warehouse"
                 )));
             }
-            if status != "sealed" {
+            if !eligible {
+                if status != "sealed" {
+                    return Err(TapectlError::Other(format!(
+                        "volume \"{label}\" is {status}, not sealed; only a sealed volume's \
+                         bytes are final, so there is nothing durable to have deposited"
+                    )));
+                }
+                // `status == "sealed"` but `eligible` is still false: the
+                // only other thing `coverage::eligible` checks is
+                // `observed_condition` (issue #255) -- a prior verify or
+                // write-time contact check quarantined this medium, so its
+                // bytes are not eligible for a durable warehouse claim even
+                // though the write itself completed and sealed.
                 return Err(TapectlError::Other(format!(
-                    "volume \"{label}\" is {status}, not sealed; only a sealed volume's bytes \
-                     are final, so there is nothing durable to have deposited"
+                    "volume \"{label}\" is sealed but its observed_condition is \
+                     \"{condition}\" (ADR-0012, the 2026-09-17 amendment): a prior verify or \
+                     write-time contact check found evidence this medium cannot be trusted, so \
+                     there is nothing durable to have deposited. `--force` does not apply -- \
+                     this is a fact the catalog recorded, not a risk judgement."
                 )));
             }
 
