@@ -1510,6 +1510,126 @@ pub fn cartridge_mark_erased(
     Ok(())
 }
 
+/// `volumes.status` values migration 017's CHECK still admits
+/// (`017_volume_observed_condition.sql`) -- `'quarantined'` was retired
+/// there as a legal value, not merely deprecated. A status recovered from
+/// `events.old_value` is checked against this SAME set before ever being
+/// written back to `status`, for the identical reason 017's own migrating
+/// subquery does (see its header): an unfiltered read of pre-017 history
+/// can legally carry `'quarantined'`, and writing that straight back trips
+/// the CHECK (issue #250).
+const LEGAL_VOLUME_STATUSES: [&str; 8] = [
+    "blank",
+    "initialized",
+    "active",
+    "full",
+    "retired",
+    "missing",
+    "erased",
+    "sealed",
+];
+
+/// What [`cartridge_unretire`] should do with one volume's pre-retirement
+/// status, recovered from the `events` audit trail (issue #250).
+struct VolumeUnretirePlan {
+    /// `Some(status)` when a legal status was recovered and should be
+    /// written back to `volumes.status`; `None` when nothing usable was
+    /// found and the volume is left exactly as it is (`'retired'`).
+    restore_status: Option<String>,
+    /// True when the most recent retirement event's `old_value` was itself
+    /// `'quarantined'`. Migration 017 only rewrote rows whose `status` WAS
+    /// `'quarantined'` at migration time; this volume's was already
+    /// `'retired'` by then, so 017 never touched it and the fact survives
+    /// only here. It must be recovered into `observed_condition` -- the
+    /// column that now owns it -- never dropped: `policy::coverage`'s
+    /// `eligible` predicate consults `observed_condition`, so silently
+    /// losing this would return a volume the operator once proved bad to
+    /// full service.
+    recovered_quarantine: bool,
+}
+
+/// Reads the most recent `action = 'retired', field = 'status'` event for
+/// `vol_id` and decides what [`cartridge_unretire`] should restore.
+///
+/// Three shapes, all reachable purely from history already on disk (no new
+/// column, no migration):
+///
+/// - The common case: `old_value` is already a legal status (including a
+///   `'retired' -> 'retired'` self-loop for a volume that was independently
+///   retired before its cartridge was) -- restore to it verbatim, same as
+///   before this fix.
+/// - `old_value` is specifically `'quarantined'` -- the legacy shape this
+///   issue exists for. The pre-quarantine status is a SEPARATE, earlier
+///   `events` row: the verify path (`quarantine_on_medium_evidence`,
+///   pre-017) always logged `field = 'status', new_value = 'quarantined'`
+///   when it fired, so walking back to that row (filtered to the same
+///   legal set, for the same reason 017 filters it -- a verify-while
+///   -already-quarantined self-loop can legally read `'quarantined' ->
+///   'quarantined'` too) recovers the true prior status whenever that
+///   event exists. When it does not, the quarantine can only have come
+///   from one of `session.rs`'s three write-path writers, which quarantine
+///   a session that never reached `seal` and (pre-017, like post-017) log
+///   no event at all -- migration 017's header gives exactly this shape
+///   its documented fallback, `'initialized'`, and the same reasoning
+///   applies here: `observed_condition`, not `status`, is what blocks the
+///   write path, so `'initialized'` does not silently become writable
+///   again. Both branches are therefore fully recoverable -- there is no
+///   "give up" case for a genuine `'quarantined'` old_value.
+/// - `old_value` is NULL (no event at all) or an unrecognized, hand-edited
+///   value that is neither a legal status nor `'quarantined'` -- honestly
+///   left alone (`restore_status: None`), exactly as a missing event
+///   always has been. A garbage value is not assumed to mean quarantine.
+fn plan_volume_unretire(conn: &Connection, vol_id: i64) -> Result<VolumeUnretirePlan> {
+    let raw_prior: Option<String> = conn
+        .query_row(
+            "SELECT old_value FROM events
+             WHERE entity_type = 'volume' AND entity_id = ?1
+               AND action = 'retired' AND field = 'status'
+             ORDER BY id DESC LIMIT 1",
+            params![vol_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match raw_prior.as_deref() {
+        Some(v) if LEGAL_VOLUME_STATUSES.contains(&v) => Ok(VolumeUnretirePlan {
+            restore_status: raw_prior,
+            recovered_quarantine: false,
+        }),
+        Some("quarantined") => {
+            // Built from `LEGAL_VOLUME_STATUSES` rather than a second
+            // hardcoded literal, so the two can never drift apart: every
+            // member is one of our own fixed lowercase-ASCII literals, not
+            // external input, so string-building the `IN (...)` list is
+            // safe.
+            let legal_list = LEGAL_VOLUME_STATUSES
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT old_value FROM events
+                 WHERE entity_type = 'volume' AND entity_id = ?1
+                   AND field = 'status' AND new_value = 'quarantined'
+                   AND old_value IN ({legal_list})
+                 ORDER BY id DESC LIMIT 1"
+            );
+            let pre_quarantine: Option<String> = conn
+                .query_row(&sql, params![vol_id], |row| row.get(0))
+                .optional()?;
+            let restore_status = Some(pre_quarantine.unwrap_or_else(|| "initialized".to_string()));
+            Ok(VolumeUnretirePlan {
+                restore_status,
+                recovered_quarantine: true,
+            })
+        }
+        _ => Ok(VolumeUnretirePlan {
+            restore_status: None,
+            recovered_quarantine: false,
+        }),
+    }
+}
+
 /// Reverse a `cartridge retire` (issue #163 / ADR-0012's consequences
 /// bullet).
 ///
@@ -1539,6 +1659,27 @@ pub fn cartridge_mark_erased(
 /// `cartridge mark-erased` is untouched by this command and remains the
 /// separate, irreversible statement that the bytes are gone (ADR-0011,
 /// corrected 2026-09-14).
+///
+/// Issue #250: migration 017 retired `'quarantined'` from `volumes.status`'s
+/// CHECK, not merely deprecated it, but this command's recovery of
+/// `events.old_value` predates that migration and can legally hold exactly
+/// that value (`cartridge_retire`'s own logging loop records `old_value =
+/// prior` for every mounted volume with no filter, and a quarantined volume
+/// on a cartridge being retired is a deliberately permitted path). Writing
+/// it straight back trips the new CHECK -- the identical defect 017's own
+/// header describes fixing in its migrating subquery. [`plan_volume_unretire`]
+/// checks the SAME legal set 017's CHECK enforces before ever writing to
+/// `status` -- in Rust rather than a SQL filter on the primary query, so a
+/// legacy `'quarantined'` value can be told apart from a missing event and
+/// from an unrecognized one, rather than all three collapsing into "no
+/// legal value found" -- so that failure is unreachable by construction,
+/// and maps a recovered `'quarantined'` onto 017's own translation instead
+/// of dropping it: `observed_condition = 'quarantined'` (the column that
+/// now owns the fact) plus `status` recovered from the events row that
+/// recorded the transition INTO quarantine (that lookup IS a SQL-filtered
+/// subquery, 017-style, since it only ever needs the legal/illegal
+/// distinction), or -- when no such row exists -- 017's own documented
+/// fallback, `'initialized'`.
 pub fn cartridge_unretire(
     conn: &Connection,
     barcode: &str,
@@ -1590,30 +1731,30 @@ pub fn cartridge_unretire(
     // Only volumes still `retired` are this command's business: anything
     // else (already erased, or moved on some other route since) is not
     // this retirement's doing to undo.
-    let mut restorable: Vec<(i64, String, Option<String>)> = Vec::new();
+    let mut restorable: Vec<(i64, String, VolumeUnretirePlan)> = Vec::new();
     for (vol_id, label, vol_status) in &mounted {
         if vol_status != "retired" {
             continue;
         }
-        let prior: Option<String> = conn
-            .query_row(
-                "SELECT old_value FROM events
-                 WHERE entity_type = 'volume' AND entity_id = ?1
-                   AND action = 'retired' AND field = 'status'
-                 ORDER BY id DESC LIMIT 1",
-                params![vol_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        restorable.push((*vol_id, label.clone(), prior));
+        let plan = plan_volume_unretire(conn, *vol_id)?;
+        restorable.push((*vol_id, label.clone(), plan));
     }
     let volumes_restored: Vec<(String, String)> = restorable
         .iter()
-        .filter_map(|(_, label, prior)| prior.as_ref().map(|p| (label.clone(), p.clone())))
+        .filter_map(|(_, label, plan)| {
+            plan.restore_status
+                .as_ref()
+                .map(|s| (label.clone(), s.clone()))
+        })
         .collect();
     let volumes_not_restored: Vec<String> = restorable
         .iter()
-        .filter(|(_, _, prior)| prior.is_none())
+        .filter(|(_, _, plan)| plan.restore_status.is_none())
+        .map(|(_, label, _)| label.clone())
+        .collect();
+    let volumes_quarantine_recovered: Vec<String> = restorable
+        .iter()
+        .filter(|(_, _, plan)| plan.recovered_quarantine)
         .map(|(_, label, _)| label.clone())
         .collect();
 
@@ -1628,6 +1769,7 @@ pub fn cartridge_unretire(
                     "cartridge_event_found": cartridge_event_found,
                     "volumes_restored": volumes_restored,
                     "volumes_not_restored": volumes_not_restored,
+                    "volumes_quarantine_recovered": volumes_quarantine_recovered,
                     "dry_run": true,
                 })
             );
@@ -1641,7 +1783,15 @@ pub fn cartridge_unretire(
                 );
             }
             for (label, prior) in &volumes_restored {
-                println!("  volume \"{label}\" would be restored to \"{prior}\"");
+                if volumes_quarantine_recovered.contains(label) {
+                    println!(
+                        "  volume \"{label}\" would be restored to \"{prior}\"; its \
+                         quarantine survived only in the retirement event (migration 017 \
+                         predates it) and would be recovered as observed_condition = quarantined"
+                    );
+                } else {
+                    println!("  volume \"{label}\" would be restored to \"{prior}\"");
+                }
             }
             for label in &volumes_not_restored {
                 println!(
@@ -1670,8 +1820,8 @@ pub fn cartridge_unretire(
         &restored_cartridge_status,
         None,
     )?;
-    for (vol_id, label, prior) in &restorable {
-        if let Some(prior_status) = prior {
+    for (vol_id, label, plan) in &restorable {
+        if let Some(prior_status) = &plan.restore_status {
             tx.execute(
                 "UPDATE volumes SET status = ?1 WHERE id = ?2",
                 params![prior_status, vol_id],
@@ -1688,6 +1838,32 @@ pub fn cartridge_unretire(
                 None,
             )?;
         }
+        if plan.recovered_quarantine {
+            // Read the CURRENT condition inside the transaction rather than
+            // assuming 'ok' -- issue #250's documented scenario always has
+            // it, but nothing enforces that, and the logged `old_value`
+            // must be the true one.
+            let previous_condition: String = tx.query_row(
+                "SELECT observed_condition FROM volumes WHERE id = ?1",
+                params![vol_id],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                params![vol_id],
+            )?;
+            events::log_field_change(
+                &tx,
+                "volume",
+                *vol_id,
+                label,
+                "unretired",
+                "observed_condition",
+                Some(&previous_condition),
+                "quarantined",
+                None,
+            )?;
+        }
     }
     tx.commit()?;
 
@@ -1700,6 +1876,7 @@ pub fn cartridge_unretire(
                 "cartridge_event_found": cartridge_event_found,
                 "volumes_restored": volumes_restored,
                 "volumes_not_restored": volumes_not_restored,
+                "volumes_quarantine_recovered": volumes_quarantine_recovered,
                 "changed": true,
             })
         );
@@ -1714,7 +1891,15 @@ pub fn cartridge_unretire(
             );
         }
         for (label, prior) in &volumes_restored {
-            println!("  volume \"{label}\" restored to \"{prior}\"");
+            if volumes_quarantine_recovered.contains(label) {
+                println!(
+                    "  volume \"{label}\" restored to \"{prior}\"; its quarantine survived \
+                     only in the retirement event (migration 017 predates it) and is now \
+                     recorded as observed_condition = quarantined"
+                );
+            } else {
+                println!("  volume \"{label}\" restored to \"{prior}\"");
+            }
         }
         for label in &volumes_not_restored {
             println!(
@@ -6029,6 +6214,276 @@ mod tests {
                 "retired",
                 "the volume's most recent 'retired' event says retired -> retired"
             );
+        }
+
+        /// Issue #250. Migration 017 removed `'quarantined'` from
+        /// `volumes.status`'s CHECK, but pre-017 code (this exact command's
+        /// own `cartridge_retire`, whose own logging loop records
+        /// `old_value = prior` for EVERY mounted volume with no filter) can
+        /// legally have left an `events` row recording `action = 'retired',
+        /// field = 'status', old_value = 'quarantined'` for a volume that
+        /// was `retired` -- NOT `'quarantined'` -- by the time 017 ran, so
+        /// 017's own data migration never touched it (017 only rewrites
+        /// rows whose status IS `'quarantined'` at migration time). The
+        /// quarantine fact then survives ONLY in this trail entry. This
+        /// seeds exactly that legacy shape directly against `events`
+        /// (`events.old_value` is unconstrained TEXT, so nothing on
+        /// today's schema stops it holding a value the CURRENT
+        /// `volumes.status` CHECK no longer admits) via a real
+        /// `cartridge_retire` call plus one extra `events` row for the
+        /// transition INTO quarantine, never a hand-set `status =
+        /// 'quarantined'` -- the CHECK makes that route unreachable now,
+        /// which is the whole point.
+        ///
+        /// This is the CONTROL, run against the unfixed reader (no legal-
+        /// set filter): `cartridge_unretire` must panic on the CHECK
+        /// violation, not on some unrelated fixture mistake. It is written
+        /// as the FIXED behavior on purpose (`.expect(...)`, then asserts
+        /// on the recovered status/condition/events) so the exact same
+        /// test source proves red before the fix and green after it --
+        /// against unfixed code, `.expect` panics and the panic message
+        /// carries the CHECK error itself.
+        #[test]
+        fn a_legacy_quarantined_old_value_restores_the_pre_quarantine_status_and_recovers_the_condition(
+        ) {
+            let (conn, cart_id, vol_id) = setup_retired();
+            // The verify path's shape (`quarantine_on_medium_evidence`,
+            // pre-017): an OLDER event recording the transition INTO
+            // quarantine, `sealed -> quarantined`.
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "quarantined",
+                Some("status"),
+                Some("sealed"),
+                Some("quarantined"),
+                None,
+                None,
+            )
+            .unwrap();
+            // The legacy shape itself: `cartridge_retire`'s pre-017
+            // unconditional logging of `old_value = prior` overwrites the
+            // real `setup_retired()` event (higher `id`, so `ORDER BY id
+            // DESC` sees this one) with `old_value = 'quarantined'`.
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "retired",
+                Some("status"),
+                Some("quarantined"),
+                Some("retired"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            cartridge_unretire(&conn, "BC-RET", false, false).expect(
+                "a recovered 'quarantined' old_value must never be written back to \
+                 volumes.status -- if this panics, read the panic message for \
+                 'CHECK constraint failed'",
+            );
+
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "sealed",
+                "the pre-quarantine status recovered from the INTO-quarantine event"
+            );
+            assert_eq!(
+                status_of(&conn, "cartridges", cart_id),
+                "in_use",
+                "the cartridge side of this reversal is unaffected by the volume's legacy shape"
+            );
+            let condition: String = conn
+                .query_row(
+                    "SELECT observed_condition FROM volumes WHERE id = ?1",
+                    params![vol_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                condition, "quarantined",
+                "the quarantine fact must be recovered into observed_condition, not dropped"
+            );
+
+            let (s_action, s_old, s_new): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT action, old_value, new_value FROM events
+                     WHERE entity_type = 'volume' AND entity_id = ?1 AND field = 'status'
+                     ORDER BY id DESC LIMIT 1",
+                    params![vol_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(s_action, "unretired");
+            assert_eq!(s_old.as_deref(), Some("retired"));
+            assert_eq!(s_new.as_deref(), Some("sealed"));
+
+            let (c_action, c_old, c_new): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT action, old_value, new_value FROM events
+                     WHERE entity_type = 'volume' AND entity_id = ?1
+                       AND field = 'observed_condition'
+                     ORDER BY id DESC LIMIT 1",
+                    params![vol_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(c_action, "unretired");
+            assert_eq!(
+                c_old.as_deref(),
+                Some("ok"),
+                "the logged old_value must be the volume's true prior condition"
+            );
+            assert_eq!(c_new.as_deref(), Some("quarantined"));
+        }
+
+        /// The write-path-writer shape (issue #250 / migration 017's
+        /// header): a `'quarantined'` old_value with NO recorded
+        /// transition INTO quarantine at all. `session.rs`'s three
+        /// write-path quarantine writers fire mid-session, before `seal`,
+        /// and log no event -- pre-017 exactly as post-017. 017's own
+        /// header gives this shape its documented fallback,
+        /// `'initialized'`, and the same reasoning holds here:
+        /// `observed_condition`, not `status`, is what blocks the write
+        /// path, so `'initialized'` does not silently become writable
+        /// again.
+        #[test]
+        fn a_legacy_quarantined_old_value_with_no_into_quarantine_event_falls_back_to_initialized()
+        {
+            let (conn, _cart_id, vol_id) = setup_retired();
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "retired",
+                Some("status"),
+                Some("quarantined"),
+                Some("retired"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            cartridge_unretire(&conn, "BC-RET", false, false)
+                .expect("must recover via the documented fallback, not hit the CHECK");
+
+            assert_eq!(status_of(&conn, "volumes", vol_id), "initialized");
+            let condition: String = conn
+                .query_row(
+                    "SELECT observed_condition FROM volumes WHERE id = ?1",
+                    params![vol_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(condition, "quarantined");
+        }
+
+        /// A second, MORE RECENT quarantine round-trip
+        /// (`'quarantined' -> 'quarantined'`, migration 017's own header
+        /// names this exact self-loop as legal pre-017 -- a verify against
+        /// an already-quarantined tape) must not be mistaken for the real
+        /// pre-quarantine status: the legal-set filter on the
+        /// INTO-quarantine lookup must skip over it to the older, genuinely
+        /// legal transition.
+        #[test]
+        fn a_quarantined_to_quarantined_self_loop_is_skipped_for_the_older_legal_transition() {
+            let (conn, _cart_id, vol_id) = setup_retired();
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "quarantined",
+                Some("status"),
+                Some("sealed"),
+                Some("quarantined"),
+                None,
+                None,
+            )
+            .unwrap();
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "quarantined",
+                Some("status"),
+                Some("quarantined"),
+                Some("quarantined"),
+                None,
+                None,
+            )
+            .unwrap();
+            events::log_event(
+                &conn,
+                "volume",
+                vol_id,
+                Some("L6-CART"),
+                "retired",
+                Some("status"),
+                Some("quarantined"),
+                Some("retired"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            cartridge_unretire(&conn, "BC-RET", false, false).unwrap();
+
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "sealed",
+                "must skip the illegal 'quarantined' self-loop and land on the real prior status"
+            );
+        }
+
+        /// A hand-edited or otherwise unrecognized `old_value` -- neither a
+        /// legal status nor `'quarantined'` -- earns no guess and no
+        /// invented quarantine fact: same honest treatment as a missing
+        /// event.
+        #[test]
+        fn a_hand_edited_unrecognized_old_value_is_left_alone_not_treated_as_quarantine() {
+            let (conn, cart_id, vol_id) = setup_retired();
+            conn.execute(
+                "UPDATE events SET old_value = 'bogus'
+                 WHERE entity_type = 'volume' AND entity_id = ?1
+                   AND action = 'retired' AND field = 'status'",
+                params![vol_id],
+            )
+            .unwrap();
+
+            cartridge_unretire(&conn, "BC-RET", false, false).unwrap();
+
+            assert_eq!(status_of(&conn, "cartridges", cart_id), "in_use");
+            assert_eq!(
+                status_of(&conn, "volumes", vol_id),
+                "retired",
+                "left alone -- a garbage value is not assumed to mean quarantine"
+            );
+            let condition: String = conn
+                .query_row(
+                    "SELECT observed_condition FROM volumes WHERE id = ?1",
+                    params![vol_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                condition, "ok",
+                "no invented quarantine fact from a garbage value"
+            );
+            let observed_condition_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE field = 'observed_condition'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(observed_condition_events, 0);
         }
     }
 
