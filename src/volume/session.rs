@@ -1314,6 +1314,23 @@ impl SealedPending {
             }))
         }
     }
+
+    /// Move this session's `writes` rows to `'interrupted'` without ever
+    /// calling `confirm` (issue #276's `TAPECTL_TEST_PAUSE_AFTER_SEAL` hook,
+    /// `volume::write::finish_session`). Exposed `pub(crate)` rather than
+    /// inlined at that call site because `write_ids` and [`mark_writes`] are
+    /// both private to this module; this is a thin, read-only-in-intent
+    /// door onto the same helper `confirm`'s own `Inconclusive`/`Quarantined`
+    /// arms use, so an interruption caught here leaves EXACTLY the same
+    /// `writes.status = 'interrupted'` / `volumes.sealed_at` set /
+    /// `volumes.status = 'initialized'` shape migration 018's case (b)
+    /// describes — `tapectl volume resume` (`rehydrate` selects
+    /// `interrupted` rows, `seal_recorded` reads `sealed_at`) picks it back
+    /// up and re-enters confirm directly, exactly as it does for a real
+    /// `Inconclusive` outcome.
+    pub(crate) fn mark_interrupted(&self, conn: &Connection) -> Result<()> {
+        mark_writes(conn, &self.write_ids, "interrupted")
+    }
 }
 
 // ── shared execute loop ──

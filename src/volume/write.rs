@@ -1739,6 +1739,39 @@ fn finish_session(
                  WHERE id = ?1",
                 params![volume_id],
             )?;
+
+            // Issue #276: sibling to `session`'s `TAPECTL_TEST_PAUSE_AFTER_PLAN`
+            // hook, for a state that one cannot reach -- it parks BEFORE any
+            // entry is written, so `seal()` never runs. This one parks AFTER
+            // `sealed_at` above and BEFORE `confirm`, which is the only way to
+            // hold a real cartridge in exactly the "sealed but unconfirmed"
+            // state migration 018 exists to name, long enough for an operator
+            // or test harness to interrupt it. See `park_after_seal`'s own doc
+            // for why this is a PAUSE, never a forced outcome.
+            if let Some(marker) = pause_after_seal_marker_from_env() {
+                if park_after_seal(&marker) {
+                    sealed_pending.mark_interrupted(conn)?;
+                    events::log_event(
+                        conn,
+                        "volume",
+                        volume_id,
+                        Some(label),
+                        "write_confirm_interrupted",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    return Err(TapectlError::Other(format!(
+                        "volume \"{label}\": interrupted after seal, before confirm -- the \
+                         tape IS sealed but its readback never ran, so the catalog cannot \
+                         yet count it as a copy. Reload the same cartridge and run `tapectl \
+                         volume resume {label}` to re-enter confirm."
+                    )));
+                }
+            }
+
             finish_confirm(
                 conn,
                 store,
@@ -1804,6 +1837,74 @@ fn finish_session(
                 a.reason
             )))
         }
+    }
+}
+
+/// The ONE place `TAPECTL_TEST_PAUSE_AFTER_SEAL`'s environment variable is
+/// read (issue #276), mirroring `session::park_marker_from_env`'s own
+/// reasoning: environment variables are process-global, so an in-process
+/// test that set one would leak into every other test running in parallel
+/// in the same binary. No test ever touches the environment — this is the
+/// single boundary function that would need to.
+fn pause_after_seal_marker_from_env() -> Option<String> {
+    std::env::var("TAPECTL_TEST_PAUSE_AFTER_SEAL").ok()
+}
+
+/// Parks in [`finish_session`], immediately after `sealed_at` is recorded
+/// and before `confirm` is called, when `marker` names a readiness-marker
+/// path (issue #276). Sibling to `session::run_entries`'s
+/// `TAPECTL_TEST_PAUSE_AFTER_PLAN` hook, whose design this follows
+/// exactly: writes the marker file so a harness knows parking has begun,
+/// then polls [`crate::signal::is_interrupted`] -- the same process-global
+/// flag `PlannedSession::execute`/`InterruptedSession::resume` default to
+/// -- on a 120-second ceiling, after which it warns and gives up so a
+/// harness bug fails on its own assertion rather than hanging.
+///
+/// **It is a PAUSE, not a failure injection.** This function only decides
+/// how long to wait; it never touches `writes`/`volumes` and never
+/// constructs a `ConfirmOutcome` -- the caller decides what an interruption
+/// means (`finish_session` marks the session interrupted and returns
+/// without calling confirm; letting the ceiling expire instead falls
+/// through to a perfectly normal confirm). A SIGKILL during the pause ends
+/// the process outright, same as anywhere else in a write session; a
+/// SIGINT sets the same flag this function polls, so it is noticed here
+/// exactly as fast as it would be between two `run_entries` entries.
+///
+/// Returns `true` iff the pause ended because of an interruption (so the
+/// caller should treat this as "interrupted before confirm"), `false` if
+/// it ended because the marker could not be created or the ceiling
+/// expired (so the caller should proceed as if this hook were absent).
+fn park_after_seal(marker: &str) -> bool {
+    tracing::warn!(
+        marker = %marker,
+        "TAPECTL_TEST_PAUSE_AFTER_SEAL is set — parking after seal() with confirm not yet \
+         called. This is a TEST hook; it must never be set for a real write."
+    );
+    if let Err(e) = std::fs::write(marker, "parked\n") {
+        tracing::warn!(
+            marker = %marker,
+            error = %e,
+            "TAPECTL_TEST_PAUSE_AFTER_SEAL: cannot create readiness marker; proceeding \
+             without parking"
+        );
+        return false;
+    }
+
+    let parked_at = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(120);
+    loop {
+        if crate::signal::is_interrupted() {
+            return true;
+        }
+        if parked_at.elapsed() >= limit {
+            tracing::warn!(
+                "TAPECTL_TEST_PAUSE_AFTER_SEAL: no interrupt within 120s — proceeding with \
+                 a normal confirm so the caller fails on its own assertion rather than \
+                 hanging"
+            );
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -3556,6 +3657,21 @@ mod tests {
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
     use sha2::{Digest, Sha256};
+
+    /// `pause_after_seal_marker_from_env` is the single boundary where the
+    /// variable is read (never inside `park_after_seal` or `finish_session`),
+    /// mirroring `session::park_marker_is_absent_by_default`'s own reasoning:
+    /// no test should have to mutate process-global environment state to
+    /// exercise the hook, since that would leak into every other test
+    /// running in parallel in this binary.
+    #[test]
+    fn pause_after_seal_marker_is_absent_by_default() {
+        assert!(
+            pause_after_seal_marker_from_env().is_none(),
+            "TAPECTL_TEST_PAUSE_AFTER_SEAL must not be set in the test environment; if \
+             this fails, something is exporting it and every write is parking"
+        );
+    }
 
     /// Issue #147 / ADR-0012: `compact-finish` shipped ADR-0008's tiers
     /// inverted — it prompted at zero coverage and let `--force` through,
