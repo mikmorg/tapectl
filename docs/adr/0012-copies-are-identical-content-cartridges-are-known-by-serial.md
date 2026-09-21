@@ -616,3 +616,66 @@ migration and a dedicated command (safest for the ADR-0003 arm, but adds a schem
 and a command on the eve of first production use); and making `volume verify --full` the
 promotion path (attractive now that verify already clears the condition, but it gives a
 command operators run casually the power to mutate `volumes.status`).
+
+### The seal is RECORDED, not inferred — correcting the amendment above (2026-09-21, #277)
+
+The amendment immediately above ruled that `resume` re-confirms an already-sealed tape,
+on three conjunctive conditions, and explicitly **rejected** "a new `writes.status`
+value with a migration" as adding schema on the eve of first production use.
+
+**That rejection was wrong, and the third pre-production review found why.** The ruling's
+outcome was right; its mechanism has a hole that its own cost paragraph did not
+anticipate.
+
+**The hole.** All three conditions route through `seal_marker_parses_at`, which returns
+`false` when the read **errors**, not only when the position holds no marker. That
+conflation is deliberate and is correct for a fresh write — a blank tape's positions do
+not read, and that must mean "not sealed". On resume it is fatal, because the one
+`MismatchKind` that produces `Inconclusive` in the first place is `SealUnreadable`. So
+the seal file this session wrote is exactly the file the resume cannot read: no
+`AlreadySealed`, identity matches, `ContactOutcome::Matches`, the empty arm, and
+execution falls through to `reposition_for_resume` and `seal()` — **a write to a
+physically sealed cartridge, with ADR-0003 bypassed and `resume_reconfirm_eligible` never
+consulted, since it is called only inside the `AlreadySealed` arm.** If the seal was
+unreadable because of a real flaw, the overwrite can fail partway and convert a
+drive-side read failure into medium-side destruction: the inversion of this ADR's own
+premise that a readback which did not succeed is not a verdict about the medium.
+
+**Why no cleverer probe fixes it.** Two states are indistinguishable to the tape *and*,
+today, to the catalog:
+
+- (a) execute finished, `seal()` never ran (interrupted between the two) — resume **must** seal;
+- (b) execute finished, `seal()` ran, confirm was `Inconclusive` — resume must **never** seal.
+
+Both leave `writes.status = 'interrupted'`, `volumes.status = 'initialized'`, every
+`write_positions` row `'written'`, and a seal position that does not read. Any rule
+derived from the tape alone must get one of the two wrong.
+
+**Ruled: record the seal.** At the moment `seal()` returns `Ok`, the fact that this
+session sealed becomes durable state (migration **018**), and `resume` reads it instead
+of inferring it:
+
+- recorded-sealed → re-enter `confirm`; **never** `reposition_for_resume`, never `seal()`
+- not recorded-sealed → the seal is still owed; resume seals as it does today
+
+The three conjunctive conditions above remain as **defence in depth** for the case where
+the tape *can* be read — they are not replaced, and none may be dropped. What changes is
+that an unreadable seal no longer silently means "unsealed".
+
+**This is the #242 pattern for the third time** (after #197 and #242 itself): when the
+question is "how do we infer X", check first whether X can simply be recorded. A fact
+several callers need is a column, not an inference. The rejected alternative was costed
+as "a schema value on the eve of first production use"; the actual cost of not having it
+is a rewritten sealed cartridge, which is the outcome ADR-0003 exists to forbid.
+
+**A second caller is already waiting for it.** Issue #276 — `retire_impacts` filters
+`writes.status = 'completed'`, so a confirm-failed volume yields no impacts and the
+Tier-3 zero-copy floor never fires, letting `volume retire` and `cartridge mark-erased`
+destroy the only copy of a sealed, restorable tape — is the same blind spot about the
+same state. It is to be fixed against this recorded fact, not against a second inference.
+
+**Constraint on the implementation.** The new state must not make a sealed-but-unconfirmed
+volume look like a completed one to anything that counts copies: `policy::coverage`
+remains the sole owner of that question (#96), and a volume whose confirm has not passed
+is not yet a copy. The change is about what `resume` and the retire family may *do*, not
+about what counts as coverage.
