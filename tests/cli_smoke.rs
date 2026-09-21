@@ -2097,16 +2097,24 @@ fn seed_one_completed_copy_stage_set(home: &std::path::Path, label: &str) {
     .expect("insert writes row");
 }
 
-/// Issue #244 (ADR-0012's 2026-09-17 amendment): `staging clean --json`'s
-/// refusal must itself be a single, parseable JSON document on stdout --
-/// never a JSON object beside a plain-text line (issue #56's defect class,
-/// guarded live by `scripts/lifecycle-suite.sh`'s "assert the WHOLE stdout
-/// parses"). This is checked against the real binary, not the in-process
-/// `cli::staging::run` unit tests in `src/cli/staging.rs`, because only a
-/// real process run distinguishes "printed to stdout" from "baked into the
-/// error and printed to stderr at exit".
+/// Issue #244 (ADR-0012's 2026-09-17 amendment), revised by issue #262:
+/// `staging clean --json`'s report must itself be a single, parseable JSON
+/// document on stdout -- never a JSON object beside a plain-text line
+/// (issue #56's defect class, guarded live by
+/// `scripts/lifecycle-suite.sh`'s "assert the WHOLE stdout parses"). This is
+/// checked against the real binary, not the in-process `cli::staging::run`
+/// unit tests in `src/cli/staging.rs`, because only a real process run
+/// distinguishes "printed to stdout" from "baked into the error and printed
+/// to stderr at exit".
+///
+/// Before #262, this fixture (one unit, one completed copy, below
+/// min_copies=2) made the WHOLE command refuse with `"refused": true`. #262
+/// changed that: with nothing else in the database to release, the command
+/// now SUCCEEDS (there is genuinely nothing to release, so `sets_cleaned`
+/// is 0) and reports the retention via a `"retained"` array instead of an
+/// error.
 #[test]
-fn staging_clean_json_refusal_is_one_parseable_document() {
+fn staging_clean_json_retained_report_is_one_parseable_document() {
     let home = TempDir::new().expect("tempdir");
     let init = run_tapectl_noninteractive(home.path(), &["init"]);
     assert!(
@@ -2124,27 +2132,34 @@ fn staging_clean_json_refusal_is_one_parseable_document() {
 
     let out = run_tapectl_noninteractive(home.path(), &["--json", "staging", "clean"]);
     assert!(
-        !out.status.success(),
-        "staging clean --json must refuse when a unit is below its policy's min_copies"
+        out.status.success(),
+        "issue #262: staging clean must succeed (retaining, not refusing) \
+         when a unit is below its policy's min_copies: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
-            "staging clean --json's refusal did not parse as one JSON document: {e}\n\
+            "staging clean --json's report did not parse as one JSON document: {e}\n\
              stdout={stdout:?}\nstderr={}",
             String::from_utf8_lossy(&out.stderr)
         )
     });
-    assert_eq!(parsed["refused"], serde_json::json!(true), "{parsed}");
-    let under_copied = parsed["under_copied"]
+    assert_eq!(
+        parsed["sets_cleaned"],
+        serde_json::json!(0),
+        "nothing else was covered, so nothing should have been released: {parsed}"
+    );
+    let retained = parsed["retained"]
         .as_array()
-        .unwrap_or_else(|| panic!("missing 'under_copied' array: {parsed}"));
+        .unwrap_or_else(|| panic!("missing 'retained' array: {parsed}"));
     assert!(
-        under_copied
+        retained
             .iter()
             .any(|u| u["unit"] == "unit-PM244-JSON" && u["copies"] == 1 && u["min_copies"] == 2),
-        "expected unit-PM244-JSON at 1/2 copies: {under_copied:?}"
+        "expected unit-PM244-JSON at 1/2 copies: {retained:?}"
     );
 }
 
