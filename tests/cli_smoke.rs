@@ -584,6 +584,106 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
     );
 }
 
+/// Issue #271: `volume plan --json` on a fresh home (nothing staged) used to
+/// print a plain sentence ("no staged data to plan") and exit 0 -- not JSON
+/// at all, so a `json.load(...)` consumer got a parse error rather than the
+/// empty document issue #56's rule requires ("every `--json` mode's whole
+/// stdout must parse"). This pins the empty-case document shape: the same
+/// keys the populated case emits, zeroed, with an empty `units` array.
+#[test]
+fn volume_plan_json_parses_with_nothing_staged() {
+    let home = TempDir::new().expect("tempdir");
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init_out.status.success(),
+        "tapectl init failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&init_out.stdout),
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let out = run_tapectl(home.path(), &["volume", "plan", "--json"]);
+    assert!(
+        out.status.success(),
+        "tapectl volume plan --json failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("volume plan --json stdout did not parse as whole JSON: {e}\n{stdout}")
+    });
+    assert_eq!(parsed["copies"], serde_json::json!(1));
+    assert_eq!(parsed["total_slices"], serde_json::json!(0));
+    assert_eq!(parsed["total_bytes"], serde_json::json!(0));
+    assert_eq!(parsed["units"], serde_json::json!([]));
+}
+
+/// Issue #271's populated-case companion: `volume plan --json` must ALSO
+/// parse as whole JSON once something is staged -- the JSON arm never
+/// resolves an LTO backend (only the human "estimated tapes" line does,
+/// via `resolve_lto_backend`), so a fresh home with no `[[backends.lto]]`
+/// configured is fine here. Seeds one `staged` stage_set directly (no dar,
+/// no encryption) since `volume plan` only ever reads the DB.
+#[test]
+fn volume_plan_json_parses_with_one_staged_unit() {
+    let home = TempDir::new().expect("tempdir");
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init_out.status.success(),
+        "tapectl init failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&init_out.stdout),
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).expect("open db to seed a staged unit");
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+        [],
+    )
+    .expect("insert tenant");
+    let tenant_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+         VALUES ('u1', 'photos', ?1, '/tmp/photos', 'active')",
+        params![tenant_id],
+    )
+    .expect("insert unit");
+    let unit_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+         VALUES (?1, 1, 'staged', '/tmp/photos', 1, 32)",
+        params![unit_id],
+    )
+    .expect("insert snapshot");
+    let snapshot_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices, total_encrypted_size)
+         VALUES (?1, 'staged', 524288, 1, 32)",
+        params![snapshot_id],
+    )
+    .expect("insert stage_set");
+    drop(conn);
+
+    let out = run_tapectl(home.path(), &["volume", "plan", "--json"]);
+    assert!(
+        out.status.success(),
+        "tapectl volume plan --json failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("volume plan --json stdout did not parse as whole JSON: {e}\n{stdout}")
+    });
+    assert_eq!(parsed["copies"], serde_json::json!(1));
+    assert_eq!(parsed["total_slices"], serde_json::json!(1));
+    assert_eq!(parsed["total_bytes"], serde_json::json!(32));
+    let units = parsed["units"].as_array().expect("units must be an array");
+    assert_eq!(units.len(), 1, "{units:?}");
+    assert_eq!(units[0]["unit"], "photos");
+}
+
 /// Calling `db fsck` before `init` must fail loudly (non-zero exit), not
 /// silently report success against a database that doesn't exist yet.
 /// A cheap companion to the exit-code pin above: this is the "never exits

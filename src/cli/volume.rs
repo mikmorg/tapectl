@@ -919,54 +919,59 @@ pub fn run(
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            if rows.is_empty() {
+            let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
+            let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
+
+            // Issue #271: `--json` must be checked BEFORE the `is_empty`
+            // branch, not after it -- the empty case used to fall into a
+            // plain `println!("no staged data to plan")` regardless of
+            // `json_output`, so `--json` on a fresh home emitted a bare
+            // English sentence instead of JSON (issue #56's rule: every
+            // `--json` mode's WHOLE stdout must parse). The document shape
+            // below is the same one the populated case emits, just zeroed.
+            if json_output {
+                let units: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|(name, ver, slices, size)| {
+                        serde_json::json!({"unit": name, "version": ver, "slices": slices, "size": size})
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "copies": copies, "total_slices": total_slices,
+                        "total_bytes": total_bytes, "units": units,
+                    })
+                );
+            } else if rows.is_empty() {
                 println!("no staged data to plan");
             } else {
-                let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
-                let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
-
-                if json_output {
-                    let units: Vec<serde_json::Value> = rows
-                        .iter()
-                        .map(|(name, ver, slices, size)| {
-                            serde_json::json!({"unit": name, "version": ver, "slices": slices, "size": size})
-                        })
-                        .collect();
+                println!("volume write plan ({copies} copy/copies):");
+                for (name, ver, slices, size) in &rows {
                     println!(
-                        "{}",
-                        serde_json::json!({
-                            "copies": copies, "total_slices": total_slices,
-                            "total_bytes": total_bytes, "units": units,
-                        })
-                    );
-                } else {
-                    println!("volume write plan ({copies} copy/copies):");
-                    for (name, ver, slices, size) in &rows {
-                        println!(
-                            "  {name} v{ver}: {} slices, {}",
-                            slices.unwrap_or(0),
-                            crate::util::format_bytes_binary(size.unwrap_or(0)),
-                        );
-                    }
-                    println!(
-                        "\ntotal: {total_slices} slices, {} x {copies} = {}",
-                        crate::util::format_bytes_binary(total_bytes),
-                        crate::util::format_bytes_binary(total_bytes * copies),
-                    );
-                    // Estimate tapes needed from the configured LTO backend.
-                    // ADR-0010: the figure follows the GENERATION being
-                    // planned for (`--generation`, else the drive's own), not a
-                    // capacity declared on the drive.
-                    let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
-                    let tape_cap = backend.planning_capacity_bytes(generation.as_deref())? as i64;
-                    let factor = backend.usable_capacity_factor;
-                    let usable = (tape_cap as f64 * factor) as i64;
-                    let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
-                    println!(
-                        "estimated tapes: {tapes_needed} (at {}% usable capacity)",
-                        (factor * 100.0).round() as i64
+                        "  {name} v{ver}: {} slices, {}",
+                        slices.unwrap_or(0),
+                        crate::util::format_bytes_binary(size.unwrap_or(0)),
                     );
                 }
+                println!(
+                    "\ntotal: {total_slices} slices, {} x {copies} = {}",
+                    crate::util::format_bytes_binary(total_bytes),
+                    crate::util::format_bytes_binary(total_bytes * copies),
+                );
+                // Estimate tapes needed from the configured LTO backend.
+                // ADR-0010: the figure follows the GENERATION being
+                // planned for (`--generation`, else the drive's own), not a
+                // capacity declared on the drive.
+                let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
+                let tape_cap = backend.planning_capacity_bytes(generation.as_deref())? as i64;
+                let factor = backend.usable_capacity_factor;
+                let usable = (tape_cap as f64 * factor) as i64;
+                let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
+                println!(
+                    "estimated tapes: {tapes_needed} (at {}% usable capacity)",
+                    (factor * 100.0).round() as i64
+                );
             }
         }
 
