@@ -16,7 +16,7 @@ Output in JSON format
 Operator name (defaults to system username)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-no\-escrow\fR
 Do NOT create the permanent escrow recipient (ADR\-0005) at init. By default `init` generates it and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import \-\-escrow` instead, or in tests/tooling that register escrow separately

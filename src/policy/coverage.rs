@@ -7,9 +7,12 @@
 //! It is set exactly once, at confirm time, in the same transaction that
 //! flips `volumes.status` to `'sealed'` (`src/volume/session.rs`) — so
 //! `completed` implies "this volume was sealed at write time." But
-//! `volumes.status` keeps moving afterwards (`retired`, `quarantined`,
-//! `erased`, and — schema-legal though no writer currently sets it —
-//! `missing`; `src/db/migrations/003_v2_lifecycle.sql`), while the
+//! `volumes.status` keeps moving afterwards (`retired`, `erased`, and —
+//! schema-legal though no writer currently sets it — `missing`;
+//! `src/db/migrations/003_v2_lifecycle.sql`) — `quarantined` is NOT among
+//! them: ADR-0012's 2026-09-17 amendment (issue #242) moved it to
+//! `volumes.observed_condition`, a separate column [`eligible`] also
+//! consults (see [`condition_ok`]) — while the
 //! `writes` row stays `completed` forever. A derivation that only checks
 //! `writes.status` is checking eligibility as of write time, not as of
 //! now — which is precisely the gap issue #89 closed.
@@ -27,7 +30,9 @@
 use rusqlite::{params, Connection};
 
 /// The ADR-0004 eligibility predicate, rendered as a SQL boolean
-/// expression against `{volume_alias}.status`.
+/// expression against `{volume_alias}.status` AND
+/// `{volume_alias}.observed_condition` (ADR-0012's 2026-09-17 amendment
+/// folded the latter in — see [`condition_ok`]).
 ///
 /// Embed this directly in a `JOIN ... ON` condition or `WHERE` clause for
 /// queries that use plain (inner) joins and an aggregate with no `GROUP
@@ -81,7 +86,8 @@ fn condition_ok(volume_alias: &str) -> String {
 }
 
 /// The inventory predicate (issue #96), rendered as a SQL boolean
-/// expression against `{volume_alias}.status`.
+/// expression against `{volume_alias}.status` AND
+/// `{volume_alias}.observed_condition` (see [`condition_ok`]).
 ///
 /// [`eligible`] and this function answer two DIFFERENT questions, and
 /// conflating them is what issue #96 was:
@@ -138,8 +144,10 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
 /// (a tape written elsewhere, not a v2 write session); `full` is the
 /// pre-renovation sealed-equivalent; `blank`/`missing` have no writer at
 /// all. A `sealed` volume is never written again (ADR-0003), and
-/// `retired`/`erased`/`quarantined` are catalog facts that make writing
-/// wrong regardless of what the loaded tape looks like.
+/// `retired`/`erased` are catalog facts that make writing wrong regardless
+/// of what the loaded tape looks like. `quarantined` is NOT a `status`
+/// value (ADR-0012's 2026-09-17 amendment, issue #242) — it is the
+/// `condition` parameter's job, below, to refuse that case.
 ///
 /// The "interrupted, ready to resume" state is NOT a `volumes.status`
 /// value — it lives in `writes.status` (`planned → in_progress →

@@ -16,7 +16,7 @@ Output in JSON format
 Warehouse location name (must be a location of kind `warehouse`)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-receipt\fR \fI<RECEIPT>\fR
 The provider\*(Aqs receipt / object\-version identifier, if it gave one. There is deliberately no checksum field: tapectl did not perform the copy, so a typed\-in checksum would be a claim about a claim (issue #73)

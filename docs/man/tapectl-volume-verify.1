@@ -16,7 +16,7 @@ Tape device (by\-id path). Defaults to the only configured drive; required when 
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-full\fR
 Full integrity chain walk (default): hash every content file against the front index\*(Aqs ciphertext hashes

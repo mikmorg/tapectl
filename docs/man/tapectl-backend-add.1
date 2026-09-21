@@ -21,7 +21,7 @@ Name for this drive, used to select it later. Letters, digits, dot, underscore a
 Tape device node, e.g. /dev/tape/by\-id/scsi\-XXXX\-nst
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-device\-sg\fR \fI<DEVICE_SG>\fR
 SCSI generic node used for health/MAM queries, e.g. /dev/sg1

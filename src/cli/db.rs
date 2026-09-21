@@ -65,9 +65,13 @@ pub fn run(
             // then hits a schema error on the next command must not think
             // the tool is broken, so say so here. Cheap to check
             // unconditionally: on the ordinary (already-migrated) path this
-            // is always `false`, so it changes nothing there. Meaningful on
-            // a dry run too: the preview still ran against the unmigrated
-            // connection issue #233 opened.
+            // is always `false`, so it changes nothing there. The `--json`
+            // object below carries `schema_pending` unconditionally,
+            // dry run included; the human "note:" line further down,
+            // though, is printed only on a real repair (the `else` branch)
+            // — the human dry-run branch does not print it, a known gap
+            // (issue #257) rather than something this comment should claim
+            // is already covered.
             let schema_pending = !crate::db::schema_is_current(conn)?;
             if json_output {
                 let mut obj = serde_json::json!({

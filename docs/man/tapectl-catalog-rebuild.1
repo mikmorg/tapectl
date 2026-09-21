@@ -21,7 +21,7 @@ Tape device (by\-id path). Defaults to the only configured drive; required when 
 There is still no `/dev/nst0` fallback (ADR\-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read\-only dump this command writes what it reads into the catalog — a silent wrong\-device default would file one tape\*(Aqs contents under another\*(Aqs. The sole configured backend\*(Aqs `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by\-id/`.
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-key\fR \fI<KEY>\fR
 Operator or escrow secret key file. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh

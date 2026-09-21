@@ -18,7 +18,7 @@ Output in JSON format
 Tenant name
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-volume\fR \fI<VOLUME>\fR
 Label of an ALREADY\-INITIALIZED volume to write to. Create it with `tapectl volume init LABEL \-\-device ...`; quick\-archive does not

@@ -22,7 +22,7 @@ Output in JSON format
 Why (appended to the cartridge\*(Aqs notes, never overwriting them)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-force\fR
 Supply the ADR\-0008 Tier\-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier\-3 refusal (issue #147) — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it. See cli::consent

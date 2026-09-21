@@ -16,7 +16,7 @@ Description. For a warehouse this is where the endpoint or prefix goes (e.g. "s3
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-kind\fR \fI<KIND>\fR [default: shelf]
 Kind of location (ADR\-0006). A `shelf` holds physical cartridges; a `warehouse` is cold cloud storage that can only receive recorded deposits (`volume deposit add`)

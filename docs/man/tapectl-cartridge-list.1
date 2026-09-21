@@ -16,7 +16,7 @@ Output in JSON format
 Filter by status (available, in_use, pending_erase, retired_permanent). `offsite` was removed by ADR\-0011 \-\- a cartridge\*(Aqs place is a location now; use \-\-location
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-location\fR \fI<LOCATION>\fR
 Filter by physical location name (issue #157) \-\- the sibling of `\-\-status`, same bound\-parameter discipline (issue #110)

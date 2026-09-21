@@ -29,7 +29,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Show what would be done without making changes
+    /// Show what would be done without making changes. Commands that
+    /// cannot preview refuse the flag rather than ignore it (issue #241).
     #[arg(long, global = true)]
     pub dry_run: bool,
 

@@ -19,7 +19,7 @@ Tenant name (required unless \-\-escrow)
 Key alias (e.g., "primary", "backup", "2026") (required unless \-\-escrow)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-key\-type\fR \fI<KEY_TYPE>\fR [default: primary]
 Key type

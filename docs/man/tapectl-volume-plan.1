@@ -16,7 +16,7 @@ Number of copies to plan
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Estimate against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. counting LTO\-5 cartridges for an LTO\-6 drive. No cartridge need be loaded; this is an estimate, and the authoritative figure is each volume\*(Aqs own `capacity_bytes` once `volume init` has detected the medium it is actually on

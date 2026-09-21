@@ -18,7 +18,7 @@ Output in JSON format
 Only volumes in this status (blank, initialized, active, full, retired, missing, erased, sealed). Every status is shown when omitted. A medium\*(Aqs CONDITION (e.g. quarantined) is its own fact now (ADR\-0012, the 2026\-09\-17 amendment) and is shown in its own column/line, not filterable here
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

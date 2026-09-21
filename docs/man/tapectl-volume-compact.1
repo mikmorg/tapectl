@@ -21,7 +21,7 @@ Destination volume label. Without it the flow PROMPTS for one, which needs a ter
 Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-allow\-missing\-escrow\fR
 See `volume write \-\-allow\-missing\-escrow`
