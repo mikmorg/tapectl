@@ -330,6 +330,39 @@ the normative design set named in the Policy block below.
   declaring the queue empty, audit `gh issue list --state open` in full, not
   just the label.
 
+- **QUEUE STATE 2026-09-21 — the second review's queue is being worked; 2 highs left and BOTH
+  are parked on one CTO decision.** Master is past `89fb001`; gate 1625 tests / 0 failed,
+  clippy 0, fmt clean; mhvtl gate GREEN **now with a sixth leg, `rust_e2e`**; lifecycle `--all`
+  GREEN 383/372/0/11; CI green.
+  **Closed this round:** #233, #241, #242, #247, #248, #256, #259, #263, #265, #266, #268.
+  **Open: 15** (2 high, 9 medium, 4 low). Newly filed: #267/#268/#269 (uncovered write-path
+  risks the triage found) and **#270**.
+  **PARKED — the only pending CTO decision: #260 + #267 (+ the already-implemented #268).**
+  The ADR ruled the OUTCOME (confirm gains `Inconclusive`: do not seal, do not condemn, stay
+  re-confirmable). The MECHANISM is a fork the amendment does not answer, and the obvious
+  implementation does not work: the only `writes.status` `rehydrate` selects is `interrupted`,
+  but confirm runs AFTER `seal`, so a resume re-enters `check_tape_contact`, hits
+  `AlreadySealed`, and quarantines — producing the exact false quarantine the ruling exists to
+  prevent, one command later. Three options and a recommendation (teach `resume` to
+  re-confirm) are on #260. **Not taken unilaterally** because the edit lands in the one arm
+  whose failure mode is rewriting a sealed cartridge, and this project's own history records
+  that path being got wrong once already.
+  **A process correction worth keeping: #268 was OVER-parked.** It was grouped with #260/#267
+  on "none is safe without the others" — true of the three *decisions*, false of #268's
+  *implementation*, which has no dependency on the confirm mechanism and was more urgent while
+  #260 is open. When parking a cluster, check whether each item's IMPLEMENTATION is actually
+  coupled, not just its decision.
+  **THE GATE NEVER RAN THE RUST ON-MEDIA SUITE (#259).** Five legs of bash, and
+  `tests/mhvtl_e2e.rs` invoked by nothing — so "GATE GREEN 26/26" was true about the bash legs
+  and silent about 12 tests unrun by anything routine for 105 commits. Leg 6 runs them in ~38s.
+  **Asserting a destructive effect in a file nothing executes is not coverage** — the #259 fix
+  would have been worthless without it.
+  **Standing trap, third instance (#270):** `--json` captured with `2>&1` merges stderr into
+  the file that is then parsed. #226 hit it, #265's `first-run.sh` needed `run_capture_json`
+  for it, and 38 sites in `scripts/lifecycle-suite.sh` still do it. tapectl writes progress to
+  stderr ON PURPOSE so `--json` stdout stays parseable. Never copy the suite's `2>&1` idiom for
+  a capture you intend to parse.
+
 - **QUEUE STATE 2026-09-18 (late) — THE LABEL IS EMPTY. Master `c4b3d53`.**
   #233, #241, #242 and #247 all landed and closed. **Zero open issues under
   `review-2026-09-13`, nothing parked**; gate 1616 tests / 0 failed, clippy 0, fmt clean;
