@@ -160,6 +160,20 @@ run_capture() {
   "$@" 2>&1 | tee "$f" | tee -a "$LOG"
   return "${PIPESTATUS[0]}"
 }
+# run_capture_json FILE cmd...: like `run_capture`, but keeps stdout CLEAN.
+# `run_capture` merges stderr with `2>&1` so its callers can grep one stream;
+# that is fatal for a `--json` capture, because tapectl deliberately writes
+# progress and warnings to stderr precisely so `--json` stdout stays parseable
+# (src/volume/write.rs `announce_staged_selection`). Merging them yields a file
+# that is not JSON and a parse that silently falls back. Stderr still reaches
+# the terminal and the log, just not the JSON file.
+run_capture_json() {
+  local f="$1"; shift
+  printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $*"
+  mkdir -p "$(dirname "$f")"
+  "$@" >"$f" 2> >(tee -a "$LOG" >&2)
+  return $?
+}
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
 tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
@@ -773,8 +787,53 @@ EOF
     note "When you put a sticker on it:  tapectl cartridge relabel $CART_BOUND <your-barcode>"
   fi
   run tc volume write "$LABEL" --device "$DEVICE" || die "write did not seal — read the output; the catalog knows exactly why"
-  run tc volume verify "$LABEL" --device "$DEVICE" --full || die "verify FAILED — do not trust this tape"
-  ok "$LABEL sealed and verified"
+  # Issue #265: a failed verify has TWO outcomes and they need opposite
+  # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
+  # medium bad takes the volume out of service; a drive or transport error
+  # proves nothing about the tape and leaves it untouched. Collapsing both into
+  # "do not trust this tape" told the operator the opposite of what the tool had
+  # just decided in one of the two cases, and never mentioned that the other had
+  # silently changed the catalog.
+  VERIFY_JSON="$(dirname "$LOG")/volume-verify-$LABEL.json"
+  if run_capture_json "$VERIFY_JSON" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
+    ok "$LABEL sealed and verified"
+  else
+    # `quarantined` is the discriminator (src/cli/volume.rs, `volume verify
+    # --json`): true = the medium was proved bad and the volume is now out of
+    # service; false = the verify failed without proving anything about the
+    # medium. "unknown" if the JSON did not parse, in which case say so rather
+    # than guess which.
+    VERIFY_QUAR="$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("unknown"); raise SystemExit(0)
+print("yes" if d.get("quarantined") else "no")' "$VERIFY_JSON" 2>/dev/null || echo unknown)"
+    case "$VERIFY_QUAR" in
+      yes)
+        note "The catalog has taken $LABEL out of service: the verify proved the MEDIUM bad, so"
+        note "its units' copy counts have just dropped. That is a real finding about this cartridge."
+        explain <<'EOF'
+Do not trust this tape. The data you staged is still on disk — nothing has been deleted — so the recovery is to write a fresh cartridge: put a new tape in, `tapectl volume init <new-label>`, `tapectl volume write <new-label>`. Keep this one out of the rotation until you know why it failed; `tapectl volume info` and the drive's own health page (`sg_logs`) are where to look.
+EOF
+        die "verify proved the medium bad — $LABEL is out of service, heir kit NOT generated"
+        ;;
+      no)
+        note "The verify did not complete, but it proved NOTHING about the medium: this reads as a"
+        note "DRIVE or transport problem, so $LABEL is untouched and still in service."
+        explain <<'EOF'
+Do not retire this cartridge. Clean the drive, check the cable and the SCSI path, then run the verify again — `tapectl volume verify <label> --device <device> --full`. A verify that then passes clears the volume's condition and finishes this step. The tape has not been altered by a failed read.
+EOF
+        die "verify did not complete (drive/transport, not the medium) — re-run it, heir kit NOT generated"
+        ;;
+      *)
+        note "The verify failed and its --json could not be parsed, so this script cannot tell you"
+        note "whether the MEDIUM was proved bad or the DRIVE could not read it. Read $VERIFY_JSON"
+        note "and the output above before deciding; the two cases have opposite remedies."
+        die "verify FAILED and its outcome could not be classified — heir kit NOT generated"
+        ;;
+    esac
+  fi
   explain <<'EOF'
 `audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge: `volume read-slices` + `volume write`, or just stage again.
 EOF
