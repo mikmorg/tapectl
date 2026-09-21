@@ -594,7 +594,69 @@ impl LoggingConfig {
 
 impl Config {
     /// Load config from file, falling back to defaults.
+    ///
+    /// Every check here is load-bearing (see each validator's own doc
+    /// comment) — this is the ONLY loader a write path may ever use.
+    /// [`Config::load_tolerating_backend_ambiguity`] is this function minus
+    /// exactly the backend-collision check, for the narrow, named set of
+    /// read/repair commands that can prove they never need it (issue #261);
+    /// see that function's doc and `main.rs`'s dispatch for the full
+    /// reasoning. Do not weaken what THIS function checks to solve that
+    /// problem — add a sibling instead, the way issue #233's
+    /// `db::open_for_repair` sits beside `db::open` rather than changing it.
     pub fn load(path: &Path) -> Result<Self> {
+        let config = Self::load_without_backend_check(path)?;
+        config.validate_backends(path)?;
+        Ok(config)
+    }
+
+    /// [`Config::load`] minus its backend-collision check
+    /// ([`Config::validate_backends`]) — issue #261.
+    ///
+    /// `validate_backends` decides whether two `[[backends.lto]]` entries
+    /// collide by calling `std::fs::canonicalize` on both `device_tape`
+    /// values (via [`device_matches`]), so whether it fires depends on what
+    /// `/dev` looks like at the instant it runs — CLAUDE.md's own warning:
+    /// "DEVICE NUMBERING IS NOT STABLE ... a reboot can hand it /dev/nst0."
+    /// That refusal is load-bearing for the WRITE path: it is what makes
+    /// `resolve_lto_backend`'s `.find(...)` (issue #222) fail loudly instead
+    /// of silently picking whichever backend happens to be first — possibly
+    /// the real production drive instead of the mhvtl one a renumbering
+    /// displaced onto the same device. Nothing here weakens that; `load`
+    /// above still calls it unconditionally.
+    ///
+    /// But a command that never resolves an LTO backend for a write gets
+    /// zero protection from that check and all of the fragility: transient
+    /// `/dev` state can make it fail to start at all, with no repair path —
+    /// the exact asymmetry issue #233 already closed for the database
+    /// (`db::open_for_repair`, reached only for the one named, repairable
+    /// failure). This is the config-side counterpart: reached only by the
+    /// named, conservative command set `main.rs` dispatches through it
+    /// (`restore`, `catalog` [rebuild resolves its device leniently, via
+    /// `resolve_device`, on purpose], `report`, `audit`, `db backup`, and
+    /// `db fsck --repair` — none of which can reach `resolve_lto_backend`;
+    /// see `main.rs`'s own comment for the per-command proof), never a
+    /// general replacement for `load`.
+    ///
+    /// Every OTHER refusal `Config::load` makes still applies, unchanged:
+    /// a missing file, stale renamed fields, a structural TOML error, and
+    /// every [`Config::validate_sizes`] / [`Config::validate_closed_sets`] /
+    /// [`Config::validate_ranges`] problem. This is not a second, more
+    /// lenient definition of "valid config" (that trap is exactly why this
+    /// is a sibling of `load` sharing its body, not a filtered read of
+    /// [`Config::semantic_problems`], which `policy::lenient_config` uses
+    /// for `config check` and would silently also swallow a bad
+    /// `compaction.utilization_threshold` or an unknown key) — it is the
+    /// same definition, missing one specific, narrowly-scoped check.
+    pub fn load_tolerating_backend_ambiguity(path: &Path) -> Result<Self> {
+        Self::load_without_backend_check(path)
+    }
+
+    /// Shared body of [`Config::load`] and
+    /// [`Config::load_tolerating_backend_ambiguity`]: parse, plus every
+    /// validator except [`Config::validate_backends`], which each caller
+    /// applies (or deliberately doesn't) itself.
+    fn load_without_backend_check(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(TapectlError::ConfigNotFound(path.display().to_string()));
         }
@@ -617,7 +679,6 @@ impl Config {
         config.validate_sizes(path)?;
         config.validate_closed_sets(path)?;
         config.validate_ranges(path)?;
-        config.validate_backends(path)?;
         Ok(config)
     }
 

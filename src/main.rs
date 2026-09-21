@@ -200,7 +200,68 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cfg = Config::load(&paths.config_file).context("failed to load config")?;
+    // Issue #261 (precedent: #233's `db::open_for_repair`): `Config::load`'s
+    // backend-collision refusal (`validate_backends`) calls
+    // `std::fs::canonicalize` on both sides of every `[[backends.lto]]`
+    // pair, so whether it fires depends on what `/dev` looks like at this
+    // instant — CLAUDE.md's own warning that device numbering is not
+    // stable on this VM. That refusal is load-bearing for the WRITE path
+    // (it is what keeps `resolve_lto_backend`'s `.find(...)` from silently
+    // picking the wrong drive, issue #222) and stays exactly as strict as
+    // it always was for every command NOT named below.
+    //
+    // The named set is every command that can be shown to never reach
+    // `resolve_lto_backend`/`cli::write_device` — the strict resolver —
+    // so the collision protects nothing for them while still being able to
+    // brick them outright:
+    //   - `Restore` (`Unit`/`File`/`RawVolume`): all three resolve their
+    //     device via `cli::read_device` -> `config::resolve_device`, the
+    //     LENIENT resolver, by design (ADR-0010's DR path — a rebuilt
+    //     machine has keys and no `backend add` yet). `src/cli/restore.rs`.
+    //   - `Catalog` (`Ls`/`Search`/`Locate`/`Stats`/`Rebuild`): only
+    //     `Rebuild` touches `config` at all, and only via
+    //     `config::resolve_device` + `tape::media_detect::check_read_contact`
+    //     (itself `resolve_device`) — both lenient, both reads. It rebuilds
+    //     the DATABASE from tape, never writes one. `src/cli/catalog.rs`.
+    //   - `Report` (every subcommand): reads `config.defaults` /
+    //     `config.compaction` for policy math only; no subcommand ever
+    //     calls a device resolver. `src/cli/report.rs`.
+    //   - `Audit`: same — reads `config.defaults`/`config.compaction`
+    //     for policy resolution, never a device. `src/cli/audit.rs`.
+    //   - `Db { Backup }` and `Db { Fsck { repair: true } }`: `cli::db::run`
+    //     doesn't take a `Config` parameter at all (`src/cli/db.rs`) — there
+    //     is no code path from either arm to any resolver. `repair: true`
+    //     only, mirroring #233's own specificity: a plain `fsck` (no
+    //     `--repair`) never mutates and was never the blocked command in
+    //     the first place.
+    //
+    // Every other command (`Volume`, `Collection`, `Snapshot`, `Stage`,
+    // `Tenant`, `Key`, `Unit`, `Cartridge`, `ArchiveSet`, `Export`,
+    // `Import`, `QuickArchive`, `Backend`, `Db::{Export,Import,Stats}`,
+    // `Config::Show`) keeps the strict loader below unconditionally —
+    // several of them (`Volume`, `Collection`, `QuickArchive`) reach
+    // `resolve_lto_backend` directly and must never see this door.
+    let lenient_backend_ok = matches!(
+        cli.command,
+        Commands::Restore { .. }
+            | Commands::Catalog { .. }
+            | Commands::Report { .. }
+            | Commands::Audit { .. }
+            | Commands::Db {
+                command: cli::DbCommands::Backup { .. }
+            }
+            | Commands::Db {
+                command: cli::DbCommands::Fsck { repair: true }
+            }
+    );
+    let cfg = match Config::load(&paths.config_file) {
+        Ok(cfg) => cfg,
+        Err(_) if lenient_backend_ok => {
+            Config::load_tolerating_backend_ambiguity(&paths.config_file)
+                .context("failed to load config")?
+        }
+        Err(e) => return Err(e).context("failed to load config"),
+    };
     // Issue #172: a real, generically useful DEBUG-level log line — proof,
     // observable from `logging.level = "debug"` alone with no tape/write
     // path involved, that the wired keys actually reach the subscriber
