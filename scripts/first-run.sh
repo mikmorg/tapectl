@@ -743,9 +743,44 @@ except Exception: pass' 2>/dev/null || true)"
 Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it runs dar over every unit, hashes, encrypts to every recipient and writes the slices to your staging directory. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13.
 EOF
   confirm "Stage them now? (runs dar + encryption, writes to staging)" || die "stopped before staging"
+  # Issue #283: this loop MUST tolerate a unit that is already staged. The
+  # explain block directly above tells the operator they may stage a subset
+  # by hand and re-enter with `--from 13` -- and `stage create` refuses a unit
+  # whose latest snapshot is no longer `'created'`, so following that advice
+  # used to abort the script right here. There was then NO path through step
+  # 13 that reached the write: answering "yes" died on the first
+  # already-staged unit, and answering "no" died at the confirm above. A
+  # re-entrant step has to tolerate the state its own documented recovery
+  # path creates.
+  #
+  # The skip is deliberately narrow: ONLY when `stage create`'s refusal is
+  # the no-unstaged-snapshot one AND that unit already has a `'staged'` set.
+  # Any other failure still aborts, because "already done" and "broken" must
+  # not look the same on production day.
+  staged_already() { # staged_already <unit>
+    local f; f="$(dirname "$LOG")/stage-list-staged.json"
+    tc stage list --status staged --json >"$f" 2>/dev/null || return 1
+    # `stage list --json` emits a list of StageRow; the unit's name is the
+    # "unit" key (verified against `stage_rows_to_json`, not assumed -- the
+    # lifecycle suite lost a whole check once to a guessed --json key).
+    python3 - "$f" "$1" <<'PY'
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(r.get("unit") == sys.argv[2] for r in rows) else 1)
+PY
+  }
   while IFS= read -r u; do
     [ -z "$u" ] && continue
-    run tc stage create "$u" || die "stage failed for $u"
+    so="$(dirname "$LOG")/stage-$u.out"
+    if run_capture "$so" tc stage create "$u"; then continue; fi
+    if grep -q 'no unstaged snapshot for unit' "$so" && staged_already "$u"; then
+      note "$u is already staged -- skipping it (staged by hand, or by an earlier run of this step)"
+      continue
+    fi
+    die "stage failed for $u"
   done <<< "$UNITS"
   run tc staging status || true
   # `volume plan` reads the staged stage_sets and totals their encrypted size
