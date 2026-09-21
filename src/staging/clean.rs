@@ -1,12 +1,34 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use tracing::warn;
 
 use crate::config::Config;
 use crate::db::events;
 use crate::error::Result;
+
+/// Which stage_sets a [`clean_staging`] call is allowed to consider (issue
+/// #248). This is a SELECTION, never a policy decision: it says which
+/// stage_sets the eligibility rule inside `clean_staging` gets to look at,
+/// not whether any of them may actually be released — that stays entirely
+/// with the caller (`cli::staging::run`'s min_copies gate;
+/// `collection::batch::execute_batch`'s own `under_copied_units` gate),
+/// exactly as ADR-0012's #244 amendment requires ("`clean_staging` stays
+/// policy-free; the gate goes in the CLI caller").
+#[derive(Debug, Clone, Copy)]
+pub enum CleanScope<'a> {
+    /// Every stage_set in the database — `tapectl staging clean`'s
+    /// existing, deliberately archive-wide behaviour. Unaffected by issue
+    /// #248: the CLI keeps this scope.
+    Whole,
+    /// Only stage_sets whose snapshot belongs to one of these unit ids —
+    /// `collection::batch::execute_batch`'s scope: a batch's release must
+    /// never reach past its own units into a different batch's still-
+    /// staged data. An empty slice matches nothing (it does not widen back
+    /// to `Whole`).
+    Units(&'a [i64]),
+}
 
 /// Clean staged files from disk and update DB.
 ///
@@ -80,26 +102,82 @@ use crate::error::Result;
 /// indistinguishable from crash garbage), so a sweep would produce a report
 /// rather than a cleanup — which is what naming the path here already does,
 /// without a new scan that could race a writer.
-pub fn clean_staging(conn: &Connection, config: &Config, force: bool) -> Result<CleanReport> {
+///
+/// `scope` narrows *which* stage_sets the eligibility rule above is even
+/// allowed to consider — it is a SELECTION, not a policy decision (issue
+/// #248). Whether a given stage_set may be released is still decided
+/// entirely by the eligibility rule above (`force`, `writes` status) plus
+/// whatever gate the caller ran before ever calling this function
+/// (`cli::staging::run`'s min_copies refusal; `collection::batch::
+/// execute_batch`'s own `under_copied_units`) — `clean_staging` itself
+/// stays exactly as policy-free as ADR-0012's #244 amendment requires.
+/// `CleanScope::Whole` reproduces this function's original, unscoped
+/// behaviour verbatim (`tapectl staging clean`'s archive-wide sweep, issue
+/// #244's own gate sits in front of it and is unaffected).
+/// `CleanScope::Units` additionally requires the stage_set's snapshot to
+/// belong to one of the given unit ids — `execute_batch`'s scope, so one
+/// batch's release can never reach into a different batch's still-staged
+/// data.
+pub fn clean_staging(
+    conn: &Connection,
+    config: &Config,
+    force: bool,
+    scope: CleanScope,
+) -> Result<CleanReport> {
     let mut report = CleanReport::default();
 
+    let unit_ids: &[i64] = match scope {
+        CleanScope::Whole => &[],
+        CleanScope::Units(ids) => {
+            // Nothing in scope -- e.g. a batch driver called with an empty
+            // unit list. Match `Whole`'s "no candidates -> no-op" exit
+            // rather than falling through to a query with a `... IN ()`
+            // that some SQL dialects reject outright.
+            if ids.is_empty() {
+                return Ok(report);
+            }
+            ids
+        }
+    };
+    let scope_join = match scope {
+        CleanScope::Whole => "",
+        CleanScope::Units(_) => {
+            "JOIN snapshots __scope_sn ON __scope_sn.id = stage_sets.snapshot_id"
+        }
+    };
+    let scope_predicate = match scope {
+        CleanScope::Whole => String::new(),
+        CleanScope::Units(_) => format!(
+            "AND __scope_sn.unit_id IN ({})",
+            unit_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+        ),
+    };
+
     let candidate_sql = if force {
-        "SELECT id, status FROM stage_sets WHERE status IN ('staged', 'failed')"
+        format!(
+            "SELECT stage_sets.id, stage_sets.status FROM stage_sets {scope_join}
+             WHERE stage_sets.status IN ('staged', 'failed') {scope_predicate}"
+        )
     } else {
-        "SELECT id, status FROM stage_sets
-         WHERE status = 'failed'
-            OR (status = 'staged'
-                AND EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = stage_sets.id)
-                AND NOT EXISTS (
-                    SELECT 1 FROM writes w
-                    WHERE w.stage_set_id = stage_sets.id AND w.status <> 'completed'
-                ))"
+        format!(
+            "SELECT stage_sets.id, stage_sets.status FROM stage_sets {scope_join}
+             WHERE (stage_sets.status = 'failed'
+                OR (stage_sets.status = 'staged'
+                    AND EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = stage_sets.id)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM writes w
+                        WHERE w.stage_set_id = stage_sets.id AND w.status <> 'completed'
+                    )))
+             {scope_predicate}"
+        )
     };
 
     let candidates: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(candidate_sql)?;
+        let mut stmt = conn.prepare(&candidate_sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params_from_iter(unit_ids.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
@@ -666,7 +744,8 @@ mod tests {
         let (conn, _stage_set_id, path, dir) = seed_stage_set();
         seed_write(&conn, _stage_set_id, "V1", "completed");
 
-        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
         assert_eq!(report.files_removed, 1);
         assert!(!path.exists(), "staged file should have been removed");
@@ -676,10 +755,107 @@ mod tests {
     fn default_guard_refuses_when_no_write_exists_at_all() {
         let (conn, _stage_set_id, path, dir) = seed_stage_set();
 
-        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 0);
         assert_eq!(report.files_removed, 0);
         assert!(path.exists(), "never-written stage_set must not be cleaned");
+    }
+
+    /// Issue #248: `CleanScope::Units` must restrict the sweep to
+    /// stage_sets whose snapshot belongs to one of the given unit ids —
+    /// direct, unit-level pin of the scoping mechanism `collection::batch::
+    /// execute_batch` relies on. Two units, each independently eligible
+    /// under the exact same non-force guard (one `writes` row, all
+    /// `'completed'`); only one is named in `scope`.
+    #[test]
+    fn scope_units_only_cleans_stage_sets_belonging_to_the_given_units() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(dir.path());
+
+        let mut unit_ids = Vec::new();
+        let mut staged_paths = Vec::new();
+        for name in ["unit-a", "unit-b"] {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?1, ?2, '/tmp/u', 'active')",
+                params![name, tenant_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
+                params![unit_id],
+            )
+            .unwrap();
+            let snapshot_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snapshot_id],
+            )
+            .unwrap();
+            let stage_set_id = conn.last_insert_rowid();
+
+            let path = dir.path().join(format!("{name}.age"));
+            std::fs::write(&path, b"staged slice bytes").unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                            sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, 1, 19, 19, 'deadbeef', 'deadbeef', ?2)",
+                params![stage_set_id, path.to_string_lossy()],
+            )
+            .unwrap();
+            seed_write(&conn, stage_set_id, &format!("V-{name}"), "completed");
+
+            unit_ids.push(unit_id);
+            staged_paths.push(path);
+        }
+
+        let report =
+            clean_staging(&conn, &config, false, CleanScope::Units(&[unit_ids[0]])).unwrap();
+        assert_eq!(
+            report.sets_cleaned, 1,
+            "only unit-a's stage_set is in scope, even though unit-b's is equally eligible"
+        );
+        assert!(
+            !staged_paths[0].exists(),
+            "unit-a's staged file must be removed -- it was in scope"
+        );
+        assert!(
+            staged_paths[1].exists(),
+            "unit-b's staged file must survive -- it was never in scope"
+        );
+    }
+
+    /// An empty `CleanScope::Units` slice matches nothing — it must not
+    /// silently widen back to `Whole` (e.g. via a malformed `... IN ()`
+    /// that some SQL engines would treat as always-true).
+    #[test]
+    fn scope_units_empty_slice_matches_nothing() {
+        let (conn, _stage_set_id, path, dir) = seed_stage_set();
+        seed_write(&conn, _stage_set_id, "V1", "completed");
+
+        let report = clean_staging(
+            &conn,
+            &config_for(dir.path()),
+            false,
+            CleanScope::Units(&[]),
+        )
+        .unwrap();
+        assert_eq!(report.sets_cleaned, 0);
+        assert!(
+            path.exists(),
+            "an empty scope must match nothing, not fall back to a whole-database sweep"
+        );
     }
 
     /// The §3.5 regression case: a stage_set planned onto TWO cartridges (2
@@ -695,7 +871,8 @@ mod tests {
             seed_write(&conn, stage_set_id, "V-SEALED", "completed");
             seed_write(&conn, stage_set_id, "V-PENDING", blocking_status);
 
-            let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+            let report =
+                clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
             assert_eq!(
                 report.sets_cleaned, 0,
                 "must not clean while a copy is '{blocking_status}'"
@@ -718,7 +895,8 @@ mod tests {
             seed_write(&conn, stage_set_id, "V-SEALED", "completed");
             seed_write(&conn, stage_set_id, "V-DEAD", terminal_non_success);
 
-            let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+            let report =
+                clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
             assert_eq!(
                 report.sets_cleaned, 0,
                 "must not clean while a copy is '{terminal_non_success}'"
@@ -732,7 +910,8 @@ mod tests {
         let (conn, stage_set_id, path, dir) = seed_stage_set();
         seed_write(&conn, stage_set_id, "V-PENDING", "planned");
 
-        let report = clean_staging(&conn, &config_for(dir.path()), true).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), true, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
         assert!(!path.exists());
     }
@@ -745,7 +924,8 @@ mod tests {
     fn failed_set_is_cleaned_unconditionally_without_force() {
         let (conn, stage_set_id, path, dir) = seed_stage_set_with_status("failed");
 
-        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
         assert!(!path.exists(), "failed set's .age file should be removed");
 
@@ -806,7 +986,8 @@ mod tests {
             return;
         }
 
-        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
 
         // Restore write permission first, so the TempDir can clean up even
         // if an assertion below fails.
@@ -846,7 +1027,8 @@ mod tests {
     #[test]
     fn a_successful_clean_strands_nothing() {
         let (conn, _id, path, dir) = seed_stage_set_with_status("failed");
-        let report = clean_staging(&conn, &config_for(dir.path()), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert!(!path.exists());
         assert_eq!(report.errors, 0);
         assert!(report.stranded.is_empty());
@@ -863,7 +1045,8 @@ mod tests {
         let (conn, stage_set_id, staging_dir, dar_path, sha_path, _dir) =
             seed_failed_stage_set_with_plaintext_orphan();
 
-        let report = clean_staging(&conn, &config_for(&staging_dir), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(&staging_dir), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
         assert_eq!(report.files_removed, 2, "both .dar and .sha512 orphans");
         assert!(!dar_path.exists(), "orphaned .dar must be removed");
@@ -1085,7 +1268,8 @@ mod tests {
         let other_path = dir.path().join(format!("{other_prefix}1.dar"));
         std::fs::write(&other_path, b"sibling's plaintext slice").unwrap();
 
-        let report = clean_staging(&conn, &config_for(&staging_dir), false).unwrap();
+        let report =
+            clean_staging(&conn, &config_for(&staging_dir), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
         assert!(!dar_path.exists());
         assert!(

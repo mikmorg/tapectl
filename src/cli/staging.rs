@@ -256,7 +256,7 @@ pub fn run(
                 }
             }
 
-            let mut report = clean::clean_staging(conn, config, *force)?;
+            let mut report = clean::clean_staging(conn, config, *force, clean::CleanScope::Whole)?;
             clean::reclaim_session_dirs_and_lockfiles(
                 conn,
                 config,

@@ -638,7 +638,13 @@ mod tests {
 
         // Release the first stage set's slices (force, since there's no
         // completed write backing it in this test).
-        crate::staging::clean::clean_staging(&conn, &config, true).unwrap();
+        crate::staging::clean::clean_staging(
+            &conn,
+            &config,
+            true,
+            crate::staging::clean::CleanScope::Whole,
+        )
+        .unwrap();
         let status: String = conn
             .query_row("SELECT status FROM stage_sets LIMIT 1", [], |row| {
                 row.get(0)
@@ -735,7 +741,13 @@ mod tests {
         )
         .unwrap();
 
-        crate::staging::clean::clean_staging(&conn, &config, true).unwrap();
+        crate::staging::clean::clean_staging(
+            &conn,
+            &config,
+            true,
+            crate::staging::clean::CleanScope::Whole,
+        )
+        .unwrap();
         run(
             &conn,
             &paths,
