@@ -2116,28 +2116,37 @@ fn seed_planned_write_session(home: &std::path::Path, label: &str) {
 /// Issue #237's claim, checked against the real binary rather than only
 /// against source: `tapectl --yes volume abort LABEL` — the GLOBAL `--yes`
 /// given before the subcommand, no local `--yes` anywhere — was reported to
-/// "fail closed" because `src/cli/volume.rs`'s `Abort` arm passes only the
-/// subcommand-local flag (`write::volume_abort(conn, label, *yes)`),
-/// dropping the separate global `yes: bool` that `run()` also receives.
+/// "fail closed" because `src/cli/volume.rs`'s `Abort` arm passes only a
+/// subcommand-local flag, dropping the separate global `yes: bool` that
+/// `run()` also receives.
 ///
-/// It does not reproduce. `Abort`'s local `yes` field and the global
-/// `Cli::yes` share clap's default arg id (the field name, "yes"), and
-/// clap's global-value propagation unifies matches by id regardless of
-/// where the flag was typed: giving `--yes` in EITHER position sets both
-/// `Cli.yes` and `Abort.yes` together (confirmed independently via
+/// It did not reproduce, though not for the reason first suspected. At the
+/// time, `Abort` still declared its own local `yes` field
+/// (`#[arg(long)] yes: bool`), and it shared clap's default arg id with the
+/// global (both named "yes"): clap's global-value propagation unifies
+/// matches by id regardless of where the flag was typed, so giving `--yes`
+/// in EITHER position set both `Cli.yes` and `Abort.yes` together
+/// (confirmed independently via
 /// `Cli::try_parse_from(["tapectl", "--yes", "volume", "abort", "L1"])`,
-/// which yields `Abort { yes: true, .. }` with no local `--yes` token
+/// which yielded `Abort { yes: true, .. }` with no local `--yes` token
 /// anywhere). This test proves the same thing end-to-end against a fixture
 /// whose `writes` row genuinely reaches the consent gate — see
 /// `volume_abort_without_yes_refuses_non_interactively` below, which proves
 /// that same fixture refuses when NO `--yes` is given at all, so a success
 /// here cannot be explained by the gate never being reached.
 ///
-/// This is a regression pin, not a fix verification. `src/cli/volume.rs`
-/// was deliberately NOT changed for issue #237: the requested `*yes || yes`
-/// would OR two values that are already always equal for the long flag — a
-/// no-op — and applying it anyway despite the premise not reproducing would
-/// have been "working around" a false claim rather than fixing a real one.
+/// **Issue #251's correction (issue #258): the local field described above
+/// no longer exists.** Issue #240 found the ONE thing the shared-id field
+/// could not share -- clap's `short`, so `-y` parsed before the subcommand
+/// and failed after it -- and removed the local field outright rather than
+/// also redeclaring `short = 'y'` on it (`src/cli/volume.rs`'s `Abort`
+/// variant, and its match arm, now read only the global `yes` parameter;
+/// see that arm's own comment). This test is still a valid regression pin
+/// for the ORIGINAL #237 claim ("global `--yes` before the subcommand must
+/// skip the prompt"), which remains true and is now trivially so — there is
+/// no second declaration left to disagree with the global. The `*yes ||
+/// yes` no-op this doc used to reason about was about code that has since
+/// been deleted, not code that still exists.
 #[test]
 fn volume_abort_proceeds_on_global_yes_alone() {
     let home = TempDir::new().expect("tempdir");

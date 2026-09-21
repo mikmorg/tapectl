@@ -1355,9 +1355,20 @@ fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
     );
 
     let text = String::from_utf8_lossy(&out.stdout);
+    // Issue #258: `text.contains('1')` is satisfied by "u1", "L6-0001" or
+    // this test's own tempdir path, so it never actually checked the slice
+    // count -- a wrong count (0, or any other digit sequence not literally
+    // "1") would still pass. `src/cli/restore.rs:118`'s exact format is
+    // `"would restore \"{}\" from {} ({} slices) to {}"`, and this fixture
+    // wrote exactly one `write_positions` row, so the real preview must
+    // name it as "(1 slices)".
     assert!(
-        text.contains("would restore") && text.contains('1'),
-        "dry-run output does not name the preview or the slice count: {text}"
+        text.contains("would restore"),
+        "dry-run output does not name the preview: {text}"
+    );
+    assert!(
+        text.contains("(1 slices)"),
+        "dry-run output does not report the real slice count: {text}"
     );
     assert!(
         !root.path().join("out").exists(),

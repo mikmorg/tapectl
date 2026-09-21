@@ -289,13 +289,18 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
 
-    /// One row of the precedence table: `--home`, `--config`,
-    /// `TAPECTL_HOME`, `HOME` — exactly [`resolve_from`]'s parameters.
-    type Row<'a> = (
+    /// A row of the precedence table (`--home`, `--config`, `TAPECTL_HOME`,
+    /// `HOME` — exactly [`resolve_from`]'s parameters) plus the two outputs
+    /// the whole-table test below pins:
+    /// the resolved home, and `ambiguous_config_home` (`None`, or `Some`
+    /// naming the same path as the home).
+    type ExpectedRow<'a> = (
         Option<&'a str>,
         Option<&'a str>,
         Option<&'a OsStr>,
         Option<&'a OsStr>,
+        &'a str,
+        Option<&'a str>,
     );
 
     fn os(s: &str) -> OsString {
@@ -639,47 +644,123 @@ mod tests {
         assert!(notice.contains("home=/mnt/archive"), "{notice}");
     }
 
-    /// `main`'s pre-subscriber resolution and `run`'s authoritative one are
-    /// the same call on the same inputs. With the environment as
-    /// parameters, "they cannot diverge" is finally a test rather than an
-    /// argument.
+    /// **Issue #258.** This test used to call [`resolve_from`] twice with
+    /// the identical literal arguments and assert the two results equal
+    /// each other -- `f(x) == f(x)` on a function with no interior
+    /// mutability, no I/O and no randomness. That cannot fail for any
+    /// implementation: a mutation that resolves every row to the wrong
+    /// home just as consistently would still pass, because "consistent
+    /// with itself" and "correct" are different properties, and only the
+    /// first was ever checked. (The doc comment's actual claim --  that
+    /// `main`'s pre-subscriber peek and `run`'s authoritative resolution
+    /// cannot diverge -- is true, but for a reason no unit test proves: both
+    /// call sites in `main.rs` are the identical `startup::resolve(...)`
+    /// expression, so there is only ever one implementation to run.)
+    ///
+    /// Rewritten to pin what "the whole table" should have meant: each
+    /// row's ACTUAL resolved `home` and `ambiguous_config_home`, against
+    /// the same expected values the single-scenario tests above assert
+    /// one precedence rule at a time. A wrong precedence decision now
+    /// reddens this test, not just a nondeterministic one.
     #[test]
-    fn the_resolution_is_deterministic_across_the_whole_table() {
+    fn the_resolution_matches_the_whole_precedence_table() {
         let home = os("/home/op");
         let env = os("/mnt/from-env");
         let empty = os("");
-        let rows: &[Row<'_>] = &[
-            (None, None, None, Some(home.as_os_str())),
-            (Some("/mnt/a"), None, None, Some(home.as_os_str())),
+        let rows: &[ExpectedRow<'_>] = &[
+            // neither flag: $HOME/.tapectl
+            (
+                None,
+                None,
+                None,
+                Some(home.as_os_str()),
+                "/home/op/.tapectl",
+                None,
+            ),
+            // --home alone
+            (
+                Some("/mnt/a"),
+                None,
+                None,
+                Some(home.as_os_str()),
+                "/mnt/a",
+                None,
+            ),
+            // --config alone relocates the home and is ambiguous about it
             (
                 None,
                 Some("/mnt/a/config.toml"),
                 None,
                 Some(home.as_os_str()),
+                "/mnt/a",
+                Some("/mnt/a"),
             ),
+            // both flags, disagreeing: --home decides, unambiguously
             (
                 Some("/mnt/a"),
                 Some("/mnt/b/other.toml"),
                 None,
                 Some(home.as_os_str()),
+                "/mnt/a",
+                None,
             ),
-            (None, Some("config.toml"), None, Some(home.as_os_str())),
-            (None, Some("/"), None, Some(home.as_os_str())),
-            (None, None, Some(env.as_os_str()), Some(home.as_os_str())),
-            (None, None, Some(empty.as_os_str()), Some(home.as_os_str())),
-            (Some("/mnt/a"), None, None, None),
+            // bare relative --config: empty parent becomes "."
+            (
+                None,
+                Some("config.toml"),
+                None,
+                Some(home.as_os_str()),
+                ".",
+                Some("."),
+            ),
+            // --config at the filesystem root: no parent, falls back to "."
+            (
+                None,
+                Some("/"),
+                None,
+                Some(home.as_os_str()),
+                ".",
+                Some("."),
+            ),
+            // TAPECTL_HOME selects the archive like --home does
+            (
+                None,
+                None,
+                Some(env.as_os_str()),
+                Some(home.as_os_str()),
+                "/mnt/from-env",
+                None,
+            ),
+            // empty TAPECTL_HOME is treated as unset, falls back to $HOME
+            (
+                None,
+                None,
+                Some(empty.as_os_str()),
+                Some(home.as_os_str()),
+                "/home/op/.tapectl",
+                None,
+            ),
+            // --home alone needs no HOME at all
+            (Some("/mnt/a"), None, None, None, "/mnt/a", None),
         ];
-        for (home_flag, config_flag, tapectl_home, home_env) in rows {
-            let first = resolve_from(*home_flag, *config_flag, *tapectl_home, *home_env)
-                .expect("row should resolve");
-            let second = resolve_from(*home_flag, *config_flag, *tapectl_home, *home_env)
-                .expect("row should resolve");
+        for (home_flag, config_flag, tapectl_home, home_env, expected_home, expected_ambiguous) in
+            rows
+        {
+            let r = resolve_from(*home_flag, *config_flag, *tapectl_home, *home_env)
+                .unwrap_or_else(|e| {
+                    panic!("row {home_flag:?}/{config_flag:?} should resolve: {e}")
+                });
             assert_eq!(
-                first.paths.home, second.paths.home,
-                "row {home_flag:?}/{config_flag:?} resolved two different homes"
+                r.paths.home,
+                PathBuf::from(expected_home),
+                "row {home_flag:?}/{config_flag:?}/{tapectl_home:?}/{home_env:?} \
+                 resolved the wrong home"
             );
-            assert_eq!(first.paths.config_file, second.paths.config_file);
-            assert_eq!(first.ambiguous_config_home, second.ambiguous_config_home);
+            assert_eq!(
+                r.ambiguous_config_home,
+                expected_ambiguous.map(PathBuf::from),
+                "row {home_flag:?}/{config_flag:?} disagreed on ambiguous_config_home"
+            );
         }
     }
 
