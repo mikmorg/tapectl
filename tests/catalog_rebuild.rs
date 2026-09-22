@@ -1215,11 +1215,29 @@ fn a_serial_with_no_identity_source_also_rebuilds_unbound_and_says_so() {
     );
 }
 
-/// The recipe `volume_init`'s `AlreadySealed` refusal already prints —
-/// `tapectl cartridge mark-erased <barcode>` — must be runnable on a
-/// rebuilt tape. Before issue #165 there was no row to name at all.
+/// The recipe `volume_init`'s `AlreadySealed` refusal prints — "retire its
+/// current volume, bulk-erase the physical tape, then run `tapectl cartridge
+/// mark-erased`" — must reach a rebuilt tape rather than dead-end on a
+/// missing row. Before issue #165 there was no cartridge row to name at all.
+///
+/// Issue #289 changed what "runnable" means here, and the change is the
+/// point. `cartridge mark-erased` now runs the ADR-0008 Tier-3 floor, so
+/// calling it DIRECTLY on a rebuilt tape — skipping the `volume retire` the
+/// recipe names first — is refused while that tape is some unit's last
+/// eligible copy. That is the recipe working, not failing: a catalog
+/// rebuilt from one tape necessarily believes that tape is the only copy,
+/// and erasing it is exactly the data loss Tier 3 is absolute about. The
+/// other half of the same printed recipe, `volume retire`, has refused this
+/// case since issue #147; until #289 `mark-erased` was the ungated door,
+/// and this test passed only because of it.
+///
+/// So both halves are asserted. The refusal must be the FLOOR talking and
+/// not a missing row (that is #165's actual claim, and `cartridge
+/// "{barcode}" not found` would also contain the barcode — so the barcode
+/// alone proves nothing). And once the versions are given up on purpose,
+/// the recipe must complete.
 #[test]
-fn the_already_sealed_recipe_is_runnable_on_a_rebuilt_tape() {
+fn the_already_sealed_recipe_reaches_a_rebuilt_tape_and_completes_once_coverage_is_released() {
     let mut vol = build_sealed_volume(true);
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
@@ -1227,6 +1245,44 @@ fn the_already_sealed_recipe_is_runnable_on_a_rebuilt_tape() {
     let secret = vol.operator_secret.clone();
     rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
 
+    // Half 1: the rebuilt row IS reachable, and the Tier-3 floor is what
+    // stops the erase -- with `force = true`, which reaches nothing here.
+    let err = tapectl::cli::operations::cartridge_mark_erased(
+        &conn,
+        "REBUILDSERIAL",
+        true,
+        false,
+        false,
+        false,
+    )
+    .expect_err(
+        "erasing a rebuilt tape that is a unit's last eligible copy must be refused (issue #289)",
+    )
+    .to_string();
+    assert!(
+        err.contains("LAST eligible copy"),
+        "the refusal must come from the ADR-0008 Tier-3 floor: {err}"
+    );
+    assert!(
+        !err.contains("not found"),
+        "the rebuilt cartridge must be NAMEABLE -- a `not found` here would be issue #165 \
+         regressing, not the floor firing: {err}"
+    );
+    assert!(
+        err.contains(LABEL),
+        "the floor's recovery commands name the VOLUME whose slices must be copied off: {err}"
+    );
+
+    // Give the versions up on purpose -- the act the refusal itself names,
+    // `tapectl snapshot mark-reclaimable <unit> --version N`, applied here
+    // directly because that command's own preconditions (tape-only 2x
+    // multiplier, staging state) are a different subject under test.
+    // `versions_at_stake` only considers `status = 'current'` snapshots, so
+    // this is precisely what the operator's release does to the floor.
+    conn.execute("UPDATE snapshots SET status = 'reclaimable'", [])
+        .unwrap();
+
+    // Half 2: with nothing live at stake, the recipe completes.
     tapectl::cli::operations::cartridge_mark_erased(
         &conn,
         "REBUILDSERIAL",
@@ -1235,7 +1291,7 @@ fn the_already_sealed_recipe_is_runnable_on_a_rebuilt_tape() {
         false,
         false,
     )
-    .expect("a rebuilt cartridge must be nameable by cartridge mark-erased");
+    .expect("once no live version is at stake the rebuilt cartridge must be erasable");
     let status: String = conn
         .query_row(
             "SELECT status FROM cartridges WHERE barcode = 'REBUILDSERIAL'",
