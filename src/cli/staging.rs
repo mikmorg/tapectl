@@ -32,6 +32,17 @@ pub enum StagingCommands {
         /// error, not a silent no-op.
         #[arg(long = "unit")]
         unit: Vec<String>,
+
+        /// Narrow release further, to just this snapshot version within
+        /// the single unit named by `--unit` -- issue #278. Requires
+        /// exactly one `--unit`; zero or more than one is a usage error
+        /// naming the constraint, never a silent widening back to
+        /// unit-level scope. Exists so a `--force` release meant for one
+        /// under-written version of a unit can never also release a
+        /// DIFFERENT, still-unwritten version of that same unit -- see
+        /// `CleanScope::UnitVersion`'s contract in `src/staging/clean.rs`.
+        #[arg(long = "version")]
+        version: Option<i64>,
     },
 }
 
@@ -152,6 +163,23 @@ fn under_copied_release_candidates(
     Ok(under)
 }
 
+/// The scope actually passed to [`clean::clean_staging`] when releasing
+/// `ids` (issue #278). Ordinarily this is just `CleanScope::Units(ids)` --
+/// but when a `--version` was given, `ids` is guaranteed (by the pairing
+/// check in `StagingCommands::Clean`'s handler) to be exactly the one unit
+/// id that version belongs to, so the release narrows one step further, to
+/// `CleanScope::UnitVersion`, matching only that unit's stage_set at that
+/// version rather than every `'staged'` set the unit has.
+fn release_scope(ids: &[i64], version: Option<i64>) -> clean::CleanScope<'_> {
+    match (version, ids) {
+        (Some(v), [unit_id]) => clean::CleanScope::UnitVersion {
+            unit_id: *unit_id,
+            version: v,
+        },
+        _ => clean::CleanScope::Units(ids),
+    }
+}
+
 /// Lines naming each retained unit and its shortfall, for both the
 /// human-readable report and the JSON `"retained"` array. Factored out --
 /// like [`staging_rows_to_json`] below -- so a test can assert on the exact
@@ -269,7 +297,11 @@ pub fn run(
             }
         }
 
-        StagingCommands::Clean { force, unit } => {
+        StagingCommands::Clean {
+            force,
+            unit,
+            version,
+        } => {
             // Issue #241: the #244 min_copies gate right below must
             // reproduce exactly, or a dry run would claim a release is
             // safe when the real run refuses it (or vice versa) — "a dry
@@ -294,6 +326,22 @@ pub fn run(
                         .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))
                 })
                 .collect::<Result<Vec<i64>>>()?;
+
+            // Issue #278: `--version` only ever narrows within a SINGLE
+            // named unit -- it says nothing about which unit if more than
+            // one (or none) was named, so that pairing is a usage error
+            // naming the constraint, never a silent fallback to unit-level
+            // scope or to `--version`'s first/only unit guessed some other
+            // way.
+            if version.is_some() && named_ids.len() != 1 {
+                return Err(TapectlError::Other(format!(
+                    "`--version` requires exactly one `--unit` naming the unit that \
+                     version belongs to, got {} -- pass exactly one `--unit <name>` \
+                     alongside `--version <N>`, or drop `--version` to scope by unit alone",
+                    named_ids.len()
+                )));
+            }
+
             // `None` here is exactly the pre-#274 unscoped path -- every
             // branch below falls back to `CleanScope::Whole` in that case,
             // reproducing today's output and `CleanScope::Whole`/
@@ -322,7 +370,7 @@ pub fn run(
             // #262's ruling on `CleanScope::Units`).
             let (mut report, retained): (clean::CleanReport, Vec<UnderCopiedUnit>) = if *force {
                 let scope = match unit_scope {
-                    Some(ids) => clean::CleanScope::Units(ids),
+                    Some(ids) => release_scope(ids, *version),
                     None => clean::CleanScope::Whole,
                 };
                 (clean::clean_staging(conn, config, true, scope)?, Vec::new())
@@ -336,7 +384,7 @@ pub fn run(
                     // (never widened to `Whole` just because nothing here
                     // needed retaining).
                     let scope = match unit_scope {
-                        Some(ids) => clean::CleanScope::Units(ids),
+                        Some(ids) => release_scope(ids, *version),
                         None => clean::CleanScope::Whole,
                     };
                     (
@@ -562,6 +610,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: false,
                 unit: Vec::new(),
+                version: None,
             },
             false,
             false,
@@ -619,6 +668,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: true,
                 unit: Vec::new(),
+                version: None,
             },
             false,
             false,
@@ -737,6 +787,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: false,
                 unit: Vec::new(),
+                version: None,
             },
             false,
             false,
@@ -820,6 +871,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: false,
                 unit: Vec::new(),
+                version: None,
             },
             false,
             false,
@@ -862,6 +914,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: false,
                 unit: Vec::new(),
+                version: None,
             },
             false,
             false,
@@ -917,6 +970,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: false,
                 unit: vec!["testlib/named".to_string()],
+                version: None,
             },
             false,
             false,
@@ -949,6 +1003,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: false,
                 unit: vec!["testlib/ghost".to_string()],
+                version: None,
             },
             false,
             false,
@@ -977,6 +1032,7 @@ mod tests {
             &StagingCommands::Clean {
                 force: true,
                 unit: vec!["testlib/alpha".to_string()],
+                version: None,
             },
             false,
             false,
@@ -988,6 +1044,200 @@ mod tests {
             .unwrap();
         assert_eq!(status, "cleaned");
         assert!(!staged_file.exists());
+    }
+
+    /// Issue #278's acceptance shape, verbatim: the SAME unit has a
+    /// version (1) already written and retained only for being under
+    /// min_copies, and a DIFFERENT version (4) that was staged and never
+    /// written anywhere. `restage_action` (`src/cli/audit.rs`) now emits
+    /// `--force`'s recipe scoped to `--version 1` for exactly this
+    /// shape; this is the CLI-level proof that the flag itself enforces
+    /// the narrowing, independent of what `restage_action` composes: v4's
+    /// bytes -- which exist nowhere else -- must survive a `--force`
+    /// clean aimed at v1.
+    #[test]
+    fn version_flag_with_force_releases_only_the_named_version_of_the_unit() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('photos', 'photos', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        // v1: one completed write -- under min_copies=2, so a bare clean
+        // would retain it (the "retained" half of the shape).
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'superseded', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap1],
+        )
+        .unwrap();
+        let stage_set_v1 = conn.last_insert_rowid();
+        let path_v1 = dir.path().join("v1.age");
+        std::fs::write(&path_v1, b"v1 bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 8, 8, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_v1, path_v1.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V1', 'lto', 'lto0', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let vol1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_v1, snap1, vol1],
+        )
+        .unwrap();
+
+        // v4: staged, never written anywhere -- these bytes exist nowhere
+        // else.
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 4, 'current', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap4 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap4],
+        )
+        .unwrap();
+        let stage_set_v4 = conn.last_insert_rowid();
+        let path_v4 = dir.path().join("v4.age");
+        std::fs::write(&path_v4, b"v4 bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 8, 8, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_v4, path_v4.to_string_lossy()],
+        )
+        .unwrap();
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: true,
+                unit: vec!["photos".to_string()],
+                version: Some(1),
+            },
+            false,
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        assert!(!path_v1.exists(), "v1's staged bytes must be released");
+        assert!(
+            path_v4.exists(),
+            "issue #278: v4 was never written anywhere -- a --force clean \
+             scoped to --version 1 must not reach it just because it shares \
+             a unit with v1"
+        );
+
+        let status_v4: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_v4],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_v4, "staged", "v4's stage_set must be untouched");
+    }
+
+    /// `--version` with no `--unit` at all is a usage error naming the
+    /// pairing constraint -- never a silent no-op and never a guess at
+    /// which unit was meant.
+    #[test]
+    fn version_flag_with_no_unit_errors_naming_the_constraint() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: false,
+                unit: Vec::new(),
+                version: Some(1),
+            },
+            false,
+            false,
+        );
+        let err = result.expect_err("--version with zero --unit must error");
+        let msg = err.to_string();
+        assert!(msg.contains("--version"), "{msg}");
+        assert!(msg.contains("--unit"), "{msg}");
+    }
+
+    /// `--version` with more than one `--unit` is the same usage error --
+    /// which of the named units the version belongs to is ambiguous, so
+    /// this must not silently pick one.
+    #[test]
+    fn version_flag_with_two_units_errors_naming_the_constraint() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        for name in ["testlib/one", "testlib/two"] {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?1, ?2, '/tmp/u', 'active')",
+                params![name, tenant_id],
+            )
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+
+        let result = run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: false,
+                unit: vec!["testlib/one".to_string(), "testlib/two".to_string()],
+                version: Some(1),
+            },
+            false,
+            false,
+        );
+        let err = result.expect_err("--version with two --unit values must error");
+        let msg = err.to_string();
+        assert!(msg.contains("--version"), "{msg}");
+        assert!(msg.contains("--unit"), "{msg}");
     }
 
     /// `staging status --json` shape (issue: C2 row-listing drift). One row

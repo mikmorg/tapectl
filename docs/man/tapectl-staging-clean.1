@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-staging\-clean \- Clean staged files from disk
 .SH SYNOPSIS
-\fBtapectl staging clean\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-unit\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl staging clean\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-unit\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Clean staged files from disk
 .SH OPTIONS
@@ -23,6 +23,9 @@ Narrow which staged sets are considered for release to this unit (repeatable) \-
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-\-version\fR \fI<VERSION>\fR
+Narrow release further, to just this snapshot version within the single unit named by `\-\-unit` \-\- issue #278. Requires exactly one `\-\-unit`; zero or more than one is a usage error naming the constraint, never a silent widening back to unit\-level scope. Exists so a `\-\-force` release meant for one under\-written version of a unit can never also release a DIFFERENT, still\-unwritten version of that same unit \-\- see `CleanScope::UnitVersion`\*(Aqs contract in `src/staging/clean.rs`
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)

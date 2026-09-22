@@ -620,21 +620,25 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
 /// would reproduce the exact ciphertext/recipient list the finding says
 /// is wrong.
 ///
-/// `tapectl staging clean --unit <name>` is prefixed exactly once when any
-/// named version still has live slices blocking a re-stage — every stage
-/// set that can reach this function already has a completed write (that is
-/// how the finding fired), so releasing it is always safe for the write
-/// this same recipe ends with. Issue #274: the clean is scoped to this
-/// unit alone, so a pasted recipe can never reach past it into another
-/// unit's staged data, and it is `--force`d exactly when this unit is
-/// itself below its own resolved `min_copies` — the one case where a bare
-/// `staging clean` would retain rather than release (ADR-0012's
-/// 2026-09-21 amendment, issue #262), which would otherwise leave the
-/// following `stage create --version` refusing on a still-live stage set.
-/// Forcing it here is deliberately narrower than the archive-wide
-/// `--force`: it can only ever touch the one unit named in scope, and the
-/// copy this recipe's final `volume write` step produces is exactly the
-/// copy that shortfall requires — so releasing early costs nothing.
+/// `tapectl staging clean --unit <name> --version <v>` is prefixed, one
+/// invocation per live version, exactly when that named version still has
+/// live slices blocking a re-stage — every stage set that can reach this
+/// function already has a completed write (that is how the finding fired),
+/// so releasing it is always safe for the write this same recipe ends
+/// with. Issue #278: the clean is scoped to this unit AND this one
+/// version (`CleanScope::UnitVersion`, `src/staging/clean.rs`), not the
+/// whole unit (issue #274's earlier, unit-only scoping) — a pasted recipe
+/// can therefore never reach past the version it names into a DIFFERENT,
+/// possibly never-written version of the SAME unit. It is `--force`d
+/// exactly when this unit is itself below its own resolved `min_copies` —
+/// the one case where a bare `staging clean` would retain rather than
+/// release (ADR-0012's 2026-09-21 amendment, issue #262), which would
+/// otherwise leave the following `stage create --version` refusing on a
+/// still-live stage set. Forcing it here is deliberately narrower than
+/// both the archive-wide `--force` and issue #274's unit-wide `--force`:
+/// it can only ever touch the one (unit, version) pair named in scope, and
+/// the copy this recipe's final `volume write` step produces is exactly
+/// the copy that shortfall requires — so releasing early costs nothing.
 fn restage_action(
     conn: &Connection,
     unit: &Unit,
@@ -657,9 +661,12 @@ fn restage_action(
 
     let live_by_version: std::collections::HashMap<i64, bool> =
         current_versions_live(conn, unit.id)?.into_iter().collect();
-    let any_live = versions
+    let live_versions: Vec<i64> = versions
         .iter()
-        .any(|v| live_by_version.get(v).copied().unwrap_or(false));
+        .copied()
+        .filter(|v| live_by_version.get(v).copied().unwrap_or(false))
+        .collect();
+    let any_live = !live_versions.is_empty();
 
     // Issue #274: the same `copy_count_for_unit` derivation
     // `check_copy_count`/`under_copied_release_candidates` use (issue
@@ -667,14 +674,17 @@ fn restage_action(
     let under_copied = copy_count_for_unit(conn, unit.id)? < resolved.min_copies;
 
     let mut steps: Vec<String> = Vec::new();
-    if any_live {
+    for v in &live_versions {
         if under_copied {
             steps.push(format!(
-                "tapectl staging clean --unit {} --force",
+                "tapectl staging clean --unit {} --version {v} --force",
                 unit.name
             ));
         } else {
-            steps.push(format!("tapectl staging clean --unit {}", unit.name));
+            steps.push(format!(
+                "tapectl staging clean --unit {} --version {v}",
+                unit.name
+            ));
         }
     }
     for v in versions {
@@ -2843,14 +2853,17 @@ mod tests {
     /// version-scoped re-stage would be refused
     /// (`cli/stage.rs`'s live-slices gate) until it is released.
     ///
-    /// **This test used to pin the BROKEN recipe (issue #274).** A bare,
-    /// un-scoped `tapectl staging clean` prefixed onto this exact
-    /// under-copied fixture would only ever RETAIN "reels"'s staged bytes
-    /// (ADR-0012's 2026-09-21 amendment, issue #262), leaving the very next
-    /// `stage create --version 1` step refusing on the still-live stage
-    /// set -- a two-step recipe whose first step guaranteed the second
-    /// could not run. The recipe now scopes the clean to this one unit and
-    /// forces it release, since "reels" is exactly the under-copied case;
+    /// **This test used to pin the unit-wide-`--force` recipe (issue
+    /// #274), itself since superseded by issue #278.** A bare, un-scoped
+    /// `tapectl staging clean` prefixed onto this exact under-copied
+    /// fixture would only ever RETAIN "reels"'s staged bytes (ADR-0012's
+    /// 2026-09-21 amendment, issue #262), leaving the very next `stage
+    /// create --version 1` step refusing on the still-live stage set -- a
+    /// two-step recipe whose first step guaranteed the second could not
+    /// run. Issue #274 fixed that by scoping the clean to this one unit
+    /// and forcing its release; issue #278 narrowed it once more, to this
+    /// one unit AND this one version, so the same `--force` can never
+    /// reach a different, possibly never-written version of "reels".
     /// `restage_action_scoped_clean_actually_frees_the_stage_set` below
     /// proves running that scoped clean really does free it.
     #[test]
@@ -2864,7 +2877,8 @@ mod tests {
         let action = restage_action(&conn, &unit, &[1], "", &resolved).unwrap();
         assert_eq!(
             action,
-            "tapectl staging clean --unit reels --force && tapectl stage create reels --version 1 && \
+            "tapectl staging clean --unit reels --version 1 --force && \
+             tapectl stage create reels --version 1 && \
              tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> \
              (\"reels\" is below its policy's min_copies, so a bare clean would retain \
              its staged bytes -- --force releases them here because the write below \
@@ -2883,14 +2897,16 @@ mod tests {
         assert_eq!(finding.action, action);
     }
 
-    /// The acceptance criterion for issue #274, end-to-end and asserted on
+    /// The acceptance criterion for issue #278, end-to-end and asserted on
     /// DB state, not on the printed recipe string: running the EXACT clean
     /// `restage_action` now names for an under-copied, still-live unit
-    /// (`clean_staging` with `CleanScope::Units(&[unit_id])` and
-    /// `force = true`) must actually free the stage set, i.e.
+    /// (`clean_staging` with `CleanScope::UnitVersion { unit_id, version: 1
+    /// }` and `force = true`) must actually free the stage set, i.e.
     /// `stage_set_has_live_slices` must be false for its resulting status
     /// -- the precondition `stage create --version N`'s live-slices gate
-    /// (`src/cli/stage.rs`) checks before refusing.
+    /// (`src/cli/stage.rs`) checks before refusing. The scope here is
+    /// narrower than issue #274's original `Units(&[unit_id])` -- proving
+    /// the tighter scope still frees the one stage_set it is supposed to.
     #[test]
     fn restage_action_scoped_clean_actually_frees_the_stage_set() {
         let (conn, unit_id, stage_set_id) = seed_reels_under_copied_and_still_live();
@@ -2906,7 +2922,10 @@ mod tests {
             &conn,
             &config,
             true,
-            crate::staging::clean::CleanScope::Units(&[unit_id]),
+            crate::staging::clean::CleanScope::UnitVersion {
+                unit_id,
+                version: 1,
+            },
         )
         .unwrap();
         assert_eq!(

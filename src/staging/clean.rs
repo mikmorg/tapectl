@@ -41,6 +41,67 @@ pub enum CleanScope<'a> {
     /// that it is swept unconditionally — #262 is what made the code match
     /// the doc.)
     Units(&'a [i64]),
+    /// Restricts the `'staged'` branch to the single stage_set whose
+    /// snapshot belongs to `unit_id` AND is at `version` — issue #278's
+    /// narrowing, one level tighter than `Units`. `cli::audit`'s
+    /// auto-emitted remedy (`restage_action`) uses this so a pasted
+    /// `--force` recipe for one under-written version of a unit can never
+    /// reach a DIFFERENT, still-unwritten version of that SAME unit (the
+    /// defect #278 exists to fix: `Units(&[unit_id])` matches every
+    /// `'staged'` set for the unit regardless of version). `cli::staging`'s
+    /// `--unit <name> --version <N>` flag pair builds this directly.
+    ///
+    /// There is no "empty slice" case here the way there is for `Units` —
+    /// a single `(unit_id, version)` pair either matches the one stage_set
+    /// at that version or matches nothing at all (an unknown or
+    /// never-staged version). Either way this scope only ever NARROWS: it
+    /// can never widen back to `Whole` or to `Units`'s broader
+    /// whole-unit match.
+    ///
+    /// The `'failed'` branch is, exactly as for `Units`, NEVER restricted
+    /// by this — the same issue #262 ruling: a `'failed'` set carries no
+    /// copy requirement for any scope, unit- or version-shaped, to
+    /// protect.
+    UnitVersion { unit_id: i64, version: i64 },
+}
+
+/// The exact non-force `'staged'` eligibility condition [`clean_staging`]
+/// enforces, as a reusable SQL boolean expression (issue #96's
+/// single-derivation rule, restated for issue #279): at least one `writes`
+/// row references the stage_set named by `id_expr` and none of them is
+/// anything but `'completed'`. `id_expr` is the caller's own qualified
+/// column or placeholder (`stage_sets.id`, `ss.id`, `?1`) so this drops
+/// into any query's WHERE clause without forcing a particular alias.
+///
+/// Both `clean_staging`'s own non-force SQL below and
+/// `cli::staging::staged_release_candidate_units` build their queries from
+/// this same fragment; `cli::stage`'s live-slices refusal evaluates it
+/// directly against one stage_set id via [`is_release_candidate`]. None of
+/// the three hand-writes a second copy of the `EXISTS (SELECT 1 FROM
+/// writes ...)` pair.
+fn release_candidate_predicate_sql(id_expr: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = {id_expr})
+         AND NOT EXISTS (
+             SELECT 1 FROM writes w
+             WHERE w.stage_set_id = {id_expr} AND w.status <> 'completed'
+         )"
+    )
+}
+
+/// Whether `stage_set_id` alone is a non-force release candidate — the
+/// exact predicate [`release_candidate_predicate_sql`] describes, evaluated
+/// for one specific stage_set rather than embedded in a larger query.
+/// `cli::stage`'s live-slices refusal (issue #279) uses this to say the
+/// RIGHT reason a bare `staging clean` would leave a given live stage_set
+/// alone: `false` means it is not a candidate at all (most commonly: no
+/// `writes` row exists yet, i.e. it was never written anywhere) so only
+/// `--force` releases it; `true` means it IS a candidate, so the ordinary
+/// min_copies-shortfall wording still applies.
+pub(crate) fn is_release_candidate(conn: &Connection, stage_set_id: i64) -> Result<bool> {
+    let sql = format!("SELECT {}", release_candidate_predicate_sql("?1"));
+    let v: i64 = conn.query_row(&sql, params![stage_set_id], |row| row.get(0))?;
+    Ok(v != 0)
 }
 
 /// Clean staged files from disk and update DB.
@@ -131,7 +192,10 @@ pub enum CleanScope<'a> {
 /// stage_set's snapshot to belong to one of the given unit ids —
 /// `execute_batch`'s scope, so one batch's release can never reach into a
 /// different batch's still-staged data; and `cli::staging::run`'s scope for
-/// the units its min_copies check found covered.
+/// the units its min_copies check found covered. `CleanScope::UnitVersion`
+/// narrows one step further, to a single unit id AND a single snapshot
+/// version — `cli::audit`'s auto-emitted `--force` recipe (issue #278) and
+/// `cli::staging::run`'s `--unit <name> --version <N>` pair.
 ///
 /// **The `'failed'` branch is exempt from `scope` entirely (issue #262).**
 /// A `'failed'` set never reached `'staged'`, so it carries no `writes` row
@@ -151,14 +215,16 @@ pub fn clean_staging(
     // the query below, because the `'failed'` branch must be swept
     // regardless of scope (see `CleanScope::Units`'s doc) -- an empty unit
     // list only means "match no `'staged'` set", never "match nothing at
-    // all".
-    let unit_ids: &[i64] = match scope {
-        CleanScope::Whole => &[],
-        CleanScope::Units(ids) => ids,
-    };
+    // all". `CleanScope::UnitVersion` has no such empty case -- it is
+    // always exactly one (unit_id, version) pair.
+    //
+    // `bind_params` carries whatever scalars `scope_predicate` below needs
+    // bound, in the exact order its placeholders appear -- `Units` binds
+    // zero or more unit ids, `UnitVersion` binds exactly two (unit_id,
+    // version).
     let scope_join = match scope {
         CleanScope::Whole => "",
-        CleanScope::Units(_) => {
+        CleanScope::Units(_) | CleanScope::UnitVersion { .. } => {
             "JOIN snapshots __scope_sn ON __scope_sn.id = stage_sets.snapshot_id"
         }
     };
@@ -167,14 +233,22 @@ pub fn clean_staging(
     // unconditional. `"AND 0"` for an empty `Units` slice is deliberately
     // spelled out rather than emitting `IN ()`: SQLite treats an empty `IN
     // ()` as always-false too, but that is not guaranteed portable and a
-    // literal `AND 0` needs no placeholder count to line up with `unit_ids`
-    // (which is empty here, so `params_from_iter` binds zero parameters).
-    let scope_predicate = match scope {
-        CleanScope::Whole => String::new(),
-        CleanScope::Units([]) => "AND 0".to_string(),
-        CleanScope::Units(_) => format!(
-            "AND __scope_sn.unit_id IN ({})",
-            unit_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+    // literal `AND 0` needs no placeholder count to line up with
+    // `bind_params` (empty here, so `params_from_iter` binds zero
+    // parameters).
+    let (scope_predicate, bind_params): (String, Vec<i64>) = match scope {
+        CleanScope::Whole => (String::new(), Vec::new()),
+        CleanScope::Units([]) => ("AND 0".to_string(), Vec::new()),
+        CleanScope::Units(ids) => (
+            format!(
+                "AND __scope_sn.unit_id IN ({})",
+                ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+            ),
+            ids.to_vec(),
+        ),
+        CleanScope::UnitVersion { unit_id, version } => (
+            "AND __scope_sn.unit_id = ? AND __scope_sn.version = ?".to_string(),
+            vec![unit_id, version],
         ),
     };
 
@@ -189,19 +263,16 @@ pub fn clean_staging(
             "SELECT stage_sets.id, stage_sets.status FROM stage_sets {scope_join}
              WHERE stage_sets.status = 'failed'
                 OR (stage_sets.status = 'staged'
-                    AND EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = stage_sets.id)
-                    AND NOT EXISTS (
-                        SELECT 1 FROM writes w
-                        WHERE w.stage_set_id = stage_sets.id AND w.status <> 'completed'
-                    )
-                    {scope_predicate})"
+                    AND {}
+                    {scope_predicate})",
+            release_candidate_predicate_sql("stage_sets.id")
         )
     };
 
     let candidates: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(&candidate_sql)?;
         let rows = stmt
-            .query_map(params_from_iter(unit_ids.iter()), |row| {
+            .query_map(params_from_iter(bind_params.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1007,6 +1078,212 @@ mod tests {
         assert_eq!(
             report.sets_cleaned, 2,
             "both A ('staged', in scope) and B ('failed', out of scope) must be swept"
+        );
+        assert!(!path_a.exists());
+        assert!(
+            !path_b.exists(),
+            "B's 'failed' set must be swept even though B was never named in scope"
+        );
+    }
+
+    /// Issue #278's root scenario, at this function's own level: the SAME
+    /// unit has a version-1 stage_set (one completed write) and a
+    /// version-4 stage_set that was staged and never written anywhere.
+    /// `CleanScope::UnitVersion { unit_id, version: 1 }` with `force =
+    /// true` must release version 1's bytes but leave version 4's alone —
+    /// `Units(&[unit_id])` cannot make this distinction at all, since it
+    /// matches every `'staged'` set for the unit regardless of version.
+    #[test]
+    fn scope_unit_version_releases_only_the_named_version_of_a_unit() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('photos', 'photos', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(dir.path());
+
+        // v1: one completed write.
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'superseded', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap1],
+        )
+        .unwrap();
+        let stage_set_v1 = conn.last_insert_rowid();
+        let path_v1 = dir.path().join("v1.age");
+        std::fs::write(&path_v1, b"v1 bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 8, 8, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_v1, path_v1.to_string_lossy()],
+        )
+        .unwrap();
+        seed_write(&conn, stage_set_v1, "V1", "completed");
+
+        // v4: staged, never written anywhere.
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 4, 'current', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap4 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap4],
+        )
+        .unwrap();
+        let stage_set_v4 = conn.last_insert_rowid();
+        let path_v4 = dir.path().join("v4.age");
+        std::fs::write(&path_v4, b"v4 bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 8, 8, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_v4, path_v4.to_string_lossy()],
+        )
+        .unwrap();
+
+        let report = clean_staging(
+            &conn,
+            &config,
+            true,
+            CleanScope::UnitVersion {
+                unit_id,
+                version: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.sets_cleaned, 1, "only v1 must be in scope");
+        assert!(!path_v1.exists(), "v1's staged bytes must be released");
+        assert!(
+            path_v4.exists(),
+            "v4 was never written anywhere -- a version-scoped release of v1 \
+             must not reach it just because it shares a unit with v1"
+        );
+
+        let status_v4: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![stage_set_v4],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_v4, "staged", "v4's stage_set must be untouched");
+    }
+
+    /// The third contract item `CleanScope::UnitVersion`'s own doc comment
+    /// promises, at this function's level: a `'failed'` set belonging to a
+    /// unit and version NOT named in scope must still be swept — the same
+    /// issue #262 ruling `Units` already honors
+    /// (`scope_units_sweeps_a_failed_set_outside_the_named_units` above),
+    /// now pinned for the narrower scope too.
+    #[test]
+    fn scope_unit_version_still_sweeps_a_failed_set_outside_the_named_scope() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(dir.path());
+
+        // Unit A, version 1: a 'staged' set, in scope.
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('a', 'a', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
+            params![unit_a],
+        )
+        .unwrap();
+        let snap_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_a],
+        )
+        .unwrap();
+        let stage_set_a = conn.last_insert_rowid();
+        let path_a = dir.path().join("a.age");
+        std::fs::write(&path_a, b"a bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 7, 7, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_a, path_a.to_string_lossy()],
+        )
+        .unwrap();
+        seed_write(&conn, stage_set_a, "V-A", "completed");
+
+        // Unit B, version 1: a 'failed' set, NOT the (unit, version) named
+        // in scope.
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('b', 'b', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_b = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'created', '/tmp/u', 1, 10)",
+            params![unit_b],
+        )
+        .unwrap();
+        let snap_b = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'failed', 524288)",
+            params![snap_b],
+        )
+        .unwrap();
+        let stage_set_b = conn.last_insert_rowid();
+        let path_b = dir.path().join("b.age");
+        std::fs::write(&path_b, b"b bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 7, 7, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_b, path_b.to_string_lossy()],
+        )
+        .unwrap();
+
+        let report = clean_staging(
+            &conn,
+            &config,
+            false,
+            CleanScope::UnitVersion {
+                unit_id: unit_a,
+                version: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.sets_cleaned, 2,
+            "both A (in scope) and B ('failed', out of scope) must be swept"
         );
         assert!(!path_a.exists());
         assert!(
