@@ -324,7 +324,12 @@ check() { # check <name> <fn> [args...]
         RESULT[$name]=PASS
     elif [ "$rc" -eq 77 ]; then
         RESULT[$name]=SKIP
-        NOTE[$name]="$(tail -1 "$RUN/log-$name.txt" 2>/dev/null | sed 's/^[^:]*: SKIP — //')"
+        # Greedy `.*`, not `[^:]*`: a check name may itself contain a colon
+        # (`pm.step34.mutate:modify`), and the character-class version then
+        # matched only up to the FIRST colon, failed to reach `: SKIP — `,
+        # and left the whole prefix in the note. Every `mutate:*` skip in
+        # REPORT.md read `pm.step34.mutate:modify | SKIP | pm.step34.mutate:modify: SKIP — ...`.
+        NOTE[$name]="$(tail -1 "$RUN/log-$name.txt" 2>/dev/null | sed 's/^.*: SKIP — //')"
     else
         RESULT[$name]=FAIL
     fi
