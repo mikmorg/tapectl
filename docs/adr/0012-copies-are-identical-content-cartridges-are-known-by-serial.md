@@ -674,6 +674,18 @@ Tier-3 zero-copy floor never fires, letting `volume retire` and `cartridge mark-
 destroy the only copy of a sealed, restorable tape — is the same blind spot about the
 same state. It is to be fixed against this recorded fact, not against a second inference.
 
+*Fact correction, 2026-09-22 (#289).* The sentence above is right about the outcome and
+wrong about the mechanism for one of the two commands it names. `volume retire` was
+blinded by the `writes.status = 'completed'` filter, and widening it (#276) restored its
+floor. `cartridge mark-erased` was not blinded by that filter or any other: it never
+called `retire_impacts` or `refuse_last_eligible_copy` at all, so it was blind to every
+state equally and no change to the filter could have reached it. It was a fourth command
+with the inverted shape ADR-0012 named three of, and #147's sweep did not visit it. The
+floor now runs there too, unconditionally and before the Tier-2 consent — a structural
+no-op on the ordinary retire → bulk-erase → mark-erased lifecycle, because `volume
+retire` has already moved the volume to `retired` by then and `holds_sealed_bytes`
+excludes it. The ruling is unchanged; only the account of how the door was open.
+
 **Constraint on the implementation.** The new state must not make a sealed-but-unconfirmed
 volume look like a completed one to anything that counts copies: `policy::coverage`
 remains the sole owner of that question (#96), and a volume whose confirm has not passed
