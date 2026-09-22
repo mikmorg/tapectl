@@ -1081,7 +1081,13 @@ mod tests {
             .unwrap();
 
         let root = tempfile::tempdir().unwrap();
-        let unit_dir = root.path().join("alpha");
+        // Canonicalised before use: on a host where /tmp is a symlink (this
+        // VM points it at /scratch), an un-canonicalised `current_path`
+        // never prefix-matches `canonical_root`'s output, `units_under_root`
+        // finds ZERO units, and every `is_empty()` assertion below passes
+        // for the wrong reason (issue #285).
+        let root_path = root.path().canonicalize().unwrap();
+        let unit_dir = root_path.join("alpha");
         std::fs::create_dir_all(&unit_dir).unwrap();
         std::fs::write(unit_dir.join("f.txt"), b"hello").unwrap();
         std::fs::write(unit_dir.join("Thumbs.db"), b"AAAA").unwrap();
@@ -1104,7 +1110,7 @@ mod tests {
 
         let lib = crate::config::CollectionConfig {
             name: "testlib".into(),
-            root: root.path().to_string_lossy().to_string(),
+            root: root_path.to_string_lossy().to_string(),
             tenant: "media".into(),
             unit_depth: 1,
             exclude: vec![],
@@ -1135,6 +1141,25 @@ mod tests {
             "must stay clean on a second scan too — got {:?}",
             scan.pending
         );
+
+        // THE POSITIVE CONTROL. Both assertions above are negative, and a
+        // negative assertion cannot tell "the scan looked and correctly
+        // found nothing" from "the scan never found this unit at all" — a
+        // path mismatch, a status filter, a renamed root would all satisfy
+        // them silently. Change a file that is NOT excluded and require the
+        // SAME scan to flag the SAME unit: if this fails, the two
+        // `is_empty()` assertions above were proving nothing.
+        std::fs::write(unit_dir.join("f.txt"), b"hello, and then some more").unwrap();
+        let scan = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
+        assert_eq!(
+            scan.pending.len(),
+            1,
+            "the scan must actually REACH this unit — a non-excluded change \
+             has to make it pending, or the is_empty() assertions above are \
+             vacuous: {:?}",
+            scan.pending
+        );
+        assert_eq!(scan.pending[0].unit.name, "testlib/alpha");
     }
 
     /// Issue #285 / ADR-0012's 2026-09-22 amendment ("an unparseable unit
