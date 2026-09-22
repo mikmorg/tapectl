@@ -2451,3 +2451,85 @@ fn staging_clean_force_still_overrides_the_under_copied_refusal() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// Issue #296 / ADR-0013 §3: `report health --json` after migration 021,
+/// pinned by parsing the WHOLE stdout as one JSON document and comparing it
+/// to the complete expected value — every key, every row, in order.
+///
+/// Three readings, one per attribution state: a fully attributed one
+/// (volume, contact, drive, cartridge); a drive-only one with NO volume,
+/// which the old INNER JOIN to `volumes` silently dropped; and a pre-021
+/// one with no contact, whose `drive_serial`/`cartridge_barcode` must be
+/// `null` — "not recorded", never a guess.
+#[test]
+fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings() {
+    let home = TempDir::new().expect("tempdir");
+    let init_out = run_tapectl(home.path(), &["init"]);
+    assert!(
+        init_out.status.success(),
+        "init failed: stderr={}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    {
+        let conn = tapectl::db::open(&db_path).expect("open the initialized db");
+        conn.execute_batch(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status)
+                VALUES (1, 'V-FULL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed'),
+                       (2, 'V-OLD',  'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed');
+             INSERT INTO cartridges (id, barcode, media_type, nominal_capacity)
+                VALUES (10, 'CART01', 'LTO-6', 2500000000000);
+             INSERT INTO drives (id, serial) VALUES (20, 'SER-A'), (21, 'SER-B');
+             INSERT INTO cartridge_contacts (id, cartridge_id, volume_id, drive_id, operation, device)
+                VALUES (30, 10, 1, 20, 'volume write', '/dev/nst0'),
+                       (31, NULL, NULL, 21, 'volume identify', '/dev/nst0');
+             INSERT INTO health_logs (volume_id, contact_id, logged_at, operation, total_bytes,
+                                      total_corrected, total_uncorrected, tape_alerts)
+                VALUES (1, 30, '2026-09-22 03:00:00', 'write', 4096, 2, 1, 0),
+                       (NULL, 31, '2026-09-22 02:00:00', 'verify', NULL, NULL, 0, NULL),
+                       (2, NULL, '2026-09-22 01:00:00', 'write', 1024, 0, 0, NULL);",
+        )
+        .expect("seed health readings");
+    }
+
+    let out = run_tapectl(home.path(), &["report", "health", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "report health --json should exit 0: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("report health --json stdout did not parse as one JSON document: {e}\n{stdout:?}")
+    });
+    let rows = parsed.as_array().expect("an array of readings");
+    assert_eq!(
+        rows.len(),
+        3,
+        "positive control: every seeded reading is present"
+    );
+
+    let expected = serde_json::json!([
+        {
+            "volume": "V-FULL", "operation": "write", "at": "2026-09-22 03:00:00",
+            "bytes": 4096, "corrected": 2, "uncorrected": 1, "tape_alerts": 0,
+            "corrected_no_delay": null, "ecc_invocations": null,
+            "drive_serial": "SER-A", "cartridge_barcode": "CART01"
+        },
+        {
+            "volume": null, "operation": "verify", "at": "2026-09-22 02:00:00",
+            "bytes": null, "corrected": null, "uncorrected": 0, "tape_alerts": null,
+            "corrected_no_delay": null, "ecc_invocations": null,
+            "drive_serial": "SER-B", "cartridge_barcode": null
+        },
+        {
+            "volume": "V-OLD", "operation": "write", "at": "2026-09-22 01:00:00",
+            "bytes": 1024, "corrected": 0, "uncorrected": 0, "tape_alerts": null,
+            "corrected_no_delay": null, "ecc_invocations": null,
+            "drive_serial": null, "cartridge_barcode": null
+        }
+    ]);
+    assert_eq!(parsed, expected, "the whole --json document");
+}

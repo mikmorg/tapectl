@@ -64,6 +64,22 @@ pub fn open_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open an in-memory database migrated to EXACTLY `version` through the
+/// production migration list — for a test whose claim is about one
+/// migration's effect and must not drift the moment a later migration
+/// legitimately touches the same table (issue #296: 021 rebuilt
+/// `health_logs`, and a 019 pin written against "latest" started measuring
+/// 021 instead of 019).
+#[cfg(test)]
+pub(crate) fn open_memory_at_version(version: usize) -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    configure(&conn).unwrap();
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    migrations().to_version(&mut conn, version).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn
+}
+
 /// Set WAL mode and other pragmas.
 fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -246,6 +262,26 @@ fn migrations() -> Migrations<'static> {
         // header for the full rationale, including why `db::open` grows no
         // recovery sweep for `closed_at IS NULL` (issue #98).
         M::up(include_str!("migrations/020_cartridge_contacts.sql")),
+        // 021 rebuilds `health_logs` (ADR-0013 §3 "`health_logs` becomes a
+        // child of the contact row — in exactly one rebuild", issue #296,
+        // pass 2). THE ONLY REBUILD THIS TABLE GETS: four issues in the
+        // tape-forensics suite each proposed one, each saying "coordinate
+        // with siblings", and migrations do not come back — so every
+        // sibling's requirement lands here at once. `contact_id` FK,
+        // `volume_id` nullable (a drive-only reading has no volume),
+        // `tapectl_version` (§7), and the `operation` CHECK dropped for free
+        // TEXT (§4 — it permitted `read` and `clean`, which no code has ever
+        // written). `raw_log` and 009's NULL-vs-0 `tape_alerts` distinction
+        // both survive untouched, and NOTHING is backfilled.
+        //
+        // `.foreign_key_check()` for the same reason as 003/012/013/017: this
+        // is a create/copy/drop/rename rebuild. Nothing holds an INBOUND
+        // reference to `health_logs` — it is a leaf, so this drop can orphan
+        // no other table's rows — but it owns three OUTBOUND edges
+        // (`volume_id`, `session_id`, `contact_id`) and a rebuild that
+        // renumbered rows or lost an edge would leave them dangling in
+        // silence. The check is what makes that loud.
+        M::up(include_str!("migrations/021_health_logs_contact.sql")).foreign_key_check(),
     ])
 }
 
@@ -1491,10 +1527,11 @@ mod tests {
     /// Exists for the same reason `open_memory_at_016`/`open_memory_at_017`
     /// do: the "this migration changed nothing else" pins below must hold on
     /// their own terms rather than against whatever migration happens to be
-    /// latest. Today it is equivalent to `open_memory()`; the moment 021
-    /// lands it stops being, which is precisely when it earns its keep — 021
-    /// is irreversible and its verification standard (#227/#264) needs a
-    /// before-picture that cannot drift.
+    /// latest. It was equivalent to `open_memory()` for exactly as long as
+    /// 020 was the newest migration; 021 has now landed, which is precisely
+    /// when it earns its keep — 021 is irreversible, and its verification
+    /// standard (#227/#264) needs a before-picture that cannot drift. Every
+    /// 021 test below takes its "before" from here.
     fn open_memory_at_020() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         configure(&conn).unwrap();
@@ -1530,6 +1567,575 @@ mod tests {
             .unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn
+    }
+
+    /// A connection migrated to exactly the 021 schema — the after-picture
+    /// for the `health_logs` rebuild's four-part verification below, and the
+    /// before-picture whatever migration comes next will need.
+    ///
+    /// Today it is equivalent to `open_memory()`. It exists anyway, for the
+    /// reason `open_memory_at_016`/`open_memory_at_017`/`open_memory_at_020`
+    /// each earned in turn: the moment a later migration legitimately touches
+    /// this table, a comparison written against "latest" starts silently
+    /// measuring that migration instead of this one.
+    fn open_memory_at_021() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+            M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
+            M::up(include_str!(
+                "migrations/014_cartridge_binding_identity_source.sql"
+            )),
+            M::up(include_str!(
+                "migrations/015_cartridge_load_count_unknown.sql"
+            )),
+            M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
+            M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/018_volume_sealed_at.sql")),
+            M::up(include_str!("migrations/019_drives.sql")),
+            M::up(include_str!("migrations/020_cartridge_contacts.sql")),
+            M::up(include_str!("migrations/021_health_logs_contact.sql")).foreign_key_check(),
+        ];
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    // --- Migration 021 (ADR-0013 §3: `health_logs`' ONE permitted rebuild) ---
+    //
+    // The #227/#264 standard in full, because `PRAGMA table_info` reports
+    // NEITHER foreign keys NOR CHECK constraints: a columns-only test would
+    // pass just as happily on a rebuild that silently dropped every
+    // constraint the table had. That is the #227 lesson and #264 is the proof
+    // it gets missed. Four parts, one test each — columns, indexes, foreign
+    // keys, CHECK — plus a populated-database test for the data itself.
+
+    /// PART 1 of 4 — COLUMNS. Every pre-021 column survives with its name,
+    /// type, notnull, default and pk unchanged.
+    ///
+    /// The three deliberate changes are pulled out and pinned explicitly
+    /// rather than folded into the blanket comparison (017's own handling of
+    /// `observed_condition`): `contact_id` and `tapectl_version` are new, and
+    /// `volume_id` loses its NOT NULL. Everything else is compared as a
+    /// literal before/after equality, so a type or a default that drifted has
+    /// nowhere to hide.
+    ///
+    /// Note what this does NOT prove — and it is most of what the rebuild
+    /// risks: `table_info` reports no foreign key and no CHECK, so this test
+    /// would pass on a rebuild that dropped `REFERENCES volumes(id)`,
+    /// `REFERENCES verification_sessions(id)` and every constraint besides.
+    /// Parts 2–4 are those halves.
+    #[test]
+    fn test_migration_021_changes_no_health_log_column() {
+        let before = open_memory_at_020();
+        let mut cols_020 = table_info(&before, "health_logs");
+        let after = open_memory_at_021();
+        let mut cols_021 = table_info(&after, "health_logs");
+
+        // The two new columns, by shape and by position.
+        let contact_pos = cols_021
+            .iter()
+            .position(|c| c.0 == "contact_id")
+            .expect("021 must add contact_id");
+        let contact = cols_021.remove(contact_pos);
+        assert_eq!(
+            contact,
+            ("contact_id".to_string(), "INTEGER".to_string(), 0, None, 0,),
+            "contact_id must be nullable with no default — a pre-021 row \
+             genuinely has no contact and nothing backfills one"
+        );
+        let version_pos = cols_021
+            .iter()
+            .position(|c| c.0 == "tapectl_version")
+            .expect("021 must add tapectl_version (ADR-0013 §7)");
+        let version = cols_021.remove(version_pos);
+        assert_eq!(
+            version,
+            (
+                "tapectl_version".to_string(),
+                "TEXT".to_string(),
+                0,
+                None,
+                0,
+            ),
+            "tapectl_version must be nullable with no default — a pre-021 row \
+             does not know which build wrote it, and stamping today's version \
+             on it would be a lie in the column whose job is to say who observed"
+        );
+
+        // The one deliberately changed column, pinned on BOTH sides. Pulling
+        // it out of only the "after" list would let a rebuild that ALSO
+        // changed its type or default slip through.
+        let vol_020 = cols_020.remove(
+            cols_020
+                .iter()
+                .position(|c| c.0 == "volume_id")
+                .expect("020 must still have volume_id"),
+        );
+        let vol_021 = cols_021.remove(
+            cols_021
+                .iter()
+                .position(|c| c.0 == "volume_id")
+                .expect("021 must still have volume_id"),
+        );
+        assert_eq!(
+            vol_020,
+            ("volume_id".to_string(), "INTEGER".to_string(), 1, None, 0),
+            "precondition: volume_id was NOT NULL before 021"
+        );
+        assert_eq!(
+            vol_021,
+            ("volume_id".to_string(), "INTEGER".to_string(), 0, None, 0),
+            "021 makes volume_id NULLABLE and changes nothing else about it — \
+             a drive-only reading has no volume (ADR-0013 §§2-3)"
+        );
+
+        assert_eq!(
+            cols_020, cols_021,
+            "021's rebuild changed the name/type/notnull/default/pk of a \
+             column that already existed in 020 — in particular `raw_log` and \
+             `tape_alerts` must come through untouched (ADR-0013 §3)"
+        );
+    }
+
+    /// PART 2 of 4 — INDEXES. A create/copy/drop/rename rebuild silently
+    /// drops whatever its new DDL forgets to restate, and an index is the
+    /// easiest thing to forget because nothing fails without it.
+    ///
+    /// `health_logs` carries no UNIQUE index and never has (`id INTEGER
+    /// PRIMARY KEY` is a rowid alias, which SQLite gives no autoindex), so
+    /// there is no uniqueness to prove still ENFORCES — and inventing one
+    /// would be worse than useless. The behavioural assertion that actually
+    /// belongs here is the OPPOSITE one, and it is not vacuous: many readings
+    /// per volume is the whole point of a trend table, so a rebuild that
+    /// "helpfully" made `idx_health_volume` unique would destroy it. That is
+    /// proved by an insert that must SUCCEED, with `PRAGMA index_list`
+    /// confirming neither index is unique.
+    #[test]
+    fn test_migration_021_recreates_the_volume_index_and_adds_the_contact_one() {
+        let conn = open_memory().unwrap();
+        assert_eq!(
+            index_names(&conn, "health_logs"),
+            vec!["idx_health_contact", "idx_health_volume"],
+            "001's idx_health_volume must be restated by the rebuild, and 021 \
+             adds idx_health_contact for the delta query ADR-0013 §3 names"
+        );
+
+        let unique: Vec<(String, i64)> = conn
+            .prepare("PRAGMA index_list(health_logs)")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            unique.len(),
+            2,
+            "positive control: index_list saw {unique:?}"
+        );
+        assert!(
+            unique.iter().all(|(_, uniq)| *uniq == 0),
+            "no index on health_logs may be UNIQUE — a volume has many \
+             readings and that is what the table is for: {unique:?}"
+        );
+
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-IDX', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO health_logs (volume_id, operation) VALUES (?1, 'verify')",
+                rusqlite::params![vid],
+            )
+            .expect("two readings of one volume must both be storable");
+        }
+    }
+
+    /// PART 3 of 4 — FOREIGN KEYS. `PRAGMA table_info` reports none of these,
+    /// so part 1 would pass on a rebuild that dropped every one of them.
+    ///
+    /// Two assertions per edge, and the second is the one that would catch a
+    /// dropped constraint: the enumeration proves the edge is DECLARED, the
+    /// insert proves it is ENFORCED. `contact_id` gets the enforcement proof
+    /// because it is 021's whole point; `volume_id` gets one too because it is
+    /// the edge this rebuild had to restate while changing the column, which
+    /// is exactly the shape a rebuild loses.
+    #[test]
+    fn test_migration_021_preserves_and_adds_the_health_log_foreign_keys() {
+        let before = open_memory_at_020();
+        let after = open_memory_at_021();
+
+        assert_eq!(
+            foreign_keys_of(&before, "health_logs"),
+            vec![
+                (
+                    "verification_sessions".to_string(),
+                    "session_id".to_string(),
+                    "id".to_string()
+                ),
+                (
+                    "volumes".to_string(),
+                    "volume_id".to_string(),
+                    "id".to_string()
+                ),
+            ],
+            "precondition: 020 declares exactly the two outbound FKs 001 gave it"
+        );
+        assert_eq!(
+            foreign_keys_of(&after, "health_logs"),
+            vec![
+                (
+                    "cartridge_contacts".to_string(),
+                    "contact_id".to_string(),
+                    "id".to_string()
+                ),
+                (
+                    "verification_sessions".to_string(),
+                    "session_id".to_string(),
+                    "id".to_string()
+                ),
+                (
+                    "volumes".to_string(),
+                    "volume_id".to_string(),
+                    "id".to_string()
+                ),
+            ],
+            "021 adds `contact_id REFERENCES cartridge_contacts(id)` and must \
+             restate both existing edges — a rebuild drops any constraint its \
+             new DDL omits"
+        );
+
+        after
+            .execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('V-FK', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                [],
+            )
+            .unwrap();
+        let vid = after.last_insert_rowid();
+
+        // Positive control: the same INSERT minus the dangling key works, so
+        // the two refusals below are the foreign keys and not a broken
+        // statement.
+        after
+            .execute(
+                "INSERT INTO health_logs (volume_id, operation) VALUES (?1, 'verify')",
+                rusqlite::params![vid],
+            )
+            .unwrap();
+
+        assert!(
+            after
+                .execute(
+                    "INSERT INTO health_logs (volume_id, contact_id, operation)
+                     VALUES (?1, 99999, 'verify')",
+                    rusqlite::params![vid],
+                )
+                .is_err(),
+            "contact_id must be ENFORCED, not merely declared: a reading \
+             cannot name a contact that never happened"
+        );
+        assert!(
+            after
+                .execute(
+                    "INSERT INTO health_logs (volume_id, operation) VALUES (99999, 'verify')",
+                    [],
+                )
+                .is_err(),
+            "volume_id is NULLABLE from 021, not unconstrained — a non-NULL \
+             value must still be a real volume"
+        );
+    }
+
+    /// PART 4 of 4 — THE CHECK IS GONE. Behavioural, and the assertion is the
+    /// OPPOSITE of 017's: 017 proved a narrowed CHECK still refuses; this
+    /// proves a dropped one no longer does.
+    ///
+    /// ADR-0013 §4. The old constraint was `CHECK(operation IN
+    /// ('write','read','verify','clean'))`, a closed vocabulary already wrong
+    /// in half its values — `read` and `clean` have never had a writer — and
+    /// it made the one value the code needed (`resume`) impossible to write.
+    /// Free text replaces it, with a pinning test against what code actually
+    /// writes (`tape::health`'s `the_reading_vocabulary_is_what_code_actually_writes`)
+    /// standing in for the typo protection.
+    ///
+    /// `'compact'` rather than `'resume'` deliberately: `resume` is now a
+    /// real value with a real writer, and pinning the CHECK's absence on it
+    /// would make this test and the rewritten `health::tests` tripwire the
+    /// same test twice. `'compact'` is a value nothing writes today, so this
+    /// test asserts only what it says it asserts.
+    #[test]
+    fn test_migration_021_drops_the_operation_check() {
+        let insert = "INSERT INTO health_logs (volume_id, operation) VALUES (?1, 'compact')";
+        let seed = "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-CHECK', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')";
+
+        // Positive control: the value really was forbidden one migration ago.
+        // Without this, "the insert succeeded" could mean the CHECK is gone
+        // OR that it never rejected this value in the first place.
+        let before = open_memory_at_020();
+        before.execute(seed, []).unwrap();
+        let vid_before = before.last_insert_rowid();
+        let err = before
+            .execute(insert, rusqlite::params![vid_before])
+            .expect_err("precondition: 020's CHECK rejects 'compact'");
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "precondition: the refuser must be the CHECK, got: {err}"
+        );
+
+        let after = open_memory_at_021();
+        after.execute(seed, []).unwrap();
+        let vid = after.last_insert_rowid();
+        after
+            .execute(insert, rusqlite::params![vid])
+            .expect("021 drops the operation CHECK — the vocabulary is free TEXT");
+        let stored: String = after
+            .query_row(
+                "SELECT operation FROM health_logs WHERE volume_id = ?1",
+                rusqlite::params![vid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "compact", "the value must be stored verbatim");
+
+        // Free text is not OPTIONAL text: a reading that cannot say what kind
+        // of reading it is has lost what makes it comparable to another.
+        assert!(
+            after
+                .execute(
+                    "INSERT INTO health_logs (volume_id, operation) VALUES (?1, NULL)",
+                    rusqlite::params![vid],
+                )
+                .is_err(),
+            "operation must stay NOT NULL"
+        );
+
+        // `'resume'` specifically — the value the whole CHECK drop exists
+        // for (the #295 hazard). Refused at 020, stored at 021.
+        let resume = "INSERT INTO health_logs (volume_id, operation) VALUES (?1, 'resume')";
+        let err = before
+            .execute(resume, rusqlite::params![vid_before])
+            .expect_err("precondition: 020's CHECK rejects 'resume'");
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "precondition: the refuser must be the CHECK, got: {err}"
+        );
+        after
+            .execute(resume, rusqlite::params![vid])
+            .expect("021 must accept 'resume'");
+
+        // `volume_id` NOT NULL is gone too (ADR-0013 §§2-3: a drive-only
+        // reading has no volume) — refused at 020, stored at 021.
+        let drive_only = "INSERT INTO health_logs (volume_id, operation) VALUES (NULL, 'verify')";
+        let err = before
+            .execute(drive_only, [])
+            .expect_err("precondition: 020's volume_id is NOT NULL");
+        assert!(
+            err.to_string().contains("NOT NULL constraint failed"),
+            "precondition: the refuser must be NOT NULL, got: {err}"
+        );
+        after
+            .execute(drive_only, [])
+            .expect("021 must accept a drive-only reading with no volume");
+        let drive_only_rows: i64 = after
+            .query_row(
+                "SELECT COUNT(*) FROM health_logs WHERE volume_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(drive_only_rows, 1, "the drive-only reading must be stored");
+    }
+
+    /// The data half: a populated 020 database through the real production
+    /// `migrate()`, proving the rebuild moved every recorded fact and
+    /// invented none.
+    ///
+    /// Mirrors
+    /// `test_migrate_016_populated_db_to_017_migrates_quarantine_data_and_preserves_ids_and_fk`.
+    /// The three rows are chosen to pin ADR-0013 §3's two survival
+    /// requirements as a DISCRIMINATOR rather than an assertion about one
+    /// value: `tape_alerts` is NULL on one row, 0 on another and 3 on a
+    /// third, so a rebuild that defaulted or backfilled 0 fails on the first
+    /// row while still "passing" on the other two. Each carries a distinct
+    /// `raw_log`, so a rebuild that dropped or shuffled the column cannot
+    /// pass by coincidence.
+    ///
+    /// Ids are explicit and out of sequence (900/700/800) because a rebuild
+    /// that omitted `id` from its copy would renumber them 1/2/3 — which a
+    /// test seeded with 1/2/3 could not distinguish from success.
+    #[test]
+    fn test_migrate_020_populated_db_to_021_preserves_every_recorded_fact() {
+        let mut conn = open_memory_at_020();
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES (42, 'V-KEEP', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions
+                (id, volume_id, verify_type, outcome, completed_at, slices_checked, slices_passed, slices_failed)
+             VALUES (7, 42, 'full', 'passed', '2026-01-01 00:00:00', 3, 3, 0)",
+            [],
+        )
+        .unwrap();
+
+        // (id, operation, tape_alerts, raw_log, session_id)
+        type Seed<'a> = (i64, &'a str, Option<i64>, &'a str, Option<i64>);
+        let seeded: Vec<Seed> = vec![
+            (900, "write", None, "=== page 0x02 ===\nrow-900", None),
+            (
+                700,
+                "verify",
+                Some(0),
+                "=== page 0x03 ===\nrow-700",
+                Some(7),
+            ),
+            (800, "write", Some(3), "=== page 0x2e ===\nrow-800", None),
+        ];
+        for (id, op, alerts, raw, session) in &seeded {
+            conn.execute(
+                "INSERT INTO health_logs
+                    (id, volume_id, session_id, logged_at, operation, total_bytes,
+                     total_uncorrected, total_corrected, total_retries, total_rewritten,
+                     raw_log, tape_alerts)
+                 VALUES (?1, 42, ?2, '2026-01-01 00:00:0' || (?1 % 10), ?3, 1024, 1, 2, 3, 4, ?4, ?5)",
+                rusqlite::params![id, session, op, raw, alerts],
+            )
+            .unwrap();
+        }
+
+        // The real production migrate(), with its real FK off/on wrapping and
+        // this migration's registered `.foreign_key_check()`.
+        migrate(&mut conn).unwrap();
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "the rebuild orphaned a row");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count as usize, seeded.len(), "the rebuild lost rows");
+
+        for (id, op, alerts, raw, session) in &seeded {
+            #[allow(clippy::type_complexity)]
+            let row: (
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT volume_id, session_id, contact_id, logged_at, operation,
+                            total_bytes, total_uncorrected, total_corrected, total_retries,
+                            total_rewritten, raw_log, tape_alerts, tapectl_version
+                       FROM health_logs WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                            r.get(10)?,
+                            r.get(11)?,
+                            r.get(12)?,
+                        ))
+                    },
+                )
+                .unwrap_or_else(|e| panic!("row {id} did not survive the rebuild: {e}"));
+
+            assert_eq!(row.0, Some(42), "row {id}: volume_id moved");
+            assert_eq!(row.1, *session, "row {id}: session_id moved");
+            assert_eq!(row.4, *op, "row {id}: operation moved");
+            assert_eq!(
+                (row.5, row.6, row.7, row.8, row.9),
+                (Some(1024), Some(1), Some(2), Some(3), Some(4)),
+                "row {id}: a counter column shifted in the copy"
+            );
+            assert_eq!(
+                row.10.as_deref(),
+                Some(*raw),
+                "row {id}: raw_log is the ONE place this project already honours \
+                 the capture-everything standard — losing it is the suite \
+                 defeating its own purpose (ADR-0013 §3)"
+            );
+            assert_eq!(
+                row.11, *alerts,
+                "row {id}: 009's NULL-vs-0 tape_alerts distinction must survive \
+                 verbatim — NULL is 'not recorded', 0 is 'recorded, none raised', \
+                 and backfilling 0 asserts the drive reported no alerts about a \
+                 collection that never looked"
+            );
+
+            // Nothing is backfilled. Unknown must read as unknown.
+            assert_eq!(
+                row.2, None,
+                "row {id}: contact_id must stay NULL — a pre-021 row genuinely \
+                 had no contact and correlating one by timestamp would \
+                 manufacture a link that reads like an observation"
+            );
+            assert_eq!(
+                row.12, None,
+                "row {id}: tapectl_version must stay NULL — a pre-021 row does \
+                 not know which build wrote it"
+            );
+        }
+
+        // The rows are still joinable both ways they were before.
+        let joined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM health_logs h
+                   JOIN volumes v ON v.id = h.volume_id
+                   JOIN verification_sessions vs ON vs.id = h.session_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 1, "the one session-bearing row must still join");
+
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(report.integrity_ok, "db fsck integrity check failed");
     }
 
     /// Migration 020 creates `cartridge_contacts` and NOTHING else

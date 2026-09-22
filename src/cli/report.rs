@@ -1269,12 +1269,65 @@ fn latest_failed_session(
     }))
 }
 
-fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bool) -> Result<()> {
+/// One `health_logs` reading as `report health` shows it.
+///
+/// `volume` is `Option` from migration 021 (ADR-0013 §3): a drive-only
+/// reading has no volume, and the report must still show it.
+/// `drive_serial`/`cartridge_barcode` come through the reading's contact
+/// (`contact_id -> cartridge_contacts -> drives / cartridges`) and are
+/// `None` whenever that chain does not reach them — a pre-021 row has no
+/// contact, a pre-019 contact has no drive, a contact with an
+/// unidentified cartridge has no barcode. `None` is "not recorded", never a
+/// guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HealthRow {
+    pub(crate) volume: Option<String>,
+    pub(crate) operation: Option<String>,
+    pub(crate) logged_at: String,
+    pub(crate) bytes: Option<i64>,
+    pub(crate) corrected: Option<i64>,
+    pub(crate) uncorrected: Option<i64>,
+    /// tape_alerts (issue #107). `Option` is the whole point: rows written
+    /// before migration 009 genuinely do not know, and rendering that as 0
+    /// would assert the drive reported no alerts when nothing was recorded.
+    pub(crate) tape_alerts: Option<i64>,
+    /// raw_log (issue #120): re-parsed on read via
+    /// `HealthCounters::from_raw_log` to surface the ECC parameters that
+    /// `total_corrected` alone can miss on some drives (see
+    /// `src/tape/health.rs` module doc). `None`/empty means an older row or
+    /// a partial collection — the derived fields render as "n/a".
+    pub(crate) raw_log: Option<String>,
+    pub(crate) drive_serial: Option<String>,
+    pub(crate) cartridge_barcode: Option<String>,
+}
+
+/// The query behind `report health`, split from the printing (the
+/// `verify_status_rows` pattern) so the FROM/JOIN shape is assertable.
+///
+/// Driven FROM `health_logs` with LEFT JOINs throughout. It was an INNER
+/// JOIN to `volumes`, which was correct only while `volume_id` was NOT
+/// NULL: from migration 021 a drive-only reading has no volume, and an
+/// INNER JOIN would drop it silently — captured and invisible, #293's
+/// defect in a second report (ADR-0013 §3 assigns that fix to 021's
+/// author). The contact/drive/cartridge joins are LEFT for the same reason:
+/// every link in that chain is nullable, and a reading must never vanish
+/// because its attribution is unknown.
+///
+/// A `--volume` filter still narrows to that volume's readings, which by
+/// definition excludes the drive-only ones.
+pub(crate) fn health_rows(
+    conn: &Connection,
+    volume_filter: Option<&str>,
+) -> Result<Vec<HealthRow>> {
     let mut sql = String::from(
         "SELECT v.label, h.operation, h.logged_at, h.total_bytes,
-                h.total_corrected, h.total_uncorrected, h.tape_alerts, h.raw_log
+                h.total_corrected, h.total_uncorrected, h.tape_alerts, h.raw_log,
+                d.serial, c.barcode
          FROM health_logs h
-         JOIN volumes v ON v.id = h.volume_id
+         LEFT JOIN volumes v ON v.id = h.volume_id
+         LEFT JOIN cartridge_contacts cc ON cc.id = h.contact_id
+         LEFT JOIN drives d ON d.id = cc.drive_id
+         LEFT JOIN cartridges c ON c.id = cc.cartridge_id
          WHERE 1=1",
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1282,83 +1335,105 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
         sql.push_str(" AND v.label = ?");
         param_values.push(Box::new(label.to_string()));
     }
-    sql.push_str(" ORDER BY h.logged_at DESC LIMIT 50");
+    // `id` breaks the tie: `logged_at` is second-resolution.
+    sql.push_str(" ORDER BY h.logged_at DESC, h.id DESC LIMIT 50");
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    type Row = (
-        String,
-        Option<String>,
-        String,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        // tape_alerts (issue #107). `Option` is the whole point: rows written
-        // before migration 009 genuinely do not know, and rendering that as 0
-        // would assert the drive reported no alerts when nothing was recorded.
-        Option<i64>,
-        // raw_log (issue #120): re-parsed on read via
-        // `HealthCounters::from_raw_log` to surface the ECC parameters that
-        // `total_corrected` alone can miss on some drives (see
-        // `src/tape/health.rs` module doc). `None`/empty means an older row
-        // or a partial collection — the derived fields render as "n/a".
-        Option<String>,
-    );
-    let rows: Vec<Row> = stmt
+    let rows = stmt
         .query_map(params_ref.as_slice(), |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-            ))
+            Ok(HealthRow {
+                volume: row.get(0)?,
+                operation: row.get(1)?,
+                logged_at: row.get(2)?,
+                bytes: row.get(3)?,
+                corrected: row.get(4)?,
+                uncorrected: row.get(5)?,
+                tape_alerts: row.get(6)?,
+                raw_log: row.get(7)?,
+                drive_serial: row.get(8)?,
+                cartridge_barcode: row.get(9)?,
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 
-    if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(|(label, op, at, bytes, corrected, uncorrected, alerts, raw_log)| {
-            let derived = derive_trending_counters(raw_log.as_deref());
-            serde_json::json!({
-                "volume": label,
-                "operation": op,
-                "at": at,
-                "bytes": bytes,
-                "corrected": corrected,
-                "uncorrected": uncorrected,
-                "tape_alerts": alerts,
-                // New (issue #120), additive: the existing "corrected" key is
-                // untouched (still `total_corrected`, in case anything parses
-                // it) — these two are `null` when raw_log is absent/empty,
-                // same convention as "tape_alerts" above.
-                "corrected_no_delay": derived.as_ref().map(|h| h.corrected_no_delay),
-                "ecc_invocations": derived.as_ref().map(|h| h.correction_algorithm_invocations),
+/// `report health --json`: one object per reading. Additive-key rule: every
+/// key that existed keeps its name and meaning; `volume` may now be `null`
+/// (a drive-only reading, migration 021), and `drive_serial` /
+/// `cartridge_barcode` are new and `null` whenever not recorded.
+pub(crate) fn health_json(rows: &[HealthRow]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                let derived = derive_trending_counters(r.raw_log.as_deref());
+                serde_json::json!({
+                    "volume": r.volume,
+                    "operation": r.operation,
+                    "at": r.logged_at,
+                    "bytes": r.bytes,
+                    "corrected": r.corrected,
+                    "uncorrected": r.uncorrected,
+                    "tape_alerts": r.tape_alerts,
+                    // New (issue #120), additive: the existing "corrected" key is
+                    // untouched (still `total_corrected`, in case anything parses
+                    // it) — these two are `null` when raw_log is absent/empty,
+                    // same convention as "tape_alerts" above.
+                    "corrected_no_delay": derived.as_ref().map(|h| h.corrected_no_delay),
+                    "ecc_invocations": derived.as_ref().map(|h| h.correction_algorithm_invocations),
+                    // New (issue #296), additive: which drive and which
+                    // cartridge, through the reading's contact.
+                    "drive_serial": r.drive_serial,
+                    "cartridge_barcode": r.cartridge_barcode,
+                })
             })
-        }).collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            .collect(),
+    )
+}
+
+fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bool) -> Result<()> {
+    let rows = health_rows(conn, volume_filter)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&health_json(&rows)).unwrap()
+        );
     } else if rows.is_empty() {
         println!("no health logs recorded");
     } else {
-        for (label, op, at, _bytes, corrected, uncorrected, alerts, raw_log) in &rows {
+        for r in &rows {
             println!(
-                "{}",
+                "{}{}",
                 health_line(
-                    label,
-                    op.as_deref(),
-                    at,
-                    *corrected,
-                    *uncorrected,
-                    *alerts,
-                    raw_log.as_deref(),
-                )
+                    r.volume.as_deref().unwrap_or(NO_VOLUME),
+                    r.operation.as_deref(),
+                    &r.logged_at,
+                    r.corrected,
+                    r.uncorrected,
+                    r.tape_alerts,
+                    r.raw_log.as_deref(),
+                ),
+                health_attribution(r.drive_serial.as_deref(), r.cartridge_barcode.as_deref()),
             );
         }
     }
     Ok(())
+}
+
+/// What a drive-only reading (no volume, migration 021) prints in the label
+/// slot.
+const NO_VOLUME: &str = "(no volume)";
+
+/// The drive/cartridge suffix of a `report health` line (issue #296). `-`
+/// is "not recorded", the same convention `alerts=-` already uses.
+fn health_attribution(drive_serial: Option<&str>, cartridge_barcode: Option<&str>) -> String {
+    format!(
+        " drive={} cartridge={}",
+        drive_serial.unwrap_or("-"),
+        cartridge_barcode.unwrap_or("-")
+    )
 }
 
 /// Re-derive the trending counters (issue #120) from a stored `raw_log`,
@@ -3027,6 +3102,89 @@ Write error counter page [0x2]
             );
             assert!(line.contains("alerts=2"));
             assert!(line.contains("TAPE ALERT"));
+        }
+    }
+
+    /// Issue #296 / ADR-0013 §3: `report health` after migration 021.
+    mod health_attribution_rows {
+        use super::*;
+
+        /// Three readings, one per attribution state the report must render:
+        ///
+        /// - `V-FULL`: volume, contact, drive `SER-A`, cartridge `CART01`.
+        /// - drive-only: NO volume, a contact with drive `SER-B` and no
+        ///   cartridge (the reading an INNER JOIN to `volumes` dropped).
+        /// - `V-OLD`: a pre-021 row — no contact, so neither drive nor
+        ///   cartridge is recorded.
+        ///
+        /// `logged_at` is explicit so the ORDER BY is deterministic.
+        pub(crate) fn seed(conn: &Connection) {
+            conn.execute_batch(
+                "INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status)
+                    VALUES (1, 'V-FULL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed'),
+                           (2, 'V-OLD',  'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed');
+                 INSERT INTO cartridges (id, barcode, media_type, nominal_capacity)
+                    VALUES (10, 'CART01', 'LTO-6', 2500000000000);
+                 INSERT INTO drives (id, serial) VALUES (20, 'SER-A'), (21, 'SER-B');
+                 INSERT INTO cartridge_contacts (id, cartridge_id, volume_id, drive_id, operation, device)
+                    VALUES (30, 10, 1, 20, 'volume write', '/dev/nst0'),
+                           (31, NULL, NULL, 21, 'volume identify', '/dev/nst0');
+                 INSERT INTO health_logs (volume_id, contact_id, logged_at, operation, total_uncorrected, tape_alerts)
+                    VALUES (1, 30, '2026-09-22 03:00:00', 'write', 1, 0),
+                           (NULL, 31, '2026-09-22 02:00:00', 'verify', 0, NULL),
+                           (2, NULL, '2026-09-22 01:00:00', 'write', 0, NULL);",
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn a_drive_only_reading_appears_and_attribution_comes_through_the_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn);
+            let rows = health_rows(&conn, None).unwrap();
+            let got: Vec<(Option<&str>, Option<&str>, Option<&str>)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.volume.as_deref(),
+                        r.drive_serial.as_deref(),
+                        r.cartridge_barcode.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (Some("V-FULL"), Some("SER-A"), Some("CART01")),
+                    // The row an INNER JOIN to `volumes` silently dropped.
+                    (None, Some("SER-B"), None),
+                    (Some("V-OLD"), None, None),
+                ]
+            );
+        }
+
+        /// The filter still narrows to one volume — and so, by definition,
+        /// excludes the drive-only reading. Positive control: unfiltered
+        /// there are three.
+        #[test]
+        fn a_volume_filter_narrows_to_that_volume() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn);
+            assert_eq!(health_rows(&conn, None).unwrap().len(), 3);
+            let rows = health_rows(&conn, Some("V-FULL")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].volume.as_deref(), Some("V-FULL"));
+        }
+
+        /// The human line names the drive and cartridge, and renders "not
+        /// recorded" as `-`, never as a guess.
+        #[test]
+        fn the_line_suffix_renders_unknown_as_a_dash() {
+            assert_eq!(
+                health_attribution(Some("SER-A"), Some("CART01")),
+                " drive=SER-A cartridge=CART01"
+            );
+            assert_eq!(health_attribution(None, None), " drive=- cartridge=-");
         }
     }
 

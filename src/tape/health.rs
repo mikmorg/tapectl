@@ -186,7 +186,61 @@ pub fn collect(sg_device: &str) -> Result<(HealthCounters, String)> {
     Ok((totals, combined_raw))
 }
 
+/// What KIND of reading a `health_logs` row is — the `operation` vocabulary.
+///
+/// Free TEXT in the schema from migration 021 (ADR-0013 §4), which is why
+/// this type exists: the CHECK that used to close the column was
+/// `IN ('write','read','verify','clean')`, and `read` and `clean` have
+/// **never had a writer**. A closed vocabulary already wrong in half its
+/// values protects nothing, and it made the one value the code actually
+/// needed — `resume` — impossible to write. The replacement is this enum plus
+/// [`tests::the_reading_vocabulary_is_what_code_actually_writes`], which gives
+/// the same typo protection at no migration cost and can additionally catch
+/// the failure a CHECK never could: a permitted value nothing writes.
+///
+/// A **different vocabulary** from [`crate::tape::contact::Operation`], which
+/// is the command verbatim (`volume init`, `volume verify`, …). Migration
+/// 020's header says so explicitly and neither list may stand in for the
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// A fresh `volume write`.
+    Write,
+    /// A `volume resume` continuing an interrupted write. Recorded as
+    /// `'write'` until migration 021, because the CHECK forbade the honest
+    /// word and a refused INSERT would have silently dropped the row.
+    Resume,
+    /// A `volume verify`.
+    Verify,
+}
+
+impl Reading {
+    /// Every value, for the pinning test. Kept in one place so the test
+    /// cannot drift from the type.
+    pub const ALL: &'static [Reading] = &[Reading::Write, Reading::Resume, Reading::Verify];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reading::Write => "write",
+            Reading::Resume => "resume",
+            Reading::Verify => "verify",
+        }
+    }
+}
+
 /// Insert a row into the `health_logs` table.
+///
+/// `volume_id` is `Option` from migration 021: a drive-only reading has no
+/// volume (ADR-0013 §§2-3), and `NOT NULL` forbade recording one at all. No
+/// production path passes `None` today — all three writers have a volume in
+/// hand — so this is the schema no longer forbidding the reading, not a claim
+/// that one already exists.
+///
+/// `contact_id` is the `cartridge_contacts` row this reading was taken
+/// during (ADR-0013 §2, migration 021). It is what makes the reading
+/// differenceable against its own pair, and the only route from a reading to
+/// the DRIVE that produced it — without which "is it the drive or the tape?",
+/// the central question in tape diagnostics, is unanswerable from this table.
 ///
 /// `session_id` is the `verification_sessions` row this reading belongs to,
 /// and **nothing else** (ADR-0013 §3: the column keeps exactly the meaning
@@ -198,11 +252,18 @@ pub fn collect(sg_device: &str) -> Result<(HealthCounters, String)> {
 /// verification session: a column with no writer reads as a promise
 /// (issue #107's lesson), and a fabricated session id would be worse than
 /// the NULL.
+///
+/// `tapectl_version` is **not a parameter**: there is exactly one build doing
+/// the writing, so there is nothing for a caller to get wrong, and ADR-0013
+/// §7 requires every row to record its observer — "parse it later" needs to
+/// know which build wrote the parsed columns beside the raw text, or a parser
+/// bug fixed in a later version is indistinguishable from a hardware change.
 pub fn record(
     conn: &Connection,
-    volume_id: i64,
+    volume_id: Option<i64>,
+    contact_id: Option<i64>,
     session_id: Option<i64>,
-    operation: &str,
+    operation: Reading,
     counters: &HealthCounters,
     raw_log: &str,
 ) -> Result<()> {
@@ -210,14 +271,17 @@ pub fn record(
         // `tape_alerts` added by migration 009 (issue #107). It had been
         // parsed on every collection since this module was written and then
         // dropped on the floor here, because there was no column for it.
+        // `contact_id` and `tapectl_version` added by migration 021.
         "INSERT INTO health_logs
-            (volume_id, session_id, operation, total_bytes, total_uncorrected,
-             total_corrected, total_retries, total_rewritten, tape_alerts, raw_log)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (volume_id, contact_id, session_id, operation, total_bytes, total_uncorrected,
+             total_corrected, total_retries, total_rewritten, tape_alerts, raw_log,
+             tapectl_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             volume_id,
+            contact_id,
             session_id,
-            operation,
+            operation.as_str(),
             counters.total_bytes_processed,
             counters.total_uncorrected,
             counters.total_corrected,
@@ -225,9 +289,118 @@ pub fn record(
             counters.total_rewritten,
             counters.tape_alerts,
             raw_log,
+            env!("CARGO_PKG_VERSION"),
         ],
     )?;
     Ok(())
+}
+
+// ── Is it the drive or the tape? ──────────────────────────────────────────
+
+/// One drive's health readings, across every cartridge it read them through.
+///
+/// The FIRST of ADR-0013's two routes: a problem that follows the MACHINE
+/// shows up here as one drive with bad readings across several cartridges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveReadings {
+    pub drive_id: i64,
+    pub serial: String,
+    /// Readings taken during a contact with this drive.
+    pub readings: i64,
+    /// Distinct identified cartridges those readings came through. A
+    /// reading whose contact never identified its cartridge counts in
+    /// `readings` but not here.
+    pub cartridges: i64,
+    /// The worst `total_uncorrected` any one reading reported — deliberately
+    /// not a SUM: whether these counters are per-load or lifetime is not yet
+    /// established (ADR-0013 leaves trend analysis to the non-gating work),
+    /// and summing lifetime counters would multiply-count one error.
+    pub max_uncorrected: Option<i64>,
+    /// Readings whose `tape_alerts` was recorded AND non-zero. A NULL (not
+    /// recorded, 009) is never counted as either raised or clean.
+    pub readings_with_alerts: i64,
+}
+
+/// One cartridge's health readings, across every drive that read it.
+///
+/// The SECOND route: a problem that follows the MEDIUM shows up here as one
+/// cartridge with bad readings across several drives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CartridgeReadings {
+    pub cartridge_id: i64,
+    pub barcode: String,
+    pub readings: i64,
+    /// Distinct identified drives that took those readings. A reading whose
+    /// contact recorded no drive counts in `readings` but not here.
+    pub drives: i64,
+    /// See [`DriveReadings::max_uncorrected`].
+    pub max_uncorrected: Option<i64>,
+    pub readings_with_alerts: i64,
+}
+
+/// Group health readings BY DRIVE across cartridges (ADR-0013 §§1-2, issue
+/// #296's acceptance query).
+///
+/// A reading reaches its drive only through its contact
+/// (`health_logs.contact_id -> cartridge_contacts.drive_id`); the table grows
+/// no drive column of its own (§1). Readings that cannot be attributed — a
+/// pre-021 row with no contact, or a contact whose drive published no serial
+/// — are therefore absent from this grouping, not assigned a guessed drive.
+pub fn readings_by_drive(conn: &Connection) -> Result<Vec<DriveReadings>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.serial, COUNT(h.id), COUNT(DISTINCT cc.cartridge_id),
+                MAX(h.total_uncorrected),
+                SUM(CASE WHEN h.tape_alerts > 0 THEN 1 ELSE 0 END)
+           FROM health_logs h
+           JOIN cartridge_contacts cc ON cc.id = h.contact_id
+           JOIN drives d ON d.id = cc.drive_id
+          GROUP BY d.id
+          ORDER BY d.serial",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DriveReadings {
+                drive_id: r.get(0)?,
+                serial: r.get(1)?,
+                readings: r.get(2)?,
+                cartridges: r.get(3)?,
+                max_uncorrected: r.get(4)?,
+                readings_with_alerts: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Group health readings BY CARTRIDGE across drives — the other route; see
+/// [`readings_by_drive`]. A reading reaches its cartridge through its
+/// contact (`cartridge_contacts.cartridge_id`), never through `volume_id`:
+/// a volume is a logical thing a cartridge can be re-initialised away from
+/// (ADR-0010/0011), and a blank or foreign tape has no volume at all.
+pub fn readings_by_cartridge(conn: &Connection) -> Result<Vec<CartridgeReadings>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.barcode, COUNT(h.id), COUNT(DISTINCT cc.drive_id),
+                MAX(h.total_uncorrected),
+                SUM(CASE WHEN h.tape_alerts > 0 THEN 1 ELSE 0 END)
+           FROM health_logs h
+           JOIN cartridge_contacts cc ON cc.id = h.contact_id
+           JOIN cartridges c ON c.id = cc.cartridge_id
+          GROUP BY c.id
+          ORDER BY c.barcode",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(CartridgeReadings {
+                cartridge_id: r.get(0)?,
+                barcode: r.get(1)?,
+                readings: r.get(2)?,
+                drives: r.get(3)?,
+                max_uncorrected: r.get(4)?,
+                readings_with_alerts: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn run_sg_logs(sg_device: &str, page: u8) -> Result<String> {
@@ -517,7 +690,16 @@ Read error counter page  [0x3]
             corrected_with_delay: 0,
             correction_algorithm_invocations: 0,
         };
-        record(&conn, vid, None, "write", &counters, "raw log contents").unwrap();
+        record(
+            &conn,
+            Some(vid),
+            None,
+            None,
+            Reading::Write,
+            &counters,
+            "raw log contents",
+        )
+        .unwrap();
 
         let (bytes, uncorrected, corrected, raw): (i64, i64, i64, String) = conn
             .query_row(
@@ -564,7 +746,16 @@ Read error counter page  [0x3]
             corrected_with_delay: 0,
             correction_algorithm_invocations: 0,
         };
-        record(&conn, vid, None, "verify", &counters, "raw").unwrap();
+        record(
+            &conn,
+            Some(vid),
+            None,
+            None,
+            Reading::Verify,
+            &counters,
+            "raw",
+        )
+        .unwrap();
 
         let stored: Option<i64> = conn
             .query_row(
@@ -598,9 +789,10 @@ Read error counter page  [0x3]
 
         record(
             &conn,
-            vid,
+            Some(vid),
             None,
-            "verify",
+            None,
+            Reading::Verify,
             &HealthCounters {
                 total_bytes_processed: 1,
                 total_uncorrected: 0,
@@ -658,9 +850,10 @@ Read error counter page  [0x3]
 
         record(
             &conn,
-            vid,
+            Some(vid),
+            None,
             Some(session_id),
-            "verify",
+            Reading::Verify,
             &HealthCounters::default(),
             "raw",
         )
@@ -695,7 +888,16 @@ Read error counter page  [0x3]
         )
         .unwrap();
         let vid = conn.last_insert_rowid();
-        record(&conn, vid, None, "write", &HealthCounters::default(), "raw").unwrap();
+        record(
+            &conn,
+            Some(vid),
+            None,
+            None,
+            Reading::Write,
+            &HealthCounters::default(),
+            "raw",
+        )
+        .unwrap();
 
         let stored: Option<i64> = conn
             .query_row(
@@ -707,25 +909,30 @@ Read error counter page  [0x3]
         assert_eq!(stored, None);
     }
 
-    /// TRIPWIRE for issue #296, not a statement of what `operation` should
-    /// mean.
+    /// The tripwire from issue #295, **fired and rewritten** — not deleted.
     ///
-    /// `volume resume` records `operation = 'write'`, which is a lie in the
-    /// record, and ADR-0013 §4 rules the vocabulary free TEXT precisely so
-    /// `'resume'` costs no migration. But the CHECK that closes it
-    /// (`001_initial.sql:332-333`, `IN ('write','read','verify','clean')`)
-    /// is still in force until migration 021 rebuilds this table (#296), and
-    /// SQLite enforces a CHECK unconditionally. Writing `'resume'` today
-    /// would fail the INSERT — and because health collection is best-effort
-    /// and only warns, it would silently DROP the health row on every
-    /// resume, which is strictly worse than the mislabel.
+    /// Its first life asserted the opposite: that `record(…, "resume", …)`
+    /// FAILED with `CHECK constraint failed`, because
+    /// `001_initial.sql`'s `CHECK(operation IN ('write','read','verify','clean'))`
+    /// was still in force and `collect_health_best_effort` only *warns* on an
+    /// insert failure — so writing the honest word would have silently
+    /// dropped the health row on every resume, strictly worse than the
+    /// mislabel it fixed. `volume resume` therefore recorded `'write'`, and
+    /// the test pinned why. It was written to go RED the moment migration 021
+    /// dropped the CHECK: a reminder wired into the gate rather than a
+    /// sentence in an issue.
     ///
-    /// So the resume call site still passes `'write'`, and this test pins
-    /// why. When 021 lands and drops the CHECK, this test fails — that is
-    /// the signal to flip the literal in `volume::write::volume_resume` and
-    /// delete this test.
+    /// 021 has landed, so this is the other side of it. Two halves, because
+    /// "the schema now permits it" is only half the fix — the other half is
+    /// that `volume resume` actually says it:
+    ///
+    /// 1. `Reading::Resume` round-trips and stores the string `resume`.
+    /// 2. `volume::write::volume_resume` **passes it**. Without this, 021
+    ///    would have landed leaving the vocabulary naming a value nothing
+    ///    writes — which is precisely the `read`/`clean` defect ADR-0013 §4
+    ///    was filed against, reintroduced by its own fix.
     #[test]
-    fn resume_is_not_yet_an_accepted_operation_until_migration_021() {
+    fn resume_is_recorded_as_resume_now_that_migration_021_dropped_the_check() {
         let conn = crate::db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
@@ -735,22 +942,248 @@ Read error counter page  [0x3]
         .unwrap();
         let vid = conn.last_insert_rowid();
 
-        // Positive control: the vocabulary the CHECK does accept works, so a
-        // failure below is the CHECK and not a broken INSERT.
-        record(&conn, vid, None, "write", &HealthCounters::default(), "raw").unwrap();
-
-        let err = record(
+        record(
             &conn,
-            vid,
+            Some(vid),
             None,
-            "resume",
+            None,
+            Reading::Resume,
             &HealthCounters::default(),
             "raw",
         )
-        .expect_err("the operation CHECK still rejects 'resume' until migration 021");
-        assert!(
-            err.to_string().contains("CHECK constraint failed"),
-            "expected the operation CHECK to be the refuser, got: {err}"
+        .expect("migration 021 drops the CHECK that used to refuse 'resume'");
+
+        let stored: String = conn
+            .query_row(
+                "SELECT operation FROM health_logs WHERE volume_id = ?1",
+                params![vid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, "resume",
+            "a resume must record the word it means, not 'write'"
         );
+
+        // Half two: the production writer. `volume_resume` is the only caller
+        // that may pass this, and it reaches `record` through
+        // `collect_health_best_effort`'s `operation` parameter — threaded
+        // through by #295 for exactly this flip.
+        let resume_fn = source_of("volume/write.rs")
+            .split("fn volume_resume_contacted")
+            .nth(1)
+            .expect(
+                "positive control: volume_resume_contacted must exist in \
+                 src/volume/write.rs — the scan below is vacuous without it",
+            )
+            .to_string();
+        assert!(
+            resume_fn.contains("health::Reading::Resume") || resume_fn.contains("Reading::Resume"),
+            "volume_resume_contacted must pass Reading::Resume — a vocabulary \
+             value with no writer is the `read`/`clean` defect ADR-0013 §4 names"
+        );
+    }
+
+    /// The pinning test ADR-0013 §4 requires in place of the dropped CHECK,
+    /// and the half a CHECK could never do — the sibling of
+    /// `tape::contact`'s `the_operation_vocabulary_is_what_code_actually_writes`.
+    ///
+    /// **These are two different vocabularies and neither list may stand in
+    /// for the other.** `health_logs.operation` is what KIND of reading a row
+    /// is; `cartridge_contacts.operation` is the command verbatim
+    /// (`volume init`, `volume verify`, …). Migration 020's header says so
+    /// explicitly.
+    ///
+    /// Two halves, because either alone is the defect the ADR describes:
+    ///
+    /// 1. The strings are exactly these — the typo protection the CHECK gave.
+    /// 2. **Every one of them has a production writer.** The expected set is
+    ///    deliberately NOT seeded from the CHECK's four values: `read` and
+    ///    `clean` never had a writer, so a list asserted only against itself
+    ///    would enshrine exactly the lie the CHECK was told to stop telling —
+    ///    in the one artefact that is supposed to be the evidence.
+    #[test]
+    fn the_reading_vocabulary_is_what_code_actually_writes() {
+        let names: Vec<&str> = Reading::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["write", "resume", "verify"],
+            "health_logs.operation is what KIND of reading a row is — a \
+             different vocabulary from cartridge_contacts.operation, which is \
+             the command verbatim"
+        );
+
+        let corpus = source_of("volume/write.rs");
+        // Positive control on the scan: a corpus that read nothing would make
+        // every assertion below vacuous (issues #282/#284/#285).
+        assert!(
+            corpus.contains("collect_health_best_effort"),
+            "positive control: the source scan must actually have read the call sites"
+        );
+        for reading in Reading::ALL {
+            let variant = format!("Reading::{reading:?}");
+            assert!(
+                corpus.contains(&variant),
+                "{variant} has no writer in src/volume/write.rs — a vocabulary \
+                 value with no writer is exactly the `read`/`clean` defect \
+                 ADR-0013 §4 names, and it is a FINDING, not a row to add"
+            );
+        }
+    }
+
+    /// ADR-0013 §7: every row records the observer. "Parse it later" requires
+    /// knowing which build wrote the parsed columns beside the raw text, or a
+    /// parser bug fixed in a later version is indistinguishable from a
+    /// hardware change.
+    ///
+    /// It is not a parameter — there is one build doing the writing — so what
+    /// this proves is that `record` stamps it at all. The paired negative is
+    /// in `db::tests::test_migrate_020_populated_db_to_021_preserves_every_recorded_fact`:
+    /// a pre-021 row keeps NULL, because it genuinely does not know.
+    #[test]
+    fn record_stamps_the_build_that_wrote_the_row() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-VERSION', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+        record(
+            &conn,
+            Some(vid),
+            None,
+            None,
+            Reading::Write,
+            &HealthCounters::default(),
+            "raw",
+        )
+        .unwrap();
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT tapectl_version FROM health_logs WHERE volume_id = ?1",
+                params![vid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Issue #296's acceptance, both routes: 2 drives x 2 cartridges, every
+    /// pairing read once, so each grouping is non-trivial — every drive
+    /// spans two cartridges and every cartridge two drives.
+    ///
+    /// `SER-BAD` is the bad drive: its readings are bad on BOTH cartridges,
+    /// while each cartridge is bad on only one drive. So the by-drive route
+    /// shows the fault following the machine, and the by-cartridge route
+    /// shows each medium clean on the good drive — the two answers to "is
+    /// it the drive or the tape?" read off one fixture.
+    ///
+    /// Plus the two readings neither route may attribute: a pre-021 row
+    /// with no contact (in neither grouping) and a drive-only reading with no
+    /// identified cartridge (counts for its drive, not for any cartridge).
+    fn seed_two_by_two(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO cartridges (id, barcode, media_type, nominal_capacity)
+                VALUES (10, 'C1', 'LTO-6', 2500000000000),
+                       (11, 'C2', 'LTO-6', 2500000000000);
+             INSERT INTO drives (id, serial) VALUES (20, 'SER-BAD'), (21, 'SER-GOOD');
+             INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status)
+                VALUES (1, 'V-OLD', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed');
+             INSERT INTO cartridge_contacts (id, cartridge_id, drive_id, operation, device)
+                VALUES (30, 10, 20, 'volume verify', '/dev/nst0'),
+                       (31, 11, 20, 'volume verify', '/dev/nst0'),
+                       (32, 10, 21, 'volume verify', '/dev/nst1'),
+                       (33, 11, 21, 'volume verify', '/dev/nst1'),
+                       (34, NULL, 21, 'volume identify', '/dev/nst1');
+             INSERT INTO health_logs (volume_id, contact_id, operation, total_uncorrected, tape_alerts)
+                VALUES (NULL, 30, 'verify', 7, 2),
+                       (NULL, 31, 'verify', 9, 1),
+                       (NULL, 32, 'verify', 0, 0),
+                       (NULL, 33, 'verify', 0, NULL),
+                       (NULL, 34, 'verify', 0, 0),
+                       (1, NULL, 'write', 99, 5);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn readings_group_by_drive_across_cartridges() {
+        let conn = crate::db::open_memory().unwrap();
+        seed_two_by_two(&conn);
+        let by_drive = readings_by_drive(&conn).unwrap();
+        assert!(
+            !by_drive.is_empty(),
+            "positive control: the grouping saw rows"
+        );
+        assert_eq!(
+            by_drive,
+            vec![
+                DriveReadings {
+                    drive_id: 20,
+                    serial: "SER-BAD".into(),
+                    readings: 2,
+                    cartridges: 2,
+                    max_uncorrected: Some(9),
+                    readings_with_alerts: 2,
+                },
+                DriveReadings {
+                    drive_id: 21,
+                    serial: "SER-GOOD".into(),
+                    // Three: two cartridges plus the drive-only reading,
+                    // which has a drive but no identified cartridge.
+                    readings: 3,
+                    cartridges: 2,
+                    max_uncorrected: Some(0),
+                    readings_with_alerts: 0,
+                },
+            ],
+            "the contact-less pre-021 row (uncorrected 99) must be in NO group"
+        );
+    }
+
+    #[test]
+    fn readings_group_by_cartridge_across_drives() {
+        let conn = crate::db::open_memory().unwrap();
+        seed_two_by_two(&conn);
+        let by_cartridge = readings_by_cartridge(&conn).unwrap();
+        assert!(
+            !by_cartridge.is_empty(),
+            "positive control: the grouping saw rows"
+        );
+        assert_eq!(
+            by_cartridge,
+            vec![
+                CartridgeReadings {
+                    cartridge_id: 10,
+                    barcode: "C1".into(),
+                    readings: 2,
+                    drives: 2,
+                    max_uncorrected: Some(7),
+                    readings_with_alerts: 1,
+                },
+                CartridgeReadings {
+                    cartridge_id: 11,
+                    barcode: "C2".into(),
+                    readings: 2,
+                    drives: 2,
+                    max_uncorrected: Some(9),
+                    // C2 on SER-GOOD recorded NULL alerts: not counted as
+                    // raised, and not as clean either.
+                    readings_with_alerts: 1,
+                },
+            ],
+            "neither the drive-only reading nor the pre-021 row names a cartridge"
+        );
+    }
+
+    /// Read one source file under `src/`, for the writer halves above.
+    fn source_of(relative: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"))
     }
 }

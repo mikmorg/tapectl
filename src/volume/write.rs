@@ -1276,7 +1276,14 @@ fn volume_write_contacted<'c>(
         execute_outcome.into(),
     );
 
-    collect_health_best_effort(conn, config, device, volume_id, "write");
+    collect_health_best_effort(
+        conn,
+        config,
+        device,
+        volume_id,
+        contact.id(),
+        health::Reading::Write,
+    );
 
     result
 }
@@ -1443,7 +1450,7 @@ fn volume_resume_contacted<'c>(
     // THE CONTACT BEGINS HERE — resume's `det` is this contact's own reading
     // of the tape, exactly like `volume_write`'s, and the contact records
     // the same one.
-    contact.fill(ContactGuard::open(
+    let contact = contact.fill(ContactGuard::open(
         conn,
         config,
         Operation::VolumeResume,
@@ -1492,17 +1499,25 @@ fn volume_resume_contacted<'c>(
         outcome,
     );
 
-    // `'resume'` is the honest word, and ADR-0013 §4 rules this vocabulary
-    // free TEXT precisely so a new value costs no migration — but the CHECK
-    // that closes it (`001_initial.sql:332-333`) is still in force until
-    // migration 021 rebuilds `health_logs` (issue #296). SQLite enforces a
-    // CHECK unconditionally, and `collect_health_best_effort` only warns on
-    // an insert failure, so writing `'resume'` today would silently DROP the
-    // health row on every resume — strictly worse than the mislabel. The
-    // word is threaded through as a parameter so #296 flips one literal;
-    // `health::tests::resume_is_not_yet_an_accepted_operation_until_migration_021`
-    // fails the moment the CHECK is gone, which is the signal to flip it.
-    collect_health_best_effort(conn, config, device, volume_id, "write");
+    // `'resume'` — the honest word, and the record says it from migration 021
+    // (issue #296) onward. It could not before: `001_initial.sql`'s
+    // `CHECK(operation IN ('write','read','verify','clean'))` was in force,
+    // SQLite enforces a CHECK unconditionally, and
+    // `collect_health_best_effort` only warns on an insert failure — so
+    // writing `'resume'` would have silently DROPPED the health row on every
+    // resume, strictly worse than the mislabel. #295 threaded the word
+    // through as a parameter so this became one literal; 021 dropped the
+    // CHECK, and this is that literal flipped. "Free TEXT so a new value
+    // costs no migration" was true only AFTER the migration that made it
+    // free (the #295 hazard note).
+    collect_health_best_effort(
+        conn,
+        config,
+        device,
+        volume_id,
+        contact.id(),
+        health::Reading::Resume,
+    );
 
     result
 }
@@ -2407,65 +2422,121 @@ pub(crate) fn quarantine_on_medium_evidence(
 /// errors only logged).
 ///
 /// `operation` is the caller's own word for what it was doing, threaded
-/// through rather than hardcoded because two different commands land here —
-/// see the note at the `volume_resume` call site for why both still say
-/// `write` today.
+/// through rather than hardcoded because two different commands land here.
+/// Issue #295 threaded it; migration 021 (issue #296) dropped the CHECK that
+/// had been forcing `volume resume` to call itself `write`, and the resume
+/// call site now passes [`health::Reading::Resume`].
+///
+/// `contact_id` is the contact the caller's guard opened (issue #296): the
+/// reading names it, and the drive this collection identifies is attached to
+/// it — see [`record_health_and_drive`].
 fn collect_health_best_effort(
     conn: &Connection,
     config: &Config,
     device: &str,
     volume_id: i64,
-    operation: &str,
+    contact_id: Option<i64>,
+    operation: health::Reading,
 ) {
     if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
-        match health::collect(&bk.device_sg) {
-            Ok((counters, raw)) => {
-                if let Err(e) = health::record(conn, volume_id, None, operation, &counters, &raw) {
-                    warn!(err = %e, "health_logs insert failed");
-                }
-                // AFTER the health row, deliberately: identity capture is an
-                // addition to the record, never a precondition for it
-                // (issue #295). The backend `bk` is the one this function
-                // already resolved — no second lookup to disagree with the
-                // first (#187).
-                record_drive_identity_best_effort(conn, bk, Some(&raw));
-            }
-            Err(e) => {
-                warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed");
-                // A drive whose counters could not be read is still a drive
-                // that was contacted, and its identity is read by a
-                // different route.
-                record_drive_identity_best_effort(conn, bk, None);
-            }
-        }
+        collect_and_record_health(conn, bk, Some(volume_id), contact_id, None, operation);
     }
 }
 
-/// Record the drive this contact talked to (ADR-0013 §1, issue #295) —
-/// best-effort and non-fatal, exactly like the health collection it rides
-/// on.
+/// The hardware half of a health reading: run `sg_logs` and read the drive's
+/// identity from the backend the caller ALREADY resolved (no second lookup
+/// to disagree with the first, #187), then hand both to
+/// [`record_health_and_drive`], which does every database write.
 ///
-/// `raw_log` is the sg_logs text that was just collected, if any: its
-/// identity header carries vendor/product/firmware and has been sitting
-/// unqueryable in `health_logs.raw_log` on every row ever written, so it
-/// fills any field the sysfs read did not yield. A drive that yields no
-/// serial records NO row — unknown by absence, never a guess.
-fn record_drive_identity_best_effort(
+/// Each log page is read exactly once here (ADR-0013's read-to-clear
+/// hazard): the drive identity comes from sysfs / VPD 0x80 and from the
+/// header of the text this ONE collection already returned — never from a
+/// second `sg_logs` run.
+fn collect_and_record_health(
     conn: &Connection,
-    backend: &crate::config::LtoBackendConfig,
-    raw_log: Option<&str>,
+    bk: &crate::config::LtoBackendConfig,
+    volume_id: Option<i64>,
+    contact_id: Option<i64>,
+    session_id: Option<i64>,
+    reading: health::Reading,
 ) {
-    let mut identity = drive_identity::read_identity(backend);
-    if let Some(raw) = raw_log {
+    let collected = match health::collect(&bk.device_sg) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed");
+            None
+        }
+    };
+    let identity = drive_identity::read_identity(bk);
+    record_health_and_drive(
+        conn,
+        volume_id,
+        contact_id,
+        session_id,
+        reading,
+        collected.as_ref().map(|(c, raw)| (c, raw.as_str())),
+        identity,
+        &bk.device_tape,
+    );
+}
+
+/// Every database write a health reading makes, with no hardware in it —
+/// split from [`collect_and_record_health`] so the attribution this issue
+/// exists for is testable by value (issue #296).
+///
+/// 1. The `health_logs` row, naming its contact (ADR-0013 §2) and, on the
+///    verify path, its `verification_sessions` row (§3). Skipped only when
+///    `sg_logs` itself failed: there is no reading to record.
+/// 2. The drive (ADR-0013 §1, issue #295) — AFTER the health row,
+///    deliberately: identity capture is an addition to the record, never a
+///    precondition for it. The `sg_logs` identity header fills any field
+///    sysfs did not yield. A drive with no serial records NO row — unknown
+///    by absence, never a guess.
+/// 3. The contact's `drive_id`, by id rather than through a guard, because
+///    on the verify path the guard has already closed
+///    ([`contact::record_drive_for`]). Attempted on the sg_logs-failed path
+///    too: a drive whose counters could not be read is still the drive that
+///    was contacted.
+///
+/// Returns the `drives.id` attached, if any. Best-effort throughout: every
+/// failure is a warning, never an error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_health_and_drive(
+    conn: &Connection,
+    volume_id: Option<i64>,
+    contact_id: Option<i64>,
+    session_id: Option<i64>,
+    reading: health::Reading,
+    collected: Option<(&health::HealthCounters, &str)>,
+    mut identity: drive_identity::DriveIdentity,
+    device_for_log: &str,
+) -> Option<i64> {
+    if let Some((counters, raw)) = collected {
+        if let Err(e) = health::record(
+            conn, volume_id, contact_id, session_id, reading, counters, raw,
+        ) {
+            warn!(err = %e, "health_logs insert failed");
+        }
         identity.backfill_from_sg_logs_header(raw);
     }
     match drive_identity::upsert(conn, &identity) {
-        Ok(Some(_)) => {}
-        Ok(None) => warn!(
-            device = %backend.device_tape,
-            "drive identity unavailable (no serial); this contact is recorded without a drive"
-        ),
-        Err(e) => warn!(err = %e, "drives upsert failed"),
+        Ok(Some(drive_id)) => {
+            if let Some(cid) = contact_id {
+                contact::record_drive_for(conn, cid, drive_id);
+            }
+            Some(drive_id)
+        }
+        Ok(None) => {
+            warn!(
+                device = %device_for_log,
+                "drive identity unavailable (no serial); this contact is recorded without a drive"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(err = %e, "drives upsert failed");
+            None
+        }
     }
 }
 
@@ -2812,32 +2883,19 @@ pub fn volume_verify(
     // raw-string lookup — and when none resolves, SAY so rather than
     // silently recording nothing.
     match backend {
-        Some(bk) => {
-            match health::collect(&bk.device_sg) {
-                Ok((counters, raw)) => {
-                    // `session_id` at last has a writer (issue #295): this
-                    // reading belongs to the `verification_sessions` row
-                    // `volume_verify_with_store` just created, which is
-                    // exactly — and only — what the column's foreign key has
-                    // declared since `001_initial.sql` (ADR-0013 §3).
-                    if let Err(e) = health::record(
-                        conn,
-                        volume_id,
-                        report.session_id,
-                        "verify",
-                        &counters,
-                        &raw,
-                    ) {
-                        warn!(err = %e, "health_logs insert failed");
-                    }
-                    record_drive_identity_best_effort(conn, bk, Some(&raw));
-                }
-                Err(e) => {
-                    warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed");
-                    record_drive_identity_best_effort(conn, bk, None);
-                }
-            }
-        }
+        // `session_id` (issue #295) and `contact_id` (issue #296) are both
+        // carried OUT of `volume_verify_with_store` on the report, because
+        // the session is created and the contact closed inside it — before
+        // this collection runs. The reading names both; the drive attaches
+        // to the (already closed) contact by id.
+        Some(bk) => collect_and_record_health(
+            conn,
+            bk,
+            Some(volume_id),
+            report.contact_id,
+            report.session_id,
+            health::Reading::Verify,
+        ),
         None => {
             report.drive_health_note = Some(format!(
                 "no [[backends.lto]] entry configured for device {device}; drive health \
@@ -2868,7 +2926,8 @@ pub(crate) fn volume_verify_with_store(
     site: ContactSite<'_>,
 ) -> Result<VerifyReport> {
     let guard = site.open(conn, Some(volume_id));
-    let r = verify_contacted(
+    let contact_id = guard.id();
+    let mut r = verify_contacted(
         conn,
         store,
         label,
@@ -2894,6 +2953,11 @@ pub(crate) fn volume_verify_with_store(
         ),
         Ok(_) => guard.finish(contact::OUTCOME_OK, None),
         Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
+    }
+    // Carried out on the report (issue #296): the guard is gone after this,
+    // and `volume_verify`'s health collection still has to name the contact.
+    if let Ok(report) = &mut r {
+        report.contact_id = contact_id;
     }
     r
 }
@@ -3053,6 +3117,8 @@ fn verify_contacted(
 
     Ok(VerifyReport {
         session_id: Some(session_id),
+        // Filled by `volume_verify_with_store`, which holds the guard.
+        contact_id: None,
         checked: evidence.files_checked as usize,
         passed: (evidence.files_checked as usize).saturating_sub(evidence.mismatches.len()),
         failed: evidence.mismatches.len(),
@@ -3861,6 +3927,20 @@ pub struct VerifyReport {
     /// `None` only on a `VerifyReport` no verify produced (`Default`), never
     /// on a real one.
     pub session_id: Option<i64>,
+    /// The `cartridge_contacts` row this verify opened (issue #296) — the
+    /// same shape, and for the same reason, as `session_id` above.
+    ///
+    /// The contact is opened AND closed inside [`volume_verify_with_store`],
+    /// and `volume_verify` collects drive health only after that, so without
+    /// this field the reading could not name its contact
+    /// (`health_logs.contact_id`, ADR-0013 §2) and the drive `sg_logs`
+    /// identified could not be attached to it (`cartridge_contacts.drive_id`
+    /// — NULL on every real row before this, which is what left "is it the
+    /// drive or the tape?" unanswerable).
+    ///
+    /// `None` on a `Default` report, and on a real one only when the
+    /// contact INSERT itself failed (an inert guard).
+    pub contact_id: Option<i64>,
     pub checked: usize,
     pub passed: usize,
     pub failed: usize,
@@ -4990,6 +5070,282 @@ mod tests {
             )
             .unwrap();
         assert_eq!(report.session_id, Some(session_id));
+    }
+
+    /// `VerifyReport` must carry the `cartridge_contacts` row OUT of the
+    /// seam that opened and closed it (issue #296) — `session_id`'s shape,
+    /// for the same reason: `volume_verify` collects drive health only after
+    /// the guard is gone, and can only name what the report hands it.
+    ///
+    /// By VALUE, against a second, unrelated contact opened first, so the
+    /// assertion cannot pass on "the first/only contact row" by accident.
+    #[test]
+    fn a_verify_carries_its_contact_id_out_on_the_report() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"bytes whose verify must name the contact it was made in. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "VR-CONTACT",
+            "vc-unit",
+            4,
+            &good,
+            "completed",
+            "staged",
+        );
+        let volume_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = 'VR-CONTACT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // A decoy contact: an earlier, unrelated one.
+        let decoy = site(Operation::VolumeIdentify).open(&conn, None);
+        let decoy_id = decoy
+            .id()
+            .expect("positive control: the decoy contact exists");
+        decoy.finish(contact::OUTCOME_OK, None);
+
+        let mut store = mem_store_v2_tape("VR-CONTACT", &good, &good);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-CONTACT",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+
+        let verify_contact: i64 = conn
+            .query_row(
+                "SELECT id FROM cartridge_contacts
+                  WHERE volume_id = ?1 AND operation = 'volume verify'",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            verify_contact, decoy_id,
+            "positive control: two distinct contacts"
+        );
+        assert_eq!(report.contact_id, Some(verify_contact));
+    }
+
+    /// A contact on `conn` for the health-recorder tests below, plus a volume
+    /// to hang the reading on.
+    fn contact_and_volume(conn: &Connection, label: &str) -> (i64, i64) {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            params![label],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+        let guard = site(Operation::VolumeWrite).open(conn, Some(vid));
+        let cid = guard
+            .id()
+            .expect("positive control: the contact row exists");
+        guard.finish(contact::OUTCOME_OK, None);
+        (vid, cid)
+    }
+
+    fn identity_with_serial(serial: Option<&str>) -> drive_identity::DriveIdentity {
+        drive_identity::DriveIdentity {
+            serial: serial.map(str::to_string),
+            vendor: Some("HP".to_string()),
+            model: Some("Ultrium 6-SCSI".to_string()),
+            firmware_rev: Some("35GD".to_string()),
+        }
+    }
+
+    fn drive_of_contact(conn: &Connection, contact_id: i64) -> Option<i64> {
+        conn.query_row(
+            "SELECT drive_id FROM cartridge_contacts WHERE id = ?1",
+            params![contact_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// THE attribution issue #296 exists for, by value: a health reading
+    /// names the contact it was taken in, and that contact names the drive
+    /// the reading identified. Before this, `record_drive` had no production
+    /// caller and `cartridge_contacts.drive_id` was NULL on every real row
+    /// (20 of 20 in the pass-1 mhvtl gate).
+    ///
+    /// Two contacts and two drives, with the reading attributed to the
+    /// SECOND of each — so "some contact got some drive" cannot pass for
+    /// "this contact got this drive". `collect_health_best_effort` only
+    /// WARNS on a failed insert, so the rows are asserted to EXIST, not
+    /// inferred from the absence of an error.
+    #[test]
+    fn a_health_reading_names_its_contact_and_the_contact_names_its_drive() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_, other_cid) = contact_and_volume(&conn, "HR-OTHER");
+        let other_drive =
+            drive_identity::upsert(&conn, &identity_with_serial(Some("OTHER_SERIAL")))
+                .unwrap()
+                .unwrap();
+        let (vid, cid) = contact_and_volume(&conn, "HR-THIS");
+        assert_ne!(cid, other_cid, "positive control: two distinct contacts");
+
+        let counters = health::HealthCounters {
+            total_uncorrected: 2,
+            tape_alerts: 0,
+            ..Default::default()
+        };
+        let drive_id = record_health_and_drive(
+            &conn,
+            Some(vid),
+            Some(cid),
+            None,
+            health::Reading::Write,
+            Some((&counters, "=== page 0x02 ===\nraw")),
+            identity_with_serial(Some("HUJ808A5L4")),
+            "/dev/nst-test",
+        )
+        .expect("an identity with a serial must produce a drive");
+
+        let expected_drive: i64 = conn
+            .query_row(
+                "SELECT id FROM drives WHERE serial = 'HUJ808A5L4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            expected_drive, other_drive,
+            "positive control: two distinct drives"
+        );
+        assert_eq!(drive_id, expected_drive);
+        assert_eq!(
+            drive_of_contact(&conn, cid),
+            Some(expected_drive),
+            "the contact must name the drive this reading identified"
+        );
+        assert_eq!(
+            drive_of_contact(&conn, other_cid),
+            None,
+            "an unrelated contact must not be touched"
+        );
+
+        let rows: Vec<(Option<i64>, Option<i64>, String, i64)> = conn
+            .prepare("SELECT volume_id, contact_id, operation, total_uncorrected FROM health_logs")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(Some(vid), Some(cid), "write".to_string(), 2)],
+            "exactly one health row, naming THIS contact"
+        );
+    }
+
+    /// `sg_logs` failed: there is no reading, so no health row — but the
+    /// drive was still the one contacted, and its identity is read by a
+    /// different route, so the contact still gets its drive.
+    #[test]
+    fn a_failed_collection_still_attaches_the_drive_to_the_contact() {
+        let conn = crate::db::open_memory().unwrap();
+        let (vid, cid) = contact_and_volume(&conn, "HR-NOLOG");
+        let drive_id = record_health_and_drive(
+            &conn,
+            Some(vid),
+            Some(cid),
+            None,
+            health::Reading::Verify,
+            None,
+            identity_with_serial(Some("XYZZY_A1")),
+            "/dev/nst-test",
+        )
+        .expect("the identity has a serial");
+        assert_eq!(drive_of_contact(&conn, cid), Some(drive_id));
+        let health_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            health_rows, 0,
+            "no sg_logs output means no reading to record"
+        );
+    }
+
+    /// A drive that publishes no serial gets no `drives` row (migration
+    /// 019's rule) and the contact's `drive_id` stays NULL — unknown by
+    /// absence, never guessed. The reading is still recorded and still
+    /// names its contact: identity is an addition to the record, never a
+    /// precondition for it.
+    #[test]
+    fn a_drive_with_no_serial_leaves_the_contact_without_a_drive() {
+        let conn = crate::db::open_memory().unwrap();
+        let (vid, cid) = contact_and_volume(&conn, "HR-NOSERIAL");
+        let drive = record_health_and_drive(
+            &conn,
+            Some(vid),
+            Some(cid),
+            None,
+            health::Reading::Write,
+            Some((&health::HealthCounters::default(), "raw")),
+            identity_with_serial(None),
+            "/dev/nst-test",
+        );
+        assert_eq!(drive, None);
+        assert_eq!(drive_of_contact(&conn, cid), None);
+        let drives: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drives, 0);
+        let named: Option<i64> = conn
+            .query_row("SELECT contact_id FROM health_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(named, Some(cid));
+    }
+
+    /// Every production path that writes a health row must hand it a
+    /// contact (issue #296). The recorder is hardware-free and tested by
+    /// value above; what no ungated test can drive is the three CALLERS
+    /// (`sg_logs` needs a drive), so their wiring is pinned by source scan —
+    /// calibrated by a positive control that the scan found each one.
+    #[test]
+    fn every_health_writer_passes_its_contact() {
+        const SRC: &str = include_str!("write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.len() < SRC.len(),
+            "positive control: the production half was separated from the tests"
+        );
+        assert_eq!(
+            prod.matches("health::record(").count(),
+            1,
+            "health::record must have ONE production caller, record_health_and_drive — a \
+             second writer is a second place to forget the contact"
+        );
+        for (f, needle) in [
+            ("fn volume_write_contacted", "contact.id(),"),
+            ("fn volume_resume_contacted", "contact.id(),"),
+            ("pub fn volume_verify(", "report.contact_id,"),
+        ] {
+            let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+            let end = prod[start..].find("\n}\n").unwrap() + start;
+            let body = &prod[start..end];
+            assert!(
+                !body[f.len()..].contains("\npub fn "),
+                "{f}: body extraction overran into another function"
+            );
+            assert!(
+                body.contains("collect_health_best_effort(")
+                    || body.contains("collect_and_record_health("),
+                "positive control: {f} must still collect health"
+            );
+            assert!(
+                body.contains(needle),
+                "{f} must pass its contact ({needle}) to the health collection"
+            );
+        }
     }
 
     /// A mismatch at a METADATA position is counted by the session and has

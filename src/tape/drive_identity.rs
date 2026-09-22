@@ -694,7 +694,15 @@ mod tests {
         // migration 021 (issue #296). 019 must leave it byte-identical to
         // what 009 left behind — a drive column here would be the second of
         // the four uncoordinated rebuilds the ADR exists to prevent.
-        let conn = crate::db::open_memory().unwrap();
+        //
+        // Migrated to exactly 019, not "latest": 021 IS that one rebuild and
+        // legitimately adds `contact_id`/`tapectl_version`, so a pin against
+        // the newest schema would be measuring 021, not 019.
+        let conn = crate::db::open_memory_at_version(19);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 19, "positive control: this pin is about 019");
         let mut stmt = conn.prepare("PRAGMA table_info(health_logs)").unwrap();
         let columns: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(1))
@@ -850,9 +858,10 @@ mod tests {
 
         crate::tape::health::record(
             &conn,
-            vid,
+            Some(vid),
             None,
-            "verify",
+            None,
+            crate::tape::health::Reading::Verify,
             &crate::tape::health::HealthCounters::default(),
             "raw",
         )

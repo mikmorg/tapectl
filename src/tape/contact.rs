@@ -138,8 +138,9 @@ pub const OUTCOME_FAILED: &str = "failed";
 /// ADR-0013 §4 rules this vocabulary **free TEXT in the schema**: migrations
 /// are forward-only and the set grows with every new tape-touching command, so
 /// a closed `CHECK` would turn each new command into a schema change. The
-/// `health_logs.operation` CHECK is the argument against itself — it permits
-/// `read` and `clean`, neither of which any code has ever written.
+/// `health_logs.operation` CHECK (dropped by migration 021) was the argument
+/// against itself — it permitted `read` and `clean`, neither of which any
+/// code has ever written.
 ///
 /// An enum here gives the typo protection the CHECK was supposed to give, at
 /// no migration cost, **and one thing the CHECK never could**: an unused
@@ -148,7 +149,8 @@ pub const OUTCOME_FAILED: &str = "failed";
 /// `read` and `clean` should have been caught.
 ///
 /// Note this is a DIFFERENT vocabulary from `health_logs.operation`, which
-/// says what *kind* of reading a row is (`write`/`verify`). Neither list may
+/// says what *kind* of reading a row is (`write`/`resume`/`verify`,
+/// [`crate::tape::health::Reading`]). Neither list may
 /// stand in for the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
@@ -526,12 +528,38 @@ impl<'a> ContactGuard<'a> {
         let Some(id) = self.id else {
             return;
         };
-        if let Err(e) = self.conn.execute(
-            "UPDATE cartridge_contacts SET drive_id = ?2 WHERE id = ?1",
-            params![id, drive_id],
-        ) {
-            warn!(err = %e, contact_id = id, "cartridge_contacts drive update failed");
-        }
+        record_drive_for(self.conn, id, drive_id);
+    }
+
+    /// The `cartridge_contacts` row this guard opened, or `None` for an
+    /// inert guard whose INSERT failed.
+    ///
+    /// Surfaced for the reason `VerifyReport.session_id` was (issue #295):
+    /// a reading taken during this contact must be able to NAME it
+    /// (`health_logs.contact_id`, ADR-0013 §2), and on the verify path the
+    /// guard has already closed by the time sg_logs runs — so the id has to
+    /// be carried out of the seam rather than the guard kept alive.
+    pub fn id(&self) -> Option<i64> {
+        self.id
+    }
+}
+
+/// Attach a drive to a contact by id — [`ContactGuard::record_drive`] for a
+/// contact whose guard has already closed (issue #296).
+///
+/// `volume verify` closes its contact inside the store-injectable seam and
+/// only THEN collects drive health and asks the drive who it is, so there is
+/// no guard left to call `record_drive` on. Setting `drive_id` after
+/// `closed_at` is correct, not a race: which drive the contact was made
+/// with is a fact about the contact however late it is learned, and
+/// `finish` never touches this column. Best-effort, like every other
+/// contact write: bookkeeping never refuses a tape command.
+pub fn record_drive_for(conn: &Connection, contact_id: i64, drive_id: i64) {
+    if let Err(e) = conn.execute(
+        "UPDATE cartridge_contacts SET drive_id = ?2 WHERE id = ?1",
+        params![contact_id, drive_id],
+    ) {
+        warn!(err = %e, contact_id, "cartridge_contacts drive update failed");
     }
 }
 
