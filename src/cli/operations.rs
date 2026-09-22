@@ -761,7 +761,7 @@ pub(crate) fn refuse_last_eligible_copy(
          — {named}.\n\
          \n\
          {resume_para}\
-         Retiring it leaves {those} at all: nothing else sealed, unquarantined and \
+         Going through with that leaves {those} at all: nothing else sealed, unquarantined and \
          unretired carries the content, and no recorded warehouse deposit stands in for \
          it. That is not a thinner safety margin to accept — it is the data ceasing to \
          exist, and ADR-0008 puts it in Tier 3. There is no --force for this, and --yes \
@@ -777,11 +777,11 @@ pub(crate) fn refuse_last_eligible_copy(
          and its own preconditions:\n\
          {release}\n\
          \n\
-         If you are retiring this tape BECAUSE it no longer reads, say that with the drive \
+         If you are discarding this tape BECAUSE it no longer reads, say that with the drive \
          rather than with the catalog: `tapectl volume verify {volume_label}` quarantines \
          the volume when the failure PROVES the medium is bad — a checksum mismatch, or a \
          block it cannot read where the layout says data lives. A quarantined volume counts \
-         for nothing, and retiring it is then Tier 2 at most. If it instead reports a read \
+         for nothing, and discarding it is then Tier 2 at most. If it instead reports a read \
          or transport failure the volume is left untouched on purpose (ADR-0012): that is \
          the drive talking, not the tape, so clean it, check the block size and the cabling, \
          and verify again. A catalog saying \"one copy, unverified\" is telling the truth; \
@@ -1727,6 +1727,108 @@ const LEGAL_VOLUME_STATUSES: [&str; 8] = [
     "erased",
     "sealed",
 ];
+
+/// Issue #287: [`LEGAL_VOLUME_STATUSES`] hand-copies the set the `volumes`
+/// table's own CHECK constraint permits, and nothing pinned the two
+/// together. Migrations are forward-only and this archive is about to take
+/// production data, so the drift window is every future migration, forever.
+///
+/// **This is deliberately NOT routed through `policy::coverage`** — that
+/// module owns coverage PREDICATES ("does this count as a copy"), and this
+/// is a LEGALITY filter ("may this string be written to the column"). The
+/// third review's completeness critic made that call and it is preserved
+/// here rather than re-argued.
+///
+/// The test reads the live CHECK out of `sqlite_master` instead of
+/// restating the list, so it follows the schema rather than duplicating it
+/// a third time. Both drift directions fail:
+///   * a status the schema permits but the constant omits — which produces
+///     a WRONG REFUSAL, the direction an insert-probe test cannot catch;
+///   * a status in the constant the schema has dropped — accepted by the
+///     CLI, then rejected by SQLite as a raw constraint violation.
+#[cfg(test)]
+mod legal_volume_statuses_match_the_schema {
+    use super::LEGAL_VOLUME_STATUSES;
+    use std::collections::BTreeSet;
+
+    /// Pull `CHECK(status IN ('a','b',...))` out of a `CREATE TABLE`
+    /// statement and return the quoted values.
+    ///
+    /// Scans for the `status` column's own CHECK specifically: `volumes`
+    /// also carries one for `observed_condition` (migration 017), and a
+    /// looser search would happily compare against the wrong one and pass.
+    fn check_set(create_sql: &str) -> BTreeSet<String> {
+        let flat = create_sql.replace('\n', " ");
+        let needle = "CHECK(status IN (";
+        let start = flat
+            .find(needle)
+            .or_else(|| flat.find("CHECK (status IN ("))
+            .unwrap_or_else(|| {
+                panic!("no `CHECK(status IN (...))` found on volumes; schema was: {flat}")
+            });
+        let rest = &flat[start..];
+        let open = rest.find("IN (").expect("IN (") + 4;
+        let close = rest[open..].find(')').expect("closing paren") + open;
+        rest[open..close]
+            .split(',')
+            .map(|tok| tok.trim().trim_matches('\'').to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_constant_equals_the_volumes_status_check() {
+        let conn = crate::db::open_memory().unwrap();
+        let create_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'volumes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let schema: BTreeSet<String> = check_set(&create_sql);
+        let constant: BTreeSet<String> = LEGAL_VOLUME_STATUSES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            constant,
+            schema,
+            "\n`LEGAL_VOLUME_STATUSES` and the `volumes.status` CHECK have drifted.\n\
+             THE SCHEMA IS AUTHORITATIVE: a migration changed the CHECK and the constant \
+             was not updated (or vice versa).\n\
+             Only in the constant (the CLI would accept these, then SQLite would reject \
+             the write): {:?}\n\
+             Only in the schema (the CLI would refuse these though the database permits \
+             them): {:?}\n",
+            constant.difference(&schema).collect::<Vec<_>>(),
+            schema.difference(&constant).collect::<Vec<_>>()
+        );
+    }
+
+    /// The parser is the part of the test above that can silently stop
+    /// working — a CHECK it fails to locate, or one it locates loosely
+    /// enough to match `observed_condition`'s, would make the comparison
+    /// meaningless rather than red. Pin it against both shapes.
+    #[test]
+    fn the_check_parser_finds_the_status_clause_and_not_its_neighbour() {
+        let sql = "CREATE TABLE volumes (\n  status TEXT NOT NULL DEFAULT 'blank'\n    \
+                   CHECK(status IN ('blank','sealed')),\n  observed_condition TEXT \
+                   NOT NULL DEFAULT 'ok'\n    CHECK(observed_condition IN \
+                   ('ok','quarantined'))\n)";
+        let got = check_set(sql);
+        assert_eq!(
+            got,
+            ["blank", "sealed"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
+            "must read the status CHECK, not observed_condition's"
+        );
+    }
+}
 
 /// What [`cartridge_unretire`] should do with one volume's pre-retirement
 /// status, recovered from the `events` audit trail (issue #250).
