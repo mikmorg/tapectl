@@ -6995,6 +6995,134 @@ mod tests {
             assert_eq!(cartridge_status(&conn, cart_id), "retired_permanent");
             assert!(err.to_string().contains("unretire"));
         }
+
+        // ── ADR-0008 Tier 3, extended to `mark-erased` (issue #289) ──
+        //
+        // Before this, `cartridge_mark_erased` recorded every mounted volume
+        // `status='erased'` behind a Tier-2 consent that `--force`/`--yes`
+        // waived, and never called `retire_impacts`/`refuse_last_eligible_copy`
+        // at all -- so `mark-erased --force` on an `in_use` cartridge could
+        // take a unit's last live copy to zero with no refusal, the exact
+        // outcome ADR-0008 Tier 3 makes structurally unreachable for `volume
+        // retire` and `cartridge retire`.
+
+        /// `cartridge_retire::setup(with_other_copy)` -- the exact "cartridge
+        /// `in_use` mounting volume `L6-CART` carrying `unitA`'s only
+        /// completed write" shape `cartridge_retire`'s own Tier-3 tests use
+        /// -- with `L6-CART` additionally SEALED, so marking it erased
+        /// really does discard a live copy (ADR-0012). Shared rather than
+        /// re-typed, so this command's Tier-3 tests cannot silently drift
+        /// from `cartridge_retire`'s on what "last copy" means.
+        fn setup_sealed_for_mark_erased(with_other_copy: bool) -> (Connection, i64, i64) {
+            let (conn, cart_id, vol_id) = super::cartridge_retire::setup(with_other_copy);
+            conn.execute(
+                "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+                params![vol_id],
+            )
+            .unwrap();
+            (conn, cart_id, vol_id)
+        }
+
+        /// THE headline of issue #289: `--force` must not discard the last
+        /// eligible copy of a live version. Must FAIL against the
+        /// unmodified code -- the coordinator's report quotes the observed
+        /// RED transcript.
+        #[test]
+        fn mark_erased_refuses_at_tier3_when_force_would_discard_a_last_copy() {
+            let (conn, cart_id, vol_id) = setup_sealed_for_mark_erased(false);
+            let err = cartridge_mark_erased(&conn, "BC-RET", true, false, false, false)
+                .expect_err("--force must not defeat ADR-0008 Tier 3 (issue #289)");
+            let msg = err.to_string();
+            assert!(msg.contains("LAST eligible copy"), "got: {msg}");
+            assert!(
+                msg.contains("tapectl volume read-slices --from L6-CART"),
+                "recovery must name the VOLUME, proof this routed through the shared \
+                 `retire_impacts` -> `refuse_last_eligible_copy` derivation rather than a \
+                 new inline one (issue #96): {msg}"
+            );
+            assert_eq!(
+                cartridge_status(&conn, cart_id),
+                "in_use",
+                "a refused mark-erased must not touch the cartridge"
+            );
+            assert_eq!(
+                volume_status(&conn, vol_id),
+                "sealed",
+                "a refused mark-erased must not touch the volume either"
+            );
+        }
+
+        /// The other flag half of the same proof: the global `--yes` must
+        /// not reach Tier 3 either -- `--yes`'s own help text promises it
+        /// "never reaches a Tier-3 refusal". Must FAIL against the
+        /// unmodified code, same as (a).
+        #[test]
+        fn mark_erased_refuses_at_tier3_when_yes_would_discard_a_last_copy() {
+            let (conn, cart_id, vol_id) = setup_sealed_for_mark_erased(false);
+            let err = cartridge_mark_erased(&conn, "BC-RET", false, true, false, false)
+                .expect_err("--yes must not defeat ADR-0008 Tier 3 (issue #289)");
+            let msg = err.to_string();
+            assert!(msg.contains("LAST eligible copy"), "got: {msg}");
+            assert!(
+                msg.contains("tapectl volume read-slices --from L6-CART"),
+                "got: {msg}"
+            );
+            assert_eq!(cartridge_status(&conn, cart_id), "in_use");
+            assert_eq!(volume_status(&conn, vol_id), "sealed");
+        }
+
+        /// The positive control for the floor's PLACEMENT, not just its
+        /// existence (issue #289): on the ORDINARY retire -> bulk-erase ->
+        /// mark-erased lifecycle, `volume_retire` already ran this same
+        /// floor and, on success, left the volume `'retired'` and freed the
+        /// cartridge to `pending_erase` (`free_cartridge_if_last_live`).
+        /// `holds_sealed_bytes` excludes a `retired` volume, so
+        /// `retire_impacts` returns no `at_stake` rows here and the floor
+        /// falls straight through -- proving the unconditional placement
+        /// did not make the ordinary reuse path unusable.
+        #[test]
+        fn mark_erased_still_completes_the_ordinary_pending_erase_lifecycle() {
+            let (conn, cart_id, vol_id) = super::cartridge_retire::setup(true);
+            // `with_other_copy=true`: the unit keeps a copy elsewhere, so
+            // retiring `L6-CART` removes nothing at Tier 3 and `--yes`
+            // clears Tier 2 -- reaching `pending_erase` through the REAL
+            // lifecycle, not a hand-set status.
+            volume_retire(&conn, &Config::default(), "L6-CART", true, false, false)
+                .expect("retiring the volume with a copy elsewhere must succeed");
+            assert_eq!(
+                cartridge_status(&conn, cart_id),
+                "pending_erase",
+                "retiring the cartridge's only live volume must free it via \
+                 `free_cartridge_if_last_live`"
+            );
+
+            cartridge_mark_erased(&conn, "BC-RET", false, false, false, false).expect(
+                "the ordinary pending_erase lifecycle must still complete after the Tier-3 \
+                 floor was made unconditional (issue #289)",
+            );
+            assert_eq!(cartridge_status(&conn, cart_id), "available");
+            assert_eq!(
+                volume_status(&conn, vol_id),
+                "erased",
+                "the volume already retired by `volume retire` must still move to erased"
+            );
+        }
+
+        /// The positive control for the refusal itself (issue #289):
+        /// without a second eligible copy, (a)/(b) above cannot distinguish
+        /// "the floor fired correctly" from "this command now refuses
+        /// everything". Same fixture as (a)/(b) plus a second `sealed`
+        /// volume (`cartridge_retire::setup`'s own `with_other_copy` shape)
+        /// carrying a `completed` write of the same stage set -- `--force`
+        /// on the `in_use` cartridge must succeed.
+        #[test]
+        fn mark_erased_succeeds_when_another_eligible_copy_exists() {
+            let (conn, cart_id, vol_id) = setup_sealed_for_mark_erased(true);
+            cartridge_mark_erased(&conn, "BC-RET", true, false, false, false)
+                .expect("a real other copy must let the floor pass through (issue #289)");
+            assert_eq!(cartridge_status(&conn, cart_id), "available");
+            assert_eq!(volume_status(&conn, vol_id), "erased");
+        }
     }
 
     /// Issue #38/H12: `db_import`'s always-on ADR-0008 Tier-2 consent
