@@ -567,6 +567,11 @@ pub(crate) fn retire_impacts(conn: &Connection, vol_id: i64) -> Result<Vec<Retir
 /// shipped the tiers inverted. Each calls this BEFORE reaching any
 /// Tier-2 prompt, so no ordering can let consent arrive first.
 ///
+/// **A fourth caller, found later:** `cartridge mark-erased` (issue #289)
+/// shipped the same inversion but was not part of ADR-0012's original
+/// three — issue #147's sweep did not visit it. It now calls this too,
+/// before its own Tier-2 consent branch, for the identical reason.
+///
 /// `act` names what the operator asked for, in the imperative
 /// (`retire volume "L6-0007"`), and `volume_label` is the volume whose
 /// coverage is at stake — for a cartridge those differ, and the recovery
@@ -1436,6 +1441,28 @@ fn print_mark_erased_impact(
 
 /// Mark a cartridge as erased (available for reuse), moving any
 /// currently-mounted volume to `erased`.
+///
+/// **ADR-0008 Tier 3 runs FIRST, unconditionally, before any Tier-2
+/// consent** (issue #289 — this command shipped without it, the fourth
+/// case of the inversion ADR-0012 named three of). Marking a cartridge
+/// erased writes every mounted volume `status='erased'`, which is exactly
+/// as capable of taking a unit's last live copy to zero as `volume retire`
+/// or `cartridge retire` retiring it — so it goes through the same
+/// absolute floor ([`retire_impacts`] → [`refuse_last_eligible_copy`]),
+/// per mounted volume, with no `force`/`--yes` parameter able to reach
+/// past it, exactly as those two commands enforce it.
+///
+/// **This floor is a structural no-op on the ORDINARY `pending_erase`
+/// lifecycle**, not merely scoped away from it: by the time `mark-erased`
+/// runs at the end of retire → bulk-erase → mark-erased, the volume was
+/// already moved to `'retired'` by `volume retire` (which ran this same
+/// floor itself before that transition). `holds_sealed_bytes` — the
+/// predicate [`crate::policy::coverage::versions_at_stake`] joins the
+/// subject volume through — excludes `retired`/`missing`/`erased`, so
+/// `retire_impacts` returns no `at_stake` rows for it and the floor loop
+/// falls straight through without refusing anything. It only ever fires
+/// for the shape issue #289 exists to close: a cartridge whose mounted
+/// volume is still `sealed` and never went through `volume retire` at all.
 ///
 /// Enforces the physical-reuse lifecycle (ADR-0008 Tier 2): the cartridge
 /// should be in `pending_erase` — the state `volume compact-finish` (and
