@@ -58,8 +58,8 @@ impl Drop for RestoreScratch {
 }
 
 /// Restore a unit from a volume to a destination directory.
-// 9 args reflects the CLI's flat shape (unit/volume/dest/device/block_size/
-// dry_run alongside conn/paths/config); interim allow. This used to carry a
+// 10 args reflects the CLI's flat shape (unit/volume/dest/device/block_size/
+// version/dry_run alongside conn/paths/config); interim allow. This used to carry a
 // comment blaming the count on "the store read seam in #71 (epic #20)" —
 // wrong: #71 was closed and scoped only to the write-side execute/confirm
 // seam. The read seam migrated here directly (issue #85): per-slice tape
@@ -75,6 +75,7 @@ pub fn restore_unit(
     dest_dir: &str,
     device: &str,
     block_size: usize,
+    version: Option<i64>,
     dry_run: bool,
 ) -> Result<RestoreReport> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
@@ -86,19 +87,18 @@ pub fn restore_unit(
     queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
-    // Find write positions for this unit on this volume
-    let positions = get_write_positions(conn, unit.id, volume_label)?;
-    if positions.is_empty() {
-        return Err(TapectlError::Other(format!(
-            "no data for unit \"{unit_name}\" on volume \"{volume_label}\""
-        )));
-    }
+    // Exactly one snapshot version's slices on this volume (issue #315) —
+    // resolved before the drive is touched, so a `--version` the volume does
+    // not carry is refused with no tape I/O, and a dry run counts only the
+    // selected version's slices.
+    let selection = select_write_positions(conn, unit_name, volume_label, version)?;
 
     if dry_run {
         return Ok(RestoreReport {
             unit_name: unit_name.to_string(),
             volume_label: volume_label.to_string(),
-            slices: positions.len(),
+            version: selection.version,
+            slices: selection.positions.len(),
             destination: dest_dir.to_string(),
             dry_run: true,
             success: true,
@@ -128,6 +128,7 @@ pub fn restore_unit(
         config,
         unit_name,
         volume_label,
+        selection.version,
         dest_dir,
         &mut store,
         ContactSite::new(
@@ -149,36 +150,39 @@ pub fn restore_unit(
 /// whole path exists to do without. The contact is bookkeeping ABOUT that
 /// dump, not part of it, so it belongs here.
 ///
-/// **`Medium::NotAttempted`, and `cartridge_id` NULL.** This path reads no
-/// MAM: it consults nothing but the tape (ADR-0005). The contact is recorded
-/// anyway — a contact is a physical fact whether or not the cartridge could
-/// be identified — and `REASON_MAM_NOT_ATTEMPTED` says which of the five
-/// reasons the NULL is, so the row is never a silent absence.
+/// **`site`'s medium is what the CLI read off the cartridge's MAM** (issue
+/// #316) — the same one-parameter shape as [`restore_unit_from_store`].
+/// This used to be hard-coded `Medium::NotAttempted`, so every raw-volume
+/// contact said `REASON_MAM_NOT_ATTEMPTED` ("no MAM read is attempted on this
+/// path") while the CLI arm had in fact read the MAM in `check_read_contact`
+/// (issue #166) and the journal recorded that read (issue #297) — the
+/// contact denied a read its own journal rows proved. The CLI now takes the
+/// same two reads every other read path takes (ADR-0013 §5):
+/// `check_read_contact`, then [`crate::volume::binding::loaded_medium`],
+/// whose [`MamInfo`](crate::tape::mam::MamInfo) is what the site's
+/// `Medium` carries.
 ///
-/// `reads`: the MAM capture the CLI's `check_read_contact` took before the
-/// store opened (issue #297), journalled against this contact. That check
-/// DOES read the MAM when a backend resolves (issue #166 added it), so
-/// "reads no MAM" above describes this function's own identification, not
-/// the command as a whole — a known wording gap left for #296's owner; the
-/// journal records the read regardless.
+/// Taking the second read rather than justifying one: the first read hands
+/// back only a verdict and a raw capture, not the parsed `MamInfo` a contact
+/// records, so without the second there is no serial or load count to put
+/// on the row. It does not compromise ADR-0005: the chip is part of the
+/// CARTRIDGE, not the catalog, and nothing here corroborates or refuses on
+/// it — `ContactGuard::open` only records. A DR machine with no backend gets
+/// `Medium::NoBackend` (no read happened, `REASON_NO_BACKEND_CONFIGURED`);
+/// one whose catalog never saw this cartridge gets
+/// `REASON_SERIAL_UNREGISTERED`, which is the honest answer. `volume_id` is
+/// NULL: this path runs against whatever tape is loaded and names none.
+///
+/// The site carries both MAM captures the CLI took before the store opened
+/// (`ContactSite::with_mam_reads`, issue #297), journalled against this
+/// contact when it opens.
 pub fn restore_raw_volume(
     conn: &Connection,
-    config: &Config,
-    device: &str,
     store: &mut dyn Store,
     dest: &Path,
     expect_label: Option<&str>,
-    reads: Option<&MamReads<'_>>,
+    site: ContactSite<'_>,
 ) -> Result<crate::volume::raw::RawRestoreReport> {
-    let mut site = ContactSite::new(
-        config,
-        Operation::RestoreRawVolume,
-        device,
-        Medium::NotAttempted,
-    );
-    if let Some(reads) = reads {
-        site = site.with_mam_reads(reads);
-    }
     let guard = site.open(conn, None);
     let r = crate::volume::raw::restore_raw(store, dest, expect_label);
     // A dump whose checksums did not all verify is how this contact ENDED,
@@ -218,6 +222,7 @@ pub(crate) fn restore_unit_from_store(
     config: &Config,
     unit_name: &str,
     volume_label: &str,
+    version: i64,
     dest_dir: &str,
     store: &mut dyn Store,
     site: ContactSite<'_>,
@@ -240,6 +245,7 @@ pub(crate) fn restore_unit_from_store(
         config,
         unit_name,
         volume_label,
+        version,
         dest_dir,
         store,
         site.medium_serial(),
@@ -254,6 +260,7 @@ fn restore_unit_contacted(
     config: &Config,
     unit_name: &str,
     volume_label: &str,
+    version: i64,
     dest_dir: &str,
     store: &mut dyn Store,
     medium_serial: Option<&str>,
@@ -262,12 +269,10 @@ fn restore_unit_contacted(
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
-    let positions = get_write_positions(conn, unit.id, volume_label)?;
-    if positions.is_empty() {
-        return Err(TapectlError::Other(format!(
-            "no data for unit \"{unit_name}\" on volume \"{volume_label}\""
-        )));
-    }
+    // ONE version's slices (issue #315). The version is resolved by the
+    // caller — `restore_unit` before it opens the drive — and passed here
+    // concretely, so the version counted and the version read are the same.
+    let positions = select_write_positions(conn, unit_name, volume_label, Some(version))?.positions;
 
     // Corroborate at contact (ADR-0012, issue #193), before a scratch
     // directory is made, before a key is loaded and before a single slice is
@@ -359,6 +364,7 @@ fn restore_unit_contacted(
     Ok(RestoreReport {
         unit_name: unit_name.to_string(),
         volume_label: volume_label.to_string(),
+        version,
         slices: positions.len(),
         destination: dest_dir.to_string(),
         dry_run: false,
@@ -535,6 +541,7 @@ pub fn restore_file(
     dest_dir: &str,
     device: &str,
     block_size: usize,
+    version: Option<i64>,
 ) -> Result<()> {
     // First do a full restore to a temp dir, then extract the single file
     let tmp = tempfile::tempdir().map_err(|e| TapectlError::Other(e.to_string()))?;
@@ -549,6 +556,7 @@ pub fn restore_file(
         &tmp_path,
         device,
         block_size,
+        version,
         false,
     )?;
 
@@ -605,6 +613,9 @@ fn place_restored_entry(source: &Path, meta: &fs::Metadata, dest: &Path) -> Resu
 pub struct RestoreReport {
     pub unit_name: String,
     pub volume_label: String,
+    /// The snapshot version restored (or that would be) — the newest on the
+    /// volume unless `--version` named one (issue #315).
+    pub version: i64,
     pub slices: usize,
     pub destination: String,
     pub dry_run: bool,
@@ -612,21 +623,79 @@ pub struct RestoreReport {
     pub success: bool,
 }
 
-struct WritePositionInfo {
-    slice_number: i64,
-    position: String,
-    sha256_plain: String,
-    sha256_encrypted: String,
-    encrypted_bytes: i64,
+/// One slice of the selected version, as restore reads it off the volume.
+#[derive(Debug, Clone)]
+pub struct WritePositionInfo {
+    /// The stage set this slice belongs to — one stage set is one snapshot
+    /// version's complete dar archive (issue #315).
+    pub stage_set_id: i64,
+    pub slice_number: i64,
+    /// `write_positions.position` — the tape file number, not the slice
+    /// number.
+    pub position: String,
+    pub sha256_plain: String,
+    pub sha256_encrypted: String,
+    pub encrypted_bytes: i64,
 }
 
-fn get_write_positions(
+/// Exactly ONE snapshot version of a unit on one volume, and its slices —
+/// what `restore unit` / `restore file` read (issue #315).
+#[derive(Debug, Clone)]
+pub struct RestoreSelection {
+    /// `snapshots.version` of the selected stage set.
+    pub version: i64,
+    pub stage_set_id: i64,
+    /// Every version of this unit with written slices on this volume,
+    /// ascending — what a refusal names, and what an operator can pass to
+    /// `--version`.
+    pub versions_on_volume: Vec<i64>,
+    /// The selected stage set's slices, in slice order.
+    pub positions: Vec<WritePositionInfo>,
+}
+
+/// Select the ONE snapshot version of `unit_name` to restore from
+/// `volume_label`, and return its slices (issue #315).
+///
+/// A volume can carry the same unit in several snapshot versions — every
+/// staged stage set rides the same write — and the query this replaced had
+/// no version filter at all: it returned every version's slices, each was
+/// decrypted to `restore.{slice_number}.dar`, and a later version's slice N
+/// overwrote an earlier one's, handing `dar` a mix. RESTORE.sh had already
+/// been fixed for the same defect (`AWK_SELECT_VERSION`, issue #131); this
+/// applies the SAME rule so the two restore paths cannot disagree:
+///
+/// - **`version: None`** — the highest `snapshots.version` of the unit that
+///   has written slices on this volume (AWK: the `[[units]]` block with the
+///   greatest `snapshot_version`).
+/// - **`version: Some(n)`** — exactly version `n` (AWK: `want`). A version
+///   not on the volume is REFUSED, naming the versions that are; AWK prints
+///   nothing in that case and RESTORE.sh reports it.
+/// - No snapshot-status filter, as AWK has none: a superseded or reclaimable
+///   version that is physically on the tape stays restorable.
+///
+/// **Two stage sets of one version on one volume** is not reachable through
+/// the CLI: `writes` is `UNIQUE(stage_set_id, volume_id)`, and `stage create
+/// --version` refuses while any stage set of that version still has live
+/// slices, so two sets of one version are never staged together into one
+/// write session. It is resolved deterministically anyway, by the highest
+/// `stage_sets.id` (the later staging): each stage set is a complete archive
+/// of the same snapshot, so either is a correct restore, and mixing them is
+/// the one wrong answer. AWK breaks the same tie by manifest order (`>=`
+/// keeps the last block), which is equally arbitrary; any deterministic
+/// choice of ONE set matches it in what matters.
+pub fn select_write_positions(
     conn: &Connection,
-    unit_id: i64,
+    unit_name: &str,
     volume_label: &str,
-) -> Result<Vec<WritePositionInfo>> {
+    want: Option<i64>,
+) -> Result<RestoreSelection> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    // Every (version, stage set) of this unit with written slices on this
+    // volume — newest version first, later stage set first within one.
     let mut stmt = conn.prepare(
-        "SELECT sl.slice_number, wp.position, sl.sha256_plain, sl.sha256_encrypted, sl.encrypted_bytes
+        "SELECT DISTINCT s.version, ss.id
          FROM write_positions wp
          JOIN writes w ON w.id = wp.write_id
          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
@@ -634,17 +703,74 @@ fn get_write_positions(
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN volumes v ON v.id = w.volume_id
          WHERE s.unit_id = ?1 AND v.label = ?2 AND w.status = 'completed' AND wp.status = 'written'
+         ORDER BY s.version DESC, ss.id DESC",
+    )?;
+    let candidates = stmt
+        .query_map(params![unit.id, volume_label], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if candidates.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "no data for unit \"{unit_name}\" on volume \"{volume_label}\""
+        )));
+    }
+
+    let mut versions_on_volume: Vec<i64> = candidates.iter().map(|(v, _)| *v).collect();
+    versions_on_volume.sort_unstable();
+    versions_on_volume.dedup();
+
+    // `candidates` is ordered newest-first, so the first match is the pick.
+    let picked = match want {
+        None => candidates.first(),
+        Some(want) => candidates.iter().find(|(v, _)| *v == want),
+    };
+    let Some(&(version, stage_set_id)) = picked else {
+        let listed: Vec<String> = versions_on_volume.iter().map(i64::to_string).collect();
+        return Err(TapectlError::Other(format!(
+            "unit \"{unit_name}\" has no version {} on volume \"{volume_label}\"; \
+             version(s) on it: {} — pass one of those with --version",
+            want.unwrap_or_default(),
+            listed.join(", "),
+        )));
+    };
+
+    let positions = get_write_positions(conn, stage_set_id, volume_label)?;
+    Ok(RestoreSelection {
+        version,
+        stage_set_id,
+        versions_on_volume,
+        positions,
+    })
+}
+
+/// The written slices of ONE stage set on one volume, in slice order.
+fn get_write_positions(
+    conn: &Connection,
+    stage_set_id: i64,
+    volume_label: &str,
+) -> Result<Vec<WritePositionInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT sl.slice_number, wp.position, sl.sha256_plain, sl.sha256_encrypted, sl.encrypted_bytes,
+                sl.stage_set_id
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE sl.stage_set_id = ?1 AND v.label = ?2 AND w.status = 'completed' AND wp.status = 'written'
          ORDER BY sl.slice_number",
     )?;
 
     let rows = stmt
-        .query_map(params![unit_id, volume_label], |row| {
+        .query_map(params![stage_set_id, volume_label], |row| {
             Ok(WritePositionInfo {
                 slice_number: row.get(0)?,
                 position: row.get(1)?,
                 sha256_plain: row.get(2)?,
                 sha256_encrypted: row.get(3)?,
                 encrypted_bytes: row.get(4)?,
+                stage_set_id: row.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -732,6 +858,7 @@ mod tests {
             .unwrap();
 
         let wp = WritePositionInfo {
+            stage_set_id: 1,
             slice_number: 1,
             position: "0".to_string(),
             sha256_plain,
@@ -882,6 +1009,7 @@ mod tests {
             &dest_str,
             "/dev/null",
             524288,
+            None,
             false,
         );
 
@@ -1103,6 +1231,224 @@ mod tests {
         assert!(std::fs::symlink_metadata(&dest).unwrap().is_symlink());
     }
 
+    /// Issue #315: one volume can carry the SAME unit in several snapshot
+    /// versions — every staged stage set rides the same write. Restore must
+    /// select exactly ONE version's slices, the newest by default (the rule
+    /// RESTORE.sh's `AWK_SELECT_VERSION` applies), never the union.
+    mod version_selection {
+        use super::*;
+
+        pub(super) struct TwoVersions {
+            pub conn: Connection,
+            /// `stage_sets.id` of v1 (three slices) and v2 (one slice).
+            pub v1_set: i64,
+            pub v2_set: i64,
+        }
+
+        /// The seed-8 shape in miniature: `big` v1 with THREE slices and v2
+        /// with ONE, both completed writes on `VOL-PM4`, positions 8..10 and
+        /// 11. Different slice counts on purpose — a mix of the two is then
+        /// visible in the count as well as in the stage-set ids.
+        pub(super) fn two_versions_on_one_volume() -> TwoVersions {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tenant_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('big', 'big', ?1, 'mtime_size', 1, 'active')",
+                params![tenant_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('VOL-PM4', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                [],
+            )
+            .unwrap();
+            let volume_id = conn.last_insert_rowid();
+
+            let mut next_position = 8;
+            let mut add_version = |version: i64, slices: i64| -> i64 {
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                     VALUES (?1, ?2, 'staged', '/tmp', 1, 16)",
+                    params![unit_id, version],
+                )
+                .unwrap();
+                let snap_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                    params![snap_id],
+                )
+                .unwrap();
+                let ss_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss_id, snap_id, volume_id],
+                )
+                .unwrap();
+                let write_id = conn.last_insert_rowid();
+                for n in 1..=slices {
+                    conn.execute(
+                        "INSERT INTO stage_slices
+                            (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+                         VALUES (?1, ?2, 16, 16, 'aa', 'bb')",
+                        params![ss_id, n],
+                    )
+                    .unwrap();
+                    let slice_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO write_positions (write_id, stage_slice_id, position, status, sha256_on_volume)
+                         VALUES (?1, ?2, ?3, 'written', 'bb')",
+                        params![write_id, slice_id, next_position.to_string()],
+                    )
+                    .unwrap();
+                    next_position += 1;
+                }
+                ss_id
+            };
+            let v1_set = add_version(1, 3);
+            let v2_set = add_version(2, 1);
+            TwoVersions {
+                conn,
+                v1_set,
+                v2_set,
+            }
+        }
+
+        /// The defect itself: with no version named, the positions returned
+        /// are exactly v2's one slice — not v1's three plus v2's one, which
+        /// the scratch-dir naming (`restore.{slice_number}.dar`) collapsed
+        /// into v2's slice 1 followed by v1's slices 2..3.
+        #[test]
+        fn the_default_selects_only_the_newest_versions_slices() {
+            let f = two_versions_on_one_volume();
+            // Positive control: the fixture really does carry both versions'
+            // positions on the one volume — four written positions in all.
+            let all: i64 = f
+                .conn
+                .query_row("SELECT COUNT(*) FROM write_positions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(all, 4);
+            assert_ne!(f.v1_set, f.v2_set);
+
+            let sel = select_write_positions(&f.conn, "big", "VOL-PM4", None).unwrap();
+            assert_eq!(sel.version, 2);
+            assert_eq!(sel.stage_set_id, f.v2_set);
+            assert_eq!(sel.versions_on_volume, vec![1, 2]);
+            let sets: Vec<i64> = sel.positions.iter().map(|p| p.stage_set_id).collect();
+            assert_eq!(sets, vec![f.v2_set], "only v2's one slice may be read");
+            assert_eq!(sel.positions[0].position, "11");
+        }
+
+        /// `--version 1` selects exactly v1's three slices, in slice order,
+        /// at v1's positions — and none of v2's.
+        #[test]
+        fn an_explicit_version_selects_exactly_that_versions_slices() {
+            let f = two_versions_on_one_volume();
+            let sel = select_write_positions(&f.conn, "big", "VOL-PM4", Some(1)).unwrap();
+            assert_eq!(sel.version, 1);
+            assert_eq!(sel.stage_set_id, f.v1_set);
+            let rows: Vec<(i64, i64, &str)> = sel
+                .positions
+                .iter()
+                .map(|p| (p.stage_set_id, p.slice_number, p.position.as_str()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(f.v1_set, 1, "8"), (f.v1_set, 2, "9"), (f.v1_set, 3, "10")]
+            );
+        }
+
+        /// A version the volume does not carry is refused, and the refusal
+        /// names the versions it DOES carry.
+        #[test]
+        fn a_version_not_on_the_volume_is_refused_naming_the_ones_that_are() {
+            let f = two_versions_on_one_volume();
+            let err = select_write_positions(&f.conn, "big", "VOL-PM4", Some(9))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no version 9"), "{err}");
+            assert!(err.contains("VOL-PM4"), "{err}");
+            assert!(err.contains("1, 2"), "{err}");
+        }
+
+        /// A unit with nothing on the volume keeps its old message.
+        #[test]
+        fn a_unit_with_nothing_on_the_volume_says_so() {
+            let f = two_versions_on_one_volume();
+            let err = select_write_positions(&f.conn, "big", "ELSEWHERE", None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no data for unit \"big\""), "{err}");
+        }
+
+        /// The unreachable-through-the-CLI tie (two stage sets of ONE version
+        /// on one volume) still selects ONE set — the later one — never both.
+        #[test]
+        fn two_stage_sets_of_one_version_select_the_later_set_only() {
+            let f = two_versions_on_one_volume();
+            // Re-point v1's stage set at v2's snapshot: now both sets are v2.
+            let v2_snap: i64 = f
+                .conn
+                .query_row(
+                    "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                    params![f.v2_set],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            f.conn
+                .execute(
+                    "UPDATE stage_sets SET snapshot_id = ?1 WHERE id = ?2",
+                    params![v2_snap, f.v1_set],
+                )
+                .unwrap();
+            let sel = select_write_positions(&f.conn, "big", "VOL-PM4", None).unwrap();
+            assert_eq!(sel.version, 2);
+            assert!(f.v2_set > f.v1_set);
+            assert_eq!(sel.stage_set_id, f.v2_set);
+            assert!(sel.positions.iter().all(|p| p.stage_set_id == f.v2_set));
+            assert_eq!(sel.positions.len(), 1);
+        }
+
+        /// The wiring: `restore_unit --dry-run` counts the SELECTED version's
+        /// slices — 1 for the default (v2), 3 for `--version 1` — where the
+        /// unfiltered query counted all 4. A refused version fails the dry
+        /// run too, before any drive is touched.
+        #[test]
+        fn restore_unit_dry_run_counts_only_the_selected_version() {
+            let f = two_versions_on_one_volume();
+            let home = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(home.path().join(".tapectl"));
+            let run = |v: Option<i64>| {
+                restore_unit(
+                    &f.conn,
+                    &paths,
+                    &Config::default(),
+                    "big",
+                    "VOL-PM4",
+                    "/nonexistent/tapectl-dry-run-dest",
+                    "/nonexistent/tapectl-dry-run-nst",
+                    524288,
+                    v,
+                    true,
+                )
+            };
+            let newest = run(None).unwrap();
+            assert_eq!((newest.version, newest.slices), (2, 1));
+            let v1 = run(Some(1)).unwrap();
+            assert_eq!((v1.version, v1.slices), (1, 3));
+            let err = run(Some(3)).unwrap_err().to_string();
+            assert!(err.contains("no version 3"), "{err}");
+        }
+    }
+
     /// Restore is a contact (ADR-0012, issue #193) and corroborates before it
     /// makes a scratch directory, loads a key or reads a slice. Proves only
     /// that the CALL happens — the rule's own branches are drilled in
@@ -1213,6 +1559,7 @@ mod tests {
                 &Config::default(),
                 "r-unit",
                 "RESTORE-WANT",
+                1,
                 &dest.path().to_string_lossy(),
                 &mut store,
                 site(Operation::RestoreUnit),
@@ -1246,6 +1593,7 @@ mod tests {
                 &Config::default(),
                 "r-unit",
                 "RESTORE-OK",
+                1,
                 &dest.path().to_string_lossy(),
                 &mut store,
                 site(Operation::RestoreUnit),
@@ -1279,6 +1627,7 @@ mod tests {
                 &Config::default(),
                 "rc-unit",
                 "RC-WANT",
+                1,
                 &dest.path().to_string_lossy(),
                 &mut store,
                 site(Operation::RestoreUnit),
@@ -1324,6 +1673,7 @@ mod tests {
                 &Config::default(),
                 "rc-unit",
                 "RC-OK",
+                1,
                 &dest.path().to_string_lossy(),
                 &mut store,
                 site(Operation::RestoreUnit),
@@ -1339,47 +1689,136 @@ mod tests {
             assert_eq!(only_contact(&conn).0, "restore unit");
         }
 
-        /// `restore raw-volume` — the heir/DR path (ADR-0005). It reads no
-        /// MAM at all, so `cartridge_id` is NULL; the contact is recorded
-        /// anyway, because a contact is a physical fact whether or not the
-        /// cartridge could be identified, and `identity_reason` says WHICH
-        /// of the five reasons the NULL is rather than leaving a silent
-        /// absence.
-        #[test]
-        fn restore_raw_volume_records_a_contact_that_attempted_no_mam_read() {
-            let conn = crate::db::open_memory().unwrap();
+        /// `(outcome, cartridge_id, volume_id, backend_name, identity_reason)`.
+        type RawRow = (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        );
+
+        /// `restore raw-volume`'s contact row after `restore_raw_volume`
+        /// over `store`: `(outcome, cartridge_id, volume_id, backend_name,
+        /// identity_reason)`. The dump itself fails — `tape_labelled` writes
+        /// File 0 only and `restore_raw` needs the front index at File 3 —
+        /// which is beside the point: recording the contact must not depend
+        /// on the dump succeeding.
+        fn raw_volume_contact(conn: &Connection, config: &Config, medium: Medium<'_>) -> RawRow {
             let mut store = tape_labelled("RAW-VOL");
             let dest = TempDir::new().unwrap();
-
-            // The dump itself fails: `tape_labelled` writes File 0 only, and
-            // `restore_raw` needs the front index at File 3. That is beside
-            // the point here — the contact is what is being asserted, and
-            // recording it must not depend on the dump succeeding.
             let _ = restore_raw_volume(
-                &conn,
-                &Config::default(),
-                "/nonexistent/tapectl-contact-test-nst",
+                conn,
                 &mut store,
                 dest.path(),
                 None,
-                None,
+                ContactSite::new(config, Operation::RestoreRawVolume, "/dev/null", medium),
             );
+            assert_eq!(only_contact(conn).0, "restore raw-volume");
+            conn.query_row(
+                "SELECT outcome, cartridge_id, volume_id, backend_name, identity_reason
+                 FROM cartridge_contacts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        }
 
-            let (operation, outcome) = only_contact(&conn);
-            assert_eq!(operation, "restore raw-volume");
+        fn lto0() -> crate::config::LtoBackendConfig {
+            crate::config::LtoBackendConfig {
+                name: "lto0".to_string(),
+                device_tape: "/dev/null".to_string(),
+                device_sg: "/dev/sg-nonexistent".to_string(),
+                generation: "LTO-6".to_string(),
+                capacity_override: None,
+                usable_capacity_factor: 0.95,
+                enospc_buffer: "1GiB".to_string(),
+            }
+        }
+
+        /// Issue #316: where the CLI read the MAM, the contact says what the
+        /// read found — not `REASON_MAM_NOT_ATTEMPTED`, which denied a read
+        /// the journal recorded. The serial is on no registered cartridge
+        /// (a DR catalog that never saw this tape), so the reason is
+        /// `REASON_SERIAL_UNREGISTERED`, and the backend the read went
+        /// through is recorded.
+        #[test]
+        fn restore_raw_volume_contact_reflects_the_mam_read_the_cli_took() {
+            let conn = crate::db::open_memory().unwrap();
+            let backend = lto0();
+            let mut config = Config::default();
+            config.backends.lto.push(backend.clone());
+            let mam = crate::tape::mam::MamInfo {
+                serial: Some("RAWSERIAL01".to_string()),
+                load_count: Some(12),
+                ..Default::default()
+            };
+
+            let (outcome, cartridge, volume, backend_name, reason) = raw_volume_contact(
+                &conn,
+                &config,
+                Medium::Observed {
+                    backend: &backend,
+                    mam: &mam,
+                },
+            );
             assert_eq!(outcome.as_deref(), Some("failed"));
-            let (cartridge, volume, reason): (Option<i64>, Option<i64>, Option<String>) = conn
-                .query_row(
-                    "SELECT cartridge_id, volume_id, identity_reason FROM cartridge_contacts",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .unwrap();
-            assert_eq!(cartridge, None, "this path reads no serial at all");
-            assert_eq!(volume, None, "and runs against whatever tape is loaded");
-            assert_eq!(
+            assert_ne!(
                 reason.as_deref(),
                 Some(crate::tape::contact::REASON_MAM_NOT_ATTEMPTED),
+                "the contact denies the MAM read the CLI took (issue #316)"
+            );
+            assert_eq!(
+                reason.as_deref(),
+                Some(crate::tape::contact::REASON_SERIAL_UNREGISTERED)
+            );
+            assert_eq!(backend_name.as_deref(), Some("lto0"));
+            assert_eq!(
+                cartridge, None,
+                "no registered cartridge carries that serial"
+            );
+            assert_eq!(
+                volume, None,
+                "raw-volume runs against whatever tape is loaded"
+            );
+
+            // And a registered serial names its cartridge: the read is used.
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, serial_number, nominal_capacity)
+                 VALUES ('RAW001L6', 'LTO-6', 'RAWSERIAL01', 2500000000000)",
+                [],
+            )
+            .unwrap();
+            let cid = conn.last_insert_rowid();
+            let (_, cartridge, _, _, reason) = raw_volume_contact(
+                &conn,
+                &config,
+                Medium::Observed {
+                    backend: &backend,
+                    mam: &mam,
+                },
+            );
+            assert_eq!(cartridge, Some(cid));
+            assert_eq!(reason, None);
+        }
+
+        /// Positive control for the assertion above: the reason column is
+        /// live on this path. With no backend configured no MAM read
+        /// happens, and the contact says exactly that — by value, so the
+        /// `assert_ne!` above cannot pass on a column that is never written.
+        #[test]
+        fn restore_raw_volume_contact_with_no_backend_says_no_read_happened() {
+            let conn = crate::db::open_memory().unwrap();
+            let (outcome, cartridge, volume, backend_name, reason) =
+                raw_volume_contact(&conn, &Config::default(), Medium::NoBackend);
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert_eq!(cartridge, None);
+            assert_eq!(volume, None);
+            assert_eq!(backend_name, None);
+            assert_eq!(
+                reason.as_deref(),
+                Some(crate::tape::contact::REASON_NO_BACKEND_CONFIGURED),
                 "a NULL cartridge_id with no reason is the data loss #296 exists to stop"
             );
         }

@@ -1359,7 +1359,7 @@ fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
     // this test's own tempdir path, so it never actually checked the slice
     // count -- a wrong count (0, or any other digit sequence not literally
     // "1") would still pass. `src/cli/restore.rs`'s dry-run branch format is
-    // `"would restore \"{}\" from {} ({} slices) to {}"`, and this fixture
+    // `"would restore \"{}\" v{} from {} ({} slices) to {}"`, and this fixture
     // wrote exactly one `write_positions` row, so the real preview must
     // name it as "(1 slices)".
     assert!(

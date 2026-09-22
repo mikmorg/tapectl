@@ -25,6 +25,12 @@ pub enum RestoreCommands {
         /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
+        /// Snapshot version to restore. Defaults to the newest version of
+        /// the unit on this volume (the same rule RESTORE.sh applies); a
+        /// version the volume does not carry is refused, naming the ones it
+        /// does (issue #315)
+        #[arg(long)]
+        version: Option<i64>,
         /// Show what would be restored without restoring
         #[arg(long)]
         dry_run: bool,
@@ -48,6 +54,12 @@ pub enum RestoreCommands {
         /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
+        /// Snapshot version to restore. Defaults to the newest version of
+        /// the unit on this volume (the same rule RESTORE.sh applies); a
+        /// version the volume does not carry is refused, naming the ones it
+        /// does (issue #315)
+        #[arg(long)]
+        version: Option<i64>,
     },
 
     /// Dump every file off a tape verbatim, using only what is on the tape
@@ -87,6 +99,7 @@ pub fn run(
             from,
             to,
             device,
+            version,
             dry_run,
         } => {
             let device = crate::cli::read_device(config, device.as_deref())?;
@@ -99,6 +112,7 @@ pub fn run(
                 to,
                 &device,
                 DEFAULT_BLOCK_SIZE,
+                *version,
                 *dry_run,
             )?;
 
@@ -108,6 +122,7 @@ pub fn run(
                     serde_json::json!({
                         "unit": report.unit_name,
                         "volume": report.volume_label,
+                        "version": report.version,
                         "slices": report.slices,
                         "destination": report.destination,
                         "dry_run": report.dry_run,
@@ -115,13 +130,21 @@ pub fn run(
                 );
             } else if report.dry_run {
                 println!(
-                    "would restore \"{}\" from {} ({} slices) to {}",
-                    report.unit_name, report.volume_label, report.slices, report.destination,
+                    "would restore \"{}\" v{} from {} ({} slices) to {}",
+                    report.unit_name,
+                    report.version,
+                    report.volume_label,
+                    report.slices,
+                    report.destination,
                 );
             } else {
                 println!(
-                    "restored \"{}\" from {} ({} slices) to {}",
-                    report.unit_name, report.volume_label, report.slices, report.destination,
+                    "restored \"{}\" v{} from {} ({} slices) to {}",
+                    report.unit_name,
+                    report.version,
+                    report.volume_label,
+                    report.slices,
+                    report.destination,
                 );
             }
         }
@@ -132,6 +155,7 @@ pub fn run(
             from,
             to,
             device,
+            version,
         } => {
             // Issue #241: unlike `restore unit`, this has no cheap
             // preview yet — a faithful one would need to confirm the
@@ -157,6 +181,7 @@ pub fn run(
                 to,
                 &device,
                 DEFAULT_BLOCK_SIZE,
+                *version,
             )?;
 
             if json_output {
@@ -187,27 +212,34 @@ pub fn run(
             // Issue #166: refuse before the store is opened if this drive
             // cannot read the loaded medium. Proceeds silently with no
             // configured backend — this is the heir/DR path, ADR-0005.
-            // Its MAM capture is held and journalled against the contact
+            // Both MAM captures are held and journalled against the contact
             // `restore_raw_volume` opens (issue #297).
             let reads = crate::tape::mam_journal::MamReads::new(
                 conn,
                 crate::tape::contact::Operation::RestoreRawVolume,
             );
             reads.check_read_contact(config, &device)?;
+            // The second read, as on every read path (ADR-0013 §5): the
+            // contact records what the chip said rather than denying a read
+            // happened (issue #316). Before `TapeStore::open_read` — the st
+            // driver refuses a second concurrent open. LENIENT: no backend
+            // yields `None`, recorded as no read at all. Nothing refuses on
+            // it; this path corroborates nothing (ADR-0005).
+            let observed = crate::volume::binding::loaded_medium(config, &device, &reads);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             // Through `volume::restore` rather than `volume::raw` directly:
             // `raw::restore_raw` stays `Connection`-free (it is what an heir
             // runs with no catalog at all), and the contact record is
             // bookkeeping ABOUT the dump, not part of it.
-            let report = volume::restore::restore_raw_volume(
-                conn,
+            let site = crate::tape::contact::ContactSite::new(
                 config,
+                crate::tape::contact::Operation::RestoreRawVolume,
                 &device,
-                &mut store,
-                dest,
-                from.as_deref(),
-                Some(&reads),
-            )?;
+                crate::tape::contact::Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+            )
+            .with_mam_reads(&reads);
+            let report =
+                volume::restore::restore_raw_volume(conn, &mut store, dest, from.as_deref(), site)?;
 
             if json_output {
                 let files: Vec<_> = report

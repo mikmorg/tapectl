@@ -8,8 +8,8 @@
 //! simpler than the artifact — it would keep passing after a change to the
 //! real packing broke every real tape.
 //!
-//! The load-bearing assertion is `restore_resolution_query`: the *verbatim*
-//! join `volume::restore::restore_unit` uses. A rebuild that inserts rows
+//! The load-bearing assertion is `restore_resolution_query`: the very
+//! resolution `volume::restore::restore_unit` performs. A rebuild that inserts rows
 //! which merely look plausible but do not satisfy that query has rebuilt
 //! nothing an operator can restore from.
 
@@ -437,40 +437,22 @@ fn fresh_db(dir: &Path) -> rusqlite::Connection {
     db::open(&dir.join("rebuilt.db")).unwrap()
 }
 
-/// The VERBATIM resolution join from `volume::restore::restore_unit`. The
-/// point of copying it rather than paraphrasing: a rebuild is only useful if
-/// this exact query finds the slices.
+/// The resolution `volume::restore::restore_unit` itself performs — called,
+/// not copied. The point: a rebuild is only useful if restore's own
+/// selection finds the slices. This used to be a verbatim copy of the join;
+/// issue #315 put a version selection in front of it
+/// (`select_write_positions`), and a copy would have kept passing against a
+/// query restore no longer runs.
 fn restore_resolution_query(
     conn: &rusqlite::Connection,
     unit_name: &str,
 ) -> Vec<(i64, String, String)> {
-    let unit_id: i64 = conn
-        .query_row(
-            "SELECT id FROM units WHERE name = ?1",
-            rusqlite::params![unit_name],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|e| panic!("rebuilt catalog has no unit {unit_name}: {e}"));
-    let mut stmt = conn
-        .prepare(
-            "SELECT sl.slice_number, wp.position, sl.sha256_plain
-             FROM write_positions wp
-             JOIN writes w ON w.id = wp.write_id
-             JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-             JOIN stage_sets ss ON ss.id = sl.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             JOIN volumes v ON v.id = w.volume_id
-             WHERE s.unit_id = ?1 AND v.label = ?2 AND w.status = 'completed'
-               AND wp.status = 'written'
-             ORDER BY sl.slice_number",
-        )
-        .unwrap();
-    stmt.query_map(rusqlite::params![unit_id, LABEL], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-    })
-    .unwrap()
-    .map(|r| r.unwrap())
-    .collect()
+    tapectl::volume::restore::select_write_positions(conn, unit_name, LABEL, None)
+        .unwrap_or_else(|e| panic!("restore cannot resolve {unit_name} on {LABEL}: {e}"))
+        .positions
+        .into_iter()
+        .map(|p| (p.slice_number, p.position, p.sha256_plain))
+        .collect()
 }
 
 fn rebuild(

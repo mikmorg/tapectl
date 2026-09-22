@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-file \- Restore a single file from a unit
 .SH SYNOPSIS
-\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-to\fR> [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-device\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-to\fR> [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-device\fR] [\fB\-\-home\fR] [\fB\-\-version\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Restore a single file from a unit
 .SH OPTIONS
@@ -45,6 +45,9 @@ Tape device (by\-id path). Defaults to the only configured drive; required when 
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
 Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+.TP
+\fB\-\-version\fR \fI<VERSION>\fR
+Snapshot version to restore. Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does (issue #315)
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

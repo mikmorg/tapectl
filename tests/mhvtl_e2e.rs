@@ -414,6 +414,7 @@ fn restore_to(h: &Harness, unit_name: &str, label: &str, dest: &Path) {
         &dest.to_string_lossy(),
         &tape_dev(),
         BLOCK_SIZE,
+        None,
         false,
     )
     .unwrap();
@@ -622,6 +623,7 @@ fn mhvtl_tenant_isolation() {
         &bob_via_op.to_string_lossy(),
         &tape_dev(),
         BLOCK_SIZE,
+        None,
         false,
     )
     .expect("operator key must still recover bob-u — operator is a recipient on every slice");
@@ -640,6 +642,7 @@ fn mhvtl_tenant_isolation() {
         &bob_dest.to_string_lossy(),
         &tape_dev(),
         BLOCK_SIZE,
+        None,
         false,
     );
     assert!(
