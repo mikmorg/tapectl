@@ -1,0 +1,2 @@
+VPD INQUIRY: Unit serial number page
+  Unit serial number: XYZZY_A1
