@@ -335,6 +335,43 @@ pub fn is_sealed_but_unconfirmed(
     )?)
 }
 
+/// True when `volume_label` counts as a Copy RIGHT NOW (issue #280) —
+/// exactly [`eligible`], evaluated for one volume by label rather than
+/// embedded in a larger `JOIN`/aggregate. Built directly from `eligible`'s
+/// own expression, never a second hand-written `status = 'sealed' AND ...`
+/// — that duplication is how issue #96 happened, and this module's header
+/// names `coverage.rs` the sole owner of every `volumes.status` predicate
+/// for exactly that reason.
+///
+/// Exists so `volume verify`'s clean-clear message (the "RETURNED TO
+/// SERVICE" text and its `--json` twin) can say whether the volume it just
+/// cleared `observed_condition` on actually rejoins the coverage count,
+/// without that claim ever being able to drift from what `audit`/`report
+/// copies`/every `min_copies` gate would count for the same volume. Before
+/// this existed, the clean-clear message asserted "it counts as a copy
+/// again" unconditionally — true only while `status = 'sealed'`, and
+/// silently false for a `retired` volume (salvaged after quarantine, then
+/// deliberately retired) or one stuck `initialized` after a confirm that
+/// never reached the sealing `UPDATE` (`session.rs`'s `proves_medium_bad`
+/// arm) — both real, reachable states where "returned to service" is a lie
+/// an operator would read as a durability guarantee.
+///
+/// A clean clear only ever sets `observed_condition = 'ok'`
+/// (`clear_condition_on_clean_full_verify`), so after one runs this reduces
+/// to "is `status = 'sealed'`" — but the call site must not hand-derive
+/// that either; it asks this function, exactly as every other copy-counting
+/// call site asks [`eligible`].
+pub fn counts_as_copy(conn: &Connection, volume_label: &str) -> crate::error::Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM volumes WHERE label = ?1 AND {})",
+            eligible("volumes")
+        ),
+        params![volume_label],
+        |row| row.get(0),
+    )?)
+}
+
 // ── Deposit-aware copy / location derivations (issue #73, ADR-0006) ──
 
 /// Which slice of a unit's coverage a derivation is asking about.
@@ -1895,6 +1932,71 @@ pub(crate) mod tests {
             count, 0,
             "an unconfirmed volume must not count as a copy, or `audit`/`report copies` \
              would overstate coverage this unit does not have"
+        );
+    }
+
+    // ── counts_as_copy (issue #280) ──
+    //
+    // `volume verify`'s clean-clear message needs a per-volume answer to
+    // "does this count as a copy right now", built from `eligible` rather
+    // than a second hand-written status check. These four cases are the
+    // ones the message itself must distinguish: `setup_at_stake`'s `HERE`
+    // volume is built `status = 'sealed'`, `observed_condition = 'ok'`
+    // (migration 017's default) — each test mutates exactly the column(s)
+    // its name says and nothing else, so a failure here points at exactly
+    // one column's handling.
+
+    #[test]
+    fn counts_as_copy_is_true_for_a_sealed_volume_in_ok_condition() {
+        let (conn, _unit_id, _here) = setup_at_stake(false);
+        assert!(
+            counts_as_copy(&conn, "HERE").unwrap(),
+            "a sealed, ok-condition volume is exactly what `eligible` admits"
+        );
+    }
+
+    #[test]
+    fn counts_as_copy_is_false_for_a_retired_volume() {
+        let (conn, _unit_id, here) = setup_at_stake(false);
+        conn.execute(
+            "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+            params![here],
+        )
+        .unwrap();
+        assert!(
+            !counts_as_copy(&conn, "HERE").unwrap(),
+            "a retired volume is not `sealed`, so `eligible` excludes it and this must too"
+        );
+    }
+
+    #[test]
+    fn counts_as_copy_is_false_for_an_initialized_volume() {
+        let (conn, _unit_id, here) = setup_at_stake(false);
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized' WHERE id = ?1",
+            params![here],
+        )
+        .unwrap();
+        assert!(
+            !counts_as_copy(&conn, "HERE").unwrap(),
+            "an `initialized` volume (never sealed, or sealed-but-unconfirmed per issue \
+             #276) is not a Copy under ADR-0004"
+        );
+    }
+
+    #[test]
+    fn counts_as_copy_is_false_for_a_sealed_but_quarantined_volume() {
+        let (conn, _unit_id, here) = setup_at_stake(false);
+        conn.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+            params![here],
+        )
+        .unwrap();
+        assert!(
+            !counts_as_copy(&conn, "HERE").unwrap(),
+            "`status = 'sealed'` alone is not enough -- `eligible` also requires \
+             `observed_condition = 'ok'`, and this is the case a clean verify's clear is \
+             about to fix"
         );
     }
 }
