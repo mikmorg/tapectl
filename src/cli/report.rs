@@ -1002,16 +1002,46 @@ fn report_pending(conn: &Connection, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn report_verify_status(
+/// One row of `report verify-status`: one volume's verification session —
+/// or, issue #293, the volume itself with no session at all. `outcome` is
+/// the never-verified discriminator: it is NOT NULL on every real session
+/// (schema default `'in_progress'`), so `None` here can only come from the
+/// LEFT JOIN finding no session row.
+type VerifyStatusRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// The query behind `report verify-status`, split out from the printing
+/// (the same split `dirty_rows`/`report_dirty` use) so the FROM/JOIN shape
+/// and the ordering can be asserted on directly rather than through
+/// captured stdout.
+fn verify_status_rows(
     conn: &Connection,
     volume_filter: Option<&str>,
-    json_output: bool,
-) -> Result<()> {
+) -> Result<Vec<VerifyStatusRow>> {
+    // Issue #293: drive FROM volumes with a LEFT JOIN, not FROM
+    // verification_sessions with an INNER JOIN. A volume with zero sessions
+    // must still appear — that is the never-verified case this report
+    // exists to surface — so it cannot be excluded by requiring a session
+    // row to exist.
+    //
+    // Multiplicity: a volume with several sessions still produces one row
+    // per session (unchanged from before) — the LEFT JOIN only adds the
+    // single synthetic NULL-session row for a volume with none. This is a
+    // deliberate choice, not an oversight: collapsing to one row per volume
+    // would hide exactly the history (repeated failures, improving trend)
+    // this report is for.
     let mut sql = String::from(
         "SELECT v.label, vs.verify_type, vs.outcome, vs.completed_at,
                 vs.slices_checked, vs.slices_passed, vs.slices_failed
-         FROM verification_sessions vs
-         JOIN volumes v ON v.id = vs.volume_id
+         FROM volumes v
+         LEFT JOIN verification_sessions vs ON vs.volume_id = v.id
          WHERE 1=1",
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1019,21 +1049,21 @@ fn report_verify_status(
         sql.push_str(" AND v.label = ?");
         param_values.push(Box::new(label.to_string()));
     }
-    sql.push_str(" ORDER BY vs.completed_at DESC");
+    // Oldest evidence first (docs/operator-guide.md: "verification recency,
+    // oldest first"), never-verified first of all: a NULL `completed_at` is
+    // the oldest possible evidence, not the newest, so the leading
+    // `(completed_at IS NOT NULL)` key sorts every NULL row ahead of every
+    // real timestamp, and `completed_at ASC` then orders the real
+    // timestamps oldest-first behind them. `v.label` breaks ties
+    // deterministically: several never-verified volumes all share a NULL
+    // `completed_at`, and a report an operator reads twice must not
+    // reorder itself between runs.
+    sql.push_str(" ORDER BY (vs.completed_at IS NOT NULL) ASC, vs.completed_at ASC, v.label ASC");
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    type Row = (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    );
-    let rows: Vec<Row> = stmt
+    let rows: Vec<VerifyStatusRow> = stmt
         .query_map(params_ref.as_slice(), |row| {
             Ok((
                 row.get(0)?,
@@ -1046,6 +1076,34 @@ fn report_verify_status(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The `--json` element for one `VerifyStatusRow` (issue #293): carries
+/// `never_verified` as its own explicit field rather than leaving a
+/// consumer to infer it from `outcome`/`completed` being null — the whole
+/// point of this fix is that the never-verified case must not depend on
+/// omission to be recognized.
+fn verify_status_row_json(row: &VerifyStatusRow) -> serde_json::Value {
+    let (label, vtype, outcome, completed, checked, passed, failed) = row;
+    serde_json::json!({
+        "volume": label,
+        "never_verified": outcome.is_none(),
+        "type": vtype,
+        "outcome": outcome,
+        "completed": completed,
+        "checked": checked,
+        "passed": passed,
+        "failed": failed
+    })
+}
+
+fn report_verify_status(
+    conn: &Connection,
+    volume_filter: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let rows = verify_status_rows(conn, volume_filter)?;
 
     // Issue #142: the aggregate above says HOW MANY slices failed and never
     // which. `verification_results` now knows, so the most recent failed
@@ -1053,9 +1111,7 @@ fn report_verify_status(
     let latest_failure = latest_failed_session(conn, volume_filter)?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(|(label, vtype, outcome, completed, checked, passed, failed)| {
-            serde_json::json!({"volume": label, "type": vtype, "outcome": outcome, "completed": completed, "checked": checked, "passed": passed, "failed": failed})
-        }).collect();
+        let json: Vec<serde_json::Value> = rows.iter().map(verify_status_row_json).collect();
         // The top level stays the ARRAY it has always been — a consumer that
         // iterates it keeps working — and the detail rides on each element
         // of it, attached to the session it belongs to.
@@ -1080,9 +1136,20 @@ fn report_verify_status(
         }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
-        println!("no verification sessions found");
+        // Now driven FROM volumes (issue #293), this fires only when no
+        // volume matches at all (an empty catalog, or a `--volume` label
+        // with no such volume) — never merely because none has been
+        // verified, since a never-verified volume produces a row of its
+        // own and no longer hides behind this message.
+        println!("no volumes found");
     } else {
         for (label, vtype, outcome, completed, checked, passed, failed) in &rows {
+            if outcome.is_none() {
+                // The line that tells the operator what to verify next —
+                // spelled out, not left as an empty column to interpret.
+                println!("  {label}: never verified");
+                continue;
+            }
             println!(
                 "  {label}: {} {} at {} ({}/{}/{} checked/passed/failed)",
                 vtype.as_deref().unwrap_or("?"),
@@ -1827,6 +1894,166 @@ mod tests {
             let failure = latest_failed_session(&conn, None).unwrap().unwrap();
             assert_eq!(failure.label, "VOL-M");
             assert!(failure.failures.is_empty());
+        }
+    }
+
+    /// Issue #293: `report verify-status` was driven FROM
+    /// `verification_sessions` with an INNER JOIN, so a volume with zero
+    /// sessions produced zero rows — invisible in the one report whose
+    /// entire subject is verification recency — and the results sorted
+    /// `completed_at DESC`, newest evidence first, the opposite of the
+    /// documented contract (`docs/operator-guide.md`: "verification
+    /// recency, oldest first"). These tests exercise `verify_status_rows`
+    /// and `verify_status_row_json` directly, the same split
+    /// `dirty_rows`/`report_dirty` use, so the assertion is on the data,
+    /// not on println formatting.
+    ///
+    /// Every fixture below seeds ONE verified AND ONE never-verified
+    /// volume — a fixture with only verified volumes cannot distinguish
+    /// this fix from the bug it fixes.
+    mod verify_status_never_verified {
+        use super::*;
+
+        /// A volume with one completed, passed verification session.
+        fn seed_verified(conn: &rusqlite::Connection, label: &str, completed_at: &str) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            let vol = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                    (volume_id, verify_type, outcome, completed_at, slices_checked,
+                     slices_passed, slices_failed)
+                 VALUES (?1, 'full', 'passed', ?2, 3, 3, 0)",
+                params![vol, completed_at],
+            )
+            .unwrap();
+        }
+
+        /// A volume with no `verification_sessions` row at all — never
+        /// verified.
+        fn seed_never_verified(conn: &rusqlite::Connection, label: &str) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn a_never_verified_volume_appears_and_sorts_ahead_of_a_verified_one() {
+            let conn = crate::db::open_memory().unwrap();
+            // Label chosen to sort AFTER the verified volume alphabetically,
+            // so a passing test proves the order comes from evidence age
+            // (never-verified first), not from an accidental label sort.
+            seed_verified(&conn, "AAA-VERIFIED", "2020-01-01T00:00:00Z");
+            seed_never_verified(&conn, "ZZZ-NEVER");
+
+            let rows = verify_status_rows(&conn, None).unwrap();
+            assert_eq!(rows.len(), 2, "both volumes must appear");
+            assert_eq!(
+                rows[0].0, "ZZZ-NEVER",
+                "the never-verified volume must sort first despite its label"
+            );
+            assert!(
+                rows[0].2.is_none(),
+                "a never-verified row must carry no outcome"
+            );
+            assert!(
+                rows[0].3.is_none(),
+                "a never-verified row must carry no completed_at"
+            );
+            assert_eq!(rows[1].0, "AAA-VERIFIED");
+            assert_eq!(rows[1].2.as_deref(), Some("passed"));
+            assert_eq!(rows[1].3.as_deref(), Some("2020-01-01T00:00:00Z"));
+        }
+
+        #[test]
+        fn several_never_verified_volumes_tie_break_on_label() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_never_verified(&conn, "VOL-B");
+            seed_never_verified(&conn, "VOL-A");
+
+            let rows = verify_status_rows(&conn, None).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                vec!["VOL-A", "VOL-B"],
+                "a report an operator reads twice must not reorder itself"
+            );
+        }
+
+        /// Half 2 of issue #293 in isolation from half 1: among volumes
+        /// that all HAVE evidence, the ordering must be oldest-`completed_at`
+        /// first, not newest-first (the original `ORDER BY completed_at
+        /// DESC` bug) and not merely alphabetical (which the label
+        /// tie-break alone would satisfy by accident). Labels are chosen so
+        /// alphabetical order disagrees with date order: if either wrong
+        /// ordering slipped back in, this fails where the never-verified
+        /// fixtures above cannot, since those only ever pin one volume's
+        /// position relative to a NULL.
+        #[test]
+        fn among_verified_volumes_the_oldest_evidence_sorts_first() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verified(&conn, "ZZZ-NEW", "2023-06-01T00:00:00Z");
+            seed_verified(&conn, "AAA-OLD", "2020-01-01T00:00:00Z");
+
+            let rows = verify_status_rows(&conn, None).unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                vec!["AAA-OLD", "ZZZ-NEW"],
+                "the 2020 session must sort ahead of the 2023 one, despite \
+                 its label sorting after"
+            );
+        }
+
+        /// `--volume` on a never-verified volume must find it — driving FROM
+        /// volumes fixes this for free, since the row exists whether or not
+        /// a session does.
+        #[test]
+        fn the_volume_filter_finds_a_never_verified_volume_by_label() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verified(&conn, "VOL-OK", "2020-01-01T00:00:00Z");
+            seed_never_verified(&conn, "VOL-BLANK");
+
+            let rows = verify_status_rows(&conn, Some("VOL-BLANK")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, "VOL-BLANK");
+            assert!(rows[0].2.is_none());
+        }
+
+        #[test]
+        fn the_json_row_carries_never_verified_explicitly() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verified(&conn, "VOL-OK", "2020-01-01T00:00:00Z");
+            seed_never_verified(&conn, "VOL-BLANK");
+
+            let rows = verify_status_rows(&conn, None).unwrap();
+            let json: Vec<serde_json::Value> = rows.iter().map(verify_status_row_json).collect();
+            assert_eq!(json.len(), 2, "the top level stays an array of both rows");
+
+            let never = json
+                .iter()
+                .find(|v| v["volume"] == "VOL-BLANK")
+                .expect("never-verified volume must be present in the json array");
+            assert_eq!(never["never_verified"], serde_json::json!(true));
+            assert_eq!(never["outcome"], serde_json::Value::Null);
+            assert_eq!(never["completed"], serde_json::Value::Null);
+
+            let verified = json
+                .iter()
+                .find(|v| v["volume"] == "VOL-OK")
+                .expect("verified volume must be present in the json array");
+            assert_eq!(verified["never_verified"], serde_json::json!(false));
+            assert_eq!(verified["outcome"], serde_json::json!("passed"));
+            assert_eq!(
+                verified["completed"],
+                serde_json::json!("2020-01-01T00:00:00Z")
+            );
         }
     }
 
