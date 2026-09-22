@@ -679,3 +679,40 @@ volume look like a completed one to anything that counts copies: `policy::covera
 remains the sole owner of that question (#96), and a volume whose confirm has not passed
 is not yet a copy. The change is about what `resume` and the retire family may *do*, not
 about what counts as coverage.
+
+## Amendment, 2026-09-22 — an unparseable unit dotfile refuses that unit, not the collection
+
+`#263` added `#[serde(deny_unknown_fields)]` to the `.tapectl-unit.toml` types and turned a
+previously infallible per-unit read into a fallible one on a whole-collection path
+(`collection plan|status|sync|run` → `collection::fingerprint` → `staging::exclude`, with
+`?` all the way up). Its stated intent — "stops the write" — did not distinguish
+**per-unit** from **per-collection**, and the implementation silently chose per-collection:
+one typo in one unit's dotfile anywhere under a collection root archives **zero** of N
+units where N-1 were archivable before.
+
+**Ruled: per-unit, and the command exits non-zero.** The offending unit is named, with its
+file path, and is REFUSED — never archived. Every other unit proceeds. The command's exit
+status is non-zero.
+
+This is the same reasoning as the 2026-09-21 `staging clean` ruling (#262), applied to the
+same shape: a fault attributable to one unit must not hold every healthy unit hostage, and
+the archive must keep making progress. A parse failure in unit A is evidence about unit A's
+file and about nothing else — unlike a capacity or policy fact, it does not generalise.
+
+Two constraints make the narrower blast radius safe rather than merely smaller, and both
+bind:
+
+- **The offending unit is refused, not best-efforted.** A dotfile that will not parse may
+  carry an `[excludes]` section that cannot be honoured, and archiving that unit while
+  silently ignoring its exclusion list would put excluded data on a tape permanently. The
+  skip is a refusal of that unit, never an archive-with-defaults.
+- **The exit status is non-zero.** `collection run` is the unattended path. An exit-0
+  "success" that quietly omits one unit forever is the failure mode this ruling would
+  otherwise create — worse than the whole-collection refusal it replaces, because nobody
+  is watching. The non-zero exit is what makes per-unit safe for a cron.
+
+Separately, and needing no ruling: **every dotfile parse error names the file path.**
+`unit::dotfile`'s `toml::from_str(...).map_err(|e| TapectlError::Other(e.to_string()))`
+drops it, and no layer above adds it, so the same typo is reported three different ways —
+`report dirty` names the unit, `policy::resolve` names unit and path, and `collection plan`
+names neither. Attach the path at the read site.

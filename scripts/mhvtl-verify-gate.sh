@@ -500,6 +500,7 @@ check heir_restore_symlink_unit step_heir_restore_symlinks
 RLABEL1="MHVTLR1"   # arm 1: interrupted before any content — resume from BOT
 RLABEL2="MHVTLR2"   # arm 2: interrupted mid-run — resume repositions
 RLABEL3="MHVTLR3"   # arm 3: hard-killed — startup sweep then resume
+RLABEL4="MHVTLR4"   # arm 4: interrupted AFTER seal — the Tier-3 floor (issue #276)
 
 # Start a write in the background and SIGINT it once the DB shows the state
 # this arm needs. Polling beats a fixed sleep for two reasons found the hard
@@ -714,6 +715,141 @@ step_resume_restore() {
     && diff -r "$SRC/unitA" "$RUN/restored-resumed"
 }
 
+
+# --- arm 4: interrupted AFTER seal, before confirm (issue #276) ---
+#
+# The state migration 018 calls case (b): `seal()` succeeded, so the seal
+# marker is physically on the tape and `volumes.sealed_at` is recorded, but
+# `confirm` never landed an outcome — `volumes.status` is still
+# 'initialized' and the writes rows are 'interrupted'. Arms 1–3 cannot
+# reach it: all three interrupt during execute, so seal() never runs.
+#
+# Why this arm is the acceptance for #276 and not a unit test: the defect is
+# that `volume retire`'s ADR-0008 Tier-3 floor could not SEE this volume, so
+# the only copy of a unit could be discarded with no refusal. Proving the fix
+# needs the state to have been produced by a real write to real media, not
+# hand-written into the catalog with an UPDATE — a fabricated row proves the
+# query, never the reachability. TAPECTL_TEST_PAUSE_AFTER_SEAL parks the
+# writer at exactly that point so the interrupt is a fact, not a race, the
+# same way TAPECTL_TEST_PAUSE_AFTER_PLAN does for the BOT arm (issue #113).
+#
+# `--yes` is passed to the retire ON PURPOSE. ADR-0008 says Tier 3 is a fact,
+# not a risk to accept, and `--yes` must not reach it; passing the flag makes
+# a silent downgrade to a Tier-2 prompt fail here instead of hanging on stdin.
+interrupt_write_after_seal() { # interrupt_write_after_seal <label>
+    local label="$1" pid start waited marker
+    marker="$RUN/sealed-parked-$label"
+    rm -f "$marker"
+    start=$SECONDS
+    TAPECTL_TEST_PAUSE_AFTER_SEAL="$marker" \
+        "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        [ -e "$marker" ] && break
+        if [ $(( SECONDS - start )) -ge 120 ]; then
+            echo "interrupt_write_after_seal: TIMEOUT waiting for the post-seal park marker"; break
+        fi
+        sleep 0.1
+    done
+    waited=$(( SECONDS - start ))
+    kill -INT "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    echo "interrupt_write_after_seal: label=$label waited=${waited}s (parked after seal)"
+}
+
+# The reachability proof, and its own positive control. Asserting only that
+# retire refuses would pass just as happily if the write had never run at
+# all, so this pins the three facts that MAKE it case (b) first.
+assert_sealed_but_unconfirmed() { # assert_sealed_but_unconfirmed <label>
+    python3 - "$HOME_DIR/tapectl.db" "$1" <<'PYS'
+import sqlite3, sys
+db, label = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(db)
+row = c.execute("SELECT status, sealed_at FROM volumes WHERE label=?", (label,)).fetchone()
+assert row is not None, f"{label}: no volumes row at all — the write never ran"
+status, sealed_at = row
+assert sealed_at is not None, (
+    f"{label}: sealed_at is NULL, so seal() never ran and this is migration 018's case "
+    f"(a), not (b). The park hook fired too early — check that "
+    f"TAPECTL_TEST_PAUSE_AFTER_SEAL parks AFTER the sealed_at UPDATE in finish_session.")
+assert status != 'sealed', (
+    f"{label}: volume is already {status!r} — confirm completed, so this is an ordinary "
+    f"sealed tape and the arm is testing nothing. The interrupt landed too late.")
+by = dict(c.execute(
+    """SELECT w.status, COUNT(*) FROM writes w JOIN volumes v ON v.id=w.volume_id
+       WHERE v.label=? GROUP BY w.status""", (label,)).fetchall())
+assert by.get('interrupted', 0) > 0, (
+    f"{label}: expected >=1 write row 'interrupted' after the post-seal interrupt; got {by}")
+print(f"{label}: sealed_at={sealed_at}, volume status={status!r}, writes={by} "
+      f"— migration 018 case (b), reached from a real write")
+PYS
+}
+
+# The refusal itself. Every assertion names a substring of the Tier-3 message,
+# because a bare non-zero exit is also what "volume not found" or a panic
+# produces — the distinction this gate exists to make (issue #275: a check
+# that only asserts a failure cannot tell WHICH failure it got).
+assert_retire_refused() { # assert_retire_refused <label> <unit> <want_resume_line:yes|no>
+    local label="$1" unit="$2" want_resume="$3" out rc
+    set +e
+    out="$(TCTL volume retire "$label" --yes 2>&1)"
+    rc=$?
+    set -e
+    printf '%s\n' "$out" > "$RUN/retire-refusal-$label.txt"
+    if [ $rc -eq 0 ]; then
+        echo "assert_retire_refused: $label: retire SUCCEEDED (rc=0). This is issue #276 \
+exactly: a sealed-but-unconfirmed volume holding the only copy of \"$unit\" was retired \
+with no ADR-0008 Tier-3 refusal. Output:"
+        printf '%s\n' "$out"
+        return 1
+    fi
+    for needle in "LAST eligible copy" "$unit"; do
+        if ! printf '%s' "$out" | grep -qF "$needle"; then
+            echo "assert_retire_refused: $label: refused (rc=$rc) but the message does not \
+contain \"$needle\" — a non-zero exit alone does not prove the Tier-3 floor fired rather \
+than some unrelated error. Output:"
+            printf '%s\n' "$out"
+            return 1
+        fi
+    done
+    # The `volume resume` advice must appear when it APPLIES and be absent when
+    # it does not -- asserting only its presence would pass a build that printed
+    # it unconditionally, which would be wrong advice for an ordinary sealed
+    # tape. Checked in both directions for that reason.
+    if printf '%s' "$out" | grep -qF "volume resume"; then
+        if [ "$want_resume" != yes ]; then
+            echo "assert_retire_refused: $label: the refusal offers \`volume resume\` for a \
+volume that is already sealed. is_sealed_but_unconfirmed should be false here; that advice \
+is only correct while confirm is still owed. Output:"
+            printf '%s\n' "$out"
+            return 1
+        fi
+    elif [ "$want_resume" = yes ]; then
+        echo "assert_retire_refused: $label: refused (rc=$rc) but never offers \`volume \
+resume\`, which is the cheapest correct first act for a sealed-but-unconfirmed volume \
+(issue #276). Output:"
+        printf '%s\n' "$out"
+        return 1
+    fi
+    echo "$label: retire refused at Tier 3 despite --yes, naming \"$unit\" (volume resume \
+offered: $want_resume)"
+}
+
+# The arm. MUST run after arm 3: `volume init` displaces the cartridge's
+# previous volume and marks it 'erased' (ADR-0012), so by the time RLABEL4 is
+# initialised every earlier arm's volume is gone and RLABEL4 genuinely holds
+# the ONLY copy of unitA/unitB — which is the precondition the floor gates on.
+step_tier3_floor_unconfirmed() {
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase \
+    && TCTL volume init "$RLABEL4" --device "$TAPE_DEV" \
+    && interrupt_write_after_seal "$RLABEL4" \
+    && assert_sealed_but_unconfirmed "$RLABEL4" \
+    && assert_retire_refused "$RLABEL4" unitA yes \
+    && TCTL volume resume "$RLABEL4" --device "$TAPE_DEV" \
+    && assert_sealed "$RLABEL4" \
+    && assert_retire_refused "$RLABEL4" unitA no
+}
+
 echo "gate: leg 4 — interrupt + resume (volume resume, issue #93)"
 check resume_bot        step_resume_bot
 check resume_midwrite   step_resume_midwrite
@@ -731,6 +867,7 @@ check resume_midwrite   step_resume_midwrite
 check resume_verify     step_resume_verify
 check resume_restore    step_resume_restore
 check resume_after_crash step_resume_after_crash
+check tier3_floor_unconfirmed step_tier3_floor_unconfirmed
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
