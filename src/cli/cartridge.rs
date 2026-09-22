@@ -117,6 +117,9 @@ pub enum CartridgeCommands {
         /// Override the pending_erase lifecycle precondition (ADR-0008
         /// Tier 2 — see cli::consent). Does NOT reach a `retired_permanent`
         /// cartridge (issue #207) — `cartridge unretire` is the way back.
+        /// Does NOT reach the Tier-3 zero-copy floor either (issue #289):
+        /// if a mounted volume holds a unit's last eligible copy, marking
+        /// the cartridge erased is refused, and no flag waives that.
         #[arg(long)]
         force: bool,
     },
