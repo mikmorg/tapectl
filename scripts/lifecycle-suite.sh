@@ -3478,6 +3478,15 @@ scenario_permute() {
         echo "and no other. Recorded per unit:"
         echo
     } >>"$REPORT"
+    # Which cartridge is in the drive NOW. The walk ends with the last
+    # volume written loaded, but the stranded branch below loads an older
+    # one -- after which a later unit whose copy IS on the final volume
+    # would be read against the wrong cartridge ("wrong tape: ... File 0
+    # identifies VOL-PM3"). Seed 9 hit exactly that: `photos` and `docs`
+    # stranded on VOL-PM3, then `big` "read in place" from VOL-PM4 with
+    # VOL-PM3 still loaded. Load whenever the needed volume is not the one
+    # in the drive, not whenever it is not the one written last.
+    pm_in_drive="${PM_WRITTEN[${#PM_WRITTEN[@]}-1]:-}"
     for u in photos docs big; do
         case "$u" in photos|big) tenant=alice ;; docs) tenant=bob ;; esac
         if [ "${#PM_WRITTEN[@]}" -eq 0 ]; then
@@ -3560,7 +3569,7 @@ for v in vols:
                         "$last holds $u's latest copy but was erased in place by a later write under --single-cartridge"
                     continue
                 fi
-            elif [ "$last" != "$pm_latest" ] && ! load_volume_tape "$last"; then
+            elif [ "$last" != "$pm_in_drive" ] && ! load_volume_tape "$last"; then
                 # Multi-cartridge: the cartridge is in a library slot, so it
                 # must be loaded before reading or `binding::corroborate_volume`
                 # refuses the contact. Only load when it is not already in the
@@ -3569,6 +3578,7 @@ for v in vols:
                     "could not load $last, the cartridge holding $u's latest copy"
                 continue
             fi
+            [ "$SINGLE_CARTRIDGE" = 1 ] || pm_in_drive="$last"
             restore_matrix "$last" "$u" "$tenant" "$pm_sd/pm-snapshot-$last/$u" "pm-final-$u"
         else
             check "pm-final-$u.unit" pm_skip_never_written "$u"
