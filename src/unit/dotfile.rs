@@ -187,10 +187,20 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
 }
 
 /// Read and parse a dotfile from disk.
+///
+/// Issue #285 (ADR-0012's 2026-09-22 amendment, "every dotfile parse error
+/// names the file path"): both failure branches below used to drop `path`
+/// entirely (`std::fs::read_to_string(path)?`'s bare `io::Error`, and the
+/// toml parse's `map_err(|e| TapectlError::Other(e.to_string()))`), so the
+/// same typo was reported three different ways by three different callers
+/// and `collection plan` named neither the unit nor the file. `path` is now
+/// prepended on both branches; the toml error's own line/column detail is
+/// kept, not replaced.
 pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
-    let content = std::fs::read_to_string(path)?;
-    let wrapper: DotfileToml =
-        toml::from_str(&content).map_err(|e| TapectlError::Other(e.to_string()))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| TapectlError::Other(format!("{}: {e}", path.display())))?;
+    let wrapper: DotfileToml = toml::from_str(&content)
+        .map_err(|e| TapectlError::Other(format!("{}: {e}", path.display())))?;
 
     Ok(UnitDotfile {
         uuid: wrapper.unit.uuid,
@@ -399,6 +409,44 @@ archive_sett = "cold"
             read_dotfile(&path).is_err(),
             "a misspelled archive_set key must be refused, not silently yield \
              archive_set: None (issue #263)"
+        );
+    }
+
+    /// Issue #285 / ADR-0012's 2026-09-22 amendment: a malformed dotfile's
+    /// error must name both the file that broke and the offending key,
+    /// since nothing above `read_dotfile` re-adds either. This is the
+    /// funnel `collection::fingerprint::pending_units_for_collection`
+    /// (issue #285's own fix) relies on to build a refusal an operator can
+    /// act on without re-deriving which file is at fault. If this fails,
+    /// either failure branch in `read_dotfile` dropped the path again.
+    #[test]
+    fn read_dotfile_error_names_the_file_path_and_the_bad_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        // The real issue #263 typo: `pattern` (singular) instead of
+        // `patterns`.
+        std::fs::write(
+            &path,
+            r#"
+[unit]
+uuid = "u-1"
+name = "docs"
+created = "2026-01-01T00:00:00Z"
+tenant = "alice"
+
+[excludes]
+pattern = ["*.tmp"]
+"#,
+        )
+        .unwrap();
+        let err = read_dotfile(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(&path.display().to_string()),
+            "error must name the dotfile's own path: {err}"
+        );
+        assert!(
+            err.contains("pattern"),
+            "error must name the offending key: {err}"
         );
     }
 
