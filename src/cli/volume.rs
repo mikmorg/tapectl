@@ -443,9 +443,10 @@ fn clean_clear_message(
     } else {
         let sealed_note = if sealed_at_set {
             format!(
-                " The tape IS physically sealed — the seal marker and every byte are on it \
-                 — but its catalog status (\"{status}\") is not \"sealed\", so it still does \
-                 not count as a copy."
+                " The tape IS physically sealed, though: the seal marker and every byte are \
+                 on it, and this verify just read them all back. What is missing is the \
+                 catalog's record that the write session's confirm completed, which is the \
+                 only thing that sets \"sealed\"."
             )
         } else {
             String::new()
