@@ -74,6 +74,43 @@ pub struct PendingUnit {
     pub changes: FingerprintDiff,
 }
 
+/// One unit refused during a collection-wide scan
+/// (`pending_units_for_collection`) because its OWN `.tapectl-unit.toml`
+/// could not be parsed — ADR-0012's 2026-09-22 amendment (issue #285): "an
+/// unparseable unit dotfile refuses that unit, not the collection." A parse
+/// failure in one unit's dotfile is evidence about that unit's file alone;
+/// it never generalises to any other unit under the same collection root.
+/// The unit is excluded from [`PendingScan::pending`] and named here
+/// instead — never archived, and never best-effort archived with its
+/// (possibly load-bearing, unreadable) `[excludes]` section silently
+/// dropped.
+#[derive(Debug, Clone)]
+pub struct RefusedUnit {
+    /// The unit's registered name (`units.name`), for an operator to find it.
+    pub unit_name: String,
+    /// The dotfile's own path (`<unit_path>/.tapectl-unit.toml`), named
+    /// explicitly rather than left only inside `reason`'s free-text message
+    /// so a `--json` caller can act on it without parsing prose.
+    pub path: String,
+    /// `read_dotfile`'s own error text — already path-and-key-qualified
+    /// (issue #285's "every dotfile parse error names the file path" half,
+    /// `unit::dotfile::read_dotfile`).
+    pub reason: String,
+}
+
+/// The result of scanning one collection for archival work (issue #285):
+/// units ready to archive, and units refused because their own dotfile
+/// could not be read. Every caller of `pending_units_for_collection`
+/// (`collection sync|status|plan|run`) must report `refused` and exit
+/// non-zero when it is non-empty — silently proceeding as though the
+/// collection were fully healthy is exactly the failure this type exists to
+/// make impossible to forget.
+#[derive(Debug, Clone, Default)]
+pub struct PendingScan {
+    pub pending: Vec<PendingUnit>,
+    pub refused: Vec<RefusedUnit>,
+}
+
 /// Fresh walk of `unit_path`, sorted by path. Mirrors
 /// `staging::walk_directory`'s file enumeration and its exact
 /// mtime-to-RFC3339 conversion, so a byte-identical directory always
@@ -160,12 +197,33 @@ pub fn classify(
     let Some(path) = unit.current_path.as_deref() else {
         return Ok(None);
     };
-    if !Path::new(path).is_dir() {
+    let unit_path = Path::new(path);
+    if !unit_path.is_dir() {
         // Vanished — sync's job to mark `missing`, not this scan's.
         return Ok(None);
     }
 
-    let fresh = walk_fingerprint(Path::new(path), global_excludes)?;
+    let fresh = walk_fingerprint(unit_path, global_excludes)?;
+    classify_from_walk(conn, unit, unit_path, fresh)
+}
+
+/// The post-walk half of `classify`: compare an already-computed fresh walk
+/// against the unit's latest snapshot. Split out (issue #285) so
+/// `pending_units_for_collection` can run the fallible walk step itself,
+/// catch ONLY a dotfile-parsing failure there — the one thing
+/// `walk_fingerprint` can fail on; see its own doc comment — and refuse
+/// just that unit, while every error this half can still raise (a
+/// `Database` error from `content_match`'s queries) stays a hard `Err` for
+/// the whole scan. `classify` itself is behaviourally UNCHANGED by this
+/// split: it still calls straight through with `?`, for every caller that
+/// must not distinguish the two failure kinds (`unit status --dirty`,
+/// `report dirty`, `mark-tape-only`'s guard).
+fn classify_from_walk(
+    conn: &Connection,
+    unit: &Unit,
+    unit_path: &Path,
+    fresh: Vec<FileStamp>,
+) -> Result<Option<PendingUnit>> {
     let estimated_bytes: u64 = fresh.iter().map(|f| f.size_bytes.max(0) as u64).sum();
 
     let Some((snapshot_id, _version, _status)) = content_match::latest_snapshot(conn, unit.id)?
@@ -182,7 +240,7 @@ pub fn classify(
         conn,
         snapshot_id,
         &unit.checksum_mode,
-        Path::new(path),
+        unit_path,
         &fresh,
         crate::staging::validate::hash_source_file,
     )?;
@@ -202,8 +260,8 @@ pub fn classify(
 /// no directory to walk, and `tape_only`/`retired` are deliberate operator
 /// states this module never second-guesses.
 ///
-/// `global_excludes` (issue #49) is threaded straight through to `classify`
-/// for every unit — required so `collection sync|status|plan` (this
+/// `global_excludes` (issue #49) is threaded straight through to the walk
+/// for every unit — required so `collection sync|status|plan|run` (this
 /// function's callers) agree with `unit status --dirty`/`report dirty`
 /// about which units are dirty. Without it, once `staging::walk_directory`
 /// starts filtering `config.defaults.global_excludes` out of the `files`
@@ -211,20 +269,58 @@ pub fn classify(
 /// unfiltered fresh walk would report a permanent phantom `added` entry for
 /// every globally-excluded file — worse than the pre-fix gap, not a
 /// continuation of it.
+///
+/// **Issue #285 / ADR-0012's 2026-09-22 amendment.** Before this fix, this
+/// function ran `classify(...)?` in the loop below, so one unit whose own
+/// dotfile could not be parsed made the whole scan return `Err` — and every
+/// caller (`collection plan|status|sync|run`) propagated that `Err` all the
+/// way up, archiving ZERO of N units where N-1 were archivable. This is the
+/// single funnel all four commands share, so the fix lives here once: the
+/// walk step (the only thing that can fail on a bad dotfile — see
+/// `walk_fingerprint`'s doc comment) is run and matched directly instead of
+/// going through `classify`, so a per-unit parse failure is caught and
+/// recorded in [`PendingScan::refused`] instead of aborting the loop. A DB
+/// error from the content-match half (`classify_from_walk`'s own `?`) is
+/// NOT a per-unit fault — it says nothing about any one unit's file — and
+/// still propagates as a hard `Err` for the whole call, exactly as before.
 pub fn pending_units_for_collection(
     conn: &Connection,
     lib: &CollectionConfig,
     global_excludes: &[String],
-) -> Result<Vec<PendingUnit>> {
+) -> Result<PendingScan> {
     let root = super::canonical_root(lib)?;
     let units = super::units_under_root(conn, &root)?;
-    let mut out = Vec::new();
+    let mut scan = PendingScan::default();
     for unit in units.into_iter().filter(|u| u.status == "active") {
-        if let Some(p) = classify(conn, &unit, global_excludes)? {
-            out.push(p);
+        let Some(path) = unit.current_path.as_deref() else {
+            continue;
+        };
+        let unit_path = Path::new(path);
+        if !unit_path.is_dir() {
+            // Vanished — sync's job to mark `missing`, not this scan's.
+            continue;
+        }
+
+        let fresh = match walk_fingerprint(unit_path, global_excludes) {
+            Ok(f) => f,
+            Err(e) => {
+                // The offending unit is REFUSED, never best-effort
+                // archived with its excludes silently dropped (ADR-0012's
+                // 2026-09-22 amendment) — named here with its own dotfile
+                // path, and the loop continues to every other unit.
+                scan.refused.push(RefusedUnit {
+                    unit_name: unit.name.clone(),
+                    path: unit_path.join(".tapectl-unit.toml").display().to_string(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+        if let Some(p) = classify_from_walk(conn, &unit, unit_path, fresh)? {
+            scan.pending.push(p);
         }
     }
-    Ok(out)
+    Ok(scan)
 }
 
 #[cfg(test)]
@@ -1016,12 +1112,14 @@ mod tests {
             dotfiles: true,
         };
 
-        let pending = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
+        let scan = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
         assert!(
-            pending.is_empty(),
+            scan.pending.is_empty(),
             "a freshly-snapshotted unit with only globally-excluded junk must \
-             not be pending — got {pending:?}"
+             not be pending — got {:?}",
+            scan.pending
         );
+        assert!(scan.refused.is_empty());
 
         // Second scan: the junk file changes (still excluded) — must still
         // not be flagged (the #36 perpetual-dirtiness trap, at the
@@ -1031,10 +1129,119 @@ mod tests {
             b"much bigger junk content, definitely a different size",
         )
         .unwrap();
-        let pending = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
+        let scan = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
         assert!(
-            pending.is_empty(),
-            "must stay clean on a second scan too — got {pending:?}"
+            scan.pending.is_empty(),
+            "must stay clean on a second scan too — got {:?}",
+            scan.pending
+        );
+    }
+
+    /// Issue #285 / ADR-0012's 2026-09-22 amendment ("an unparseable unit
+    /// dotfile refuses that unit, not the collection"): three units, the
+    /// MIDDLE one carrying the real issue #263 typo (`[excludes] pattern`,
+    /// singular, instead of `patterns`). A one-unit fixture cannot
+    /// distinguish "refuses only its own unit" from "refuses the whole
+    /// collection" — both behaviours pass it — so three is the minimum. If
+    /// this test fails with an `Err` instead of `Ok`, or with alpha/gamma
+    /// missing from `pending`, the fix regressed to whole-collection abort.
+    #[test]
+    fn a_malformed_dotfile_refuses_only_its_own_unit() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'media'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        // Canonicalized up front: on this VM `/tmp` is itself a symlink
+        // (to `/scratch/root-offload/tmp`), and `canonical_root` below
+        // resolves `lib.root` through `std::fs::canonicalize` before
+        // `units_under_root` string-compares it against each unit's
+        // `current_path` — a raw, un-canonicalized path here would never
+        // match and every unit would silently vanish from the scan (not
+        // just the malformed one), which is exactly the false-pass shape
+        // a purely negative assertion cannot catch on its own.
+        let root_path = root.path().canonicalize().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            let dir = root_path.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?2, ?3, ?4, 'active')",
+                params![
+                    format!("u-{name}"),
+                    format!("testlib/{name}"),
+                    tenant_id,
+                    dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        // beta's dotfile carries the real #263 typo — `pattern`, not
+        // `patterns` — under `[excludes]`.
+        let beta_dotfile = root_path.join("beta/.tapectl-unit.toml");
+        std::fs::write(
+            &beta_dotfile,
+            r#"
+[unit]
+uuid = "u-beta"
+name = "testlib/beta"
+created = "2026-01-01T00:00:00Z"
+tenant = "media"
+
+[excludes]
+pattern = ["*.tmp"]
+"#,
+        )
+        .unwrap();
+
+        let lib = crate::config::CollectionConfig {
+            name: "testlib".into(),
+            root: root_path.to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+
+        let scan = pending_units_for_collection(&conn, &lib, &[])
+            .expect("a per-unit dotfile fault must not abort the whole scan");
+
+        let pending_names: Vec<&str> = scan.pending.iter().map(|p| p.unit.name.as_str()).collect();
+        assert_eq!(
+            scan.pending.len(),
+            2,
+            "alpha and gamma must still be pending, got {pending_names:?}"
+        );
+        assert!(pending_names.contains(&"testlib/alpha"));
+        assert!(pending_names.contains(&"testlib/gamma"));
+        assert!(
+            !pending_names.contains(&"testlib/beta"),
+            "the malformed unit must never appear in pending (not even best-effort), \
+             got {pending_names:?}"
+        );
+
+        assert_eq!(scan.refused.len(), 1, "exactly one unit must be refused");
+        assert_eq!(scan.refused[0].unit_name, "testlib/beta");
+        assert_eq!(
+            scan.refused[0].path,
+            beta_dotfile.to_string_lossy().to_string(),
+            "the refusal must name the exact dotfile path"
+        );
+        assert!(
+            scan.refused[0].reason.contains("pattern"),
+            "the refusal reason must name the offending key: {}",
+            scan.refused[0].reason
         );
     }
 }

@@ -37,6 +37,7 @@ use crate::config::{CollectionConfig, Config};
 use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
 
+use super::fingerprint::RefusedUnit;
 use super::selector::{self, Batch};
 use crate::volume::layout_model::pad_to_blocks;
 
@@ -56,18 +57,25 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// budget came from — that seam is exactly what lets [`plan_for_collection`]
 /// (a media generation) and [`plan_for_run`] (a destination volume's own
 /// row) share one implementation instead of two copies that could drift.
+///
+/// Issue #285 / ADR-0012's 2026-09-22 amendment: `pending_units_for_collection`
+/// now refuses a per-unit dotfile fault instead of aborting the whole scan,
+/// so its `refused` list is carried straight through here rather than
+/// dropped — every caller of this function (`plan_for_collection`,
+/// `plan_for_run`) must keep reporting it and exit non-zero.
 fn batches_for_budget(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
     budget: u64,
-) -> Result<Vec<Batch>> {
-    let pending = super::fingerprint::pending_units_for_collection(
+) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
+    let scan = super::fingerprint::pending_units_for_collection(
         conn,
         lib,
         &config.defaults.global_excludes,
     )?;
-    let synthetic: Vec<selector::PendingUnit> = pending
+    let synthetic: Vec<selector::PendingUnit> = scan
+        .pending
         .iter()
         .map(|p| selector::PendingUnit {
             name: p.unit.name.clone(),
@@ -75,7 +83,7 @@ fn batches_for_budget(
         })
         .collect();
 
-    selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
+    let batches = selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
         TapectlError::Other(format!(
             "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
              batched (units are never split across tapes): {}",
@@ -87,7 +95,8 @@ fn batches_for_budget(
                 .collect::<Vec<_>>()
                 .join("; "),
         ))
-    })
+    })?;
+    Ok((batches, scan.refused))
 }
 
 /// Compute one collection's batches against its resolved LTO backend
@@ -108,7 +117,7 @@ pub fn plan_for_collection(
     // errored outright the moment a second drive was configured rather than
     // asking which one was meant.
     device: Option<&str>,
-) -> Result<Vec<Batch>> {
+) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
     let backend = crate::config::resolve_lto_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
@@ -366,7 +375,7 @@ pub fn plan_for_run(
     lib: &CollectionConfig,
     device: &str,
     labels: &[String],
-) -> Result<(Vec<Batch>, DestinationBudget)> {
+) -> Result<(Vec<Batch>, DestinationBudget, Vec<RefusedUnit>)> {
     if labels.len() > 1 {
         return Err(TapectlError::Other(format!(
             "collection run: refuses more than one destination label ({} given: {}) — \
@@ -381,8 +390,8 @@ pub fn plan_for_run(
         )));
     }
     let budget = destination_budget(conn, config, device, labels)?;
-    let batches = batches_for_budget(conn, config, lib, budget.bytes)?;
-    Ok((batches, budget))
+    let (batches, refused) = batches_for_budget(conn, config, lib, budget.bytes)?;
+    Ok((batches, budget, refused))
 }
 
 #[cfg(test)]
@@ -435,7 +444,8 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let batches = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+        assert!(refused.is_empty());
         assert_eq!(batches.len(), 1, "two 3 MiB units must fit one 10 MiB tape");
         assert_eq!(
             batches[0].unit_names(),
@@ -493,10 +503,12 @@ mod tests {
         let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
         assert!(err.to_string().contains("--device"), "{err}");
 
-        let big = plan_for_collection(&conn, &config, &lib, None, Some("/dev/null")).unwrap();
+        let (big, _refused) =
+            plan_for_collection(&conn, &config, &lib, None, Some("/dev/null")).unwrap();
         assert_eq!(big.len(), 1, "10 MiB tape holds both 3 MiB units");
 
-        let small = plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero")).unwrap();
+        let (small, _refused) =
+            plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero")).unwrap();
         assert_eq!(small.len(), 2, "4 MiB tape cannot hold both 3 MiB units");
     }
 
@@ -543,7 +555,7 @@ mod tests {
 
         let config = config_with_tiny_backend();
 
-        let (volume_batches, _budget) =
+        let (volume_batches, _budget, _refused) =
             plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
         assert_eq!(
             volume_batches.len(),
@@ -551,7 +563,8 @@ mod tests {
             "a 4 MiB destination volume cannot hold both 3 MiB units in one batch"
         );
 
-        let generation_batches = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+        let (generation_batches, _refused) =
+            plan_for_collection(&conn, &config, &lib, None, None).unwrap();
         assert_eq!(
             generation_batches.len(),
             1,
@@ -625,7 +638,8 @@ mod tests {
         assert_eq!(budget.binding_capacity_bytes, 4 * 1024 * 1024);
         assert_eq!(budget.num_destinations, 2);
 
-        let batches = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        let (batches, refused) = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
             2,
@@ -997,8 +1011,9 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let (batches, budget) =
+        let (batches, budget, refused) =
             plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
             1,
@@ -1217,7 +1232,8 @@ mod tests {
              the other staged set, not the raw 10 MiB capacity"
         );
 
-        let batches = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        let (batches, refused) = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
             2,
@@ -1286,5 +1302,117 @@ mod tests {
             before, after,
             "a duplicated destination label must fail before staging ever touches snapshots"
         );
+    }
+
+    /// Issue #285 / ADR-0012's 2026-09-22 amendment: "the same typo is
+    /// reported three different ways ... `collection plan` names neither
+    /// [unit nor path]." Driven through `plan_for_collection` itself — the
+    /// function `collection plan` calls — rather than through
+    /// `pending_units_for_collection` directly (that's
+    /// `a_malformed_dotfile_refuses_only_its_own_unit` in
+    /// `fingerprint.rs`), to prove the fix (and `read_dotfile`'s
+    /// path-qualified error) actually reaches this call path and not just
+    /// the funnel underneath it. If this fails with an `Err` instead of an
+    /// `Ok(refused-non-empty)`, or with `refused[0].path` missing, the old
+    /// per-collection abort (or the old path-less error) is back.
+    #[test]
+    fn a_dotfile_error_names_the_file_on_the_collection_path() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'media'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        // Canonicalized up front (same reasoning as the fingerprint-level
+        // regression test): on this VM `/tmp` is itself a symlink, and
+        // `canonical_root` resolves `lib.root` through
+        // `std::fs::canonicalize` before string-comparing it against each
+        // unit's `current_path` — an un-canonicalized path here would make
+        // every unit vanish from the scan, not just the malformed one.
+        let root_path = root.path().canonicalize().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            let dir = root_path.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 1024]).unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?2, ?3, ?4, 'active')",
+                params![
+                    format!("u-{name}"),
+                    format!("testlib/{name}"),
+                    tenant_id,
+                    dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        // beta's dotfile carries the real #263 typo, exactly as the
+        // fingerprint-level regression test does.
+        let beta_dotfile = root_path.join("beta/.tapectl-unit.toml");
+        std::fs::write(
+            &beta_dotfile,
+            r#"
+[unit]
+uuid = "u-beta"
+name = "testlib/beta"
+created = "2026-01-01T00:00:00Z"
+tenant = "media"
+
+[excludes]
+pattern = ["*.tmp"]
+"#,
+        )
+        .unwrap();
+
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root_path.to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+
+        let config = config_with_tiny_backend();
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None)
+            .expect("a per-unit dotfile fault must not abort `collection plan`'s own scan");
+
+        assert_eq!(refused.len(), 1, "exactly one unit must be refused");
+        assert_eq!(refused[0].unit_name, "testlib/beta", "must name the unit");
+        assert_eq!(
+            refused[0].path,
+            beta_dotfile.to_string_lossy().to_string(),
+            "must name the dotfile's own path"
+        );
+        assert!(
+            refused[0]
+                .reason
+                .contains(&beta_dotfile.to_string_lossy().to_string())
+                && refused[0].reason.contains("pattern"),
+            "the reason text itself (read_dotfile's own error) must also carry the path \
+             and the offending key: {}",
+            refused[0].reason
+        );
+
+        let planned_names: Vec<String> = batches
+            .iter()
+            .flat_map(|b| b.unit_names())
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            planned_names.len(),
+            2,
+            "alpha and gamma must still be planned, got {planned_names:?}"
+        );
+        assert!(!planned_names.iter().any(|n| n == "testlib/beta"));
     }
 }

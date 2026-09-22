@@ -6,10 +6,10 @@ use rusqlite::{params, Connection};
 use crate::config::{CollectionConfig, Config};
 use crate::error::Result;
 
-use super::fingerprint::PendingReason;
+use super::fingerprint::{PendingReason, RefusedUnit};
 
 /// One collection's readiness snapshot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct CollectionStatus {
     /// Units with no snapshot at all yet.
     pub pending: usize,
@@ -22,6 +22,12 @@ pub struct CollectionStatus {
     /// Active units with fewer completed tape copies than their resolved
     /// policy requires.
     pub under_copied: usize,
+    /// Units refused during pending/dirty detection because their own
+    /// dotfile could not be parsed (ADR-0012's 2026-09-22 amendment, issue
+    /// #285) — never counted in `pending`/`dirty`, and never archived.
+    /// `cli::collection::cmd_status` must report these and exit non-zero
+    /// when non-empty.
+    pub refused: Vec<RefusedUnit>,
 }
 
 /// Compute one collection's status.
@@ -32,16 +38,18 @@ pub fn status_for_collection(
 ) -> Result<CollectionStatus> {
     let mut status = CollectionStatus::default();
 
-    for p in super::fingerprint::pending_units_for_collection(
+    let scan = super::fingerprint::pending_units_for_collection(
         conn,
         lib,
         &config.defaults.global_excludes,
-    )? {
+    )?;
+    for p in &scan.pending {
         match p.reason {
             PendingReason::New => status.pending += 1,
             PendingReason::Dirty => status.dirty += 1,
         }
     }
+    status.refused = scan.refused;
 
     let root = super::canonical_root(lib)?;
     let tracked = super::units_under_root(conn, &root)?;

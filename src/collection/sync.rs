@@ -16,7 +16,7 @@ use crate::error::{Result, TapectlError};
 use crate::unit::dotfile;
 
 /// Outcome of one `collection sync` run.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct SyncReport {
     /// Newly registered units (fresh directories, or orphaned dotfiles the
     /// DB didn't know about yet).
@@ -32,6 +32,14 @@ pub struct SyncReport {
     pub pending: usize,
     /// Units needing archival work: a snapshot exists but is stale.
     pub dirty: usize,
+    /// Units refused during step 3's pending/dirty detection because their
+    /// own dotfile could not be parsed (ADR-0012's 2026-09-22 amendment,
+    /// issue #285) — distinct from `errors` (step 1's per-directory
+    /// registration failures, an existing and unrelated mechanism): never
+    /// counted in `pending`/`dirty`, and never archived.
+    /// `cli::collection::cmd_sync` must report these and exit non-zero when
+    /// non-empty.
+    pub refused: Vec<super::fingerprint::RefusedUnit>,
 }
 
 /// Sync one collection. `dry_run` computes and reports every count above
@@ -113,12 +121,14 @@ pub fn sync_collection(
     // dry-run mode this is the PRE-sync state, since nothing above was
     // actually written — newly-would-be-created units correctly don't
     // appear here yet, they're already counted via `report.created`).
-    for p in super::fingerprint::pending_units_for_collection(conn, lib, global_excludes)? {
+    let scan = super::fingerprint::pending_units_for_collection(conn, lib, global_excludes)?;
+    for p in &scan.pending {
         match p.reason {
             super::fingerprint::PendingReason::New => report.pending += 1,
             super::fingerprint::PendingReason::Dirty => report.dirty += 1,
         }
     }
+    report.refused = scan.refused;
 
     Ok((report, errors))
 }
