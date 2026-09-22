@@ -301,8 +301,13 @@ fn sysfs_device_dir_for_node(node: &str) -> PathBuf {
 /// missing `model` must leave a hole, never shift `rev` into its place.
 fn read_sysfs_triple(dir: &Path) -> Option<DriveIdentity> {
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    // The TRAILING newline is load-bearing: `parse_sysfs_triple` pops one
+    // empty final element as the file's own trailing-newline artifact, so
+    // without it an unreadable `rev` -- the LAST slot -- would be popped as
+    // that artifact and collapse the triple to two lines, discarding the
+    // vendor and model this read did get.
     let raw = format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n",
         read("vendor").trim_end_matches('\n'),
         read("model").trim_end_matches('\n'),
         read("rev").trim_end_matches('\n'),
@@ -435,6 +440,20 @@ mod tests {
         assert_eq!(parse_sysfs_triple("IBM     \nULT3580-TD8     \n"), None);
         assert_eq!(parse_sysfs_triple(""), None);
         assert_eq!(parse_sysfs_triple("IBM\nULT\n2160\nextra\n"), None);
+    }
+
+    /// The LAST slot is the one that breaks if the caller's empty-line
+    /// substitution and the parser's trailing-newline strip collide: an
+    /// unreadable `rev` must leave a hole, not discard the vendor and model
+    /// that WERE read. This is the exact string `read_sysfs_triple` builds
+    /// in that case.
+    #[test]
+    fn sysfs_triple_keeps_a_hole_when_the_last_field_was_unreadable() {
+        let id = parse_sysfs_triple("IBM\nULT3580-TD8\n\n")
+            .expect("an unreadable rev must not discard vendor and model");
+        assert_eq!(id.vendor.as_deref(), Some("IBM"));
+        assert_eq!(id.model.as_deref(), Some("ULT3580-TD8"));
+        assert_eq!(id.firmware_rev, None);
     }
 
     #[test]
