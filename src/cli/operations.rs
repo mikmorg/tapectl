@@ -1374,6 +1374,66 @@ fn mark_erased_consent_facts(barcode: &str, status: &str, volume_labels: &[Strin
     facts
 }
 
+/// The impact analysis `cartridge_mark_erased` prints for a dry run or a
+/// Tier-3 refusal -- the `print_cartridge_retire_impact` pattern, adapted to
+/// "marking erased" rather than "retiring" (issue #289).
+fn print_mark_erased_impact(
+    barcode: &str,
+    status: &str,
+    volumes: &[String],
+    impacts: &[RetireImpact],
+    at_risk: &[String],
+) {
+    println!("Marking cartridge \"{barcode}\" erased");
+    println!("  Current status: {status}");
+    if volumes.is_empty() {
+        println!("  Volumes on it:  none");
+    } else {
+        println!("  Volumes on it:  {}", volumes.join(", "));
+    }
+    println!("  Affected units:");
+    if impacts.is_empty() {
+        println!("    (none)");
+    }
+    let now = chrono::Utc::now().naive_utc();
+    for impact in impacts {
+        let warning = if impact.other_copies == 0 {
+            " *** ZERO copies remaining! ***"
+        } else {
+            ""
+        };
+        println!(
+            "    {} [{}]: {} other copy/copies{warning}",
+            impact.unit_name, impact.unit_status, impact.other_copies
+        );
+        // ADR-0008 Tier 3 (issue #147, #289): name the versions this
+        // cartridge holds the last eligible copy of, same as
+        // `print_cartridge_retire_impact`.
+        for version in impact.at_stake.iter().filter(|v| v.copies_after == 0) {
+            println!(
+                "      *** v{} — this cartridge holds its LAST eligible copy; marking it \
+                 erased is REFUSED (ADR-0008 Tier 3) ***",
+                version.version
+            );
+        }
+        // ADR-0004 Tier 1: evidence age is displayed wherever a destructive
+        // operation consumes coverage, and never gates.
+        if impact.other_copies != 0 {
+            if let Some(line) =
+                crate::policy::evidence::describe(&impact.unit_name, &impact.evidence, now)
+            {
+                println!("      {line}");
+            }
+        }
+    }
+    if !at_risk.is_empty() {
+        println!(
+            "\n  WARNING: {} unit(s) will have ZERO copies after this!",
+            at_risk.len()
+        );
+    }
+}
+
 /// Mark a cartridge as erased (available for reuse), moving any
 /// currently-mounted volume to `erased`.
 ///
@@ -1461,12 +1521,43 @@ pub fn cartridge_mark_erased(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let volume_labels: Vec<String> = mounted_volumes.iter().map(|(_, l)| l.clone()).collect();
 
+    // ADR-0008 Tier-3 impact analysis (issue #289), computed unconditionally
+    // and BEFORE the dry-run return -- same shape `cartridge_retire` builds.
+    // Kept per-VOLUME (`per_volume`) because the floor's recovery commands
+    // name a volume (`volume read-slices --from <LABEL>`), and separately
+    // MERGED by unit (`merged`, worst reading kept) for display and `--json`,
+    // exactly as `cartridge_retire` does.
+    let mut per_volume: Vec<(String, Vec<RetireImpact>)> = Vec::new();
+    let mut merged: Vec<RetireImpact> = Vec::new();
+    for (vol_id, vol_label) in &mounted_volumes {
+        let impacts = retire_impacts(conn, *vol_id)?;
+        per_volume.push((vol_label.clone(), impacts.clone()));
+        for impact in impacts {
+            match merged.iter_mut().find(|m| m.unit_name == impact.unit_name) {
+                Some(existing) if impact.other_copies < existing.other_copies => {
+                    *existing = impact;
+                }
+                Some(_) => {}
+                None => merged.push(impact),
+            }
+        }
+    }
+    merged.sort_by(|a, b| a.unit_name.cmp(&b.unit_name));
+
+    let at_risk: Vec<String> = merged
+        .iter()
+        .filter(|impact| impact.other_copies == 0)
+        .map(|impact| impact.unit_name.clone())
+        .collect();
+
     if dry_run {
         if json_output {
             let mut obj = serde_json::json!({
                 "barcode": barcode,
                 "status": status,
                 "volumes_to_erase": volume_labels,
+                "affected_units": retire_impacts_json(&merged),
+                "at_risk_units": at_risk,
             });
             obj["dry_run"] = serde_json::json!(true);
             println!("{obj}");
@@ -1475,6 +1566,7 @@ pub fn cartridge_mark_erased(
             for label in &volume_labels {
                 println!("  would move volume \"{label}\" to \"erased\"");
             }
+            print_mark_erased_impact(barcode, &status, &volume_labels, &merged, &at_risk);
             println!("DRY RUN — no changes made.");
         }
         return Ok(());
