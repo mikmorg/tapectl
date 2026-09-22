@@ -3255,8 +3255,7 @@ mod tests {
         /// refuses.
         #[test]
         fn initialized_sealed_but_unconfirmed_does_not_claim_service_or_name_resume() {
-            let msg =
-                clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
+            let msg = clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
             assert!(
                 !msg.contains("RETURNED TO SERVICE"),
                 "an initialized, unconfirmed volume must never be told it returned to \
@@ -3287,8 +3286,7 @@ mod tests {
         /// is actually said, not just that nothing false is said.
         #[test]
         fn initialized_sealed_but_unconfirmed_says_the_tape_is_physically_sealed() {
-            let msg =
-                clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
+            let msg = clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
             assert!(
                 msg.to_lowercase().contains("physically sealed"),
                 "sealed_at is set -- the tape really does carry the seal marker and bytes, \
