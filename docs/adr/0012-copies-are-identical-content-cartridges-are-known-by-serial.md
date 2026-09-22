@@ -728,3 +728,53 @@ Separately, and needing no ruling: **every dotfile parse error names the file pa
 drops it, and no layer above adds it, so the same typo is reported three different ways —
 `report dirty` names the unit, `policy::resolve` names unit and path, and `collection plan`
 names neither. Attach the path at the read site.
+
+## Amendment, 2026-09-22 — the three no-flag refusals of this diff, tiered (#286)
+
+The third pre-production review's completeness critic noted that this diff added three
+refusals no flag can override, and that none had been checked against ADR-0008. Audited;
+the result is that **no code change was needed**, and the reasoning is recorded here so the
+question is not re-opened at 2am by someone hitting one of them.
+
+**ADR-0008 is about DESTRUCTIVE consent, and none of these three destroys anything.** Its
+opening sentence enumerates the operations it governs — `volume retire`, `unit
+mark-tape-only`, `compact-finish`, `db import`, `cartridge mark-erased`, `snapshot delete`
+— all of which give something up. These three are *precondition failures*: they stop an
+operation before it starts, and nothing is lost when they fire. So the tier ladder does not
+strictly apply to them.
+
+What does apply is ADR-0008's own test for where the ladder tops out:
+
+> *"The distinction Tier 2/Tier 3 draws is between risk and incoherence. `--force` should
+> mean 'I accept a degraded but non-zero safety margin.' ... The escape hatch for Tier 3 is
+> not a flag but a single command, which resolves the incoherence instead of waiving it."*
+
+By that test all three are incoherences with a resolving action, not waivable risks:
+
+1. **`resolve_lto_backend`'s ambiguity gate (#272).** Two drives are configured and the
+   operator has not said which to write to. There is no safety margin to accept here —
+   there is no fact the operator could assert that makes "either drive" coherent. The
+   escape is an argument that supplies the missing fact, and the message already names it:
+   *"multiple LTO backends configured (...); pass `--device` to select one"*. The
+   collision branch likewise names `tapectl config check`. **Correct as it stands.**
+
+2. **`Config::load_tolerating_backend_ambiguity` (#261) is not a refusal at all**, and the
+   review's premise is wrong on this one. It is a lenient *loader* — it TOLERATES a
+   collision that `Config::load` refuses, precisely so read paths (`volume identify`,
+   `verify`, `restore`, `catalog rebuild`) keep working during disaster recovery. It
+   widens what is accepted rather than narrowing it. Nothing to tier. The refusal that
+   sits downstream of it is item 1, which is tiered above.
+
+3. **Dotfile strictness (#263).** A `.tapectl-unit.toml` that does not parse cannot yield
+   the exclusion list that decides what reaches the tape. Archiving the unit anyway would
+   not be a thinner safety margin — it is writing data to write-once media under
+   exclusions nobody can read, which is the same shape as marking a Never Archived unit
+   tape-only. The escape is fixing the file, which resolves the incoherence. Issue #285
+   made the error name the file path and the offending key, which is what makes that
+   escape actionable. **Correct as it stands.**
+
+**On "a Tier 3 message must say why no flag exists":** applied where the absence is
+surprising, not everywhere. It earns its place in the retire family, where an operator
+reasonably expects `--force` to work and ADR-0008 deliberately withholds it. It would be
+noise on a TOML parse error, where naming the file and the bad key already tells the reader
+exactly what to do and no one expects a flag to parse a broken file for them.
