@@ -441,15 +441,24 @@ fn clean_clear_message(
              not undo it."
         )
     } else {
+        // A plain `&str`, not `format!` — it interpolates nothing, and
+        // `clippy::useless_format` is an error under `-D warnings`.
+        //
+        // "confirm PASSED", not "confirm completed": in this state confirm
+        // did run to completion. It took `SealedPending::confirm`'s
+        // `proves_medium_bad` branch, which is what recorded the quarantine
+        // this verify has just cleared. What never happened is confirm
+        // passing — the one branch that moves `writes` to `completed` and
+        // `volumes.status` to `sealed`. Saying "completed" would read as if
+        // confirm had crashed or never run, which is a different fault with
+        // a different remedy.
         let sealed_note = if sealed_at_set {
-            format!(
-                " The tape IS physically sealed, though: the seal marker and every byte are \
-                 on it, and this verify just read them all back. What is missing is the \
-                 catalog's record that the write session's confirm completed, which is the \
-                 only thing that sets \"sealed\"."
-            )
+            " The tape IS physically sealed, though: the seal marker and every byte are on \
+             it, and this verify just read them all back. What is missing is the catalog's \
+             record that the write session's confirm PASSED, which is the only thing that \
+             sets \"sealed\"."
         } else {
-            String::new()
+            ""
         };
         format!(
             "volume \"{label}\": a full verify read every file back and found no mismatch, so \
