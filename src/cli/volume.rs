@@ -399,6 +399,78 @@ fn validate_volume_status(value: &str) -> Result<()> {
         .map_err(TapectlError::Other)
 }
 
+/// The three things a clean FULL verify's clearing of
+/// `volumes.observed_condition` can honestly be told to the operator
+/// (issue #280), chosen by `counts_as_copy` — the exact answer
+/// `policy::coverage::counts_as_copy` gives for this volume, i.e. the same
+/// predicate `audit`/`report copies`/every `min_copies` gate reads. Kept as
+/// its own pure function (no `Connection`, no `VerifyReport`) so each of
+/// the three outcomes can be pinned by its own test without a live
+/// store/DB round trip through the whole `volume verify` command.
+///
+/// `clear_condition_on_clean_full_verify` (`src/volume/write.rs`) only ever
+/// writes `observed_condition`; `volumes.status` never moves here or there
+/// (that is parked for the CTO, ADR-0012). So "counts as a copy again" is
+/// only ever true in the one case this message was originally written for
+/// (`counts_as_copy` true, which after a clean clear means `status =
+/// 'sealed'`) — the other two branches are issue #280's fix, and neither
+/// one offers a remedy: an `initialized` volume stuck past a confirm that
+/// never reached the sealing `UPDATE` cannot be resumed here (`volume
+/// resume` only rehydrates an `interrupted` write, and this state's
+/// `writes` rows are `aborted` — `session.rs`'s `proves_medium_bad` arm),
+/// and naming it as one would hand the operator a command that refuses.
+fn clean_clear_message(
+    label: &str,
+    previous_condition: &str,
+    status: &str,
+    sealed_at_set: bool,
+    counts_as_copy: bool,
+) -> String {
+    if counts_as_copy {
+        format!(
+            "volume \"{label}\" RETURNED TO SERVICE: a full verify read every file back and \
+             found no mismatch, so its condition moves from \"{previous_condition}\" to \"ok\" \
+             and it counts as a copy again (ADR-0012, 2026-09-18). Its status was never touched."
+        )
+    } else if status == "retired" {
+        format!(
+            "volume \"{label}\": a full verify read every file back and found no mismatch, so \
+             its condition moves from \"{previous_condition}\" to \"ok\" — but it remains \
+             RETIRED (`volumes.status = \"retired\"`), so it still counts as a copy for \
+             nothing. That status was set deliberately, and a clean medium observation does \
+             not undo it."
+        )
+    } else {
+        let sealed_note = if sealed_at_set {
+            format!(
+                " The tape IS physically sealed — the seal marker and every byte are on it \
+                 — but its catalog status (\"{status}\") is not \"sealed\", so it still does \
+                 not count as a copy."
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "volume \"{label}\": a full verify read every file back and found no mismatch, so \
+             its condition moves from \"{previous_condition}\" to \"ok\" — but it still does \
+             NOT count as a copy: its status is \"{status}\", not \"sealed\".{sealed_note}"
+        )
+    }
+}
+
+/// The `--json` twin of [`clean_clear_message`]'s branch selection (issue
+/// #280): `returned_to_service` must never read `true` when the volume
+/// does not currently count as a copy, exactly as the human message must
+/// never claim RETURNED TO SERVICE in that case. `cleared` is
+/// `report.cleared.is_some()` — this verify actually cleared the
+/// condition — and `counts_as_copy` is `policy::coverage::counts_as_copy`'s
+/// answer for this volume. Pulled out, like `clean_clear_message`, so this
+/// one bit of `--json` semantics can be pinned by a test without a live
+/// DB/store round trip.
+fn returned_to_service_json(cleared: bool, counts_as_copy: bool) -> bool {
+    cleared && counts_as_copy
+}
+
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
 /// mirroring the `audit` convention (`src/cli/audit.rs`): 0=clean,
 /// 1=warning, 2=violation. Every arm but `Verify` has no exit-code
@@ -593,6 +665,28 @@ pub fn run(
             let device = read_device(config, device.as_deref())?;
             let report =
                 write::volume_verify(conn, config, label, &device, DEFAULT_BLOCK_SIZE, tier)?;
+            // Issue #280: read ONCE, before either output branch, so the
+            // human message and its `--json` twin can never derive "does
+            // this volume count as a copy" two different ways.
+            // `counts_as_copy` routes through `policy::coverage::eligible`
+            // (issue #96's sole owner of every `volumes.status` predicate)
+            // — never hand-write `status = 'sealed'` at this call site.
+            let current_volume_status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE label = ?1",
+                    [label.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            let volume_sealed_at_set: bool = conn
+                .query_row(
+                    "SELECT sealed_at IS NOT NULL FROM volumes WHERE label = ?1",
+                    [label.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            let volume_counts_as_copy =
+                crate::policy::coverage::counts_as_copy(conn, label).unwrap_or(false);
             if json_output {
                 // Issue #142: `failed: 3` without naming the three is the
                 // difference between an operator who knows what to re-copy
@@ -636,11 +730,30 @@ pub fn run(
                         // Issue #268, additive: the inverse of `quarantined`.
                         // True only when this verify actually returned the
                         // volume to service, never on the ordinary clean
-                        // verify of a healthy one.
-                        "returned_to_service": report.cleared.is_some(),
+                        // verify of a healthy one. Issue #280 corrected the
+                        // semantics without renaming the field: a clean
+                        // clear on a `retired` or otherwise non-`sealed`
+                        // volume no longer claims `true` here — that was
+                        // the durability lie this field existed to avoid,
+                        // just stated for the wrong half of the condition.
+                        // `condition_changed` alone (which `cleared` below
+                        // still carries unconditionally) is enough to tell
+                        // a machine reader "the condition moved"; this
+                        // field now also answers "and it counts".
+                        "returned_to_service": returned_to_service_json(
+                            report.cleared.is_some(),
+                            volume_counts_as_copy,
+                        ),
                         "cleared": report.cleared.as_ref().map(|c| serde_json::json!({
                             "previous_condition": c.previous_condition,
                             "condition_changed": true,
+                            // Issue #280: the same derived answer the human
+                            // message gives, plus the status it is derived
+                            // from, so a machine reader is never left to
+                            // infer "does this count" from `status` and
+                            // `eligible` on its own.
+                            "counts_as_copy": volume_counts_as_copy,
+                            "status": current_volume_status,
                         })),
                         "quarantine": report.quarantine.as_ref().map(|q| {
                             // Issue #242: a verify no longer touches
@@ -734,14 +847,31 @@ pub fn run(
                     // as a copy again -- and an operator who cleaned the drive
                     // and re-verified needs to be told it worked, in the same
                     // place they were told it failed.
+                    //
+                    // Issue #280: "counts as a copy again" is only true while
+                    // `status = 'sealed'` -- `clear_condition_on_clean_full_
+                    // verify` only ever touches `observed_condition`, so a
+                    // `retired` volume (salvaged after quarantine, then
+                    // deliberately retired) or one stuck `initialized` after
+                    // a confirm that never reached the sealing UPDATE
+                    // (`session.rs`'s `proves_medium_bad` arm) clears clean
+                    // and STILL counts for nothing. `clean_clear_message`
+                    // (below) is the single place that decides which of the
+                    // three true statements to make, driven by
+                    // `counts_as_copy` -- the same predicate `audit`/`report
+                    // copies` read -- so this text can never claim more than
+                    // the catalog would count.
                     (None, _) => {
                         if let Some(c) = &report.cleared {
                             println!(
-                                "volume \"{label}\" RETURNED TO SERVICE: a full verify read \
-                                 every file back and found no mismatch, so its condition moves \
-                                 from \"{}\" to \"ok\" and it counts as a copy again \
-                                 (ADR-0012, 2026-09-18). Its status was never touched.",
-                                c.previous_condition,
+                                "{}",
+                                clean_clear_message(
+                                    label,
+                                    &c.previous_condition,
+                                    &current_volume_status,
+                                    volume_sealed_at_set,
+                                    volume_counts_as_copy,
+                                )
                             );
                         }
                     }
