@@ -2,6 +2,7 @@ use clap::Subcommand;
 use rusqlite::Connection;
 
 use crate::collection;
+use crate::collection::fingerprint::RefusedUnit;
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 
@@ -108,6 +109,16 @@ pub enum CollectionCommands {
 /// a whole batch and wrote a real tape — the worst instance of the gap,
 /// since ADR-0003 makes a sealed volume immutable and the cartridge is
 /// consumed. `Status`/`Plan` are reads with nothing to suppress.
+///
+/// Returns a process exit code (issue #45/H10 precedent, extended by issue
+/// #285): 0 when every unit was processed cleanly, non-zero when at least
+/// one unit anywhere was REFUSED because its own dotfile could not be
+/// parsed (ADR-0012's 2026-09-22 amendment). A refused unit is never
+/// reported by returning `Err` here — `Err` would abort before the healthy
+/// units in the same collection ever ran, which is exactly the
+/// whole-collection-abort bug this issue exists to fix. `main.rs` mirrors
+/// the `Volume`/`Config::Check` arms: capture the code, then
+/// `exit_if_nonzero`.
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -115,7 +126,7 @@ pub fn run(
     command: &CollectionCommands,
     json_output: bool,
     global_dry_run: bool,
-) -> Result<()> {
+) -> Result<i32> {
     match command {
         // `Sync` declares its OWN `--dry-run` as well. The two are OR-ed,
         // but NOT because the global one was being dropped here: both args
@@ -170,19 +181,66 @@ fn no_libraries_configured(json_output: bool) {
     }
 }
 
+/// Exit code for a `collection` command carrying a `refused`-unit list
+/// (ADR-0012's 2026-09-22 amendment, issue #285). Mirrors the `audit`/`db
+/// fsck` convention (0=clean, 1=warning, 2=violation): a refused unit is a
+/// per-unit fault the command already worked around — every OTHER unit
+/// still ran — so it is a warning, not a hard error. `EXIT_ERROR` stays
+/// reserved for a genuine collection-wide failure (a bad root, a DB error)
+/// that still propagates as `Err` and is handled by `main.rs`'s
+/// `exit_with_error`, exactly as `db fsck`'s "the integrity check itself
+/// failing is a violation, full stop" reasons about its own 1-vs-2 split.
+fn refused_exit_code(any_refused: bool) -> i32 {
+    if any_refused {
+        crate::error::EXIT_WARNING
+    } else {
+        crate::error::EXIT_SUCCESS
+    }
+}
+
+/// `refused`, shaped for `--json` output (issue #285: "if --json is set,
+/// the refusals must appear in the JSON too, not only on stderr").
+fn refused_json(refused: &[RefusedUnit]) -> Vec<serde_json::Value> {
+    refused
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "unit": r.unit_name,
+                "path": r.path,
+                "reason": r.reason,
+            })
+        })
+        .collect()
+}
+
+/// Plain-text report for `refused`, shared by all four commands: names each
+/// refused unit, marks it clearly as never archived (ADR-0012's 2026-09-22
+/// amendment — refused, not best-effort). `r.reason` already carries the
+/// dotfile's own path (issue #285's `read_dotfile` fix), so it is not
+/// repeated here.
+fn print_refused_plain(refused: &[RefusedUnit]) {
+    for r in refused {
+        println!(
+            "  REFUSED (not archived): unit \"{}\" — its dotfile could not be parsed: {}",
+            r.unit_name, r.reason
+        );
+    }
+}
+
 fn cmd_sync(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
     dry_run: bool,
     json_output: bool,
-) -> Result<()> {
+) -> Result<i32> {
     if config.collections.is_empty() {
         no_libraries_configured(json_output);
-        return Ok(());
+        return Ok(crate::error::EXIT_SUCCESS);
     }
 
     let mut rows = Vec::new();
+    let mut any_refused = false;
     for lib in &config.collections {
         let (report, errors) = collection::sync::sync_collection(
             conn,
@@ -191,6 +249,7 @@ fn cmd_sync(
             dry_run,
             &config.defaults.global_excludes,
         )?;
+        any_refused |= !report.refused.is_empty();
         rows.push((lib.name.clone(), report, errors));
     }
 
@@ -208,6 +267,7 @@ fn cmd_sync(
                     "pending": r.pending,
                     "dirty": r.dirty,
                     "errors": errors,
+                    "refused": refused_json(&r.refused),
                 })
             })
             .collect();
@@ -223,20 +283,23 @@ fn cmd_sync(
             for e in errors {
                 println!("  error: {e}");
             }
+            print_refused_plain(&r.refused);
         }
     }
-    Ok(())
+    Ok(refused_exit_code(any_refused))
 }
 
-fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i32> {
     if config.collections.is_empty() {
         no_libraries_configured(json_output);
-        return Ok(());
+        return Ok(crate::error::EXIT_SUCCESS);
     }
 
     let mut rows = Vec::new();
+    let mut any_refused = false;
     for lib in &config.collections {
         let status = collection::status::status_for_collection(conn, config, lib)?;
+        any_refused |= !status.refused.is_empty();
         rows.push((lib.name.clone(), status));
     }
 
@@ -250,6 +313,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<(
                     "dirty": s.dirty,
                     "missing": s.missing,
                     "under_copied": s.under_copied,
+                    "refused": refused_json(&s.refused),
                 })
             })
             .collect();
@@ -260,9 +324,10 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<(
                 "collection \"{name}\": {} pending, {} dirty, {} missing, {} under-copied",
                 s.pending, s.dirty, s.missing, s.under_copied
             );
+            print_refused_plain(&s.refused);
         }
     }
-    Ok(())
+    Ok(refused_exit_code(any_refused))
 }
 
 fn cmd_plan(
@@ -272,22 +337,25 @@ fn cmd_plan(
     generation: Option<&str>,
     device: Option<&str>,
     json_output: bool,
-) -> Result<()> {
+) -> Result<i32> {
     if config.collections.is_empty() {
         no_libraries_configured(json_output);
-        return Ok(());
+        return Ok(crate::error::EXIT_SUCCESS);
     }
 
     let mut rows = Vec::new();
+    let mut any_refused = false;
     for lib in &config.collections {
-        let batches = collection::plan::plan_for_collection(conn, config, lib, generation, device)?;
-        rows.push((lib.name.clone(), batches));
+        let (batches, refused) =
+            collection::plan::plan_for_collection(conn, config, lib, generation, device)?;
+        any_refused |= !refused.is_empty();
+        rows.push((lib.name.clone(), batches, refused));
     }
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, batches)| {
+            .map(|(name, batches, refused)| {
                 let batch_json: Vec<serde_json::Value> = batches
                     .iter()
                     .enumerate()
@@ -305,36 +373,42 @@ fn cmd_plan(
                     "copies": copies,
                     "batches": batch_json,
                     "cartridges_needed": batches.len() as i64 * copies,
+                    "refused": refused_json(refused),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        for (name, batches) in &rows {
+        for (name, batches, refused) in &rows {
             if batches.is_empty() {
                 println!("collection \"{name}\": nothing pending");
-                continue;
-            }
-            println!("collection \"{name}\" plan ({copies} copy/copies):");
-            for (i, b) in batches.iter().enumerate() {
-                println!(
-                    "  batch {i}: {} units, {} raw, {} on-tape (padded)",
-                    b.units.len(),
-                    crate::util::format_bytes_binary(b.total_bytes as i64),
-                    crate::util::format_bytes_binary(b.padded_bytes as i64),
-                );
-                for u in b.unit_names() {
-                    println!("    {u}");
+            } else {
+                println!("collection \"{name}\" plan ({copies} copy/copies):");
+                for (i, b) in batches.iter().enumerate() {
+                    println!(
+                        "  batch {i}: {} units, {} raw, {} on-tape (padded)",
+                        b.units.len(),
+                        crate::util::format_bytes_binary(b.total_bytes as i64),
+                        crate::util::format_bytes_binary(b.padded_bytes as i64),
+                    );
+                    for u in b.unit_names() {
+                        println!("    {u}");
+                    }
                 }
+                println!(
+                    "  {} batch(es) x {copies} copy/copies = {} cartridge(s) needed",
+                    batches.len(),
+                    batches.len() as i64 * copies,
+                );
             }
-            println!(
-                "  {} batch(es) x {copies} copy/copies = {} cartridge(s) needed",
-                batches.len(),
-                batches.len() as i64 * copies,
-            );
+            // Printed regardless of whether `batches` is empty — the
+            // `continue` this replaced (issue #285) used to skip refusal
+            // reporting whenever a collection's ENTIRE pending set was
+            // refused, which is exactly the case that most needs it.
+            print_refused_plain(refused);
         }
     }
-    Ok(())
+    Ok(refused_exit_code(any_refused))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -348,7 +422,7 @@ fn cmd_run(
     device: &str,
     json_output: bool,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<i32> {
     let lib = collection::find_collection(config, collection_name)?;
     // No `--generation` here: `collection run` writes to volumes that are
     // already `volume init`-ed, so each destination's real capacity is on
@@ -359,7 +433,15 @@ fn cmd_run(
     // `execute_batch` stages anything (issue #175). The device IS given
     // though: `run` already resolved the drive it is writing to, and its
     // usable-capacity factor / ENOSPC buffer still come from that drive.
-    let (batches, budget) = collection::plan::plan_for_run(conn, config, lib, device, labels)?;
+    //
+    // `refused` (issue #285): units this same collection's scan excluded
+    // because their own dotfile could not be parsed. They never appear in
+    // `batches` — the batch that follows only ever contains healthy units —
+    // so nothing below needs to special-case them; they are only reported,
+    // and their presence is what makes this command's exit code non-zero.
+    let (batches, budget, refused) =
+        collection::plan::plan_for_run(conn, config, lib, device, labels)?;
+    let exit_code = refused_exit_code(!refused.is_empty());
 
     if !json_output {
         println!(
@@ -375,6 +457,7 @@ fn cmd_run(
                 "s"
             },
         );
+        print_refused_plain(&refused);
     }
 
     let batch = batches.get(batch_idx).ok_or_else(|| {
@@ -408,6 +491,7 @@ fn cmd_run(
                     "units": batch.unit_names(),
                     "labels": labels,
                     "dry_run": true,
+                    "refused": refused_json(&refused),
                 })
             );
         } else {
@@ -423,7 +507,7 @@ fn cmd_run(
             }
             println!("  destination(s): {}", labels.join(", "));
         }
-        return Ok(());
+        return Ok(exit_code);
     }
 
     let report = collection::batch::execute_batch(
@@ -453,6 +537,7 @@ fn cmd_run(
                     "copies": p.copies,
                     "min_copies": p.min_copies,
                 })).collect::<Vec<_>>(),
+                "refused": refused_json(&refused),
             })
         );
     } else {
@@ -479,5 +564,168 @@ fn cmd_run(
             }
         }
     }
-    Ok(())
+    Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CollectionConfig, TapectlPaths};
+    use crate::db;
+    use rusqlite::params;
+
+    /// Three units under `root`: alpha/beta/gamma, each with a healthy
+    /// `f.txt` and no snapshot yet. When `malformed_beta` is true, beta
+    /// additionally gets the real issue #263 typo (`[excludes] pattern`,
+    /// singular, not `patterns`) — otherwise beta has no dotfile at all
+    /// (equally healthy; `dotfiles: true` on the returned `CollectionConfig`
+    /// does not require one to already exist).
+    fn seed_three_unit_collection(
+        conn: &Connection,
+        root: &std::path::Path,
+        malformed_beta: bool,
+    ) -> CollectionConfig {
+        // Canonicalized up front: on this VM `/tmp` is itself a symlink (to
+        // `/scratch/root-offload/tmp`), and `collection::canonical_root`
+        // resolves `CollectionConfig::root` through `std::fs::canonicalize`
+        // before string-comparing it against each unit's `current_path` —
+        // an un-canonicalized `root` here would make every unit vanish from
+        // the scan (not just the malformed one), which a purely negative
+        // ("exit 0") assertion could not tell apart from correct behaviour.
+        let root = root.canonicalize().unwrap();
+        let root = root.as_path();
+
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'media'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        for name in ["alpha", "beta", "gamma"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?2, ?3, ?4, 'active')",
+                params![
+                    format!("u-{name}"),
+                    format!("testlib/{name}"),
+                    tenant_id,
+                    dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        if malformed_beta {
+            std::fs::write(
+                root.join("beta/.tapectl-unit.toml"),
+                r#"
+[unit]
+uuid = "u-beta"
+name = "testlib/beta"
+created = "2026-01-01T00:00:00Z"
+tenant = "media"
+
+[excludes]
+pattern = ["*.tmp"]
+"#,
+            )
+            .unwrap();
+        }
+
+        CollectionConfig {
+            name: "testlib".into(),
+            root: root.to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        }
+    }
+
+    /// Issue #285 / ADR-0012's 2026-09-22 amendment: the top-level
+    /// dispatcher `cli::collection::run` — what `main.rs` actually calls —
+    /// must return a non-zero code when one unit's dotfile is malformed,
+    /// WHILE the other two units in the same collection are still fully
+    /// processed by the underlying scan. If this fails by returning 0, the
+    /// exit-code wiring from `pending_units_for_collection`'s `refused`
+    /// list up through `cli::collection::run` is broken — an unattended
+    /// `collection run` would report success while silently never
+    /// archiving one unit forever.
+    #[test]
+    fn a_malformed_dotfile_makes_the_command_exit_non_zero() {
+        let conn = db::open_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let lib = seed_three_unit_collection(&conn, root.path(), true);
+
+        let mut config = Config::default();
+        config.collections.push(lib.clone());
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+
+        let code = run(
+            &conn,
+            &paths,
+            &config,
+            &CollectionCommands::Status,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            code, 0,
+            "a refused unit must make the command exit non-zero"
+        );
+
+        // Independently confirm the healthy units were still processed —
+        // not just that the exit code happens to be non-zero for some
+        // unrelated reason: alpha and gamma have no snapshot yet, so both
+        // must still be counted `pending`, and beta must be the one named
+        // refusal.
+        let status = collection::status::status_for_collection(&conn, &config, &lib).unwrap();
+        assert_eq!(
+            status.pending, 2,
+            "alpha and gamma must still be counted pending"
+        );
+        assert_eq!(status.refused.len(), 1);
+        assert_eq!(status.refused[0].unit_name, "testlib/beta");
+    }
+
+    /// Positive control for the test above (issue #285's own point: a
+    /// command that always returns non-zero would also pass
+    /// `a_malformed_dotfile_makes_the_command_exit_non_zero`). Same
+    /// three-unit fixture, no malformed dotfile anywhere — must exit 0 with
+    /// no refusals.
+    #[test]
+    fn a_collection_with_no_malformed_dotfile_exits_zero() {
+        let conn = db::open_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let lib = seed_three_unit_collection(&conn, root.path(), false);
+
+        let mut config = Config::default();
+        config.collections.push(lib);
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+
+        let code = run(
+            &conn,
+            &paths,
+            &config,
+            &CollectionCommands::Status,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0, "no unit was refused, so the command must exit 0");
+    }
 }

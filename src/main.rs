@@ -302,7 +302,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::unit::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Collection { ref command } => {
-            cli::collection::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
+            // Issue #285: `collection::run` now returns a process exit code
+            // (0=clean, 1=warning) when a per-unit dotfile fault refused one
+            // unit while every other unit still ran — mirrors the
+            // Volume/Config::Check arms, the established mechanism for
+            // "work completed, non-zero status" (never an `Err`, which
+            // would abort before the healthy units ran).
+            let exit_code =
+                cli::collection::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
+            exit_if_nonzero(exit_code);
         }
         Commands::Snapshot { ref command } => {
             cli::snapshot::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
