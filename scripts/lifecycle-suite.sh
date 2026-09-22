@@ -910,27 +910,41 @@ for k in active + list(reversed(inactive)):
 }
 
 # heir_restore_try_keys <key_type> <dest> <logfile> — run the heir RESTORE.sh
-# against each key the tenant holds, stopping at the first that opens the
-# envelope, and SAY WHICH ONE DID. Fails if none does.
+# ONCE with every key the tenant holds, which is what a person holding a Heir
+# Kit actually does, and SAY WHICH KEY OPENED IT. Fails if the keyring cannot.
+#
+# Until #288 this looped one invocation per key, because RESTORE.sh took a
+# single --key. That could never restore a unit whose envelope and slices sit
+# on DIFFERENT key generations — a `key rotate` between staging a unit and
+# writing the volume carrying it leaves no single key that opens both, which
+# is precisely what made seed 3 red. RESTORE.sh now tries each key
+# independently for the envelope and for every slice, so the keyring goes in
+# one call and the two halves can be answered by different keys.
+#
+# This is still a real assertion, not "some key works": it fails when NO key
+# the tenant holds restores the unit. What changed is that the subject of the
+# claim is the tenant's KEYRING, which is the honest unit — a tenant does not
+# choose which generation sealed which half.
 heir_restore_try_keys() { # <key_type> <dest> <logfile>
     local ktype="$1" to="$2" log="$3"
-    local keys tried=0 k
+    local keys k opened
+    local -a args=()
     keys="$(heir_key_candidates "$RM_TENANT" "$ktype")"
     [ -n "$keys" ] || { echo "no $ktype key of tenant $RM_TENANT on disk at all"; return 1; }
-    : >"$log"
     while IFS= read -r k; do
         [ -n "$k" ] || continue
-        tried=$((tried + 1))
-        if (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore \
-                --unit "$RM_UNIT" --key "$k" --to "$to") >>"$log" 2>&1; then
-            echo "heir restore of $RM_UNIT opened with $ktype key $(basename "$k") (candidate $tried of $(printf '%s\n' "$keys" | grep -c .))"
-            return 0
-        fi
-        echo "--- $ktype candidate $(basename "$k") did not open the envelope ---" >>"$log"
-        rm -rf "$to"
+        args+=(--key "$k")
     done <<<"$keys"
+    : >"$log"
+    if (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore \
+            --unit "$RM_UNIT" "${args[@]}" --to "$to") >>"$log" 2>&1; then
+        opened="$(sed -n 's/.*opened with key //p' "$log" | head -1)"
+        echo "heir restore of $RM_UNIT succeeded from a keyring of $((${#args[@]} / 2)) $ktype key(s); envelope opened with ${opened:-<unreported>}"
+        return 0
+    fi
     cat "$log"
-    echo "no $ktype key held by tenant $RM_TENANT opened $RM_UNIT's envelope ($tried tried)"
+    echo "none of the $((${#args[@]} / 2)) $ktype key(s) tenant $RM_TENANT holds restored $RM_UNIT"
+    rm -rf "$to"
     return 1
 }
 
@@ -938,7 +952,7 @@ rm_step_restore_sh_primary() {
     ensure_heir_restore_sh || return 1
     local to="$RM_WORK/primary"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key <each primary key of $RM_TENANT, active first> --to $to"
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key <every primary key of $RM_TENANT, one invocation> --to $to"
         return 0
     fi
     heir_restore_try_keys primary "$to" "$RM_WORK/restore_primary.txt" || return 1
@@ -949,7 +963,7 @@ rm_step_restore_sh_backup() {
     ensure_heir_restore_sh || return 1
     local to="$RM_WORK/backup"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key <each backup key of $RM_TENANT, active first> --to $to (proves the backup key is a real recipient)"
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key <every backup key of $RM_TENANT, one invocation> --to $to (proves the backup key is a real recipient)"
         return 0
     fi
     heir_restore_try_keys backup "$to" "$RM_WORK/restore_backup.txt" || return 1
