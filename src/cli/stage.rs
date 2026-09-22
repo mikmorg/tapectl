@@ -824,6 +824,104 @@ mod tests {
         assert!(msg.contains("--force"), "{msg}");
     }
 
+    /// The granularity check the two tests above cannot tell apart on
+    /// their own: `is_release_candidate` is evaluated per LIVE STAGE_SET,
+    /// not per unit and not against the `stage_sets` table as a whole. A
+    /// second, unrelated unit's stage_set has a completed write (so it
+    /// alone would read as a release candidate); "unit1"'s own stage_set
+    /// still has none. If the refusal wrongly asked "does ANY stage_set
+    /// have a completed write" instead of "does unit1's OWN live
+    /// stage_set", it would emit the min_copies-flavoured message here --
+    /// this test fails on that wrong composition even though both of the
+    /// tests above still pass.
+    #[test]
+    fn create_with_version_refusal_checks_this_units_own_stage_set_not_any_in_the_table() {
+        let (conn, paths, config, _tmp) = setup();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        // A second, unrelated unit with a completed write on its own
+        // stage_set -- present in `stage_sets` and `writes` alongside
+        // unit1's, so a table-wide (rather than per-stage_set) check
+        // would wrongly find it.
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('unit2', 'unit2', ?1, '/tmp/u2', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit2_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'current', '/tmp/u2', 1, 10)",
+            params![unit2_id],
+        )
+        .unwrap();
+        let snap2_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             VALUES (?1, 'staged', 524288)",
+            params![snap2_id],
+        )
+        .unwrap();
+        let stage_set2_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V2', 'lto', 'lto0', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume2_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set2_id, snap2_id, volume2_id],
+        )
+        .unwrap();
+
+        // unit1's own stage_set is still never-written -- re-staging it
+        // must still get the never-written message, unaffected by unit2's
+        // unrelated completed write.
+        let err = run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: Some(1),
+            },
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--force"),
+            "unit1's own stage_set is still never-written: {msg}"
+        );
+        assert!(
+            !msg.contains("min_copies"),
+            "a different unit's completed write must not leak into unit1's \
+             refusal message: {msg}"
+        );
+    }
+
     #[test]
     fn create_with_version_succeeds_once_the_only_stage_set_is_cleaned() {
         let (conn, paths, config, _tmp) = setup();
