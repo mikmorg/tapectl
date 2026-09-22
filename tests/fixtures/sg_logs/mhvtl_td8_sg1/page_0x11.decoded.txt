@@ -1,0 +1,6 @@
+DT device status page (ssc-3, adc-3) [0x11]
+  Very high frequency data:
+  PAMR=0 HUI=0 MACC=1 CMPR=0 WRTP=0 CRQST=0 CRQRD=0 DINIT=0
+  INXTN=0 RAA=1 MPRSNT=1 MSTD=1 MTHRD=1 MOUNTED=1
+  DT device activity: No DT device activity
+  VS=0 TDDEC=0 EPP=0 ESR=0 RRQST=0 INTFC=0 TAFC=0

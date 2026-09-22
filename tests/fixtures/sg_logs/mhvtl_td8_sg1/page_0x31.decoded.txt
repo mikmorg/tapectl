@@ -1,0 +1,5 @@
+Tape capacity page  (LTO-5 and LTO-6 specific) [0x31]
+  Main partition remaining capacity (in MiB): 4278190079
+  Alternate partition remaining capacity (in MiB): 4278190079
+  Main partition maximum capacity (in MiB): 4278190079
+  Alternate partition maximum capacity (in MiB): 4278190079

@@ -1,0 +1,2 @@
+Temperature page  [0xd]
+  Current temperature = 0 C (or less)
