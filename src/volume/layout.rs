@@ -1530,10 +1530,24 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
         "# Recovery Guide for {tenant_name}\n\n\
          Volume: {label}\n\
          Date: {now}\n\n\
-         This tape holds age-encrypted `dar` archives. With your age key and the\n\
+         This tape holds age-encrypted `dar` archives. With your age key(s) and the\n\
          standard tools (`mt`, `dd`, `truncate`, `age`, `dar`, `sha256sum`) you can\n\
          recover your data by hand — no tapectl required. The automated `RESTORE.sh`\n\
          (tape file 2) does exactly these steps for you; use it if you can.\n\n\
+         ## Which key\n\n\
+         The key that opened this envelope is\n\
+         not necessarily the key that opens the slices below.\n\
+         The envelope was sealed when the tape was written; each slice was sealed\n\
+         earlier, when it was staged. If the keys were rotated in between, the\n\
+         slices need an older key. `age` accepts several keys at once and uses\n\
+         whichever one matches, so pass every key you hold:\n\n\
+         ```bash\n\
+         age -d -i OLD.age.key -i NEW.age.key ...\n\
+         ```\n\n\
+         Name only key files that exist:\n\
+         one unreadable `-i` path fails the whole command.\n\
+         If every key fails with `no identity matched any of the recipients`, the\n\
+         slice was sealed to a key you have not supplied — the data is not corrupt.\n\n\
          ## Units in this envelope\n\n\
          | Unit | Snapshot | Slices | Tape files |\n\
          |------|----------|--------|------------|\n"
@@ -1563,7 +1577,9 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
              `ls -l /dev/tape/by-id/` and substitute your own drive, or you may\n\
              read a different tape:\n\n\
              ```bash\n\
-             mt -f /dev/nst0 setblk 524288\n\n",
+             mt -f /dev/nst0 setblk 524288\n\n\
+             # On each `age -d` line, add `-i <file>` for every other key you hold\n\
+             # (see \"Which key\" above).\n\n",
             unit.name, unit.uuid, unit.snapshot_version,
         ));
         for slice in &unit.slices {
@@ -1601,8 +1617,10 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
            `dar -x restore` (base name `restore`, no `.N.dar` suffix in the command).\n\
          - **sha256 mismatch** — re-read the slice from tape; a short read or the wrong\n\
            block mode (must be 512KB fixed) is the usual cause.\n\
-         - **wrong key** — `age` decryption silently fails with a foreign key; use the\n\
-           key issued for this tenant (or the operator key, which can read every unit).\n",
+         - **age: \"no identity matched any of the recipients\"** — none of the keys\n\
+           you passed is the one this slice was sealed to. It may be an older key from\n\
+           before a rotation (see \"Which key\"), or the operator key, which can read\n\
+           every unit. Pass them all with repeated `-i`.\n",
     );
 
     s
@@ -1869,6 +1887,57 @@ mod tests {
         assert!(!s.contains("slice_1.dar"), "old slice_N naming leaked");
         assert!(!s.contains("ARCHIVE_BASE"), "placeholder leaked");
         assert!(!s.contains("bs=64k"));
+    }
+
+    /// #312: the envelope is sealed at WRITE time and each slice at STAGE
+    /// time (`build.rs` vs `staging/mod.rs`), so a `key rotate` between the
+    /// two leaves no single key that opens both (#288, on a real tape).
+    /// RECOVERY.md is read by someone who has already opened the envelope —
+    /// the manual path must not let them conclude that key is the only one
+    /// the slices can need. Each claim below was measured against the real
+    /// `age` CLI: several `-i` are accepted at once, one unreadable `-i`
+    /// path fails the whole command, and a missing key reports "no identity
+    /// matched any of the recipients" (it does not fail silently).
+    #[test]
+    fn recovery_md_says_the_slices_may_need_a_different_key() {
+        let units = vec![ManifestUnit {
+            name: "alpha".into(),
+            uuid: "uuid-a".into(),
+            snapshot_version: 1,
+            stage_set_id: 1,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: 4,
+                size_bytes: 1,
+                encrypted_bytes: 2,
+                sha256_plain: "abc".into(),
+                sha256_encrypted: "def".into(),
+            }],
+        }];
+        let s = generate_recovery_md("LAB01", "alice", &units);
+        assert!(
+            s.contains("not necessarily the key that opens the slices"),
+            "must say the envelope's key may not open the slices"
+        );
+        assert!(
+            s.contains("-i OLD.age.key -i NEW.age.key"),
+            "must show age taking several identities at once"
+        );
+        assert!(
+            s.contains("one unreadable `-i` path fails the whole command"),
+            "must warn that naming a missing key file fails age outright"
+        );
+        assert!(
+            s.contains("no identity matched any of the recipients"),
+            "must name the error the reader will actually see"
+        );
+        // The old troubleshooting claim was false: age does not fail silently.
+        assert!(
+            !s.contains("silently fails"),
+            "stale 'silently fails' claim"
+        );
     }
 
     /// #130: every heir-facing document hands out literal `mt -f /dev/nst0`
