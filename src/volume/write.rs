@@ -11,6 +11,7 @@ use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
 use crate::staging;
+use crate::tape::contact::{self, ContactGuard, ContactSite, ContactSlot, Medium, Operation};
 use crate::tape::drive_identity;
 use crate::tape::health;
 use crate::util::{HashingWriter, TruncatingWriter};
@@ -142,6 +143,35 @@ pub fn volume_init(
     device: &str,
     block_size: usize,
     force: bool,
+    declared_media: Option<&str>,
+    cartridge_barcode: Option<&str>,
+) -> Result<i64> {
+    // The contact cannot be opened here: every refusal above the MAM read
+    // below — a label that already exists, no backend, an empty drive — is a
+    // command that never reached a cartridge. See [`ContactSlot`].
+    let mut contact = ContactSlot::empty();
+    let r = volume_init_contacted(
+        conn,
+        config,
+        label,
+        device,
+        block_size,
+        force,
+        declared_media,
+        cartridge_barcode,
+        &mut contact,
+    );
+    contact.finish_result(r)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn volume_init_contacted<'c>(
+    conn: &'c Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
     // `--generation <GEN>`: the operator's declaration of the loaded medium's
     // generation. Only consulted when nothing could be detected; an error
     // when it contradicts a detected density code.
@@ -149,6 +179,7 @@ pub fn volume_init(
     // `--cartridge <BARCODE>`: bind to this already-registered cartridge
     // when the medium's serial matches no row (or no serial is readable).
     cartridge_barcode: Option<&str>,
+    contact: &mut ContactSlot<'c>,
 ) -> Result<i64> {
     // Creation-time label validation (issue #103). A label reaches the
     // filesystem too: `volume_read_slices` below joins
@@ -199,6 +230,23 @@ pub fn volume_init(
         )));
     }
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    // THE CONTACT BEGINS HERE: the MAM read above is the first moment this
+    // command and a cartridge were in the same drive, and `volume_id` is
+    // NULL because no `volumes` row exists yet — `init` creates it below.
+    // Everything from here down is inside the contact, including the six
+    // ADR-0010/ADR-0012 fact refusals, each of which really did happen with
+    // a tape loaded.
+    let contact = contact.fill(ContactGuard::open(
+        conn,
+        config,
+        Operation::VolumeInit,
+        device,
+        None,
+        Medium::Observed {
+            backend,
+            mam: &det.mam,
+        },
+    ));
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
             TapectlError::Other(format!(
@@ -358,6 +406,24 @@ pub fn volume_init(
     events::log_created(&tx, "volume", volume_id, label, None)?;
     tx.commit()?;
 
+    // AFTER the commit, and ONLY when the CHIP named the cartridge.
+    // `cartridge_contacts` has no `identity_source` column, so a
+    // `--cartridge <barcode>` bind written here would make an operator's
+    // typed assertion read as an observation off the medium — exactly what
+    // `REASON_SERIAL_UNREGISTERED` forbids, and the same `serial.is_some()`
+    // discriminator the File 0 `[media]` block just below uses to choose
+    // between `"mam"` and `"operator"`.
+    //
+    // The contact was opened before this cartridge row existed, so on the
+    // auto-registration path it still carries `REASON_SERIAL_UNREGISTERED`,
+    // which was true then and is a lie now; `record_cartridge` replaces both
+    // in one statement.
+    if serial.is_some() {
+        if let Some(cartridge_id) = bound.cartridge_id {
+            contact.record_cartridge(cartridge_id);
+        }
+    }
+
     report_binding(label, &lookup, &bound);
 
     // Provisional total_files: unknown until the write session builds the
@@ -505,6 +571,15 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
 /// half of the ladder: match a registered row by serial, else auto-register
 /// one whose barcode IS the serial. ADR-0011's `refuse_retired` applies
 /// here for the same reason it applies at init.
+///
+/// Returns **the cartridge the CHIP'S OWN SERIAL identified**, or `None`
+/// (issue #296). `None` is not "nothing was bound": an already-bound volume
+/// whose medium serial matches no registered row stays bound and still
+/// returns `None`, because nothing this chip said established that binding.
+/// The caller records it on the contact, and `cartridge_contacts` has no
+/// `identity_source` column — so a value returned here that the medium did
+/// not name would make an operator's typed barcode read as an observation
+/// off the tape (ADR-0012: a cartridge's identity is its chip serial).
 fn bind_late(
     conn: &Connection,
     volume_id: i64,
@@ -512,9 +587,9 @@ fn bind_late(
     det: &crate::tape::media_detect::Detected,
     volume_media_type: Option<&str>,
     drive_generation: &str,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     let Some(serial) = det.mam.serial.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     // The volume's own recorded generation first (ADR-0010 decided it at
     // init from the medium that was loaded), then what the drive detects
@@ -524,7 +599,7 @@ fn bind_late(
         .or(det.generation)
         .or_else(|| crate::media::Generation::parse(drive_generation))
     else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Resolve the cartridge this contact's medium identifies BEFORE
@@ -545,16 +620,17 @@ fn bind_late(
     if let Some(bound_id) = already_bound {
         return match &lookup.row {
             // Same cartridge: today's no-op, unchanged.
-            Some(row) if row.id == bound_id => Ok(()),
+            Some(row) if row.id == bound_id => Ok(Some(row.id)),
             // A DIFFERENT, KNOWN cartridge: the Change-2 refusal, so the
             // message is identical to every other writer of
             // `cartridge_volumes`. Never duplicated here.
-            Some(row) => binding::refuse_rebind(conn, volume_id, row.id),
+            Some(row) => binding::refuse_rebind(conn, volume_id, row.id).map(|_| None),
             // The medium's serial matches no registered row at all. Absence
             // is not contradiction (ADR-0012) — tapectl has no SPECIFIC
             // other cartridge to name, so this stays the no-op it always
-            // was rather than a guess.
-            None => Ok(()),
+            // was rather than a guess. The volume IS bound, but not by
+            // anything this chip said, so the contact learns nothing.
+            None => Ok(None),
         };
     }
 
@@ -584,7 +660,7 @@ fn bind_late(
         );
         report_binding(label, &lookup, &bound);
     }
-    Ok(())
+    Ok(bound.cartridge_id)
 }
 
 /// A volume's own recorded capacity and media generation — the ADR-0010
@@ -770,6 +846,37 @@ fn blocking_validation_errors(
 #[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow
 pub fn volume_write(
     conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
+    allow_missing_escrow: bool,
+) -> Result<()> {
+    // ONE contact for the whole write, and the one `volume compact-write`,
+    // `collection run` and `quick-archive` inherit — all three reach the
+    // drive only through this function, so a guard of their own would
+    // record one physical contact twice. See [`ContactSlot`] for why it
+    // cannot simply be opened here.
+    let mut contact = ContactSlot::empty();
+    let r = volume_write_contacted(
+        conn,
+        paths,
+        config,
+        label,
+        device,
+        block_size,
+        force,
+        allow_missing_escrow,
+        &mut contact,
+    );
+    contact.finish_result(r)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn volume_write_contacted<'c>(
+    conn: &'c Connection,
     // Unused now that backend resolution goes through `resolve_lto_backend`
     // (ADR-0010) rather than `no_lto_backend_error(Some(paths))`. Kept as a
     // parameter (not removed) since it is public API called positionally
@@ -784,6 +891,7 @@ pub fn volume_write(
     block_size: usize,
     force: bool,
     allow_missing_escrow: bool,
+    contact: &mut ContactSlot<'c>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
@@ -916,6 +1024,20 @@ pub fn volume_write(
     // (`layout-session.md`'s validation point 1).
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
     let mam = det.mam.clone();
+    // THE CONTACT BEGINS HERE, at the same one read of the medium the three
+    // refusals below consult — the `st` driver refuses a second concurrent
+    // open, so there is no second reading to be had and none is taken.
+    let contact = contact.fill(ContactGuard::open(
+        conn,
+        config,
+        Operation::VolumeWrite,
+        device,
+        Some(volume_id),
+        Medium::Observed {
+            backend,
+            mam: &det.mam,
+        },
+    ));
 
     // Corroborate at contact (ADR-0012, issue #193) — wrong-cartridge
     // discipline one layer earlier than the File 0 check (ADR-0010): the
@@ -1124,14 +1246,22 @@ pub fn volume_write(
     // writes anything, and nothing in between needs the binding.
     //
     // Mirrors `volume_init`'s ordering (see the invariant comment above it).
-    bind_late(
+    // The cartridge id comes back so the contact can name it (issue #296):
+    // a legacy unbound volume auto-registers its cartridge HERE, long after
+    // the contact opened carrying `REASON_SERIAL_UNREGISTERED`, which was
+    // true then and is a lie now. `bind_late` returns `None` unless the
+    // CHIP's own serial established the identity, so an operator-established
+    // binding never reads as an observation off the medium.
+    if let Some(cartridge_id) = bind_late(
         conn,
         volume_id,
         label,
         &det,
         volume_media_type.as_deref(),
         &backend.generation,
-    )?;
+    )? {
+        contact.record_cartridge(cartridge_id);
+    }
 
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
     let execute_outcome = planned.execute(conn, &mut store)?;
@@ -1179,12 +1309,29 @@ pub fn volume_write(
 /// `volume_write` rather than copying them.
 pub fn volume_resume(
     conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+) -> Result<()> {
+    // See [`ContactSlot`]: resume refuses on the volume's status, on its
+    // `writes` rows and on a missing backend long before it reads the MAM,
+    // and none of those refusals is a contact.
+    let mut contact = ContactSlot::empty();
+    let r = volume_resume_contacted(conn, paths, config, label, device, block_size, &mut contact);
+    contact.finish_result(r)
+}
+
+fn volume_resume_contacted<'c>(
+    conn: &'c Connection,
     // See `volume_write`'s `_paths` for why this is unused but kept.
     _paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
     block_size: usize,
+    contact: &mut ContactSlot<'c>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
@@ -1293,6 +1440,20 @@ pub fn volume_resume(
     // A fact refusal on File 0 here would pre-empt the quarantine that is
     // how a resume is supposed to record a divergent tape.
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    // THE CONTACT BEGINS HERE — resume's `det` is this contact's own reading
+    // of the tape, exactly like `volume_write`'s, and the contact records
+    // the same one.
+    contact.fill(ContactGuard::open(
+        conn,
+        config,
+        Operation::VolumeResume,
+        device,
+        Some(volume_id),
+        Medium::Observed {
+            backend,
+            mam: &det.mam,
+        },
+    ));
     binding::corroborate_volume(
         conn,
         volume_id,
@@ -2625,7 +2786,7 @@ pub fn volume_verify(
     // and drops the fd, and the st driver refuses a second concurrent open.
     // LENIENT — an unconfigured backend yields `None`, which is an absence
     // and proceeds (ADR-0010's read-path leniency).
-    let medium_serial = binding::loaded_medium_serial(config, device);
+    let observed = binding::loaded_medium(config, device);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     let mut report = volume_verify_with_store(
@@ -2635,7 +2796,12 @@ pub fn volume_verify(
         volume_id,
         block_size,
         tier,
-        medium_serial.as_deref(),
+        ContactSite::new(
+            config,
+            Operation::VolumeVerify,
+            device,
+            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        ),
     )?;
 
     // Best-effort sg_logs health collection. Advisory only, and deliberately
@@ -2693,6 +2859,48 @@ pub fn volume_verify(
 /// recording is tested at all. `volume_verify` keeps the drive-only parts
 /// (opening the device, sg_logs health collection).
 pub(crate) fn volume_verify_with_store(
+    conn: &Connection,
+    store: &mut dyn Store,
+    label: &str,
+    volume_id: i64,
+    block_size: usize,
+    tier: Tier,
+    site: ContactSite<'_>,
+) -> Result<VerifyReport> {
+    let guard = site.open(conn, Some(volume_id));
+    let r = verify_contacted(
+        conn,
+        store,
+        label,
+        volume_id,
+        block_size,
+        tier,
+        site.medium_serial(),
+    );
+    // NOT `finish_result` (issue #296). A verify that found mismatches
+    // returns `Ok(report)` with `report.failed > 0` — the non-zero exit is
+    // `verify_exit_code`'s job, one layer up — and `finish_result` would
+    // read that `Ok` as OUTCOME_OK. Migration 020 says this table exists for
+    // "the 2031 operator holding a tape with two uncorrected read errors";
+    // a contact that found errors and recorded `ok` is precisely the
+    // confident wrong answer that migration's own prose objects to.
+    match &r {
+        Ok(report) if report.failed > 0 => guard.finish(
+            contact::OUTCOME_FAILED,
+            Some(&format!(
+                "{} of {} files mismatched",
+                report.failed, report.checked
+            )),
+        ),
+        Ok(_) => guard.finish(contact::OUTCOME_OK, None),
+        Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
+    }
+    r
+}
+
+/// [`volume_verify_with_store`] minus the contact bookkeeping — the verify
+/// itself, unchanged.
+fn verify_contacted(
     conn: &Connection,
     store: &mut dyn Store,
     label: &str,
@@ -2892,6 +3100,34 @@ pub fn volume_identify(store: &mut dyn Store) -> Result<String> {
 pub fn volume_identify_corroborated(
     conn: &Connection,
     store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<Identified> {
+    // `volume_id` is NULL here, deliberately: `identify` takes no label and
+    // runs against whatever tape is loaded, which is one of the two cases
+    // migration 020 names for the column being nullable. The volume this
+    // tape claims to be is discovered BELOW, from File 0 — a claim, not the
+    // command's subject, and recording it in the contact's `volume_id`
+    // would turn the tape's own assertion into the catalog's.
+    let guard = site.open(conn, None);
+    let r = identify_contacted(conn, store, site.medium_serial());
+    // A contradiction is what the CLI turns into a non-zero exit, so it is
+    // how this contact ENDED even though the function returns `Ok` — the
+    // same split `volume_verify_with_store` makes for a failed verify.
+    match &r {
+        Ok(Identified {
+            contradiction: Some(why),
+            ..
+        }) => guard.finish(contact::OUTCOME_FAILED, Some(why)),
+        Ok(_) => guard.finish(contact::OUTCOME_OK, None),
+        Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
+    }
+    r
+}
+
+/// [`volume_identify_corroborated`] minus the contact bookkeeping.
+fn identify_contacted(
+    conn: &Connection,
+    store: &mut dyn Store,
     medium_serial: Option<&str>,
 ) -> Result<Identified> {
     let text = volume_identify(store)?;
@@ -3028,6 +3264,39 @@ fn stream_verify_slice_to_staging(
 /// caller opens `TapeStore::open_read`, so this function is directly
 /// unit-testable against a `MemStore` fixture.
 pub fn read_slices(
+    conn: &Connection,
+    config: &Config,
+    from_label: &str,
+    unit_name: &str,
+    store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<ReadSlicesReport> {
+    // The source volume, looked up twice — once here only so the contact
+    // can name it, and once inside where the refusal it produces is the
+    // documented `VolumeNotFound`. An absent row is not an absent contact:
+    // by the time this seam runs, the caller has already opened the device
+    // and read the MAM, so a tape was in a drive whether or not the label
+    // resolves — which is exactly why `volume_id` is nullable.
+    let from_vol_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![from_label],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let guard = site.open(conn, from_vol_id);
+    guard.finish_result(read_slices_contacted(
+        conn,
+        config,
+        from_label,
+        unit_name,
+        store,
+        site.medium_serial(),
+    ))
+}
+
+/// [`read_slices`] minus the contact bookkeeping.
+fn read_slices_contacted(
     conn: &Connection,
     config: &Config,
     from_label: &str,
@@ -3193,6 +3462,38 @@ pub struct CompactReadReport {
 /// caller opens `TapeStore::open_read`, so this function is directly
 /// unit-testable against a `MemStore` fixture.
 pub fn compact_read(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<CompactReadReport> {
+    // The operation travels with the SITE, not as a constant here: this one
+    // function serves two commands. `volume compact-read` records
+    // `Operation::VolumeCompactRead`; the interactive `volume compact`
+    // records `Operation::VolumeCompact` for its step 1, and makes a second,
+    // separate contact through `volume_write` for step 2 — which is
+    // physically what happens, because the read-only store must close before
+    // the same device can be opened for writing.
+    let volume_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let guard = site.open(conn, volume_id);
+    guard.finish_result(compact_read_contacted(
+        conn,
+        config,
+        label,
+        store,
+        site.medium_serial(),
+    ))
+}
+
+/// [`compact_read`] minus the contact bookkeeping.
+fn compact_read_contacted(
     conn: &Connection,
     config: &Config,
     label: &str,
@@ -3751,7 +4052,81 @@ fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
 mod tests {
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
+    use crate::tape::mam::MamInfo;
     use sha2::{Digest, Sha256};
+
+    /// A device path for tests. NOT `/dev/null` and not `/dev/nstN`: no
+    /// ungated test may open a device node, and `detect`'s ladder would try.
+    /// Nothing here opens it — the contact seam never reads the drive.
+    const TEST_DEVICE: &str = "/nonexistent/tapectl-contact-test-nst";
+
+    /// The `ContactSite` a `MemStore` test has: no configured backend, which
+    /// is the honest description of a machine with no drive at all (ADR-0005's
+    /// DR shape), so nothing about a drive that is not there is invented.
+    ///
+    /// Replaces the bare `None` these call sites used to pass for
+    /// `medium_serial` — the same absence, now carrying the reason for it.
+    fn site(operation: Operation) -> ContactSite<'static> {
+        static CFG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+        ContactSite::new(
+            CFG.get_or_init(Config::default),
+            operation,
+            TEST_DEVICE,
+            Medium::NoBackend,
+        )
+    }
+
+    /// A site whose drive DID report a medium serial — the corroboration
+    /// path's `Some(serial)`, now inseparable from the MAM reading the
+    /// contact records.
+    fn site_observed(operation: Operation, mam: &MamInfo) -> ContactSite<'_> {
+        static CFG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+        static BK: std::sync::OnceLock<crate::config::LtoBackendConfig> =
+            std::sync::OnceLock::new();
+        ContactSite::new(
+            CFG.get_or_init(Config::default),
+            operation,
+            TEST_DEVICE,
+            Medium::Observed {
+                backend: BK.get_or_init(|| crate::config::LtoBackendConfig {
+                    name: "lto0".to_string(),
+                    device_tape: TEST_DEVICE.to_string(),
+                    device_sg: "/nonexistent/tapectl-contact-test-sg".to_string(),
+                    generation: "LTO-6".to_string(),
+                    capacity_override: None,
+                    usable_capacity_factor: 0.95,
+                    enospc_buffer: "1GiB".to_string(),
+                }),
+                mam,
+            },
+        )
+    }
+
+    /// A MAM reading carrying just a serial — the only field every
+    /// corroboration call site here ever used.
+    fn mam_serial(serial: &str) -> MamInfo {
+        MamInfo {
+            serial: Some(serial.to_string()),
+            ..MamInfo::default()
+        }
+    }
+
+    /// `(operation, outcome, detail)` of the one contact row, asserted BY
+    /// VALUE — `is_some()` cannot tell `ok` from `failed`, which is the
+    /// whole question these tests ask.
+    fn only_contact(conn: &Connection) -> (String, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT operation, outcome, detail FROM cartridge_contacts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn contact_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+            .unwrap()
+    }
 
     /// `pause_after_seal_marker_from_env` is the single boundary where the
     /// variable is read (never inside `park_after_seal` or `finish_session`),
@@ -4482,7 +4857,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -4548,7 +4923,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -4603,7 +4978,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -4645,7 +5020,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -4745,7 +5120,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
         assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
@@ -4836,7 +5211,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
         assert_eq!(report.failed, 1, "mismatches: {:?}", report.mismatches);
@@ -4885,7 +5260,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -4935,7 +5310,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -5283,7 +5658,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -5388,7 +5763,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -5456,7 +5831,7 @@ mod tests {
             volume_id,
             4096,
             Tier::Integrity,
-            None,
+            site(Operation::VolumeVerify),
         )
         .unwrap();
 
@@ -5501,7 +5876,15 @@ mod tests {
 
         let mut store = mem_store_with_slice_at(4, &data);
 
-        let report = read_slices(&conn, &config, "RSLABEL", "rs-unit", &mut store, None).unwrap();
+        let report = read_slices(
+            &conn,
+            &config,
+            "RSLABEL",
+            "rs-unit",
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        )
+        .unwrap();
         assert_eq!(report.slices_read, 1);
         assert_eq!(report.bytes_read, data.len() as i64);
 
@@ -5529,7 +5912,14 @@ mod tests {
 
         let mut store = mem_store_with_slice_at(4, &data);
 
-        let report = compact_read(&conn, &config, "CRLABEL", &mut store, None).unwrap();
+        let report = compact_read(
+            &conn,
+            &config,
+            "CRLABEL",
+            &mut store,
+            site(Operation::VolumeCompactRead),
+        )
+        .unwrap();
         assert_eq!(report.slices_read, 1);
         assert_eq!(report.slices_skipped, 0);
         assert_eq!(report.bytes_read, data.len() as i64);
@@ -7774,8 +8164,17 @@ mod tests {
             .unwrap()
         }
 
-        fn call(conn: &Connection, vol_id: i64, det: &Detected) -> Result<()> {
+        fn call(conn: &Connection, vol_id: i64, det: &Detected) -> Result<Option<i64>> {
             bind_late(conn, vol_id, "L6-0001", det, Some("LTO-6"), "LTO-6")
+        }
+
+        fn cartridge_id_for_barcode(conn: &Connection, barcode: &str) -> i64 {
+            conn.query_row(
+                "SELECT id FROM cartridges WHERE barcode = ?1",
+                params![barcode],
+                |r| r.get(0),
+            )
+            .unwrap()
         }
 
         /// The headline: a serial readable now auto-registers a cartridge
@@ -7783,8 +8182,16 @@ mod tests {
         #[test]
         fn a_readable_serial_binds_a_volume_init_left_unbound() {
             let (conn, vol_id) = unbound_volume();
-            call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
+            let bound = call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
             assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("SER-1"));
+            // Issue #296: the CHIP named this one, so the contact may record
+            // it. `cartridge_id_for_barcode` re-reads the row rather than
+            // trusting the return, so this compares two independent answers.
+            assert_eq!(
+                bound,
+                Some(cartridge_id_for_barcode(&conn, "SER-1")),
+                "an auto-registration from the medium's own serial IS a chip identity"
+            );
         }
 
         /// A registered cartridge carrying that serial wins over
@@ -7799,8 +8206,9 @@ mod tests {
                 [],
             )
             .unwrap();
-            call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
+            let bound = call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
             assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("A001L6"));
+            assert_eq!(bound, Some(cartridge_id_for_barcode(&conn, "A001L6")));
             let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM cartridges", [], |r| r.get(0))
                 .unwrap();
@@ -7812,8 +8220,9 @@ mod tests {
         #[test]
         fn no_serial_leaves_the_volume_unbound_without_erroring() {
             let (conn, vol_id) = unbound_volume();
-            call(&conn, vol_id, &det_with_serial(None)).unwrap();
+            let bound = call(&conn, vol_id, &det_with_serial(None)).unwrap();
             assert_eq!(bound_barcode(&conn, vol_id), None);
+            assert_eq!(bound, None, "no serial named nothing, so nothing to record");
         }
 
         /// An already-bound volume is left strictly alone.
@@ -7837,8 +8246,13 @@ mod tests {
             )
             .unwrap();
 
-            call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
+            let bound = call(&conn, vol_id, &det_with_serial(Some("SER-1"))).unwrap();
             assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("A001L6"));
+            assert_eq!(
+                bound,
+                Some(cart_id),
+                "a no-op rebind still reports the cartridge the chip named"
+            );
             let events: i64 = conn
                 .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
                 .unwrap();
@@ -7904,6 +8318,44 @@ mod tests {
             );
             // The refusal must not have touched the existing binding.
             assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("BC-A"));
+        }
+
+        /// The fourth arm, and the one that carries the whole `identity_
+        /// source` distinction (issue #296): a volume bound by the
+        /// operator's typed barcode, with a medium whose serial matches NO
+        /// registered row. Absence is not contradiction (ADR-0012), so this
+        /// stays the no-op it always was — and returns `None`, because
+        /// nothing this chip said established that binding.
+        ///
+        /// `cartridge_contacts` has no `identity_source` column, so a
+        /// `Some` here would write an operator's assertion into a column
+        /// that reads as an observation off the medium.
+        #[test]
+        fn a_bound_volume_whose_medium_is_unregistered_reports_no_chip_identity() {
+            let (conn, vol_id) = unbound_volume();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('BC-TYPED', 'LTO-6', 2500000000000, NULL, 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'operator')",
+                params![cart, vol_id],
+            )
+            .unwrap();
+
+            let bound = call(&conn, vol_id, &det_with_serial(Some("SER-UNKNOWN"))).unwrap();
+            assert_eq!(
+                bound, None,
+                "the chip named a serial the catalog does not know, so it established \
+                 nothing — the binding here is the operator's, not the medium's"
+            );
+            // Unchanged, as the arm has always promised.
+            assert_eq!(bound_barcode(&conn, vol_id).as_deref(), Some("BC-TYPED"));
         }
 
         /// ADR-0011 applies here for the same reason it applies at init: no
@@ -8535,10 +8987,17 @@ mod tests {
             .unwrap();
 
             let b = volume_id(&conn, "L6-B");
-            let err =
-                volume_verify_with_store(&conn, &mut store, "L6-B", b, 4096, Tier::Integrity, None)
-                    .unwrap_err()
-                    .to_string();
+            let err = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "L6-B",
+                b,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("wrong tape"), "{err}");
             assert!(err.contains("L6-B"), "must name what was asked for: {err}");
             assert!(err.contains("L6-A"), "must name what was found: {err}");
@@ -8570,7 +9029,7 @@ mod tests {
                 v,
                 4096,
                 Tier::Integrity,
-                None,
+                site(Operation::VolumeVerify),
             )
             .unwrap();
             assert_eq!(report.failed, 0, "{:?}", report.mismatches);
@@ -8614,7 +9073,7 @@ mod tests {
                 v,
                 4096,
                 Tier::Integrity,
-                Some("SER-LOADED"),
+                site_observed(Operation::VolumeVerify, &mam_serial("SER-LOADED")),
             )
             .unwrap_err()
             .to_string();
@@ -8632,9 +9091,16 @@ mod tests {
             let mut config = Config::default();
             config.staging.directory = tmp.path().to_string_lossy().into_owned();
 
-            let err = read_slices(&conn, &config, "RS-WANT", "rs-unit2", &mut store, None)
-                .unwrap_err()
-                .to_string();
+            let err = read_slices(
+                &conn,
+                &config,
+                "RS-WANT",
+                "rs-unit2",
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("wrong tape"), "{err}");
             let staged: Option<String> = conn
                 .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
@@ -8653,9 +9119,15 @@ mod tests {
             let mut config = Config::default();
             config.staging.directory = tmp.path().to_string_lossy().into_owned();
 
-            let err = compact_read(&conn, &config, "CR-WANT", &mut store, None)
-                .unwrap_err()
-                .to_string();
+            let err = compact_read(
+                &conn,
+                &config,
+                "CR-WANT",
+                &mut store,
+                site(Operation::VolumeCompactRead),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("wrong tape"), "{err}");
         }
 
@@ -8684,7 +9156,12 @@ mod tests {
             )
             .unwrap();
 
-            let id = volume_identify_corroborated(&conn, &mut store, Some("SER-DRIVE")).unwrap();
+            let id = volume_identify_corroborated(
+                &conn,
+                &mut store,
+                site_observed(Operation::VolumeIdentify, &mam_serial("SER-DRIVE")),
+            )
+            .unwrap();
             // The answer is printed, not withheld: the tape's own File 0 comes
             // back intact, and the disagreement rides alongside it.
             assert!(id.text.contains("ID-VOL"), "{}", id.text);
@@ -8702,7 +9179,12 @@ mod tests {
             let conn = crate::db::open_memory().unwrap();
             let data = b"x".repeat(16);
             let mut store = mem_store_v2_tape("NEVER-SEEN", &data, &data);
-            let id = volume_identify_corroborated(&conn, &mut store, Some("SER-ANY")).unwrap();
+            let id = volume_identify_corroborated(
+                &conn,
+                &mut store,
+                site_observed(Operation::VolumeIdentify, &mam_serial("SER-ANY")),
+            )
+            .unwrap();
             assert!(id.text.contains("NEVER-SEEN"), "{}", id.text);
             assert!(
                 id.contradiction.is_none(),
@@ -8711,6 +9193,672 @@ mod tests {
         }
 
         // ── the two device-bound contacts ──
+
+        // ── issue #296: the contact ROW each of these writes ──
+        //
+        // `operation` and `outcome` are asserted BY VALUE, never by
+        // `is_some()`: a row exists either way, and "which command, ending
+        // how" is the entire question `cartridge_contacts` was added to
+        // answer. Every refusal below records its contact too — the contact
+        // happened; the command refusing is what `outcome` is for.
+
+        /// The happy path. One row, `volume verify`, `ok`.
+        #[test]
+        fn verify_records_one_contact_naming_the_command_and_a_clean_outcome() {
+            let conn = crate::db::open_memory().unwrap();
+            let good = b"intact slice bytes for the contact row test. ".repeat(4);
+            seed_one_slice_fixture(
+                &conn,
+                "VC-OK",
+                "vc-ok-unit",
+                4,
+                &good,
+                "completed",
+                "current",
+            );
+            let v = volume_id(&conn, "VC-OK");
+            let mut store = mem_store_v2_tape("VC-OK", &good, &good);
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VC-OK",
+                v,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            assert_eq!(report.failed, 0, "{:?}", report.mismatches);
+
+            assert_eq!(contact_count(&conn), 1);
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume verify");
+            assert_eq!(outcome.as_deref(), Some("ok"));
+            assert_eq!(detail, None);
+            let vol: Option<i64> = conn
+                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(vol, Some(v), "the contact names the volume it verified");
+        }
+
+        /// A verify that FOUND mismatches returns `Ok` — the non-zero exit is
+        /// `verify_exit_code`'s job one layer up — so `finish_result` would
+        /// have recorded `ok`. Migration 020 says this table exists for "the
+        /// 2031 operator holding a tape with two uncorrected read errors";
+        /// that operator must be able to find this contact by its outcome.
+        #[test]
+        fn a_verify_that_found_mismatches_records_a_failed_contact_not_an_ok_one() {
+            let conn = crate::db::open_memory().unwrap();
+            let good = b"the only copy of this version, on one tape. ".repeat(4);
+            let rotted = b"what the drive actually read back today!!!! ".repeat(4);
+            assert_eq!(good.len(), rotted.len());
+            seed_one_slice_fixture(
+                &conn,
+                "VC-ROT",
+                "vc-rot-unit",
+                4,
+                &good,
+                "completed",
+                "current",
+            );
+            let v = volume_id(&conn, "VC-ROT");
+            let mut store = mem_store_v2_tape("VC-ROT", &good, &rotted);
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VC-ROT",
+                v,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            assert_eq!(report.failed, 1, "fixture must actually mismatch");
+
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume verify");
+            assert_eq!(
+                outcome.as_deref(),
+                Some("failed"),
+                "an Ok(report) with mismatches is not an `ok` contact"
+            );
+            assert!(
+                detail.as_deref().unwrap_or("").contains("mismatched"),
+                "the count belongs in detail: {detail:?}"
+            );
+        }
+
+        /// The refusal shape, for the read seams: a wrong tape records the
+        /// contact with a non-OK outcome. The contact happened — a cartridge
+        /// was in a drive and File 0 was read off it — even though the
+        /// command then refused.
+        #[test]
+        fn a_verify_refused_for_the_wrong_tape_still_records_its_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "VC-WANT", "VC-LOADED", "vc-w-unit");
+            let v = volume_id(&conn, "VC-WANT");
+            let err = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VC-WANT",
+                v,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("wrong tape"), "{err}");
+
+            assert_eq!(
+                verification_sessions(&conn),
+                0,
+                "issue #164 still holds: no evidence row for either volume"
+            );
+            assert_eq!(
+                contact_count(&conn),
+                1,
+                "but the CONTACT is recorded — it physically happened"
+            );
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume verify");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail.as_deref().unwrap_or("").contains("wrong tape"),
+                "the refusal is the detail: {detail:?}"
+            );
+        }
+
+        #[test]
+        fn read_slices_records_one_contact_naming_the_command() {
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"read-slices contact fixture bytes, repeated. ".repeat(4);
+            seed_one_slice_fixture(&conn, "RSC-OK", "rsc-unit", 4, &data, "completed", "staged");
+            let v = volume_id(&conn, "RSC-OK");
+            let mut store = mem_store_v2_tape("RSC-OK", &data, &data);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+            read_slices(
+                &conn,
+                &config,
+                "RSC-OK",
+                "rsc-unit",
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+            .unwrap();
+
+            assert_eq!(contact_count(&conn), 1);
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume read-slices");
+            assert_eq!(outcome.as_deref(), Some("ok"));
+            let vol: Option<i64> = conn
+                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(vol, Some(v));
+        }
+
+        #[test]
+        fn read_slices_refused_for_the_wrong_tape_still_records_its_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "RSC-WANT", "RSC-LOADED", "rsc-w-unit");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+            read_slices(
+                &conn,
+                &config,
+                "RSC-WANT",
+                "rsc-w-unit",
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+            .unwrap_err();
+
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume read-slices");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+        }
+
+        /// `volume compact-read` and `volume compact` share ONE function and
+        /// differ only in the operation their site carries. Both halves are
+        /// asserted, because a constant inside `compact_read` would pass the
+        /// first and silently mislabel every step 1 of the interactive
+        /// command.
+        #[test]
+        fn compact_read_records_the_operation_its_site_carries_not_a_constant() {
+            for (operation, expected) in [
+                (Operation::VolumeCompactRead, "volume compact-read"),
+                (Operation::VolumeCompact, "volume compact"),
+            ] {
+                let conn = crate::db::open_memory().unwrap();
+                let data = b"compact-read contact fixture bytes, repeated. ".repeat(4);
+                seed_one_slice_fixture(
+                    &conn,
+                    "CRC-OK",
+                    "crc-unit",
+                    4,
+                    &data,
+                    "completed",
+                    "current",
+                );
+                let mut store = mem_store_v2_tape("CRC-OK", &data, &data);
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = Config::default();
+                config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+                compact_read(&conn, &config, "CRC-OK", &mut store, site(operation)).unwrap();
+
+                assert_eq!(contact_count(&conn), 1);
+                let (recorded, outcome, _) = only_contact(&conn);
+                assert_eq!(
+                    recorded, expected,
+                    "the operation must come from the SITE: `volume compact` step 1 and \
+                     `volume compact-read` are different commands through one function"
+                );
+                assert_eq!(outcome.as_deref(), Some("ok"));
+            }
+        }
+
+        #[test]
+        fn compact_read_refused_for_the_wrong_tape_still_records_its_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "CRC-WANT", "CRC-LOADED", "crc-w-unit");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+            compact_read(
+                &conn,
+                &config,
+                "CRC-WANT",
+                &mut store,
+                site(Operation::VolumeCompactRead),
+            )
+            .unwrap_err();
+
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume compact-read");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+        }
+
+        /// `identify` runs against whatever tape is loaded, so `volume_id` is
+        /// NULL by construction — one of the two cases migration 020 names
+        /// for that column being nullable. The volume File 0 CLAIMS is a
+        /// claim, not the command's subject.
+        #[test]
+        fn identify_records_a_contact_with_no_volume_and_no_contradiction() {
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"y".repeat(16);
+            let mut store = mem_store_v2_tape("ID-NEVER-SEEN", &data, &data);
+            volume_identify_corroborated(
+                &conn,
+                &mut store,
+                site_observed(Operation::VolumeIdentify, &mam_serial("SER-ANY")),
+            )
+            .unwrap();
+
+            assert_eq!(contact_count(&conn), 1);
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume identify");
+            assert_eq!(outcome.as_deref(), Some("ok"));
+            let vol: Option<i64> = conn
+                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                vol, None,
+                "`identify` takes no label; the tape's own claim is not the catalog's"
+            );
+        }
+
+        /// `identify` returns `Ok` on a contradiction — the answer is
+        /// printed, never withheld — but the CLI turns it into a non-zero
+        /// exit, and that is how the contact ENDED.
+        #[test]
+        fn an_identify_that_contradicts_the_catalog_records_a_failed_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = wrong_tape(&conn, "IDC-VOL", "IDC-VOL", "idc-unit");
+            let v = volume_id(&conn, "IDC-VOL");
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('BC-IDC', 'LTO-6', 2500000000000, 'SER-SHELF', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cart = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'mam')",
+                params![cart, v],
+            )
+            .unwrap();
+
+            let id = volume_identify_corroborated(
+                &conn,
+                &mut store,
+                site_observed(Operation::VolumeIdentify, &mam_serial("SER-DRIVE")),
+            )
+            .unwrap();
+            assert!(id.contradiction.is_some(), "fixture must contradict");
+
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume identify");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail.as_deref().unwrap_or("").contains("wrong cartridge"),
+                "{detail:?}"
+            );
+        }
+
+        // ── the three write paths, and the three that inherit ──
+        //
+        // These CANNOT reach a tape ungated, but they CAN be driven past
+        // their own MAM read: `check_drive_can_write` refuses an LTO-8 drive
+        // asked to write an LTO-6 volume, and that refusal sits AFTER
+        // `detect()` and BEFORE `TapeStore::open`. So the window the contact
+        // now covers is exactly the window an ungated test can enter, and
+        // the row it leaves is real.
+
+        /// A backend whose generation (LTO-8) cannot write the fixtures'
+        /// LTO-6 volumes, on a device that does not exist — so `detect`
+        /// finds nothing, `check_drive_can_write` falls back to the volume's
+        /// own recorded generation, and refuses.
+        fn lto8_config(staging: &std::path::Path) -> Config {
+            let mut config = Config::default();
+            config.staging.directory = staging.join("staging").to_string_lossy().into_owned();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto8".into(),
+                device_tape: GENCHK_DEVICE.into(),
+                device_sg: "/nonexistent/tapectl-contact-genchk-sg".into(),
+                generation: "LTO-8".into(),
+                capacity_override: None,
+                usable_capacity_factor: 1.0,
+                enospc_buffer: "0".into(),
+            });
+            config
+        }
+
+        const GENCHK_DEVICE: &str = "/nonexistent/tapectl-contact-genchk-nst";
+
+        /// One staged unit plus an `initialized` LTO-6 volume named `label`,
+        /// enough for `volume_write` to get past `find_staged_data` and down
+        /// to the generation refusal.
+        fn genchk_fixture(label: &str) -> Connection {
+            let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                     sha256_encrypted, staging_path)
+                 VALUES (?1, 1, 10, 10, 'p', 'e', '/nonexistent/tapectl-contact-slice.dar.age')",
+                params![stage_set_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+                params![label],
+            )
+            .unwrap();
+            conn
+        }
+
+        #[test]
+        fn a_refused_write_records_its_contact_as_volume_write_failed() {
+            let conn = genchk_fixture("WC-GEN");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+
+            let err = volume_write(
+                &conn,
+                &paths,
+                &config,
+                "WC-GEN",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cannot write LTO-6"), "{err}");
+
+            assert_eq!(contact_count(&conn), 1);
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume write");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("cannot write LTO-6"),
+                "{detail:?}"
+            );
+        }
+
+        /// The negative half, and the control this whole slot design exists
+        /// for: a refusal ABOVE the MAM read is not a contact, and must
+        /// leave no row. `volumes.status = 'sealed'` refuses before any
+        /// backend is resolved, let alone a drive touched.
+        #[test]
+        fn a_write_refused_before_the_mam_read_records_no_contact_at_all() {
+            let conn = genchk_fixture("WC-SEALED");
+            conn.execute(
+                "UPDATE volumes SET status = 'sealed' WHERE label = 'WC-SEALED'",
+                [],
+            )
+            .unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+
+            volume_write(
+                &conn,
+                &paths,
+                &config,
+                "WC-SEALED",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                contact_count(&conn),
+                0,
+                "nothing was ever in a drive: a catalog-status refusal is not a contact"
+            );
+        }
+
+        /// `volume compact-write` INHERITS `volume_write`'s contact. Exactly
+        /// one row, and it says `volume write` — two rows would mean it
+        /// opened its own, recording one physical contact twice.
+        #[test]
+        fn compact_write_inherits_exactly_one_contact_from_volume_write() {
+            let conn = genchk_fixture("WC-COMPACT");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+
+            compact_write(
+                &conn,
+                &paths,
+                &config,
+                "WC-COMPACT",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                contact_count(&conn),
+                1,
+                "compact-write reaches the drive only through volume_write"
+            );
+            assert_eq!(only_contact(&conn).0, "volume write");
+        }
+
+        /// `collection run` INHERITS too, through `collection::batch::
+        /// execute_batch`'s write loop. Exactly one row, saying `volume
+        /// write`.
+        ///
+        /// The batch's staging loop is driven to its `(false, "staged")`
+        /// no-op arm — an empty source directory matching a snapshot with no
+        /// file rows — so no `dar` runs and the loop reaches `volume_write`
+        /// with the fixture's own staged data, exactly as a real run does
+        /// once its units are already staged.
+        #[test]
+        fn collection_run_inherits_exactly_one_contact_from_volume_write() {
+            let conn = genchk_fixture("WC-COLL");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let src = tmp.path().join("photos");
+            std::fs::create_dir_all(&src).unwrap();
+            conn.execute(
+                "UPDATE units SET current_path = ?1 WHERE name = 'photos'",
+                params![src.to_string_lossy()],
+            )
+            .unwrap();
+
+            let config = lto8_config(tmp.path());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let batch = crate::collection::selector::Batch {
+                units: vec![crate::collection::selector::PendingUnit {
+                    name: "photos".into(),
+                    size_bytes: 10,
+                }],
+                total_bytes: 10,
+                padded_bytes: 10,
+            };
+
+            let err = crate::collection::batch::execute_batch(
+                &conn,
+                &paths,
+                &config,
+                &batch,
+                &["WC-COLL".to_string()],
+                GENCHK_DEVICE,
+                512 * 1024,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("cannot write LTO-6"),
+                "the batch must have reached volume_write's tape-side refusal, not failed \
+                 in staging: {err}"
+            );
+
+            assert_eq!(
+                contact_count(&conn),
+                1,
+                "collection run reaches the drive only through volume_write"
+            );
+            assert_eq!(only_contact(&conn).0, "volume write");
+        }
+
+        /// `quick-archive` is the third inheritor the `Operation::VolumeWrite`
+        /// doc names, and it reaches `volume_write` from `cli::operations`.
+        /// Same claim, same proof.
+        #[test]
+        fn quick_archive_inherits_exactly_one_contact_from_volume_write() {
+            const SRC: &str = include_str!("../cli/operations.rs");
+            assert!(
+                SRC.contains("crate::volume::write::volume_write("),
+                "positive control: quick-archive must still reach the drive through \
+                 volume_write, or this test proves nothing"
+            );
+            assert!(
+                !SRC.contains("ContactGuard::open") && !SRC.contains("ContactSite::new"),
+                "cli::operations must open no contact of its own — volume_write's is the \
+                 one physical contact, and a second row would double-count it"
+            );
+        }
+
+        /// `volume resume` is the one write path no ungated test can drive
+        /// past its own MAM read: `InterruptedSession::rehydrate` runs
+        /// BEFORE `detect()` and needs a real session directory with the
+        /// frozen `layout.json` a completed `build`/`plan` left behind. So
+        /// the placement is guarded by source scan — the same shape, and for
+        /// the same reason, as `the_two_write_contacts_still_corroborate`
+        /// just below.
+        ///
+        /// The scan covers all THREE write paths, which is what calibrates
+        /// it: `volume_write`'s and `volume_init`'s contact rows are
+        /// asserted behaviourally above, so a scan that passes on those two
+        /// is a scan that recognises the real thing. A guard that only ever
+        /// examined the untestable case could not tell "found the fill" from
+        /// "found nothing and said so quietly".
+        #[test]
+        fn the_three_write_paths_open_their_contact_at_their_own_mam_read() {
+            const SRC: &str = include_str!("write.rs");
+            for f in [
+                "fn volume_init_contacted",
+                "fn volume_write_contacted",
+                "fn volume_resume_contacted",
+            ] {
+                let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+                let end = SRC[start..].find("\n}\n").unwrap() + start;
+                let body = &SRC[start..end];
+                assert!(
+                    !body[f.len()..].contains("\npub fn "),
+                    "{f}: body extraction overran into another function; fix this test's \
+                     scan before trusting its verdict"
+                );
+                let detect = body
+                    .find("media_detect::detect(")
+                    .unwrap_or_else(|| panic!("{f} no longer reads the MAM at all"));
+                let fill = body
+                    .find("contact.fill(ContactGuard::open(")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{f} no longer opens its contact. A write path that reaches the \
+                         drive and records nothing is issue #296 returning."
+                        )
+                    });
+                assert!(
+                    detect < fill,
+                    "{f} must open its contact AFTER its own MAM read, from the reading it \
+                     already holds — the st driver refuses a second concurrent open, so a \
+                     contact opened earlier could only be filled by a second read that \
+                     cannot happen"
+                );
+                assert_eq!(
+                    body.matches("ContactGuard::open(").count(),
+                    1,
+                    "{f} must open exactly ONE contact: one command holding the drive is \
+                     one physical contact"
+                );
+            }
+        }
+
+        /// `volume init` refuses right after its MAM read when the drive
+        /// reports no medium serial and no `--cartridge` names one
+        /// (ADR-0012's `require_named_cartridge`). The contact is already
+        /// open by then, so the refusal is recorded rather than lost.
+        #[test]
+        fn a_refused_init_records_its_contact_as_volume_init_failed() {
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+
+            let err = volume_init(
+                &conn,
+                &config,
+                "IC-NEW",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no medium serial"), "{err}");
+
+            assert_eq!(contact_count(&conn), 1);
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume init");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            // `volume init` creates the volume row, so a refusal before that
+            // has none to name — and NULL here is honest, not missing.
+            let vol: Option<i64> = conn
+                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(vol, None);
+        }
+
+        /// The negative control for `volume init`: a label that already
+        /// exists refuses before the MAM read, and records nothing.
+        #[test]
+        fn an_init_refused_before_the_mam_read_records_no_contact_at_all() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('IC-DUP', 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+
+            volume_init(
+                &conn,
+                &config,
+                "IC-DUP",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(contact_count(&conn), 0);
+        }
 
         /// `volume write` and `volume resume` cannot be driven without a tape
         /// device, so their corroboration is proved on real hardware by the
@@ -8721,7 +9869,12 @@ mod tests {
         #[test]
         fn the_two_write_contacts_still_corroborate() {
             const SRC: &str = include_str!("write.rs");
-            for f in ["pub fn volume_write(", "pub fn volume_resume("] {
+            // The INNER functions (issue #296): the public entry points are
+            // now thin contact wrappers, and the work — corroboration
+            // included — lives one call down. The call moved, so the
+            // assertion moved with it, which is what this test's own
+            // instruction below says to do.
+            for f in ["fn volume_write_contacted", "fn volume_resume_contacted"] {
                 let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
                 // Function bodies end at the first `\n}` in column 0.
                 let end = SRC[start..].find("\n}\n").unwrap() + start;
@@ -8759,7 +9912,7 @@ mod tests {
         #[test]
         fn volume_write_records_mam_facts_only_after_the_tape_side_refusals() {
             const SRC: &str = include_str!("write.rs");
-            let f = "pub fn volume_write(";
+            let f = "fn volume_write_contacted";
             let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
             let end = SRC[start..].find("\n}\n").unwrap() + start;
             let body = &SRC[start..end];
@@ -8807,7 +9960,7 @@ mod tests {
         #[test]
         fn volume_init_parses_capacity_override_decimally() {
             const SRC: &str = include_str!("write.rs");
-            let f = "pub fn volume_init(";
+            let f = "fn volume_init_contacted";
             let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
             let end = SRC[start..].find("\n}\n").unwrap() + start;
             let body = &SRC[start..end];

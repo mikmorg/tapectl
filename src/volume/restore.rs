@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{info, warn};
 
 use crate::config::{Config, TapectlPaths};
@@ -11,6 +11,7 @@ use crate::dar;
 use crate::db::queries;
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
+use crate::tape::contact::{self, ContactSite, Medium, Operation};
 use crate::util::{HashingWriter, TruncatingWriter};
 
 /// Removes the restore scratch directory when it goes out of scope, on every
@@ -113,7 +114,7 @@ pub fn restore_unit(
     // read-only and drops the fd, and the st driver refuses a second
     // concurrent open. LENIENT — no configured backend yields `None`, an
     // absence, which is the DR machine with keys and no `backend add`.
-    let medium_serial = crate::volume::binding::loaded_medium_serial(config, device);
+    let observed = crate::volume::binding::loaded_medium(config, device);
     // Open the store read-only, positioned at BOT.
     let mut store = TapeStore::open_read(device, block_size)?;
     restore_unit_from_store(
@@ -124,8 +125,60 @@ pub fn restore_unit(
         volume_label,
         dest_dir,
         &mut store,
-        medium_serial.as_deref(),
+        ContactSite::new(
+            config,
+            Operation::RestoreUnit,
+            device,
+            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        ),
     )
+}
+
+/// `restore raw-volume` over an already-open store — the heir/DR dump
+/// (ADR-0005), with its contact recorded.
+///
+/// A thin wrapper around [`crate::volume::raw::restore_raw`], which stays
+/// `Connection`-free on purpose: it is the function an heir runs with no
+/// catalog at all, and giving it a database would be giving it the thing the
+/// whole path exists to do without. The contact is bookkeeping ABOUT that
+/// dump, not part of it, so it belongs here.
+///
+/// **`Medium::NotAttempted`, and `cartridge_id` NULL.** This path reads no
+/// MAM: it consults nothing but the tape (ADR-0005). The contact is recorded
+/// anyway — a contact is a physical fact whether or not the cartridge could
+/// be identified — and `REASON_MAM_NOT_ATTEMPTED` says which of the five
+/// reasons the NULL is, so the row is never a silent absence.
+pub fn restore_raw_volume(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    store: &mut dyn Store,
+    dest: &Path,
+    expect_label: Option<&str>,
+) -> Result<crate::volume::raw::RawRestoreReport> {
+    let guard = ContactSite::new(
+        config,
+        Operation::RestoreRawVolume,
+        device,
+        Medium::NotAttempted,
+    )
+    .open(conn, None);
+    let r = crate::volume::raw::restore_raw(store, dest, expect_label);
+    // A dump whose checksums did not all verify is how this contact ENDED,
+    // even though the function returns `Ok` — the CLI's exit status says the
+    // same thing (`RawRestoreReport::all_verified`).
+    match &r {
+        Ok(report) if !report.all_verified() => guard.finish(
+            contact::OUTCOME_FAILED,
+            Some(&format!(
+                "{} of {} files mismatched",
+                report.mismatched_count, report.files_dumped
+            )),
+        ),
+        Ok(_) => guard.finish(contact::OUTCOME_OK, None),
+        Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
+    }
+    r
 }
 
 /// [`restore_unit`] minus the tape device — everything from the contact
@@ -143,6 +196,42 @@ pub fn restore_unit(
 /// function that cannot be called on its own is not a seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_unit_from_store(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    volume_label: &str,
+    dest_dir: &str,
+    store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<RestoreReport> {
+    // The volume the restore names, looked up here only so the contact can
+    // reference it. An absent row is not an absent contact: the tape in the
+    // drive was still read (File 0, below), which is exactly the situation a
+    // `volume_id` this command cannot resolve describes.
+    let volume_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            rusqlite::params![volume_label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let guard = site.open(conn, volume_id);
+    guard.finish_result(restore_unit_contacted(
+        conn,
+        paths,
+        config,
+        unit_name,
+        volume_label,
+        dest_dir,
+        store,
+        site.medium_serial(),
+    ))
+}
+
+/// [`restore_unit_from_store`] minus the contact bookkeeping.
+#[allow(clippy::too_many_arguments)]
+fn restore_unit_contacted(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
@@ -567,6 +656,30 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
     use tempfile::TempDir;
+
+    /// The `ContactSite` a `MemStore` test has: no configured backend, the
+    /// honest description of a machine with no drive at all (ADR-0005's DR
+    /// shape). Nothing here opens the device path; the contact seam never
+    /// reads the drive.
+    fn site(operation: Operation) -> ContactSite<'static> {
+        static CFG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+        ContactSite::new(
+            CFG.get_or_init(Config::default),
+            operation,
+            "/nonexistent/tapectl-contact-test-nst",
+            Medium::NoBackend,
+        )
+    }
+
+    /// `(operation, outcome)` of the one contact row, asserted BY VALUE.
+    fn only_contact(conn: &Connection) -> (String, Option<String>) {
+        conn.query_row(
+            "SELECT operation, outcome FROM cartridge_contacts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
 
     fn direct_hash(data: &[u8]) -> String {
         let mut h = Sha256::new();
@@ -1085,7 +1198,7 @@ mod tests {
                 "RESTORE-WANT",
                 &dest.path().to_string_lossy(),
                 &mut store,
-                None,
+                site(Operation::RestoreUnit),
             )
             .unwrap_err()
             .to_string();
@@ -1118,13 +1231,138 @@ mod tests {
                 "RESTORE-OK",
                 &dest.path().to_string_lossy(),
                 &mut store,
-                None,
+                site(Operation::RestoreUnit),
             )
             .unwrap_err()
             .to_string();
             assert!(
                 !err.contains("wrong tape"),
                 "the contact check must have passed; got: {err}"
+            );
+        }
+
+        // ── issue #296: the contact ROW ──
+
+        /// `restore unit` records its contact, refusal and all: a cartridge
+        /// was in a drive and File 0 was read off it, which is what
+        /// `cartridge_contacts` records. `operation` and `outcome` are
+        /// asserted BY VALUE — a row exists either way, and "which command,
+        /// ending how" is the whole question.
+        #[test]
+        fn a_restore_refused_for_the_wrong_tape_still_records_its_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "RC-WANT", "rc-unit");
+            let mut store = tape_labelled("RC-LOADED");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+
+            restore_unit_from_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "rc-unit",
+                "RC-WANT",
+                &dest.path().to_string_lossy(),
+                &mut store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err();
+
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1);
+            let (operation, outcome) = only_contact(&conn);
+            assert_eq!(operation, "restore unit");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+
+            // The contact names the volume the operator asked for — the one
+            // this command is about, not the one File 0 turned out to claim.
+            let want: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'RC-WANT'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let vol: Option<i64> = conn
+                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(vol, Some(want));
+        }
+
+        /// The positive control for the assertion above: with the RIGHT tape
+        /// the restore gets past the contact check and fails later, on the
+        /// key load — and STILL records exactly one contact, proving the row
+        /// above is not an artefact of the refusal path.
+        #[test]
+        fn a_restore_that_passes_the_contact_check_records_exactly_one_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "RC-OK", "rc-unit");
+            let mut store = tape_labelled("RC-OK");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+
+            let err = restore_unit_from_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "rc-unit",
+                "RC-OK",
+                &dest.path().to_string_lossy(),
+                &mut store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("wrong tape"), "{err}");
+
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1, "one command holding the drive is one contact");
+            assert_eq!(only_contact(&conn).0, "restore unit");
+        }
+
+        /// `restore raw-volume` — the heir/DR path (ADR-0005). It reads no
+        /// MAM at all, so `cartridge_id` is NULL; the contact is recorded
+        /// anyway, because a contact is a physical fact whether or not the
+        /// cartridge could be identified, and `identity_reason` says WHICH
+        /// of the five reasons the NULL is rather than leaving a silent
+        /// absence.
+        #[test]
+        fn restore_raw_volume_records_a_contact_that_attempted_no_mam_read() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = tape_labelled("RAW-VOL");
+            let dest = TempDir::new().unwrap();
+
+            // The dump itself fails: `tape_labelled` writes File 0 only, and
+            // `restore_raw` needs the front index at File 3. That is beside
+            // the point here — the contact is what is being asserted, and
+            // recording it must not depend on the dump succeeding.
+            let _ = restore_raw_volume(
+                &conn,
+                &Config::default(),
+                "/nonexistent/tapectl-contact-test-nst",
+                &mut store,
+                dest.path(),
+                None,
+            );
+
+            let (operation, outcome) = only_contact(&conn);
+            assert_eq!(operation, "restore raw-volume");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            let (cartridge, volume, reason): (Option<i64>, Option<i64>, Option<String>) = conn
+                .query_row(
+                    "SELECT cartridge_id, volume_id, identity_reason FROM cartridge_contacts",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(cartridge, None, "this path reads no serial at all");
+            assert_eq!(volume, None, "and runs against whatever tape is loaded");
+            assert_eq!(
+                reason.as_deref(),
+                Some(crate::tape::contact::REASON_MAM_NOT_ATTEMPTED),
+                "a NULL cartridge_id with no reason is the data loss #296 exists to stop"
             );
         }
     }

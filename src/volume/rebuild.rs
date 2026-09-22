@@ -345,7 +345,7 @@ pub fn rebuild_from_volume(
     // LENIENT (ADR-0010): rebuild is THE disaster-recovery read path, so a
     // machine with keys and no `backend add` yields `None` — an absence,
     // which corroborates against nothing and proceeds.
-    let medium_serial = crate::volume::binding::loaded_medium_serial(config, device);
+    let observed = crate::volume::binding::loaded_medium(config, device);
     let mut store = TapeStore::open_read(device, block_size)?;
     rebuild_from_store(
         conn,
@@ -356,7 +356,17 @@ pub fn rebuild_from_volume(
         backend_name,
         scratch,
         device,
-        medium_serial.as_deref(),
+        // The REAL reading, not the `MamInfo::default()` the rebuild hands
+        // `mount_and_record` further down: that default exists so a
+        // `total_load_count` COALESCE is a no-op rather than asserting a
+        // reading nobody took, and reusing it here would record the same
+        // invention as an observation.
+        crate::tape::contact::ContactSite::new(
+            config,
+            crate::tape::contact::Operation::CatalogRebuild,
+            device,
+            crate::tape::contact::Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        ),
     )
 }
 
@@ -376,6 +386,36 @@ pub fn rebuild_from_store(
     fallback_tenant: &str,
     // The configured LTO backend's name; `None` falls back to the backend
     // type, matching `volume_import`.
+    backend_name: Option<&str>,
+    scratch: &Path,
+    device_label: &str,
+    site: crate::tape::contact::ContactSite<'_>,
+) -> Result<RebuildReport> {
+    // `volume_id` is NULL: the rebuild's whole premise is that the catalog
+    // does not yet have a row for this volume — creating one is the
+    // command's OUTPUT, not an input the contact can reference.
+    let guard = site.open(conn, None);
+    guard.finish_result(rebuild_contacted(
+        conn,
+        store,
+        identities,
+        expect_label,
+        fallback_tenant,
+        backend_name,
+        scratch,
+        device_label,
+        site.medium_serial(),
+    ))
+}
+
+/// [`rebuild_from_store`] minus the contact bookkeeping.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_contacted(
+    conn: &Connection,
+    store: &mut dyn Store,
+    identities: &[age::x25519::Identity],
+    expect_label: Option<&str>,
+    fallback_tenant: &str,
     backend_name: Option<&str>,
     scratch: &Path,
     device_label: &str,

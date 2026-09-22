@@ -189,7 +189,18 @@ pub fn run(
             // configured backend — this is the heir/DR path, ADR-0005.
             crate::tape::media_detect::check_read_contact(config, &device)?;
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-            let report = volume::raw::restore_raw(&mut store, dest, from.as_deref())?;
+            // Through `volume::restore` rather than `volume::raw` directly:
+            // `raw::restore_raw` stays `Connection`-free (it is what an heir
+            // runs with no catalog at all), and the contact record is
+            // bookkeeping ABOUT the dump, not part of it.
+            let report = volume::restore::restore_raw_volume(
+                conn,
+                config,
+                &device,
+                &mut store,
+                dest,
+                from.as_deref(),
+            )?;
 
             if json_output {
                 let files: Vec<_> = report

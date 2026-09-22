@@ -223,6 +223,29 @@ fn migrations() -> Migrations<'static> {
         // references `drives` yet; migration 020 will. See the migration
         // header for the full rationale.
         M::up(include_str!("migrations/019_drives.sql")),
+        // 020 creates `cartridge_contacts` (ADR-0013 §2 "The contact row is
+        // the spine", issue #296): thirteen code paths put a cartridge in a
+        // drive and not one wrote a row saying it happened. `cartridge_volumes`
+        // is a BINDING record -- `UNIQUE(volume_id)`, one row per volume for
+        // the life of that volume -- so ten verifies leave it exactly as
+        // `volume init` wrote it, and `cartridges.total_load_count` has
+        // exactly one writer, also `volume init`.
+        //
+        // Every foreign key on it is nullable and each NULL means something
+        // different; `identity_reason` is never NULL when `cartridge_id` is,
+        // because a NULL with no reason is the data loss this suite exists to
+        // stop. `operation` is free TEXT (ADR-0013 §4) with a pinning test,
+        // and it is a DIFFERENT vocabulary from `health_logs.operation` --
+        // the command verbatim, not what kind of reading a row is.
+        //
+        // It creates one table and touches nothing else -- in particular it
+        // adds NO column to `health_logs`, whose one permitted rebuild is
+        // migration 021 (ADR-0013 §3, the second pass of this same issue).
+        // No rebuild here, so no `.foreign_key_check()` -- nothing references
+        // `cartridge_contacts` yet; migration 022 will. See the migration
+        // header for the full rationale, including why `db::open` grows no
+        // recovery sweep for `closed_at IS NULL` (issue #98).
+        M::up(include_str!("migrations/020_cartridge_contacts.sql")),
     ])
 }
 
@@ -1452,6 +1475,181 @@ mod tests {
             )),
             M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
             M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
+        ];
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    /// A connection migrated to exactly the 020 schema — the last point
+    /// before migration 021 (the second pass of issue #296) performs
+    /// `health_logs`' one permitted rebuild (ADR-0013 §3).
+    ///
+    /// Exists for the same reason `open_memory_at_016`/`open_memory_at_017`
+    /// do: the "this migration changed nothing else" pins below must hold on
+    /// their own terms rather than against whatever migration happens to be
+    /// latest. Today it is equivalent to `open_memory()`; the moment 021
+    /// lands it stops being, which is precisely when it earns its keep — 021
+    /// is irreversible and its verification standard (#227/#264) needs a
+    /// before-picture that cannot drift.
+    fn open_memory_at_020() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+            M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
+            M::up(include_str!(
+                "migrations/014_cartridge_binding_identity_source.sql"
+            )),
+            M::up(include_str!(
+                "migrations/015_cartridge_load_count_unknown.sql"
+            )),
+            M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
+            M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/018_volume_sealed_at.sql")),
+            M::up(include_str!("migrations/019_drives.sql")),
+            M::up(include_str!("migrations/020_cartridge_contacts.sql")),
+        ];
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        Migrations::new(std::mem::take(&mut ms))
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    /// Migration 020 creates `cartridge_contacts` and NOTHING else
+    /// (ADR-0013 §3, issue #296).
+    ///
+    /// The ADR exists because four drafts in the tape-forensics suite each
+    /// independently proposed rebuilding `health_logs`, and four
+    /// uncoordinated rebuilds of the table holding the schema's largest
+    /// blobs is the most likely way that suite loses the data it was filed
+    /// to capture. `health_logs` gets exactly ONE rebuild and it is
+    /// migration 021.
+    ///
+    /// Pinned by DIFFERENCE against the 019 schema rather than by an
+    /// absolute list, so a table some later migration legitimately adds
+    /// cannot be mistaken for 020's doing.
+    #[test]
+    fn migration_020_creates_only_cartridge_contacts() {
+        fn table_names(conn: &Connection) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .unwrap();
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|n| n.unwrap())
+                .collect();
+            names
+        }
+
+        let before = table_names(&open_memory_at_019());
+        let after = table_names(&open_memory_at_020());
+
+        let added: Vec<&String> = after.iter().filter(|t| !before.contains(t)).collect();
+        assert_eq!(
+            added,
+            vec!["cartridge_contacts"],
+            "migration 020 must add exactly one table"
+        );
+        let removed: Vec<&String> = before.iter().filter(|t| !after.contains(t)).collect();
+        assert!(
+            removed.is_empty(),
+            "migration 020 must remove no table: {removed:?}"
+        );
+    }
+
+    /// The `health_logs` pin specifically, by column list, mirroring
+    /// `tape::drive_identity::tests::migration_019_adds_no_column_to_health_logs`.
+    ///
+    /// `PRAGMA table_info` is compared on BOTH sides rather than against a
+    /// hardcoded list: the #227 lesson is that `table_info` reports neither
+    /// foreign keys nor CHECK constraints, so an equality against a literal
+    /// list would pass a rebuild that silently dropped 009's NULL-vs-0
+    /// `tape_alerts` distinction. Comparing 019's own table against 020's
+    /// proves the table was not touched at all, which is the stronger claim.
+    #[test]
+    fn migration_020_adds_no_column_to_health_logs() {
+        fn health_logs_columns(conn: &Connection) -> Vec<(String, String, i64, Option<String>)> {
+            let mut stmt = conn.prepare("PRAGMA table_info(health_logs)").unwrap();
+            let cols = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+            cols
+        }
+
+        let before = health_logs_columns(&open_memory_at_019());
+        let after = health_logs_columns(&open_memory_at_020());
+        assert_eq!(
+            before, after,
+            "migration 020 must leave health_logs byte-identical to what 019 left \
+             behind — its one permitted rebuild is migration 021 (ADR-0013 §3)"
+        );
+        // Positive control: the comparison above would also "pass" if both
+        // sides were empty, i.e. if the table did not exist at all.
+        assert!(
+            after.iter().any(|(name, _, _, _)| name == "tape_alerts"),
+            "positive control: health_logs must actually exist and still carry 009's column"
+        );
+    }
+
+    /// A connection migrated to exactly the 019 schema — the before-picture
+    /// for 020's "changed nothing else" pins above.
+    fn open_memory_at_019() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        let mut ms = vec![
+            M::up(include_str!("migrations/001_initial.sql")),
+            M::up(include_str!("migrations/002_fts5_catalog.sql")),
+            M::up(include_str!("migrations/003_v2_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/004_volume_uuid.sql")),
+            M::up(include_str!("migrations/005_file_types.sql")),
+            M::up(include_str!("migrations/006_write_session_dir.sql")),
+            M::up(include_str!("migrations/007_warehouse_locations.sql")),
+            M::up(include_str!("migrations/008_drop_volume_storage_class.sql")),
+            M::up(include_str!("migrations/009_health_tape_alerts.sql")),
+            M::up(include_str!("migrations/010_stage_set_origin.sql")),
+            M::up(include_str!("migrations/011_cartridge_serial_index.sql")),
+            M::up(include_str!("migrations/012_cartridge_lifecycle.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/013_drop_manifest_entry_flags.sql")).foreign_key_check(),
+            M::up(include_str!(
+                "migrations/014_cartridge_binding_identity_source.sql"
+            )),
+            M::up(include_str!(
+                "migrations/015_cartridge_load_count_unknown.sql"
+            )),
+            M::up(include_str!("migrations/016_cartridge_operator_serial.sql")),
+            M::up(include_str!("migrations/017_volume_observed_condition.sql")).foreign_key_check(),
+            M::up(include_str!("migrations/018_volume_sealed_at.sql")),
+            M::up(include_str!("migrations/019_drives.sql")),
         ];
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         Migrations::new(std::mem::take(&mut ms))

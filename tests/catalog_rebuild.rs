@@ -22,6 +22,28 @@ use tapectl::crypto::keys::generate_keypair;
 use tapectl::db;
 use tapectl::staging;
 use tapectl::store::{MemStore, Tier};
+use tapectl::tape::contact::{ContactSite, Medium, Operation};
+use tapectl::tape::mam::MamInfo;
+
+/// A `MemStore` rebuild has no configured drive behind it; these are the
+/// long-lived stand-ins the `ContactSite` borrows.
+fn cfg() -> &'static tapectl::config::Config {
+    static CFG: std::sync::OnceLock<tapectl::config::Config> = std::sync::OnceLock::new();
+    CFG.get_or_init(tapectl::config::Config::default)
+}
+
+fn backend() -> &'static tapectl::config::LtoBackendConfig {
+    static BK: std::sync::OnceLock<tapectl::config::LtoBackendConfig> = std::sync::OnceLock::new();
+    BK.get_or_init(|| tapectl::config::LtoBackendConfig {
+        name: "lto0".to_string(),
+        device_tape: "/nonexistent/tapectl-rebuild-test-nst".to_string(),
+        device_sg: "/nonexistent/tapectl-rebuild-test-sg".to_string(),
+        generation: "LTO-6".to_string(),
+        capacity_override: None,
+        usable_capacity_factor: 0.95,
+        enospc_buffer: "1GiB".to_string(),
+    })
+}
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
 use tapectl::volume::layout_model::KeyAvailability;
 use tapectl::volume::rebuild;
@@ -480,6 +502,30 @@ fn rebuild_observing(
     let key = key_file(key_dir.path(), "k.age.key", secret);
     let secret_str = tapectl::crypto::keys::read_secret_key(&key)?;
     let identity: age::x25519::Identity = secret_str.parse().unwrap();
+    // The serial the corroboration check takes and the one the contact
+    // records are ONE reading (issue #296), so the test supplies it as the
+    // MAM reading it is rather than as a bare string.
+    let mam = observed_serial.map(|serial| MamInfo {
+        serial: Some(serial.to_string()),
+        ..MamInfo::default()
+    });
+    let site = match &mam {
+        Some(mam) => ContactSite::new(
+            cfg(),
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::Observed {
+                backend: backend(),
+                mam,
+            },
+        ),
+        None => ContactSite::new(
+            cfg(),
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::NoBackend,
+        ),
+    };
     rebuild::rebuild_from_store(
         conn,
         &mut vol.store,
@@ -489,8 +535,126 @@ fn rebuild_observing(
         Some("lto0"),
         scratch,
         "memstore",
-        observed_serial,
+        site,
     )
+}
+
+/// Issue #296: `catalog rebuild` puts a cartridge in a drive and must say so.
+///
+/// `operation` and `outcome` are asserted BY VALUE — a row exists either way,
+/// and "which command, ending how" is the whole question `cartridge_contacts`
+/// was added to answer.
+///
+/// `volume_id` is NULL by construction and that is the point: the rebuild's
+/// premise is that the catalog has no row for this volume yet, so the row it
+/// creates is the command's OUTPUT, never an input the contact can reference.
+#[test]
+fn a_rebuild_records_its_contact_as_catalog_rebuild_ok() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    rebuild(&conn, &mut vol, &secret, scratch.path()).expect("rebuild from a sealed volume");
+
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "one command holding the drive is one contact");
+    let (operation, outcome, volume_id): (String, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT operation, outcome, volume_id FROM cartridge_contacts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(operation, "catalog rebuild");
+    assert_eq!(outcome.as_deref(), Some("ok"));
+    assert_eq!(
+        volume_id, None,
+        "the volumes row a rebuild creates is its output, not the contact's subject"
+    );
+}
+
+/// The failure half: a rebuild refused because the catalog's cartridge
+/// binding disagrees with the drive STILL records the contact, with a
+/// non-OK outcome. The contact happened — the tape was read — even though
+/// the command then refused.
+#[test]
+fn a_refused_rebuild_still_records_its_contact_with_a_failed_outcome() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    // A volume row already claiming a DIFFERENT medium serial than the site
+    // below reports, so `corroborate_volume` refuses.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('BC-SHELF2', 'LTO-6', 2500000000000, 'SER-SHELF2', 'in_use')",
+        [],
+    )
+    .unwrap();
+    let cartridge_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+         VALUES (?1, ?2, 'mam')",
+        rusqlite::params![cartridge_id, volume_id],
+    )
+    .unwrap();
+
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_file(key_dir.path(), "k.age.key", &secret);
+    let secret_str = tapectl::crypto::keys::read_secret_key(&key).unwrap();
+    let identity: age::x25519::Identity = secret_str.parse().unwrap();
+    let drive_mam = MamInfo {
+        serial: Some("SER-IN-DRIVE".to_string()),
+        ..MamInfo::default()
+    };
+    rebuild::rebuild_from_store(
+        &conn,
+        &mut vol.store,
+        &[identity],
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        ContactSite::new(
+            cfg(),
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::Observed {
+                backend: backend(),
+                mam: &drive_mam,
+            },
+        ),
+    )
+    .expect_err("the catalog's binding and the drive disagree");
+
+    let (operation, outcome, cartridge): (String, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT operation, outcome, cartridge_id FROM cartridge_contacts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(operation, "catalog rebuild");
+    assert_eq!(outcome.as_deref(), Some("failed"));
+    assert_eq!(
+        cartridge, None,
+        "the serial the drive reported matches no registered cartridge, which is an \
+         honest absence, not the shelf's belief about which tape this is"
+    );
 }
 
 #[test]
@@ -1996,6 +2160,10 @@ fn rebuild_refuses_when_the_catalog_binds_that_volume_to_another_cartridge() {
     let key = key_file(key_dir.path(), "k.age.key", &vol.operator_secret);
     let secret_str = tapectl::crypto::keys::read_secret_key(&key).unwrap();
     let identity: age::x25519::Identity = secret_str.parse().unwrap();
+    let drive_mam = MamInfo {
+        serial: Some("SER-DRIVE".to_string()),
+        ..MamInfo::default()
+    };
 
     let err = rebuild::rebuild_from_store(
         &conn,
@@ -2006,7 +2174,15 @@ fn rebuild_refuses_when_the_catalog_binds_that_volume_to_another_cartridge() {
         Some("lto0"),
         scratch.path(),
         "memstore",
-        Some("SER-DRIVE"),
+        ContactSite::new(
+            cfg(),
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::Observed {
+                backend: backend(),
+                mam: &drive_mam,
+            },
+        ),
     )
     .unwrap_err()
     .to_string();

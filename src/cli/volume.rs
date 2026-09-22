@@ -7,6 +7,7 @@ use crate::cli::{read_device, write_device};
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::store::{TapeStore, Tier};
+use crate::tape::contact::{ContactSite, Medium, Operation};
 use crate::volume::write;
 
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 512 * 1024; // 512 KB
@@ -920,13 +921,21 @@ pub fn run(
             // Before the store open: reading the MAM opens the device
             // read-only and drops the fd, and the st driver refuses a second
             // concurrent open.
-            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
+            let observed = crate::volume::binding::loaded_medium(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             // Corroborated (ADR-0012, issue #193) where there is a catalog
             // row to compare against; the bare `volume_identify` stays the
             // DB-less File 0 reader the heir path mirrors.
-            let id =
-                write::volume_identify_corroborated(conn, &mut store, medium_serial.as_deref())?;
+            let id = write::volume_identify_corroborated(
+                conn,
+                &mut store,
+                ContactSite::new(
+                    config,
+                    Operation::VolumeIdentify,
+                    &device,
+                    Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+                ),
+            )?;
             // The tape's own account FIRST, always — see `Identified`. A
             // contradiction is reported after it and through the exit code,
             // never by withholding the answer the operator asked for.
@@ -1020,7 +1029,7 @@ pub fn run(
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
             crate::tape::media_detect::check_read_contact(config, &device)?;
-            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
+            let observed = crate::volume::binding::loaded_medium(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = write::read_slices(
                 conn,
@@ -1028,7 +1037,12 @@ pub fn run(
                 from,
                 unit,
                 &mut store,
-                medium_serial.as_deref(),
+                ContactSite::new(
+                    config,
+                    Operation::VolumeReadSlices,
+                    &device,
+                    Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+                ),
             )?;
             if json_output {
                 println!(
@@ -1144,10 +1158,20 @@ pub fn run(
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
             crate::tape::media_detect::check_read_contact(config, &device)?;
-            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
+            let observed = crate::volume::binding::loaded_medium(config, &device);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-            let report =
-                write::compact_read(conn, config, label, &mut store, medium_serial.as_deref())?;
+            let report = write::compact_read(
+                conn,
+                config,
+                label,
+                &mut store,
+                ContactSite::new(
+                    config,
+                    Operation::VolumeCompactRead,
+                    &device,
+                    Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+                ),
+            )?;
             if json_output {
                 println!(
                     "{}",
@@ -1260,10 +1284,27 @@ pub fn run(
             // Scoped so the read-only store (and its device fd) closes
             // before step 2 opens the same device for writing — the st
             // driver refuses a second concurrent open (EBUSY).
-            let medium_serial = crate::volume::binding::loaded_medium_serial(config, &device);
+            let observed = crate::volume::binding::loaded_medium(config, &device);
             let report = {
                 let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-                write::compact_read(conn, config, label, &mut store, medium_serial.as_deref())?
+                // `Operation::VolumeCompact`, not `VolumeCompactRead`: this
+                // is step 1 of the interactive three-step command, and step 2
+                // makes a SECOND, separate contact through `volume_write`
+                // (the read-only store must close first — the st driver
+                // refuses a second concurrent open), which is physically
+                // what happens.
+                write::compact_read(
+                    conn,
+                    config,
+                    label,
+                    &mut store,
+                    ContactSite::new(
+                        config,
+                        Operation::VolumeCompact,
+                        &device,
+                        Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+                    ),
+                )?
             };
             println!(
                 "  Read {} slices ({})",

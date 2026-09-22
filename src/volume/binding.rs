@@ -1277,10 +1277,18 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
     }
 }
 
-/// The MAM medium serial the drive can report for `device`, or `None`.
+/// The backend that resolved for `device` and **the whole MAM reading** it
+/// yielded, or `None` when no backend resolved.
+///
+/// Returns the whole `MamInfo`, not just the serial it used to (issue #296):
+/// the contact record wants the chip's `load_count` from the SAME reading the
+/// corroboration check takes its serial from, and the `st` driver refuses a
+/// second concurrent open, so there is no second reading to be had. One read,
+/// one value, both purposes — `ContactSite::medium_serial` is how the serial
+/// is taken back out.
 ///
 /// LENIENT by construction (ADR-0010, "Read paths stay usable without a
-/// configured drive"): the serial lives behind the drive's SCSI generic
+/// configured drive"): the MAM lives behind the drive's SCSI generic
 /// node, which is only known from a configured backend. A rebuilt machine
 /// with keys and no `backend add` gets `None` — an absence, so every read
 /// path still works, which is exactly ADR-0005's DR path.
@@ -1294,13 +1302,20 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
 /// reads as an ABSENCE, and corroboration treats absence as "cannot see,
 /// cannot contradict" and proceeds. So following the recommended practice
 /// quietly switched off the cartridge-identity check on every read path.
-pub(crate) fn loaded_medium_serial(config: &crate::config::Config, device: &str) -> Option<String> {
+pub(crate) fn loaded_medium<'a>(
+    config: &'a crate::config::Config,
+    device: &str,
+) -> Option<(
+    &'a crate::config::LtoBackendConfig,
+    crate::tape::mam::MamInfo,
+)> {
     let backend = crate::config::resolve_device(config, Some(device))
         .ok()
         .and_then(|(_, b)| b)?;
-    crate::tape::media_detect::detect(device, &backend.device_sg)
-        .mam
-        .serial
+    Some((
+        backend,
+        crate::tape::media_detect::detect(device, &backend.device_sg).mam,
+    ))
 }
 
 /// The catalog's claim about one volume, for [`corroborate_contact`].
