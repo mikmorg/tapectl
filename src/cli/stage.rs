@@ -344,54 +344,101 @@ pub fn run(
                         .collect();
 
                     if !live_ids.is_empty() {
-                        // Issue #279: a bare `staging clean` leaves a live
-                        // stage set alone for exactly one of two reasons,
-                        // and the refusal must name the one that actually
-                        // applies here rather than listing both. Reuses
-                        // `staging::clean::is_release_candidate` -- the
-                        // SAME predicate `cli::staging::
-                        // staged_release_candidate_units` evaluates per
-                        // unit (issue #96) -- never a third hand-written
-                        // copy of `EXISTS (SELECT 1 FROM writes ...)`.
-                        let mut is_candidate = false;
+                        // Issues #279 and #292: a bare `staging clean`
+                        // leaves a live stage set alone for one of FOUR
+                        // reasons, and the refusal must name the one that
+                        // actually applies. #279 split this two ways and
+                        // recommended `--force` for everything that was
+                        // not a release candidate; `staging::clean::
+                        // release_blocker` answers the finer question,
+                        // because for an interrupted session `--force`
+                        // deletes the very slices `volume resume` needs.
+                        //
+                        // Worst blocker across this version's live sets
+                        // wins, for the same reason `release_blocker`
+                        // orders its own variants: a set may be bin-packed
+                        // across volumes, and the costliest thing to be
+                        // wrong about is telling someone to delete slices
+                        // something is still using.
+                        let mut worst = staging::clean::ReleaseBlocker::None;
                         for id in &live_ids {
-                            if staging::clean::is_release_candidate(conn, *id)? {
-                                is_candidate = true;
-                                break;
+                            let b = staging::clean::release_blocker(conn, *id)?;
+                            let rank = |x: &staging::clean::ReleaseBlocker| match x {
+                                staging::clean::ReleaseBlocker::WriteInFlight { .. } => 4,
+                                staging::clean::ReleaseBlocker::Interrupted { .. } => 3,
+                                staging::clean::ReleaseBlocker::Abandoned => 2,
+                                staging::clean::ReleaseBlocker::NeverWritten => 1,
+                                staging::clean::ReleaseBlocker::None => 0,
+                            };
+                            if rank(&b) > rank(&worst) {
+                                worst = b;
                             }
                         }
 
-                        let msg = if is_candidate {
-                            // Has a completed-writes-only stage set: a
-                            // bare clean WOULD release it, unless the unit
-                            // is currently below its policy's min_copies
-                            // (in which case --force is needed) -- today's
-                            // wording, unchanged.
-                            format!(
-                                "unit \"{name}\" v{v} already has a stage set with live slices — \
-                                 use `tapectl volume write` to consume them, or \
+                        let head = format!(
+                            "unit \"{name}\" v{v} already has a stage set with live slices"
+                        );
+                        let msg = match &worst {
+                            // A candidate: a bare clean WOULD release it,
+                            // unless the unit is below its policy's
+                            // min_copies. Today's wording, unchanged.
+                            staging::clean::ReleaseBlocker::None => format!(
+                                "{head} — use `tapectl volume write` to consume them, or \
                                  `tapectl staging clean --unit {name}` to release them first \
                                  (retained by default if \"{name}\" is below its policy's \
                                  min_copies — add --force to release it anyway)"
-                            )
-                        } else {
-                            // Not a release candidate at all -- most
-                            // commonly, no `writes` row exists for it yet
-                            // (it has never been written to any volume).
-                            // A bare clean is a silent no-op here
-                            // (`cleaned 0 stage set(s)`); min_copies never
-                            // enters into it, so this must not mention it
-                            // -- `--force` is unconditionally what is
-                            // needed, named against the version-scoped
-                            // form (issue #278) so the operator releases
-                            // exactly this stage set.
-                            format!(
-                                "unit \"{name}\" v{v} already has a stage set with live slices — \
-                                 use `tapectl volume write` to consume them; it has no \
+                            ),
+                            // Never written: #279's wording, unchanged.
+                            staging::clean::ReleaseBlocker::NeverWritten => format!(
+                                "{head} — use `tapectl volume write` to consume them; it has no \
                                  completed write backing it, so `tapectl staging clean \
                                  --unit {name} --version {v}` would leave it untouched — \
                                  pass --force to release it"
-                            )
+                            ),
+                            // #292: `--force` here destroys the recovery.
+                            // Name `volume resume` first, as the Tier-3
+                            // refusal does for a sealed-but-unconfirmed
+                            // volume (`operations::refuse_last_eligible_copy`).
+                            staging::clean::ReleaseBlocker::Interrupted { volume_label } => {
+                                let resume = match volume_label {
+                                    Some(l) => format!("`tapectl volume resume {l}`"),
+                                    None => "`tapectl volume resume <LABEL>`".to_string(),
+                                };
+                                format!(
+                                    "{head}, and they are the input to an INTERRUPTED write \
+                                     session — {resume} continues that session from these \
+                                     exact staged files rather than rebuilding them, so \
+                                     releasing them is what would make it unrecoverable. \
+                                     Reload the same cartridge and resume it, or write these \
+                                     slices to another volume. Only give them up on purpose \
+                                     (`tapectl volume abort`, then `staging clean --force`) \
+                                     once you have decided the interrupted write is not \
+                                     worth finishing."
+                                )
+                            }
+                            // #292: something is reading them right now.
+                            staging::clean::ReleaseBlocker::WriteInFlight { volume_label } => {
+                                let onto = match volume_label {
+                                    Some(l) => format!(" onto volume \"{l}\""),
+                                    None => String::new(),
+                                };
+                                format!(
+                                    "{head}, and a write session is using them RIGHT NOW{onto}. \
+                                     Let it finish — `tapectl volume write` is consuming these \
+                                     slices, and releasing them under a running session is not \
+                                     something --force should be pointed at. If no write is \
+                                     actually running, the session died without recording an \
+                                     outcome; `tapectl db fsck` sweeps that."
+                                )
+                            }
+                            // Abandoned: --force IS the documented act, and
+                            // `volume abort`'s own consent text says so.
+                            staging::clean::ReleaseBlocker::Abandoned => format!(
+                                "{head}, left behind by a write session that was aborted or \
+                                 failed. A bare `tapectl staging clean` will not release them \
+                                 — use `tapectl staging clean --unit {name} --version {v} \
+                                 --force`, or write them to another volume first."
+                            ),
                         };
                         return Err(TapectlError::Other(msg));
                     }
@@ -683,6 +730,137 @@ mod tests {
     /// operator whose unit is not under min_copies into concluding
     /// `--force` does not apply to them, when it is the only thing that
     /// would help. The positive control for this test is
+    /// Issue #292: a write row in a NON-`completed` state is not one fact
+    /// but four, and issue #279's fix collapsed them. This helper stages
+    /// `unit1`, attaches one `writes` row in `status`, and returns the
+    /// refusal an operator then sees from `stage create --version 1`.
+    fn refusal_with_write_status(status: &str) -> String {
+        let (conn, paths, config, _tmp) = setup();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        let stage_set_id: i64 = conn
+            .query_row("SELECT id FROM stage_sets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L6-0007', 'lto', 'lto0', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![stage_set_id, snapshot_id, volume_id, status],
+        )
+        .unwrap();
+
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: Some(1),
+            },
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    /// **The one that matters (issue #292).** `volume resume` continues an
+    /// interrupted session from its frozen staging files, so these slices
+    /// ARE the recovery. Issue #279's refusal said "pass --force to release
+    /// it" here, which destroys it. The refusal must lead with resume and
+    /// must not present --force as the first act.
+    #[test]
+    fn create_with_version_refusal_names_resume_not_force_for_an_interrupted_write() {
+        let msg = refusal_with_write_status("interrupted");
+        assert!(
+            msg.contains("volume resume L6-0007"),
+            "must name resume, with the volume to reload: {msg}"
+        );
+        assert!(
+            msg.contains("INTERRUPTED"),
+            "must say which state this is: {msg}"
+        );
+        let force_at = msg.find("--force");
+        let resume_at = msg.find("volume resume");
+        assert!(
+            resume_at < force_at || force_at.is_none(),
+            "resume must come BEFORE any mention of --force -- an operator \
+             acts on the first command they read: {msg}"
+        );
+        assert!(
+            !msg.contains("min_copies"),
+            "min_copies is not why a clean leaves this one alone: {msg}"
+        );
+    }
+
+    /// Issue #292: a session running RIGHT NOW is reading these slices.
+    /// Releasing them under it is not something `--force` should be aimed
+    /// at, so the refusal must not offer it as the remedy.
+    #[test]
+    fn create_with_version_refusal_says_a_live_write_is_using_the_slices() {
+        for status in ["in_progress", "planned"] {
+            let msg = refusal_with_write_status(status);
+            assert!(
+                msg.contains("RIGHT NOW"),
+                "{status}: must say a session is using them now: {msg}"
+            );
+            assert!(
+                msg.contains("L6-0007"),
+                "{status}: must name the volume being written: {msg}"
+            );
+            assert!(
+                !msg.contains("pass --force"),
+                "{status}: must not recommend forcing a release under a \
+                 running session: {msg}"
+            );
+        }
+    }
+
+    /// Issue #292's POSITIVE CONTROL for `--force`: an aborted or failed
+    /// session is exactly where `--force` IS the documented act, and
+    /// `volume abort`'s own consent text says so. Without this, the two
+    /// tests above cannot distinguish "stopped recommending --force where
+    /// it is wrong" from "stopped recommending --force at all".
+    #[test]
+    fn create_with_version_refusal_still_offers_force_for_an_abandoned_write() {
+        for status in ["aborted", "failed"] {
+            let msg = refusal_with_write_status(status);
+            assert!(
+                msg.contains("--force"),
+                "{status}: --force is the right act here: {msg}"
+            );
+            assert!(
+                !msg.contains("volume resume"),
+                "{status}: resume cannot adopt this session, so naming it \
+                 would hand over a command that refuses: {msg}"
+            );
+        }
+    }
+
     /// `create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set`
     /// below: without it, this test alone cannot distinguish "says the
     /// right thing" from "stopped mentioning min_copies anywhere".

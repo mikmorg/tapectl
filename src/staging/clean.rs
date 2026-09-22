@@ -89,19 +89,88 @@ fn release_candidate_predicate_sql(id_expr: &str) -> String {
     )
 }
 
-/// Whether `stage_set_id` alone is a non-force release candidate — the
-/// exact predicate [`release_candidate_predicate_sql`] describes, evaluated
-/// for one specific stage_set rather than embedded in a larger query.
-/// `cli::stage`'s live-slices refusal (issue #279) uses this to say the
-/// RIGHT reason a bare `staging clean` would leave a given live stage_set
-/// alone: `false` means it is not a candidate at all (most commonly: no
-/// `writes` row exists yet, i.e. it was never written anywhere) so only
-/// `--force` releases it; `true` means it IS a candidate, so the ordinary
-/// min_copies-shortfall wording still applies.
-pub(crate) fn is_release_candidate(conn: &Connection, stage_set_id: i64) -> Result<bool> {
-    let sql = format!("SELECT {}", release_candidate_predicate_sql("?1"));
-    let v: i64 = conn.query_row(&sql, params![stage_set_id], |row| row.get(0))?;
-    Ok(v != 0)
+/// Why a bare `staging clean` would leave one live stage_set alone — the
+/// REASON, not just the fact (issue #292).
+///
+/// [`release_candidate_predicate_sql`] answers a boolean that is correct
+/// for CLEANING and too coarse for ADVICE: it reads `false` for a stage_set
+/// with no `writes` row, for one whose session is running right now, for
+/// one that was interrupted, and for one that was deliberately abandoned.
+/// Those four want four different next acts, and issue #279's refusal
+/// recommended `--force` for all of them. For `Interrupted` that is the
+/// wrong advice in the most expensive direction: `tapectl volume resume`
+/// continues a session from its frozen staging files, so releasing them is
+/// exactly what makes the interrupted write unrecoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseBlocker {
+    /// Nothing blocks it: at least one `writes` row and all of them
+    /// `'completed'`. A bare clean releases it unless the unit is below
+    /// its policy's `min_copies`.
+    None,
+    /// No `writes` row at all — staged and never written anywhere. A bare
+    /// clean does not see it; only `--force` releases it.
+    NeverWritten,
+    /// A write session is live RIGHT NOW (`'planned'` or `'in_progress'`)
+    /// and is reading these slices.
+    WriteInFlight { volume_label: Option<String> },
+    /// A session stopped partway and `tapectl volume resume` can still
+    /// adopt it (`rehydrate` selects `'interrupted'` rows). Its slices are
+    /// the input to that recovery.
+    Interrupted { volume_label: Option<String> },
+    /// A session was deliberately abandoned (`'aborted'`) or failed
+    /// outright (`'failed'`). `volume abort`'s own consent text already
+    /// tells the operator `--force` is how these are released, and it is
+    /// right about that narrower claim.
+    Abandoned,
+}
+
+/// Which blocker applies to `stage_set_id`.
+///
+/// **Ordered by urgency, because one stage_set can carry several `writes`
+/// rows** — bin-packing puts a set on more than one volume, and those rows
+/// can disagree. A live session outranks a recoverable one, which outranks
+/// an abandoned one: the worst thing to be wrong about is telling someone
+/// to delete slices something is still using.
+pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<ReleaseBlocker> {
+    let statuses: Vec<String> = conn
+        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1")?
+        .query_map(params![stage_set_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if statuses.is_empty() {
+        return Ok(ReleaseBlocker::NeverWritten);
+    }
+    if statuses.iter().all(|s| s == "completed") {
+        return Ok(ReleaseBlocker::None);
+    }
+
+    // `volume_label_for` is best-effort: a row whose volume vanished still
+    // yields the right VARIANT, just without a label to name. The variant
+    // decides the advice; the label only makes the command copy-pastable.
+    let label_for = |want: &str| -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT v.label FROM writes w JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 AND w.status = ?2 LIMIT 1",
+                params![stage_set_id, want],
+                |row| row.get(0),
+            )
+            .ok())
+    };
+
+    for live in ["in_progress", "planned"] {
+        if statuses.iter().any(|s| s == live) {
+            return Ok(ReleaseBlocker::WriteInFlight {
+                volume_label: label_for(live)?,
+            });
+        }
+    }
+    if statuses.iter().any(|s| s == "interrupted") {
+        return Ok(ReleaseBlocker::Interrupted {
+            volume_label: label_for("interrupted")?,
+        });
+    }
+    Ok(ReleaseBlocker::Abandoned)
 }
 
 /// Clean staged files from disk and update DB.
