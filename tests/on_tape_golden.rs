@@ -7,6 +7,25 @@
 //! fails, the on-tape format changed — that is a CTO decision (bytes on tape
 //! are forever), never something to fix by updating the constant here.
 //!
+//! **RE-PINNED ONCE, 2026-09-22, under an explicit CTO ruling on issue #288.**
+//! The rule above held: the worker that moved the bytes was fenced out of this
+//! file and reported the new hash rather than writing it, and the constant was
+//! updated by the coordinator after reading the generated script. The ruling
+//! covers exactly three changes, batched deliberately onto one re-pin so the
+//! habit is not trained by cosmetic ones: repeated `--key` so an heir holding
+//! a keyring can restore a volume whose envelope and slices sit on different
+//! key generations (#288); the three "no envelope opened" exits all carrying
+//! the tape's identity and the rotation cause, with the quoting defect that
+//! made two of them print `'\''VOL-A'\''` fixed (#291); and the carried
+//! `MB` -> `MiB` that #218 ruled should ride the next substantive change.
+//! The CTO's own note on the timing: this is the cheapest moment the change
+//! will ever be available, because after the first production write an
+//! improved heir script means tapes in the archive disagree with each other
+//! about their own recovery instructions.
+//!
+//! This paragraph is the record, not a precedent. The next failure of this
+//! test is a CTO decision again.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -23,7 +42,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "f0aea2e7ae22a19b34824acdd4ea76146a1b225efce99f0bafaa2a740f404e7d";
+const RESTORE_SH_SHA256: &str = "bb29026cdf82975b8fb89e894f70f1dbb335a3ffbcde9e98ac3747d240a97f9a";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {

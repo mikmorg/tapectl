@@ -14,6 +14,16 @@
 //! `every_named_awk_fragment_is_present_verbatim_in_the_assembled_script`
 //! checks each const is a verbatim substring of the assembled script.
 //!
+//! **2026-09-22 — the script's bytes HAVE since changed, once, by CTO
+//! ruling.** The paragraph above is a claim about the C6 split itself, and it
+//! remains true of that commit: the split moved no bytes. It is not a standing
+//! promise that `RESTORE_SH_SHA256` never moves. Issues #288 (repeated
+//! `--key`), #291 (every envelope failure carries its context) and #218 (the
+//! carried `MB` -> `MiB`) landed together under one authorised re-pin. No awk
+//! fragment below was touched by it, so the verbatim-substring check still
+//! holds for every const here — which is the property this module exists to
+//! keep, and the reason the re-pin did not have to reach into this file.
+//!
 //! **No fragment may contain an apostrophe.** Every program below is
 //! single-quoted in the shell it is assembled into, so a `'` anywhere
 //! inside it — including inside an awk comment — would end the quoting

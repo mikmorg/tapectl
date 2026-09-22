@@ -495,6 +495,7 @@ keys_args() {
 require_key_files() {
   local k
   for k in ${KEYS[@]+"${KEYS[@]}"}; do
+    [ -n "$k" ] || die "--key needs a value"
     [ -f "$k" ] || die "key file not found: $k"
   done
 }

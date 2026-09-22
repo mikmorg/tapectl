@@ -1098,6 +1098,13 @@ notably not `tapectl`.
    ./RESTORE.sh --restore --unit UNIT --key your.age.key --to /dest
    ```
 
+   **Bring every key you hold, not just the current one.** `--key` may be
+   repeated, and each key is tried on its own for the envelope and for every
+   slice. A tape's envelope is sealed with the key that was active when the
+   volume was *written*, while its slices were sealed when the data was
+   *staged* — so a `key rotate` between those two moments leaves no single key
+   that opens both, and the fix is to pass both (issue #288).
+
 ### If you hold the operator or escrow key: rebuild the catalog
 
 There are two sources — the heir kit's catalog bundle, and the tapes themselves

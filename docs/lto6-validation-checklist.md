@@ -136,6 +136,13 @@ mhvtl. `fsf 2` assumes the layout order ID-thunk(0)/guide(1)/RESTORE.sh(2)
 - [ ] `./RESTORE.sh --restore --key <tenant-key>.age.key --to /tmp/recovered`
       — full restore succeeds: all slice checksums pass, age decryption works,
       dar extraction completes.
+- [ ] `--key` repeated with every key the tenant holds also succeeds. An
+      envelope is sealed with the key active when the volume was WRITTEN and
+      its slices with the key active when they were STAGED, so after a
+      `key rotate` between the two there is no single key that opens both —
+      each `--key` is tried independently for the envelope and for each slice
+      (issue #288). The Heir Kit should carry every key, not only the current
+      one.
 - [ ] `diff -r --no-dereference <original-source-dir> /tmp/recovered` — byte-identical.
       (`--no-dereference` is load-bearing: plain `diff -r` follows symlinks and
       false-fails on any source tree with a dangling link — `/usr/share/doc`
