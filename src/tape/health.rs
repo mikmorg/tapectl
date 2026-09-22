@@ -187,9 +187,21 @@ pub fn collect(sg_device: &str) -> Result<(HealthCounters, String)> {
 }
 
 /// Insert a row into the `health_logs` table.
+///
+/// `session_id` is the `verification_sessions` row this reading belongs to,
+/// and **nothing else** (ADR-0013 §3: the column keeps exactly the meaning
+/// its foreign key has always declared, and nothing may overload it). It has
+/// existed since `001_initial.sql` with zero writers; issue #295 gives it
+/// one, at the only call site that has the value — `volume_verify`, whose
+/// session row is created by `volume_verify_with_store` and carried out on
+/// `VerifyReport::session_id`. `None` on the write path, which runs no
+/// verification session: a column with no writer reads as a promise
+/// (issue #107's lesson), and a fabricated session id would be worse than
+/// the NULL.
 pub fn record(
     conn: &Connection,
     volume_id: i64,
+    session_id: Option<i64>,
     operation: &str,
     counters: &HealthCounters,
     raw_log: &str,
@@ -199,11 +211,12 @@ pub fn record(
         // parsed on every collection since this module was written and then
         // dropped on the floor here, because there was no column for it.
         "INSERT INTO health_logs
-            (volume_id, operation, total_bytes, total_uncorrected,
+            (volume_id, session_id, operation, total_bytes, total_uncorrected,
              total_corrected, total_retries, total_rewritten, tape_alerts, raw_log)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             volume_id,
+            session_id,
             operation,
             counters.total_bytes_processed,
             counters.total_uncorrected,
@@ -504,7 +517,7 @@ Read error counter page  [0x3]
             corrected_with_delay: 0,
             correction_algorithm_invocations: 0,
         };
-        record(&conn, vid, "write", &counters, "raw log contents").unwrap();
+        record(&conn, vid, None, "write", &counters, "raw log contents").unwrap();
 
         let (bytes, uncorrected, corrected, raw): (i64, i64, i64, String) = conn
             .query_row(
@@ -551,7 +564,7 @@ Read error counter page  [0x3]
             corrected_with_delay: 0,
             correction_algorithm_invocations: 0,
         };
-        record(&conn, vid, "verify", &counters, "raw").unwrap();
+        record(&conn, vid, None, "verify", &counters, "raw").unwrap();
 
         let stored: Option<i64> = conn
             .query_row(
@@ -586,6 +599,7 @@ Read error counter page  [0x3]
         record(
             &conn,
             vid,
+            None,
             "verify",
             &HealthCounters {
                 total_bytes_processed: 1,
@@ -613,6 +627,130 @@ Read error counter page  [0x3]
             stored,
             Some(0),
             "recorded-and-clean must not read as unknown"
+        );
+    }
+
+    /// `health_logs.session_id` has existed since `001_initial.sql` with a
+    /// foreign key to `verification_sessions(id)` and ZERO writers. Issue
+    /// #295 gives it one; ADR-0013 §3 narrows its meaning to exactly what
+    /// that foreign key declares and forbids overloading it. This proves the
+    /// value survives the round trip and that the join the column was
+    /// always for actually resolves — `report verify-status` and `report
+    /// health` become joinable on it.
+    #[test]
+    fn record_populates_session_id_and_the_join_resolves() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-SESSION', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO verification_sessions
+                (volume_id, verify_type, outcome, completed_at, slices_checked, slices_passed, slices_failed)
+             VALUES (?1, 'full', 'passed', datetime('now'), 3, 3, 0)",
+            params![vid],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        record(
+            &conn,
+            vid,
+            Some(session_id),
+            "verify",
+            &HealthCounters::default(),
+            "raw",
+        )
+        .unwrap();
+
+        // Read the health row back THROUGH the join, not by reading the
+        // column and trusting it points somewhere.
+        let (stored_session, outcome): (i64, String) = conn
+            .query_row(
+                "SELECT vs.id, vs.outcome
+                   FROM health_logs h
+                   JOIN verification_sessions vs ON vs.id = h.session_id
+                  WHERE h.volume_id = ?1",
+                params![vid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_session, session_id);
+        assert_eq!(outcome, "passed");
+    }
+
+    /// The write path runs no verification session, so its rows must carry
+    /// NULL rather than a fabricated id — the paired negative for the join
+    /// test above, and the reason `session_id` is `Option<i64>`.
+    #[test]
+    fn a_write_path_reading_records_a_null_session_id() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-NOSESSION', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+        record(&conn, vid, None, "write", &HealthCounters::default(), "raw").unwrap();
+
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT session_id FROM health_logs WHERE volume_id = ?1",
+                params![vid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    /// TRIPWIRE for issue #296, not a statement of what `operation` should
+    /// mean.
+    ///
+    /// `volume resume` records `operation = 'write'`, which is a lie in the
+    /// record, and ADR-0013 §4 rules the vocabulary free TEXT precisely so
+    /// `'resume'` costs no migration. But the CHECK that closes it
+    /// (`001_initial.sql:332-333`, `IN ('write','read','verify','clean')`)
+    /// is still in force until migration 021 rebuilds this table (#296), and
+    /// SQLite enforces a CHECK unconditionally. Writing `'resume'` today
+    /// would fail the INSERT — and because health collection is best-effort
+    /// and only warns, it would silently DROP the health row on every
+    /// resume, which is strictly worse than the mislabel.
+    ///
+    /// So the resume call site still passes `'write'`, and this test pins
+    /// why. When 021 lands and drops the CHECK, this test fails — that is
+    /// the signal to flip the literal in `volume::write::volume_resume` and
+    /// delete this test.
+    #[test]
+    fn resume_is_not_yet_an_accepted_operation_until_migration_021() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V-RESUME', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+
+        // Positive control: the vocabulary the CHECK does accept works, so a
+        // failure below is the CHECK and not a broken INSERT.
+        record(&conn, vid, None, "write", &HealthCounters::default(), "raw").unwrap();
+
+        let err = record(
+            &conn,
+            vid,
+            None,
+            "resume",
+            &HealthCounters::default(),
+            "raw",
+        )
+        .expect_err("the operation CHECK still rejects 'resume' until migration 021");
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "expected the operation CHECK to be the refuser, got: {err}"
         );
     }
 }
