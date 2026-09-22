@@ -3180,4 +3180,131 @@ mod tests {
             assert!(err.to_string().contains("NOPE"), "{err}");
         }
     }
+
+    /// Issue #280: `volume verify`'s clean-clear message ("RETURNED TO
+    /// SERVICE") asserted "it counts as a copy again" unconditionally, but
+    /// `clear_condition_on_clean_full_verify` only ever touches
+    /// `observed_condition` -- the claim is only true while `status =
+    /// 'sealed'`. These tests drive `clean_clear_message` and
+    /// `returned_to_service_json` directly (the smallest functions that
+    /// decide the wording), for the three reachable (status, condition)
+    /// shapes named in the issue.
+    mod clean_clear_message_tests {
+        use super::*;
+
+        /// Test 1, the POSITIVE CONTROL: a `sealed` volume whose condition
+        /// this verify just cleared is exactly the case the 2026-09-18
+        /// ruling (ADR-0012) was written for, and it must not regress.
+        /// Without this passing, the absence assertions in the other two
+        /// tests below cannot distinguish "correctly refuses to claim" from
+        /// "never claims anything" -- this is the case that proves the
+        /// function CAN say RETURNED TO SERVICE at all.
+        #[test]
+        fn sealed_and_cleared_says_returned_to_service_and_counts_as_a_copy() {
+            let msg = clean_clear_message("L6-0001", "quarantined", "sealed", true, true);
+            assert!(
+                msg.contains("RETURNED TO SERVICE"),
+                "a sealed volume that now counts as a copy must say so: {msg}"
+            );
+            assert!(
+                msg.contains("counts as a copy again"),
+                "the durability claim itself must still be made here: {msg}"
+            );
+            assert!(
+                returned_to_service_json(true, true),
+                "the --json twin must agree with the human message"
+            );
+        }
+
+        /// Test 2: state (A) from issue #280 -- a `retired` volume a clean
+        /// verify just cleared the condition on. Must NOT say RETURNED TO
+        /// SERVICE, must NOT claim it counts, and must name `status =
+        /// "retired"` as the reason -- the operator retired it on purpose
+        /// and a medium observation does not undo that.
+        #[test]
+        fn retired_and_cleared_does_not_claim_returned_to_service() {
+            let msg = clean_clear_message("L6-0002", "quarantined", "retired", true, false);
+            assert!(
+                !msg.contains("RETURNED TO SERVICE"),
+                "a retired volume must never be told it returned to service: {msg}"
+            );
+            assert!(
+                !msg.contains("counts as a copy again"),
+                "a retired volume does not count as a copy, and must not be told it does: {msg}"
+            );
+            assert!(
+                msg.contains("retired") || msg.contains("RETIRED"),
+                "the status itself must be named as the reason: {msg}"
+            );
+            assert!(
+                !returned_to_service_json(true, false),
+                "the --json twin must not carry a true returned_to_service for a retired \
+                 volume"
+            );
+        }
+
+        /// Test 3: state (B) from issue #280 -- a volume left `initialized`
+        /// because `SealedPending::confirm`'s `proves_medium_bad` arm never
+        /// reached the sealing UPDATE, with `sealed_at` set (the tape IS
+        /// physically sealed) and every `writes` row `aborted`. Must NOT
+        /// claim RETURNED TO SERVICE, must name the actual status, and --
+        /// the specific defect the issue calls out -- must NEVER name
+        /// `volume resume` as a remedy: `resume`'s `rehydrate` only selects
+        /// `interrupted` write rows, and this state's rows are `aborted`, so
+        /// a recipe naming it would hand the operator a command that
+        /// refuses.
+        #[test]
+        fn initialized_sealed_but_unconfirmed_does_not_claim_service_or_name_resume() {
+            let msg =
+                clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
+            assert!(
+                !msg.contains("RETURNED TO SERVICE"),
+                "an initialized, unconfirmed volume must never be told it returned to \
+                 service: {msg}"
+            );
+            assert!(
+                !msg.contains("counts as a copy again"),
+                "it does not count as a copy, and must not be told it does: {msg}"
+            );
+            assert!(
+                msg.contains("initialized"),
+                "the actual status must be named: {msg}"
+            );
+            assert!(
+                !msg.to_lowercase().contains("resume"),
+                "must never name `volume resume` here -- it cannot adopt an aborted \
+                 session, so naming it hands the operator a command that refuses: {msg}"
+            );
+            assert!(
+                !returned_to_service_json(true, false),
+                "the --json twin must not carry a true returned_to_service for an \
+                 initialized, unconfirmed volume"
+            );
+        }
+
+        /// The `sealed_at`-set note is materially true and worth saying
+        /// (the bytes ARE on the tape) precisely in state (B) -- assert it
+        /// is actually said, not just that nothing false is said.
+        #[test]
+        fn initialized_sealed_but_unconfirmed_says_the_tape_is_physically_sealed() {
+            let msg =
+                clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
+            assert!(
+                msg.to_lowercase().contains("physically sealed"),
+                "sealed_at is set -- the tape really does carry the seal marker and bytes, \
+                 which is a materially different fact from a blank tape: {msg}"
+            );
+        }
+
+        /// `returned_to_service_json` in isolation: the conjunction must
+        /// never read true unless BOTH `cleared` and `counts_as_copy` are
+        /// true.
+        #[test]
+        fn returned_to_service_json_requires_both_cleared_and_counts_as_copy() {
+            assert!(returned_to_service_json(true, true));
+            assert!(!returned_to_service_json(true, false));
+            assert!(!returned_to_service_json(false, true));
+            assert!(!returned_to_service_json(false, false));
+        }
+    }
 }
