@@ -698,8 +698,12 @@ if kind == "add":
     sys.exit(0)
 
 if not files:
+    # Exit 3, not 1: this is the WALK failing to meet this op's precondition
+    # (earlier mutate:delete steps emptied the unit), not a defect. The caller
+    # turns 3 into a visible SKIP and still FAILs on any other error, so a real
+    # python fault cannot hide behind this. Issue #282, found on seed 5.
     print("mutate_source: no eligible regular file to mutate in %s" % d, file=sys.stderr)
-    sys.exit(1)
+    sys.exit(3)
 
 target = rng.choice(files)
 if kind == "modify":
@@ -3070,7 +3074,24 @@ pm_skip_never_written() { skip "pm-final-$1.unit" "unit $1 never ended up on any
 # copy is on a cartridge this run cannot put back in the drive.
 pm_skip_unreachable() { skip "pm-final-$1.unit" "$2"; return $?; }
 
-pm_op_mutate() { mutate_source "$SRC/$2" "$SEED" "${1#mutate:}"; }
+# A randomised walk can pick `mutate:modify big` after earlier `mutate:delete`
+# steps have emptied that unit. That is the walk failing to meet an op's
+# precondition — the same shape `stage` and `write-next-volume` already SKIP
+# for — and it FAILED, turning a whole run red on nothing but the seed. Found
+# on seed 5 while establishing #282's seed-independence, which is the same
+# disease that issue is about: red or green by RNG.
+#
+# Only exit 3 becomes a SKIP; any other failure still FAILs, so a genuine
+# fault in mutate_source cannot hide here.
+pm_op_mutate() {
+    local rc
+    mutate_source "$SRC/$2" "$SEED" "${1#mutate:}"; rc=$?
+    if [ "$rc" -eq 3 ]; then
+        skip "$PM_CHECK_NAME" "unit \"$2\" has no eligible file left to ${1#mutate:} — the walk picked this op with its precondition unmet"
+        return $?
+    fi
+    return "$rc"
+}
 pm_op_snapshot() {
     TCTL snapshot create "$1" || return 1
     PM_SNAPSHOT_COUNT["$1"]=$(( ${PM_SNAPSHOT_COUNT["$1"]:-1} + 1 ))
@@ -3440,6 +3461,18 @@ scenario_permute() {
     # `catalog locate` rather than re-deriving it from the walk.
     local u tenant locate_json labels last pm_sd
     pm_sd="$(dirname "$HOME_DIR")"
+    {
+        echo
+        echo "## End-of-walk restore matrix — which branch this seed took"
+        echo
+        echo "Issue #282. The end-of-walk matrix reads the volume holding each"
+        echo "unit's latest copy, which need not be the volume written last:"
+        echo "a \`staging-clean\` followed by a partial re-stage makes the final"
+        echo "write carry a strict subset. Only then does the load-or-skip"
+        echo "branch run, so a green run is evidence about THIS seed's shape"
+        echo "and no other. Recorded per unit:"
+        echo
+    } >>"$REPORT"
     for u in photos docs big; do
         case "$u" in photos|big) tenant=alice ;; docs) tenant=bob ;; esac
         if [ "${#PM_WRITTEN[@]}" -eq 0 ]; then
@@ -3499,6 +3532,19 @@ for v in vols:
             # exactly this, and then the matrix was enabled (issue #252)
             # with the same flaw.
             pm_latest="${PM_WRITTEN[-1]}"
+            # Say whether this walk exercised the stranded case at all
+            # (issue #282). Whether `last` is the final volume is decided by
+            # the RNG: a `staging-clean` followed by a partial re-stage makes
+            # the last write carry a strict subset, and only then does the
+            # load-or-skip branch below run. Without this line a green run is
+            # silent about which of the two paths it took, which is the same
+            # "a green run proves nothing" problem the scenario header names
+            # -- one level down, in the fix for it.
+            if [ "$last" = "$pm_latest" ]; then
+                echo "- \`$u\`: latest copy on \`$last\`, which IS the final volume — read in place, stranded-volume branch NOT exercised" >>"$REPORT"
+            else
+                echo "- \`$u\`: latest copy on \`$last\`, final volume is \`$pm_latest\` — **stranded**, so this walk DOES exercise the load-or-skip branch" >>"$REPORT"
+            fi
             if [ "$SINGLE_CARTRIDGE" = 1 ]; then
                 # One cartridge: `next_tape` erased it in place before each
                 # later write, so only the volume written LAST still has
