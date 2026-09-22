@@ -1572,12 +1572,55 @@ pub fn cartridge_mark_erased(
         return Ok(());
     }
 
+    let action = format!("mark cartridge \"{barcode}\" erased");
+
+    // ADR-0008 TIER 3, the absolute floor (ADR-0012, issue #147; a FOURTH
+    // caller found later, issue #289 -- #147's own sweep named only `volume
+    // retire`, `cartridge retire` and `volume compact-finish`). Before ANY
+    // Tier-2 consent, unconditionally -- for every mounted volume, on every
+    // path, not only the non-`pending_erase` branch below -- and with no
+    // `force`/`assume_yes` in scope to defeat it (see
+    // `refuse_last_eligible_copy`'s doc comment).
+    //
+    // On the ORDINARY lifecycle this is a structural no-op: `volume retire`
+    // already ran this same floor and, on success, left the volume
+    // `'retired'`; `holds_sealed_bytes` (which `versions_at_stake` joins the
+    // subject volume through) excludes `retired`/`missing`/`erased`, so
+    // `retire_impacts` returns no `at_stake` rows for an already-retired
+    // volume and this loop falls straight through. It only ever fires for
+    // the shape this issue exists to close: a cartridge whose mounted
+    // volume is still `sealed` (never went through `volume retire`) and
+    // `mark-erased` is asked to erase it directly, `--force`/`--yes` and
+    // all.
+    for (vol_label, impacts) in &per_volume {
+        if let Err(e) = refuse_last_eligible_copy(conn, &action, vol_label, impacts) {
+            let reason = e.to_string();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "barcode": barcode,
+                        "status": status,
+                        "affected_units": retire_impacts_json(&merged),
+                        "at_risk_units": at_risk,
+                        "consent": "refused",
+                        "reason": reason,
+                    })
+                );
+            } else {
+                // Impact analysis only; `main` prints the floor's own text
+                // once, on stderr. See `cartridge_retire`.
+                print_mark_erased_impact(barcode, &status, &volume_labels, &merged, &at_risk);
+            }
+            return Err(e);
+        }
+    }
+
     // ADR-0008 Tier 2: the normal path (cartridge already pending_erase)
     // needs no consent at all -- it's the expected end of the retire ->
     // bulk-erase -> mark-erased lifecycle. Any OTHER status is a
     // precondition violation and needs an explicit override.
     if status != "pending_erase" {
-        let action = format!("mark cartridge \"{barcode}\" erased");
         let facts = mark_erased_consent_facts(barcode, &status, &volume_labels);
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
             let reason = e.to_string();
