@@ -15,13 +15,17 @@ pub enum StageCommands {
         name: String,
 
         /// Re-stage a specific snapshot version instead of the latest
-        /// unstaged one — for when `tapectl staging clean --unit <name>`
-        /// already released the first stage set's slices and another copy
-        /// is wanted (issue #53). Refuses if a stage set for that version
-        /// already has live slices; use `volume write` to consume them, or
-        /// `staging clean --unit <name>` to release them first (retained
-        /// by default when the unit is below its policy's min_copies —
-        /// add `--force` to release it anyway).
+        /// unstaged one — for when `tapectl staging clean --unit <name>
+        /// --version <N>` already released that stage set's slices and
+        /// another copy is wanted (issue #53). Refuses if a stage set for
+        /// that version already has live slices; use `volume write` to
+        /// consume them, or `staging clean --unit <name> --version <N>`
+        /// to release them first. A plain clean releases it only when it
+        /// already has a completed write AND the unit is not currently
+        /// below its policy's min_copies; add `--force` otherwise —
+        /// including for a stage set that was never written anywhere,
+        /// which a plain clean leaves untouched regardless of min_copies
+        /// (issue #279).
         #[arg(long)]
         version: Option<i64>,
     },
@@ -328,22 +332,68 @@ pub fn run(
                             ))
                         })?;
 
-                    let statuses: Vec<String> = conn
-                        .prepare("SELECT status FROM stage_sets WHERE snapshot_id = ?1")?
-                        .query_map(params![snapshot_id], |row| row.get(0))?
+                    let stage_sets: Vec<(i64, String)> = conn
+                        .prepare("SELECT id, status FROM stage_sets WHERE snapshot_id = ?1")?
+                        .query_map(params![snapshot_id], |row| Ok((row.get(0)?, row.get(1)?)))?
                         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-                    if statuses
+                    let live_ids: Vec<i64> = stage_sets
                         .iter()
-                        .any(|s| staging::stage_set_has_live_slices(s))
-                    {
-                        return Err(TapectlError::Other(format!(
-                            "unit \"{name}\" v{v} already has a stage set with live slices — \
-                             use `tapectl volume write` to consume them, or \
-                             `tapectl staging clean --unit {name}` to release them first \
-                             (retained by default if \"{name}\" is below its policy's \
-                             min_copies — add --force to release it anyway)"
-                        )));
+                        .filter(|(_, status)| staging::stage_set_has_live_slices(status))
+                        .map(|(id, _)| *id)
+                        .collect();
+
+                    if !live_ids.is_empty() {
+                        // Issue #279: a bare `staging clean` leaves a live
+                        // stage set alone for exactly one of two reasons,
+                        // and the refusal must name the one that actually
+                        // applies here rather than listing both. Reuses
+                        // `staging::clean::is_release_candidate` -- the
+                        // SAME predicate `cli::staging::
+                        // staged_release_candidate_units` evaluates per
+                        // unit (issue #96) -- never a third hand-written
+                        // copy of `EXISTS (SELECT 1 FROM writes ...)`.
+                        let mut is_candidate = false;
+                        for id in &live_ids {
+                            if staging::clean::is_release_candidate(conn, *id)? {
+                                is_candidate = true;
+                                break;
+                            }
+                        }
+
+                        let msg = if is_candidate {
+                            // Has a completed-writes-only stage set: a
+                            // bare clean WOULD release it, unless the unit
+                            // is currently below its policy's min_copies
+                            // (in which case --force is needed) -- today's
+                            // wording, unchanged.
+                            format!(
+                                "unit \"{name}\" v{v} already has a stage set with live slices — \
+                                 use `tapectl volume write` to consume them, or \
+                                 `tapectl staging clean --unit {name}` to release them first \
+                                 (retained by default if \"{name}\" is below its policy's \
+                                 min_copies — add --force to release it anyway)"
+                            )
+                        } else {
+                            // Not a release candidate at all -- most
+                            // commonly, no `writes` row exists for it yet
+                            // (it has never been written to any volume).
+                            // A bare clean is a silent no-op here
+                            // (`cleaned 0 stage set(s)`); min_copies never
+                            // enters into it, so this must not mention it
+                            // -- `--force` is unconditionally what is
+                            // needed, named against the version-scoped
+                            // form (issue #278) so the operator releases
+                            // exactly this stage set.
+                            format!(
+                                "unit \"{name}\" v{v} already has a stage set with live slices — \
+                                 use `tapectl volume write` to consume them; it has no \
+                                 completed write backing it, so `tapectl staging clean \
+                                 --unit {name} --version {v}` would leave it untouched — \
+                                 pass --force to release it"
+                            )
+                        };
+                        return Err(TapectlError::Other(msg));
                     }
 
                     snapshot_id
@@ -621,6 +671,157 @@ mod tests {
         );
         assert!(msg.contains("volume write"));
         assert!(msg.contains("staging clean"));
+    }
+
+    /// Issue #279, one of the two branches: the live stage set above has
+    /// NEVER been written anywhere (no `writes` row exists for it at all)
+    /// -- a plain `tapectl staging clean --unit <name>` is a silent no-op
+    /// on it (`cleaned 0 stage set(s)`), so `--force` is the only thing
+    /// that releases it, regardless of the unit's min_copies standing.
+    /// The refusal must say exactly that, and must NOT mention
+    /// min_copies at all -- mentioning it here would misdirect an
+    /// operator whose unit is not under min_copies into concluding
+    /// `--force` does not apply to them, when it is the only thing that
+    /// would help. The positive control for this test is
+    /// `create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set`
+    /// below: without it, this test alone cannot distinguish "says the
+    /// right thing" from "stopped mentioning min_copies anywhere".
+    #[test]
+    fn create_with_version_refusal_names_never_written_unconditionally() {
+        let (conn, paths, config, _tmp) = setup();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        // No `writes` row exists for this stage_set at all -- the exact
+        // fixture `create_with_version_refuses_when_a_stage_set_is_staged`
+        // above builds, made explicit here as the precondition this test
+        // depends on.
+        let stage_set_id: i64 = conn
+            .query_row("SELECT id FROM stage_sets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let write_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM writes WHERE stage_set_id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_count, 0, "precondition: never written anywhere");
+
+        let err = run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: Some(1),
+            },
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already has a stage set with live slices"),
+            "{msg}"
+        );
+        assert!(msg.contains("volume write"), "{msg}");
+        assert!(
+            msg.contains("--force"),
+            "must name --force unconditionally: {msg}"
+        );
+        assert!(
+            !msg.contains("min_copies"),
+            "a never-written stage set has nothing to do with min_copies -- \
+             mentioning it here misdirects an operator whose unit is not \
+             under min_copies into thinking --force does not apply: {msg}"
+        );
+    }
+
+    /// Issue #279, the other branch and this test module's positive
+    /// control: the live stage set DOES have a completed write, and the
+    /// unit is below its policy's min_copies -- a plain
+    /// `tapectl staging clean --unit <name>` retains it for exactly that
+    /// reason, so the refusal keeps today's wording, min_copies mention
+    /// included.
+    #[test]
+    fn create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set() {
+        let (conn, paths, config, _tmp) = setup();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        let stage_set_id: i64 = conn
+            .query_row("SELECT id FROM stage_sets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V1', 'lto', 'lto0', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+
+        // `Config::default()`'s resolved min_copies is 2 (src/config.rs);
+        // one completed write leaves "unit1" under-copied.
+        let err = run(
+            &conn,
+            &paths,
+            &config,
+            &StageCommands::Create {
+                name: "unit1".to_string(),
+                version: Some(1),
+            },
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already has a stage set with live slices"),
+            "{msg}"
+        );
+        assert!(msg.contains("volume write"), "{msg}");
+        assert!(msg.contains("staging clean"), "{msg}");
+        assert!(
+            msg.contains("min_copies"),
+            "a written, under-copied set keeps today's min_copies wording: {msg}"
+        );
+        assert!(msg.contains("--force"), "{msg}");
     }
 
     #[test]
