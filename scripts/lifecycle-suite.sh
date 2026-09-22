@@ -3515,6 +3515,36 @@ for v in vols:
 }
 
 # ---------- REPORT.md ----------
+# The verdict line is the string that gets pasted into issues, commit messages
+# and this Policy block, and on its own it claims more than the run proved:
+# "LIFECYCLE-SUITE GREEN" says nothing about which seed, which erase mode, or
+# whether the weaker --single-cartridge allowance was in force. This suite has
+# already been bitten twice in exactly that gap — `retire-and-reuse` passes
+# under `--erase long` and fails under `--erase short` (issue #198), and
+# `--single-cartridge`'s copy_count allowance hid a `permute` failure
+# completely. `permute` adds a third: it is one sample of a seeded walk, so a
+# green run is evidence about that seed and no other (issue #288).
+#
+# So the mode travels with the number. A reader who sees only the last line
+# still knows what was and was not exercised.
+run_shape() {
+    local scope perm=""
+    if [ "$RUN_ALL" = 1 ]; then
+        scope="all ${#SCENARIO_NAMES[@]} scenarios"
+    else
+        scope="scenario $SCENARIO"
+    fi
+    # SEED drives `mutate_source` in six scenarios, not just `permute`, so it
+    # is always named; the step count only means anything when permute ran.
+    if [ "$RUN_ALL" = 1 ] || [ "$SCENARIO" = "permute" ]; then
+        perm=" ($STEPS permute steps)"
+    fi
+    printf '%s, seed %s%s, erase %s, %s, %s' \
+        "$scope" "$SEED" "$perm" "$ERASE_MODE" \
+        "$([ "$SINGLE_CARTRIDGE" = 1 ] && echo single-cartridge || echo multi-cartridge)" \
+        "$TAPE_DEV"
+}
+
 write_report_header() {
     [ "$DRY_RUN" = 1 ] && return 0
     {
@@ -4221,8 +4251,8 @@ done
 echo "  ${#CHECKS[@]} checks: $((${#CHECKS[@]} - fails - skips)) passed, $fails failed, $skips skipped"
 echo "  report: $REPORT"
 if [ "$fails" -gt 0 ]; then
-    echo "LIFECYCLE-SUITE RED"
+    echo "LIFECYCLE-SUITE RED — $(run_shape)"
 else
-    echo "LIFECYCLE-SUITE GREEN ($skips visible skip(s))"
+    echo "LIFECYCLE-SUITE GREEN — $(run_shape), $skips visible skip(s)"
 fi
 exit $rc
