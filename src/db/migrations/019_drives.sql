@@ -1,0 +1,96 @@
+-- 019: the drive is a first-class noun (ADR-0013 §1, issue #295).
+--
+-- `sg_logs` pages 0x02/0x03/0x2E are DRIVE-RESIDENT counters -- a property of
+-- the machine, read through whichever cartridge happened to be loaded. Until
+-- now the only subject `health_logs` could name was `volume_id`, which asserts
+-- the one attribution we have the least evidence for and makes the central
+-- question in tape diagnostics unanswerable: IS IT THE DRIVE OR THE TAPE? A
+-- rising uncorrected-error count means nothing until you know whether it
+-- follows the medium or the machine, and today neither route can be queried.
+--
+-- There is one drive today, which is exactly when this table is cheap. The
+-- moment there is a second -- or the HP LTO-6 is replaced, which is a *when*,
+-- not an *if*, for a 2017-manufactured drive -- every historical row must be
+-- able to say which machine produced it. Forward-only schema makes retrofitting
+-- that expensive, and it cannot retrofit the rows already written.
+--
+-- WHY A TABLE AND NOT COLUMNS ON `health_logs`
+-- --------------------------------------------
+-- ADR-0013 §1: every other record takes a foreign key to this table and grows
+-- NO drive column of its own. Four drafts in the tape-forensics suite each
+-- proposed their own private drive column; four uncoordinated rebuilds of the
+-- table holding the schema's largest blobs is the most likely way that suite
+-- loses data. The drive is also a physical object with a history independent of
+-- any one reading -- the same argument ADR-0012 made for a cartridge being
+-- identified by its chip serial rather than by a relabelable sticker.
+--
+-- `volumes.backend_name` is NOT a drive identity and cannot substitute: it is a
+-- config NAME, established as provenance-only by issue #151, and renaming the
+-- backend or pointing it at a replacement drive silently re-attributes every
+-- historical row.
+--
+-- THIS MIGRATION DOES NOT TOUCH `health_logs`
+-- -------------------------------------------
+-- No `drive_id`, no `cartridge_id`, no CHECK change, no rebuild. ADR-0013 §3
+-- gives `health_logs` exactly ONE rebuild and it is migration 021 (issue #296),
+-- which links readings to a drive and a cartridge through `contact_id` on
+-- `cartridge_contacts` (migration 020) rather than through columns here. This
+-- table cannot wait for that rebuild -- the rebuild takes its foreign key from
+-- this table -- but the rebuild must not be anticipated either.
+--
+-- KEYED ON SERIAL. NO SERIAL MEANS NO ROW.
+-- ----------------------------------------
+-- `serial` is the SCSI Unit Serial Number (VPD page 0x80), read from
+-- `/sys/class/scsi_tape/<node>/device/vpd_pg80` with `sg_inq --page=0x80` as
+-- the fallback (`src/tape/drive_identity.rs`). It is also the string the by-id
+-- name carries -- `scsi-HUJ808A5L4-nst` IS serial `HUJ808A5L4` -- so the routes
+-- to it are independent and their disagreement would itself be a finding.
+--
+-- NOT a composite key invented from vendor + model + device path. Two identical
+-- drives on one host would collide under such a key and silently merge their
+-- histories, and a key containing the device path would re-attribute every row
+-- the day `/dev/nst0` and `/dev/nst1` swap across a reboot -- which this VM's
+-- own documented device-numbering hazard says is routine. A drive that cannot
+-- be identified is recorded as unknown BY ITS ABSENCE, never as a guessed row.
+-- That is the same honesty migration 009 gave `tape_alerts`: NULL means "not
+-- recorded", and nothing backfills a value that was never observed.
+--
+-- Nothing is backfilled here for the same reason. Pre-019 `health_logs` rows
+-- cannot be attributed to any drive -- the machine that produced them was never
+-- recorded anywhere -- and a guess would read exactly like an observation.
+--
+-- vendor/model/firmware_rev are NULLABLE
+-- --------------------------------------
+-- The serial can be read (`sg_inq` fallback) on a contact where the sysfs
+-- triple cannot, and a row that exists is worth more than one that waits for a
+-- complete picture. `firmware_rev` is the LAST SEEN revision, not a constant: it
+-- legitimately changes over a drive's life, and a firmware upgrade is exactly
+-- the kind of event a later error-rate change must be correlated against, which
+-- is why the upsert refreshes it. A contact that does not observe a field leaves
+-- the stored one alone (`COALESCE(excluded.x, drives.x)`) rather than blanking
+-- it -- absence of an observation is not an observation of absence.
+--
+-- `first_seen` and `last_seen` are both NOT NULL with a default: every row is
+-- created by a contact, so both facts are always known at insert. The upsert
+-- moves only `last_seen`.
+--
+-- Plain CREATE TABLE -- no rebuild of anything, so no `.foreign_key_check()`
+-- (unlike migrations 003/012/013/017, which dropped and recreated a table other
+-- rows referenced). Nothing references this table yet; migration 020 will.
+--
+-- This table does not appear anywhere on tape: the operator envelope's on-tape
+-- catalog (`db::ontape_catalog`) carries its own independent, hand-written
+-- schema with no health or drive tables at all, so this migration changes no
+-- on-tape byte.
+CREATE TABLE drives (
+    id            INTEGER PRIMARY KEY,
+    -- UNIQUE is the identity rule, NOT NULL is the "no guessed row" rule, and
+    -- the length CHECK stops an empty string from becoming a third, nameless
+    -- drive that every unidentified contact would then pile into.
+    serial        TEXT NOT NULL UNIQUE CHECK(length(serial) > 0),
+    vendor        TEXT,
+    model         TEXT,
+    firmware_rev  TEXT,
+    first_seen    TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen     TEXT NOT NULL DEFAULT (datetime('now'))
+);

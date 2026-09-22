@@ -204,6 +204,25 @@ fn migrations() -> Migrations<'static> {
         // Plain ADD COLUMN, no rebuild -- see the migration header for why
         // none of 017's rebuild machinery is needed here.
         M::up(include_str!("migrations/018_volume_sealed_at.sql")),
+        // 019 creates `drives` (ADR-0013 §1 "There is a `drives` table",
+        // issue #295): sg_logs pages 0x02/0x03/0x2E are drive-resident
+        // counters, and until now the only subject `health_logs` could name
+        // was `volume_id` -- so "is it the drive or the tape?", the central
+        // question in tape diagnostics, had no column to group by. Keyed on
+        // the SCSI Unit Serial Number; no serial means no row, never a
+        // composite key invented from vendor + model + device path.
+        //
+        // It creates a table and touches nothing else -- in particular it
+        // adds NO column to `health_logs`. ADR-0013 §3 gives that table
+        // exactly ONE rebuild, migration 021 (issue #296), which reaches the
+        // drive and the cartridge through `contact_id` rather than through
+        // private columns; four drafts in this suite each proposed their own,
+        // and four uncoordinated rebuilds of the table holding the schema's
+        // largest blobs is how the suite would lose the data it exists to
+        // capture. No rebuild here, so no `.foreign_key_check()` -- nothing
+        // references `drives` yet; migration 020 will. See the migration
+        // header for the full rationale.
+        M::up(include_str!("migrations/019_drives.sql")),
     ])
 }
 
