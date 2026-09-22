@@ -860,30 +860,99 @@ rm_step_restore_sh_dd() {
     grep -q "VERIFY: PASS" "$RM_WORK/verify_sh.txt" || { cat "$RM_WORK/verify_sh.txt"; echo "expected VERIFY: PASS"; return 1; }
 }
 
+# heir_key_candidates <tenant> <key_type> — every key FILE of that type this
+# operator holds, active first, then the deactivated ones newest-first.
+#
+# Issue #288(b). `active_key_path` alone is WRONG for a volume written before a
+# `key rotate`: a tenant envelope is sealed at WRITE time with the recipients
+# the tenant had then (src/volume/build.rs:290), so the key active NOW cannot
+# open a tape written before it existed. tapectl's own restore never trips on
+# this because it trial-decrypts with every tenant and operator key; the heir
+# path takes a single --key, so the harness must model what an heir actually
+# does -- reach for the Heir Kit and try the keys they hold.
+#
+# This is emphatically NOT "pass if any key works": see heir_restore_try_keys,
+# which still fails when NO held key opens the envelope. Trying the operator's
+# own keyring is the heir's real situation; having no key that works is a real
+# failure and stays RED.
+heir_key_candidates() { # <tenant> <key_type>
+    local tenant="$1" ktype="$2" aliases
+    aliases="$(TCTL key list --tenant "$tenant" --json 2>/dev/null | KT="$ktype" python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+kt = os.environ["KT"]
+keys = [k for k in d if k.get("key_type") == kt and not k.get("is_escrow")]
+active   = [k for k in keys if k.get("is_active")]
+inactive = [k for k in keys if not k.get("is_active")]
+# Ordering is a preference, not a correctness requirement — every candidate is
+# tried. `key list` is chronological, so reversing puts the most recently
+# deactivated (most likely to match a recent tape) first.
+for k in active + list(reversed(inactive)):
+    a = k.get("alias")
+    if a:
+        print(a)
+' 2>/dev/null)"
+    local a found=0
+    while IFS= read -r a; do
+        [ -n "$a" ] || continue
+        if [ -f "$HOME_DIR/keys/$a.age.key" ]; then
+            echo "$HOME_DIR/keys/$a.age.key"; found=1
+        fi
+    done <<<"$aliases"
+    # Fall back to the conventional filename only when `key list` told us
+    # nothing — same reasoning as active_key_path's own fallback.
+    if [ "$found" -eq 0 ] && [ -f "$HOME_DIR/keys/$tenant-$ktype.age.key" ]; then
+        echo "$HOME_DIR/keys/$tenant-$ktype.age.key"
+    fi
+}
+
+# heir_restore_try_keys <key_type> <dest> <logfile> — run the heir RESTORE.sh
+# against each key the tenant holds, stopping at the first that opens the
+# envelope, and SAY WHICH ONE DID. Fails if none does.
+heir_restore_try_keys() { # <key_type> <dest> <logfile>
+    local ktype="$1" to="$2" log="$3"
+    local keys tried=0 k
+    keys="$(heir_key_candidates "$RM_TENANT" "$ktype")"
+    [ -n "$keys" ] || { echo "no $ktype key of tenant $RM_TENANT on disk at all"; return 1; }
+    : >"$log"
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        tried=$((tried + 1))
+        if (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore \
+                --unit "$RM_UNIT" --key "$k" --to "$to") >>"$log" 2>&1; then
+            echo "heir restore of $RM_UNIT opened with $ktype key $(basename "$k") (candidate $tried of $(printf '%s\n' "$keys" | grep -c .))"
+            return 0
+        fi
+        echo "--- $ktype candidate $(basename "$k") did not open the envelope ---" >>"$log"
+        rm -rf "$to"
+    done <<<"$keys"
+    cat "$log"
+    echo "no $ktype key held by tenant $RM_TENANT opened $RM_UNIT's envelope ($tried tried)"
+    return 1
+}
+
 rm_step_restore_sh_primary() {
     ensure_heir_restore_sh || return 1
-    local key to="$RM_WORK/primary"
-    key="$(active_key_path "$RM_TENANT" primary)"
+    local to="$RM_WORK/primary"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key $key --to $to"
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key <each primary key of $RM_TENANT, active first> --to $to"
         return 0
     fi
-    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$key" --to "$to") \
-        >"$RM_WORK/restore_primary.txt" 2>&1 || { cat "$RM_WORK/restore_primary.txt"; return 1; }
+    heir_restore_try_keys primary "$to" "$RM_WORK/restore_primary.txt" || return 1
     assert_identical "$RM_SRC" "$to"
 }
 
 rm_step_restore_sh_backup() {
     ensure_heir_restore_sh || return 1
-    local key to="$RM_WORK/backup"
-    key="$(active_key_path "$RM_TENANT" backup)"
+    local to="$RM_WORK/backup"
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key $key --to $to (proves the backup key is a real recipient)"
+        echo "PLAN: ./RESTORE.sh --restore --unit $RM_UNIT --key <each backup key of $RM_TENANT, active first> --to $to (proves the backup key is a real recipient)"
         return 0
     fi
-    [ -f "$key" ] || { echo "tenant backup key missing: $key"; return 1; }
-    (cd "$RM_WORK/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit "$RM_UNIT" --key "$key" --to "$to") \
-        >"$RM_WORK/restore_backup.txt" 2>&1 || { cat "$RM_WORK/restore_backup.txt"; return 1; }
+    heir_restore_try_keys backup "$to" "$RM_WORK/restore_backup.txt" || return 1
     assert_identical "$RM_SRC" "$to"
 }
 
@@ -3161,48 +3230,128 @@ assert d.get("integrity_ok"), d
     esac
 }
 
-# ---------- pm_final_copy_count_is_honest (issue #203) ----------
+# ---------- pm_final_copy_count_is_honest (issue #203, rewritten #288) ----------
 # The end-of-walk assertion that per-step copy_count checking was never able to
-# be. It does NOT ask "is audit quiet" — the walk cannot control how many copies
-# the RNG gave it. It asks the stronger question: does tapectl's copy count
-# AGREE with the volumes this walk actually wrote?
+# be. It does NOT ask "is audit quiet" -- the walk cannot control how many
+# copies the RNG gave it.
 #
-# For each unit, the expected count is |PM_WRITTEN ∩ volumes `catalog locate`
-# reports for that unit| — the walk's own record intersected with the catalog's,
-# which is not a re-derivation of tapectl's SQL and so can actually disagree
-# with it. audit's copy_count finding (when there is one) must name that same
-# number. A miscount in either direction fails, in every mode and at every seed.
+# WHAT THIS USED TO DO, AND WHY IT COULD NOT WORK (issue #288). The original
+# expectation was |PM_WRITTEN n volumes `catalog locate` names for the unit| --
+# "the walk's own record intersected with the catalog's", chosen so it would
+# not be a re-derivation of tapectl's SQL and could therefore actually
+# disagree with it. The intent was right; the quantity was not. audit's
+# copy_count is the count of ELIGIBLE copies of a CURRENT version (ADR-0012:
+# "a unit is as covered as its least-covered live version" -- literally a MIN
+# over current snapshots in `policy::coverage::copy_count_expr`). The old
+# expression counted VOLUMES EVER ASSOCIATED WITH THE UNIT, across every
+# version and every status, then intersected with this walk's writes. Those
+# are different quantities, and they diverge in BOTH directions:
+#   * too low  -- a copy written by the bootstrap is not in PM_WRITTEN at all
+#                 (seed 2: "audit says 1, this walk wrote 0");
+#   * too high -- a volume this walk wrote and later superseded or erased is
+#                 still named by `catalog locate`, and an older version's
+#                 volume is named too (seed 3: "audit says 1, this walk wrote
+#                 3").
+# So it was not merely mis-tuned. Do NOT reinstate PM_WRITTEN here: a count
+# the harness derives independently cannot account for versions and erasures
+# without interpreting catalog semantics, and interpreting them IS the
+# re-derivation the original comment was right to avoid.
+#
+# WHAT IT ASSERTS NOW -- two statements, both seed-independent:
+#
+#  1. THE SAFETY BOUND, independent of tapectl's own eligibility verdict:
+#     audit may not claim more copies than there are distinct volumes carrying
+#     that version. Overstatement is the direction that loses data -- it is
+#     what makes a `volume retire` look safe when it is not -- so this half
+#     deliberately uses no tapectl predicate at all, only "how many volumes is
+#     this version on".
+#
+#  2. CROSS-SURFACE AGREEMENT: audit's count must equal the number of volumes
+#     `catalog locate` marks Serviceable at the least-covered current version.
+#     That is not circular: `audit` reaches its number through
+#     `coverage::copy_count_expr` and `locate` marks rows through
+#     `coverage::eligible` -- two derivations sharing a module, which is
+#     exactly the pair that can drift. Nothing compared two coverage surfaces
+#     before, and that is how issue #153 shipped a wrong count that every
+#     individual surface agreed with itself about.
+#
+# `snapshot list --status current` supplies which versions are current; the MIN
+# is taken over those, mirroring copy_count_expr. Deposits are deliberately not
+# modelled -- `permute`'s op pool contains no warehouse operation, so a deposit
+# can never exist here, and the check FAILS LOUDLY rather than silently
+# mis-counting if one ever appears.
+#
+# Not asserted here, on purpose: that `catalog locate` never names a volume the
+# walk did not write. That is a real property and a different check; it is out
+# of scope rather than forgotten.
 pm_final_copy_count_is_honest() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: audit's copy_count must match the volumes this walk wrote"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: audit's copy_count must equal locate's serviceable count at the least-covered current version, and never exceed the volumes carrying it"; return 0; }
     local af="$RUN/log-pm.final.audit.json"
     TCTL audit --json >"$af" 2>"$RUN/log-pm.final.audit.stderr"
     local u rc=0
     for u in photos docs big; do
-        local locate_json expected
+        local locate_json cur_json derived expected upper
         locate_json="$(TCTL catalog locate "$u" --json 2>/dev/null)" || continue
-        expected="$(printf '%s\n' "$locate_json" | PM_W="${PM_WRITTEN[*]}" python3 -c '
+        cur_json="$(TCTL snapshot list --unit "$u" --status current --json 2>/dev/null)" || {
+            echo "snapshot list --status current unreadable for $u"; rc=1; continue
+        }
+        # Emits "<expected> <upper>", or "ERR <reason>".
+        derived="$(printf '%s\n' "$locate_json" | CUR="$cur_json" python3 -c '
 import json, os, sys
-written = set(os.environ.get("PM_W", "").split())
+
+def fail(msg):
+    print("ERR " + msg)
+    raise SystemExit
+
 try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(-1); raise SystemExit
-vols = d if isinstance(d, list) else d.get("volumes", [])
-# Issue #253: `v.get("label")` was always None -- `catalog locate --json`
-# keys its label as "volume" -- so this set was {None}, the intersection
-# with the written labels was always empty, and the "honest copy count"
-# check compared the audit answer against a structurally-zero expectation.
-# It could only ever have passed when the true count was zero too.
-labels = set()
-for v in vols:
-    if not isinstance(v, dict):
-        labels.add(v); continue
-    if "volume" not in v:
-        print(-1); raise SystemExit
-    labels.add(v["volume"])
-print(len(labels & written))
+    rows = json.load(sys.stdin)
+except Exception as e:
+    fail("catalog locate --json unparseable: %s" % e)
+try:
+    cur = json.loads(os.environ["CUR"])
+except Exception as e:
+    fail("snapshot list --json unparseable: %s" % e)
+
+if isinstance(rows, dict):
+    rows = rows.get("volumes", [])
+current = set()
+for c in (cur if isinstance(cur, list) else cur.get("snapshots", [])):
+    if not isinstance(c, dict) or "version" not in c:
+        fail("snapshot list row has no version field")
+    current.add(c["version"])
+
+# No current version at all: audit has nothing to count, expect 0.
+if not current:
+    print("0 0")
+    raise SystemExit
+
+serviceable = {v: set() for v in current}
+carrying    = {v: set() for v in current}
+for r in rows:
+    if not isinstance(r, dict):
+        fail("catalog locate row is not an object")
+    for f in ("volume", "version", "serviceable"):
+        if f not in r:
+            fail("catalog locate row has no %s field" % f)
+    if r.get("warehouse"):
+        fail("a warehouse deposit exists; permute has no deposit op, so this "
+             "check no longer models what audit counts -- update it")
+    v = r["version"]
+    if v not in current:
+        continue
+    carrying[v].add(r["volume"])
+    if r["serviceable"]:
+        serviceable[v].add(r["volume"])
+
+# copy_count_expr takes the MIN over current snapshots; the safety bound is
+# read at that same version, so the two halves speak about one version.
+worst = min(current, key=lambda v: (len(serviceable[v]), v))
+print("%d %d" % (len(serviceable[worst]), len(carrying[worst])))
 ')"
-        [ "$expected" = "-1" ] && { echo "catalog locate --json unparseable for $u"; rc=1; continue; }
+        case "$derived" in
+            ERR\ *) echo "${derived#ERR }  (unit $u)"; rc=1; continue ;;
+        esac
+        expected="${derived%% *}"; upper="${derived##* }"
         local claimed
         claimed="$(U="$u" python3 -c '
 import json, os, re, sys
@@ -3220,9 +3369,14 @@ else:
         # assertion is about the number audit DOES state.
         if [ "$claimed" = "unparsed" ]; then
             echo "copy_count message for $u did not carry a count"; rc=1
-        elif [ "$claimed" != "none" ] && [ "$claimed" != "$expected" ]; then
-            echo "copy_count disagreement for $u: audit says $claimed, this walk wrote $expected volume(s) carrying it"
-            rc=1
+        elif [ "$claimed" != "none" ]; then
+            if [ "$claimed" -gt "$upper" ]; then
+                echo "copy_count OVERSTATED for $u: audit says $claimed, but only $upper volume(s) carry that version at all"
+                rc=1
+            elif [ "$claimed" != "$expected" ]; then
+                echo "copy_count disagreement for $u: audit says $claimed, catalog locate marks $expected volume(s) serviceable at the least-covered current version"
+                rc=1
+            fi
         fi
     done
     return $rc
