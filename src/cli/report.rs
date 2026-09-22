@@ -1084,6 +1084,33 @@ fn verify_status_rows(
 /// consumer to infer it from `outcome`/`completed` being null — the whole
 /// point of this fix is that the never-verified case must not depend on
 /// omission to be recognized.
+/// The human line for one `report verify-status` row.
+///
+/// Split out from the print loop for the same reason `verify_status_rows`
+/// was: so the *words* an operator reads can be asserted directly. #293's
+/// acceptance is that a never-verified volume is MARKED as such, not merely
+/// present — a claim about this text, which nothing could check while it
+/// existed only inside a `println!`. Three operator-facing strings in this
+/// repo have already outlived the behaviour they described (#209, #274,
+/// #281), so a string an acceptance criterion names gets a test.
+fn verify_status_row_text(row: &VerifyStatusRow) -> String {
+    let (label, vtype, outcome, completed, checked, passed, failed) = row;
+    if outcome.is_none() {
+        // The line that tells the operator what to verify next — spelled
+        // out, not left as an empty column to interpret.
+        return format!("  {label}: never verified");
+    }
+    format!(
+        "  {label}: {} {} at {} ({}/{}/{} checked/passed/failed)",
+        vtype.as_deref().unwrap_or("?"),
+        outcome.as_deref().unwrap_or("?"),
+        completed.as_deref().unwrap_or("?"),
+        checked.unwrap_or(0),
+        passed.unwrap_or(0),
+        failed.unwrap_or(0),
+    )
+}
+
 fn verify_status_row_json(row: &VerifyStatusRow) -> serde_json::Value {
     let (label, vtype, outcome, completed, checked, passed, failed) = row;
     serde_json::json!({
@@ -1143,22 +1170,8 @@ fn report_verify_status(
         // own and no longer hides behind this message.
         println!("no volumes found");
     } else {
-        for (label, vtype, outcome, completed, checked, passed, failed) in &rows {
-            if outcome.is_none() {
-                // The line that tells the operator what to verify next —
-                // spelled out, not left as an empty column to interpret.
-                println!("  {label}: never verified");
-                continue;
-            }
-            println!(
-                "  {label}: {} {} at {} ({}/{}/{} checked/passed/failed)",
-                vtype.as_deref().unwrap_or("?"),
-                outcome.as_deref().unwrap_or("?"),
-                completed.as_deref().unwrap_or("?"),
-                checked.unwrap_or(0),
-                passed.unwrap_or(0),
-                failed.unwrap_or(0),
-            );
+        for row in &rows {
+            println!("{}", verify_status_row_text(row));
         }
         if let Some(failure) = &latest_failure {
             println!(
@@ -1913,6 +1926,46 @@ mod tests {
     /// this fix from the bug it fixes.
     mod verify_status_never_verified {
         use super::*;
+
+        /// #293's acceptance says a never-verified volume must be MARKED as
+        /// such. The other tests in this module prove it is a ROW; this one
+        /// proves it is a marked row, which is the half an operator reads.
+        #[test]
+        fn the_text_line_marks_never_verified_and_never_mislabels_a_verified_one() {
+            let never: VerifyStatusRow =
+                ("ZZZ-NEVER".to_string(), None, None, None, None, None, None);
+            let done: VerifyStatusRow = (
+                "AAA-VERIFIED".to_string(),
+                Some("full".to_string()),
+                Some("passed".to_string()),
+                Some("2020-01-01T00:00:00Z".to_string()),
+                Some(3),
+                Some(3),
+                Some(0),
+            );
+
+            assert_eq!(
+                verify_status_row_text(&never),
+                "  ZZZ-NEVER: never verified",
+                "a volume with no sessions must SAY so, not appear with blank \
+                 columns the reader has to interpret"
+            );
+
+            // The positive control: without it the assertion above would
+            // also pass for a renderer that labelled everything "never
+            // verified", which is the same silence in the other direction.
+            let t = verify_status_row_text(&done);
+            assert!(
+                !t.contains("never verified"),
+                "a verified volume must not be labelled never verified: {t}"
+            );
+            for needle in ["AAA-VERIFIED", "full", "passed", "2020-01-01T00:00:00Z"] {
+                assert!(
+                    t.contains(needle),
+                    "the verified line must carry its evidence ({needle}): {t}"
+                );
+            }
+        }
 
         /// A volume with one completed, passed verification session.
         fn seed_verified(conn: &rusqlite::Connection, label: &str, completed_at: &str) {
