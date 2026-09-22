@@ -348,9 +348,9 @@ padding can be defeated without knowing the exact size:
 ///   trimming to File 3's `size_bytes`) hashed and compared to File 3's
 ///   `sha256_encrypted`; File 3 itself checked against the seal binding.
 ///   Per-file PASS/FAIL lines, nonzero exit on any FAIL.
-/// - `--find-envelope --key K`: trial-decrypt envelope positions (found by
-///   type in the file map), as v1.
-/// - `--restore --key K --to DIR [--unit U] [--version N]`: slice positions/sizes come from
+/// - `--find-envelope --key K [--key K2 ...]`: trial-decrypt envelope
+///   positions (found by type in the file map), as v1.
+/// - `--restore --key K [--key K2 ...] --to DIR [--unit U] [--version N]`: slice positions/sizes come from
 ///   the decrypted MANIFEST, cross-checked against the file map's
 ///   `size_bytes`/`sha256_encrypted` before each slice is trusted/decrypted.
 ///
@@ -365,22 +365,39 @@ padding can be defeated without knowing the exact size:
 /// reaches arithmetic, `fsf`, or `seq` (S2 hardening, carried over from v1).
 /// Tools used: mt, dd, age, dar, sha256sum, head, truncate, plus standard
 /// coreutils (awk/sed/grep/tr) — no TOML collection, per the grammar contract.
-/// **CARRIED FIX — issue #218, CTO ruling 2026-09-17.** The decrypted-slice
-/// progress line inside the template below reads
-/// `info "  decrypted ($((bytes / 1048576)) MB)"`. That labels a
-/// 1048576-divided figure `MB`, and ADR-0012 requires capacities decimal,
-/// data sizes binary, **the two named apart** — so it should read `MiB`.
-/// #204 fixed this class across ~40 CLI sites and deliberately left this one,
-/// because RESTORE.sh is on-tape content pinned by `RESTORE_SH_SHA256` in
-/// `tests/on_tape_golden.rs`, and a byte change there is a CTO decision.
+/// **`--key` is repeatable (issue #288, CTO ruling 2026-09-22).** A volume's
+/// tenant envelope is sealed at WRITE time to the tenant's then-current public
+/// keys (`build.rs`), while its data slices were sealed at STAGE time
+/// (`staging/mod.rs`). A `key rotate` landing between the two puts envelope
+/// and slices on different key generations, and then NO single key opens both
+/// — measured on a real tape. tapectl itself is unaffected because it
+/// trial-decrypts with every tenant and operator key, independently for the
+/// envelope and for the slices; RESTORE.sh took one `--key`, so the heir path
+/// was the only one that failed. It now mirrors tapectl: repeated `--key`,
+/// each tried on its own for the envelope and for each slice (remembering the
+/// key that opened the previous slice, since a wrong key costs a re-read of
+/// tape-sized ciphertext). Every key path is checked for existence BEFORE the
+/// first tape read — `age -d -i good -i missing` fails outright rather than
+/// skipping the bad one.
 ///
-/// **Ruled: batch it.** Do not spend a deliberate on-tape byte change and a
-/// golden re-pin on a cosmetic label alone — every re-pin trains the habit of
-/// re-pinning, and the next one might carry a real format change with it.
+/// **CARRIED FIX — issue #218, CTO ruling 2026-09-17: done, 2026-09-22.** The
+/// decrypted-slice progress line read `MB` for a 1048576-divided figure, which
+/// ADR-0012 forbids (capacities decimal, data sizes binary, the two named
+/// apart). #204 fixed the class across ~40 CLI sites and deliberately left
+/// this one, because RESTORE.sh is on-tape content pinned by
+/// `RESTORE_SH_SHA256` in `tests/on_tape_golden.rs` and the ruling was to
+/// batch it onto the next substantive change rather than spend a re-pin on a
+/// label. #288 is that change, so the line now reads `MiB`.
 ///
-/// So: **if you are already changing this script for a substantive reason and
-/// re-pinning anyway, change that `MB` to `MiB` while you are here.** That is
-/// the entire fix.
+/// **A quoting defect went with it (issue #291).** Two of the three
+/// "no envelope opened" exits quoted the tape label as `'\''VOL-A'\''` — the
+/// idiom for embedding a quote inside a SINGLE-quoted string, in a string
+/// that is double-quoted, where a bare `'` is already literal. Bash printed
+/// the backslashes verbatim, so the one line telling a reader in a disaster
+/// whether they hold the wrong cartridge rendered as garbage. The third exit
+/// (the `--unit` one, which is the ordinary way to reach it) carried no
+/// context at all. All three now route through one `die_no_envelope` helper
+/// so they cannot drift apart again.
 ///
 /// This note lives on the FUNCTION, not inside the template: a comment added
 /// within the string becomes shell comment lines in the generated script and
@@ -402,8 +419,11 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # Usage:
 #   ./RESTORE.sh --info                                       Show tape layout + seal verdict
 #   ./RESTORE.sh --verify                                     Keyless integrity check (no key needed)
-#   ./RESTORE.sh --find-envelope --key KEYFILE                Decrypt your envelope
-#   ./RESTORE.sh --restore --key KEYFILE --to DIR [--unit U] [--version N]
+#   ./RESTORE.sh --find-envelope --key KEYFILE [--key K2 ...] Decrypt your envelope
+#   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR [--unit U] [--version N]
+#
+# --key may be repeated. An envelope and the slices it describes can need
+# different keys after a key rotation, so every key is tried independently.
 #
 # Requirements: mt, dd, age, dar, sha256sum, head, truncate
 # Total files on tape: __TOTAL_FILES__
@@ -420,6 +440,13 @@ DEVICE="${TAPE_DEVICE:-/dev/nst0}"
 LABEL="__LABEL__"
 BLOCK=524288 # 512 KB — tapectl fixed block size
 
+# Every --key given on the command line, in order. A volume's envelope and the
+# data slices it describes can be sealed to DIFFERENT key generations: the
+# envelope is built when the volume is written, each slice when it was staged.
+# A key rotation between the two leaves no single key that opens both, so each
+# key here is tried independently for the envelope and for every slice.
+KEYS=()
+
 umask 077 # decrypted plaintext and temp files must not be world-readable
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tapectl-restore.XXXXXX")" ||
   {
@@ -433,6 +460,44 @@ die() {
   exit 1
 }
 info() { echo ">>> $*"; }
+
+# The provided keys as one line, so a failure names every key that was tried.
+keys_list() {
+  local k out=""
+  for k in ${KEYS[@]+"${KEYS[@]}"}; do
+    out="$out $k"
+  done
+  echo "${out# }"
+}
+
+# "the key provided" / "any of the 3 keys provided" — the count is what tells a
+# reader whether they forgot to pass one.
+keys_phrase() {
+  if [ "${#KEYS[@]}" -eq 1 ]; then
+    echo "the key provided"
+  else
+    echo "any of the ${#KEYS[@]} keys provided"
+  fi
+}
+
+# The keys back as command-line arguments, for the hints this script prints.
+keys_args() {
+  local k out=""
+  for k in ${KEYS[@]+"${KEYS[@]}"}; do
+    out="$out --key $k"
+  done
+  echo "${out# }"
+}
+
+# Check every key path BEFORE the first tape read. `age -d -i good -i missing`
+# fails outright rather than skipping the bad one, so a mistyped path must be
+# caught here and not discovered minutes into a restore.
+require_key_files() {
+  local k
+  for k in ${KEYS[@]+"${KEYS[@]}"}; do
+    [ -f "$k" ] || die "key file not found: $k"
+  done
+}
 
 # Reject a value read from a plaintext tape metadata zone (ID thunk, front
 # index, seal marker) that is not a plain non-negative integer, BEFORE it is
@@ -598,7 +663,7 @@ bootstrap_thunk() {
 # Always say which device was read and what was found there. A silent default
 # device is how a wrong-tape read disguises itself as a key or data problem:
 # with the wrong cartridge loaded, --info happily describes it while
-# --find-envelope reports "no envelope matched the provided key", which reads
+# --find-envelope reports that no envelope matched any key given, which reads
 # as "your key is wrong" or "your archive is gone" when it means neither.
 #
 # This WARNS and continues rather than exiting. Everything here except $LABEL is
@@ -878,12 +943,30 @@ do_verify() {
 
 # ---- --find-envelope ----
 
-do_find_envelope() {
-  local keyfile=$1
+# The three "no envelope opened" exits share one shape (issues #288, #291):
+# which keys were tried, what tape is actually in the drive, and the rotation
+# fact that makes a correct-looking key fail on a correct tape. They live here,
+# in one function, because the --unit exit — the one an heir is most likely to
+# hit — had already drifted into a bare one-liner with none of it.
+die_no_envelope() { # [unit]
+  local headline="no envelope matched $(keys_phrase)"
+  if [ -n "${1:-}" ]; then
+    headline="no envelope for unit '$1' matched $(keys_phrase)"
+  fi
+  die "$headline
+       Tape in $DEVICE identifies as '${TAPE_LABEL:-<unreadable>}'; this script is for '$LABEL'.
+       If those differ, you have the wrong cartridge or the wrong drive
+       (set TAPE_DEVICE=/dev/nstN) — not necessarily the wrong key.
+       If they match, try your OTHER keys: an envelope is sealed with the key
+       that was active when THIS tape was written, so a key issued after it
+       will not open it. --find-envelope reports which keys do.
+       Keys tried: $(keys_list)"
+}
 
+do_find_envelope() {
   establish_files
 
-  local found=0 pos
+  local found=0 pos keyfile
   while IFS= read -r pos; do
     require_uint envelope_position "$pos"
     info "Trying envelope at file $pos..."
@@ -896,33 +979,37 @@ do_find_envelope() {
       [ "$esize" -gt 0 ] && truncate -s "$esize" "$WORK/envelope.enc"
     fi
 
-    rm -rf "$WORK/env" && mkdir -p "$WORK/env"
-    if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
-      tar xf - -C "$WORK/env/" 2>/dev/null; then
-      found=1
-      echo ""
-      info "Decrypted envelope at file $pos"
-      if [ -f "$WORK/env/MANIFEST.toml" ]; then
+    for keyfile in ${KEYS[@]+"${KEYS[@]}"}; do
+      rm -rf "$WORK/env" && mkdir -p "$WORK/env"
+      if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
+        tar xf - -C "$WORK/env/" 2>/dev/null; then
+        found=1
         echo ""
-        echo "--- MANIFEST.toml ---"
-        cat "$WORK/env/MANIFEST.toml"
+        info "Decrypted envelope at file $pos"
+        info "  opened with key $keyfile"
+        if [ -f "$WORK/env/MANIFEST.toml" ]; then
+          echo ""
+          echo "--- MANIFEST.toml ---"
+          cat "$WORK/env/MANIFEST.toml"
+        fi
+        if [ -f "$WORK/env/RECOVERY.md" ]; then
+          echo ""
+          echo "--- RECOVERY.md ---"
+          cat "$WORK/env/RECOVERY.md"
+        fi
+        break
       fi
-      if [ -f "$WORK/env/RECOVERY.md" ]; then
-        echo ""
-        echo "--- RECOVERY.md ---"
-        cat "$WORK/env/RECOVERY.md"
-      fi
+      info "  key $keyfile did not open the envelope at file $pos"
+    done
+    if [ "$found" -eq 1 ]; then
       break
     fi
   done < <(envelope_positions "$FILES_TXT")
 
-  [ "$found" -eq 1 ] || die "no envelope matched the provided key
-       Tape in $DEVICE identifies as '\''${TAPE_LABEL:-<unreadable>}'\''; this script is for '\''$LABEL'\''.
-       If those differ, you have the wrong cartridge or the wrong drive
-       (set TAPE_DEVICE=/dev/nstN) — not necessarily the wrong key."
+  [ "$found" -eq 1 ] || die_no_envelope
   echo ""
   echo "To restore, run:"
-  echo "  $0 --restore --key $keyfile --to /your/destination"
+  echo "  $0 --restore $(keys_args) --to /your/destination"
 }
 
 # ---- --restore ----
@@ -933,8 +1020,44 @@ manifest_has_unit() { # <manifest_path> <unit_name>
   awk -v u="$2" '__AWK_MANIFEST_HAS_UNIT__' "$1"
 }
 
+# Try every provided key against one slice, starting with whichever key opened
+# the PREVIOUS slice: the slices of one volume are normally sealed to a single
+# key, and a wrong key costs a full re-read of tape-sized ciphertext. It is
+# deliberately NOT seeded from the key that opened the envelope — that the two
+# can differ is the whole of issue #288. age's own stderr is left visible: its
+# "no identity matched any of the recipients" line is the diagnostic that made
+# that root cause findable.
+SLICE_KEY=""
+decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number>
+  local in=$1 out=$2 num=$3 k
+  local -a order=()
+  if [ -n "$SLICE_KEY" ]; then
+    order+=("$SLICE_KEY")
+  fi
+  for k in ${KEYS[@]+"${KEYS[@]}"}; do
+    if [ "$k" != "$SLICE_KEY" ]; then
+      order+=("$k")
+    fi
+  done
+  for k in ${order[@]+"${order[@]}"}; do
+    if age -d -i "$k" <"$in" >"$out"; then
+      SLICE_KEY="$k"
+      info "  key $k decrypted slice $num"
+      return 0
+    fi
+    info "  key $k did not decrypt slice $num"
+  done
+  die "cannot decrypt slice $num — none of the ${#KEYS[@]} key(s) decrypted it
+       Keys tried: $(keys_list)
+       The key that opened the envelope need not be the key that opens the
+       slices: the envelope is sealed when the volume is written, each slice
+       when it was staged, so a key rotation between the two puts them on
+       different key generations. Supply the older key as well — repeat
+       --key once per key."
+}
+
 do_restore() {
-  local keyfile=$1 destdir=$2 target_unit=$3 want_version=${4:-}
+  local destdir=$1 target_unit=$2 want_version=${3:-}
 
   mkdir -p "$destdir"
 
@@ -949,7 +1072,12 @@ do_restore() {
   # an envelope whose manifest actually lists it is found (the operator
   # envelope always does); otherwise the first decryptable envelope wins, as
   # before. (issue #127)
-  local found=0 pos
+  #
+  # Each key is tried independently at each position (#288). Once ONE key has
+  # opened an envelope that does not list --unit, the next key is pointless —
+  # it is the same ciphertext with the same contents — so the search moves to
+  # the next POSITION, preserving #127's behaviour.
+  local found=0 pos keyfile env_key=""
   while IFS= read -r pos; do
     require_uint envelope_position "$pos"
     read_tape_raw "$pos" "$WORK/envelope.enc"
@@ -959,9 +1087,18 @@ do_restore() {
       require_uint "size_bytes(@$pos)" "$esize"
       [ "$esize" -gt 0 ] && truncate -s "$esize" "$WORK/envelope.enc"
     fi
-    rm -rf "$WORK/env" && mkdir -p "$WORK/env"
-    if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
-      tar xf - -C "$WORK/env/" 2>/dev/null; then
+    local opened=0
+    for keyfile in ${KEYS[@]+"${KEYS[@]}"}; do
+      rm -rf "$WORK/env" && mkdir -p "$WORK/env"
+      if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
+        tar xf - -C "$WORK/env/" 2>/dev/null; then
+        opened=1
+        env_key=$keyfile
+        break
+      fi
+      info "Key $keyfile did not open the envelope at file $pos"
+    done
+    if [ "$opened" -eq 1 ]; then
       if [ -n "$target_unit" ] && [ -f "$WORK/env/MANIFEST.toml" ] &&
         ! manifest_has_unit "$WORK/env/MANIFEST.toml" "$target_unit"; then
         info "Envelope at file $pos decrypts but does not list '$target_unit'; continuing..."
@@ -969,17 +1106,12 @@ do_restore() {
       fi
       found=1
       info "Decrypted envelope at file $pos"
+      info "  opened with key $env_key"
       break
     fi
   done < <(envelope_positions "$FILES_TXT")
   if [ "$found" -ne 1 ]; then
-    if [ -n "$target_unit" ]; then
-      die "no envelope for unit '$target_unit' matched the provided key"
-    fi
-    die "no envelope matched the provided key
-       Tape in $DEVICE identifies as '\''${TAPE_LABEL:-<unreadable>}'\''; this script is for '\''$LABEL'\''.
-       If those differ, you have the wrong cartridge or the wrong drive
-       (set TAPE_DEVICE=/dev/nstN) — not necessarily the wrong key."
+    die_no_envelope "$target_unit"
   fi
   [ -f "$WORK/env/MANIFEST.toml" ] || die "envelope missing MANIFEST.toml"
 
@@ -1063,12 +1195,11 @@ do_restore() {
     fi
     info "  checksum verified against front index"
 
-    age -d -i "$keyfile" <"$WORK/slice.enc" >"$dar_dir/restore.$num.dar" ||
-      die "cannot decrypt slice $num — wrong key?"
+    decrypt_slice "$WORK/slice.enc" "$dar_dir/restore.$num.dar" "$num"
 
     local bytes
     bytes=$(wc -c <"$dar_dir/restore.$num.dar")
-    info "  decrypted ($((bytes / 1048576)) MB)"
+    info "  decrypted ($((bytes / 1048576)) MiB)"
     rm -f "$WORK/slice.enc"
 
   done <"$WORK/slices.txt"
@@ -1095,14 +1226,26 @@ case "${1:-}" in
   ;;
 --find-envelope)
   shift
-  [ "${1:-}" = "--key" ] && [ -n "${2:-}" ] ||
-    die "usage: $0 --find-envelope --key KEYFILE"
-  [ -f "$2" ] || die "key file not found: $2"
-  do_find_envelope "$2"
+  # --key may be repeated; every key is tried against every envelope (#288).
+  KEYS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --key)
+      [ -n "${2:-}" ] || die "usage: $0 --find-envelope --key KEYFILE"
+      KEYS+=("$2")
+      shift 2
+      ;;
+    *) die "usage: $0 --find-envelope --key KEYFILE" ;;
+    esac
+  done
+  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --find-envelope --key KEYFILE"
+  require_key_files
+  do_find_envelope
   ;;
 --restore)
   shift
-  key="" dest="" unit="" want=""
+  KEYS=()
+  dest="" unit="" want=""
   # Every flag here takes a value. `shift 2` on a TRAILING bare flag fails
   # because $# is 1, `set -e` fires, and the script exits 1 having printed
   # nothing at all — the usage check below is never reached. Check the arity
@@ -1114,7 +1257,7 @@ case "${1:-}" in
 
        usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
       case "$1" in
-      --key) key=$2 ;;
+      --key) KEYS+=("$2") ;;
       --to) dest=$2 ;;
       --unit) unit=$2 ;;
       --version) want=$2 ;;
@@ -1124,11 +1267,11 @@ case "${1:-}" in
     *) die "unknown option: $1" ;;
     esac
   done
-  [ -n "$key" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
   [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
-  [ -f "$key" ] || die "key file not found: $key"
+  require_key_files
   [ -z "$want" ] || require_uint version "$want"
-  do_restore "$key" "$dest" "$unit" "$want"
+  do_restore "$dest" "$unit" "$want"
   ;;
 --help | -h)
   echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL (layout v2)"
@@ -1136,12 +1279,17 @@ case "${1:-}" in
   echo "Usage:"
   echo "  $0 --info                                       Show tape layout + seal verdict"
   echo "  $0 --verify                                     Keyless integrity check"
-  echo "  $0 --find-envelope --key KEYFILE                Decrypt your envelope"
-  echo "  $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+  echo "  $0 --find-envelope --key KEYFILE [--key K2 ...]  Decrypt your envelope"
+  echo "  $0 --restore --key KEYFILE [--key K2 ...] --to DIR [--unit U] [--version N]"
   echo "      Full restore. Without --version the NEWEST version of the unit on"
   echo "      this volume is restored. To see which versions this tape holds,"
   echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
   echo "      encrypted envelope manifest, so --info cannot report it."
+  echo ""
+  echo "  --key may be repeated, and each key is tried on its own for the"
+  echo "      envelope and for every slice: a key rotation between staging a"
+  echo "      unit and writing the volume seals the two to different key"
+  echo "      generations, so no single key opens both."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
@@ -2584,6 +2732,481 @@ sha256_encrypted = \"bbb\"
             "--help must point version discovery at --find-envelope:\n{help}"
         );
 
+        // #288: --help must say --key repeats, and why. An heir who does not
+        // know that a rotation splits envelope and slices across two key
+        // generations has no reason to try passing a second key.
+        assert!(
+            help.contains("--key may be repeated"),
+            "--help must document repeated --key:\n{help}"
+        );
+        assert!(
+            help.contains("key rotation"),
+            "--help must say WHY --key repeats:\n{help}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lay out a directory holding the generated script plus stub versions of
+    /// every tool its prerequisite loop demands, and return the script path
+    /// and a `PATH` that finds the stubs.
+    ///
+    /// `mt` and `dd` are not inert stubs: they touch `$TAPECTL_TEST_SENTINEL`.
+    /// That is how a test can tell "refused before any tape read" from
+    /// "refused after reading tape", which is the whole point of validating
+    /// key paths up front.
+    #[cfg(test)]
+    fn stubbed_script_dir(tag: &str, label: &str) -> (std::path::PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tapectl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = dir.join("RESTORE.sh");
+        std::fs::write(&sh, generate_restore_script_v2(label, 20)).unwrap();
+
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["mt", "dd", "age", "dar", "sha256sum", "head", "truncate"] {
+            let body = if tool == "mt" || tool == "dd" {
+                "#!/bin/sh\nif [ -n \"${TAPECTL_TEST_SENTINEL:-}\" ]; then \
+                 : >\"$TAPECTL_TEST_SENTINEL\"; fi\nexit 0\n"
+            } else {
+                "#!/bin/sh\nexit 0\n"
+            };
+            let stub = bin.join(tool);
+            std::fs::write(&stub, body).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (dir, path)
+    }
+
+    /// Issue #288, CTO ruling 2026-09-22: `--key` repeats, and every key path
+    /// is validated BEFORE the first tape read.
+    ///
+    /// The discriminating cases are the ORDERING ones. Old single-key code
+    /// accepted `--key a --key b` too — `--find-envelope` ignored the trailing
+    /// pair and `--restore` simply overwrote — so "two keys are accepted"
+    /// proves nothing on its own. What the old code could not do is notice a
+    /// bad path that is not the last one: it checked exactly one file.
+    ///
+    /// `age -d -i good.key -i missing.key` fails outright rather than skipping
+    /// the bad identity, so a mistyped path has to be caught here and not
+    /// minutes into a restore — hence the sentinel, and hence the positive
+    /// control that proves the sentinel can fire at all.
+    #[test]
+    fn restore_sh_takes_repeated_keys_and_names_a_missing_one_before_reading_tape() {
+        use std::process::Command;
+
+        let (dir, path) = stubbed_script_dir("multikey", "MULTI1");
+        let sh = dir.join("RESTORE.sh");
+        let sentinel = dir.join("tape-was-read");
+
+        let good = dir.join("good.age.key");
+        let good2 = dir.join("good2.age.key");
+        std::fs::write(&good, "AGE-SECRET-KEY-1PLACEHOLDER\n").unwrap();
+        std::fs::write(&good2, "AGE-SECRET-KEY-1PLACEHOLDER2\n").unwrap();
+        let missing = dir.join("typo.age.key");
+
+        let run = |args: &[&str]| -> (i32, String, bool) {
+            let _ = std::fs::remove_file(&sentinel);
+            let o = Command::new("bash")
+                .arg(&sh)
+                .args(args)
+                .env("PATH", &path)
+                .env("TAPECTL_TEST_SENTINEL", &sentinel)
+                .output()
+                .expect("spawn script");
+            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.code().unwrap_or(-1), text, sentinel.exists())
+        };
+
+        let missing_s = missing.display().to_string();
+        let good_s = good.display().to_string();
+        let good2_s = good2.display().to_string();
+
+        // --find-envelope: the bad path is the SECOND one. Old code never
+        // looked at it.
+        let (code, text, read) = run(&["--find-envelope", "--key", &good_s, "--key", &missing_s]);
+        assert_ne!(code, 0, "a missing key file must fail:\n{text}");
+        assert!(
+            text.contains(&format!("key file not found: {missing_s}")),
+            "the missing key must be named:\n{text}"
+        );
+        assert!(
+            !read,
+            "no tape may be read before the key paths are checked"
+        );
+
+        // --restore: the bad path is the FIRST one. Old code checked only the
+        // last `--key` it saw and would have proceeded.
+        let dest = dir.join("dest");
+        let dest_s = dest.display().to_string();
+        let (code, text, read) = run(&[
+            "--restore",
+            "--key",
+            &missing_s,
+            "--key",
+            &good_s,
+            "--to",
+            &dest_s,
+        ]);
+        assert_ne!(code, 0, "a missing key file must fail:\n{text}");
+        assert!(
+            text.contains(&format!("key file not found: {missing_s}")),
+            "the missing key must be named:\n{text}"
+        );
+        assert!(
+            !read,
+            "no tape may be read before the key paths are checked"
+        );
+
+        // Positive control: with every key present, argument parsing accepts
+        // the repetition and the script goes on to touch the tape. Without
+        // this, "sentinel absent" could just mean the stub never runs.
+        let (_, text, read) = run(&["--find-envelope", "--key", &good_s, "--key", &good2_s]);
+        assert!(
+            !text.contains("key file not found"),
+            "two valid keys must both pass validation:\n{text}"
+        );
+        assert!(
+            !text.contains("usage:"),
+            "repeated --key must be accepted, not rejected as usage:\n{text}"
+        );
+        assert!(
+            read,
+            "control: with valid keys the script must reach the tape:\n{text}"
+        );
+
+        let (_, text, read) = run(&[
+            "--restore",
+            "--key",
+            &good_s,
+            "--key",
+            &good2_s,
+            "--to",
+            &dest_s,
+        ]);
+        assert!(
+            !text.contains("key file not found") && !text.contains("usage:"),
+            "--restore must accept repeated --key:\n{text}"
+        );
+        assert!(
+            read,
+            "control: with valid keys --restore must reach the tape:\n{text}"
+        );
+
+        // Zero keys is still a usage error, in both modes.
+        let (code, text, _) = run(&["--find-envelope"]);
+        assert_ne!(code, 0, "no --key at all must fail:\n{text}");
+        assert!(
+            text.contains("usage: "),
+            "no --key must print usage:\n{text}"
+        );
+        let (code, text, _) = run(&["--restore", "--to", &dest_s]);
+        assert_ne!(code, 0, "no --key at all must fail:\n{text}");
+        assert!(
+            text.contains("usage: "),
+            "no --key must print usage:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #291 + the quoting defect: all three "no envelope opened" exits
+    /// must carry the unit (where there is one), the device/label sentence and
+    /// the key-rotation sentence — and must RENDER, which the template text
+    /// alone cannot prove.
+    ///
+    /// The exits sit behind `establish_files`, which reads tape, so argv alone
+    /// cannot reach them. Sourcing the script defines its functions without
+    /// running a mode (with no positional args the trailing `case` takes the
+    /// `""` branch, which does not exit), and `die_no_envelope` can then be
+    /// called directly with the globals set the way a real failure would leave
+    /// them.
+    #[test]
+    fn the_three_no_envelope_exits_render_unit_label_and_the_rotation_hint() {
+        use std::process::Command;
+
+        let (dir, path) = stubbed_script_dir("noenv", "GOLD01");
+        let sh = dir.join("RESTORE.sh");
+
+        let call = |snippet: &str| -> (i32, String) {
+            let prog = format!(
+                "source \"{}\"\nDEVICE=/dev/nst1\nTAPE_LABEL=VOL-A\nKEYS=(k1 k2 k3)\n{snippet}\n",
+                sh.display()
+            );
+            let o = Command::new("bash")
+                .arg("-c")
+                .arg(&prog)
+                .env("PATH", &path)
+                .output()
+                .expect("spawn bash -c");
+            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.code().unwrap_or(-1), text)
+        };
+
+        // The shape every one of the three must have.
+        let shared = |text: &str, what: &str| {
+            assert!(
+                text.contains("Tape in /dev/nst1 identifies as 'VOL-A'"),
+                "{what}: the device/label sentence must render with plain \
+                 quotes:\n{text}"
+            );
+            assert!(
+                text.contains("this script is for 'GOLD01'"),
+                "{what}: the script's own label must render:\n{text}"
+            );
+            assert!(
+                !text.contains("'\\''"),
+                "{what}: the single-quote-inside-single-quotes idiom is \
+                 literal inside a double-quoted string and must not appear \
+                 in the output:\n{text}"
+            );
+            assert!(
+                text.contains("wrong cartridge or the wrong drive"),
+                "{what}: must say it may be the wrong cartridge:\n{text}"
+            );
+            assert!(
+                text.contains("sealed with the key"),
+                "{what}: must name the rotation cause (#288):\n{text}"
+            );
+            assert!(
+                text.contains("Keys tried: k1 k2 k3"),
+                "{what}: must name every key tried:\n{text}"
+            );
+        };
+
+        // Exit 1 — do_find_envelope. Exit 2 — do_restore with no --unit.
+        // Both are the no-unit form.
+        let (code, text) = call("die_no_envelope");
+        assert_ne!(code, 0, "die_no_envelope must exit non-zero:\n{text}");
+        assert!(
+            text.contains("no envelope matched any of the 3 keys provided"),
+            "the headline must count the keys:\n{text}"
+        );
+        shared(&text, "no-unit form");
+
+        // Exit 3 — do_restore WITH --unit. This is the one an heir actually
+        // hits, and the one that used to be a bare one-liner (#291).
+        let (code, text) = call("die_no_envelope photos");
+        assert_ne!(code, 0, "die_no_envelope must exit non-zero:\n{text}");
+        assert!(
+            text.contains("no envelope for unit 'photos' matched any of the 3 keys provided"),
+            "the --unit form must still name the unit:\n{text}"
+        );
+        shared(&text, "unit form");
+
+        // A single key reads as a singular, not "any of the 1 keys".
+        let prog = format!(
+            "source \"{}\"\nDEVICE=/dev/nst1\nTAPE_LABEL=VOL-A\nKEYS=(only.key)\ndie_no_envelope\n",
+            sh.display()
+        );
+        let o = Command::new("bash")
+            .arg("-c")
+            .arg(&prog)
+            .env("PATH", &path)
+            .output()
+            .expect("spawn bash -c");
+        let text = String::from_utf8_lossy(&o.stderr).to_string();
+        assert!(
+            text.contains("no envelope matched the key provided"),
+            "one key must read as a singular:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #288 at the slice, executed rather than asserted on text: each
+    /// key is tried in turn, the key that worked last time goes first, age's
+    /// own stderr stays visible, and "no key works" still fails.
+    ///
+    /// The real `age` CLI is not a test dependency here (the crate uses the
+    /// rage library; the surrounding tests stub `age` for exactly that
+    /// reason), so the stub decides by key NAME. That is enough: what is
+    /// under test is the loop, not the cryptography.
+    #[test]
+    fn a_slice_is_tried_against_every_key_starting_with_the_last_one_that_worked() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let (dir, path) = stubbed_script_dir("slicekeys", "SLICEK");
+        let sh = dir.join("RESTORE.sh");
+
+        // An `age` that succeeds only for the key named in $AGE_GOOD, records
+        // every key it was handed in $AGE_TRIED, and otherwise fails the way
+        // the real one does.
+        let age_stub = dir.join("bin").join("age");
+        std::fs::write(
+            &age_stub,
+            "#!/bin/sh\nkey=\"\"\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n  \
+             -i) key=$2; shift 2 ;;\n  *) shift ;;\n  esac\ndone\n\
+             echo \"$key\" >>\"$AGE_TRIED\"\nif [ \"$key\" = \"$AGE_GOOD\" ]; then\n  \
+             cat\n  exit 0\nfi\n\
+             echo \"age: error: no identity matched any of the recipients\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&age_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let d = dir.display();
+        let run = |prog: String| -> (i32, String) {
+            let o = Command::new("bash")
+                .arg("-c")
+                .arg(&prog)
+                .env("PATH", &path)
+                .output()
+                .expect("spawn bash -c");
+            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.code().unwrap_or(-1), text)
+        };
+
+        // kB is the only key that opens anything. kA must be tried and fail
+        // first; kC must never be reached; slice 2 must start at kB.
+        let (code, text) = run(format!(
+            "source \"{sh}\"\nKEYS=(kA kB kC)\nexport AGE_GOOD=kB\n\
+             export AGE_TRIED={d}/tried\n: >\"$AGE_TRIED\"\n\
+             printf payload >{d}/in\n\
+             decrypt_slice {d}/in {d}/out1 1\n\
+             echo TRIED1: $(cat \"$AGE_TRIED\")\n\
+             : >\"$AGE_TRIED\"\n\
+             decrypt_slice {d}/in {d}/out2 2\n\
+             echo TRIED2: $(cat \"$AGE_TRIED\")\n\
+             echo \"OUT2: $(cat {d}/out2)\"\n",
+            sh = sh.display()
+        ));
+        assert_eq!(code, 0, "a key that works must succeed:\n{text}");
+        assert!(
+            text.contains("TRIED1: kA kB\n"),
+            "slice 1 must try kA, then kB, and stop there:\n{text}"
+        );
+        assert!(
+            text.contains("TRIED2: kB\n"),
+            "slice 2 must start with the key that opened slice 1:\n{text}"
+        );
+        assert!(
+            text.contains("OUT2: payload"),
+            "the decrypted bytes must land in the output file:\n{text}"
+        );
+        assert!(
+            text.contains("key kA did not decrypt slice 1"),
+            "every key tried must be named, which is the heir's only \
+             debugging aid:\n{text}"
+        );
+
+        // No key works: this must still fail, loudly, naming the keys and the
+        // envelope-vs-slice generation fact — and age's own stderr must reach
+        // the reader, since "no identity matched any of the recipients" is
+        // what made #288 diagnosable in the first place.
+        let (code, text) = run(format!(
+            "source \"{sh}\"\nKEYS=(kA kB kC)\nexport AGE_GOOD=none\n\
+             export AGE_TRIED={d}/tried2\n: >\"$AGE_TRIED\"\n\
+             printf payload >{d}/in\n\
+             decrypt_slice {d}/in {d}/out3 7\n",
+            sh = sh.display()
+        ));
+        assert_ne!(code, 0, "no working key must still fail:\n{text}");
+        assert!(
+            text.contains("cannot decrypt slice 7"),
+            "the failure must name the slice:\n{text}"
+        );
+        assert!(
+            text.contains("Keys tried: kA kB kC"),
+            "the failure must name every key tried:\n{text}"
+        );
+        assert!(
+            text.contains("key rotation between the two"),
+            "the failure must state the envelope-vs-slice fact:\n{text}"
+        );
+        assert!(
+            text.contains("no identity matched any of the recipients"),
+            "age's own stderr must not be suppressed:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The three exits must keep going through the one helper. A future edit
+    /// that inlines a message again would pass the rendering test above (which
+    /// calls the helper directly) while re-opening #291, so pin the call sites
+    /// and pin the absence of the old single-key wording.
+    #[test]
+    fn every_no_envelope_exit_routes_through_the_shared_helper() {
+        let s = generate_restore_script_v2("ROUTE1", 20);
+        assert!(
+            s.contains("die_no_envelope() {"),
+            "the shared helper must exist"
+        );
+        // do_find_envelope's exit, and do_restore's (one call, covering both
+        // its --unit and no---unit branches via the argument).
+        assert!(
+            s.contains("|| die_no_envelope\n"),
+            "do_find_envelope must use the helper"
+        );
+        assert!(
+            s.contains("die_no_envelope \"$target_unit\""),
+            "do_restore must use the helper and pass the unit"
+        );
+        assert!(
+            !s.contains("matched the provided key"),
+            "the old single-key wording must be gone from every exit"
+        );
+        // The rendering defect must not survive anywhere in the script.
+        assert!(
+            !s.contains("'\\''"),
+            "the '\\'' idiom is literal inside a double-quoted string"
+        );
+    }
+
+    /// Issue #288's other half: a slice is tried against EVERY key, not only
+    /// the key that opened the envelope, and the key that worked last time is
+    /// tried first so a wrong key does not cost a tape-sized re-read per
+    /// slice. Plus #218's carried `MB` -> `MiB`.
+    #[test]
+    fn slice_decryption_tries_every_key_and_remembers_the_last_one() {
+        let s = generate_restore_script_v2("SLICE1", 20);
+        assert!(
+            s.contains("decrypt_slice \"$WORK/slice.enc\""),
+            "the slice loop must go through the multi-key helper"
+        );
+        assert!(
+            s.contains("SLICE_KEY=\"$k\""),
+            "the helper must remember the key that worked"
+        );
+        assert!(
+            !s.contains("cannot decrypt slice $num — wrong key?"),
+            "the single-key slice failure must be gone"
+        );
+        assert!(
+            s.contains("key rotation between the two puts them on"),
+            "the slice failure must state the envelope-vs-slice fact"
+        );
+        assert!(
+            s.contains("Keys tried: $(keys_list)"),
+            "the slice failure must name the keys tried"
+        );
+        // #218, CTO ruling 2026-09-17, carried onto this re-pin: bytes/1048576
+        // is binary and must be labelled binary (ADR-0012).
+        assert!(
+            s.contains("$((bytes / 1048576)) MiB"),
+            "the decrypted-slice size must be labelled MiB"
+        );
+        assert!(
+            !s.contains("$((bytes / 1048576)) MB"),
+            "the decimal label must be gone"
+        );
+        // The --find-envelope hint must carry every key forward, not the last
+        // one parsed.
+        assert!(
+            s.contains("--restore $(keys_args) --to /your/destination"),
+            "the restore hint must echo all the keys"
+        );
     }
 }
