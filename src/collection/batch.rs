@@ -104,6 +104,16 @@ pub struct BatchExecutionReport {
 /// different batch's unit that is still below its own `min_copies`. A
 /// still-short batch retains ALL of its own staging (not merely the short
 /// units'), by design — see [`under_copied_units`].
+///
+/// The gate-and-release decision itself lives in [`release_if_covered`]
+/// (extracted from this function, issue #284): `volume_write` above has no
+/// store injection and so cannot complete without a real tape drive, which
+/// meant nothing after it could be driven by an ungated test either — a
+/// prior regression test for this exact scope narrowing hand-copied this
+/// tail instead of calling this function, and so silently stopped testing
+/// it. `release_if_covered` is now the one place the scope decision is
+/// made, callable directly by a test; `execute_batch_still_delegates_
+/// release_to_the_scoped_helper` pins that this function still calls it.
 pub fn execute_batch(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -203,21 +213,50 @@ pub fn execute_batch(
         )?;
     }
 
-    // Release staging only when this batch's copy just sealed is enough:
-    // every unit in it must now meet its own resolved `min_copies` (issue
-    // #229's second half — see this function's doc comment and
-    // `under_copied_units` for why `clean_staging`'s own guard cannot tell
-    // this on its own).
-    //
-    // Issue #248: `clean_staging`'s own eligibility SQL has no batch/unit
-    // predicate at all — passed `CleanScope::Whole` (as the CLI's `staging
-    // clean` still does), it would release EVERY eligible `'staged'`
-    // stage_set in the database the moment this batch's gate above passed,
-    // including a different batch's unit that is still below its own
-    // min_copies. `CleanScope::Units(&this_batch_unit_ids)` narrows the
-    // release to exactly this batch, matching the gate it sits behind — the
-    // batch's blast radius stays equal to its own scope, per this function's
-    // module doc comment.
+    // Release staging only when this batch's copy just sealed is enough —
+    // see `release_if_covered`'s own doc comment for the gate and the #248
+    // scoping it applies.
+    let (cleaned, under_copied) = release_if_covered(conn, config, batch)?;
+
+    Ok(BatchExecutionReport {
+        units_staged,
+        copies_written: copy_labels.len(),
+        cleaned,
+        under_copied,
+    })
+}
+
+/// The release decision for one batch, extracted out of [`execute_batch`]
+/// (issue #284) so it can be driven by a test without `execute_batch`'s
+/// device-bound write loop ahead of it — `volume::write::volume_write` has
+/// no store injection (see its own doc comment) and so cannot complete
+/// without a real tape drive, which this workspace's guardrails forbid.
+/// Before this extraction, a regression test for the #248 scoping below
+/// hand-copied this tail instead of calling it — meaning a revert of the
+/// scope back to `CleanScope::Whole` would have gone undetected, since the
+/// test exercised its own copy of the logic, not this one. This is now the
+/// only copy.
+///
+/// Releases the batch's staging only when this batch's copy just sealed is
+/// enough: every unit in it must now meet its own resolved `min_copies`
+/// (issue #229's second half — see [`execute_batch`]'s doc comment and
+/// [`under_copied_units`] for why `clean_staging`'s own guard cannot tell
+/// this on its own).
+///
+/// Issue #248: `clean_staging`'s own eligibility SQL has no batch/unit
+/// predicate at all — passing `CleanScope::Whole` here (as the CLI's
+/// `staging clean` still does) would release EVERY eligible `'staged'`
+/// stage_set in the database the moment this batch's gate above passed,
+/// including a different batch's unit that is still below its own
+/// min_copies. `CleanScope::Units(&this_batch_unit_ids)` narrows the
+/// release to exactly this batch, matching the gate it sits behind — the
+/// batch's blast radius stays equal to its own scope, per this module's
+/// doc comment.
+fn release_if_covered(
+    conn: &Connection,
+    config: &Config,
+    batch: &Batch,
+) -> Result<(Option<CleanReport>, Vec<CopyProgress>)> {
     let under_copied = under_copied_units(conn, config, batch)?;
     let cleaned = if under_copied.is_empty() {
         let unit_ids = batch_unit_ids(conn, batch)?;
@@ -230,13 +269,7 @@ pub fn execute_batch(
     } else {
         None
     };
-
-    Ok(BatchExecutionReport {
-        units_staged,
-        copies_written: copy_labels.len(),
-        cleaned,
-        under_copied,
-    })
+    Ok((cleaned, under_copied))
 }
 
 /// Which of this batch's units still have fewer eligible copies than their
@@ -465,19 +498,18 @@ mod tests {
 
     /// Issue #229, change 6: the recipe the refusal message now names
     /// (swap cartridges, then `tapectl volume write <label2>`) is verified
-    /// END TO END here, not reasoned about. This reproduces `execute_batch`'s
-    /// own tail exactly — call [`under_copied_units`], and call
-    /// `clean_staging` ONLY when it comes back empty, scoped to this
-    /// batch's own units via [`batch_unit_ids`] exactly as `execute_batch`
-    /// does since issue #248 — and then checks the two facts a second
-    /// `volume write` actually depends on: `stage_sets.status` is still
-    /// `'staged'` (the exact precondition `find_staged_data`'s `WHERE
-    /// ss.status = 'staged'`, `src/volume/write.rs`, requires), and the
-    /// physical `.age` file `stage_slices.staging_path` points at is still
-    /// on disk. Before issue #229's fix, `execute_batch` called
-    /// `clean_staging(force = false)` unconditionally right after the
-    /// single write this batch just did, and the non-force guard passed
-    /// vacuously (one `writes` row, `'completed'`) — see
+    /// END TO END here, not reasoned about. This calls [`release_if_covered`]
+    /// directly — the ONE place `execute_batch`'s own release/scope decision
+    /// now lives (issue #284) — rather than hand-copying its body, and then
+    /// checks the two facts a second `volume write` actually depends on:
+    /// `stage_sets.status` is still `'staged'` (the exact precondition
+    /// `find_staged_data`'s `WHERE ss.status = 'staged'`,
+    /// `src/volume/write.rs`, requires), and the physical `.age` file
+    /// `stage_slices.staging_path` points at is still on disk. Before issue
+    /// #229's fix, `execute_batch` called `clean_staging(force = false)`
+    /// unconditionally right after the single write this batch just did,
+    /// and the non-force guard passed vacuously (one `writes` row,
+    /// `'completed'`) — see
     /// `staging::clean::tests::default_guard_cleans_when_the_only_planned_copy_completed`
     /// for that same guard pinned green on exactly this shape.
     #[test]
@@ -487,18 +519,12 @@ mod tests {
         let config = config_with_staging_dir(dir_guard.path(), 2);
         let batch = one_unit_batch("testlib/alpha");
 
-        let under = under_copied_units(&conn, &config, &batch).unwrap();
-        assert_eq!(under.len(), 1, "{under:?}");
-        if under.is_empty() {
-            let unit_ids = batch_unit_ids(&conn, &batch).unwrap();
-            crate::staging::clean::clean_staging(
-                &conn,
-                &config,
-                false,
-                crate::staging::clean::CleanScope::Units(&unit_ids),
-            )
-            .unwrap();
-        }
+        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        assert_eq!(under_copied.len(), 1, "{under_copied:?}");
+        assert!(
+            cleaned.is_none(),
+            "must not release while a unit is still under-copied"
+        );
 
         let status: String = conn
             .query_row(
@@ -522,11 +548,10 @@ mod tests {
     /// collection whose units resolve `min_copies = 1` must still
     /// auto-release after its single copy, exactly as before this fix. This
     /// is the behaviour the retention gate above could most easily break.
-    /// Since issue #248 the release call is scoped to this batch's own
-    /// units ([`batch_unit_ids`]) — with only one unit in the whole
-    /// database here, that scoping cannot change the outcome, but the test
-    /// now exercises the same `CleanScope::Units` call shape
-    /// `execute_batch` actually makes, not a stand-in `Whole` scope.
+    /// Calls [`release_if_covered`] directly (issue #284) — with only one
+    /// unit in the whole database here, the #248 scoping cannot change the
+    /// outcome, but the test now exercises the actual function
+    /// `execute_batch` calls, not a hand-copied stand-in.
     #[test]
     fn release_gate_cleans_staged_bytes_when_min_copies_one_is_already_met() {
         let (conn, stage_set_id, staged_file, dir_guard) =
@@ -534,18 +559,12 @@ mod tests {
         let config = config_with_staging_dir(dir_guard.path(), 1);
         let batch = one_unit_batch("testlib/alpha");
 
-        let under = under_copied_units(&conn, &config, &batch).unwrap();
-        assert!(under.is_empty(), "{under:?}");
-        if under.is_empty() {
-            let unit_ids = batch_unit_ids(&conn, &batch).unwrap();
-            crate::staging::clean::clean_staging(
-                &conn,
-                &config,
-                false,
-                crate::staging::clean::CleanScope::Units(&unit_ids),
-            )
-            .unwrap();
-        }
+        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        assert!(under_copied.is_empty(), "{under_copied:?}");
+        assert!(
+            cleaned.is_some(),
+            "must release once every unit meets its own min_copies"
+        );
 
         let status: String = conn
             .query_row(
@@ -636,11 +655,11 @@ mod tests {
     }
 
     /// Issue #248 — the negative control: the release gate is computed only
-    /// over THIS batch's units (`under_copied_units(batch)`), but the
-    /// release call it then makes, `staging::clean::clean_staging(conn,
-    /// config, false)`, has no batch/unit predicate at all — it sweeps
-    /// every eligible `'staged'` stage_set in the whole database. So a
-    /// batch containing only a fully-covered unit can still discard a
+    /// over THIS batch's units (`under_copied_units(batch)`), but an
+    /// unscoped release call, `staging::clean::clean_staging(conn, config,
+    /// false, CleanScope::Whole)`, has no batch/unit predicate at all — it
+    /// sweeps every eligible `'staged'` stage_set in the whole database. So
+    /// a batch containing only a fully-covered unit can still discard a
     /// DIFFERENT batch's still-under-copied staged ciphertext, silently
     /// destroying the only cheap route to the copy that unit's own policy
     /// still requires.
@@ -653,16 +672,21 @@ mod tests {
     /// - `testlib/beta`, NOT in `batch` and never named to
     ///   `under_copied_units`: 1/2 completed copies — still under policy.
     ///
-    /// This reproduces `execute_batch`'s exact tail (`batch.rs`, the lines
-    /// right after the write loop): call `under_copied_units` for the
-    /// batch, and when it comes back empty, call `clean_staging` exactly as
-    /// `execute_batch` does today. Against the unfixed call
-    /// (`clean_staging(conn, config, false)`, no scope), beta's staged file
-    /// is deleted too — its lone write is `'completed'` and no other write
-    /// references its stage_set, so the non-force guard passes vacuously,
-    /// identical to the pre-#229 defect this module already pins, except
-    /// now the "other planned copy still pending" is a DIFFERENT unit's
-    /// batch rather than a second write on the same stage_set.
+    /// Issue #284: this now calls [`release_if_covered`] directly — the
+    /// single place `execute_batch`'s release/scope decision lives — rather
+    /// than hand-copying its body (its own tests previously called
+    /// `under_copied_units` then `clean_staging` inline, which meant this
+    /// test exercised a SEPARATE, hand-maintained copy of the scoping logic
+    /// and would have stayed green even if `execute_batch` itself regressed
+    /// to an unscoped release; see `execute_batch_still_delegates_release_
+    /// to_the_scoped_helper` below for the complementary proof that
+    /// `execute_batch` still calls this function at all). Against an
+    /// unscoped release, beta's staged file is deleted too — its lone write
+    /// is `'completed'` and no other write references its stage_set, so the
+    /// non-force guard passes vacuously, identical to the pre-#229 defect
+    /// this module already pins, except now the "other planned copy still
+    /// pending" is a DIFFERENT unit's batch rather than a second write on
+    /// the same stage_set.
     #[test]
     fn release_gate_must_not_release_another_batchs_under_copied_unit() {
         let conn = db::open_memory().unwrap();
@@ -687,9 +711,8 @@ mod tests {
             );
 
         // beta: a DIFFERENT batch's unit, 1/2 copies -- still under policy.
-        // Deliberately never passed to `one_unit_batch` / `under_copied_units`
-        // below, exactly as it would not be if it belonged to some other
-        // batch entirely.
+        // Deliberately never passed to `one_unit_batch` below, exactly as
+        // it would not be if it belonged to some other batch entirely.
         let (_beta_stage_set_id, beta_staged_file) =
             seed_unit_with_n_completed_copies_and_staged_file(
                 &conn,
@@ -701,23 +724,15 @@ mod tests {
 
         let batch = one_unit_batch("testlib/alpha");
 
-        // execute_batch's exact tail (batch.rs:205-210 as of issue #248's base,
-        // now scoped via `batch_unit_ids` -- the fix under test).
-        let under = under_copied_units(&conn, &config, &batch).unwrap();
+        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
         assert!(
-            under.is_empty(),
-            "alpha alone must look fully covered to its own batch's gate: {under:?}"
+            under_copied.is_empty(),
+            "alpha alone must look fully covered to its own batch's gate: {under_copied:?}"
         );
-        if under.is_empty() {
-            let unit_ids = batch_unit_ids(&conn, &batch).unwrap();
-            crate::staging::clean::clean_staging(
-                &conn,
-                &config,
-                false,
-                crate::staging::clean::CleanScope::Units(&unit_ids),
-            )
-            .unwrap();
-        }
+        assert!(
+            cleaned.is_some(),
+            "alpha's batch is fully covered and must release"
+        );
 
         assert!(
             !alpha_staged_file.exists(),
@@ -727,6 +742,50 @@ mod tests {
             beta_staged_file.exists(),
             "beta is NOT in this batch and is still under its own min_copies (1/2) -- \
              a release scoped to alpha's batch must not touch beta's staged bytes (issue #248)"
+        );
+    }
+
+    /// Issue #284, P2: what the three [`release_if_covered`] tests above
+    /// cannot prove — that [`execute_batch`] still actually calls
+    /// `release_if_covered` for its release step, rather than an unscoped
+    /// `clean_staging` call inlined back into it (which would leave every
+    /// test above green while reintroducing exactly the #248 defect they
+    /// exist to catch). Same source-scan shape as
+    /// `src/volume/write.rs`'s `the_two_write_contacts_still_corroborate`
+    /// and `volume_write_records_mam_facts_only_after_the_tape_side_
+    /// refusals` (write.rs:8574, :8612) — a house pattern in this codebase
+    /// for pinning an ordering/wiring property of a function that cannot be
+    /// driven end-to-end without a tape drive, not an improvisation here.
+    #[test]
+    fn execute_batch_still_delegates_release_to_the_scoped_helper() {
+        const SRC: &str = include_str!("batch.rs");
+        let f = "pub fn execute_batch(";
+        let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+        // Function bodies end at the first `\n}` in column 0.
+        let end = SRC[start..].find("\n}\n").unwrap() + start;
+        let body = &SRC[start..end];
+        // Guard the FALSE PASS: if the `\n}\n` scan ever ran past the end of
+        // `execute_batch`, `body` could pick up a sibling function's own
+        // content and report a deleted call as present. Checked against
+        // both `fn ` and `pub fn ` (unlike the write.rs precedent, the
+        // functions immediately after `execute_batch` in this file --
+        // `under_copied_units`, `release_if_covered`, `batch_unit_ids` --
+        // are private, not `pub`).
+        assert!(
+            !body[f.len()..].contains("\nfn ") && !body[f.len()..].contains("\npub fn "),
+            "body extraction overran into another function; fix this test's scan \
+             before trusting its verdict"
+        );
+        assert!(
+            body.contains("release_if_covered("),
+            "execute_batch no longer delegates its release step to release_if_covered \
+             -- the #248 scope decision must live in exactly one place (issue #284)"
+        );
+        assert!(
+            !body.contains("CleanScope::"),
+            "execute_batch references CleanScope directly -- an unscoped clean_staging \
+             call has been inlined back into it, bypassing release_if_covered's own \
+             scoping (issue #248/#284)"
         );
     }
 }
