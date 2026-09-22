@@ -11,6 +11,7 @@ use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
 use crate::staging;
+use crate::tape::drive_identity;
 use crate::tape::health;
 use crate::util::{HashingWriter, TruncatingWriter};
 
@@ -1145,7 +1146,7 @@ pub fn volume_write(
         execute_outcome.into(),
     );
 
-    collect_health_best_effort(conn, config, device, volume_id);
+    collect_health_best_effort(conn, config, device, volume_id, "write");
 
     result
 }
@@ -1330,7 +1331,17 @@ pub fn volume_resume(
         outcome,
     );
 
-    collect_health_best_effort(conn, config, device, volume_id);
+    // `'resume'` is the honest word, and ADR-0013 §4 rules this vocabulary
+    // free TEXT precisely so a new value costs no migration — but the CHECK
+    // that closes it (`001_initial.sql:332-333`) is still in force until
+    // migration 021 rebuilds `health_logs` (issue #296). SQLite enforces a
+    // CHECK unconditionally, and `collect_health_best_effort` only warns on
+    // an insert failure, so writing `'resume'` today would silently DROP the
+    // health row on every resume — strictly worse than the mislabel. The
+    // word is threaded through as a parameter so #296 flips one literal;
+    // `health::tests::resume_is_not_yet_an_accepted_operation_until_migration_021`
+    // fails the moment the CHECK is gone, which is the signal to flip it.
+    collect_health_best_effort(conn, config, device, volume_id, "write");
 
     result
 }
@@ -2233,16 +2244,67 @@ pub(crate) fn quarantine_on_medium_evidence(
 /// Best-effort sg_logs health collection. Never lets a collection failure
 /// shadow the session's real outcome (matching v1: always attempted, its own
 /// errors only logged).
-fn collect_health_best_effort(conn: &Connection, config: &Config, device: &str, volume_id: i64) {
+///
+/// `operation` is the caller's own word for what it was doing, threaded
+/// through rather than hardcoded because two different commands land here —
+/// see the note at the `volume_resume` call site for why both still say
+/// `write` today.
+fn collect_health_best_effort(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    volume_id: i64,
+    operation: &str,
+) {
     if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
         match health::collect(&bk.device_sg) {
             Ok((counters, raw)) => {
-                if let Err(e) = health::record(conn, volume_id, "write", &counters, &raw) {
+                if let Err(e) = health::record(conn, volume_id, None, operation, &counters, &raw) {
                     warn!(err = %e, "health_logs insert failed");
                 }
+                // AFTER the health row, deliberately: identity capture is an
+                // addition to the record, never a precondition for it
+                // (issue #295). The backend `bk` is the one this function
+                // already resolved — no second lookup to disagree with the
+                // first (#187).
+                record_drive_identity_best_effort(conn, bk, Some(&raw));
             }
-            Err(e) => warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed"),
+            Err(e) => {
+                warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed");
+                // A drive whose counters could not be read is still a drive
+                // that was contacted, and its identity is read by a
+                // different route.
+                record_drive_identity_best_effort(conn, bk, None);
+            }
         }
+    }
+}
+
+/// Record the drive this contact talked to (ADR-0013 §1, issue #295) —
+/// best-effort and non-fatal, exactly like the health collection it rides
+/// on.
+///
+/// `raw_log` is the sg_logs text that was just collected, if any: its
+/// identity header carries vendor/product/firmware and has been sitting
+/// unqueryable in `health_logs.raw_log` on every row ever written, so it
+/// fills any field the sysfs read did not yield. A drive that yields no
+/// serial records NO row — unknown by absence, never a guess.
+fn record_drive_identity_best_effort(
+    conn: &Connection,
+    backend: &crate::config::LtoBackendConfig,
+    raw_log: Option<&str>,
+) {
+    let mut identity = drive_identity::read_identity(backend);
+    if let Some(raw) = raw_log {
+        identity.backfill_from_sg_logs_header(raw);
+    }
+    match drive_identity::upsert(conn, &identity) {
+        Ok(Some(_)) => {}
+        Ok(None) => warn!(
+            device = %backend.device_tape,
+            "drive identity unavailable (no serial); this contact is recorded without a drive"
+        ),
+        Err(e) => warn!(err = %e, "drives upsert failed"),
     }
 }
 
@@ -2585,9 +2647,28 @@ pub fn volume_verify(
     // silently recording nothing.
     match backend {
         Some(bk) => {
-            if let Ok((counters, raw)) = health::collect(&bk.device_sg) {
-                if let Err(e) = health::record(conn, volume_id, "verify", &counters, &raw) {
-                    warn!(err = %e, "health_logs insert failed");
+            match health::collect(&bk.device_sg) {
+                Ok((counters, raw)) => {
+                    // `session_id` at last has a writer (issue #295): this
+                    // reading belongs to the `verification_sessions` row
+                    // `volume_verify_with_store` just created, which is
+                    // exactly — and only — what the column's foreign key has
+                    // declared since `001_initial.sql` (ADR-0013 §3).
+                    if let Err(e) = health::record(
+                        conn,
+                        volume_id,
+                        report.session_id,
+                        "verify",
+                        &counters,
+                        &raw,
+                    ) {
+                        warn!(err = %e, "health_logs insert failed");
+                    }
+                    record_drive_identity_best_effort(conn, bk, Some(&raw));
+                }
+                Err(e) => {
+                    warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed");
+                    record_drive_identity_best_effort(conn, bk, None);
                 }
             }
         }
@@ -2763,6 +2844,7 @@ pub(crate) fn volume_verify_with_store(
     }
 
     Ok(VerifyReport {
+        session_id: Some(session_id),
         checked: evidence.files_checked as usize,
         passed: (evidence.files_checked as usize).saturating_sub(evidence.mismatches.len()),
         failed: evidence.mismatches.len(),
@@ -3465,6 +3547,19 @@ pub fn compact_finish(
 
 #[derive(Debug, Default)]
 pub struct VerifyReport {
+    /// The `verification_sessions` row this verify wrote (issue #295).
+    ///
+    /// The session is created inside
+    /// [`volume_verify_with_store`] and was not carried out of it, which is
+    /// why `health_logs.session_id` — a column with a foreign key to that
+    /// table since `001_initial.sql` — had no writer for the whole life of
+    /// the project. `volume_verify` is the only caller that then collects
+    /// drive health, so this is the one route by which the reading and the
+    /// session that produced it can be joined.
+    ///
+    /// `None` only on a `VerifyReport` no verify produced (`Default`), never
+    /// on a real one.
+    pub session_id: Option<i64>,
     pub checked: usize,
     pub passed: usize,
     pub failed: usize,
@@ -4465,6 +4560,61 @@ mod tests {
             })
             .unwrap();
         assert_eq!(outcome, "passed");
+    }
+
+    /// `VerifyReport` must carry the `verification_sessions` row OUT of the
+    /// function that created it (issue #295).
+    ///
+    /// Without this field the session id died inside
+    /// `volume_verify_with_store`, which is why `health_logs.session_id` —
+    /// declared with a foreign key to that table since `001_initial.sql` —
+    /// had no writer for the whole life of the project. `volume_verify` is
+    /// the only caller that then collects drive health, and it can only pass
+    /// what the report hands it.
+    ///
+    /// Positive control: the id must EQUAL the row the verify wrote, not
+    /// merely be `Some`.
+    #[test]
+    fn a_verify_carries_its_session_id_out_on_the_report() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"bytes whose verify must be joinable to its session. ".repeat(4);
+        seed_one_slice_fixture(
+            &conn,
+            "VR-SESSION",
+            "vs-unit",
+            4,
+            &good,
+            "completed",
+            "staged",
+        );
+        let volume_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = 'VR-SESSION'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let mut store = mem_store_v2_tape("VR-SESSION", &good, &good);
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-SESSION",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            None,
+        )
+        .unwrap();
+
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT id FROM verification_sessions WHERE volume_id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(report.session_id, Some(session_id));
     }
 
     /// A mismatch at a METADATA position is counted by the session and has
