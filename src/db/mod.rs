@@ -282,6 +282,15 @@ fn migrations() -> Migrations<'static> {
         // renumbered rows or lost an edge would leave them dangling in
         // silence. The check is what makes that loud.
         M::up(include_str!("migrations/021_health_logs_contact.sql")).foreign_key_check(),
+        // 022 creates `mam_journal` (ADR-0013 §5, issue #297): every MAM read
+        // verbatim, because the attributes `MamInfo` does not keep -- the
+        // "vendor/serial at last load" ring, the per-load counters -- are
+        // overwritten by loading the cartridge. The journal points at the
+        // contact (`contact_id`, nullable), never the reverse: one read-path
+        // contact takes two reads. Append-only, never pruned, never
+        // backfilled. Plain CREATE, touching no other table, so no
+        // `.foreign_key_check()`. See the migration header.
+        M::up(include_str!("migrations/022_mam_journal.sql")),
     ])
 }
 
@@ -2151,6 +2160,48 @@ mod tests {
     /// Pinned by DIFFERENCE against the 019 schema rather than by an
     /// absolute list, so a table some later migration legitimately adds
     /// cannot be mistaken for 020's doing.
+    /// Migration 022 creates `mam_journal` (and its two indexes) and touches
+    /// NOTHING else (issue #297): every other schema object's SQL is
+    /// byte-identical to 021's. Pinned by difference, like 020's test.
+    #[test]
+    fn migration_022_creates_only_mam_journal() {
+        fn objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_master \
+                     WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                )
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|n| n.unwrap())
+                .collect();
+            v
+        }
+        let before = objects(&open_memory_at_021());
+        let after = objects(&open_memory().unwrap());
+        let added: Vec<(&str, &str)> = after
+            .iter()
+            .filter(|o| !before.contains(o))
+            .map(|o| (o.0.as_str(), o.1.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                ("index", "idx_mam_journal_contact"),
+                ("index", "idx_mam_journal_serial"),
+                ("table", "mam_journal"),
+            ]
+        );
+        let changed_or_removed: Vec<&(String, String, Option<String>)> =
+            before.iter().filter(|o| !after.contains(o)).collect();
+        assert!(
+            changed_or_removed.is_empty(),
+            "022 must alter no existing object: {changed_or_removed:?}"
+        );
+    }
+
     #[test]
     fn migration_020_creates_only_cartridge_contacts() {
         fn table_names(conn: &Connection) -> Vec<String> {

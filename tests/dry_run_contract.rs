@@ -97,6 +97,8 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // it) before this branch started — confirmed by reading, not re-fixed.
     (&["cartridge", "edit"], Verdict::Honours),
     (&["cartridge", "info"], Verdict::ReadOnly),
+    // Issue #297: reads `mam_journal`, writes nothing.
+    (&["cartridge", "journal"], Verdict::ReadOnly),
     (&["cartridge", "list"], Verdict::ReadOnly),
     (&["cartridge", "mark-erased"], Verdict::Honours),
     (&["cartridge", "move"], Verdict::Honours),

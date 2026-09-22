@@ -1302,9 +1302,15 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
 /// reads as an ABSENCE, and corroboration treats absence as "cannot see,
 /// cannot contradict" and proceeds. So following the recommended practice
 /// quietly switched off the cartridge-identity check on every read path.
+///
+/// The read's verbatim capture is HELD in `reads` (issue #297) — hook
+/// `loaded_medium_serial`, the second of a read path's two MAM reads — and
+/// journalled when the command's contact opens. No backend, no read, nothing
+/// held.
 pub(crate) fn loaded_medium<'a>(
     config: &'a crate::config::Config,
     device: &str,
+    reads: &crate::tape::mam_journal::MamReads<'_>,
 ) -> Option<(
     &'a crate::config::LtoBackendConfig,
     crate::tape::mam::MamInfo,
@@ -1312,10 +1318,12 @@ pub(crate) fn loaded_medium<'a>(
     let backend = crate::config::resolve_device(config, Some(device))
         .ok()
         .and_then(|(_, b)| b)?;
-    Some((
-        backend,
-        crate::tape::media_detect::detect(device, &backend.device_sg).mam,
-    ))
+    let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    reads.hold(
+        crate::tape::mam_journal::Hook::LoadedMediumSerial,
+        det.capture,
+    );
+    Some((backend, det.mam))
 }
 
 /// The catalog's claim about one volume, for [`corroborate_contact`].

@@ -12,6 +12,7 @@ use crate::db::queries;
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
 use crate::tape::contact::{self, ContactSite, Medium, Operation};
+use crate::tape::mam_journal::MamReads;
 use crate::util::{HashingWriter, TruncatingWriter};
 
 /// Removes the restore scratch directory when it goes out of scope, on every
@@ -108,13 +109,17 @@ pub fn restore_unit(
     // read the loaded medium. Proceeds silently with no configured backend
     // or nothing detected — the DR machine with keys and no `backend add`
     // yet (ADR-0005), same leniency as the MAM read just below.
-    crate::tape::media_detect::check_read_contact(config, device)?;
+    //
+    // Both MAM reads are held and journalled when the contact opens (issue
+    // #297).
+    let reads = MamReads::new(conn, Operation::RestoreUnit);
+    reads.check_read_contact(config, device)?;
 
     // Before `TapeStore::open_read`: reading the MAM opens the device
     // read-only and drops the fd, and the st driver refuses a second
     // concurrent open. LENIENT — no configured backend yields `None`, an
     // absence, which is the DR machine with keys and no `backend add`.
-    let observed = crate::volume::binding::loaded_medium(config, device);
+    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
     // Open the store read-only, positioned at BOT.
     let mut store = TapeStore::open_read(device, block_size)?;
     restore_unit_from_store(
@@ -130,7 +135,8 @@ pub fn restore_unit(
             Operation::RestoreUnit,
             device,
             Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-        ),
+        )
+        .with_mam_reads(&reads),
     )
 }
 
@@ -148,6 +154,13 @@ pub fn restore_unit(
 /// anyway — a contact is a physical fact whether or not the cartridge could
 /// be identified — and `REASON_MAM_NOT_ATTEMPTED` says which of the five
 /// reasons the NULL is, so the row is never a silent absence.
+///
+/// `reads`: the MAM capture the CLI's `check_read_contact` took before the
+/// store opened (issue #297), journalled against this contact. That check
+/// DOES read the MAM when a backend resolves (issue #166 added it), so
+/// "reads no MAM" above describes this function's own identification, not
+/// the command as a whole — a known wording gap left for #296's owner; the
+/// journal records the read regardless.
 pub fn restore_raw_volume(
     conn: &Connection,
     config: &Config,
@@ -155,14 +168,18 @@ pub fn restore_raw_volume(
     store: &mut dyn Store,
     dest: &Path,
     expect_label: Option<&str>,
+    reads: Option<&MamReads<'_>>,
 ) -> Result<crate::volume::raw::RawRestoreReport> {
-    let guard = ContactSite::new(
+    let mut site = ContactSite::new(
         config,
         Operation::RestoreRawVolume,
         device,
         Medium::NotAttempted,
-    )
-    .open(conn, None);
+    );
+    if let Some(reads) = reads {
+        site = site.with_mam_reads(reads);
+    }
+    let guard = site.open(conn, None);
     let r = crate::volume::raw::restore_raw(store, dest, expect_label);
     // A dump whose checksums did not all verify is how this contact ENDED,
     // even though the function returns `Ok` — the CLI's exit status says the
@@ -1344,6 +1361,7 @@ mod tests {
                 "/nonexistent/tapectl-contact-test-nst",
                 &mut store,
                 dest.path(),
+                None,
                 None,
             );
 

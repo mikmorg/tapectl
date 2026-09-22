@@ -60,7 +60,8 @@ use tracing::warn;
 
 use crate::config::{Config, LtoBackendConfig};
 use crate::error::Result;
-use crate::tape::mam::MamInfo;
+use crate::tape::mam::{MamCapture, MamInfo};
+use crate::tape::mam_journal::{Hook, MamReads};
 
 // ── The identity reasons ──────────────────────────────────────────────────
 //
@@ -282,6 +283,10 @@ pub struct ContactSite<'a> {
     operation: Operation,
     device: &'a str,
     medium: Medium<'a>,
+    /// The MAM reads this command took before its store opened, journalled
+    /// against this contact the moment it opens (issue #297). `None` for a
+    /// site whose caller took no MAM read.
+    mam_reads: Option<&'a MamReads<'a>>,
 }
 
 impl<'a> ContactSite<'a> {
@@ -296,7 +301,19 @@ impl<'a> ContactSite<'a> {
             operation,
             device,
             medium,
+            mam_reads: None,
         }
+    }
+
+    /// Carry the MAM captures this command is holding, so [`open`] journals
+    /// them with the contact's id (ADR-0013 §5: the journal points at the
+    /// contact). A read path's contact opens inside its store seam, after
+    /// both of its MAM reads — this is how those reads reach it.
+    ///
+    /// [`open`]: ContactSite::open
+    pub fn with_mam_reads(mut self, reads: &'a MamReads<'a>) -> Self {
+        self.mam_reads = Some(reads);
+        self
     }
 
     /// The command this contact is being made for. `volume compact` and
@@ -313,15 +330,23 @@ impl<'a> ContactSite<'a> {
     }
 
     /// Open the contact this site describes.
+    ///
+    /// Journals any MAM reads the site carries against the new contact's id
+    /// — NULL if the contact's own INSERT failed: the reads happened either
+    /// way, and a journal row with no contact beats no journal row.
     pub fn open<'c>(&self, conn: &'c Connection, volume_id: Option<i64>) -> ContactGuard<'c> {
-        ContactGuard::open(
+        let guard = ContactGuard::open(
             conn,
             self.config,
             self.operation,
             self.device,
             volume_id,
             self.medium,
-        )
+        );
+        if let Some(reads) = self.mam_reads {
+            reads.attach(guard.id());
+        }
+        guard
     }
 }
 
@@ -529,6 +554,18 @@ impl<'a> ContactGuard<'a> {
             return;
         };
         record_drive_for(self.conn, id, drive_id);
+    }
+
+    /// Journal the MAM read this contact was opened from (issue #297) — the
+    /// write paths' seam, where the contact opens right after its one read.
+    ///
+    /// Unlike every other method here this does NOT go quiet on an inert
+    /// guard: the read happened whether or not the contact row could be
+    /// written, so the journal row is written with `contact_id` NULL.
+    /// Best-effort all the same — a journal failure warns and never fails
+    /// the tape command.
+    pub fn journal_mam(&self, trigger: Operation, hook: Hook, capture: &MamCapture) {
+        crate::tape::mam_journal::record(self.conn, self.id, trigger.as_str(), hook, capture);
     }
 
     /// The `cartridge_contacts` row this guard opened, or `None` for an
@@ -1241,6 +1278,70 @@ mod tests {
         guard.finish(OUTCOME_OK, None);
 
         assert_eq!(only_row(&conn).2, Some(drive_id));
+    }
+
+    /// Issue #297: an inert guard still journals the MAM read it was opened
+    /// from — with `contact_id` NULL — because the read happened whether or
+    /// not the contact row could be written. Positive control: a live guard
+    /// journals against its own id.
+    #[test]
+    fn journal_mam_writes_even_from_an_inert_guard() {
+        let conn = crate::db::open_memory().unwrap();
+        let config = config_with_backend();
+        let mam = mam_with_serial(None, None);
+        let capture = crate::tape::mam::MamCapture {
+            captured_at: "2026-09-22 00:00:00".into(),
+            device_sg: "/dev/sg-nonexistent".into(),
+            tool_argv: vec!["sg_read_attr".into(), "/dev/sg-nonexistent".into()],
+            stdout: Some(b"Attribute values:\n  Load count: 2\n".to_vec()),
+            ..Default::default()
+        };
+        let site = |volume_id| {
+            ContactGuard::open(
+                &conn,
+                &config,
+                Operation::VolumeWrite,
+                "/dev/null",
+                volume_id,
+                Medium::Observed {
+                    backend: &backend(),
+                    mam: &mam,
+                },
+            )
+        };
+
+        let inert = site(Some(99_999));
+        assert_eq!(
+            inert.id(),
+            None,
+            "precondition: the FK made this guard inert"
+        );
+        inert.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &capture);
+        inert.finish(OUTCOME_OK, None);
+
+        let live = site(None);
+        let live_id = live.id().expect("a live guard");
+        live.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &capture);
+        live.finish(OUTCOME_OK, None);
+
+        let rows: Vec<(Option<i64>, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT contact_id, hook, ok FROM mam_journal ORDER BY id")
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
+            v
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (None, "volume_write".to_string(), 1),
+                (Some(live_id), "volume_write".to_string(), 1),
+            ]
+        );
     }
 
     /// The #227 lesson: `PRAGMA table_info` reports neither foreign keys nor

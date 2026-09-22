@@ -189,6 +189,30 @@ pub enum CartridgeCommands {
         /// Barcode
         barcode: String,
     },
+    /// Show the MAM journal: every MAM read taken of a cartridge, verbatim
+    ///
+    /// ADR-0013 / issue #297: every `sg_read_attr` a command runs is kept
+    /// whole — including the attributes tapectl does not parse, such as the
+    /// medium's own ring of the last four drives that loaded it — because
+    /// loading the cartridge overwrites them. Lists the rows, oldest first;
+    /// `--raw <ID>` prints one row's tool output exactly as captured.
+    ///
+    /// A cartridge's rows are found two ways: reads taken in a contact
+    /// attributed to it, and reads whose chip serial is its confirmed
+    /// serial — so a read taken before it was registered is found too.
+    /// With neither a barcode nor `--serial`, every row is listed, including
+    /// reads no cartridge could be named for. Read-only.
+    Journal {
+        /// Barcode of a registered cartridge
+        barcode: Option<String>,
+        /// Select by the medium serial the chip reported instead (for a
+        /// cartridge that is not registered)
+        #[arg(long, conflicts_with = "barcode")]
+        serial: Option<String>,
+        /// Print this journal row's raw `sg_read_attr` output, byte for byte
+        #[arg(long, value_name = "ID")]
+        raw: Option<i64>,
+    },
 }
 
 #[derive(Tabled, Serialize)]
@@ -824,8 +848,150 @@ pub fn run(
         CartridgeCommands::Unretire { barcode } => {
             crate::cli::operations::cartridge_unretire(conn, barcode, dry_run, json_output)?;
         }
+        CartridgeCommands::Journal {
+            barcode,
+            serial,
+            raw,
+        } => {
+            let selector = journal_selector(conn, barcode.as_deref(), serial.as_deref())?;
+            match raw {
+                Some(id) => {
+                    let bytes = journal_raw(conn, &selector, *id)?;
+                    if json_output {
+                        println!("{}", journal_raw_json(*id, bytes.as_deref()));
+                    } else {
+                        match bytes {
+                            // Verbatim: no added newline, no lossy decode.
+                            Some(b) => {
+                                use std::io::Write;
+                                std::io::stdout().write_all(&b)?;
+                            }
+                            None => eprintln!(
+                                "MAM journal row {id} has no raw output: the tool never ran"
+                            ),
+                        }
+                    }
+                }
+                None => {
+                    let rows = crate::tape::mam_journal::entries(conn, &selector)?;
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+                    } else if rows.is_empty() {
+                        println!("no MAM journal rows");
+                    } else {
+                        let table: Vec<JournalTableRow> =
+                            rows.iter().map(JournalTableRow::from).collect();
+                        println!("{}", Table::new(table));
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Resolve `cartridge journal`'s arguments to the rows they name.
+fn journal_selector(
+    conn: &Connection,
+    barcode: Option<&str>,
+    serial: Option<&str>,
+) -> Result<crate::tape::mam_journal::Selector> {
+    use crate::tape::mam_journal::Selector;
+    if let Some(serial) = serial {
+        return Ok(Selector::Serial(serial.trim().to_string()));
+    }
+    let Some(barcode) = barcode else {
+        return Ok(Selector::All);
+    };
+    let (id, serial_number): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT id, serial_number FROM cartridges WHERE barcode = ?1",
+            params![barcode.trim()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
+    Ok(Selector::Cartridge { id, serial_number })
+}
+
+/// One row's raw bytes, refusing an id the selector does not name — a
+/// `--raw` scoped by a barcode must not print another cartridge's read.
+fn journal_raw(
+    conn: &Connection,
+    selector: &crate::tape::mam_journal::Selector,
+    id: i64,
+) -> Result<Option<Vec<u8>>> {
+    use crate::tape::mam_journal::{entries, raw_of, Selector};
+    if *selector != Selector::All && !entries(conn, selector)?.iter().any(|e| e.id == id) {
+        return Err(TapectlError::Other(format!(
+            "MAM journal row {id} is not among the rows selected; run without --raw to list them"
+        )));
+    }
+    raw_of(conn, id)
+}
+
+/// `--raw --json`: the text when it is UTF-8 (every recording so far is),
+/// otherwise its bytes as hex, so the document always parses.
+fn journal_raw_json(id: i64, bytes: Option<&[u8]>) -> serde_json::Value {
+    match bytes {
+        None => serde_json::json!({"id": id, "raw": null}),
+        Some(b) => match std::str::from_utf8(b) {
+            Ok(text) => serde_json::json!({"id": id, "raw": text}),
+            Err(_) => serde_json::json!({
+                "id": id,
+                "raw": null,
+                "raw_hex": b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
+            }),
+        },
+    }
+}
+
+#[derive(Tabled)]
+struct JournalTableRow {
+    #[tabled(rename = "ID")]
+    id: i64,
+    #[tabled(rename = "Captured (UTC)")]
+    captured_at: String,
+    #[tabled(rename = "Contact", display_with = "display_opt_i64_blank")]
+    contact_id: Option<i64>,
+    #[tabled(rename = "Command")]
+    trigger: String,
+    #[tabled(rename = "Hook")]
+    hook: String,
+    #[tabled(rename = "Serial", display_with = "display_opt_string")]
+    serial: Option<String>,
+    #[tabled(rename = "Read")]
+    outcome: String,
+}
+
+impl From<&crate::tape::mam_journal::Entry> for JournalTableRow {
+    fn from(e: &crate::tape::mam_journal::Entry) -> Self {
+        JournalTableRow {
+            id: e.id,
+            captured_at: e.captured_at.clone(),
+            contact_id: e.contact_id,
+            trigger: e.trigger.clone(),
+            hook: e.hook.clone(),
+            serial: e.serial_as_read.clone(),
+            outcome: if e.ok {
+                format!("ok ({} bytes)", e.raw_bytes.unwrap_or(0))
+            } else {
+                format!(
+                    "FAILED: {}",
+                    e.error
+                        .as_deref()
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                )
+            },
+        }
+    }
+}
+
+fn display_opt_i64_blank(v: &Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
 /// The result of `cartridge edit --generation` (issue #167, ADR-0012 Tier 1),
@@ -2004,6 +2170,7 @@ mod tests {
             code: Some(0x58),
             source: DetectSource::MamMedium,
             mam: MamInfo::default(),
+            capture: Default::default(),
         };
 
         // The stale row (LTO-6) disagrees with the loaded medium (LTO-5):
@@ -2213,5 +2380,155 @@ mod tests {
         let (chip_line, operator_line) = serial_info_lines(&None, &None);
         assert_eq!(chip_line, "  Serial (chip-confirmed):   (none)");
         assert_eq!(operator_line, "  Serial (operator-claimed): (none)");
+    }
+
+    // ── `cartridge journal` (issue #297) ──
+
+    /// The real HP LTO-6 capture, journalled with no contact — the shape of a
+    /// read taken before the cartridge was ever registered.
+    fn journal_unattributed_lto6_read(conn: &Connection) -> i64 {
+        use std::os::unix::process::ExitStatusExt;
+        let capture = crate::tape::mam::capture_from_output(
+            "/dev/sg-test",
+            "2026-09-22 12:00:00".into(),
+            None,
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: crate::tape::mam::tests_support::LTO6_SAMPLE
+                    .as_bytes()
+                    .to_vec(),
+                stderr: Vec::new(),
+            }),
+        )
+        .capture;
+        crate::tape::mam_journal::record(
+            conn,
+            None,
+            "volume identify",
+            crate::tape::mam_journal::Hook::CheckReadContact,
+            &capture,
+        )
+        .expect("row written")
+    }
+
+    fn journal_snapshot(conn: &Connection) -> Vec<Vec<String>> {
+        let mut stmt = conn
+            .prepare("SELECT * FROM mam_journal ORDER BY id")
+            .unwrap();
+        let n = stmt.column_count();
+        let v = stmt
+            .query_map([], |r| {
+                Ok((0..n)
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        v
+    }
+
+    /// No back-fill: registering the cartridge, and then its chip-confirmed
+    /// serial arriving, leave every journal row byte-identical — the rows
+    /// become FINDABLE by barcode through the query, never by rewriting.
+    /// And the operator's unconfirmed claim alone does not attribute them
+    /// (ADR-0012 amendment): only the chip's serial does.
+    #[test]
+    fn registering_a_cartridge_later_backfills_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        let row = journal_unattributed_lto6_read(&conn);
+        let before = journal_snapshot(&conn);
+        assert_eq!(before.len(), 1, "precondition: the row exists");
+
+        register(&conn, "JB001", "LTO-6", None, Some("EW7VWMVKF6")).unwrap();
+        assert_eq!(
+            journal_snapshot(&conn),
+            before,
+            "register rewrote the journal"
+        );
+        let sel = journal_selector(&conn, Some("JB001"), None).unwrap();
+        assert!(
+            crate::tape::mam_journal::entries(&conn, &sel)
+                .unwrap()
+                .is_empty(),
+            "an operator CLAIM must not attribute a chip read"
+        );
+
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM cartridges WHERE barcode = 'JB001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::volume::binding::record_medium_serial(&conn, id, "JB001", "EW7VWMVKF6").unwrap();
+        assert_eq!(
+            journal_snapshot(&conn),
+            before,
+            "binding rewrote the journal"
+        );
+
+        // Positive control: the row is now found by barcode, by query.
+        let sel = journal_selector(&conn, Some("JB001"), None).unwrap();
+        let found: Vec<i64> = crate::tape::mam_journal::entries(&conn, &sel)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(found, vec![row]);
+    }
+
+    /// `--json` is one document that parses as a whole, and carries the
+    /// labelled raw integers, not converted bytes.
+    #[test]
+    fn journal_json_parses_as_a_whole() {
+        let conn = crate::db::open_memory().unwrap();
+        journal_unattributed_lto6_read(&conn);
+        let rows =
+            crate::tape::mam_journal::entries(&conn, &crate::tape::mam_journal::Selector::All)
+                .unwrap();
+        let text = serde_json::to_string_pretty(&rows).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let arr = v.as_array().expect("an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hook"], "check_read_contact");
+        assert_eq!(arr[0]["ok"], true);
+        assert_eq!(arr[0]["serial_as_read"], "EW7VWMVKF6");
+        assert_eq!(arr[0]["parsed"]["max_capacity"]["value"], 2499053);
+        assert_eq!(arr[0]["parsed"]["max_capacity"]["unit"], "MiB");
+        assert_eq!(arr[0]["tool_argv"][0], "sg_read_attr");
+        assert_eq!(
+            arr[0]["raw_bytes"],
+            crate::tape::mam::tests_support::LTO6_SAMPLE.len()
+        );
+
+        let raw = journal_raw_json(7, Some(b"abc\n"));
+        let back: serde_json::Value = serde_json::from_str(&raw.to_string()).unwrap();
+        assert_eq!(back["raw"], "abc\n");
+        let hex = journal_raw_json(7, Some(&[0xff, 0x00]));
+        assert_eq!(hex["raw_hex"], "ff00");
+    }
+
+    /// `--raw` returns the capture byte for byte, and refuses a row the
+    /// barcode or serial does not select.
+    #[test]
+    fn journal_raw_is_verbatim_and_scoped_to_the_selection() {
+        let conn = crate::db::open_memory().unwrap();
+        let row = journal_unattributed_lto6_read(&conn);
+        let all = crate::tape::mam_journal::Selector::All;
+        assert_eq!(
+            journal_raw(&conn, &all, row).unwrap().as_deref(),
+            Some(crate::tape::mam::tests_support::LTO6_SAMPLE.as_bytes())
+        );
+        let by_serial = journal_selector(&conn, None, Some("EW7VWMVKF6")).unwrap();
+        assert!(journal_raw(&conn, &by_serial, row).unwrap().is_some());
+        let other = journal_selector(&conn, None, Some("SOMEONE-ELSE")).unwrap();
+        let err = journal_raw(&conn, &other, row).unwrap_err().to_string();
+        assert!(err.contains("not among the rows selected"), "{err}");
+        assert!(journal_raw(&conn, &all, row + 1000).is_err(), "no such row");
+        assert!(journal_selector(&conn, Some("NOPE"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
     }
 }

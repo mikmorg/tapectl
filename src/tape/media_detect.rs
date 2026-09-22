@@ -23,7 +23,7 @@ use crate::config::{Config, LtoBackendConfig};
 use crate::error::{Result, TapectlError};
 use crate::media::Generation;
 use crate::tape::ioctl;
-use crate::tape::mam::{self, MamInfo};
+use crate::tape::mam::{self, MamCapture, MamInfo};
 
 /// Which source (if any) produced [`Detected::generation`].
 ///
@@ -52,6 +52,11 @@ pub struct Detected {
     /// The full MAM read (best-effort), for callers that also want the
     /// serial number, capacity, manufacturer, etc.
     pub mam: MamInfo,
+    /// The MAM read verbatim, for the caller to journal (issue #297). A
+    /// sibling of `mam`, never folded into it: this module has no database,
+    /// so the caller — which does — writes the row. A failed read is a
+    /// capture too (`ok() == false`).
+    pub capture: MamCapture,
 }
 
 /// Detect the loaded medium's generation.
@@ -60,13 +65,13 @@ pub struct Detected {
 /// `device_tape` is queried only if neither MAM field yielded a recognised
 /// generation.
 pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
-    let mam = match mam::read_mam(device_sg) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(sg_device = %device_sg, err = %e, "MAM read failed during media detection (continuing)");
-            MamInfo::default()
-        }
-    };
+    let read = mam::read_mam(device_sg);
+    if let Some(e) = &read.error {
+        warn!(sg_device = %device_sg, err = %e, "MAM read failed during media detection (continuing)");
+    }
+    let mam = read.info;
+    let mut capture = read.capture;
+    capture.device_tape = Some(device_tape.to_string());
 
     if let Some(code) = mam.medium_density_code {
         if let Some(generation) = Generation::from_density_code(code) {
@@ -75,6 +80,7 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
                 code: Some(code),
                 source: DetectSource::MamMedium,
                 mam,
+                capture,
             };
         }
     }
@@ -86,6 +92,7 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
                 code: Some(code),
                 source: DetectSource::MamFormat,
                 mam,
+                capture,
             };
         }
     }
@@ -103,6 +110,7 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
                 code: Some(code),
                 source,
                 mam,
+                capture,
             }
         }
         Ok(None) => Detected {
@@ -110,6 +118,7 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
             code: None,
             source: DetectSource::None,
             mam,
+            capture,
         },
         Err(e) => {
             warn!(device_tape = %device_tape, err = %e, "driver density read failed during media detection (continuing)");
@@ -118,6 +127,7 @@ pub fn detect(device_tape: &str, device_sg: &str) -> Detected {
                 code: None,
                 source: DetectSource::None,
                 mam,
+                capture,
             }
         }
     }
@@ -489,16 +499,27 @@ pub fn check_drive_can_read(backend: &LtoBackendConfig, medium: Generation) -> R
 /// / `open_read`) **on the same device**: [`detect`] opens the device
 /// read-only and drops the fd, and the `st` driver refuses a second
 /// concurrent open.
-pub fn check_read_contact(config: &Config, device: &str) -> Result<()> {
-    let (_, backend) = crate::config::resolve_device(config, Some(device))?;
+///
+/// **Returns the MAM capture beside the verdict** (issue #297): the read
+/// really happened, whether or not this check then refuses, and this module
+/// has no database to journal it in. `None` exactly when no MAM read was
+/// attempted (no backend resolved). Production callers go through
+/// [`crate::tape::mam_journal::MamReads::check_read_contact`], which holds
+/// the capture for the contact.
+pub fn check_read_contact(config: &Config, device: &str) -> (Option<MamCapture>, Result<()>) {
+    let backend = match crate::config::resolve_device(config, Some(device)) {
+        Ok((_, backend)) => backend,
+        Err(e) => return (None, Err(e)),
+    };
     let Some(backend) = backend else {
-        return Ok(());
+        return (None, Ok(()));
     };
     let detected = detect(device, &backend.device_sg);
+    let capture = Some(detected.capture);
     let Some(medium) = detected.generation else {
-        return Ok(());
+        return (capture, Ok(()));
     };
-    check_drive_can_read(backend, medium)
+    (capture, check_drive_can_read(backend, medium))
 }
 
 #[cfg(test)]
@@ -576,6 +597,7 @@ mod tests {
             code: Some(code),
             source: DetectSource::MamMedium,
             mam: MamInfo::default(),
+            capture: MamCapture::default(),
         }
     }
 
@@ -585,6 +607,7 @@ mod tests {
             code: None,
             source: DetectSource::None,
             mam: MamInfo::default(),
+            capture: MamCapture::default(),
         }
     }
 
@@ -762,6 +785,7 @@ mod tests {
             code: Some(0x5a),
             source: DetectSource::Driver,
             mam: MamInfo::default(),
+            capture: MamCapture::default(),
         };
         let (_, src) = resolve_media(&det, None, None, Generation::Lto8).unwrap();
         assert_eq!(src, MediaSource::Detected(DetectSource::Driver));
@@ -863,6 +887,11 @@ mod tests {
     #[test]
     fn no_backend_means_no_read_check() {
         let config = Config::default();
-        check_read_contact(&config, "/nonexistent/tapectl-check-read-contact-device").unwrap();
+        let (capture, verdict) =
+            check_read_contact(&config, "/nonexistent/tapectl-check-read-contact-device");
+        verdict.unwrap();
+        // No backend, so no sg node, so no MAM read — and no capture to
+        // journal (issue #297): absence of a read, not a failed one.
+        assert!(capture.is_none());
     }
 }

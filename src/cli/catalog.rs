@@ -577,7 +577,14 @@ pub fn run(
             // cannot read the loaded medium. Proceeds silently with no
             // configured backend — this is the disaster-recovery path this
             // command exists for (ADR-0005).
-            crate::tape::media_detect::check_read_contact(config, &device)?;
+            // Both of this path's MAM reads (this one and the pre-store read
+            // inside `rebuild_from_volume`) are held and journalled against
+            // the rebuild's contact (issue #297).
+            let reads = crate::tape::mam_journal::MamReads::new(
+                conn,
+                crate::tape::contact::Operation::CatalogRebuild,
+            );
+            reads.check_read_contact(config, &device)?;
             let scratch =
                 std::env::temp_dir().join(format!("tapectl-rebuild-{}", std::process::id()));
             let report = crate::volume::rebuild::rebuild_from_volume(
@@ -590,6 +597,7 @@ pub fn run(
                 tenant,
                 backend.map(|b| b.name.as_str()),
                 &scratch,
+                &reads,
             );
             // The scratch dir holds decrypted MANIFEST/catalog.db copies —
             // remove it on every path out, success or failure, exactly as

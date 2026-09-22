@@ -187,7 +187,13 @@ pub fn run(
             // Issue #166: refuse before the store is opened if this drive
             // cannot read the loaded medium. Proceeds silently with no
             // configured backend — this is the heir/DR path, ADR-0005.
-            crate::tape::media_detect::check_read_contact(config, &device)?;
+            // Its MAM capture is held and journalled against the contact
+            // `restore_raw_volume` opens (issue #297).
+            let reads = crate::tape::mam_journal::MamReads::new(
+                conn,
+                crate::tape::contact::Operation::RestoreRawVolume,
+            );
+            reads.check_read_contact(config, &device)?;
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             // Through `volume::restore` rather than `volume::raw` directly:
             // `raw::restore_raw` stays `Connection`-free (it is what an heir
@@ -200,6 +206,7 @@ pub fn run(
                 &mut store,
                 dest,
                 from.as_deref(),
+                Some(&reads),
             )?;
 
             if json_output {

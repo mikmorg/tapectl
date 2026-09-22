@@ -14,6 +14,7 @@ use crate::staging;
 use crate::tape::contact::{self, ContactGuard, ContactSite, ContactSlot, Medium, Operation};
 use crate::tape::drive_identity;
 use crate::tape::health;
+use crate::tape::mam_journal::{Hook, MamReads};
 use crate::util::{HashingWriter, TruncatingWriter};
 
 use crate::store::{Store, TapeStore, Tier};
@@ -247,6 +248,9 @@ fn volume_init_contacted<'c>(
             mam: &det.mam,
         },
     ));
+    // The same one read, verbatim, into the journal (issue #297) — against
+    // this contact's id, or NULL if the contact row could not be written.
+    contact.journal_mam(Operation::VolumeInit, Hook::VolumeInit, &det.capture);
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
             TapectlError::Other(format!(
@@ -1038,6 +1042,9 @@ fn volume_write_contacted<'c>(
             mam: &det.mam,
         },
     ));
+    // The same one read, verbatim, into the journal (issue #297) — against
+    // this contact's id, or NULL if the contact row could not be written.
+    contact.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &det.capture);
 
     // Corroborate at contact (ADR-0012, issue #193) — wrong-cartridge
     // discipline one layer earlier than the File 0 check (ADR-0010): the
@@ -1461,6 +1468,9 @@ fn volume_resume_contacted<'c>(
             mam: &det.mam,
         },
     ));
+    // The same one read, verbatim, into the journal (issue #297) — against
+    // this contact's id, or NULL if the contact row could not be written.
+    contact.journal_mam(Operation::VolumeResume, Hook::VolumeResume, &det.capture);
     binding::corroborate_volume(
         conn,
         volume_id,
@@ -2851,13 +2861,18 @@ pub fn volume_verify(
     // now applies. LENIENT the same way the rest of this function is: no
     // backend, or nothing detected, and this proceeds (ADR-0010's read-path
     // leniency / the DR path, ADR-0005).
-    crate::tape::media_detect::check_read_contact(config, device)?;
+    //
+    // Both of this path's MAM reads are HELD in `reads` and journalled when
+    // the contact opens inside `volume_verify_with_store` (issue #297); a
+    // refusal before then journals them with no contact, on drop.
+    let reads = MamReads::new(conn, Operation::VolumeVerify);
+    reads.check_read_contact(config, device)?;
 
     // Before `TapeStore::open`: reading the MAM opens the device read-only
     // and drops the fd, and the st driver refuses a second concurrent open.
     // LENIENT — an unconfigured backend yields `None`, which is an absence
     // and proceeds (ADR-0010's read-path leniency).
-    let observed = binding::loaded_medium(config, device);
+    let observed = binding::loaded_medium(config, device, &reads);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     let mut report = volume_verify_with_store(
@@ -2872,7 +2887,8 @@ pub fn volume_verify(
             Operation::VolumeVerify,
             device,
             Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-        ),
+        )
+        .with_mam_reads(&reads),
     )?;
 
     // Best-effort sg_logs health collection. Advisory only, and deliberately
@@ -4133,6 +4149,7 @@ mod tests {
     use super::*;
     use crate::store::{Evidence, Mismatch, MismatchKind};
     use crate::tape::mam::MamInfo;
+    use crate::tape::mam_journal::MamReads;
     use sha2::{Digest, Sha256};
 
     /// A device path for tests. NOT `/dev/null` and not `/dev/nstN`: no
@@ -8490,6 +8507,7 @@ mod tests {
                     serial: serial.map(str::to_string),
                     ..MamInfo::default()
                 },
+                capture: Default::default(),
             }
         }
 
@@ -9173,6 +9191,7 @@ mod tests {
                     DetectSource::None
                 },
                 mam: MamInfo::default(),
+                capture: Default::default(),
             }
         }
 
@@ -10091,6 +10110,274 @@ mod tests {
                 !SRC.contains("ContactGuard::open") && !SRC.contains("ContactSite::new"),
                 "cli::operations must open no contact of its own — volume_write's is the \
                  one physical contact, and a second row would double-count it"
+            );
+        }
+
+        // ── issue #297: the MAM journal rows each contact leaves ──
+
+        /// `(trigger, hook, contact_id, the contact's own operation)` for
+        /// every journal row, oldest first.
+        fn journal(conn: &Connection) -> Vec<(String, String, Option<i64>, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT j.trigger, j.hook, j.contact_id, c.operation
+                       FROM mam_journal j LEFT JOIN cartridge_contacts c ON c.id = j.contact_id
+                      ORDER BY j.id",
+                )
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
+            v
+        }
+
+        /// A read path exactly as the CLI arms run it — `check_read_contact`,
+        /// then `loaded_medium`, then the store seam — against a configured
+        /// backend whose sg node does not exist, so both MAM reads really
+        /// run (and fail) and the contact opens inside the seam, over a
+        /// `MemStore`.
+        fn identify_like_the_cli(conn: &Connection, config: &Config) -> Result<Identified> {
+            let data = b"j".repeat(16);
+            let mut store = mem_store_v2_tape("J-TAPE", &data, &data);
+            let reads = MamReads::new(conn, Operation::VolumeIdentify);
+            reads.check_read_contact(config, GENCHK_DEVICE)?;
+            let observed = binding::loaded_medium(config, GENCHK_DEVICE, &reads);
+            volume_identify_corroborated(
+                conn,
+                &mut store,
+                ContactSite::new(
+                    config,
+                    Operation::VolumeIdentify,
+                    GENCHK_DEVICE,
+                    Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+                )
+                .with_mam_reads(&reads),
+            )
+        }
+
+        /// ADR-0013 §5, the fact that put the foreign key on the journal: a
+        /// read-path command takes TWO MAM reads inside ONE contact, and
+        /// both are journalled, by name, against that same contact.
+        #[test]
+        fn a_read_path_journals_both_reads_against_its_one_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            identify_like_the_cli(&conn, &config).unwrap();
+
+            assert_eq!(contact_count(&conn), 1, "precondition: one contact");
+            let contact: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                journal(&conn),
+                vec![
+                    (
+                        "volume identify".to_string(),
+                        "check_read_contact".to_string(),
+                        Some(contact),
+                        Some("volume identify".to_string()),
+                    ),
+                    (
+                        "volume identify".to_string(),
+                        "loaded_medium_serial".to_string(),
+                        Some(contact),
+                        Some("volume identify".to_string()),
+                    ),
+                ],
+                "exactly two rows, the two hooks by name, one contact"
+            );
+        }
+
+        /// Every hook that can be driven ungated, by the SET of distinct
+        /// `(trigger, hook)` pairs — a count could be met by the wrong rows.
+        /// `volume_resume` cannot be driven past its MAM read ungated (see
+        /// the source scan below), so its pair is proved there.
+        #[test]
+        fn every_drivable_hook_journals_its_trigger_and_hook_pair() {
+            let conn = genchk_fixture("JW-GEN");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+
+            volume_init(
+                &conn,
+                &config,
+                "JI-NEW",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+            volume_write(
+                &conn,
+                &paths,
+                &config,
+                "JW-GEN",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+            )
+            .unwrap_err();
+            identify_like_the_cli(&conn, &config).unwrap();
+
+            let rows = journal(&conn);
+            let pairs: std::collections::BTreeSet<(String, String)> =
+                rows.iter().map(|r| (r.0.clone(), r.1.clone())).collect();
+            let expected: std::collections::BTreeSet<(String, String)> = [
+                ("volume init", "volume_init"),
+                ("volume write", "volume_write"),
+                ("volume identify", "check_read_contact"),
+                ("volume identify", "loaded_medium_serial"),
+            ]
+            .iter()
+            .map(|(t, h)| (t.to_string(), h.to_string()))
+            .collect();
+            assert_eq!(pairs, expected);
+            // And every row names a contact whose operation IS its trigger:
+            // each read is attached to the contact of the command that took it.
+            for (trigger, hook, contact, operation) in &rows {
+                assert!(contact.is_some(), "{trigger}/{hook} names no contact");
+                assert_eq!(operation.as_deref(), Some(trigger.as_str()), "{hook}");
+            }
+            // The reads really ran and failed (no such sg node) — recorded,
+            // not skipped.
+            let failed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mam_journal WHERE ok = 0 AND error <> ''",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed, rows.len() as i64);
+        }
+
+        /// A read path that refuses BEFORE its contact opens — here the
+        /// store open, which a real CLI arm reaches after both reads —
+        /// still journals what it read, with no contact. Modelled by
+        /// dropping the holder without ever opening a site.
+        #[test]
+        fn a_read_path_refused_before_its_contact_still_journals_its_reads() {
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            {
+                let reads = MamReads::new(&conn, Operation::VolumeVerify);
+                reads.check_read_contact(&config, GENCHK_DEVICE).unwrap();
+                let _ = binding::loaded_medium(&config, GENCHK_DEVICE, &reads);
+                // `TapeStore::open` would fail here; nothing opens a contact.
+            }
+            assert_eq!(contact_count(&conn), 0);
+            let rows = journal(&conn);
+            let hooks: Vec<(&str, Option<i64>)> =
+                rows.iter().map(|r| (r.1.as_str(), r.2)).collect();
+            assert_eq!(
+                hooks,
+                vec![("check_read_contact", None), ("loaded_medium_serial", None)]
+            );
+        }
+
+        /// The seam is best-effort: with the journal table gone, every
+        /// insert fails — and the command still succeeds and its contact is
+        /// still recorded. The positive control (same command, intact
+        /// schema) proves the zero is the failure and not a path that never
+        /// journals.
+        #[test]
+        fn a_journal_insert_failure_never_fails_the_tape_command() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+
+            let broken = crate::db::open_memory().unwrap();
+            broken.execute("DROP TABLE mam_journal", []).unwrap();
+            let id = identify_like_the_cli(&broken, &config)
+                .expect("a journal failure must not fail the command");
+            assert!(id.text.contains("J-TAPE"));
+            assert_eq!(contact_count(&broken), 1, "the contact is still recorded");
+
+            let intact = crate::db::open_memory().unwrap();
+            identify_like_the_cli(&intact, &config).unwrap();
+            assert_eq!(journal(&intact).len(), 2, "positive control");
+        }
+
+        /// The source-scan half: `volume_resume` (undrivable ungated) and,
+        /// as calibration, the two write paths driven above all journal
+        /// their read right after their contact opens, with their own hook.
+        #[test]
+        fn the_three_write_paths_journal_their_read_at_their_contact() {
+            const SRC: &str = include_str!("write.rs");
+            for (f, op) in [
+                ("fn volume_init_contacted", "VolumeInit"),
+                ("fn volume_write_contacted", "VolumeWrite"),
+                ("fn volume_resume_contacted", "VolumeResume"),
+            ] {
+                let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+                let end = SRC[start..].find("\n}\n").unwrap() + start;
+                let body = &SRC[start..end];
+                assert!(!body[f.len()..].contains("\npub fn "), "{f}: scan overran");
+                let fill = body.find("contact.fill(ContactGuard::open(").unwrap();
+                let call =
+                    format!("contact.journal_mam(Operation::{op}, Hook::{op}, &det.capture);");
+                let journal = body
+                    .find(&call)
+                    .unwrap_or_else(|| panic!("{f} does not journal its MAM read: {call}"));
+                assert!(fill < journal, "{f}: journal before the contact opens");
+                assert_eq!(
+                    body.matches("journal_mam(").count(),
+                    1,
+                    "{f}: one read, one row"
+                );
+            }
+        }
+
+        /// Every production read path routes BOTH its MAM reads through a
+        /// holder and hands the holder to its contact. Counted by name so a
+        /// new read path that forgets is caught; the positive control is
+        /// that the scan found all eight.
+        #[test]
+        fn every_read_path_holds_both_reads_for_its_contact() {
+            let files: [(&str, &str); 6] = [
+                ("volume/write.rs", include_str!("write.rs")),
+                ("volume/restore.rs", include_str!("restore.rs")),
+                ("volume/rebuild.rs", include_str!("rebuild.rs")),
+                ("cli/volume.rs", include_str!("../cli/volume.rs")),
+                ("cli/restore.rs", include_str!("../cli/restore.rs")),
+                ("cli/catalog.rs", include_str!("../cli/catalog.rs")),
+            ];
+            let production = |src: &'static str| -> &'static str {
+                match src.find("#[cfg(test)]\nmod tests") {
+                    Some(i) => &src[..i],
+                    None => src,
+                }
+            };
+            let mut checks = 0;
+            let mut with_reads = 0;
+            for (name, src) in files {
+                let src = production(src);
+                assert!(
+                    !src.contains("media_detect::check_read_contact("),
+                    "{name} calls check_read_contact directly — its MAM capture is lost"
+                );
+                assert!(
+                    !src.contains("loaded_medium(config, device)")
+                        && !src.contains("loaded_medium(config, &device)"),
+                    "{name} calls loaded_medium without a holder"
+                );
+                checks += src.matches("reads.check_read_contact(").count();
+                with_reads += src.matches("with_mam_reads(").count();
+            }
+            assert_eq!(
+                checks, 8,
+                "verify, restore unit, catalog rebuild, restore raw-volume, identify, \
+                 read-slices, compact-read, compact"
+            );
+            assert_eq!(
+                with_reads, 8,
+                "each of the eight hands its holder to its contact"
             );
         }
 

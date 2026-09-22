@@ -917,11 +917,12 @@ pub fn run(
             // Issue #166: refuse before the store is opened if this drive
             // cannot read the loaded medium. Proceeds silently with no
             // configured backend (ADR-0010's DR-path leniency).
-            crate::tape::media_detect::check_read_contact(config, &device)?;
+            let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeIdentify);
+            reads.check_read_contact(config, &device)?;
             // Before the store open: reading the MAM opens the device
             // read-only and drops the fd, and the st driver refuses a second
             // concurrent open.
-            let observed = crate::volume::binding::loaded_medium(config, &device);
+            let observed = crate::volume::binding::loaded_medium(config, &device, &reads);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             // Corroborated (ADR-0012, issue #193) where there is a catalog
             // row to compare against; the bare `volume_identify` stays the
@@ -934,7 +935,8 @@ pub fn run(
                     Operation::VolumeIdentify,
                     &device,
                     Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-                ),
+                )
+                .with_mam_reads(&reads),
             )?;
             // The tape's own account FIRST, always — see `Identified`. A
             // contradiction is reported after it and through the exit code,
@@ -1028,8 +1030,9 @@ pub fn run(
             let device = read_device(config, device.as_deref())?;
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
-            crate::tape::media_detect::check_read_contact(config, &device)?;
-            let observed = crate::volume::binding::loaded_medium(config, &device);
+            let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeReadSlices);
+            reads.check_read_contact(config, &device)?;
+            let observed = crate::volume::binding::loaded_medium(config, &device, &reads);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = write::read_slices(
                 conn,
@@ -1042,7 +1045,8 @@ pub fn run(
                     Operation::VolumeReadSlices,
                     &device,
                     Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-                ),
+                )
+                .with_mam_reads(&reads),
             )?;
             if json_output {
                 println!(
@@ -1157,8 +1161,9 @@ pub fn run(
             let device = read_device(config, device.as_deref())?;
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
-            crate::tape::media_detect::check_read_contact(config, &device)?;
-            let observed = crate::volume::binding::loaded_medium(config, &device);
+            let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeCompactRead);
+            reads.check_read_contact(config, &device)?;
+            let observed = crate::volume::binding::loaded_medium(config, &device, &reads);
             let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
             let report = write::compact_read(
                 conn,
@@ -1170,7 +1175,8 @@ pub fn run(
                     Operation::VolumeCompactRead,
                     &device,
                     Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-                ),
+                )
+                .with_mam_reads(&reads),
             )?;
             if json_output {
                 println!(
@@ -1279,12 +1285,13 @@ pub fn run(
             let device = write_device(config, device.as_deref())?;
             // Issue #166: step 1 only reads, so it gets the same fact check
             // as every other read path, before its store is opened.
-            crate::tape::media_detect::check_read_contact(config, &device)?;
+            let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeCompact);
+            reads.check_read_contact(config, &device)?;
             println!("=== Step 1: Reading live slices from \"{label}\" ===");
             // Scoped so the read-only store (and its device fd) closes
             // before step 2 opens the same device for writing — the st
             // driver refuses a second concurrent open (EBUSY).
-            let observed = crate::volume::binding::loaded_medium(config, &device);
+            let observed = crate::volume::binding::loaded_medium(config, &device, &reads);
             let report = {
                 let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
                 // `Operation::VolumeCompact`, not `VolumeCompactRead`: this
@@ -1303,7 +1310,8 @@ pub fn run(
                         Operation::VolumeCompact,
                         &device,
                         Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-                    ),
+                    )
+                    .with_mam_reads(&reads),
                 )?
             };
             println!(

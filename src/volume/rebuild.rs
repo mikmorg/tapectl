@@ -335,6 +335,7 @@ pub fn rebuild_from_volume(
     fallback_tenant: &str,
     backend_name: Option<&str>,
     scratch: &Path,
+    reads: &crate::tape::mam_journal::MamReads<'_>,
 ) -> Result<RebuildReport> {
     let secret = crate::crypto::keys::read_secret_key(key_path)?;
     let identity: age::x25519::Identity = secret.parse().map_err(|e| {
@@ -345,7 +346,7 @@ pub fn rebuild_from_volume(
     // LENIENT (ADR-0010): rebuild is THE disaster-recovery read path, so a
     // machine with keys and no `backend add` yields `None` — an absence,
     // which corroborates against nothing and proceeds.
-    let observed = crate::volume::binding::loaded_medium(config, device);
+    let observed = crate::volume::binding::loaded_medium(config, device, reads);
     let mut store = TapeStore::open_read(device, block_size)?;
     rebuild_from_store(
         conn,
@@ -366,7 +367,8 @@ pub fn rebuild_from_volume(
             crate::tape::contact::Operation::CatalogRebuild,
             device,
             crate::tape::contact::Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-        ),
+        )
+        .with_mam_reads(reads),
     )
 }
 
