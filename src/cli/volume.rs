@@ -79,15 +79,29 @@ pub enum VolumeCommands {
 
     /// Resume an interrupted write session (issue #25). Reload the SAME
     /// cartridge first: the session continues from its frozen staging files
-    /// rather than rebuilding them, and it refuses (quarantining the volume)
-    /// if the loaded tape's File 0 does not match, or if the tape is already
-    /// sealed. There is no --force: `volume write --force` overrides a
-    /// wrong-cartridge finding before anything is written, which has no
-    /// meaning for a tape this session has already partly written.
+    /// rather than rebuilding them.
     ///
-    /// Refuses any volume not left `initialized` by `volume init` — a
-    /// sealed, retired, erased or quarantined volume is not a write target
-    /// (ADR-0012); no flag overrides it.
+    /// An already-sealed tape is RE-CONFIRMED, not refused, when the tape
+    /// itself proves it is this session's own: File 0's identity matches
+    /// this volume, File 0's OWN recorded seal-marker pointer equals this
+    /// session's layout, and a real seal marker parses at that position
+    /// (issue #208). `seal()` is never called a second time. This is the
+    /// path `volume write` sends you down when it says "run `tapectl
+    /// volume resume <label>` to retry the confirm readback".
+    ///
+    /// Everything else quarantines the volume: a File 0 whose identity does
+    /// not match, one that is unreadable or unparseable, no recorded
+    /// pointer, a pointer disagreeing with this session, or a position that
+    /// does not parse as a seal marker. There is no --force: `volume write
+    /// --force` overrides a wrong-cartridge finding before anything is
+    /// written, which has no meaning for a tape this session has already
+    /// partly written.
+    ///
+    /// Refuses any volume whose CATALOG status is not `initialized` — a
+    /// volume recorded sealed, retired or erased, or whose condition is
+    /// quarantined, is not a write target (ADR-0012); no flag overrides it.
+    /// That is a different question from whether the loaded TAPE carries a
+    /// seal marker, which is what the re-confirm path above is about.
     Resume {
         /// Volume label
         label: String,
