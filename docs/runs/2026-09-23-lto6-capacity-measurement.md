@@ -98,14 +98,18 @@ cartridge reports 2,620,446 MB native).
 | **total `volume write` wall clock** | | **2,186 s** |
 
 The staging disk reads at 219-333 MB/s (`dd iflag=direct`), so it is not what limits the
-write. The streaming loop itself (`tape::ioctl::write_stream`) does NO hashing: it reads
-one 512 KiB block from the staged file, writes it to the drive, and repeats. Integrity
-work sits only in the phases around it: the pre-write L1 check re-hashes every staged
-slice in full, and confirm reads the tape back and hashes it. This VM's CPU has no SHA-NI.
-Coreutils `sha256sum` runs at about 127 MB/s on one core, which makes the two hashing
-phases CPU-bound candidates. The 56 MB/s streaming rate is not hashing. The unprofiled
-hypothesis is that each staging read and tape write are serialized in one thread, with
-no double buffering. Extrapolated linearly to a full 2.5 TB cartridge, the same
+write. **The streaming loop hashes every byte inline.** `session.rs` `execute` wraps each
+staged file in a `util::HashingReader` and passes it to `TapeStore::execute`, so SHA-256
+runs on the same thread as the tape write, block by block. This is tri-layer L2 by design
+(`v2-open-questions.md` §2.4): it closes the window between the pre-write L1 full re-hash
+and the write, and aborts cleanly on a mismatch. So all three phases hash every byte:
+L1 before the write, L2 during it, and confirm after it. This VM's CPU has no SHA-NI, and
+coreutils `sha256sum` runs at about 127 MB/s on one core. The 56 MB/s streaming rate is
+consistent with inline hashing plus a staging read and tape write serialized on one thread,
+with no overlap. Not profiled. (An earlier revision of this paragraph said the streaming
+loop does no hashing. That was wrong; the fourth pre-production review caught it.)
+
+Extrapolated linearly to a full 2.5 TB cartridge, the same
 phases would take about 16 h (pre-write), 12.4 h (write) and 42 h (confirm). That is an
 operability question, not a correctness one.
 
