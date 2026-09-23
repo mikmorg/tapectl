@@ -1289,10 +1289,11 @@ fn volume_write_contacted<'c>(
         conn,
         config,
         device,
-        volume_id,
+        Some(volume_id),
         contact.id(),
         health::Reading::Write,
         Operation::VolumeWrite,
+        HealthProbe::default(),
     );
 
     result
@@ -1557,10 +1558,11 @@ fn volume_resume_contacted<'c>(
         conn,
         config,
         device,
-        volume_id,
+        Some(volume_id),
         contact.id(),
         health::Reading::Resume,
         Operation::VolumeResume,
+        HealthProbe::default(),
     );
 
     result
@@ -2548,27 +2550,86 @@ pub(crate) fn quarantine_on_medium_evidence(
 /// `contact_id` is the contact the caller's guard opened (issue #296): the
 /// reading names it, and the drive this collection identifies is attached to
 /// it — see [`record_health_and_drive`].
+///
+/// LENIENT by construction, which is what lets the read paths share it
+/// (issue #320): a device no configured backend claims — the DR machine
+/// with keys and no `backend add` — gets a warning and nothing else. No
+/// sweep, no row, and never an error, so a restore cannot fail on its
+/// health reading.
+///
+/// `probe` is the test seam (issue #320): [`HealthProbe::default`] — every
+/// production caller — asks the drive.
+#[allow(clippy::too_many_arguments)]
 fn collect_health_best_effort(
     conn: &Connection,
     config: &Config,
     device: &str,
-    volume_id: i64,
+    volume_id: Option<i64>,
     contact_id: Option<i64>,
     operation: health::Reading,
     trigger: Operation,
+    probe: HealthProbe<'_>,
 ) {
     match health_backend(config, device) {
         Ok(bk) => collect_and_record_health(
-            conn,
-            bk,
-            Some(volume_id),
-            contact_id,
-            None,
-            operation,
-            trigger,
+            conn, bk, volume_id, contact_id, None, operation, trigger, probe,
         ),
         Err(unattributed) => warn!("{unattributed}"),
     }
+}
+
+/// Where a health collection's hardware answers come from. The default —
+/// every production path — is the drive itself: `sg_logs` and one INQUIRY on
+/// the backend's sg node, and the drive's identity from sysfs / VPD 0x80.
+/// A test substitutes a fixture log source and a fixed identity, the same
+/// two seams a read path's [`ContactSite`] carries
+/// ([`ContactSite::with_log_source`], [`ContactSite::with_drive_identity`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HealthProbe<'a> {
+    pub log_source: Option<&'a std::cell::RefCell<dyn log_pages::LogSource + 'a>>,
+    pub identity: Option<&'a drive_identity::DriveIdentity>,
+}
+
+/// The post-command health reading of a READ-path contact (issue #320,
+/// ADR-0013's 2026-09-23 amendment): one log-page sweep, its journal rows
+/// and one `health_logs` row of kind [`health::Reading::Restore`], all
+/// naming `contact_id`, the drive attached to it by id.
+///
+/// Called by each read-path store seam exactly once, AFTER its guard has
+/// closed the contact — post-command and attached by contact id, as
+/// `volume verify` does — and on EVERY outcome: a restore that failed on a
+/// read error is precisely the contact whose read-error counters (page
+/// 0x03) this suite most needs. Because the seam that OPENS the contact is
+/// the one place this is called, a contact gets one sweep by construction:
+/// `restore file` reaches the drive through `restore unit`'s seam and so
+/// shares its one contact and its one sweep.
+///
+/// Through [`collect_health_best_effort`] and so [`health_backend`] — the
+/// same resolution `volume write`/`volume resume` use (#313's canonicalising
+/// match), which is what puts #313 under tape coverage on the read path.
+/// Lenient and best-effort throughout: nothing here can fail the command.
+///
+/// `trigger` is the site's own operation, never a constant: `compact_read`
+/// serves both `volume compact-read` and `volume compact`.
+pub(crate) fn health_after_read_contact(
+    conn: &Connection,
+    site: &ContactSite<'_>,
+    volume_id: Option<i64>,
+    contact_id: Option<i64>,
+) {
+    collect_health_best_effort(
+        conn,
+        site.config(),
+        site.device(),
+        volume_id,
+        contact_id,
+        health::Reading::Restore,
+        site.operation(),
+        HealthProbe {
+            log_source: site.injected_log_source(),
+            identity: site.injected_drive_identity(),
+        },
+    );
 }
 
 /// The configured backend a health collection on `device` reads through,
@@ -2610,6 +2671,7 @@ fn health_backend<'a>(
 /// hazard, issue #298): the sweep is the ONLY log-page reader, the counters
 /// are parsed from its offline decode, and the identity comes from sysfs /
 /// VPD 0x80 and an INQUIRY — never from a second `sg_logs` run.
+#[allow(clippy::too_many_arguments)]
 fn collect_and_record_health(
     conn: &Connection,
     bk: &crate::config::LtoBackendConfig,
@@ -2618,10 +2680,22 @@ fn collect_and_record_health(
     session_id: Option<i64>,
     reading: health::Reading,
     trigger: Operation,
+    probe: HealthProbe<'_>,
 ) {
-    let sweep = log_pages::sweep(&mut log_pages::SgLogs::new(&bk.device_sg));
-    let header = log_pages::inquiry_header(&bk.device_sg);
-    let identity = drive_identity::read_identity(bk);
+    // An injected source stands in for the drive entirely: no `sg_logs`,
+    // and no INQUIRY either (the header is an addition to the record, never
+    // a precondition for it).
+    let (sweep, header) = match probe.log_source {
+        Some(source) => (log_pages::sweep(&mut *source.borrow_mut()), None),
+        None => (
+            log_pages::sweep(&mut log_pages::SgLogs::new(&bk.device_sg)),
+            log_pages::inquiry_header(&bk.device_sg),
+        ),
+    };
+    let identity = match probe.identity {
+        Some(identity) => identity.clone(),
+        None => drive_identity::read_identity(bk),
+    };
     record_sweep_and_health(
         conn,
         HealthSite {
@@ -3111,6 +3185,7 @@ pub fn volume_verify(
             report.session_id,
             health::Reading::Verify,
             Operation::VolumeVerify,
+            HealthProbe::default(),
         ),
         None => {
             report.drive_health_note = Some(format!(
@@ -3391,6 +3466,7 @@ pub fn volume_identify_corroborated(
     // command's subject, and recording it in the contact's `volume_id`
     // would turn the tape's own assertion into the catalog's.
     let guard = site.open(conn, None);
+    let contact_id = guard.id();
     let r = identify_contacted(conn, store, site.medium_serial());
     // A contradiction is what the CLI turns into a non-zero exit, so it is
     // how this contact ENDED even though the function returns `Ok` — the
@@ -3403,6 +3479,10 @@ pub fn volume_identify_corroborated(
         Ok(_) => guard.finish(contact::OUTCOME_OK, None),
         Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
     }
+    // Identify reads tape data (File 0), so it is a read-path contact and
+    // takes the post-command reading (issue #320) — naming no volume, as
+    // its contact names none.
+    health_after_read_contact(conn, &site, None, contact_id);
     r
 }
 
@@ -3567,14 +3647,18 @@ pub fn read_slices(
         )
         .optional()?;
     let guard = site.open(conn, from_vol_id);
-    guard.finish_result(read_slices_contacted(
+    let contact_id = guard.id();
+    let r = guard.finish_result(read_slices_contacted(
         conn,
         config,
         from_label,
         unit_name,
         store,
         site.medium_serial(),
-    ))
+    ));
+    // The post-command health reading (issue #320), on every outcome.
+    health_after_read_contact(conn, &site, from_vol_id, contact_id);
+    r
 }
 
 /// [`read_slices`] minus the contact bookkeeping.
@@ -3765,13 +3849,19 @@ pub fn compact_read(
         )
         .optional()?;
     let guard = site.open(conn, volume_id);
-    guard.finish_result(compact_read_contacted(
+    let contact_id = guard.id();
+    let r = guard.finish_result(compact_read_contacted(
         conn,
         config,
         label,
         store,
         site.medium_serial(),
-    ))
+    ));
+    // The post-command health reading (issue #320), on every outcome — for
+    // `volume compact` this is step 1's contact; step 2's write contact
+    // takes its own through `volume_write`.
+    health_after_read_contact(conn, &site, volume_id, contact_id);
+    r
 }
 
 /// [`compact_read`] minus the contact bookkeeping.
@@ -5472,7 +5562,7 @@ mod tests {
         assert_ne!(cid, other_cid, "positive control: two distinct contacts");
 
         let counters = health::HealthCounters {
-            total_uncorrected: 2,
+            total_uncorrected: Some(2),
             tape_alerts: Some(0),
             ..Default::default()
         };
@@ -5511,7 +5601,9 @@ mod tests {
             "an unrelated contact must not be touched"
         );
 
-        let rows: Vec<(Option<i64>, Option<i64>, String, i64)> = conn
+        /// `(volume_id, contact_id, operation, total_uncorrected)`.
+        type HealthRow = (Option<i64>, Option<i64>, String, Option<i64>);
+        let rows: Vec<HealthRow> = conn
             .prepare("SELECT volume_id, contact_id, operation, total_uncorrected FROM health_logs")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -5520,7 +5612,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows,
-            vec![(Some(vid), Some(cid), "write".to_string(), 2)],
+            vec![(Some(vid), Some(cid), "write".to_string(), Some(2))],
             "exactly one health row, naming THIS contact"
         );
     }
@@ -5715,6 +5807,9 @@ mod tests {
             ("health::Reading::Write,", "Operation::VolumeWrite,"),
             ("health::Reading::Resume,", "Operation::VolumeResume,"),
             ("health::Reading::Verify,", "Operation::VolumeVerify,"),
+            // Issue #320: the one read-path caller takes the command from
+            // its site — `compact_read` serves two commands.
+            ("health::Reading::Restore,", "site.operation(),"),
         ] {
             let at = prod
                 .find(reading)
@@ -5804,10 +5899,11 @@ mod tests {
             &conn,
             &config,
             &device,
-            vid,
+            Some(vid),
             Some(cid),
             health::Reading::Write,
             Operation::VolumeWrite,
+            HealthProbe::default(),
         );
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
@@ -10460,6 +10556,185 @@ mod tests {
             let (operation, outcome, _) = only_contact(&conn);
             assert_eq!(operation, "volume compact-read");
             assert_eq!(outcome.as_deref(), Some("failed"));
+        }
+
+        // ── issue #320: every read seam here takes ONE post-command health
+        //    reading per contact; verify's seam takes none of its own ──
+
+        /// A config whose one backend claims [`TEST_DEVICE`], so the
+        /// post-command reading resolves a drive (the default [`site`] has
+        /// none — the DR shape — and so takes no reading).
+        fn swept_config(staging: &std::path::Path) -> Config {
+            let mut config = Config::default();
+            config.staging.directory = staging.to_string_lossy().into_owned();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto0".to_string(),
+                device_tape: TEST_DEVICE.to_string(),
+                device_sg: "/nonexistent/tapectl-contact-test-sg".to_string(),
+                generation: "LTO-6".to_string(),
+                capacity_override: None,
+                usable_capacity_factor: 0.95,
+                enospc_buffer: "1GiB".to_string(),
+            });
+            config
+        }
+
+        /// `volume identify`, `volume read-slices`, `volume compact-read`
+        /// and step 1 of `volume compact` — the read seams in this file —
+        /// each take exactly one sweep and one `restore` reading naming
+        /// their contact, journalled under the site's own command (so
+        /// `compact_read`'s two commands stay distinct), naming the volume
+        /// the contact names.
+        #[test]
+        fn every_read_seam_here_takes_exactly_one_health_reading_per_contact() {
+            use crate::tape::log_pages::tests::{
+                assert_each_page_read_once, assert_one_reading_for, FixtureSource, LISTED,
+            };
+            let data = b"read-path health fixture bytes, repeated. ".repeat(4);
+            let identity = crate::tape::drive_identity::DriveIdentity {
+                serial: Some("XYZZY_A1".to_string()),
+                ..Default::default()
+            };
+            for operation in [
+                Operation::VolumeIdentify,
+                Operation::VolumeReadSlices,
+                Operation::VolumeCompactRead,
+                Operation::VolumeCompact,
+            ] {
+                let conn = crate::db::open_memory().unwrap();
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = swept_config(tmp.path());
+                let src = std::cell::RefCell::new(FixtureSource::default());
+                let site = ContactSite::new(&config, operation, TEST_DEVICE, Medium::NoBackend)
+                    .with_drive_identity(&identity)
+                    .with_log_source(&src);
+                let label = "RPH-VOL";
+                let snapshot_status = if operation == Operation::VolumeReadSlices {
+                    "staged"
+                } else {
+                    "current"
+                };
+                seed_one_slice_fixture(
+                    &conn,
+                    label,
+                    "rph-unit",
+                    4,
+                    &data,
+                    "completed",
+                    snapshot_status,
+                );
+                let mut store = mem_store_v2_tape(label, &data, &data);
+                let expect_volume = match operation {
+                    Operation::VolumeIdentify => {
+                        volume_identify_corroborated(&conn, &mut store, site).unwrap();
+                        None
+                    }
+                    Operation::VolumeReadSlices => {
+                        read_slices(&conn, &config, label, "rph-unit", &mut store, site).unwrap();
+                        Some(volume_id(&conn, label))
+                    }
+                    _ => {
+                        compact_read(&conn, &config, label, &mut store, site).unwrap();
+                        Some(volume_id(&conn, label))
+                    }
+                };
+                assert_eq!(contact_count(&conn), 1, "{operation:?}");
+                let cid: i64 = conn
+                    .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                    .unwrap();
+                assert_each_page_read_once(&src.borrow().reads);
+                assert_one_reading_for(&conn, cid, operation.as_str(), expect_volume, LISTED.len());
+            }
+        }
+
+        /// The once-per-contact rule from the other side: `volume verify`
+        /// takes its reading OUTSIDE its store seam (`volume_verify`, after
+        /// the seam returns), so the seam must take none — or a verify
+        /// contact would be swept twice. The seam is driven with a drive it
+        /// COULD sweep, and the source is never asked.
+        #[test]
+        fn the_verify_seam_takes_no_reading_of_its_own() {
+            use crate::tape::log_pages::tests::FixtureSource;
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"verify seam health fixture bytes. ".repeat(4);
+            seed_one_slice_fixture(
+                &conn,
+                "VSH-VOL",
+                "vsh-unit",
+                4,
+                &data,
+                "completed",
+                "staged",
+            );
+            let v = volume_id(&conn, "VSH-VOL");
+            let mut store = mem_store_v2_tape("VSH-VOL", &data, &data);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = swept_config(tmp.path());
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VSH-VOL",
+                v,
+                4096,
+                Tier::Integrity,
+                ContactSite::new(
+                    &config,
+                    Operation::VolumeVerify,
+                    TEST_DEVICE,
+                    Medium::NoBackend,
+                )
+                .with_log_source(&src),
+            )
+            .unwrap();
+            assert!(report.contact_id.is_some(), "positive control: a contact");
+            assert!(src.borrow().reads.is_empty(), "the seam swept");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
+
+        /// Every read seam takes its reading through the ONE helper, once,
+        /// and nothing else in production calls it — so backend resolution
+        /// (`health_backend`, #313) is identical on every read path.
+        /// Calibrated: each seam is found first.
+        #[test]
+        fn every_read_seam_calls_the_one_read_path_helper_once() {
+            let corpus = [
+                ("write.rs", include_str!("write.rs")),
+                ("restore.rs", include_str!("restore.rs")),
+                ("rebuild.rs", include_str!("rebuild.rs")),
+            ];
+            let mut total = 0;
+            for (file, src) in corpus {
+                let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+                assert!(prod.len() < src.len(), "positive control: {file} split");
+                total += prod
+                    .matches("health_after_read_contact(conn, &site,")
+                    .count();
+            }
+            assert_eq!(
+                total, 6,
+                "six read seams — restore unit, restore raw-volume, catalog rebuild, \
+                 volume identify, read-slices, compact-read — one call each"
+            );
+            let write = corpus[0].1.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for f in [
+                "pub fn volume_identify_corroborated(",
+                "pub fn read_slices(",
+                "pub fn compact_read(",
+            ] {
+                let start = write.find(f).unwrap_or_else(|| panic!("no {f}"));
+                let end = write[start..].find("\n}\n").unwrap() + start;
+                assert_eq!(
+                    write[start..end]
+                        .matches("health_after_read_contact(")
+                        .count(),
+                    1,
+                    "{f}"
+                );
+            }
         }
 
         /// `identify` runs against whatever tape is loaded, so `volume_id` is

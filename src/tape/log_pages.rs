@@ -842,6 +842,61 @@ pub(crate) mod tests {
         );
     }
 
+    /// Issue #320: the catalog holds exactly ONE health reading and ONE
+    /// sweep's journal rows, and both belong to contact `cid` — the
+    /// once-per-contact rule, asserted from the rows a read path left.
+    ///
+    /// `pages` is how many pages the fixture's 0x00 lists (0x00 included):
+    /// one sweep journals exactly that many rows, and a second sweep would
+    /// double it and repeat page 0x00. `volume_id` is the volume the reading
+    /// must name — the same one its contact names. The reading's kind is
+    /// `restore`, the one read-path kind (ADR-0013's 2026-09-23 amendment).
+    pub(crate) fn assert_one_reading_for(
+        conn: &Connection,
+        cid: i64,
+        trigger: &str,
+        volume_id: Option<i64>,
+        pages: usize,
+    ) {
+        let health: Vec<(Option<i64>, String, Option<i64>)> = conn
+            .prepare("SELECT contact_id, operation, volume_id FROM health_logs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            health,
+            vec![(Some(cid), "restore".to_string(), volume_id)],
+            "exactly one health_logs row, of kind 'restore', naming contact {cid}"
+        );
+        let journal: Vec<(Option<i64>, String, i64)> = conn
+            .prepare("SELECT contact_id, trigger, page_code FROM log_page_journal ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            journal.len(),
+            pages,
+            "one sweep's journal rows, no more: {journal:?}"
+        );
+        assert_eq!(
+            journal.iter().filter(|(_, _, p)| *p == 0).count(),
+            1,
+            "page 0x00 read once — one sweep"
+        );
+        let foreign: Vec<_> = journal
+            .iter()
+            .filter(|(c, t, _)| *c != Some(cid) || t != trigger)
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "every journal row names contact {cid} under trigger {trigger:?}: {foreign:?}"
+        );
+    }
+
     fn open_contact(conn: &Connection) -> i64 {
         conn.execute(
             "INSERT INTO cartridge_contacts (operation, device) VALUES ('volume write', '/dev/null')",
@@ -1363,14 +1418,14 @@ pub(crate) mod tests {
         assert!(text(0x03).contains("Total times correction algorithm processed = 69"));
 
         let (c, raw_log) = s.health(None).expect("a health reading");
-        assert_eq!(c.total_uncorrected, 0);
-        assert_eq!(c.total_corrected, 0);
-        assert_eq!(c.corrected_no_delay, 920 + 69);
-        assert_eq!(c.corrected_with_delay, 0);
-        assert_eq!(c.correction_algorithm_invocations, 306488 + 69);
-        assert_eq!(c.total_bytes_processed, 12820, "the max, not the sum");
-        assert_eq!(c.total_rewritten, 0);
-        assert_eq!(c.total_retries, 0);
+        assert_eq!(c.total_uncorrected, Some(0));
+        assert_eq!(c.total_corrected, Some(0));
+        assert_eq!(c.corrected_no_delay, Some(920 + 69));
+        assert_eq!(c.corrected_with_delay, Some(0));
+        assert_eq!(c.correction_algorithm_invocations, Some(306488 + 69));
+        assert_eq!(c.total_bytes_processed, Some(12820), "the max, not the sum");
+        assert_eq!(c.total_rewritten, Some(0));
+        assert_eq!(c.total_retries, Some(0));
         assert_eq!(HealthCounters::from_raw_log(&raw_log), c);
     }
 
@@ -1383,6 +1438,249 @@ pub(crate) mod tests {
         assert!(p2e.ok(), "positive control: 0x2e read ok");
         assert!(p2e.decoded.as_deref().unwrap().contains("Hard error: 0"));
         assert_eq!(stored_tape_alerts(&s), Some(0));
+    }
+
+    // ── issue #322: every counter is NULL when a page it derives from was
+    //    not read ok — never 0, never a partial sum (#317's rule, widened) ──
+
+    /// Every counter column of the `health_logs` row a sweep's reading
+    /// stores, read back through the production writer as `Option`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct StoredCounters {
+        total_bytes: Option<i64>,
+        total_uncorrected: Option<i64>,
+        total_corrected: Option<i64>,
+        total_retries: Option<i64>,
+        total_rewritten: Option<i64>,
+        tape_alerts: Option<i64>,
+    }
+
+    fn stored_counters(s: &Sweep) -> StoredCounters {
+        let conn = crate::db::open_memory().unwrap();
+        let (counters, raw_log) = s.health(None).expect("a health reading");
+        crate::tape::health::record(
+            &conn,
+            None,
+            None,
+            None,
+            crate::tape::health::Reading::Write,
+            &counters,
+            &raw_log,
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT total_bytes, total_uncorrected, total_corrected, total_retries,
+                    total_rewritten, tape_alerts FROM health_logs",
+            [],
+            |r| {
+                Ok(StoredCounters {
+                    total_bytes: r.get(0)?,
+                    total_uncorrected: r.get(1)?,
+                    total_corrected: r.get(2)?,
+                    total_retries: r.get(3)?,
+                    total_rewritten: r.get(4)?,
+                    tape_alerts: r.get(5)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    /// Live (non-zero, pairwise distinct) texts for 0x02 and 0x03, so a
+    /// stored value cannot be right by being 0 and a partial sum cannot pass
+    /// for the whole: a partial `total_uncorrected` would be 1 or 4, the
+    /// whole is 5.
+    const LIVE_02: &str = "Write error counter page  [0x2]\n  Errors corrected without substantial delay = 875\n  Errors corrected with possible delays = 6\n  Total rewrites or rereads = 7\n  Total errors corrected = 8\n  Total times correction algorithm processed = 305674\n  Total bytes processed = 4096\n  Total uncorrected errors = 1\n";
+    const LIVE_03: &str = "Read error counter page  [0x3]\n  Errors corrected without substantial delay = 2\n  Errors corrected with possible delays = 9\n  Total rewrites or rereads = 3\n  Total errors corrected = 10\n  Total times correction algorithm processed = 11\n  Total bytes processed = 8192\n  Total uncorrected errors = 4\n";
+
+    fn live_source() -> FixtureSource {
+        let mut src = FixtureSource::default();
+        src.text.insert(0x02, LIVE_02.to_string());
+        src.text.insert(0x03, LIVE_03.to_string());
+        src
+    }
+
+    /// Positive control for every #322 case below: with BOTH pages read,
+    /// every column is the whole figure — sums, the max, each page's own.
+    #[test]
+    fn both_error_counter_pages_read_store_every_counter() {
+        let mut src = live_source();
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: Some(8192),
+                total_uncorrected: Some(5),
+                total_corrected: Some(18),
+                total_retries: Some(3),
+                total_rewritten: Some(7),
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// Page 0x00 omits 0x02: `total_rewritten` (0x02 only) and every
+    /// counter that sums or maxes both pages are NULL; `total_retries`
+    /// (0x03 only) and `tape_alerts` (0x2e) are intact.
+    #[test]
+    fn a_page_list_without_0x02_stores_null_for_every_counter_0x02_feeds() {
+        let mut src = live_source();
+        src.bytes
+            .insert(0x00, vec![0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x2e]);
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(src.order, vec![0x00, 0x03, 0x2e], "0x02 is never read");
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: None,
+                total_uncorrected: None,
+                total_corrected: None,
+                total_retries: Some(3),
+                total_rewritten: None,
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// Page 0x00 omits 0x03: the mirror image.
+    #[test]
+    fn a_page_list_without_0x03_stores_null_for_every_counter_0x03_feeds() {
+        let mut src = live_source();
+        src.bytes
+            .insert(0x00, vec![0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x2e]);
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(src.order, vec![0x00, 0x02, 0x2e], "0x03 is never read");
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: None,
+                total_uncorrected: None,
+                total_corrected: None,
+                total_retries: None,
+                total_rewritten: Some(7),
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// 0x02 listed, its read fails: the same NULLs as unlisted.
+    #[test]
+    fn a_failed_0x02_read_stores_null_for_every_counter_0x02_feeds() {
+        let mut src = live_source();
+        src.fail.insert(0x02);
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert!(!s.page(0x02).unwrap().ok(), "0x02 was attempted and failed");
+        assert!(s.page(0x03).unwrap().ok(), "positive control: 0x03 read");
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: None,
+                total_uncorrected: None,
+                total_corrected: None,
+                total_retries: Some(3),
+                total_rewritten: None,
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// 0x03 listed, its read fails: the mirror image.
+    #[test]
+    fn a_failed_0x03_read_stores_null_for_every_counter_0x03_feeds() {
+        let mut src = live_source();
+        src.fail.insert(0x03);
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert!(!s.page(0x03).unwrap().ok(), "0x03 was attempted and failed");
+        assert!(s.page(0x02).unwrap().ok(), "positive control: 0x02 read");
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: None,
+                total_uncorrected: None,
+                total_corrected: None,
+                total_retries: None,
+                total_rewritten: Some(7),
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// Positive control: the mhvtl fixture set, every page read — today's
+    /// values (all zero), and every one of them RECORDED.
+    #[test]
+    fn the_mhvtl_fixture_set_stores_every_counter_as_recorded() {
+        let s = sweep(&mut FixtureSource::default());
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: Some(0),
+                total_uncorrected: Some(0),
+                total_corrected: Some(0),
+                total_retries: Some(0),
+                total_rewritten: Some(0),
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// Positive control: the real HP LTO-6 with no medium keeps today's
+    /// values, every one recorded.
+    #[test]
+    fn the_real_hp_lto6_nomedia_set_stores_every_counter_as_recorded() {
+        let s = sweep(&mut hp_source());
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: Some(12820),
+                total_uncorrected: Some(0),
+                total_corrected: Some(0),
+                total_retries: Some(0),
+                total_rewritten: Some(0),
+                tape_alerts: Some(0),
+            }
+        );
+    }
+
+    /// Positive control: the real HP LTO-6 with the FUJIFILM cartridge
+    /// loaded (`hp_lto6_sg0_fuji_ew7vwmvkf6`, issue #298), every page it
+    /// lists answered from that set.
+    #[test]
+    fn the_real_hp_lto6_fuji_set_stores_every_counter_as_recorded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sg_logs/hp_lto6_sg0_fuji_ew7vwmvkf6");
+        let p00 = std::fs::read(dir.join("page_0x00.bin")).unwrap();
+        let listed = parse_supported_pages(&p00).unwrap();
+        assert_eq!(listed.len(), 22, "positive control: the fixture's own 0x00");
+        let mut src = FixtureSource::default();
+        for p in &listed {
+            src.bytes.insert(
+                *p,
+                std::fs::read(dir.join(format!("page_0x{p:02x}.bin"))).unwrap(),
+            );
+            src.text.insert(
+                *p,
+                std::fs::read_to_string(dir.join(format!("page_0x{p:02x}.decoded.txt"))).unwrap(),
+            );
+        }
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(src.order, listed, "every page the fixture lists, in order");
+        assert_eq!(
+            stored_counters(&s),
+            StoredCounters {
+                total_bytes: Some(0),
+                total_uncorrected: Some(0),
+                total_corrected: Some(0),
+                total_retries: Some(0),
+                total_rewritten: Some(0),
+                tape_alerts: Some(0),
+            }
+        );
     }
 
     // ── the counters: the sweep equals the old three-page path ──
@@ -1428,7 +1726,7 @@ pub(crate) mod tests {
             HealthCounters::default(),
             "positive control: the inputs are live"
         );
-        assert_eq!(expected.corrected_no_delay, 877);
+        assert_eq!(expected.corrected_no_delay, Some(877));
         assert_eq!(expected.tape_alerts, Some(2));
 
         let mut src = FixtureSource::default();

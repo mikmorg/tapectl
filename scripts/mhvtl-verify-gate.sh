@@ -956,6 +956,89 @@ PYBYID
 }
 check health_by_id_device step_health_by_id_device
 
+# ---------- by-id on the READ path (issue #320, #313's missing control) ----------
+# Since #320 every read-path contact takes the post-command sweep, through
+# the SAME backend lookup `volume write`/`volume resume` use
+# (`health_backend`, #313's canonicalising match). `volume verify` resolves
+# its backend a different way (`config::resolve_device`), so
+# health_by_id_device above cannot see a regression in `health_backend` --
+# before this step, reverting #313 to a raw string `==` left the whole gate
+# green (#321's finding). This step is that control: a by-id `restore unit`
+# gets no health row and no page-0x00 row the moment `health_backend` stops
+# canonicalising.
+#
+# Same drive, same preconditions, same "before" discipline as
+# health_by_id_device, and the same tape: RLABEL4 (sealed by the resume in
+# tier3_floor_unconfirmed; the only copy of unitA). Runs before the journals
+# leg, so its contact is also covered by log_page_sweep_complete.
+step_health_by_id_restore() {
+    local serial by_id before
+    serial="$(tail -c +5 "/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE_DEV")")/device/vpd_pg80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
+    [ -n "$serial" ] || { echo "cannot read the gate drive's serial from sysfs"; return 1; }
+    by_id="/dev/tape/by-id/scsi-${serial}-nst"
+    [ -e "$by_id" ] || { echo "precondition: $by_id does not exist"; return 1; }
+    [ "$(readlink -f "$by_id")" = "$(readlink -f "$TAPE_DEV")" ] || {
+        echo "precondition: $by_id -> $(readlink -f "$by_id"), not $TAPE_DEV -> $(readlink -f "$TAPE_DEV")"
+        return 1
+    }
+    [ "$by_id" != "$TAPE_DEV" ] || {
+        echo "precondition: the gate was run with TAPECTL_GATE_TAPE=$by_id; this step needs the /dev/nstN spelling in config"
+        return 1
+    }
+    if grep -E '^[[:space:]]*device_tape[[:space:]]*=' "$CFG" | grep -qF "\"$by_id\""; then
+        echo "precondition: $CFG already names $by_id as a device_tape -- string equality would carry the lookup"
+        return 1
+    fi
+    before="$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT COALESCE(MAX(id),0) FROM cartridge_contacts WHERE operation = '"'restore unit'"'").fetchone()[0])' "$HOME_DIR/tapectl.db")" \
+        || { echo "could not read the last restore contact id"; return 1; }
+    echo "by-id: $by_id -> $(readlink -f "$by_id") (config says $TAPE_DEV); last restore contact before: $before"
+    TCTL restore unit --unit unitA --from "$RLABEL4" --to "$RUN/restored-by-id" --device "$by_id" \
+        && diff -r "$SRC/unitA" "$RUN/restored-by-id" \
+        || return 1
+    python3 - "$HOME_DIR/tapectl.db" "$before" "$by_id" "$serial" <<'PYBYIDR'
+import sqlite3, sys
+db, before, by_id, want = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+c = sqlite3.connect(db)
+cid = c.execute(
+    "SELECT MAX(id) FROM cartridge_contacts WHERE operation = 'restore unit'").fetchone()[0]
+assert cid is not None and cid > before, (
+    f"positive control: no NEW 'restore unit' contact (max id {cid}, before {before}) -- "
+    "the assertions below would be about an earlier contact")
+device, closed_at, drive_id, serial = c.execute(
+    """SELECT cc.device, cc.closed_at, cc.drive_id, d.serial
+       FROM cartridge_contacts cc LEFT JOIN drives d ON d.id = cc.drive_id
+       WHERE cc.id = ?""", (cid,)).fetchone()
+bad = []
+if device != by_id:
+    bad.append(f"contact records device {device!r}, not the by-id spelling {by_id!r} -- "
+               "the spelling never reached tapectl")
+if closed_at is None:
+    bad.append("contact did not close")
+if drive_id is None:
+    bad.append("drive_id is NULL -- the by-id spelling found no backend at contact open")
+elif serial != want:
+    bad.append(f"drive_id names serial {serial!r}, not the gate drive {want!r}")
+health = c.execute(
+    "SELECT operation FROM health_logs WHERE contact_id = ?", (cid,)).fetchall()
+if len(health) != 1:
+    bad.append(f"{len(health)} health_logs rows for this contact, want exactly 1 -- "
+               + ("the read path's health lookup did not find the backend for the by-id "
+                  "spelling (issue #313's shape, on the path #320 added)" if not health
+                  else "a contact was read twice (ADR-0013's once-per-contact rule)"))
+elif health[0][0] != "restore":
+    bad.append(f"health_logs.operation is {health[0][0]!r}, not 'restore' (issue #320)")
+n_zero = c.execute(
+    "SELECT COUNT(*) FROM log_page_journal WHERE contact_id = ? AND page_code = 0",
+    (cid,)).fetchone()[0]
+if n_zero != 1:
+    bad.append(f"{n_zero} log_page_journal page 0x00 rows for this contact, want exactly 1 -- "
+               + ("no sweep ran" if n_zero == 0 else "more than one sweep ran"))
+assert not bad, f"by-id restore contact {cid}:\n  " + "\n  ".join(bad)
+print(f"contact {cid}: device {device}, drive {serial}, one 'restore' health row, page 0x00 swept once")
+PYBYIDR
+}
+check health_by_id_restore step_health_by_id_restore
+
 # ---------- journals leg: the forensics journals (issue #319) ----------
 # Migrations 022 (`mam_journal`, #297) and 023 (`log_page_journal`, #298)
 # journal every MAM read and every sg_logs page read verbatim, against the
@@ -985,7 +1068,12 @@ step_log_page_sweep_complete() {
     python3 - "$HOME_DIR/tapectl.db" <<'PYLP_SWEEP'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
-OPS = ("volume write", "volume resume", "volume verify")
+# "restore unit" since issue #320: every read-path contact takes the same
+# post-command sweep. The other read paths (raw-volume, rebuild, identify,
+# read-slices, compact-read) are not exercised by this gate, and the positive
+# control below requires at least one contact of EACH listed operation -- so
+# listing one the gate never runs would fail for the wrong reason.
+OPS = ("volume write", "volume resume", "volume verify", "restore unit")
 contacts = c.execute(
     f"""SELECT id, operation FROM cartridge_contacts
         WHERE operation IN ({",".join("?" * len(OPS))}) AND closed_at IS NOT NULL
@@ -993,8 +1081,8 @@ contacts = c.execute(
 # Positive control: the gate performs at least one of each, so an empty or
 # partial set means the query (or the gate) is broken, not the journal clean.
 seen = {op for _, op in contacts}
-assert len(contacts) >= 3 and seen == set(OPS), (
-    f"positive control: expected >=3 closed contacts covering every one of {OPS}; "
+assert len(contacts) >= len(OPS) and seen == set(OPS), (
+    f"positive control: expected >={len(OPS)} closed contacts covering every one of {OPS}; "
     f"got {len(contacts)} covering {sorted(seen)} -- the check cannot see what it asserts about")
 bad = []
 for cid, op in contacts:
@@ -1022,7 +1110,7 @@ for cid, op in contacts:
                    f"missing {sorted(f'{p:02x}' for p in listed - read)}, "
                    f"unlisted {sorted(f'{p:02x}' for p in read - listed)}")
 assert not bad, "log-page sweep incomplete:\n  " + "\n  ".join(bad)
-print(f"{len(contacts)} closed write/resume/verify contacts, each swept exactly the pages its own 0x00 listed")
+print(f"{len(contacts)} closed write/resume/verify/restore-unit contacts, each swept exactly the pages its own 0x00 listed")
 PYLP_SWEEP
 }
 

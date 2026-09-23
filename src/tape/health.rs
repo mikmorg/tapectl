@@ -11,7 +11,9 @@
 //! sg_logs output is human-oriented and varies across sg3-utils versions.
 //! The parser is deliberately forgiving: it greps known key phrases and
 //! ignores anything it does not understand. Unknown format = zeroed counters,
-//! not a crash.
+//! not a crash — for a page that WAS read. A page that was not read makes
+//! every counter it feeds NULL, never zero (issue #322; see
+//! [`HealthCounters`]).
 //!
 //! Different vendors populate different parameters on pages 0x02/0x03
 //! (issue #120). `Total errors corrected` is the parameter this module has
@@ -30,14 +32,33 @@
 use crate::error::Result;
 use rusqlite::{params, Connection};
 
-/// Aggregated error counters across all parsed pages.
+/// A health reading's counters — what one `health_logs` row stores.
+///
+/// Every field is `Option` (issue #322, #317's rule widened to every
+/// column): `Some` only when EVERY page the figure derives from was read ok
+/// and decoded in this sweep; `None` — stored NULL, "not recorded" — the
+/// moment one was not. Never 0 for an unread page, and never a partial sum
+/// that reads as the whole:
+///
+/// | field | derives from |
+/// |---|---|
+/// | `total_rewritten` | 0x02 |
+/// | `total_retries` | 0x03 |
+/// | `total_uncorrected`, `total_corrected`, the three ECC trending fields | the SUM of 0x02 and 0x03 |
+/// | `total_bytes_processed` | the MAX of 0x02 and 0x03 |
+/// | `tape_alerts` | 0x2e |
+///
+/// Some-ness is page-level: a page that was read and decoded but does not
+/// carry a parameter contributes 0 for it (the parser's forgiving design),
+/// exactly as a decoded 0x2e with no flag raised is `Some(0)`. What the
+/// field refuses to do is speak for a page nobody read.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HealthCounters {
-    pub total_bytes_processed: i64,
-    pub total_uncorrected: i64,
-    pub total_corrected: i64,
-    pub total_retries: i64,
-    pub total_rewritten: i64,
+    pub total_bytes_processed: Option<i64>,
+    pub total_uncorrected: Option<i64>,
+    pub total_corrected: Option<i64>,
+    pub total_retries: Option<i64>,
+    pub total_rewritten: Option<i64>,
     /// Raised TapeAlert flags on page 0x2e. `None` when no 0x2e decode
     /// contributed — the page was not listed, its read failed, or its decode
     /// failed — and `health_logs.tape_alerts` is then NULL, migration 009's
@@ -47,23 +68,47 @@ pub struct HealthCounters {
     /// "Errors corrected without substantial delay" (0x02/0x03). On drives
     /// that leave `total_corrected` (`Total errors corrected`) at 0, this is
     /// where ECC activity actually shows up — see the module doc.
-    pub corrected_no_delay: i64,
+    pub corrected_no_delay: Option<i64>,
     /// "Errors corrected with possible delays" (0x02/0x03) — sibling of
     /// `corrected_no_delay`, the costlier ECC bucket.
-    pub corrected_with_delay: i64,
+    pub corrected_with_delay: Option<i64>,
     /// "Total times correction algorithm processed" (0x02/0x03) — the other
     /// parameter that trends upward as a drive or medium degrades.
+    pub correction_algorithm_invocations: Option<i64>,
+}
+
+/// What ONE page says — its parameters as parsed, not a reading.
+///
+/// Split from [`HealthCounters`] by issue #322: a single 0x02 page's
+/// `Total uncorrected errors` is half of the reading's figure, and a type
+/// that held it under the reading's name is how a partial sum came to be
+/// stored as the whole. Only [`HealthCounters::from_decoded_pages`] /
+/// [`HealthCounters::from_raw_log`] turn pages into a reading, and they know
+/// which pages were there.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PageCounters {
+    pub total_bytes_processed: i64,
+    pub total_uncorrected: i64,
+    pub total_corrected: i64,
+    /// "Total rewrites or rereads" on page 0x03.
+    pub total_retries: i64,
+    /// "Total rewrites or rereads" on page 0x02.
+    pub total_rewritten: i64,
+    /// `Some` — possibly `Some(0)` — exactly when this is page 0x2e.
+    pub tape_alerts: Option<i64>,
+    pub corrected_no_delay: i64,
+    pub corrected_with_delay: i64,
     pub correction_algorithm_invocations: i64,
 }
 
-/// Parse a single sg_logs page output into partial counters.
+/// Parse a single sg_logs page output into that page's parameters.
 ///
-/// Merges into whatever fields that page actually reports.
 /// For 0x02/0x03 (write/read error counter): extracts total-error fields.
 /// For 0x2e (tape alert ssc-3): counts the raised flags into `tape_alerts`,
 /// which is `Some` — possibly `Some(0)` — exactly when this is page 0x2e.
-pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
-    let mut c = HealthCounters::default();
+/// Any other page yields [`PageCounters::default`].
+pub fn parse_sg_logs_page(page: u8, raw: &str) -> PageCounters {
+    let mut c = PageCounters::default();
 
     match page {
         0x02 | 0x03 => {
@@ -121,42 +166,97 @@ pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
     c
 }
 
+/// The health pages one reading was built from, each `None` until a decode
+/// of it contributed. A page seen twice (a repeated `raw_log` marker) sums,
+/// as the pre-#322 merge did.
+#[derive(Default)]
+struct HealthPages {
+    p02: Option<PageCounters>,
+    p03: Option<PageCounters>,
+    p2e: Option<PageCounters>,
+}
+
+impl HealthPages {
+    fn add(&mut self, page: u8, text: &str) {
+        let slot = match page {
+            0x02 => &mut self.p02,
+            0x03 => &mut self.p03,
+            0x2e => &mut self.p2e,
+            // A page no parser knows contributes nothing — and does not
+            // make any counter recorded.
+            _ => return,
+        };
+        let parsed = parse_sg_logs_page(page, text);
+        match slot {
+            Some(into) => merge_page(into, parsed),
+            None => *slot = Some(parsed),
+        }
+    }
+
+    /// The reading, each counter `Some` only when every page it derives
+    /// from contributed (see [`HealthCounters`]).
+    fn counters(&self) -> HealthCounters {
+        let both = |f: fn(&PageCounters) -> i64| match (&self.p02, &self.p03) {
+            (Some(a), Some(b)) => Some(f(a) + f(b)),
+            _ => None,
+        };
+        HealthCounters {
+            total_bytes_processed: match (&self.p02, &self.p03) {
+                (Some(a), Some(b)) => Some(a.total_bytes_processed.max(b.total_bytes_processed)),
+                _ => None,
+            },
+            total_uncorrected: both(|p| p.total_uncorrected),
+            total_corrected: both(|p| p.total_corrected),
+            total_retries: self.p03.as_ref().map(|p| p.total_retries),
+            total_rewritten: self.p02.as_ref().map(|p| p.total_rewritten),
+            tape_alerts: self.p2e.as_ref().and_then(|p| p.tape_alerts),
+            corrected_no_delay: both(|p| p.corrected_no_delay),
+            corrected_with_delay: both(|p| p.corrected_with_delay),
+            correction_algorithm_invocations: both(|p| p.correction_algorithm_invocations),
+        }
+    }
+}
+
 impl HealthCounters {
     /// Counters from `(page, decoded text)` pairs — each page through
-    /// [`parse_sg_logs_page`], merged. What the log-page sweep's health
-    /// reading computes ([`crate::tape::log_pages::Sweep::health`]); a page
-    /// no parser knows contributes nothing.
+    /// [`parse_sg_logs_page`], then composed so that a counter is recorded
+    /// only when every page it derives from is among the pairs (issue
+    /// #322). What the log-page sweep's health reading computes
+    /// ([`crate::tape::log_pages::Sweep::health`]); a page no parser knows
+    /// contributes nothing.
     pub fn from_decoded_pages<'a>(
         pages: impl IntoIterator<Item = (u8, &'a str)>,
     ) -> HealthCounters {
-        let mut totals = HealthCounters::default();
+        let mut acc = HealthPages::default();
         for (page, text) in pages {
-            merge(&mut totals, parse_sg_logs_page(page, text));
+            acc.add(page, text);
         }
-        totals
+        acc.counters()
     }
 
     /// Re-derive `HealthCounters` from a stored `raw_log` blob — the
     /// concatenated per-page text the health reading writes
     /// ([`crate::tape::log_pages::Sweep::health`]), delimited by
     /// `=== page 0xNN ===` markers. Lets a caller recompute counters,
-    /// including the two "trending" fields that are not persisted as their
-    /// own columns (see the module doc), from an already-stored row without
-    /// a second sg_logs collection.
+    /// including the "trending" fields that are not persisted as their own
+    /// columns (see the module doc), from an already-stored row without a
+    /// second sg_logs collection.
     ///
     /// As forgiving as `parse_sg_logs_page`: text before the first marker is
-    /// ignored, an empty or markerless string yields `HealthCounters::default()`,
-    /// and an unrecognized page number contributes nothing (same as
-    /// `parse_sg_logs_page`'s `_ => {}` arm).
+    /// ignored and an unrecognized page number contributes nothing. And as
+    /// strict as [`from_decoded_pages`](HealthCounters::from_decoded_pages)
+    /// about absence (issue #322): a counter whose page has no section in
+    /// the blob is `None`, so an empty or markerless string yields
+    /// `HealthCounters::default()` — every counter unrecorded.
     pub fn from_raw_log(raw: &str) -> HealthCounters {
-        let mut totals = HealthCounters::default();
+        let mut acc = HealthPages::default();
         let mut current_page: Option<u8> = None;
         let mut current_text = String::new();
 
         for line in raw.lines() {
             if let Some(page) = parse_page_marker(line) {
                 if let Some(p) = current_page {
-                    merge(&mut totals, parse_sg_logs_page(p, &current_text));
+                    acc.add(p, &current_text);
                 }
                 current_page = Some(page);
                 current_text.clear();
@@ -166,10 +266,10 @@ impl HealthCounters {
             }
         }
         if let Some(p) = current_page {
-            merge(&mut totals, parse_sg_logs_page(p, &current_text));
+            acc.add(p, &current_text);
         }
 
-        totals
+        acc.counters()
     }
 }
 
@@ -208,18 +308,34 @@ pub enum Reading {
     Resume,
     /// A `volume verify`.
     Verify,
+    /// A READ-path contact (issue #320, ADR-0013's 2026-09-23 amendment):
+    /// `restore unit`/`restore file`, `restore raw-volume`, `catalog
+    /// rebuild`, `volume identify`, `volume read-slices`, `volume
+    /// compact-read` and step 1 of `volume compact`. ONE kind for all of
+    /// them, as ruled — a reading's kind says which way the tape was driven,
+    /// and the exact command is already on the contact
+    /// (`cartridge_contacts.operation`) and on every journal row
+    /// (`log_page_journal.trigger`), where a second copy here could only
+    /// disagree with it.
+    Restore,
 }
 
 impl Reading {
     /// Every value, for the pinning test. Kept in one place so the test
     /// cannot drift from the type.
-    pub const ALL: &'static [Reading] = &[Reading::Write, Reading::Resume, Reading::Verify];
+    pub const ALL: &'static [Reading] = &[
+        Reading::Write,
+        Reading::Resume,
+        Reading::Verify,
+        Reading::Restore,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Reading::Write => "write",
             Reading::Resume => "resume",
             Reading::Verify => "verify",
+            Reading::Restore => "restore",
         }
     }
 }
@@ -227,10 +343,11 @@ impl Reading {
 /// Insert a row into the `health_logs` table.
 ///
 /// `volume_id` is `Option` from migration 021: a drive-only reading has no
-/// volume (ADR-0013 §§2-3), and `NOT NULL` forbade recording one at all. No
-/// production path passes `None` today — all three writers have a volume in
-/// hand — so this is the schema no longer forbidding the reading, not a claim
-/// that one already exists.
+/// volume (ADR-0013 §§2-3), and `NOT NULL` forbade recording one at all.
+/// Since issue #320 production passes `None` too: a read-path reading names
+/// the same volume its contact does, and `restore raw-volume`, `catalog
+/// rebuild` and `volume identify` contacts name none (each reads whatever
+/// tape is loaded, and a rebuild's volume row is its output, not an input).
 ///
 /// `contact_id` is the `cartridge_contacts` row this reading was taken
 /// during (ADR-0013 §2, migration 021). It is what makes the reading
@@ -409,7 +526,10 @@ pub fn readings_by_cartridge(conn: &Connection) -> Result<Vec<CartridgeReadings>
     Ok(rows)
 }
 
-fn merge(into: &mut HealthCounters, from: HealthCounters) {
+/// Two parses of the SAME page, summed (a `raw_log` that repeats a
+/// marker). Never used across pages: which pages were read is what
+/// [`HealthPages::counters`] decides from.
+fn merge_page(into: &mut PageCounters, from: PageCounters) {
     into.total_uncorrected += from.total_uncorrected;
     into.total_corrected += from.total_corrected;
     into.total_retries += from.total_retries;
@@ -507,7 +627,7 @@ Tape alert page (ssc-3) [0x2e]
     #[test]
     fn parse_unknown_page_yields_zeros() {
         let c = parse_sg_logs_page(0x99, "anything at all = 12345\n");
-        assert_eq!(c, HealthCounters::default());
+        assert_eq!(c, PageCounters::default());
     }
 
     #[test]
@@ -622,10 +742,10 @@ Read error counter page  [0x3]
             "=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n"
         );
         let c = HealthCounters::from_raw_log(&raw);
-        assert_eq!(c.corrected_no_delay, 875 + 2);
-        assert_eq!(c.correction_algorithm_invocations, 305_674 + 2);
-        assert_eq!(c.total_corrected, 0);
-        assert_eq!(c.total_uncorrected, 0);
+        assert_eq!(c.corrected_no_delay, Some(875 + 2));
+        assert_eq!(c.correction_algorithm_invocations, Some(305_674 + 2));
+        assert_eq!(c.total_corrected, Some(0));
+        assert_eq!(c.total_uncorrected, Some(0));
     }
 
     /// `from_raw_log` must carry `tape_alerts` through the re-derive too —
@@ -638,7 +758,7 @@ Read error counter page  [0x3]
             "=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n=== page 0x2e ===\n{PAGE_2E}\n"
         );
         let c = HealthCounters::from_raw_log(&raw);
-        assert_eq!(c.corrected_no_delay, 875 + 2);
+        assert_eq!(c.corrected_no_delay, Some(875 + 2));
         assert_eq!(c.tape_alerts, Some(0)); // PAGE_2E fixture has no raised flags
     }
 
@@ -650,15 +770,57 @@ Read error counter page  [0x3]
     #[test]
     fn from_raw_log_ignores_text_before_first_marker() {
         let raw = format!(
-            "some stray preamble\nnot a page marker\n=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n"
+            "some stray preamble\nnot a page marker\n=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n"
         );
         let c = HealthCounters::from_raw_log(&raw);
-        assert_eq!(c.corrected_no_delay, 875);
+        assert_eq!(c.corrected_no_delay, Some(875 + 2));
     }
 
+    /// Nothing to derive from: every counter unrecorded, none zero.
     #[test]
-    fn from_raw_log_of_empty_string_is_zero() {
-        assert_eq!(HealthCounters::from_raw_log(""), HealthCounters::default());
+    fn from_raw_log_of_empty_string_is_unrecorded() {
+        let c = HealthCounters::from_raw_log("");
+        assert_eq!(c, HealthCounters::default());
+        assert_eq!(c.total_uncorrected, None, "unrecorded, never 0");
+        assert_eq!(c.corrected_no_delay, None, "unrecorded, never 0");
+    }
+
+    /// Issue #322, the re-derive half: a stored `raw_log` with a 0x02
+    /// section and no 0x03 section yields `None` for every figure that sums
+    /// both pages — `derive_trending_counters`' two fields among them —
+    /// never 0 and never 0x02's half passed off as the whole. The 0x02-only
+    /// figure is intact.
+    #[test]
+    fn from_raw_log_without_a_0x03_section_leaves_the_summed_counters_unrecorded() {
+        let raw = format!("=== page 0x02 ===\n{HP_LTO6_BUSY_PAGE_02_JOURNAL_EXCERPT}\n");
+        let c = HealthCounters::from_raw_log(&raw);
+        assert_eq!(c.corrected_no_delay, None, "not 875: that is half a sum");
+        assert_eq!(c.correction_algorithm_invocations, None);
+        assert_eq!(c.corrected_with_delay, None);
+        assert_eq!(c.total_uncorrected, None);
+        assert_eq!(c.total_corrected, None);
+        assert_eq!(c.total_bytes_processed, None);
+        assert_eq!(c.total_retries, None, "0x03 only");
+        assert_eq!(c.total_rewritten, Some(0), "0x02 only, and 0x02 was read");
+        assert_eq!(c.tape_alerts, None);
+        // Positive control: the same text WITH a 0x03 section records all.
+        let both = HealthCounters::from_raw_log(&format!(
+            "{raw}=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n"
+        ));
+        assert_eq!(both.corrected_no_delay, Some(877));
+        assert_eq!(both.total_retries, Some(0));
+    }
+
+    /// The mirror image: a 0x03 section and no 0x02 section.
+    #[test]
+    fn from_raw_log_without_a_0x02_section_leaves_the_summed_counters_unrecorded() {
+        let raw = format!("=== page 0x03 ===\n{SYNTHETIC_HP_LTO6_PAGE_03}\n");
+        let c = HealthCounters::from_raw_log(&raw);
+        assert_eq!(c.corrected_no_delay, None, "not 2: that is half a sum");
+        assert_eq!(c.correction_algorithm_invocations, None);
+        assert_eq!(c.total_bytes_processed, None);
+        assert_eq!(c.total_rewritten, None, "0x02 only");
+        assert_eq!(c.total_retries, Some(0), "0x03 only, and 0x03 was read");
     }
 
     #[test]
@@ -677,15 +839,15 @@ Read error counter page  [0x3]
         let vid = conn.last_insert_rowid();
 
         let counters = HealthCounters {
-            total_bytes_processed: 1024,
-            total_uncorrected: 0,
-            total_corrected: 2,
-            total_retries: 1,
-            total_rewritten: 3,
+            total_bytes_processed: Some(1024),
+            total_uncorrected: Some(0),
+            total_corrected: Some(2),
+            total_retries: Some(1),
+            total_rewritten: Some(3),
             tape_alerts: Some(0),
-            corrected_no_delay: 0,
-            corrected_with_delay: 0,
-            correction_algorithm_invocations: 0,
+            corrected_no_delay: Some(0),
+            corrected_with_delay: Some(0),
+            correction_algorithm_invocations: Some(0),
         };
         record(
             &conn,
@@ -733,15 +895,15 @@ Read error counter page  [0x3]
         let vid = conn.last_insert_rowid();
 
         let counters = HealthCounters {
-            total_bytes_processed: 1,
-            total_uncorrected: 0,
-            total_corrected: 0,
-            total_retries: 0,
-            total_rewritten: 0,
+            total_bytes_processed: Some(1),
+            total_uncorrected: Some(0),
+            total_corrected: Some(0),
+            total_retries: Some(0),
+            total_rewritten: Some(0),
             tape_alerts: Some(3),
-            corrected_no_delay: 0,
-            corrected_with_delay: 0,
-            correction_algorithm_invocations: 0,
+            corrected_no_delay: Some(0),
+            corrected_with_delay: Some(0),
+            correction_algorithm_invocations: Some(0),
         };
         record(
             &conn,
@@ -791,15 +953,15 @@ Read error counter page  [0x3]
             None,
             Reading::Verify,
             &HealthCounters {
-                total_bytes_processed: 1,
-                total_uncorrected: 0,
-                total_corrected: 0,
-                total_retries: 0,
-                total_rewritten: 0,
+                total_bytes_processed: Some(1),
+                total_uncorrected: Some(0),
+                total_corrected: Some(0),
+                total_retries: Some(0),
+                total_rewritten: Some(0),
                 tape_alerts: Some(0),
-                corrected_no_delay: 0,
-                corrected_with_delay: 0,
-                correction_algorithm_invocations: 0,
+                corrected_no_delay: Some(0),
+                corrected_with_delay: Some(0),
+                correction_algorithm_invocations: Some(0),
             },
             "raw",
         )
@@ -825,7 +987,7 @@ Read error counter page  [0x3]
     fn unread_alerts_are_stored_as_null_not_zero() {
         let conn = crate::db::open_memory().unwrap();
         let counters = HealthCounters {
-            total_bytes_processed: 1,
+            total_bytes_processed: Some(1),
             ..Default::default()
         };
         assert_eq!(
@@ -1050,7 +1212,7 @@ Read error counter page  [0x3]
         let names: Vec<&str> = Reading::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(
             names,
-            vec!["write", "resume", "verify"],
+            vec!["write", "resume", "verify", "restore"],
             "health_logs.operation is what KIND of reading a row is — a \
              different vocabulary from cartridge_contacts.operation, which is \
              the command verbatim"

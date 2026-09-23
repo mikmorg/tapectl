@@ -559,6 +559,168 @@ fn a_rebuild_records_its_contact_as_catalog_rebuild_ok() {
     );
 }
 
+// ── issue #320: `catalog rebuild` takes ONE post-command health reading ──
+
+/// A log-page source answering from the mhvtl fixture texts: page 0x00
+/// lists the three health pages, each read is counted. Written here rather
+/// than borrowed because the in-crate `FixtureSource` is `cfg(test)` —
+/// which is also a check that the seam is usable from outside the crate.
+#[derive(Default)]
+struct CountingSource {
+    reads: std::collections::BTreeMap<u8, usize>,
+}
+
+impl tapectl::tape::log_pages::LogSource for CountingSource {
+    fn device_sg(&self) -> &str {
+        "/dev/sg-fixture"
+    }
+
+    fn read_page(&mut self, page: u8) -> (Vec<String>, std::io::Result<std::process::Output>) {
+        use std::os::unix::process::ExitStatusExt;
+        *self.reads.entry(page).or_default() += 1;
+        let stdout = if page == 0 {
+            vec![0x00, 0x00, 0x00, 0x03, 0x02, 0x03, 0x2e]
+        } else {
+            vec![page, 0x00, 0x00, 0x00]
+        };
+        (
+            vec!["sg_logs".into(), format!("--page=0x{page:02x}")],
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            }),
+        )
+    }
+
+    fn decode(&mut self, raw: &[u8]) -> Result<String, String> {
+        Ok(match raw[0] & 0x3f {
+            0x02 => include_str!("fixtures/sg_logs/mhvtl_td8_sg1/page_0x02.decoded.txt"),
+            0x03 => include_str!("fixtures/sg_logs/mhvtl_td8_sg1/page_0x03.decoded.txt"),
+            0x2e => include_str!("fixtures/sg_logs/mhvtl_td8_sg1/page_0x2e.decoded.txt"),
+            _ => "Supported log pages  [0x0]:\n",
+        }
+        .to_string())
+    }
+
+    fn tool_version(&mut self) -> Option<String> {
+        None
+    }
+}
+
+/// A rebuild through a configured drive takes exactly one sweep and one
+/// `restore` reading, both naming its contact — and, like the contact, no
+/// volume: the row the rebuild inserts is its output.
+#[test]
+fn a_rebuild_contact_takes_exactly_one_health_reading() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_file(key_dir.path(), "k.age.key", &secret);
+    let identity: age::x25519::Identity = tapectl::crypto::keys::read_secret_key(&key)
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let mut config = tapectl::config::Config::default();
+    let mut bk = backend().clone();
+    bk.device_tape = "memstore".to_string();
+    config.backends.lto.push(bk);
+    let drive = tapectl::tape::drive_identity::DriveIdentity {
+        serial: Some("XYZZY_A1".to_string()),
+        ..Default::default()
+    };
+    let src = std::cell::RefCell::new(CountingSource::default());
+    rebuild::rebuild_from_store(
+        &conn,
+        &mut vol.store,
+        &[identity],
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        ContactSite::new(
+            &config,
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::NoBackend,
+        )
+        .with_drive_identity(&drive)
+        .with_log_source(&src),
+    )
+    .expect("rebuild from a sealed volume");
+
+    let reads = src.borrow().reads.clone();
+    assert_eq!(
+        reads.into_iter().collect::<Vec<_>>(),
+        vec![(0x00, 1), (0x02, 1), (0x03, 1), (0x2e, 1)],
+        "one sweep: page 0x00 and every page it lists, each once"
+    );
+    let cid: i64 = conn
+        .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+        .unwrap();
+    /// `(contact_id, operation, volume_id, total_uncorrected)`.
+    type HealthRow = (Option<i64>, String, Option<i64>, Option<i64>);
+    let health: Vec<HealthRow> = conn
+        .prepare("SELECT contact_id, operation, volume_id, total_uncorrected FROM health_logs")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        health,
+        vec![(Some(cid), "restore".to_string(), None, Some(0))],
+        "exactly one reading, of kind 'restore', naming the rebuild's contact"
+    );
+    let journal: Vec<(Option<i64>, String)> = conn
+        .prepare("SELECT contact_id, trigger FROM log_page_journal")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        journal,
+        vec![(Some(cid), "catalog rebuild".to_string()); 4],
+        "one sweep's journal rows, each naming the contact and the command"
+    );
+    let drive_serial: Option<String> = conn
+        .query_row(
+            "SELECT d.serial FROM cartridge_contacts c LEFT JOIN drives d ON d.id = c.drive_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(drive_serial.as_deref(), Some("XYZZY_A1"));
+}
+
+/// The DR machine this command exists for: keys and no `backend add`. The
+/// rebuild SUCCEEDS, and takes no reading — no health row, no journal row —
+/// because no configured drive claims the device.
+#[test]
+fn a_dr_rebuild_with_no_backend_succeeds_and_takes_no_reading() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).expect("the DR rebuild");
+    assert!(
+        report.volume_inserted,
+        "positive control: the rebuild did its work"
+    );
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM cartridge_contacts"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM health_logs"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM log_page_journal"), 0);
+}
+
 /// The failure half: a rebuild refused because the catalog's cartridge
 /// binding disagrees with the drive STILL records the contact, with a
 /// non-OK outcome. The contact happened — the tape was read — even though

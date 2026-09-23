@@ -1294,8 +1294,9 @@ pub(crate) struct HealthRow {
     /// raw_log (issue #120): re-parsed on read via
     /// `HealthCounters::from_raw_log` to surface the ECC parameters that
     /// `total_corrected` alone can miss on some drives (see
-    /// `src/tape/health.rs` module doc). `None`/empty means an older row or
-    /// a partial collection — the derived fields render as "n/a".
+    /// `src/tape/health.rs` module doc). `None`/empty means an older row —
+    /// the derived fields render as "n/a". A blob missing page 0x02 or 0x03
+    /// (a partial collection) derives them as unrecorded: "-" (issue #322).
     pub(crate) raw_log: Option<String>,
     pub(crate) drive_serial: Option<String>,
     pub(crate) cartridge_barcode: Option<String>,
@@ -1381,8 +1382,10 @@ pub(crate) fn health_json(rows: &[HealthRow]) -> serde_json::Value {
                     // untouched (still `total_corrected`, in case anything parses
                     // it) — these two are `null` when raw_log is absent/empty,
                     // same convention as "tape_alerts" above.
-                    "corrected_no_delay": derived.as_ref().map(|h| h.corrected_no_delay),
-                    "ecc_invocations": derived.as_ref().map(|h| h.correction_algorithm_invocations),
+                    // `null` too when a page the figure sums was not read
+                    // in that contact (issue #322) — never a partial sum.
+                    "corrected_no_delay": derived.as_ref().and_then(|h| h.corrected_no_delay),
+                    "ecc_invocations": derived.as_ref().and_then(|h| h.correction_algorithm_invocations),
                     // New (issue #296), additive: which drive and which
                     // cartridge, through the reading's contact.
                     "drive_serial": r.drive_serial,
@@ -1438,7 +1441,9 @@ fn health_attribution(drive_serial: Option<&str>, cartridge_barcode: Option<&str
 
 /// Re-derive the trending counters (issue #120) from a stored `raw_log`,
 /// treating `None` and an all-whitespace/empty string the same way — both
-/// mean "nothing to derive from" (an older row, or a partial collection).
+/// mean "nothing to derive from" (an older row). A partial collection is
+/// NOT this case: it derives, and a figure whose page is missing comes back
+/// `None` (issue #322).
 fn derive_trending_counters(raw_log: Option<&str>) -> Option<crate::tape::health::HealthCounters> {
     raw_log
         .filter(|s| !s.trim().is_empty())
@@ -1450,7 +1455,8 @@ fn derive_trending_counters(raw_log: Option<&str>) -> Option<crate::tape::health
 ///
 /// `corrected`/`uncorrected` are `total_corrected`/`total_uncorrected` as
 /// stored; `corrected_no_delay`/`ecc_invocations` are derived from
-/// `raw_log` on the fly and print as `n/a` when it is NULL/empty — see the
+/// `raw_log` on the fly and print as `n/a` when it is NULL/empty, and as `-`
+/// when a page they sum was not in it (issue #322) — see the
 /// module doc on `src/tape/health.rs` for why a single "corrected" number
 /// isn't the whole story on every drive.
 fn health_line(
@@ -1463,14 +1469,16 @@ fn health_line(
     raw_log: Option<&str>,
 ) -> String {
     let derived = derive_trending_counters(raw_log);
-    let corrected_no_delay = derived
-        .as_ref()
-        .map(|h| h.corrected_no_delay.to_string())
-        .unwrap_or_else(|| "n/a".into());
-    let ecc_invocations = derived
-        .as_ref()
-        .map(|h| h.correction_algorithm_invocations.to_string())
-        .unwrap_or_else(|| "n/a".into());
+    // Two different absences, kept apart: `n/a` is "no raw_log to derive
+    // from at all" (an older row); `-` is "derived, but a page this figure
+    // sums was not read in that contact" (issue #322) — the same `-` a NULL
+    // stored column renders as.
+    let trending = |f: fn(&crate::tape::health::HealthCounters) -> Option<i64>| match &derived {
+        None => "n/a".to_string(),
+        Some(h) => f(h).map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+    };
+    let corrected_no_delay = trending(|h| h.corrected_no_delay);
+    let ecc_invocations = trending(|h| h.correction_algorithm_invocations);
 
     // A raised tape alert is the drive saying the medium or the head is
     // going bad. It is shouted rather than tucked in with the counters,
@@ -3025,7 +3033,11 @@ mod tests {
 
         /// Verbatim from the journal's "report health reports corrected=0
         /// while the drive reports 875" excerpt — same text used in
-        /// `src/tape/health.rs`'s own fixture for the same bug.
+        /// `src/tape/health.rs`'s own fixture for the same bug — followed by
+        /// the same drive's all-zero page 0x03
+        /// (`tests/fixtures/sg_logs/hp_lto6_page_0x03.txt`'s values): the
+        /// trending figures sum both pages, and since issue #322 a raw_log
+        /// carrying only one of them derives `-`, not half a sum.
         const BUSY_PAGE_02: &str = "\
 === page 0x02 ===
 Write error counter page [0x2]
@@ -3033,6 +3045,11 @@ Write error counter page [0x2]
   Total errors corrected                       = 0
   Total times correction algorithm processed   = 305674
   Total uncorrected errors                     = 0
+=== page 0x03 ===
+Read error counter page  [0x3]
+  Errors corrected without substantial delay = 0
+  Total times correction algorithm processed = 0
+  Total uncorrected errors = 0
 ";
 
         #[test]
@@ -3185,6 +3202,65 @@ Write error counter page [0x2]
             let (line, json) = rendered(&conn);
             assert!(line.ends_with(" alerts=0"), "{line}");
             assert_eq!(json, serde_json::json!(0));
+        }
+
+        /// Issue #322, end to end: a sweep whose page 0x00 omits 0x03 →
+        /// the production writer → `report health`. Every figure that sums
+        /// both pages renders `-` and JSON `null` — stored and re-derived
+        /// alike — never 0 and never 0x02's half; `bytes` (a max over both)
+        /// is `null` too. `tape_alerts`, from 0x2e which WAS read, is 0.
+        #[test]
+        fn a_sweep_without_0x03_reports_every_summed_counter_unknown() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut src = FixtureSource::default();
+            src.bytes
+                .insert(0x00, vec![0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x2e]);
+            // Live 0x02 values, so a partial sum would show as a number.
+            src.text.insert(
+                0x02,
+                "Write error counter page  [0x2]\n  Errors corrected without substantial delay = 875\n  \
+                 Total errors corrected = 3\n  Total times correction algorithm processed = 305674\n  \
+                 Total bytes processed = 4096\n  Total uncorrected errors = 1\n"
+                    .to_string(),
+            );
+            record_sweep_of(&conn, &mut src);
+            assert_eq!(src.reads.get(&0x03), None, "0x03 was never read");
+            let (line, _) = rendered(&conn);
+            assert!(
+                line.contains(
+                    " uncorrected=- corrected_total=- corrected_no_delay=- ecc_invocations=- alerts=0"
+                ),
+                "{line}"
+            );
+            let rows = health_rows(&conn, None).unwrap();
+            let json = &health_json(&rows)[0];
+            for key in [
+                "bytes",
+                "corrected",
+                "uncorrected",
+                "corrected_no_delay",
+                "ecc_invocations",
+            ] {
+                assert_eq!(json[key], serde_json::Value::Null, "{key}: {json}");
+            }
+            assert_eq!(json["tape_alerts"], serde_json::json!(0));
+        }
+
+        /// Positive control: both pages read, the same path renders numbers.
+        #[test]
+        fn a_sweep_with_both_error_pages_reports_every_counter() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut src = FixtureSource::default();
+            record_sweep_of(&conn, &mut src);
+            let (line, _) = rendered(&conn);
+            assert!(
+                line.contains(
+                    " uncorrected=0 corrected_total=0 corrected_no_delay=0 ecc_invocations=0 alerts=0"
+                ),
+                "{line}"
+            );
+            let rows = health_rows(&conn, None).unwrap();
+            assert_eq!(health_json(&rows)[0]["bytes"], serde_json::json!(0));
         }
     }
 

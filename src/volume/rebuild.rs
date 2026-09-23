@@ -397,7 +397,8 @@ pub fn rebuild_from_store(
     // does not yet have a row for this volume — creating one is the
     // command's OUTPUT, not an input the contact can reference.
     let guard = site.open(conn, None);
-    guard.finish_result(rebuild_contacted(
+    let contact_id = guard.id();
+    let r = guard.finish_result(rebuild_contacted(
         conn,
         store,
         identities,
@@ -407,7 +408,13 @@ pub fn rebuild_from_store(
         scratch,
         device_label,
         site.medium_serial(),
-    ))
+    ));
+    // The post-command health reading (issue #320), on every outcome. It
+    // names no volume, as the contact names none: the row a rebuild inserts
+    // is its output. On the DR machine this rebuild exists for there is
+    // usually no backend, and then there is no reading and nothing fails.
+    crate::volume::write::health_after_read_contact(conn, &site, None, contact_id);
+    r
 }
 
 /// [`rebuild_from_store`] minus the contact bookkeeping.

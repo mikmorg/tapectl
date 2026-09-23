@@ -184,6 +184,7 @@ pub fn restore_raw_volume(
     site: ContactSite<'_>,
 ) -> Result<crate::volume::raw::RawRestoreReport> {
     let guard = site.open(conn, None);
+    let contact_id = guard.id();
     let r = crate::volume::raw::restore_raw(store, dest, expect_label);
     // A dump whose checksums did not all verify is how this contact ENDED,
     // even though the function returns `Ok` — the CLI's exit status says the
@@ -199,6 +200,10 @@ pub fn restore_raw_volume(
         Ok(_) => guard.finish(contact::OUTCOME_OK, None),
         Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
     }
+    // The post-command health reading (issue #320), on every outcome — a
+    // dump that failed its checksums is exactly when the read-error
+    // counters matter. The heir's dump itself stays `Connection`-free.
+    crate::volume::write::health_after_read_contact(conn, &site, None, contact_id);
     r
 }
 
@@ -239,7 +244,8 @@ pub(crate) fn restore_unit_from_store(
         )
         .optional()?;
     let guard = site.open(conn, volume_id);
-    guard.finish_result(restore_unit_contacted(
+    let contact_id = guard.id();
+    let r = guard.finish_result(restore_unit_contacted(
         conn,
         paths,
         config,
@@ -249,7 +255,13 @@ pub(crate) fn restore_unit_from_store(
         dest_dir,
         store,
         site.medium_serial(),
-    ))
+    ));
+    // ONE post-command health reading for this contact (issue #320), on
+    // every outcome, naming the volume the contact names. This seam is the
+    // only place `restore unit` — and `restore file`, which reaches the
+    // drive through it — takes one, so a contact cannot get two.
+    crate::volume::write::health_after_read_contact(conn, &site, volume_id, contact_id);
+    r
 }
 
 /// [`restore_unit_from_store`] minus the contact bookkeeping.
@@ -1867,10 +1879,11 @@ mod tests {
             contact_drive_serial(conn)
         }
 
-        /// Issue #314: `restore unit` collects no health, so before the fix
-        /// its contact never named a drive (4 of 4 NULL in the gate). The
+        /// Issue #314: `restore unit` collected no health then, so before the
+        /// fix its contact never named a drive (4 of 4 NULL in the gate). The
         /// read path is exactly where a drive fault shows up — the contact
-        /// is attributed at open, from the identity read alone.
+        /// is attributed at open, from the identity read alone (and, since
+        /// #320, again by its post-command reading, to the same drive).
         #[test]
         fn a_restore_unit_contact_names_the_drive_it_was_made_with() {
             let conn = crate::db::open_memory().unwrap();
@@ -1932,6 +1945,322 @@ mod tests {
             );
             assert_eq!(only_contact(&conn).0, "restore raw-volume");
             assert_eq!(contact_drive_serial(&conn).as_deref(), Some("XYZZY_A1"));
+        }
+
+        // ── issue #320: a read-path contact takes ONE post-command health
+        //    reading — one sweep, one `health_logs` row, both naming it ──
+
+        use crate::tape::log_pages::tests::{
+            assert_each_page_read_once, assert_one_reading_for, FixtureSource, LISTED,
+        };
+        use std::cell::RefCell;
+
+        /// The id of the one contact row.
+        fn only_contact_id(conn: &Connection) -> i64 {
+            conn.query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn journal_rows(conn: &Connection) -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM log_page_journal", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn health_rows(conn: &Connection) -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        /// `restore unit` over a `MemStore` whose File 0 is `loaded`, the
+        /// catalog asking for `want`, the drive `device` in `config`, the
+        /// log pages answered by `src`. Returns the command's result as a
+        /// string, `Ok` or the error.
+        #[allow(clippy::too_many_arguments)]
+        fn restore_unit_swept(
+            conn: &Connection,
+            config: &Config,
+            device: &str,
+            want: &str,
+            loaded: &str,
+            src: &RefCell<FixtureSource>,
+        ) -> std::result::Result<RestoreReport, String> {
+            seed(conn, want, "rh-unit");
+            let mut store = tape_labelled(loaded);
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let identity = drive(Some("HUJ808A5L4"));
+            let backend = lto0();
+            let mam = crate::tape::mam::MamInfo::default();
+            restore_unit_from_store(
+                conn,
+                &paths,
+                &Config::default(),
+                "rh-unit",
+                want,
+                1,
+                &dest.path().to_string_lossy(),
+                &mut store,
+                ContactSite::new(
+                    config,
+                    Operation::RestoreUnit,
+                    device,
+                    Medium::Observed {
+                        backend: &backend,
+                        mam: &mam,
+                    },
+                )
+                .with_drive_identity(&identity)
+                .with_log_source(src),
+            )
+            .map_err(|e| e.to_string())
+        }
+
+        fn swept_config() -> Config {
+            let mut config = Config::default();
+            config.backends.lto.push(lto0());
+            config
+        }
+
+        /// A `restore unit` whose contact check passes (it then fails on the
+        /// key load, which is beside the point — the sweep is post-command,
+        /// on every outcome) takes exactly one sweep and one `restore`
+        /// reading, both naming its contact and its volume; the drive the
+        /// reading identified is the contact's.
+        #[test]
+        fn a_restore_unit_contact_takes_exactly_one_health_reading() {
+            let conn = crate::db::open_memory().unwrap();
+            let src = RefCell::new(FixtureSource::default());
+            let err =
+                restore_unit_swept(&conn, &swept_config(), "/dev/null", "RH-OK", "RH-OK", &src)
+                    .unwrap_err();
+            assert!(!err.contains("wrong tape"), "past the contact check: {err}");
+
+            let cid = only_contact_id(&conn);
+            let vid: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'RH-OK'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                src.borrow().order,
+                LISTED.to_vec(),
+                "one sweep, every listed page"
+            );
+            assert_each_page_read_once(&src.borrow().reads);
+            assert_one_reading_for(&conn, cid, "restore unit", Some(vid), LISTED.len());
+            assert_eq!(contact_drive_serial(&conn).as_deref(), Some("HUJ808A5L4"));
+        }
+
+        /// A restore REFUSED at the contact check still took a contact, so
+        /// it still takes its reading — a failed read path is the one whose
+        /// counters matter most.
+        #[test]
+        fn a_restore_unit_refused_for_the_wrong_tape_still_takes_its_reading() {
+            let conn = crate::db::open_memory().unwrap();
+            let src = RefCell::new(FixtureSource::default());
+            let err = restore_unit_swept(
+                &conn,
+                &swept_config(),
+                "/dev/null",
+                "RH-WANT",
+                "RH-LOADED",
+                &src,
+            )
+            .unwrap_err();
+            assert!(err.contains("wrong tape"), "{err}");
+            let cid = only_contact_id(&conn);
+            let vid: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'RH-WANT'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_one_reading_for(&conn, cid, "restore unit", Some(vid), LISTED.len());
+        }
+
+        /// Issue #313 on the READ path, ungated: `--device` spelled by-id
+        /// (a symlink) while the backend is configured by its node still
+        /// finds the backend, so the reading happens. Pairs with the gate's
+        /// `health_by_id_restore`.
+        #[test]
+        fn a_by_id_restore_unit_contact_still_takes_its_reading() {
+            let tmp = TempDir::new().unwrap();
+            let nst = tmp.path().join("nst1");
+            std::fs::File::create(&nst).unwrap();
+            let by_id = tmp.path().join("scsi-XYZZY_A1-nst");
+            std::os::unix::fs::symlink(&nst, &by_id).unwrap();
+            let mut config = Config::default();
+            let mut bk = lto0();
+            bk.device_tape = nst.display().to_string();
+            config.backends.lto.push(bk);
+
+            let conn = crate::db::open_memory().unwrap();
+            let src = RefCell::new(FixtureSource::default());
+            let _ = restore_unit_swept(
+                &conn,
+                &config,
+                &by_id.display().to_string(),
+                "RH-BYID",
+                "RH-BYID",
+                &src,
+            );
+            let cid = only_contact_id(&conn);
+            let vid: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = 'RH-BYID'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_one_reading_for(&conn, cid, "restore unit", Some(vid), LISTED.len());
+        }
+
+        /// The DR machine: no backend claims the device, so no sweep is
+        /// taken — the source is never asked — and no health or journal row
+        /// is written; and the restore ends EXACTLY as it does with the
+        /// health reading taken (positive control: the same command with a
+        /// backend does read).
+        #[test]
+        fn a_dr_restore_with_no_backend_takes_no_reading_and_ends_the_same() {
+            let dr = crate::db::open_memory().unwrap();
+            let dr_src = RefCell::new(FixtureSource::default());
+            let dr_result = restore_unit_swept(
+                &dr,
+                &Config::default(),
+                "/dev/null",
+                "RH-DR",
+                "RH-DR",
+                &dr_src,
+            );
+            assert!(dr_src.borrow().reads.is_empty(), "no backend, no sweep");
+            assert_eq!(health_rows(&dr), 0);
+            assert_eq!(journal_rows(&dr), 0);
+            assert_eq!(
+                only_contact(&dr).0,
+                "restore unit",
+                "the contact is still recorded"
+            );
+
+            let swept = crate::db::open_memory().unwrap();
+            let src = RefCell::new(FixtureSource::default());
+            let swept_result =
+                restore_unit_swept(&swept, &swept_config(), "/dev/null", "RH-DR", "RH-DR", &src);
+            assert_eq!(health_rows(&swept), 1, "positive control: a backend reads");
+            assert_eq!(
+                dr_result.map(|r| r.slices),
+                swept_result.map(|r| r.slices),
+                "the health reading changes nothing about how the restore ends"
+            );
+        }
+
+        /// A sweep that fails outright — every page read fails — fails
+        /// nothing: the restore ends as it would have, the failed reads are
+        /// journalled, and no health row claims a reading nobody got.
+        #[test]
+        fn a_failed_sweep_does_not_fail_the_restore() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut failing = FixtureSource::default();
+            failing.fail.extend([0x00, 0x02, 0x03, 0x2e]);
+            let src = RefCell::new(failing);
+            let err = restore_unit_swept(&conn, &swept_config(), "/dev/null", "RH-F", "RH-F", &src)
+                .unwrap_err();
+            // The same command with no drive to sweep ends with the SAME
+            // error: the failed sweep contributed nothing to the outcome.
+            let dr = crate::db::open_memory().unwrap();
+            let unused = RefCell::new(FixtureSource::default());
+            let dr_err = restore_unit_swept(
+                &dr,
+                &Config::default(),
+                "/dev/null",
+                "RH-F",
+                "RH-F",
+                &unused,
+            )
+            .unwrap_err();
+            assert_eq!(err, dr_err);
+            assert_eq!(health_rows(&conn), 0, "no page read, no reading");
+            assert_eq!(
+                journal_rows(&conn),
+                4,
+                "0x00 then the three fallback pages, journalled"
+            );
+        }
+
+        /// `restore raw-volume`: one reading on its contact, which names no
+        /// volume — so neither does the reading.
+        #[test]
+        fn a_restore_raw_volume_contact_takes_exactly_one_health_reading() {
+            let conn = crate::db::open_memory().unwrap();
+            let config = swept_config();
+            let backend = lto0();
+            let mam = crate::tape::mam::MamInfo::default();
+            let identity = drive(Some("XYZZY_A1"));
+            let src = RefCell::new(FixtureSource::default());
+            let mut store = tape_labelled("RAW-HEALTH");
+            let dest = TempDir::new().unwrap();
+            let _ = restore_raw_volume(
+                &conn,
+                &mut store,
+                dest.path(),
+                None,
+                ContactSite::new(
+                    &config,
+                    Operation::RestoreRawVolume,
+                    "/dev/null",
+                    Medium::Observed {
+                        backend: &backend,
+                        mam: &mam,
+                    },
+                )
+                .with_drive_identity(&identity)
+                .with_log_source(&src),
+            );
+            let cid = only_contact_id(&conn);
+            assert_each_page_read_once(&src.borrow().reads);
+            assert_one_reading_for(&conn, cid, "restore raw-volume", None, LISTED.len());
+        }
+
+        /// `restore file` reaches the drive only through `restore_unit`,
+        /// whose store seam is the one place a read-path reading is taken —
+        /// so one `restore file` is one contact and ONE sweep, never two.
+        /// Pinned by source scan (the entry points need a drive), calibrated
+        /// by finding each function first; the behaviour of the seam itself
+        /// is `a_restore_unit_contact_takes_exactly_one_health_reading`.
+        #[test]
+        fn restore_file_takes_one_reading_through_restore_unit_not_a_second() {
+            const SRC: &str = include_str!("restore.rs");
+            let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(prod.len() < SRC.len(), "positive control: tests split off");
+            let body = |f: &str| {
+                let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+                let end = prod[start..].find("\n}\n").unwrap() + start;
+                &prod[start..end]
+            };
+            let file = body("pub fn restore_file(");
+            assert_eq!(file.matches("restore_unit(").count(), 1, "positive control");
+            let unit = body("pub fn restore_unit(");
+            assert_eq!(unit.matches("restore_unit_from_store(").count(), 1);
+            let seam = body("pub(crate) fn restore_unit_from_store(");
+            for (name, b) in [("restore_file", file), ("restore_unit", unit)] {
+                for forbidden in [
+                    "health_after_read_contact(",
+                    "collect_health",
+                    "log_pages::",
+                    ".open(conn",
+                ] {
+                    assert!(
+                        !b.contains(forbidden),
+                        "{name} must not take its own contact or reading ({forbidden})"
+                    );
+                }
+            }
+            assert_eq!(
+                seam.matches("health_after_read_contact(").count(),
+                1,
+                "the seam that opens the contact takes its one reading"
+            );
+            assert_eq!(
+                prod.matches("health_after_read_contact(").count(),
+                2,
+                "restore.rs takes readings in exactly two seams: restore unit's and raw-volume's"
+            );
         }
 
         /// Positive control for

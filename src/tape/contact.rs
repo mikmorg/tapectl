@@ -74,6 +74,7 @@ use tracing::warn;
 use crate::config::{Config, LtoBackendConfig};
 use crate::error::Result;
 use crate::tape::drive_identity::{self, DriveIdentity};
+use crate::tape::log_pages::LogSource;
 use crate::tape::mam::{MamCapture, MamInfo};
 use crate::tape::mam_journal::{Hook, MamReads};
 
@@ -303,6 +304,11 @@ pub struct ContactSite<'a> {
     /// (issue #314). `None`, the production default, asks the drive itself
     /// ([`drive_identity::read_identity`]).
     drive_identity: Option<&'a DriveIdentity>,
+    /// Where the post-command log-page sweep reads from AS IF it were the
+    /// drive — the test seam for a read path's health reading (issue #320),
+    /// the same shape as `drive_identity`. `None`, the production default,
+    /// runs `sg_logs` on the backend's sg node.
+    log_source: Option<&'a std::cell::RefCell<dyn LogSource + 'a>>,
 }
 
 impl<'a> ContactSite<'a> {
@@ -319,6 +325,7 @@ impl<'a> ContactSite<'a> {
             medium,
             mam_reads: None,
             drive_identity: None,
+            log_source: None,
         }
     }
 
@@ -330,6 +337,34 @@ impl<'a> ContactSite<'a> {
     pub fn with_drive_identity(mut self, identity: &'a DriveIdentity) -> Self {
         self.drive_identity = Some(identity);
         self
+    }
+
+    /// Answer the post-command log-page sweep (issue #320) from `source`
+    /// instead of the drive — how an ungated test drives a read path's
+    /// health reading with no drive. Production never calls it.
+    pub fn with_log_source(mut self, source: &'a std::cell::RefCell<dyn LogSource + 'a>) -> Self {
+        self.log_source = Some(source);
+        self
+    }
+
+    /// The configuration this contact resolves its drive through.
+    pub(crate) fn config(&self) -> &'a Config {
+        self.config
+    }
+
+    /// The device the command was given, spelled as given.
+    pub(crate) fn device(&self) -> &'a str {
+        self.device
+    }
+
+    /// See [`ContactSite::with_drive_identity`].
+    pub(crate) fn injected_drive_identity(&self) -> Option<&'a DriveIdentity> {
+        self.drive_identity
+    }
+
+    /// See [`ContactSite::with_log_source`].
+    pub(crate) fn injected_log_source(&self) -> Option<&'a std::cell::RefCell<dyn LogSource + 'a>> {
+        self.log_source
     }
 
     /// Carry the MAM captures this command is holding, so [`open`] journals
