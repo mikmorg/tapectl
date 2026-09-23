@@ -57,3 +57,58 @@ tapectl's own `volume write` feed rate on this drive has not been measured.
 - The 2026-09-10 journal's hypothesis that MAM remaining capacity "refreshes lazily" is
   contradicted: in run 1 it had already moved when read at EOD, before any rewind.
 - TapeAlert (0x2E) read-to-clear is still unanswered: every flag was 0 throughout.
+
+## Run 3 (issue #323): tapectl's own `volume write` uses native capacity 1:1
+
+Measured the same day, on the same drive and cartridge, with a one-off release build of
+master `8007412` (the CTO approved it for this measurement only). The source was 20 x 1 GiB
+of incompressible AES-CTR keystream, staged by `stage create` into 6 slices (5 x 4.296 GB +
+7.9 KB). It ran in a temp home, never `~/.tapectl`. The tape was truncated at BOT, then
+`volume init M323A1 --force` ran (see below), then `volume write M323A1 --device
+/dev/tape/by-id/scsi-HUJ808A5L4-nst`. The command exited 0.
+
+| | run 3 (`volume write`) |
+|---|---|
+| bytes sent to the drive (process `wchar`, all 14 volume files) | 21,488,398,724 |
+| host feed rate while writing slices | **56 MB/s, steady** (each 4.296 GB slice took 76-77 s) |
+| page 0x0c "Native capacity from BOP to EOD" after the write | 21,487 MB |
+| page 0x17 "Total used native capacity [MB]" after the write | 21,487 |
+| native capacity used / data written | **1.000** |
+| page 0x17 write retries / unrecovered write errors | 2 / 0 |
+
+Both counters come from tapectl's own post-write health sweep: `log_page_journal` rows for
+pages 0x0c and 0x17 on the write's contact, decoded offline. No log page was read by hand.
+
+**This contradicts the "slower feed uses more tape" reading of runs 1 and 2.** At 56 MB/s,
+well below run 1's 94.8 MB/s, the drive used exactly one byte of native capacity per byte of
+data. The better-supported hypothesis is that what costs tape is an *irregular* feed, not a
+slow one. Run 1 came from an `openssl enc` pipe that delivers bursts. tapectl's write loop
+delivers a steady stream that the drive's speed matching can follow. That is still a
+hypothesis: only three operating points exist. For planning, what matters is that on this
+drive, **tapectl's own write path fits the generation table's 2.5 TB with margin** (the
+cartridge reports 2,620,446 MB native).
+
+### Where the 36 minutes went
+
+| phase | span (catalog timestamps) | duration |
+|---|---|---|
+| contact open to `writes.started_at` (pre-write checks, which read the staging) | 14:40:14 to 14:48:29 | 495 s |
+| writing files 0-12 (envelopes, then slices) | 14:48:29 to 14:54:52 | 383 s, 56 MB/s |
+| seal plus read-back confirm | 14:54:52 to 15:16:40 | 1,308 s |
+| **total `volume write` wall clock** | | **2,186 s** |
+
+The staging disk reads at 219-333 MB/s (`dd iflag=direct`), so it is not what limits the
+write. This VM's CPU has no SHA-NI, and coreutils `sha256sum` runs at about 127 MB/s on
+one core. The 56 MB/s write rate is consistent with more than one SHA-256 pass per byte, but
+that has not been profiled. Extrapolated linearly to a full 2.5 TB cartridge, the same
+phases would take about 16 h (pre-write), 12.4 h (write) and 42 h (confirm). That is an
+operability question, not a correctness one.
+
+### Also observed
+
+`volume init` on a tape truncated at BOT (a single filemark, then EOD) refused with "the
+loaded cartridge's File 0 already identifies a DIFFERENT volume (a present but
+unparseable/corrupt File 0)". Refusing without `--force` is correct: ADR-0003 fails closed
+on anything that is not provably blank. The wording is wrong, though, because an empty
+File 0 is not a different volume or corruption. `--force` was used under the CTO's
+authorization for this cartridge.
