@@ -1,0 +1,11 @@
+Data compression page  (LTO-5 specific) [0x32]
+  Read compression ratio x100: 99
+  Write compression ratio x100: 99
+  Megabytes transferred to server: 18046
+  Bytes transferred to server: 367390
+  Megabytes read from tape: 18050
+  Bytes read from tape: 183924
+  Megabytes transferred from server: 30029
+  Bytes transferred from server: 172648
+  Megabytes written to tape: 30043
+  Bytes written to tape: 769288

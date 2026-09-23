@@ -1,0 +1,8 @@
+Write error counter page  [0x2]
+  Errors corrected without substantial delay = 920
+  Errors corrected with possible delays = 0
+  Total rewrites or rereads = 0
+  Total errors corrected = 0
+  Total times correction algorithm processed = 306488
+  Total bytes processed = 12820
+  Total uncorrected errors = 0

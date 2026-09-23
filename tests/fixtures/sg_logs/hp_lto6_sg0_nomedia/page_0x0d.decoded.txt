@@ -1,0 +1,3 @@
+Temperature page  [0xd]
+  Current temperature = 32 C
+  Reference temperature = <not available>

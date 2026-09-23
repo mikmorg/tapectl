@@ -1,0 +1,7 @@
+Sequential access device page (ssc-3)
+  Data bytes received with WRITE commands: 31 GB
+  Data bytes written to media by WRITE commands: 31 GB
+  Data bytes read from media by READ commands: 18 GB
+  Data bytes transferred by READ commands: 18 GB
+  Maximum native capacity in device object buffer: 0 MB
+  Cleaning action not required (or completed)

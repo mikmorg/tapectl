@@ -1,0 +1,43 @@
+Device statistics page (ssc-3 and adc)
+  Lifetime media loads: 19
+  Lifetime cleaning operations: 2
+  Lifetime power on hours: 732
+  Lifetime media motion (head) hours: 32
+  Lifetime metres of tape processed: 534938
+  Lifetime media motion (head) hours when incompatible media last loaded: 0
+  Lifetime power on hours when last temperature condition occurred: 0
+  Lifetime power on hours when last power consumption condition occurred: 0
+  Media motion (head) hours since last successful cleaning operation: 32
+  Media motion (head) hours since 2nd to last successful cleaning: 32
+  Media motion (head) hours since 3rd to last successful cleaning: 0
+  Lifetime power on hours when last operator initiated forced reset
+    and/or emergency eject occurred: 0
+  Lifetime power cycles: 6
+  Volume loads since last parameter reset: 19
+  Hard write errors: 0
+  Hard read errors: 2
+  Duty cycle sample time (ms): 1129234000
+  Read duty cycle: 0
+  Write duty cycle: 0
+  Activity duty cycle: 0
+  Volume not present duty cycle: 79
+  Ready duty cycle: 20
+  MBs transferred from app client in duty cycle sample time: 31487
+  MBs transferred to app client in duty cycle sample time: 18922
+  Drive manufacturer's serial number: 0
+  Drive serial number: 0
+  Medium removal prevented: 0
+  Maximum recommended mechanism temperature exceeded: 0
+  Media motion (head) hours for each medium type:
+    Density code: 0x46, Medium type: 0x0
+      Medium motion hours: 0
+    Density code: 0x46, Medium type: 0x1
+      Medium motion hours: 0
+    Density code: 0x58, Medium type: 0x0
+      Medium motion hours: 33
+    Density code: 0x58, Medium type: 0x1
+      Medium motion hours: 0
+    Density code: 0x5a, Medium type: 0x0
+      Medium motion hours: 4
+    Density code: 0x5a, Medium type: 0x1
+      Medium motion hours: 0

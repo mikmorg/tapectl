@@ -1,0 +1,19 @@
+DT device status page (ssc-3, adc-3) [0x11]
+  Very high frequency data:
+  PAMR=0 HUI=1 MACC=0 CMPR=0 WRTP=0 CRQST=0 CRQRD=0 DINIT=1
+  INXTN=0 RAA=1 MPRSNT=0 MSTD=0 MTHRD=0 MOUNTED=0
+  DT device activity: No DT device activity
+  VS=1 TDDEC=0 EPP=0 ESR=0 RRQST=0 INTFC=0 TAFC=0
+  Very high frequency polling delay:  16 milliseconds
+  Primary port 1 status:
+    SAS: negotiated physical link rate: 6 Gbps
+    signal=1, pic=1, hashed SAS addr: 0x10126236
+    SAS addr: 0x51402ec001437f9c
+  Primary port 2 status:
+    SAS: negotiated physical link rate: phy enabled; unknown rate
+    signal=0, pic=0, hashed SAS addr: 0x4302059
+    SAS addr: 0x51402ec001437f9d
+  Vendor specific [parameter_code=0x8000]:
+ 00     80 00 03 06 41 20 00 80  00 05                      ....A ....
+  Vendor specific [parameter_code=0x8010]:
+ 00     80 10 03 08 01 00 00 08  00 00 00 00                ............
