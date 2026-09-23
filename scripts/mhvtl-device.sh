@@ -16,7 +16,7 @@
 # tapectl bug.
 #
 # Usage:
-#   mhvtl-device.sh [--tape /dev/nstN] [--ensure-media]
+#   mhvtl-device.sh [--tape /dev/nstN | /dev/tape/by-id/scsi-<serial>-nst] [--ensure-media]
 #
 # Prints eval-able KEY=VALUE lines on stdout:
 #   TAPE_DEV DRIVE_MODEL DRIVE_SG CHG_SG DTE GEN LOADED_TAG
@@ -50,7 +50,14 @@ done
 [ -r /etc/mhvtl/device.conf ] || die "/etc/mhvtl/device.conf is not readable"
 
 # ---------- drive: st node -> lsscsi row -> HCTL ----------
-ST_BASE="$(basename "$TAPE_DEV")"; ST_BASE="${ST_BASE#n}"   # nst0 -> st0
+# Every lookup below goes through the CANONICAL node (issue #321): the spelling
+# CLAUDE.md prescribes, /dev/tape/by-id/scsi-<serial>-nst, is a symlink whose
+# basename is not an st node, so `basename` alone found nothing in lsscsi.
+# TAPE_DEV itself is printed back exactly as given — the caller keeps the
+# spelling it chose, and tapectl sees that spelling.
+TAPE_REAL="$(readlink -f "$TAPE_DEV")"
+[ -n "$TAPE_REAL" ] || die "cannot resolve $TAPE_DEV to a device node"
+ST_BASE="$(basename "$TAPE_REAL")"; ST_BASE="${ST_BASE#n}"   # nst0 -> st0
 ROW="$(lsscsi -g | awk -v d="/dev/$ST_BASE" '$0 ~ d" " || $NF ~ d {print; exit}')"
 [ -n "$ROW" ] || ROW="$(lsscsi -g | grep -F "/dev/$ST_BASE " | head -1)"
 [ -n "$ROW" ] || die "cannot find $TAPE_DEV in lsscsi -g"
@@ -94,7 +101,7 @@ WANT_SERIAL="$(awk -v q="$DRIVE_Q" '
     inq && /Unit serial number:/ { sub(/.*Unit serial number: */, ""); sub(/ *$/, ""); print; exit }
 ' /etc/mhvtl/device.conf)"
 [ -n "$WANT_SERIAL" ] || die "device.conf Drive $DRIVE_Q has no Unit serial number"
-PG80="/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE_DEV")")/device/vpd_pg80"
+PG80="/sys/class/scsi_tape/$(basename "$TAPE_REAL")/device/vpd_pg80"
 GOT_SERIAL="$(tail -c +5 "$PG80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
 [ -n "$GOT_SERIAL" ] || die "cannot read $TAPE_DEV's serial from $PG80 — refusing to treat it as mhvtl"
 [ "$GOT_SERIAL" = "$WANT_SERIAL" ] \
