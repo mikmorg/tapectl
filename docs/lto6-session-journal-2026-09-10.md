@@ -919,6 +919,20 @@ that exited 0.
 | E. EOD semantics | ✅ **PASS** — forward read past EOD returns no data. §3.2's assumption holds. |
 | F. Inventory | Captured; all error counters zero at session start. |
 
+
+**D, re-derived 2026-09-23 (issue #182).** The MAM capacity unit is now measured, not
+assumed. The drive's page-0x17 "Total used native capacity [MB]" and the MAM "Remaining
+capacity [MiB]" moved by exactly the same quantity in two units, over two 20 GiB runs
+(`docs/runs/2026-09-23-lto6-capacity-measurement.md`). So no hidden 4.9% MB-vs-MiB error
+sits in the MAM figures, and the basis for the `50M` buffer (MAM accurate to ~2 MiB) is
+unchanged. The same session found something the buffer was never sized for: the native
+capacity a byte consumes depends on the host feed. It was 1.48 behind a bursty
+`openssl | dd` pipe, and 1.006 and **1.000** for steady feeds, the latter being tapectl's own
+`volume write` (#323). A 50 MiB buffer cannot absorb a 48% effect and is not meant to. Under
+Layout v2 the pre-flight capacity gate is the capacity defense, and a real EOT is a clean
+abort to an unsealed tape. What the measurement supports is that tapectl's own write path
+does not trigger the effect.
+
 Also settled: the drive advertises a **16 MB** max block size (not the 2 MiB the
 mhvtl dry-run reported), and **1 M blocks are accepted** on real hardware — the
 dry-run's `EBUSY` was an mhvtl/host artifact.

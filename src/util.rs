@@ -210,8 +210,11 @@ pub fn format_bytes_binary(bytes: i64) -> String {
 /// Human-readable byte count in DECIMAL units (KB/MB/GB/TB, 1000-based).
 ///
 /// For **capacities**: `cartridges.nominal_capacity`, `volumes.capacity_bytes`,
-/// `mam_capacity_bytes` — decimal by ADR-0012 ruling and stored decimal (the
-/// generation table holds LTO-6 as `2_500_000_000_000`). Marketed capacity
+/// `mam_capacity_bytes` — rendered decimal by ADR-0012 ruling. All three are
+/// plain byte counts: the generation table holds LTO-6 as
+/// `2_500_000_000_000`, and `mam_capacity_bytes` is the MAM attribute's MiB
+/// times 2^20 (`tape::mam`), a unit the real HP LTO-6 confirmed against its
+/// own page-0x17 counter (issue #182). Marketed capacity
 /// figures are decimal; rendering one through [`format_bytes_binary`]
 /// instead reprints the box's own number wrong, not just under a different
 /// label.
