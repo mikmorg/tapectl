@@ -128,10 +128,13 @@ pub enum VolumeCommands {
     ///
     /// The tape is never contacted (hence no --device): the cartridge is left
     /// exactly as the session left it, and the staged files stay pinned
-    /// until `staging clean` runs. The session becomes ABORTED: `volume
-    /// resume` will not pick it up again unless its seal is recorded AND a
-    /// clean full verify is recorded after the abort (ADR-0012, 2026-09-23),
-    /// and a session aborted before its seal is never resumable.
+    /// until `staging clean --force` runs. The session becomes ABORTED:
+    /// `volume resume` will not pick it up again unless its seal is recorded
+    /// AND a clean full verify is recorded after the abort (ADR-0012,
+    /// 2026-09-23), and a session aborted before its seal is never
+    /// resumable. When the seal is recorded, keep staging if you intend to
+    /// verify and resume: that re-confirm revalidates against the staged
+    /// files, so releasing them forfeits it.
     Abort {
         /// Volume label
         label: String,
@@ -670,18 +673,18 @@ pub fn run(
                      before anything changes.",
                 ));
             }
-            write::volume_abort(conn, label, yes)?;
+            let seal_recorded = write::volume_abort(conn, label, yes)?;
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"label": label, "status": "aborted"})
+                    serde_json::json!({
+                        "label": label,
+                        "status": "aborted",
+                        "seal_recorded": seal_recorded,
+                    })
                 );
             } else {
-                println!(
-                    "volume \"{label}\" write session aborted — the session can no longer be \
-                     resumed. The cartridge is unsealed and unharmed; the staged slices stay \
-                     pinned until `tapectl staging clean`."
-                );
+                println!("{}", write::abort_done_message(label, seal_recorded));
             }
         }
 

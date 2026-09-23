@@ -8,7 +8,7 @@ tapectl\-volume\-abort \- Deliberately abandon a volume\*(Aqs unfinished write s
 .SH DESCRIPTION
 Deliberately abandon a volume\*(Aqs unfinished write session (issue #94): `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
 .PP
-The tape is never contacted (hence no \-\-device): the cartridge is left exactly as the session left it, and the staged files stay pinned until `staging clean` runs. The session becomes ABORTED: `volume resume` will not pick it up again unless its seal is recorded AND a clean full verify is recorded after the abort (ADR\-0012, 2026\-09\-23), and a session aborted before its seal is never resumable.
+The tape is never contacted (hence no \-\-device): the cartridge is left exactly as the session left it, and the staged files stay pinned until `staging clean \-\-force` runs. The session becomes ABORTED: `volume resume` will not pick it up again unless its seal is recorded AND a clean full verify is recorded after the abort (ADR\-0012, 2026\-09\-23), and a session aborted before its seal is never resumable. When the seal is recorded, keep staging if you intend to verify and resume: that re\-confirm revalidates against the staged files, so releasing them forfeits it.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR

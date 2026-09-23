@@ -1584,16 +1584,20 @@ fn volume_resume_contacted<'c>(
 /// or, when its seal is recorded (an Inconclusive confirm), sealed. Only the
 /// `writes` rows move. `aborted` is not "never resumable" since ADR-0012's
 /// 2026-09-23 amendment (#280): a session whose seal is recorded is adopted
-/// by `volume resume` once a clean full verify is recorded after the abort. `write_positions`, `volumes.status`, the
-/// staged slices and the session directory are all untouched; the staged
-/// files stay pinned until `staging clean` runs.
+/// by `volume resume` once a clean full verify is recorded after the abort.
+/// `write_positions`, `volumes.status`, the staged slices and the session
+/// directory are all untouched; the staged files stay pinned until
+/// `staging clean --force` runs — and for a session whose seal is recorded,
+/// releasing them forfeits that later re-confirmation, which revalidates
+/// against them (issue #324). Returns whether the seal is recorded, so the
+/// caller's closing message can say the same.
 ///
 /// It refuses outright if any row is still `in_progress`. Per `rehydrate`'s
 /// own reasoning, `db::open` sweeps `in_progress` to `interrupted` before any
 /// command holds a `Connection`, so a surviving `in_progress` row means
 /// another process is writing this tape right now, and aborting it would
 /// corrupt a live session.
-pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<()> {
+pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<bool> {
     let volume_id: i64 = conn
         .query_row(
             "SELECT id FROM volumes WHERE label = ?1",
@@ -1645,32 +1649,7 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
         params![volume_id],
         |r| r.get(0),
     )?;
-    let cartridge_fact = if seal_recorded {
-        "The cartridge is NOT touched: its seal is recorded, so it stays SEALED with every byte \
-         on it, exactly as the session left it."
-    } else {
-        "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
-         bulk-erased and reused (`cartridge mark-erased`)."
-    };
-
-    let facts = vec![
-        format!(
-            "volume \"{label}\": {} unfinished write session row(s) ({}), covering {slice_count} \
-             planned slice position(s).",
-            write_ids.len(),
-            statuses.join(", ")
-        ),
-        "The session becomes ABORTED. `tapectl volume resume` will not pick it up again unless \
-         its seal is recorded AND a clean full verify of this volume is recorded after this \
-         abort (ADR-0012, 2026-09-23) — then resume re-enters confirm and never writes. A \
-         session aborted before its seal is never resumable."
-            .to_string(),
-        cartridge_fact.to_string(),
-        "The staged slices stay pinned on disk; because this session's `writes` row becomes \
-         ABORTED, plain `tapectl staging clean` will not release them — use `tapectl staging \
-         clean --force`, or write them to another volume first."
-            .to_string(),
-    ];
+    let facts = abort_consent_facts(label, &statuses, slice_count, seal_recorded);
     crate::cli::consent::confirm(
         &format!("abandon the unfinished write session on volume \"{label}\""),
         &facts,
@@ -1704,7 +1683,82 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
         sessions = write_ids.len(),
         "operator aborted unfinished write session"
     );
-    Ok(())
+    Ok(seal_recorded)
+}
+
+/// What `volume abort` prints once the session is aborted (issue #324):
+/// `seal_recorded` is [`volume_abort`]'s return value.
+/// The two shapes say the same thing [`abort_consent_facts`] does.
+pub fn abort_done_message(label: &str, seal_recorded: bool) -> String {
+    if seal_recorded {
+        format!(
+            "volume \"{label}\" write session aborted. Its seal is recorded, so the cartridge \
+             stays sealed and unharmed: after a clean full verify (`tapectl volume verify \
+             {label}`), `tapectl volume resume {label}` re-confirms it. The staged slices stay \
+             pinned — keep staging if you intend to verify and resume; releasing it \
+             (`tapectl staging clean --force`) forfeits that."
+        )
+    } else {
+        format!(
+            "volume \"{label}\" write session aborted — the session can no longer be \
+             resumed. The cartridge is unsealed and unharmed; the staged slices stay pinned \
+             until `tapectl staging clean --force`."
+        )
+    }
+}
+
+/// The facts `volume abort`'s consent block states (issue #324), factored
+/// out of [`volume_abort`] so both of its shapes — seal recorded or not —
+/// are testable without driving the consent prompt. `statuses` holds one
+/// entry per unfinished `writes` row.
+pub(crate) fn abort_consent_facts(
+    label: &str,
+    statuses: &[&str],
+    slice_count: i64,
+    seal_recorded: bool,
+) -> Vec<String> {
+    let cartridge_fact = if seal_recorded {
+        "The cartridge is NOT touched: its seal is recorded, so it stays SEALED with every byte \
+         on it, exactly as the session left it."
+    } else {
+        "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
+         bulk-erased and reused (`cartridge mark-erased`)."
+    };
+
+    // Issue #324: a recorded seal makes this session adoptable later
+    // (ADR-0012, 2026-09-23), and that re-confirm revalidates against the
+    // frozen staged files — so advising their release, unqualified, would
+    // take back the resume the fact above promises.
+    let staging_fact = if seal_recorded {
+        format!(
+            "The staged slices stay pinned on disk — keep staging if you intend to verify and \
+             resume: after a clean full verify (`tapectl volume verify {label}`), `tapectl \
+             volume resume {label}` re-confirms this sealed tape against those frozen staged \
+             files. Releasing them (`tapectl staging clean --force`; plain `tapectl staging \
+             clean` will not) forfeits that re-confirmation."
+        )
+    } else {
+        "The staged slices stay pinned on disk; because this session's `writes` row becomes \
+         ABORTED, plain `tapectl staging clean` will not release them — use `tapectl staging \
+         clean --force`, or write them to another volume first."
+            .to_string()
+    };
+
+    vec![
+        format!(
+            "volume \"{label}\": {} unfinished write session row(s) ({}), covering {slice_count} \
+             planned slice position(s).",
+            statuses.len(),
+            statuses.join(", ")
+        ),
+        "The session becomes ABORTED. `tapectl volume resume` will not pick it up again unless \
+         its seal is recorded AND a clean full verify of this volume is recorded after this \
+         abort (ADR-0012, 2026-09-23) — then resume re-enters confirm and never writes. A \
+         session aborted before its seal is never resumable."
+            .to_string(),
+        cartridge_fact.to_string(),
+        staging_fact,
+    ]
 }
 
 /// Explain a `rehydrate` that found nothing, naming the `writes` statuses
@@ -2100,7 +2154,7 @@ fn finish_session(
             block_size,
             sealed_pending,
         ),
-        ResumeOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
+        ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
         ResumeOutcome::Interrupted(_) => {
             events::log_event(
                 conn,
@@ -2242,7 +2296,7 @@ fn finish_confirm(
             info!(label = sealed.label, volume_id, "volume write sealed");
             Ok(())
         }
-        ConfirmOutcome::Quarantined(q) => log_quarantine(conn, volume_id, label, &q.reason),
+        ConfirmOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
         // ADR-0012's 2026-09-18 amendment (issues #260/#267): nothing here
         // proves the medium bad — confirm's readback simply did not
         // succeed. The tape is physically unharmed and unchanged;
@@ -2276,18 +2330,24 @@ fn finish_confirm(
     }
 }
 
-/// The one place a WRITE-path quarantine is recorded and reported — reached
-/// from `confirm`'s `Quarantined` outcome (either path: a fresh seal or a
+/// The ONE writer of a WRITE-path quarantine's `write_quarantined` event —
+/// reached from `confirm`'s `Quarantined` arm (either path: a fresh seal or a
 /// resume's re-confirm) and from `resume`'s own divergence findings (the
-/// resume-only arm). Confirm's OTHER non-Sealed outcome, `Inconclusive`
+/// resume-only arms). Confirm's OTHER non-Sealed outcome, `Inconclusive`
 /// (ADR-0012's 2026-09-18 amendment, issues #260/#267), is deliberately NOT
 /// routed here — it never touches `observed_condition`, so there is no
-/// quarantine fact to report; see `finish_confirm`'s own arm. ADR-0001
-/// contact-time divergence;
-/// `session.rs` has already written `volumes.observed_condition =
-/// 'quarantined'` (ADR-0012's 2026-09-17 amendment, issue #242 — `status` is
-/// left untouched) by the time this runs, so this only reports it and turns
-/// the outcome into the `Err` the command exits on.
+/// quarantine fact to record; see `finish_confirm`'s own arm. ADR-0001
+/// contact-time divergence.
+///
+/// **Called only inside `session::record_quarantine`'s transaction** (issue
+/// #324), alongside `volumes.observed_condition = 'quarantined'` (ADR-0012's
+/// 2026-09-17 amendment, issue #242 — `status` is left untouched) and
+/// `writes.status = 'aborted'`. The event is the recorded abort time
+/// `InterruptedSession::adopt_aborted` needs (ADR-0012, 2026-09-23); written
+/// after that commit, as it once was here, a crash between the two left an
+/// aborted session with no recorded abort, refused by `volume resume`
+/// forever. `conn` is that transaction. The command's exit is
+/// [`quarantine_error`]'s, which writes nothing.
 ///
 /// **Deliberately not factored together with
 /// [`quarantine_on_medium_evidence`]'s event**, issue #234's peer under
@@ -2319,9 +2379,17 @@ pub(crate) fn log_quarantine(
         None,
         None,
     )?;
-    Err(TapectlError::Other(format!(
-        "volume \"{label}\" quarantined: {reason}"
-    )))
+    Ok(())
+}
+
+/// The `Err` a write-path quarantine exits on. Reports only: the facts
+/// (condition, `writes` rows, event) were recorded together by
+/// `session::record_quarantine` before the outcome reached the caller.
+pub(crate) fn quarantine_error(label: &str, reason: &QuarantineReason) -> TapectlError {
+    TapectlError::Other(format!(
+        "volume \"{label}\" quarantined: {}",
+        describe_quarantine(reason)
+    ))
 }
 
 /// What a failed verify did to `volumes.observed_condition`, when it did
@@ -2866,7 +2934,7 @@ fn record_write_bookkeeping(
 /// wrong cartridge loaded before any write means the operator grabbed the
 /// wrong tape, not that this not-yet-written logical volume diverged, so it
 /// is never marked `quarantined`. This function's claim above still holds.)
-fn describe_quarantine(reason: &QuarantineReason) -> String {
+pub(crate) fn describe_quarantine(reason: &QuarantineReason) -> String {
     match reason {
         QuarantineReason::ConfirmFailed(evidence) => format!(
             "confirm chain-walk found {} mismatch(es) at tier {:?}: {:?}",
@@ -11612,5 +11680,66 @@ mod tests {
                  string.\n{stmt}"
             );
         }
+    }
+
+    // ---- issue #324: `volume abort`'s operator text, sealed vs unsealed ----
+
+    /// The sentence that sends the operator to `staging clean --force` with
+    /// no caveat. Correct for an unsealed session; for a sealed one it
+    /// deletes the frozen files `volume resume`'s re-confirm revalidates
+    /// against (ADR-0012, 2026-09-23).
+    const UNQUALIFIED_FORCE_ADVICE: &str = "use `tapectl staging clean --force`";
+
+    #[test]
+    fn abort_consent_for_a_sealed_session_says_keep_staging_and_that_releasing_forfeits_resume() {
+        let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, true).join("\n");
+        assert!(
+            !facts.contains(UNQUALIFIED_FORCE_ADVICE),
+            "a sealed session's consent must not advise releasing staging unqualified:\n{facts}"
+        );
+        assert!(
+            facts.contains("keep staging if you intend to verify and resume"),
+            "{facts}"
+        );
+        assert!(facts.contains("forfeits"), "{facts}");
+        assert!(facts.contains("tapectl volume verify L6-0001"), "{facts}");
+        assert!(facts.contains("tapectl volume resume L6-0001"), "{facts}");
+    }
+
+    #[test]
+    fn abort_consent_for_an_unsealed_session_keeps_the_release_advice() {
+        let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, false).join("\n");
+        assert!(facts.contains(UNQUALIFIED_FORCE_ADVICE), "{facts}");
+        assert!(
+            !facts.contains("keep staging if you intend to verify and resume"),
+            "an unsealed session can never be resumed, so nothing is forfeited:\n{facts}"
+        );
+        assert!(!facts.contains("forfeits"), "{facts}");
+        assert!(facts.contains("left unsealed"), "{facts}");
+    }
+
+    #[test]
+    fn abort_done_message_for_a_sealed_session_names_resume_and_never_says_unsealed() {
+        let msg = abort_done_message("L6-0001", true);
+        assert!(!msg.contains("can no longer be resumed"), "{msg}");
+        assert!(!msg.contains("unsealed"), "{msg}");
+        assert!(msg.contains("tapectl volume resume L6-0001"), "{msg}");
+        assert!(
+            msg.contains("keep staging if you intend to verify and resume"),
+            "{msg}"
+        );
+        assert!(msg.contains("forfeits"), "{msg}");
+    }
+
+    #[test]
+    fn abort_done_message_for_an_unsealed_session_says_not_resumable_and_force_releases() {
+        let msg = abort_done_message("L6-0001", false);
+        assert!(msg.contains("can no longer be resumed"), "{msg}");
+        assert!(msg.contains("unsealed"), "{msg}");
+        // Plain `staging clean` does not release an aborted session's slices
+        // (`staging::clean::ReleaseBlocker::Abandoned`); the message must
+        // name the flag that does.
+        assert!(msg.contains("`tapectl staging clean --force`"), "{msg}");
+        assert!(!msg.contains("forfeits"), "{msg}");
     }
 }

@@ -674,8 +674,9 @@ pub enum ResumeAdmission {
 /// `events` row for the volume whose action is one of the two every
 /// abort-to-`aborted` path logs — `write_aborted` (`write::volume_abort`, in
 /// the same transaction as the status flip; `write::finish_session`'s
-/// execute-abort arm) or `write_quarantined` (`write::log_quarantine`, for
-/// confirm's Quarantined arm and resume's own divergence arms). `None` when
+/// execute-abort arm) or `write_quarantined` ([`record_quarantine`], in the
+/// same transaction as the status flip, for confirm's Quarantined arm and
+/// resume's own divergence arms — issue #324). `None` when
 /// no such row exists; the caller refuses rather than guessing.
 fn recorded_abort_time(conn: &Connection, volume_id: i64) -> Result<Option<String>> {
     Ok(conn.query_row(
@@ -1149,20 +1150,17 @@ impl InterruptedSession {
                 // chose -- so it moves `observed_condition`, not `status`.
                 // The operator's own status (e.g. a terminal `retired`) is
                 // never overwritten by this write.
-                conn.execute(
-                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
-                    params![self.volume_id],
-                )?;
-                mark_writes(conn, &self.write_ids, "aborted")?;
-                return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
-                    volume_id: self.volume_id,
-                    label: self.built.layout.label.clone(),
-                    reason: QuarantineReason::IdentityMismatch {
+                return Ok(ResumeOutcome::Quarantined(record_quarantine(
+                    conn,
+                    self.volume_id,
+                    &self.built.layout.label,
+                    &self.write_ids,
+                    QuarantineReason::IdentityMismatch {
                         expected_label: self.built.layout.label.clone(),
                         expected_uuid: self.built.layout.volume_uuid.clone(),
                         found,
                     },
-                }));
+                )?));
             }
             ContactOutcome::AlreadySealed {
                 seal_position: found_seal_position,
@@ -1195,18 +1193,15 @@ impl InterruptedSession {
                 // behaviour exactly. Same reasoning as the
                 // `IdentityMismatch` arm just above (issue #242): an
                 // observed fact, not an operator choice.
-                conn.execute(
-                    "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
-                    params![self.volume_id],
-                )?;
-                mark_writes(conn, &self.write_ids, "aborted")?;
-                return Ok(ResumeOutcome::Quarantined(QuarantinedSession {
-                    volume_id: self.volume_id,
-                    label: self.built.layout.label.clone(),
-                    reason: QuarantineReason::AlreadySealed {
+                return Ok(ResumeOutcome::Quarantined(record_quarantine(
+                    conn,
+                    self.volume_id,
+                    &self.built.layout.label,
+                    &self.write_ids,
+                    QuarantineReason::AlreadySealed {
                         seal_position: found_seal_position,
                     },
-                }));
+                )?));
             }
         }
 
@@ -1521,16 +1516,13 @@ impl SealedPending {
             // not final: the seal is recorded, so once a clean full verify
             // clears the condition `volume resume` adopts this session
             // (`InterruptedSession::adopt_aborted`, ADR-0012 2026-09-23).
-            conn.execute(
-                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
-                params![self.volume_id],
-            )?;
-            mark_writes(conn, &self.write_ids, "aborted")?;
-            Ok(ConfirmOutcome::Quarantined(QuarantinedSession {
-                volume_id: self.volume_id,
-                label: self.built.layout.label.clone(),
-                reason: QuarantineReason::ConfirmFailed(evidence),
-            }))
+            Ok(ConfirmOutcome::Quarantined(record_quarantine(
+                conn,
+                self.volume_id,
+                &self.built.layout.label,
+                &self.write_ids,
+                QuarantineReason::ConfirmFailed(evidence),
+            )?))
         } else {
             // ADR-0012's 2026-09-18 amendment (issues #260/#267): nothing
             // here proves the medium bad, so nothing is asserted about it
@@ -1808,6 +1800,38 @@ fn entry_path(entry: &LayoutEntry) -> Result<&Path> {
             entry.position
         ))),
     }
+}
+
+/// Record a write-path quarantine as ONE act (issue #324): the observed
+/// condition (ADR-0012's 2026-09-17 amendment, issue #242 — `status` is
+/// never touched), every `writes` row of the session `aborted`, and the
+/// `write_quarantined` event whose timestamp is the recorded abort
+/// [`InterruptedSession::adopt_aborted`] must find later (ADR-0012,
+/// 2026-09-23). All three commit together or not at all: a crash can no
+/// longer leave `aborted` rows with no recorded abort, which `volume resume`
+/// would refuse forever (`AbortedAdoption::NoRecordedAbort`). The event's
+/// text has one writer, `write::log_quarantine`, called here on the
+/// transaction.
+fn record_quarantine(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    write_ids: &[(i64, i64)],
+    reason: QuarantineReason,
+) -> Result<QuarantinedSession> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+        params![volume_id],
+    )?;
+    mark_writes(&tx, write_ids, "aborted")?;
+    super::write::log_quarantine(&tx, volume_id, label, &reason)?;
+    tx.commit()?;
+    Ok(QuarantinedSession {
+        volume_id,
+        label: label.to_string(),
+        reason,
+    })
 }
 
 fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
@@ -3126,6 +3150,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(write_status, "aborted");
+
+        // Issue #324: resume's divergence arms record their abort in the
+        // same act as the status change — exactly one `write_quarantined`
+        // row, so `adopt_aborted` has a recorded abort to be later than.
+        assert_eq!(quarantine_event_count(&f.conn, f.volume_id), 1);
+        assert!(recorded_abort_time(&f.conn, f.volume_id).unwrap().is_some());
     }
 
     // --- bonus: confirm's failure branch (never hit by behaviors 1-4) -----
@@ -4337,13 +4367,47 @@ mod tests {
     }
 
     /// State (B) of issue #280: a medium-proving confirm failure
-    /// (Quarantined — `writes` aborted, condition quarantined), recorded by
-    /// the production writer `write::log_quarantine` (which `finish_confirm`
-    /// calls), an hour ago; then the tape reads clean again.
+    /// (Quarantined — `writes` aborted, condition quarantined, and the
+    /// `write_quarantined` event, all recorded by confirm itself since issue
+    /// #324), an hour ago; then the tape reads clean again.
     fn quarantined_by_confirm() -> SealedAborted {
         let (pending, mut sa, slice_position) =
             sealed_pending_on_initialized_volume(make_fixture());
         let good = sa.store.files[slice_position].clone();
+        sa.store.files[slice_position][0] ^= 0xFF;
+        match pending
+            .confirm(&sa.conn, &mut sa.store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Quarantined(_) => {}
+            _ => panic!("fixture premise: a flipped content byte quarantines"),
+        }
+        // No explicit event write here (issue #324): confirm recorded it,
+        // and `backdate_abort_events`'s `n > 0` is the positive control.
+        backdate_abort_events(&sa.conn, sa.volume_id, "-1 hour");
+        sa.store.files[slice_position] = good;
+        sa
+    }
+
+    fn quarantine_event_count(conn: &Connection, volume_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE entity_type = 'volume' AND entity_id = ?1 AND action = 'write_quarantined'",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #324: confirm's Quarantined arm records its own abort — the
+    /// `write_quarantined` event lands with `writes.status = 'aborted'`,
+    /// with no second call from the caller. Before the fix it was written
+    /// later, by `write::log_quarantine`, so a crash between the two left
+    /// `adopt_aborted` with no recorded abort to be later than, forever.
+    #[test]
+    fn confirm_quarantine_records_its_abort_event_with_the_status_change() {
+        let (pending, mut sa, slice_position) =
+            sealed_pending_on_initialized_volume(make_fixture());
         sa.store.files[slice_position][0] ^= 0xFF;
         let q = match pending
             .confirm(&sa.conn, &mut sa.store, Tier::Integrity)
@@ -4352,10 +4416,104 @@ mod tests {
             ConfirmOutcome::Quarantined(q) => q,
             _ => panic!("fixture premise: a flipped content byte quarantines"),
         };
-        let _ = super::super::write::log_quarantine(&sa.conn, sa.volume_id, &q.label, &q.reason);
-        backdate_abort_events(&sa.conn, sa.volume_id, "-1 hour");
-        sa.store.files[slice_position] = good;
-        sa
+
+        // Exactly the time `adopt_aborted` reads, from nothing but confirm.
+        assert!(
+            recorded_abort_time(&sa.conn, sa.volume_id)
+                .unwrap()
+                .is_some(),
+            "confirm's Quarantined arm must record the abort itself"
+        );
+        assert_eq!(quarantine_event_count(&sa.conn, sa.volume_id), 1);
+        // The row shape `report events` renders (cli/report.rs pins it):
+        // reason in `new_value`, no `field`, no `details`.
+        let (field, new_value, details): (Option<String>, Option<String>, Option<String>) = sa
+            .conn
+            .query_row(
+                "SELECT field, new_value, details FROM events
+                 WHERE entity_id = ?1 AND action = 'write_quarantined'",
+                params![sa.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(field, None);
+        assert_eq!(details, None);
+        assert_eq!(
+            new_value.as_deref(),
+            Some(super::super::write::describe_quarantine(&q.reason).as_str())
+        );
+        // No event without its status, and no status without its event.
+        let statuses: Vec<String> = sa
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![sa.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!statuses.is_empty() && statuses.iter().all(|s| s == "aborted"));
+
+        // And the report path the caller takes afterwards writes nothing
+        // more: one abort, one row.
+        let _ = super::super::write::quarantine_error(&q.label, &q.reason);
+        assert_eq!(quarantine_event_count(&sa.conn, sa.volume_id), 1);
+    }
+
+    /// Issue #324, the atomicity half: if the event insert fails, neither
+    /// the status change nor the event lands. The failure is injected with
+    /// an SQLite trigger that aborts exactly the `write_quarantined` insert
+    /// — no code seam — so a pre-fix confirm (status first, event never
+    /// attempted inside it) leaves `aborted` rows and no event: red.
+    #[test]
+    fn confirm_quarantine_rolls_back_status_and_event_together() {
+        let (pending, mut sa, slice_position) =
+            sealed_pending_on_initialized_volume(make_fixture());
+        let statuses_before: Vec<String> = sa
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![sa.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !statuses_before.is_empty() && statuses_before.iter().all(|s| s != "aborted"),
+            "fixture premise: {statuses_before:?}"
+        );
+        sa.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER inject_quarantine_event_failure
+                 BEFORE INSERT ON events WHEN NEW.action = 'write_quarantined'
+                 BEGIN SELECT RAISE(ABORT, 'injected: write_quarantined insert failed'); END;",
+            )
+            .unwrap();
+        sa.store.files[slice_position][0] ^= 0xFF;
+
+        let result = pending.confirm(&sa.conn, &mut sa.store, Tier::Integrity);
+        assert!(
+            result.is_err(),
+            "the injected event failure must surface, not be swallowed"
+        );
+
+        let statuses_after: Vec<String> = sa
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![sa.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(statuses_after, statuses_before, "status must roll back");
+        let condition: String = sa
+            .conn
+            .query_row(
+                "SELECT observed_condition FROM volumes WHERE id = ?1",
+                params![sa.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(condition, "ok", "condition must roll back with the status");
+        assert_eq!(quarantine_event_count(&sa.conn, sa.volume_id), 0);
     }
 
     /// The other sealed-then-aborted path: an Inconclusive confirm (rows
