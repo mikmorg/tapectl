@@ -86,6 +86,10 @@ usage: lifecycle-suite.sh [--scenario NAME | --all] [--device /dev/nstN]
   --scenario NAME                 Run one scenario (see --list for names).
   --all                           Run every scenario in order.
   --device PATH                   Tape device (default: $TAPECTL_GATE_TAPE; there is no fallback).
+                                   A /dev/tape/by-id/scsi-<serial>-nst symlink is accepted
+                                   and is the spelling to use for a real drive (/dev/nstN
+                                   numbering moves across reboots); it is resolved only
+                                   for lsscsi/sysfs lookups and passed to tapectl as given.
   --erase long|short              long = mt rewind+erase (instant on mhvtl, HOURS on
                                    real LTO — never the default on a real drive).
                                    short = mt rewind+weof 1+rewind. This UNSEALS a tape;
@@ -222,10 +226,39 @@ else
         # sg_read_attr's own "Medium serial number" field — a loose grep
         # matches an unrelated MAM field first and either refuses every
         # legitimate run or, worse, matches the wrong thing and passes.
-        ST_BASE="$(basename "$TAPE_DEV")"; ST_BASE="${ST_BASE#n}"
+        #
+        # Every lookup goes through the CANONICAL node (issue #334, the
+        # sibling of mhvtl-device.sh's #321 fix): the spelling CLAUDE.md
+        # prescribes for the real drive, /dev/tape/by-id/scsi-<serial>-nst,
+        # is a symlink whose basename is not an st node, so `basename
+        # "$TAPE_DEV"` found nothing in lsscsi. TAPE_DEV itself is passed to
+        # tapectl, mt and dd exactly as given.
+        TAPE_REAL="$(readlink -f "$TAPE_DEV")"
+        [ -n "$TAPE_REAL" ] || die "cannot resolve $TAPE_DEV to a device node"
+        ST_NODE="$(basename "$TAPE_REAL")"
+        [ -n "$ST_NODE" ] || die "cannot resolve $TAPE_DEV to a device node"
+        [ -d "/sys/class/scsi_tape/$ST_NODE" ] \
+            || die "$TAPE_DEV resolves to $TAPE_REAL, which is not an st tape node (no /sys/class/scsi_tape/$ST_NODE)"
+        # The drive's sg node comes from the kernel's own binding of THIS st
+        # node (sysfs, no SCSI command sent), so the consent check below
+        # reads the MAM of the same drive the tape path names. The lsscsi row
+        # is looked up independently from the same canonical node and must
+        # agree: two derivations that disagree are a refusal, never a pick.
+        SG_DIR="/sys/class/scsi_tape/$ST_NODE/device/scsi_generic"
+        SG_ENTRIES=()
+        for e in "$SG_DIR"/sg*; do [ -e "$e" ] && SG_ENTRIES+=("$(basename "$e")"); done
+        [ "${#SG_ENTRIES[@]}" -gt 0 ] || die "cannot find the sg node of $TAPE_DEV ($TAPE_REAL) in $SG_DIR"
+        [ "${#SG_ENTRIES[@]}" -eq 1 ] \
+            || die "$SG_DIR lists more than one sg node (${SG_ENTRIES[*]}) — refusing to guess which one is $TAPE_DEV"
+        [ -n "${SG_ENTRIES[0]}" ] || die "empty sg node name under $SG_DIR"
+        SYSFS_SG="/dev/${SG_ENTRIES[0]}"
+        ST_BASE="${ST_NODE#n}"   # nst0 -> st0, as lsscsi prints it
         ROW="$(lsscsi -g | grep -F "/dev/$ST_BASE " | head -1)"
-        [ -n "$ROW" ] || die "cannot find $TAPE_DEV in lsscsi -g"
+        [ -n "$ROW" ] || die "cannot find $TAPE_DEV ($TAPE_REAL) in lsscsi -g"
         DRIVE_SG="$(echo "$ROW" | awk '{print $NF}')"
+        [ -n "$DRIVE_SG" ] || die "lsscsi -g row for $TAPE_DEV names no sg node"
+        [ "$DRIVE_SG" = "$SYSFS_SG" ] || die \
+            "$TAPE_DEV: lsscsi names sg node '$DRIVE_SG' but sysfs names '$SYSFS_SG' — refusing to read consent from an unproven drive"
         DRIVE_MODEL="$(echo "$ROW" | awk '{print $3" "$4}')"
         CHG_SG=""; DTE=""; GEN=""; LOADED_TAG="$LOSE_SERIAL"
 
