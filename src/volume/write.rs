@@ -3015,6 +3015,31 @@ fn decide_fresh_write_contact(
                 )))
             }
         }
+        // Issue #327: the same refusal and the same --force override as a
+        // mismatch — an empty File 0 is not provably blank (ADR-0003 fails
+        // closed) — but told as what it is. It identifies no volume and is
+        // not corrupt, so "a DIFFERENT volume" / "wrong physical cartridge"
+        // would send the operator hunting for a tape they already hold.
+        ContactOutcome::EmptyFileZero => {
+            if allow_overwrite {
+                warn!(
+                    label,
+                    volume_uuid,
+                    "--force overriding an empty File 0 (a filemark at BOT) at contact"
+                );
+                Ok(())
+            } else {
+                Err(TapectlError::Other(format!(
+                    "refusing to write volume \"{label}\" (uuid {volume_uuid}): the loaded \
+                     cartridge's File 0 is EMPTY — a filemark at the beginning of the tape with \
+                     no bytes before it, not a tapectl ID thunk. That identifies no volume, but \
+                     it is not a blank tape either: something wrote that filemark, and tapectl \
+                     only writes to a cartridge it can prove is blank or its own. If you know \
+                     what this cartridge holds and are deliberately overwriting it, re-run with \
+                     --force."
+                )))
+            }
+        }
     }
 }
 
@@ -9152,6 +9177,54 @@ mod tests {
         let err = decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains(FW_LABEL));
+        // Issue #327's positive control: File 0 bytes that do not parse keep
+        // the corrupt-File-0 wording; only an EMPTY File 0 changed.
+        assert!(
+            msg.contains("a present but unparseable/corrupt File 0"),
+            "{msg}"
+        );
+        assert!(!msg.contains("EMPTY"), "{msg}");
+    }
+
+    /// Issue #327: File 0 with zero bytes before its filemark (a filemark at
+    /// BOT). Refused exactly as a mismatch is — ADR-0003 fails closed on
+    /// anything not provably blank — but told as what it is: it identifies
+    /// no volume and is not corrupt.
+    #[test]
+    fn decide_fresh_write_contact_empty_file_zero_refuses_without_force_naming_the_filemark() {
+        let err =
+            decide_fresh_write_contact(&ContactOutcome::EmptyFileZero, FW_LABEL, FW_UUID, false)
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(FW_LABEL), "{msg}");
+        assert!(msg.contains(FW_UUID), "{msg}");
+        assert!(msg.contains("File 0 is EMPTY"), "{msg}");
+        assert!(
+            msg.contains("a filemark at the beginning of the tape"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "the override is still named: {msg}"
+        );
+        for wrong in [
+            "DIFFERENT volume",
+            "unparseable",
+            "corrupt",
+            "wrong physical cartridge",
+        ] {
+            assert!(!msg.contains(wrong), "must not say {wrong:?}: {msg}");
+        }
+        // `scripts/first-run.sh` routes an init refusal on "ADR-0003" to its
+        // no-flag-helps (sealed) branch; this one IS --force-overridable, so
+        // it must not carry that marker.
+        assert!(!msg.contains("ADR-0003"), "{msg}");
+    }
+
+    #[test]
+    fn decide_fresh_write_contact_empty_file_zero_permits_with_force() {
+        decide_fresh_write_contact(&ContactOutcome::EmptyFileZero, FW_LABEL, FW_UUID, true)
+            .unwrap();
     }
 
     #[test]
@@ -9218,6 +9291,34 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("WRONGVOL"), "found label missing from: {msg}");
         assert!(msg.contains(FW_LABEL), "expected label missing from: {msg}");
+    }
+
+    /// Issue #327, through the real contact check: a tape whose File 0 is
+    /// only a filemark (`mt rewind; mt weof 1`) reads back as a present,
+    /// zero-byte file — NOT as a blank tape — and is refused without
+    /// --force, with the empty-File-0 wording.
+    #[test]
+    fn check_fresh_write_contact_empty_file_zero_refuses_without_force() {
+        for seal_position in [None, Some(5)] {
+            let mut store = MemStore::new(FW_BS as usize);
+            fw_put_file(&mut store, 0, Vec::new());
+            let err =
+                check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, seal_position, false)
+                    .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("File 0 is EMPTY"), "{seal_position:?}: {msg}");
+            assert!(
+                !msg.contains("DIFFERENT volume"),
+                "{seal_position:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_fresh_write_contact_empty_file_zero_permits_with_force() {
+        let mut store = MemStore::new(FW_BS as usize);
+        fw_put_file(&mut store, 0, Vec::new());
+        check_fresh_write_contact(&mut store, FW_LABEL, FW_UUID, None, true).unwrap();
     }
 
     #[test]

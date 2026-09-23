@@ -384,6 +384,14 @@ pub enum ContactOutcome {
     IdentityMismatch {
         found: Option<format::IdThunkIdentity>,
     },
+    /// File 0 was readable but EMPTY: zero bytes before its filemark — a
+    /// filemark at BOT (issue #327; `mt rewind; mt weof 1` produces it). It
+    /// identifies no volume and is not corrupt, so it must not be reported
+    /// as either; but it is not provably blank either (a blank tape's File
+    /// 0 read fails, [`Self::Blank`]), so every caller treats it exactly as
+    /// it treats [`Self::IdentityMismatch`]: the fresh-write path refuses
+    /// without `--force` (ADR-0003 fails closed), resume quarantines.
+    EmptyFileZero,
     /// The seal-marker position parsed as a seal marker: this tape already
     /// holds a SEALED volume (ADR-0003 — sealed volumes are immutable,
     /// there is no append).
@@ -475,6 +483,15 @@ pub fn check_tape_contact(
             // issue #27's headline scenario -- a foreign-but-SEALED
             // cartridge presenting as a plain mismatch the flag could
             // defeat -- is closed by the hoisted probe, not here.
+            //
+            // Issue #327: `Store::read_file` succeeds with zero bytes when
+            // File 0 is only a filemark (`TapeStore`: the first read
+            // returns 0), and "" fails to parse just as garbage does. The
+            // two are different facts and are reported as such; both
+            // still refuse.
+            if id_thunk_bytes.is_empty() {
+                return ContactOutcome::EmptyFileZero;
+            }
             return ContactOutcome::IdentityMismatch {
                 found: identity.ok(),
             };
@@ -1179,7 +1196,14 @@ impl InterruptedSession {
                 // Fall through to the two-case cursor rule exactly as
                 // before.
             }
-            ContactOutcome::IdentityMismatch { found } => {
+            contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
+                // Issue #327: an empty File 0 at resume is divergence too —
+                // this session wrote a real ID thunk there. It quarantines
+                // exactly as an unparseable File 0 does (`found: None`).
+                let found = match contact {
+                    ContactOutcome::IdentityMismatch { found } => found,
+                    _ => None,
+                };
                 // ADR-0012's 2026-09-17 amendment (issue #242): this is a
                 // catalog fact tapectl OBSERVED, never one the operator
                 // chose -- so it moves `observed_condition`, not `status`.
@@ -4066,6 +4090,34 @@ mod tests {
             }
             other => panic!("expected IdentityMismatch, got {other:?}"),
         }
+    }
+
+    /// Issue #327: File 0 present with ZERO bytes — a filemark at BOT.
+    /// `TapeStore::read_file` returns `Ok(0)` for it (the first read hits
+    /// the filemark), which `MemStore` models as an empty recorded file. It
+    /// is its own finding, neither `Blank` (a blank tape's File 0 read
+    /// FAILS) nor an unparseable `IdentityMismatch`.
+    #[test]
+    fn check_tape_contact_empty_file_zero_is_its_own_finding() {
+        for seal_position in [None, Some(5)] {
+            let mut store = MemStore::new(BS as usize);
+            put_file(&mut store, 0, Vec::new());
+            let outcome =
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, seal_position);
+            assert_eq!(outcome, ContactOutcome::EmptyFileZero, "{seal_position:?}");
+        }
+    }
+
+    /// Issue #327's positive control: a File 0 of zero-FILLED bytes is not
+    /// empty — it has bytes, and they do not parse. It stays the
+    /// unparseable `IdentityMismatch`, so the empty check keys on length,
+    /// not on content.
+    #[test]
+    fn check_tape_contact_zero_filled_file_zero_is_unparseable_not_empty() {
+        let mut store = MemStore::new(BS as usize);
+        put_file(&mut store, 0, vec![0u8; BS as usize]);
+        let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None);
+        assert_eq!(outcome, ContactOutcome::IdentityMismatch { found: None });
     }
 
     #[test]
