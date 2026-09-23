@@ -277,6 +277,27 @@ pub fn holds_sealed_bytes(volume_alias: &str) -> String {
     )
 }
 
+/// "Does this volume hold bytes a verify could check?" -- the question
+/// `report verify-status` asks before it synthesises a "never verified"
+/// line for a volume with no verification session (issue #336).
+///
+/// Bytes: legacy `active`/`full`, `sealed`, or a recorded seal on a volume
+/// whose confirm never landed (`sealed_at` set while `initialized` -- the
+/// state [`holds_sealed_bytes`] also widens to). Not gone: `retired`,
+/// `missing` and `erased` media is not verified. Unlike
+/// [`holds_sealed_bytes`] this does NOT exclude a quarantined condition: a
+/// quarantined volume is exactly one to verify, since a clean full verify is
+/// what clears it (ADR-0012, 2026-09-17). `blank`/`initialized` without a
+/// recorded seal hold nothing to verify.
+pub fn holds_bytes_to_verify(volume_alias: &str) -> String {
+    format!(
+        "(({in_bytes} OR {alias}.sealed_at IS NOT NULL) AND {not_gone})",
+        in_bytes = status_in(volume_alias, &["active", "full", "sealed"]),
+        alias = volume_alias,
+        not_gone = status_not_in(volume_alias, &["retired", "missing", "erased"]),
+    )
+}
+
 /// A write's status set that means "this write's bytes are physically ON
 /// the tape right now", regardless of whether confirm has yet recorded an
 /// outcome for it (issue #276).

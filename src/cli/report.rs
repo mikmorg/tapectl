@@ -1048,6 +1048,18 @@ fn verify_status_rows(
     if let Some(label) = volume_filter {
         sql.push_str(" AND v.label = ?");
         param_values.push(Box::new(label.to_string()));
+    } else {
+        // Issue #336: the fleet-wide listing synthesises a "never verified"
+        // line only for a volume that holds bytes a verify could check --
+        // not for an erased, retired, missing, blank or merely initialized
+        // one, which would otherwise sort to the TOP of "what to verify
+        // next". A volume WITH sessions keeps every row whatever its status
+        // now (its history is the report's point), and `--volume L` shows
+        // the named volume regardless: the operator asked for it.
+        sql.push_str(&format!(
+            " AND (vs.id IS NOT NULL OR {})",
+            crate::policy::coverage::holds_bytes_to_verify("v")
+        ));
     }
     // Oldest evidence first (docs/operator-guide.md: "verification recency,
     // oldest first"), never-verified first of all: a NULL `completed_at` is
@@ -2163,6 +2175,59 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].0, "VOL-BLANK");
             assert!(rows[0].2.is_none());
+        }
+
+        /// Issue #336: a session-less volume that holds nothing to verify
+        /// is not listed as "never verified" -- erased, retired, missing,
+        /// blank and plain initialized. Positive controls: a sealed one, a
+        /// legacy `full` one, a quarantined sealed one (verify is what
+        /// clears quarantine) and an `initialized` one whose seal is
+        /// recorded all still appear; an erased volume WITH a session keeps
+        /// its history row; and `--volume` finds an erased one by name.
+        #[test]
+        fn never_verified_lists_only_volumes_holding_bytes_to_verify() {
+            let conn = crate::db::open_memory().unwrap();
+            let seed = |label: &str, status: &str, sealed: bool, cond: &str| {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status, observed_condition, sealed_at)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000, ?2, ?3,
+                             CASE WHEN ?4 THEN datetime('now') END)",
+                    params![label, status, cond, sealed],
+                )
+                .unwrap();
+            };
+            for status in ["erased", "retired", "missing", "blank", "initialized"] {
+                seed(&format!("GONE-{status}"), status, false, "ok");
+            }
+            seed("GONE-erased-sealed", "erased", true, "ok");
+            seed("KEEP-sealed", "sealed", false, "ok");
+            seed("KEEP-full", "full", false, "ok");
+            seed("KEEP-quarantined", "sealed", false, "quarantined");
+            seed("KEEP-init-sealed", "initialized", true, "ok");
+            seed_verified(&conn, "KEEP-verified", "2020-01-01T00:00:00Z");
+            conn.execute(
+                "UPDATE volumes SET status = 'erased' WHERE label = 'KEEP-verified'",
+                [],
+            )
+            .unwrap();
+
+            let rows = verify_status_rows(&conn, None).unwrap();
+            let mut labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+            labels.sort_unstable();
+            assert_eq!(
+                labels,
+                vec![
+                    "KEEP-full",
+                    "KEEP-init-sealed",
+                    "KEEP-quarantined",
+                    "KEEP-sealed",
+                    "KEEP-verified"
+                ]
+            );
+
+            let named = verify_status_rows(&conn, Some("GONE-erased")).unwrap();
+            assert_eq!(named.len(), 1, "--volume shows the volume it names");
         }
 
         #[test]
