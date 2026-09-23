@@ -309,6 +309,7 @@ fn print_json(
                 "device_tape_exists": c.device_tape_exists,
                 "device_sg": c.device_sg,
                 "device_sg_exists": c.device_sg_exists,
+                "device_sg_pairing_problem": c.pairing_problem,
             })
         })
         .collect();

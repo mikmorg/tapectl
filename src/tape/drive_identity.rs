@@ -289,6 +289,66 @@ fn sysfs_device_dir(device_tape: &str) -> Option<PathBuf> {
     Some(sysfs_device_dir_for_node(&node))
 }
 
+/// The sg node the kernel binds to `device_tape`'s st node — the one entry
+/// of sysfs `device/scsi_generic/` — as `/dev/sgN`. Read from sysfs only: no
+/// device is opened and no SCSI command is sent. `None` when it cannot be
+/// proven (no such sysfs directory, e.g. a test's fake path, or not exactly
+/// one entry), and a caller must then assume nothing either way.
+pub fn sg_node_for_tape(device_tape: &str) -> Option<PathBuf> {
+    let dir = sysfs_device_dir(device_tape)?.join("scsi_generic");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    if names.len() != 1 {
+        return None;
+    }
+    Some(Path::new("/dev").join(names.remove(0)))
+}
+
+/// Issue #329: does `backend.device_sg` name the SAME drive as
+/// `backend.device_tape`? A contact's drive identity is read through the
+/// tape node's sysfs, but its MAM and log pages through `device_sg`, so a
+/// config pairing a stable by-id `device_tape` with a `/dev/sgN` that moved
+/// on a reboot mixes two drives in one contact row — and, on the write
+/// path, binds and sizes a cartridge from another drive's chip.
+///
+/// `Some(problem)` only when the mismatch is PROVEN (the kernel's binding is
+/// readable and differs); an unprovable pairing is `None`, never a refusal.
+pub fn sg_pairing_problem(backend: &LtoBackendConfig) -> Option<String> {
+    let bound = sg_node_for_tape(&backend.device_tape)?;
+    pairing_problem(
+        &backend.name,
+        &backend.device_tape,
+        &bound,
+        &backend.device_sg,
+    )
+}
+
+/// The comparison behind [`sg_pairing_problem`], split out so it is testable
+/// without sysfs. `configured_sg` is resolved through symlinks first, so a
+/// by-id spelling of the right node is not a mismatch.
+fn pairing_problem(
+    name: &str,
+    device_tape: &str,
+    bound: &Path,
+    configured_sg: &str,
+) -> Option<String> {
+    let configured =
+        std::fs::canonicalize(configured_sg).unwrap_or_else(|_| PathBuf::from(configured_sg));
+    if configured == bound {
+        return None;
+    }
+    Some(format!(
+        "backend \"{name}\": device_sg = {configured_sg} is not the drive device_tape = \
+         {device_tape} names — the kernel binds that tape node to {}. Its cartridge chip (MAM) \
+         and log pages would be read from a different device (/dev/sgN numbering moves across \
+         reboots). Set device_sg = \"{}\" in this [[backends.lto]] entry.",
+        bound.display(),
+        bound.display()
+    ))
+}
+
 /// Build the sysfs device directory for a tape node name (`nst1`).
 /// Split out from [`sysfs_device_dir`] so the path shape is testable
 /// without a device node or a `/sys` read.
@@ -636,6 +696,40 @@ mod tests {
     }
 
     // ── sysfs path shape (no `/sys` read, no device node) ─────────────
+
+    /// Issue #329: a proven mismatch names both nodes and the fix; the same
+    /// node, however spelled, is no problem. Pure: no sysfs, no device.
+    #[test]
+    fn pairing_problem_reports_a_proven_mismatch_only() {
+        let bound = Path::new("/dev/sg-bound-fixture");
+        assert_eq!(
+            pairing_problem(
+                "lto0",
+                "/dev/tape/by-id/x-nst",
+                bound,
+                "/dev/sg-bound-fixture"
+            ),
+            None
+        );
+        let p = pairing_problem(
+            "lto0",
+            "/dev/tape/by-id/x-nst",
+            bound,
+            "/dev/sg-other-fixture",
+        )
+        .expect("a different sg node is a problem");
+        assert!(p.contains("lto0"), "{p}");
+        assert!(p.contains("/dev/sg-other-fixture"), "{p}");
+        assert!(p.contains("device_sg = \"/dev/sg-bound-fixture\""), "{p}");
+    }
+
+    /// An unprovable binding (no sysfs directory for a fake node) is `None`:
+    /// a pairing that cannot be checked is never reported as wrong.
+    #[test]
+    fn sg_node_for_tape_is_none_when_sysfs_cannot_prove_it() {
+        assert_eq!(sg_node_for_tape("/dev/nst-no-such-node"), None);
+        assert_eq!(sg_node_for_tape("memstore"), None);
+    }
 
     #[test]
     fn sysfs_device_dir_for_node_is_the_kernels_layout() {

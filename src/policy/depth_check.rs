@@ -360,6 +360,9 @@ pub struct TapeDeviceCheck {
     pub device_tape_exists: bool,
     pub device_sg: String,
     pub device_sg_exists: bool,
+    /// Issue #329: `Some` when sysfs PROVES `device_sg` is not the drive
+    /// `device_tape` names (read from sysfs only, never the device).
+    pub pairing_problem: Option<String>,
 }
 
 /// Probe every configured LTO backend's device paths for existence only.
@@ -374,6 +377,7 @@ pub fn scan_tape_devices(config: &Config) -> Vec<TapeDeviceCheck> {
             device_tape_exists: Path::new(&b.device_tape).exists(),
             device_sg: b.device_sg.clone(),
             device_sg_exists: Path::new(&b.device_sg).exists(),
+            pairing_problem: crate::tape::drive_identity::sg_pairing_problem(b),
         })
         .collect()
 }
@@ -382,6 +386,11 @@ pub fn scan_tape_devices(config: &Config) -> Vec<TapeDeviceCheck> {
 /// phrased as a mild note ("not attached"), never "warning" — absence is
 /// the normal state when a drive isn't plugged in.
 pub fn describe_tape_device(check: &TapeDeviceCheck) -> String {
+    // Issue #329: unlike absence, a PROVEN wrong pairing is a warning — a
+    // write through this backend is refused until it is fixed.
+    if let Some(problem) = &check.pairing_problem {
+        return format!("warning: {problem} (volume write refuses this backend until then)");
+    }
     let mut missing = Vec::new();
     if !check.device_tape_exists {
         missing.push(check.device_tape.as_str());
@@ -466,6 +475,23 @@ mod tests {
 
     // -- describe_tape_device: pure, mild wording --
 
+    /// Issue #329: a proven pairing problem is the line's whole content,
+    /// and it is a warning (a write refuses the backend).
+    #[test]
+    fn describe_tape_device_names_a_proven_pairing_problem_as_a_warning() {
+        let line = describe_tape_device(&TapeDeviceCheck {
+            backend_name: "lto1".to_string(),
+            device_tape: "/dev/tape/by-id/x-nst".to_string(),
+            device_tape_exists: true,
+            device_sg: "/dev/sg-wrong".to_string(),
+            device_sg_exists: true,
+            pairing_problem: Some("backend \"lto1\": device_sg = /dev/sg-wrong ...".into()),
+        });
+        assert!(line.starts_with("warning: "), "{line}");
+        assert!(line.contains("/dev/sg-wrong"), "{line}");
+        assert!(line.contains("volume write refuses"), "{line}");
+    }
+
     #[test]
     fn describe_tape_device_absent_is_a_note_not_a_warning() {
         let line = describe_tape_device(&TapeDeviceCheck {
@@ -474,6 +500,7 @@ mod tests {
             device_tape_exists: false,
             device_sg: "/dev/sg0".to_string(),
             device_sg_exists: false,
+            pairing_problem: None,
         });
         assert!(!line.to_lowercase().contains("warning"));
         assert!(line.contains("/dev/nst0"));
@@ -489,6 +516,7 @@ mod tests {
             device_tape_exists: true,
             device_sg: "/dev/sg0".to_string(),
             device_sg_exists: true,
+            pairing_problem: None,
         });
         assert!(line.contains("both present"));
     }

@@ -1354,6 +1354,23 @@ pub fn resolve_lto_backend<'a>(
              `tapectl config check` and fix it before writing)"
         )));
     }
+    let backend = resolve_lto_backend_unchecked(config, device)?;
+    // Issue #329: a write binds and sizes the cartridge from the chip read
+    // through `device_sg`, so a PROVEN mismatch with the drive `device_tape`
+    // names is refused here, before any MAM read or drive contact.
+    if let Some(problem) = crate::tape::drive_identity::sg_pairing_problem(backend) {
+        return Err(TapectlError::Config(format!(
+            "refusing to resolve an LTO backend for a write: {problem}"
+        )));
+    }
+    Ok(backend)
+}
+
+/// [`resolve_lto_backend`] before its device-pairing check.
+fn resolve_lto_backend_unchecked<'a>(
+    config: &'a Config,
+    device: Option<&str>,
+) -> Result<&'a LtoBackendConfig> {
     if let Some(dev) = device {
         return config
             .backends
@@ -1410,6 +1427,32 @@ pub fn resolve_lto_backend<'a>(
 ///   one is an error asking for `--device`, mirroring
 ///   [`resolve_lto_backend`].
 pub fn resolve_device<'a>(
+    config: &'a Config,
+    device: Option<&str>,
+) -> Result<(String, Option<&'a LtoBackendConfig>)> {
+    let (dev, backend) = resolve_device_unchecked(config, device)?;
+    // Issue #329, the lenient half: a read path never refuses over config
+    // (DR must work), but a backend whose `device_sg` is PROVEN to be
+    // another drive is not used for this contact's MAM read, log sweep or
+    // drive attribution — it proceeds exactly as a no-backend (DR) read.
+    let backend = match backend {
+        Some(b) => match crate::tape::drive_identity::sg_pairing_problem(b) {
+            Some(problem) => {
+                tracing::warn!(
+                    "{problem} Proceeding as if no backend matched: this read records no \
+                     cartridge chip, log pages or drive."
+                );
+                None
+            }
+            None => Some(b),
+        },
+        None => None,
+    };
+    Ok((dev, backend))
+}
+
+/// [`resolve_device`] before its device-pairing check.
+fn resolve_device_unchecked<'a>(
     config: &'a Config,
     device: Option<&str>,
 ) -> Result<(String, Option<&'a LtoBackendConfig>)> {
