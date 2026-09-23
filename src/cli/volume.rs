@@ -674,18 +674,19 @@ pub fn run(
                      before anything changes.",
                 ));
             }
-            let seal_recorded = write::volume_abort(conn, label, yes)?;
+            let seal = write::volume_abort(conn, label, yes)?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({
                         "label": label,
                         "status": "aborted",
-                        "seal_recorded": seal_recorded,
+                        "seal_recorded": seal.seal_recorded(),
+                        "reconfirmable": seal == write::AbortSeal::SealedReconfirmable,
                     })
                 );
             } else {
-                println!("{}", write::abort_done_message(label, seal_recorded));
+                println!("{}", write::abort_done_message(label, &seal));
             }
         }
 

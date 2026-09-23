@@ -1621,7 +1621,7 @@ fn volume_resume_contacted<'c>(
 /// command holds a `Connection`, so a surviving `in_progress` row means
 /// another process is writing this tape right now, and aborting it would
 /// corrupt a live session.
-pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<bool> {
+pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<AbortSeal> {
     let volume_id: i64 = conn
         .query_row(
             "SELECT id FROM volumes WHERE label = ?1",
@@ -1668,12 +1668,22 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
     let statuses: Vec<&str> = rows.iter().map(|(_, s)| s.as_str()).collect();
     // Issue #280: an Inconclusive confirm leaves `interrupted` rows on a
     // tape whose seal IS recorded, so "left unsealed" is not always true.
-    let seal_recorded: bool = conn.query_row(
-        "SELECT sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
-        params![volume_id],
-        |r| r.get(0),
-    )?;
-    let facts = abort_consent_facts(label, &statuses, slice_count, seal_recorded);
+    // Issue #331: and a recorded seal alone does not make the session
+    // re-confirmable -- resume refuses a volume that is no longer
+    // `initialized` (retired, erased by displacement or mark-erased). The
+    // question is asked of the state the abort WILL leave, so the abort is
+    // applied in a transaction that is rolled back, the same predicate
+    // `stage create --version`'s refusal uses is asked of it
+    // (`session::aborted_session_reconfirmable_after_verify`), and only then
+    // is the operator shown the facts. The two texts cannot disagree.
+    let seal = {
+        let dry_run = conn.unchecked_transaction()?;
+        apply_abort(&dry_run, volume_id, label, &write_ids)?;
+        let seal = abort_seal(&dry_run, volume_id)?;
+        dry_run.rollback()?;
+        seal
+    };
+    let facts = abort_consent_facts(label, &statuses, slice_count, &seal);
     crate::cli::consent::confirm(
         &format!("abandon the unfinished write session on volume \"{label}\""),
         &facts,
@@ -1681,14 +1691,31 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
     )?;
 
     let tx = conn.unchecked_transaction()?;
-    for id in &write_ids {
-        tx.execute(
+    apply_abort(&tx, volume_id, label, &write_ids)?;
+    tx.commit()?;
+
+    info!(
+        label,
+        volume_id,
+        sessions = write_ids.len(),
+        "operator aborted unfinished write session"
+    );
+    Ok(seal)
+}
+
+/// The catalog change `volume abort` makes: the session's rows become
+/// `aborted` and the `write_aborted` event resume's adoption reads is
+/// logged. Shared by the rolled-back dry run and the real abort, so the
+/// state the texts describe is the state the abort leaves.
+fn apply_abort(conn: &Connection, volume_id: i64, label: &str, write_ids: &[i64]) -> Result<()> {
+    for id in write_ids {
+        conn.execute(
             "UPDATE writes SET status = 'aborted' WHERE id = ?1",
             params![id],
         )?;
     }
     events::log_event(
-        &tx,
+        conn,
         "volume",
         volume_id,
         Some(label),
@@ -1699,35 +1726,68 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
         None,
         None,
     )?;
-    tx.commit()?;
-
-    info!(
-        label,
-        volume_id,
-        sessions = write_ids.len(),
-        "operator aborted unfinished write session"
-    );
-    Ok(seal_recorded)
+    Ok(())
 }
 
-/// What `volume abort` prints once the session is aborted (issue #324):
-/// `seal_recorded` is [`volume_abort`]'s return value.
-/// The two shapes say the same thing [`abort_consent_facts`] does.
-pub fn abort_done_message(label: &str, seal_recorded: bool) -> String {
-    if seal_recorded {
-        format!(
+/// What an aborted session's volume is, for `volume abort`'s texts (issues
+/// #324, #331).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortSeal {
+    /// No seal recorded: the session aborted before `seal()`.
+    Unsealed,
+    /// The seal is recorded and `volume resume` would re-confirm the session
+    /// after a clean full verify (ADR-0012, 2026-09-23).
+    SealedReconfirmable,
+    /// The seal is recorded but resume would refuse -- e.g. the volume is
+    /// no longer `initialized` (`status` names what it is).
+    SealedNotReconfirmable { status: String },
+}
+
+impl AbortSeal {
+    pub fn seal_recorded(&self) -> bool {
+        !matches!(self, AbortSeal::Unsealed)
+    }
+}
+
+/// Classify `volume_id` for `volume abort`, asked of the post-abort state.
+fn abort_seal(conn: &Connection, volume_id: i64) -> Result<AbortSeal> {
+    let (sealed, status): (bool, String) = conn.query_row(
+        "SELECT sealed_at IS NOT NULL, status FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(if !sealed {
+        AbortSeal::Unsealed
+    } else if session::aborted_session_reconfirmable_after_verify(conn, volume_id)? {
+        AbortSeal::SealedReconfirmable
+    } else {
+        AbortSeal::SealedNotReconfirmable { status }
+    })
+}
+
+/// What `volume abort` prints once the session is aborted (issues #324,
+/// #331): `seal` is [`volume_abort`]'s return value. The three shapes say
+/// the same thing [`abort_consent_facts`] does.
+pub fn abort_done_message(label: &str, seal: &AbortSeal) -> String {
+    match seal {
+        AbortSeal::SealedReconfirmable => format!(
             "volume \"{label}\" write session aborted. Its seal is recorded, so the cartridge \
              stays sealed and unharmed: after a clean full verify (`tapectl volume verify \
              {label}`), `tapectl volume resume {label}` re-confirms it. The staged slices stay \
              pinned — keep staging if you intend to verify and resume; releasing it \
              (`tapectl staging clean --force`) forfeits that."
-        )
-    } else {
-        format!(
+        ),
+        AbortSeal::SealedNotReconfirmable { status } => format!(
+            "volume \"{label}\" write session aborted. Its seal was recorded, so this volume is \
+             never written again (ADR-0003), but it is `{status}` in the catalog, so `tapectl \
+             volume resume` cannot re-confirm it. The staged slices stay pinned until `tapectl \
+             staging clean --force`; releasing them forfeits nothing."
+        ),
+        AbortSeal::Unsealed => format!(
             "volume \"{label}\" write session aborted — the session can no longer be \
              resumed. The cartridge is unsealed and unharmed; the staged slices stay pinned \
              until `tapectl staging clean --force`."
-        )
+        ),
     }
 }
 
@@ -1739,21 +1799,29 @@ pub(crate) fn abort_consent_facts(
     label: &str,
     statuses: &[&str],
     slice_count: i64,
-    seal_recorded: bool,
+    seal: &AbortSeal,
 ) -> Vec<String> {
-    let cartridge_fact = if seal_recorded {
-        "The cartridge is NOT touched: its seal is recorded, so it stays SEALED with every byte \
-         on it, exactly as the session left it."
-    } else {
-        "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
-         bulk-erased and reused (`cartridge mark-erased`)."
+    // Issue #331: "every byte on it" only for a volume the catalog still
+    // holds as `initialized` -- an `erased` one was displaced by a
+    // re-initialisation or marked erased, and its bytes are gone.
+    let cartridge_fact = match seal {
+        AbortSeal::SealedReconfirmable => "The cartridge is NOT touched: its seal is recorded, \
+             so it stays SEALED with every byte on it, exactly as the session left it."
+            .to_string(),
+        AbortSeal::SealedNotReconfirmable { status } => format!(
+            "The cartridge is NOT touched by this command. Its seal was recorded, so this \
+             volume is never written again (ADR-0003); the catalog holds it as `{status}`."
+        ),
+        AbortSeal::Unsealed => "The cartridge is NOT touched: it is left unsealed and \
+             physically unharmed, so it can be bulk-erased and reused (`cartridge mark-erased`)."
+            .to_string(),
     };
 
     // Issue #324: a recorded seal makes this session adoptable later
     // (ADR-0012, 2026-09-23), and that re-confirm revalidates against the
     // frozen staged files — so advising their release, unqualified, would
     // take back the resume the fact above promises.
-    let staging_fact = if seal_recorded {
+    let staging_fact = if *seal == AbortSeal::SealedReconfirmable {
         format!(
             "The staged slices stay pinned on disk — keep staging if you intend to verify and \
              resume: after a clean full verify (`tapectl volume verify {label}`), `tapectl \
@@ -1785,7 +1853,7 @@ pub(crate) fn abort_consent_facts(
          abort (ADR-0012, 2026-09-23) — then resume re-enters confirm and never writes. A \
          session aborted before its seal is never resumable."
             .to_string(),
-        cartridge_fact.to_string(),
+        cartridge_fact,
         staging_fact,
     ]
 }
@@ -11862,7 +11930,13 @@ mod tests {
 
     #[test]
     fn abort_consent_for_a_sealed_session_says_keep_staging_and_that_releasing_forfeits_resume() {
-        let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, true).join("\n");
+        let facts = abort_consent_facts(
+            "L6-0001",
+            &["interrupted"],
+            3,
+            &AbortSeal::SealedReconfirmable,
+        )
+        .join("\n");
         assert!(
             !facts.contains(UNQUALIFIED_FORCE_ADVICE),
             "a sealed session's consent must not advise releasing staging unqualified:\n{facts}"
@@ -11878,7 +11952,8 @@ mod tests {
 
     #[test]
     fn abort_consent_for_an_unsealed_session_keeps_the_release_advice() {
-        let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, false).join("\n");
+        let facts =
+            abort_consent_facts("L6-0001", &["interrupted"], 3, &AbortSeal::Unsealed).join("\n");
         assert!(facts.contains(UNQUALIFIED_FORCE_ADVICE), "{facts}");
         assert!(
             !facts.contains("keep staging if you intend to verify and resume"),
@@ -11900,7 +11975,7 @@ mod tests {
 
     #[test]
     fn abort_done_message_for_a_sealed_session_names_resume_and_never_says_unsealed() {
-        let msg = abort_done_message("L6-0001", true);
+        let msg = abort_done_message("L6-0001", &AbortSeal::SealedReconfirmable);
         assert!(!msg.contains("can no longer be resumed"), "{msg}");
         assert!(!msg.contains("unsealed"), "{msg}");
         assert!(msg.contains("tapectl volume resume L6-0001"), "{msg}");
@@ -11913,7 +11988,7 @@ mod tests {
 
     #[test]
     fn abort_done_message_for_an_unsealed_session_says_not_resumable_and_force_releases() {
-        let msg = abort_done_message("L6-0001", false);
+        let msg = abort_done_message("L6-0001", &AbortSeal::Unsealed);
         assert!(msg.contains("can no longer be resumed"), "{msg}");
         assert!(msg.contains("unsealed"), "{msg}");
         // Plain `staging clean` does not release an aborted session's slices
@@ -12071,5 +12146,123 @@ mod tests {
             !msg.contains("unresolved write session"),
             "an aborted row is resolved: {msg}"
         );
+    }
+
+    /// Issue #331's fixture: a volume in `volume_status` with one
+    /// `interrupted` write session, its seal recorded or not -- what
+    /// `volume abort` is run against.
+    fn abortable_fixture(volume_status: &str, sealed: bool) -> Connection {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-ABORT', 'lto', 'lto0', 'LTO-6', 2500000000000, ?1)",
+            params![volume_status],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+        if sealed {
+            conn.execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![volume_id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Issue #331: `volume abort` classifies the volume from the state the
+    /// abort leaves, through the predicate `stage create --version` uses. A
+    /// sealed `initialized` volume is re-confirmable; a sealed `retired` or
+    /// `erased` one is not (resume refuses any status but `initialized`);
+    /// an unsealed one is `Unsealed`. The abort itself happens in every case.
+    #[test]
+    fn volume_abort_classifies_the_seal_by_whether_resume_would_reconfirm() {
+        let cases = [
+            ("initialized", true, AbortSeal::SealedReconfirmable),
+            (
+                "retired",
+                true,
+                AbortSeal::SealedNotReconfirmable {
+                    status: "retired".into(),
+                },
+            ),
+            (
+                "erased",
+                true,
+                AbortSeal::SealedNotReconfirmable {
+                    status: "erased".into(),
+                },
+            ),
+            ("initialized", false, AbortSeal::Unsealed),
+        ];
+        for (status, sealed, want) in cases {
+            let conn = abortable_fixture(status, sealed);
+            let got = volume_abort(&conn, "L6-ABORT", true).unwrap();
+            assert_eq!(got, want, "{status} sealed={sealed}");
+            let (aborted, events): (i64, i64) = (
+                conn.query_row(
+                    "SELECT COUNT(*) FROM writes WHERE status = 'aborted'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = 'write_aborted'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                (aborted, events),
+                (1, 1),
+                "the real abort is applied exactly once (the dry run rolled back): {status}"
+            );
+        }
+    }
+
+    /// Issue #331: a sealed volume resume would refuse is never promised a
+    /// re-confirmation, and an erased one is never said to keep "every
+    /// byte". Positive control: the re-confirmable shape still names verify
+    /// then resume.
+    #[test]
+    fn abort_texts_promise_resume_only_when_it_would_reconfirm() {
+        let not = AbortSeal::SealedNotReconfirmable {
+            status: "erased".into(),
+        };
+        let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, &not).join("\n");
+        let done = abort_done_message("L6-0001", &not);
+        for text in [&facts, &done] {
+            assert!(!text.contains("volume verify"), "{text}");
+            assert!(!text.contains("re-confirms"), "{text}");
+            assert!(!text.contains("every byte"), "{text}");
+            assert!(!text.contains("forfeits that"), "{text}");
+            assert!(text.contains("`erased`"), "{text}");
+            assert!(text.contains("ADR-0003"), "{text}");
+        }
+        assert!(facts.contains("`tapectl staging clean --force`"), "{facts}");
+        assert!(done.contains("cannot re-confirm"), "{done}");
+
+        let yes = AbortSeal::SealedReconfirmable;
+        let done = abort_done_message("L6-0001", &yes);
+        let v = done.find("`tapectl volume verify L6-0001`").expect(&done);
+        let r = done.find("`tapectl volume resume L6-0001`").expect(&done);
+        assert!(v < r, "{done}");
+        let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, &yes).join("\n");
+        assert!(facts.contains("every byte"), "{facts}");
     }
 }
