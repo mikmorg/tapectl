@@ -1131,7 +1131,17 @@ assert not dups, (
     "a log page was read more than once inside one contact (read-to-clear hazard, "
     "ADR-0013) -- (contact_id, trigger, page, subpage, reads):\n  "
     + "\n  ".join(map(str, dups)))
-print(f"{n} log_page_journal rows, no (contact, page, subpage) read twice")
+# One ROW is one sg_logs process; it is one LOG SENSE only if the argv pins
+# the allocation length. Without --maxlen, sg_logs sends a 4-byte probe first
+# (`man sg_logs`), a second command at a page that may clear when read (#328).
+import json
+multi = [(rid, cid, argv) for rid, cid, argv in c.execute(
+    "SELECT id, contact_id, tool_argv FROM log_page_journal ORDER BY id")
+    if not any(a.startswith("--maxlen=") for a in json.loads(argv))]
+assert not multi, (
+    "log page reads without --maxlen are two LOG SENSE commands each (#328) -- (row, contact, argv):\n  "
+    + "\n  ".join(map(str, multi[:10])))
+print(f"{n} log_page_journal rows, no (contact, page, subpage) read twice, every read one LOG SENSE")
 PYLP_ONCE
 }
 

@@ -6,7 +6,8 @@
 //! 0x2E) and never asked page 0x00 what the drive supports. This module
 //! replaces that read with ONE sweep per contact:
 //!
-//! 1. read page 0x00 once, `sg_logs --raw` — the response bytes exactly;
+//! 1. read page 0x00 once, `sg_logs --maxlen=65532 --raw` — ONE LOG SENSE
+//!    ([`READ_MAXLEN`], issue #328), the response bytes exactly;
 //! 2. derive the page list from those bytes (4-byte header, then one page
 //!    code per byte — [`parse_supported_pages`]);
 //! 3. read every listed page once, `--raw` again;
@@ -70,6 +71,29 @@ use crate::tape::health::HealthCounters;
 /// The tool every log-page read and decode spawns.
 pub const LOG_TOOL: &str = "sg_logs";
 
+/// The LOG SENSE allocation length every page read pins, so ONE `sg_logs`
+/// invocation is ONE LOG SENSE command at the device (issue #328).
+///
+/// Without `--maxlen`, sg_logs 1.81 (`man sg_logs`, `-m, --maxlen=LEN`)
+/// "first fetches the 4 byte response then does a second access with the
+/// length indicated" — two commands per page. For a read-to-clear TapeAlert
+/// page (0x2E) the header-only first fetch could clear the flags before the
+/// second fetch, the one whose bytes reach stdout, was sent. ADR-0013's
+/// once-per-contact rule is about commands at the drive, not processes, so
+/// the read must be a single fetch.
+///
+/// 65532 (0xfffc) is sg_logs's own `MX_ALLOC_LEN`: exactly what its second
+/// fetch asked for when no `--maxlen` was given, so the single fetch
+/// requests no less than the old two-fetch read did and stdout keeps the
+/// same shape (`page length + 4` bytes). It is even and a multiple of four
+/// (sg_logs itself rounds odd lengths up because "some HBAs don't like odd
+/// transfer lengths"), and inside both option spellings' bounds (`--maxlen`
+/// accepts 2..=65535, the old-style `-m` 0..=0xfffc). A page longer than
+/// this is possible in principle — a LOG SENSE page length is 16 bits — and
+/// sg_logs then truncates its output and still exits 0, which
+/// [`capture_from_output`] catches from the page header.
+pub const READ_MAXLEN: u16 = 0xfffc;
+
 /// LOG SENSE page 0x00: the drive's list of supported pages.
 pub const SUPPORTED_PAGES: u8 = 0x00;
 
@@ -84,8 +108,9 @@ pub const HEALTH_PAGES: [u8; 3] = [0x02, 0x03, 0x2e];
 pub trait LogSource {
     /// The sg node reads are taken through (provenance for the journal).
     fn device_sg(&self) -> &str;
-    /// ONE LOG SENSE of `page`, raw. Returns the argv spawned and what the
-    /// process gave.
+    /// ONE LOG SENSE of `page`, raw — one command at the device, not merely
+    /// one process (the real source pins [`READ_MAXLEN`]). Returns the argv
+    /// spawned and what the process gave.
     fn read_page(&mut self, page: u8) -> (Vec<String>, std::io::Result<Output>);
     /// Decode `raw` offline — no device. `Err` carries why it could not.
     fn decode(&mut self, raw: &[u8]) -> std::result::Result<String, String>;
@@ -105,12 +130,16 @@ impl SgLogs {
         }
     }
 
-    /// The argv of one raw page read — the exact command the fixtures were
-    /// captured with (`tests/fixtures/sg_logs/mhvtl_td8_sg1/README.md`).
+    /// The argv of one raw page read: a single LOG SENSE ([`READ_MAXLEN`]).
+    /// The fixtures under `tests/fixtures/sg_logs/` were captured before
+    /// issue #328 with this argv minus `--maxlen` (two LOG SENSE per page);
+    /// sg_logs writes `page length + 4` bytes to stdout either way, so their
+    /// bytes are the shape this argv produces.
     pub fn read_argv(device_sg: &str, page: u8) -> Vec<String> {
         vec![
             LOG_TOOL.to_string(),
             format!("--page=0x{page:02x}"),
+            format!("--maxlen={READ_MAXLEN}"),
             "--raw".to_string(),
             device_sg.to_string(),
         ]
@@ -256,8 +285,21 @@ pub fn capture_from_output(
     match output {
         Err(e) => capture.error = Some(format!("{LOG_TOOL} spawn failed: {e}")),
         Ok(out) => {
+            let short = truncated_page(&out.stdout);
             capture.raw = Some(out.stdout);
-            if !out.status.success() {
+            if out.status.success() {
+                // sg_logs truncates a page longer than `--maxlen` and still
+                // exits 0 (its "Only fetched" note goes to stderr). The page
+                // header says how long the page is, so check it: a partial
+                // page is not a reading. The bytes are kept; `ok = 0` keeps
+                // them out of the decode and the health counters.
+                if let Some((declared, received)) = short {
+                    capture.error = Some(format!(
+                        "{LOG_TOOL} page 0x{page_code:02x} truncated: the page header declares \
+                         {declared} bytes, {received} received (--maxlen={READ_MAXLEN})"
+                    ));
+                }
+            } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 capture.error = Some(if stderr.trim().is_empty() {
                     format!("{LOG_TOOL} page 0x{page_code:02x} exit {}", out.status)
@@ -272,6 +314,17 @@ pub fn capture_from_output(
         }
     }
     capture
+}
+
+/// `Some((declared, received))` when a response's header declares more bytes
+/// (page length + 4) than arrived — a truncated page. `None` for a complete
+/// page, and for fewer than 4 bytes, which carry no length to check.
+pub fn truncated_page(raw: &[u8]) -> Option<(usize, usize)> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let declared = u16::from_be_bytes([raw[2], raw[3]]) as usize + 4;
+    (declared > raw.len()).then_some((declared, raw.len()))
 }
 
 // ── Page 0x00 ────────────────────────────────────────────────────────────
@@ -1881,7 +1934,9 @@ pub(crate) mod tests {
             assert_eq!(row.8.as_deref(), Some("/dev/nst-fixture"));
             assert_eq!(
                 row.9,
-                format!(r#"["sg_logs","--page=0x{page:02x}","--raw","/dev/sg-fixture"]"#)
+                format!(
+                    r#"["sg_logs","--page=0x{page:02x}","--maxlen=65532","--raw","/dev/sg-fixture"]"#
+                )
             );
             assert_eq!(row.10.as_deref(), Some("Version string: 1.81 20200110"));
             assert_eq!(row.11, env!("CARGO_PKG_VERSION"));
@@ -1945,6 +2000,71 @@ pub(crate) mod tests {
         assert!(!c.ok());
         assert_eq!(c.raw, None);
         assert!(c.error.unwrap().contains("spawn failed"));
+    }
+
+    /// A page longer than `--maxlen` comes back truncated with exit 0 (sg_logs
+    /// only notes it on stderr). The header's declared length exposes it: the
+    /// capture keeps the bytes but is not ok, so nothing decodes a partial
+    /// page into counters. Positive control: a complete page of the same
+    /// shape stays ok.
+    #[test]
+    fn a_truncated_page_is_kept_but_not_ok() {
+        use std::os::unix::process::ExitStatusExt;
+        let run = |stdout: Vec<u8>| {
+            capture_from_output(
+                0x2e,
+                "/dev/sg0",
+                "t".into(),
+                SgLogs::read_argv("/dev/sg0", 0x2e),
+                None,
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout,
+                    stderr: b"Only fetched 8 bytes of response".to_vec(),
+                }),
+            )
+        };
+        // Header declares 8 parameter bytes (12 total); 8 arrived.
+        let short = vec![0x2e, 0, 0, 8, 0, 1, 3, 1];
+        assert_eq!(truncated_page(&short), Some((12, 8)));
+        let c = run(short.clone());
+        assert!(!c.ok());
+        assert_eq!(c.raw.as_deref(), Some(&short[..]), "the bytes are kept");
+        let err = c.error.unwrap();
+        assert!(err.contains("truncated"), "{err}");
+        assert!(err.contains("declares 12 bytes, 8 received"), "{err}");
+
+        let whole = vec![0x2e, 0, 0, 4, 0, 1, 3, 1];
+        assert_eq!(truncated_page(&whole), None);
+        let c = run(whole);
+        assert!(c.ok(), "positive control: a complete page is ok");
+        assert_eq!(c.error, None);
+
+        // Fewer than 4 bytes carry no length: not called truncated here.
+        assert_eq!(truncated_page(&[0x2e, 0]), None);
+    }
+
+    /// Every recorded fixture page is complete by its own header — the
+    /// truncation check cannot misfire on what real drives returned.
+    #[test]
+    fn every_fixture_page_is_complete_by_its_header() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sg_logs");
+        let mut n = 0;
+        for sub in std::fs::read_dir(&dir).unwrap() {
+            let sub = sub.unwrap().path();
+            if !sub.is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(&sub).unwrap() {
+                let f = f.unwrap().path();
+                if f.extension().and_then(|e| e.to_str()) == Some("bin") {
+                    let bytes = std::fs::read(&f).unwrap();
+                    assert_eq!(truncated_page(&bytes), None, "{}", f.display());
+                    n += 1;
+                }
+            }
+        }
+        assert!(n >= 50, "positive control: {n} fixture pages were checked");
     }
 
     /// A refused INSERT is best-effort. Positive control: a valid contact
@@ -2022,10 +2142,21 @@ pub(crate) mod tests {
 
     #[test]
     fn argv_shapes_are_the_fixture_capture_commands() {
+        // `--maxlen` makes one invocation ONE LOG SENSE (issue #328): without
+        // it sg_logs sends a 4-byte probe first, a second command at a page
+        // that may clear when read. The fixtures were captured without it;
+        // the stdout shape is the same (see `read_argv`).
         assert_eq!(
             SgLogs::read_argv("/dev/sg1", 0x2e),
-            vec!["sg_logs", "--page=0x2e", "--raw", "/dev/sg1"]
+            vec![
+                "sg_logs",
+                "--page=0x2e",
+                "--maxlen=65532",
+                "--raw",
+                "/dev/sg1"
+            ]
         );
+        assert_eq!(READ_MAXLEN, 0xfffc, "sg_logs's own MX_ALLOC_LEN");
         assert_eq!(
             SgLogs::decode_argv(),
             vec!["sg_logs", "--in=-", "--raw", "--pdt=1"]

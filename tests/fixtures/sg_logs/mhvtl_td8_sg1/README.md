@@ -25,3 +25,12 @@ a disk and decodes 0x17 as "Non-volatile cache page".
 captured; the only real-drive pages are `../hp_lto6_page_0x02.txt` and
 `../hp_lto6_page_0x03.txt`, both text-only. Capturing the real drive's page
 0x00 and full page set is a job for the real-drive rehearsal on home2.
+
+**2026-09-23 — captured with the two-fetch argv (issue #328).** These pages
+were read with `sg_logs --page=0xNN --raw <sg>`, no `--maxlen`. Per `man
+sg_logs` (`-m, --maxlen=LEN`) that is TWO LOG SENSE commands per page: a
+4-byte probe for the page length, then the full page. tapectl now reads with
+`sg_logs --page=0xNN --maxlen=65532 --raw <sg>` — one LOG SENSE per page
+(`tape::log_pages::READ_MAXLEN`). sg_logs writes `page length + 4` bytes to
+stdout either way, so these bytes are the shape the new argv produces, and
+every `.bin` here is complete by its own header. They were NOT re-captured.

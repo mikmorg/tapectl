@@ -26,3 +26,15 @@ TapeAlert flag was 0 on the first read, and the second read is byte-identical
 — but zero-then-zero cannot distinguish "reading clears" from "nothing to
 clear". Answering it needs a set flag (e.g. a cartridge that raises one) at
 the real-drive rehearsal.
+
+**2026-09-23 — captured with the two-fetch argv (issue #328).** These pages
+were read with `sg_logs --page=0xNN --raw <sg>`, no `--maxlen`. Per `man
+sg_logs` (`-m, --maxlen=LEN`) that is TWO LOG SENSE commands per page: a
+4-byte probe for the page length, then the full page. tapectl now reads with
+`sg_logs --page=0xNN --maxlen=65532 --raw <sg>` — one LOG SENSE per page
+(`tape::log_pages::READ_MAXLEN`). sg_logs writes `page length + 4` bytes to
+stdout either way, so these bytes are the shape the new argv produces, and
+every `.bin` here is complete by its own header. They were NOT re-captured.
+For `page_0x2e.second_read.bin` that means the "second read" was the third
+and fourth LOG SENSE of 0x2e, and the first read was itself two — the
+read-to-clear question stays open either way (all flags were 0).

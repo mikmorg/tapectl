@@ -12,3 +12,12 @@ read ok. With a cartridge loaded, the per-medium pages have content: 0x17
 volume statistics (thread count 2, 13205 data sets written), 0x30/0x31 tape
 usage/capacity. Every TapeAlert flag (0x2e) is 0, so read-to-clear is still
 unanswered.
+
+**2026-09-23 — captured with the two-fetch argv (issue #328).** These pages
+were read with `sg_logs --page=0xNN --raw <sg>`, no `--maxlen`. Per `man
+sg_logs` (`-m, --maxlen=LEN`) that is TWO LOG SENSE commands per page: a
+4-byte probe for the page length, then the full page. tapectl now reads with
+`sg_logs --page=0xNN --maxlen=65532 --raw <sg>` — one LOG SENSE per page
+(`tape::log_pages::READ_MAXLEN`). sg_logs writes `page length + 4` bytes to
+stdout either way, so these bytes are the shape the new argv produces, and
+every `.bin` here is complete by its own header. They were NOT re-captured.
