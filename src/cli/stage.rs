@@ -366,7 +366,7 @@ pub fn run(
                             let rank = |x: &staging::clean::ReleaseBlocker| match x {
                                 staging::clean::ReleaseBlocker::WriteInFlight { .. } => 4,
                                 staging::clean::ReleaseBlocker::Interrupted { .. } => 3,
-                                staging::clean::ReleaseBlocker::Abandoned => 2,
+                                staging::clean::ReleaseBlocker::Abandoned { .. } => 2,
                                 staging::clean::ReleaseBlocker::NeverWritten => 1,
                                 staging::clean::ReleaseBlocker::None => 0,
                             };
@@ -431,14 +431,41 @@ pub fn run(
                                      outcome; `tapectl db fsck` sweeps that."
                                 )
                             }
-                            // Abandoned: --force IS the documented act, and
-                            // `volume abort`'s own consent text says so.
-                            staging::clean::ReleaseBlocker::Abandoned => format!(
-                                "{head}, left behind by a write session that was aborted or \
-                                 failed. A bare `tapectl staging clean` will not release them \
-                                 — use `tapectl staging clean --unit {name} --version {v} \
-                                 --force`, or write them to another volume first."
+                            // Issue #325: an aborted session whose seal is
+                            // recorded can still be re-confirmed by `volume
+                            // resume` after a clean full verify, and that
+                            // re-confirm needs these frozen files — the same
+                            // facts `volume abort`'s sealed-session text
+                            // states (`write::abort_consent_facts`). Resume
+                            // first, then what --force costs.
+                            staging::clean::ReleaseBlocker::Abandoned {
+                                reconfirm_on: Some(l),
+                            } => format!(
+                                "{head}, left behind by a write session on volume \"{l}\" that \
+                                 was aborted after its seal was recorded. Keep staging if you \
+                                 intend to verify and resume: after a clean full verify \
+                                 (`tapectl volume verify {l}`), `tapectl volume resume {l}` \
+                                 re-confirms that sealed tape against these frozen staged \
+                                 files, and once it passes that session no longer holds them. \
+                                 Releasing them now (`tapectl staging clean --unit {name} \
+                                 --version {v} --force`; a bare `tapectl staging clean` will \
+                                 not) forfeits that re-confirmation."
                             ),
+                            // Nothing can adopt the session: --force is the
+                            // only release. Issue #325: writing the slices
+                            // to another volume adds a completed row but
+                            // leaves this one, so it does not unblock a bare
+                            // clean — never advise it as if it did.
+                            staging::clean::ReleaseBlocker::Abandoned { reconfirm_on: None } => {
+                                format!(
+                                    "{head}, left behind by a write session that was aborted \
+                                     or failed. A bare `tapectl staging clean` will not release \
+                                     them, and writing them to another volume does not change \
+                                     that — the abandoned session's `writes` row keeps blocking \
+                                     it. Release them with `tapectl staging clean --unit {name} \
+                                     --version {v} --force`."
+                                )
+                            }
                         };
                         return Err(TapectlError::Other(msg));
                     }
@@ -735,6 +762,15 @@ mod tests {
     /// `unit1`, attaches one `writes` row in `status`, and returns the
     /// refusal an operator then sees from `stage create --version 1`.
     fn refusal_with_write_status(status: &str) -> String {
+        refusal_with_write_on_volume(status, "initialized", false)
+    }
+
+    /// [`refusal_with_write_status`] with the volume's shape chosen (issue
+    /// #325): `volume_status` is `volumes.status`, and `sealed` records a
+    /// seal (`sealed_at`) plus the `write_aborted` event `volume abort`
+    /// writes — the recorded rows `volume resume`'s adoption of an aborted
+    /// session reads (ADR-0012, 2026-09-23).
+    fn refusal_with_write_on_volume(status: &str, volume_status: &str, sealed: bool) -> String {
         let (conn, paths, config, _tmp) = setup();
         crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         run(
@@ -761,8 +797,8 @@ mod tests {
             .unwrap();
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
-             VALUES ('L6-0007', 'lto', 'lto0', 2500000000000, 'initialized')",
-            [],
+             VALUES ('L6-0007', 'lto', 'lto0', 2500000000000, ?1)",
+            params![volume_status],
         )
         .unwrap();
         let volume_id = conn.last_insert_rowid();
@@ -772,6 +808,26 @@ mod tests {
             params![stage_set_id, snapshot_id, volume_id, status],
         )
         .unwrap();
+        if sealed {
+            conn.execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![volume_id],
+            )
+            .unwrap();
+            crate::db::events::log_event(
+                &conn,
+                "volume",
+                volume_id,
+                Some("L6-0007"),
+                "write_aborted",
+                None,
+                None,
+                Some("operator abandoned the unfinished write session (`volume abort`)"),
+                None,
+                None,
+            )
+            .unwrap();
+        }
 
         run(
             &conn,
@@ -857,6 +913,87 @@ mod tests {
                 !msg.contains("volume resume"),
                 "{status}: resume cannot adopt this session, so naming it \
                  would hand over a command that refuses: {msg}"
+            );
+        }
+    }
+
+    /// Issue #325: "or write them to another volume first" was never a way
+    /// to release an abandoned stage set — a second, completed write leaves
+    /// the aborted row in place, and it still blocks a bare `staging clean`
+    /// (`staging::clean`'s `default_guard_refuses_when_a_second_planned_copy_aborted_or_failed`).
+    /// The refusal names the one act that does release them.
+    #[test]
+    fn create_with_version_refusal_for_an_unsealed_abandoned_write_names_only_force() {
+        for status in ["aborted", "failed"] {
+            let msg = refusal_with_write_status(status);
+            assert!(
+                !msg.contains("or write them to another volume first"),
+                "{status}: writing elsewhere does not unblock a bare clean: {msg}"
+            );
+            assert!(
+                msg.contains("writing them to another volume does not change that"),
+                "{status}: {msg}"
+            );
+            assert!(
+                msg.contains("tapectl staging clean --unit unit1 --version 1 --force"),
+                "{status}: must name the release that works: {msg}"
+            );
+            assert!(
+                !msg.contains("forfeits"),
+                "{status}: nothing to forfeit: {msg}"
+            );
+        }
+    }
+
+    /// Issue #325: an aborted session whose seal is recorded is one `volume
+    /// resume` re-confirms after a clean full verify (ADR-0012, 2026-09-23;
+    /// #280), against these very staged files. The refusal must say what
+    /// `volume abort`'s sealed-session text says (`write::abort_consent_facts`):
+    /// keep staging to verify and resume; `--force` forfeits that. Resume
+    /// comes first, as in the interrupted refusal.
+    #[test]
+    fn create_with_version_refusal_for_a_sealed_aborted_write_says_force_forfeits_reconfirm() {
+        let msg = refusal_with_write_on_volume("aborted", "initialized", true);
+        assert!(
+            msg.contains("Keep staging if you intend to verify and resume"),
+            "{msg}"
+        );
+        assert!(msg.contains("tapectl volume verify L6-0007"), "{msg}");
+        assert!(msg.contains("tapectl volume resume L6-0007"), "{msg}");
+        assert!(msg.contains("forfeits"), "{msg}");
+        assert!(
+            msg.contains("tapectl staging clean --unit unit1 --version 1 --force"),
+            "the release is still named, with its cost: {msg}"
+        );
+        assert!(
+            !msg.contains("another volume"),
+            "no write-elsewhere advice on this path either: {msg}"
+        );
+        let resume_at = msg.find("volume resume").unwrap();
+        let force_at = msg.find("--force").unwrap();
+        assert!(
+            resume_at < force_at,
+            "resume must come before --force: {msg}"
+        );
+    }
+
+    /// Issue #325's positive control for the predicate: a recorded seal alone
+    /// does not make an aborted session re-confirmable. On a volume that is
+    /// no longer `initialized`, `volume resume` refuses outright
+    /// (`VolumeNotWriteTarget`), and a `'failed'` row is never adopted — so
+    /// neither may be answered by naming `volume resume`.
+    #[test]
+    fn create_with_version_refusal_names_resume_only_where_resume_would_accept() {
+        for (status, volume_status) in [("aborted", "retired"), ("failed", "initialized")] {
+            let msg = refusal_with_write_on_volume(status, volume_status, true);
+            assert!(
+                !msg.contains("volume resume"),
+                "{status} on a {volume_status} sealed volume: resume would refuse: {msg}"
+            );
+            assert!(!msg.contains("forfeits"), "{status}/{volume_status}: {msg}");
+            assert!(
+                msg.contains("tapectl staging clean --unit unit1 --version 1 --force"),
+                "{status}/{volume_status}: {msg}"
             );
         }
     }

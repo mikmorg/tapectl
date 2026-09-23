@@ -772,6 +772,41 @@ pub fn resume_would_reconfirm(conn: &Connection, volume_id: i64) -> Result<bool>
     })
 }
 
+/// Whether this volume's `aborted` write session is one `tapectl volume
+/// resume <label>` would re-confirm once a clean full verify of the volume
+/// is recorded — the question `stage create`'s refusal for an abandoned
+/// stage set asks before it tells the operator that releasing the staged
+/// files forfeits a re-confirmation (issue #325). Unlike
+/// [`resume_would_reconfirm`] it does not require that verify to have
+/// happened yet: the operator is told to run it. Built from the same gates
+/// `write::volume_resume` applies, through the same functions — the volume
+/// is `initialized` with no completed write, and [`resume_admission`] finds
+/// an aborted session whose only unmet conditions (if any) are the ones a
+/// clean full verify resolves (`ConditionNotOk`,
+/// `NoCleanFullVerifyAfterAbort`). `NotSealed`, `NotInitialized` and
+/// `NoRecordedAbort` never become adoptable, so they answer `false`.
+pub fn aborted_session_reconfirmable_after_verify(
+    conn: &Connection,
+    volume_id: i64,
+) -> Result<bool> {
+    let status: String = conn.query_row(
+        "SELECT status FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if status != "initialized" || crate::policy::coverage::has_completed_write(conn, volume_id)? {
+        return Ok(false);
+    }
+    Ok(matches!(
+        resume_admission(conn, volume_id)?,
+        ResumeAdmission::Aborted(
+            AbortedAdoption::Adoptable
+                | AbortedAdoption::ConditionNotOk { .. }
+                | AbortedAdoption::NoCleanFullVerifyAfterAbort { .. }
+        )
+    ))
+}
+
 impl PlannedSession {
     /// `PlannedSession -> ExecuteOutcome`, checking for interruption via the
     /// real process-global signal flag. See [`Self::execute_checking`] for

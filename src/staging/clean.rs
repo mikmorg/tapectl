@@ -118,10 +118,20 @@ pub(crate) enum ReleaseBlocker {
     /// the input to that recovery.
     Interrupted { volume_label: Option<String> },
     /// A session was deliberately abandoned (`'aborted'`) or failed
-    /// outright (`'failed'`). `volume abort`'s own consent text already
-    /// tells the operator `--force` is how these are released, and it is
-    /// right about that narrower claim.
-    Abandoned,
+    /// outright (`'failed'`). Its row is terminal, so a bare clean never
+    /// releases these slices — not even after they are written to another
+    /// volume, since that adds a `'completed'` row without removing this
+    /// one. `--force` releases them.
+    ///
+    /// `reconfirm_on` (issue #325) names a volume whose `'aborted'` session
+    /// `tapectl volume resume` would re-confirm once a clean full verify is
+    /// recorded (ADR-0012's 2026-09-23 amendment, issue #280; the predicate
+    /// is `session::aborted_session_reconfirmable_after_verify`). That
+    /// re-confirm revalidates against these frozen staged files and, when
+    /// it passes, moves the row to `'completed'` — so for such a volume
+    /// `--force` is not free: it forfeits the re-confirmation, exactly as
+    /// `volume abort`'s sealed-session text says.
+    Abandoned { reconfirm_on: Option<String> },
 }
 
 /// Which blocker applies to `stage_set_id`.
@@ -170,7 +180,26 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
             volume_label: label_for("interrupted")?,
         });
     }
-    Ok(ReleaseBlocker::Abandoned)
+    // Issue #325: an `'aborted'` row on a sealed volume may still be
+    // re-confirmed by `volume resume`; name that volume so the refusal can
+    // say what releasing these slices would cost. `'failed'` rows are never
+    // adopted (`InterruptedSession::adopt_aborted` loads only `'aborted'`).
+    let aborted_on: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT DISTINCT v.id, v.label FROM writes w JOIN volumes v ON v.id = w.volume_id
+             WHERE w.stage_set_id = ?1 AND w.status = 'aborted'
+             ORDER BY v.id",
+        )?
+        .query_map(params![stage_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (volume_id, label) in aborted_on {
+        if crate::volume::session::aborted_session_reconfirmable_after_verify(conn, volume_id)? {
+            return Ok(ReleaseBlocker::Abandoned {
+                reconfirm_on: Some(label),
+            });
+        }
+    }
+    Ok(ReleaseBlocker::Abandoned { reconfirm_on: None })
 }
 
 /// Clean staged files from disk and update DB.

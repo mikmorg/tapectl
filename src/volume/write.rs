@@ -1738,9 +1738,14 @@ pub(crate) fn abort_consent_facts(
              clean` will not) forfeits that re-confirmation."
         )
     } else {
+        // Issue #325: writing the slices to another volume adds a
+        // `completed` row but leaves this ABORTED one, which still blocks a
+        // plain clean (`staging::clean`'s default guard) — so it is not a
+        // way to release them, and must not read like one.
         "The staged slices stay pinned on disk; because this session's `writes` row becomes \
          ABORTED, plain `tapectl staging clean` will not release them — use `tapectl staging \
-         clean --force`, or write them to another volume first."
+         clean --force`. Writing them to another volume does not change that: the aborted row \
+         still blocks a plain clean."
             .to_string()
     };
 
@@ -11716,6 +11721,16 @@ mod tests {
         );
         assert!(!facts.contains("forfeits"), "{facts}");
         assert!(facts.contains("left unsealed"), "{facts}");
+        // Issue #325: writing the slices elsewhere leaves this aborted row,
+        // which still blocks a plain clean — it is not a release path.
+        assert!(
+            !facts.contains("or write them to another volume first"),
+            "{facts}"
+        );
+        assert!(
+            facts.contains("Writing them to another volume does not change that"),
+            "{facts}"
+        );
     }
 
     #[test]
