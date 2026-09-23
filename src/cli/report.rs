@@ -1485,8 +1485,11 @@ fn health_line(
         "  {label} {}: {} — uncorrected={} corrected_total={} corrected_no_delay={} ecc_invocations={} alerts={}{}",
         operation.unwrap_or("?"),
         logged_at,
-        uncorrected.unwrap_or(0),
-        corrected.unwrap_or(0),
+        // NULL is "not recorded" here too (issue #317's rule): `-`, never 0.
+        uncorrected
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into()),
+        corrected.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
         corrected_no_delay,
         ecc_invocations,
         tape_alerts.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
@@ -3089,6 +3092,22 @@ Write error counter page [0x2]
             assert!(line.contains("ecc_invocations=n/a"));
         }
 
+        /// Issue #317's rule for every stored counter: a NULL
+        /// `total_uncorrected`/`total_corrected` renders `-`, not 0.
+        #[test]
+        fn null_error_counters_render_as_dash_not_zero() {
+            let line = health_line(
+                "LTO6-0001",
+                Some("verify"),
+                "2026-01-01 00:00:00",
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(line.contains(" uncorrected=- corrected_total=- "), "{line}");
+        }
+
         #[test]
         fn tape_alert_note_is_still_appended() {
             let line = health_line(
@@ -3102,6 +3121,70 @@ Write error counter page [0x2]
             );
             assert!(line.contains("alerts=2"));
             assert!(line.contains("TAPE ALERT"));
+        }
+    }
+
+    /// Issue #317, end to end: a sweep → the production writer → the
+    /// `report health` query → both renderings. A sweep whose page 0x00
+    /// omits 0x2e renders `alerts=-` and JSON `null`; the mhvtl fixture,
+    /// which reads 0x2e ok with nothing raised, renders `alerts=0` and `0`.
+    mod health_unrecorded_alerts {
+        use super::*;
+        use crate::tape::log_pages::{sweep, tests::FixtureSource};
+
+        fn record_sweep_of(conn: &Connection, src: &mut FixtureSource) {
+            let (counters, raw_log) = sweep(src).health(None).expect("a health reading");
+            crate::tape::health::record(
+                conn,
+                None,
+                None,
+                None,
+                crate::tape::health::Reading::Verify,
+                &counters,
+                &raw_log,
+            )
+            .unwrap();
+        }
+
+        fn rendered(conn: &Connection) -> (String, serde_json::Value) {
+            let rows = health_rows(conn, None).unwrap();
+            assert_eq!(rows.len(), 1);
+            let r = &rows[0];
+            let line = health_line(
+                NO_VOLUME,
+                r.operation.as_deref(),
+                &r.logged_at,
+                r.corrected,
+                r.uncorrected,
+                r.tape_alerts,
+                r.raw_log.as_deref(),
+            );
+            (line, health_json(&rows)[0]["tape_alerts"].clone())
+        }
+
+        #[test]
+        fn a_sweep_without_0x2e_reports_unknown_not_zero() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut src = FixtureSource::default();
+            src.bytes
+                .insert(0x00, vec![0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x03]);
+            record_sweep_of(&conn, &mut src);
+            let (line, json) = rendered(&conn);
+            assert!(line.ends_with(" alerts=-"), "{line}");
+            assert!(!line.contains("alerts=0"), "{line}");
+            assert_eq!(json, serde_json::Value::Null);
+        }
+
+        /// Positive control: the same path with 0x2e read ok says 0.
+        #[test]
+        fn a_sweep_with_a_clean_0x2e_reports_zero() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut src = FixtureSource::default();
+            record_sweep_of(&conn, &mut src);
+            assert_eq!(src.reads.get(&0x2e), Some(&1), "0x2e was read");
+            let (line, json) = rendered(&conn);
+            assert!(line.ends_with(" alerts=0"), "{line}");
+            assert_eq!(json, serde_json::json!(0));
         }
     }
 

@@ -38,7 +38,12 @@ pub struct HealthCounters {
     pub total_corrected: i64,
     pub total_retries: i64,
     pub total_rewritten: i64,
-    pub tape_alerts: i64,
+    /// Raised TapeAlert flags on page 0x2e. `None` when no 0x2e decode
+    /// contributed — the page was not listed, its read failed, or its decode
+    /// failed — and `health_logs.tape_alerts` is then NULL, migration 009's
+    /// "not recorded" (issue #317). `Some(0)` is a 0x2e that was read and
+    /// raised nothing. Never default one into the other.
+    pub tape_alerts: Option<i64>,
     /// "Errors corrected without substantial delay" (0x02/0x03). On drives
     /// that leave `total_corrected` (`Total errors corrected`) at 0, this is
     /// where ECC activity actually shows up — see the module doc.
@@ -55,7 +60,8 @@ pub struct HealthCounters {
 ///
 /// Merges into whatever fields that page actually reports.
 /// For 0x02/0x03 (write/read error counter): extracts total-error fields.
-/// For 0x2e (tape alert ssc-3): sums any non-zero flag as `tape_alerts`.
+/// For 0x2e (tape alert ssc-3): counts the raised flags into `tape_alerts`,
+/// which is `Some` — possibly `Some(0)` — exactly when this is page 0x2e.
 pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
     let mut c = HealthCounters::default();
 
@@ -96,15 +102,18 @@ pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
         }
         0x2e => {
             // Every line of the form "  <flag name>: <0|1>"; sum the ones.
+            // A decoded 0x2e is a recording even with nothing raised.
+            let mut raised = 0;
             for line in raw.lines() {
                 let line = line.trim();
                 if let Some(idx) = line.rfind(": ") {
                     let val = line[idx + 2..].trim();
                     if val == "1" {
-                        c.tape_alerts += 1;
+                        raised += 1;
                     }
                 }
             }
+            c.tape_alerts = Some(raised);
         }
         _ => {}
     }
@@ -306,6 +315,10 @@ pub struct DriveReadings {
     /// Readings whose `tape_alerts` was recorded AND non-zero. A NULL (not
     /// recorded, 009) is never counted as either raised or clean.
     pub readings_with_alerts: i64,
+    /// Readings whose `tape_alerts` is NULL — 0x2e not read ok in that
+    /// contact (issue #317), or a pre-009 row. Without this count,
+    /// `readings - readings_with_alerts` would pass unknown off as clean.
+    pub readings_alerts_unrecorded: i64,
 }
 
 /// One cartridge's health readings, across every drive that read it.
@@ -323,6 +336,8 @@ pub struct CartridgeReadings {
     /// See [`DriveReadings::max_uncorrected`].
     pub max_uncorrected: Option<i64>,
     pub readings_with_alerts: i64,
+    /// See [`DriveReadings::readings_alerts_unrecorded`].
+    pub readings_alerts_unrecorded: i64,
 }
 
 /// Group health readings BY DRIVE across cartridges (ADR-0013 §§1-2, issue
@@ -337,7 +352,8 @@ pub fn readings_by_drive(conn: &Connection) -> Result<Vec<DriveReadings>> {
     let mut stmt = conn.prepare(
         "SELECT d.id, d.serial, COUNT(h.id), COUNT(DISTINCT cc.cartridge_id),
                 MAX(h.total_uncorrected),
-                SUM(CASE WHEN h.tape_alerts > 0 THEN 1 ELSE 0 END)
+                SUM(CASE WHEN h.tape_alerts > 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN h.tape_alerts IS NULL THEN 1 ELSE 0 END)
            FROM health_logs h
            JOIN cartridge_contacts cc ON cc.id = h.contact_id
            JOIN drives d ON d.id = cc.drive_id
@@ -353,6 +369,7 @@ pub fn readings_by_drive(conn: &Connection) -> Result<Vec<DriveReadings>> {
                 cartridges: r.get(3)?,
                 max_uncorrected: r.get(4)?,
                 readings_with_alerts: r.get(5)?,
+                readings_alerts_unrecorded: r.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -368,7 +385,8 @@ pub fn readings_by_cartridge(conn: &Connection) -> Result<Vec<CartridgeReadings>
     let mut stmt = conn.prepare(
         "SELECT c.id, c.barcode, COUNT(h.id), COUNT(DISTINCT cc.drive_id),
                 MAX(h.total_uncorrected),
-                SUM(CASE WHEN h.tape_alerts > 0 THEN 1 ELSE 0 END)
+                SUM(CASE WHEN h.tape_alerts > 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN h.tape_alerts IS NULL THEN 1 ELSE 0 END)
            FROM health_logs h
            JOIN cartridge_contacts cc ON cc.id = h.contact_id
            JOIN cartridges c ON c.id = cc.cartridge_id
@@ -384,6 +402,7 @@ pub fn readings_by_cartridge(conn: &Connection) -> Result<Vec<CartridgeReadings>
                 drives: r.get(3)?,
                 max_uncorrected: r.get(4)?,
                 readings_with_alerts: r.get(5)?,
+                readings_alerts_unrecorded: r.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -395,7 +414,11 @@ fn merge(into: &mut HealthCounters, from: HealthCounters) {
     into.total_corrected += from.total_corrected;
     into.total_retries += from.total_retries;
     into.total_rewritten += from.total_rewritten;
-    into.tape_alerts += from.tape_alerts;
+    // Absent + absent stays absent: NULL is never merged into "0 raised".
+    into.tape_alerts = match (into.tape_alerts, from.tape_alerts) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    };
     into.corrected_no_delay += from.corrected_no_delay;
     into.corrected_with_delay += from.corrected_with_delay;
     into.correction_algorithm_invocations += from.correction_algorithm_invocations;
@@ -429,7 +452,9 @@ mod tests {
         assert_eq!(c.total_uncorrected, 0);
         assert_eq!(c.total_corrected, 0);
         assert_eq!(c.total_rewritten, 0);
-        assert_eq!(c.tape_alerts, 0);
+        // Page 0x02 carries no TapeAlert flags: not recorded, never "none"
+        // (issue #317 — this pinned 0 before).
+        assert_eq!(c.tape_alerts, None);
     }
 
     #[test]
@@ -442,7 +467,7 @@ mod tests {
     #[test]
     fn parse_page_2e_no_alerts() {
         let c = parse_sg_logs_page(0x2e, PAGE_2E);
-        assert_eq!(c.tape_alerts, 0);
+        assert_eq!(c.tape_alerts, Some(0));
     }
 
     #[test]
@@ -476,7 +501,7 @@ Tape alert page (ssc-3) [0x2e]
   Media life: 1
 ";
         let c = parse_sg_logs_page(0x2e, raw);
-        assert_eq!(c.tape_alerts, 3);
+        assert_eq!(c.tape_alerts, Some(3));
     }
 
     #[test]
@@ -614,7 +639,7 @@ Read error counter page  [0x3]
         );
         let c = HealthCounters::from_raw_log(&raw);
         assert_eq!(c.corrected_no_delay, 875 + 2);
-        assert_eq!(c.tape_alerts, 0); // PAGE_2E fixture has no raised flags
+        assert_eq!(c.tape_alerts, Some(0)); // PAGE_2E fixture has no raised flags
     }
 
     /// Text before the first `=== page 0xNN ===` marker (a stray blank line,
@@ -657,7 +682,7 @@ Read error counter page  [0x3]
             total_corrected: 2,
             total_retries: 1,
             total_rewritten: 3,
-            tape_alerts: 0,
+            tape_alerts: Some(0),
             corrected_no_delay: 0,
             corrected_with_delay: 0,
             correction_algorithm_invocations: 0,
@@ -713,7 +738,7 @@ Read error counter page  [0x3]
             total_corrected: 0,
             total_retries: 0,
             total_rewritten: 0,
-            tape_alerts: 3,
+            tape_alerts: Some(3),
             corrected_no_delay: 0,
             corrected_with_delay: 0,
             correction_algorithm_invocations: 0,
@@ -771,7 +796,7 @@ Read error counter page  [0x3]
                 total_corrected: 0,
                 total_retries: 0,
                 total_rewritten: 0,
-                tape_alerts: 0,
+                tape_alerts: Some(0),
                 corrected_no_delay: 0,
                 corrected_with_delay: 0,
                 correction_algorithm_invocations: 0,
@@ -791,6 +816,52 @@ Read error counter page  [0x3]
             stored,
             Some(0),
             "recorded-and-clean must not read as unknown"
+        );
+    }
+
+    /// Issue #317: a reading whose 0x2e was never read ok stores NULL —
+    /// the other half of `zero_alerts_is_stored_as_zero_not_null`.
+    #[test]
+    fn unread_alerts_are_stored_as_null_not_zero() {
+        let conn = crate::db::open_memory().unwrap();
+        let counters = HealthCounters {
+            total_bytes_processed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            counters.tape_alerts, None,
+            "the default is not-recorded, never 0"
+        );
+        record(&conn, None, None, None, Reading::Write, &counters, "raw").unwrap();
+        let stored: Option<i64> = conn
+            .query_row("SELECT tape_alerts FROM health_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, None, "not recorded must not read as clean");
+    }
+
+    /// Issue #317: merging keeps NULL-vs-0 through every combination, in
+    /// both parse routes — pages without 0x2e yield `None`, a 0x2e with
+    /// nothing raised yields `Some(0)`, and a raised flag is never lost to
+    /// an absent page on either side.
+    #[test]
+    fn merged_pages_keep_absent_alerts_absent() {
+        let without = HealthCounters::from_decoded_pages([(0x02, PAGE_02), (0x03, PAGE_03)]);
+        assert_eq!(without.tape_alerts, None);
+        let with =
+            HealthCounters::from_decoded_pages([(0x02, PAGE_02), (0x2e, PAGE_2E), (0x03, PAGE_03)]);
+        assert_eq!(with.tape_alerts, Some(0), "positive control");
+        let raised = "Tape alert page (ssc-3) [0x2e]\n  Hard error: 1\n";
+        assert_eq!(
+            HealthCounters::from_decoded_pages([(0x2e, raised), (0x03, PAGE_03)]).tape_alerts,
+            Some(1)
+        );
+        assert_eq!(
+            HealthCounters::from_raw_log(&format!(
+                "=== page 0x02 ===\n{PAGE_02}\n=== page 0x03 ===\n{PAGE_03}\n"
+            ))
+            .tape_alerts,
+            None,
+            "a raw_log with no 0x2e section re-derives not-recorded"
         );
     }
 
@@ -1100,6 +1171,7 @@ Read error counter page  [0x3]
                     cartridges: 2,
                     max_uncorrected: Some(9),
                     readings_with_alerts: 2,
+                    readings_alerts_unrecorded: 0,
                 },
                 DriveReadings {
                     drive_id: 21,
@@ -1110,6 +1182,9 @@ Read error counter page  [0x3]
                     cartridges: 2,
                     max_uncorrected: Some(0),
                     readings_with_alerts: 0,
+                    // C2's NULL reading: 3 readings, 0 raised, and ONE of
+                    // them unknown — not three clean (issue #317).
+                    readings_alerts_unrecorded: 1,
                 },
             ],
             "the contact-less pre-021 row (uncorrected 99) must be in NO group"
@@ -1135,6 +1210,7 @@ Read error counter page  [0x3]
                     drives: 2,
                     max_uncorrected: Some(7),
                     readings_with_alerts: 1,
+                    readings_alerts_unrecorded: 0,
                 },
                 CartridgeReadings {
                     cartridge_id: 11,
@@ -1145,6 +1221,7 @@ Read error counter page  [0x3]
                     // C2 on SER-GOOD recorded NULL alerts: not counted as
                     // raised, and not as clean either.
                     readings_with_alerts: 1,
+                    readings_alerts_unrecorded: 1,
                 },
             ],
             "neither the drive-only reading nor the pre-021 row names a cartridge"

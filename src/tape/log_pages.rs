@@ -1173,6 +1173,218 @@ pub(crate) mod tests {
         );
     }
 
+    // ── issue #317: absent 0x2e is NULL, never "recorded, none" ──
+
+    /// The `health_logs.tape_alerts` a sweep's health reading stores, read
+    /// back through the production writer [`crate::tape::health::record`]
+    /// as `Option` so NULL and 0 stay distinct.
+    fn stored_tape_alerts(s: &Sweep) -> Option<i64> {
+        let conn = crate::db::open_memory().unwrap();
+        let (counters, raw_log) = s.health(None).expect("a health reading");
+        crate::tape::health::record(
+            &conn,
+            None,
+            None,
+            None,
+            crate::tape::health::Reading::Write,
+            &counters,
+            &raw_log,
+        )
+        .unwrap();
+        conn.query_row("SELECT tape_alerts FROM health_logs", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A drive whose page 0x00 lists 0x02 and 0x03 but NOT 0x2e: the
+    /// reading is recorded (its counters exist) but its tape-alert count
+    /// was never read, so the row says NULL — not 0, which would claim the
+    /// drive reported no alerts.
+    #[test]
+    fn a_page_list_without_0x2e_stores_null_tape_alerts() {
+        let mut src = FixtureSource::default();
+        src.bytes
+            .insert(0x00, vec![0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x03]);
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(src.order, vec![0x00, 0x02, 0x03], "0x2e is never read");
+        assert!(s.page(0x2e).is_none());
+        assert!(
+            s.page(0x02).unwrap().ok() && s.page(0x03).unwrap().ok(),
+            "positive control: the error-counter pages were read"
+        );
+        assert_eq!(stored_tape_alerts(&s), None);
+    }
+
+    /// 0x2e listed, but its read fails: the same NULL, and the failed page
+    /// is not read a second time to try again.
+    #[test]
+    fn a_failed_0x2e_read_stores_null_tape_alerts() {
+        let mut src = FixtureSource::default();
+        src.fail.insert(0x2e);
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(src.order, LISTED.to_vec(), "0x2e was listed and attempted");
+        assert!(!s.page(0x2e).unwrap().ok());
+        assert_eq!(stored_tape_alerts(&s), None);
+    }
+
+    /// Positive control: the mhvtl fixture reads 0x2e ok with every flag 0,
+    /// and that IS a recording — 0, not NULL.
+    #[test]
+    fn a_clean_0x2e_read_stores_zero_tape_alerts() {
+        let mut src = FixtureSource::default();
+        let s = sweep(&mut src);
+        let p2e = s.page(0x2e).expect("0x2e is listed in the mhvtl fixture");
+        assert!(p2e.ok(), "positive control: 0x2e read ok");
+        assert!(
+            p2e.decoded.as_deref().unwrap().contains("Tape alert page"),
+            "positive control: 0x2e decoded"
+        );
+        assert_eq!(stored_tape_alerts(&s), Some(0));
+    }
+
+    /// Positive control: two raised flags store 2.
+    #[test]
+    fn a_0x2e_read_with_two_flags_stores_two() {
+        let mut src = FixtureSource::default();
+        src.text.insert(
+            0x2e,
+            "Tape alert page (ssc-3) [0x2e]\n  Read warning: 1\n  Write warning: 0\n  \
+             Hard error: 1\n"
+                .to_string(),
+        );
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(stored_tape_alerts(&s), Some(2));
+    }
+
+    // ── the real HP LTO-6: every page it supports, no medium loaded ──
+
+    macro_rules! hp_fixture {
+        ($hex:literal) => {
+            (
+                include_bytes!(concat!(
+                    "../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia/page_0x",
+                    $hex,
+                    ".bin"
+                ))
+                .as_slice(),
+                include_str!(concat!(
+                    "../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia/page_0x",
+                    $hex,
+                    ".decoded.txt"
+                )),
+            )
+        };
+    }
+
+    /// The 22 pages the real HP LTO-6's page 0x00 lists, spelled out BY
+    /// NAME from the fixture README rather than derived from the bytes.
+    const HP_LISTED: [u8; 22] = [
+        0x00, 0x02, 0x03, 0x0c, 0x0d, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1b, 0x2e,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x3e,
+    ];
+
+    /// `(page, raw bytes, offline decode)` for every HP LTO-6 page.
+    fn hp_pages() -> Vec<(u8, &'static [u8], &'static str)> {
+        let all = [
+            (0x00, hp_fixture!("00")),
+            (0x02, hp_fixture!("02")),
+            (0x03, hp_fixture!("03")),
+            (0x0c, hp_fixture!("0c")),
+            (0x0d, hp_fixture!("0d")),
+            (0x11, hp_fixture!("11")),
+            (0x12, hp_fixture!("12")),
+            (0x13, hp_fixture!("13")),
+            (0x14, hp_fixture!("14")),
+            (0x15, hp_fixture!("15")),
+            (0x16, hp_fixture!("16")),
+            (0x17, hp_fixture!("17")),
+            (0x18, hp_fixture!("18")),
+            (0x1b, hp_fixture!("1b")),
+            (0x2e, hp_fixture!("2e")),
+            (0x30, hp_fixture!("30")),
+            (0x31, hp_fixture!("31")),
+            (0x32, hp_fixture!("32")),
+            (0x33, hp_fixture!("33")),
+            (0x34, hp_fixture!("34")),
+            (0x35, hp_fixture!("35")),
+            (0x3e, hp_fixture!("3e")),
+        ];
+        all.into_iter().map(|(p, (b, t))| (p, b, t)).collect()
+    }
+
+    /// A [`FixtureSource`] answering every page from the HP LTO-6 set. Its
+    /// overrides take precedence over the mhvtl defaults, and every page the
+    /// HP list names is overridden, so no mhvtl byte can leak in.
+    fn hp_source() -> FixtureSource {
+        let mut src = FixtureSource::default();
+        for (p, b, t) in hp_pages() {
+            src.bytes.insert(p, b.to_vec());
+            src.text.insert(p, t.to_string());
+        }
+        src
+    }
+
+    /// The first test against real-drive bytes: the HP LTO-6's page 0x00
+    /// lists exactly the 22 README codes, the sweep reads each once, every
+    /// read is ok and decoded, and the health counters parse to the values
+    /// the offline decodes show.
+    #[test]
+    fn the_real_hp_lto6_fixture_set_sweeps_once_each_and_parses() {
+        assert_eq!(hp_pages().len(), HP_LISTED.len());
+        let (_, p00, _) = hp_pages()[0];
+        assert_eq!(parse_supported_pages(p00).unwrap(), HP_LISTED.to_vec());
+
+        let mut src = hp_source();
+        let s = sweep(&mut src);
+        assert_each_page_read_once(&src.reads);
+        assert_eq!(src.reads.len(), 22, "22 distinct pages read");
+        assert_eq!(src.order, HP_LISTED.to_vec(), "the pages read, in order");
+        assert_eq!(s.listed.as_deref(), Some(&HP_LISTED[..]));
+        assert!(s.captures.iter().all(PageCapture::ok), "every read ok");
+        assert!(
+            s.captures.iter().all(|c| c.decoded.is_some()),
+            "every page decoded"
+        );
+        assert_eq!(src.decodes, 22);
+        for (p, b, _) in hp_pages() {
+            assert_eq!(
+                s.page(p).unwrap().raw.as_deref(),
+                Some(b),
+                "0x{p:02x} captured verbatim"
+            );
+        }
+
+        // Positive control: the inputs carry the lines the parser keys on.
+        let text = |p: u8| hp_pages().into_iter().find(|(q, _, _)| *q == p).unwrap().2;
+        assert!(text(0x02).contains("Total uncorrected errors = 0"));
+        assert!(text(0x02).contains("Errors corrected without substantial delay = 920"));
+        assert!(text(0x03).contains("Total times correction algorithm processed = 69"));
+
+        let (c, raw_log) = s.health(None).expect("a health reading");
+        assert_eq!(c.total_uncorrected, 0);
+        assert_eq!(c.total_corrected, 0);
+        assert_eq!(c.corrected_no_delay, 920 + 69);
+        assert_eq!(c.corrected_with_delay, 0);
+        assert_eq!(c.correction_algorithm_invocations, 306488 + 69);
+        assert_eq!(c.total_bytes_processed, 12820, "the max, not the sum");
+        assert_eq!(c.total_rewritten, 0);
+        assert_eq!(c.total_retries, 0);
+        assert_eq!(HealthCounters::from_raw_log(&raw_log), c);
+    }
+
+    /// The real HP LTO-6 lists 0x2e and every flag is 0: it stores 0.
+    #[test]
+    fn the_real_hp_lto6_stores_zero_tape_alerts() {
+        let mut src = hp_source();
+        let s = sweep(&mut src);
+        let p2e = s.page(0x2e).expect("the HP LTO-6 lists 0x2e");
+        assert!(p2e.ok(), "positive control: 0x2e read ok");
+        assert!(p2e.decoded.as_deref().unwrap().contains("Hard error: 0"));
+        assert_eq!(stored_tape_alerts(&s), Some(0));
+    }
+
     // ── the counters: the sweep equals the old three-page path ──
 
     /// What the pre-#298 `collect` computed from three page texts:
@@ -1217,7 +1429,7 @@ pub(crate) mod tests {
             "positive control: the inputs are live"
         );
         assert_eq!(expected.corrected_no_delay, 877);
-        assert_eq!(expected.tape_alerts, 2);
+        assert_eq!(expected.tape_alerts, Some(2));
 
         let mut src = FixtureSource::default();
         src.text.insert(0x02, p02.to_string());

@@ -5373,7 +5373,7 @@ mod tests {
 
         let counters = health::HealthCounters {
             total_uncorrected: 2,
-            tape_alerts: 0,
+            tape_alerts: Some(0),
             ..Default::default()
         };
         let drive_id = record_health_and_drive(
