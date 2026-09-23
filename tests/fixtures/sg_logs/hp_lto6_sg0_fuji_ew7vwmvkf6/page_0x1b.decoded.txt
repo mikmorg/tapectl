@@ -1,0 +1,12 @@
+Data compression page  (ssc-4) [0x1b]
+  Read compression ratio x100: 0
+  Write compression ratio x100: 0
+  Megabytes transferred to server: 0
+  Bytes transferred to server: 0
+  Megabytes read from tape: 0
+  Bytes read from tape: 0
+  Megabytes transferred from server: 0
+  Bytes transferred from server: 0
+  Megabytes written to tape: 0
+  Bytes written to tape: 0
+  Data compression enabled: 0x0

@@ -1,0 +1,17 @@
+Tape capacity page  (LTO-5 and LTO-6 specific) [0x31]
+  Main partition remaining capacity (in MiB): 2499030
+  Alternate partition remaining capacity (in MiB): 0
+  Main partition maximum capacity (in MiB): 2499053
+  Alternate partition maximum capacity (in MiB): 0
+  unknown parameter code = 0x5, contents in hex:
+ 00     00 05 60 04 00 00 00 00
+
+  unknown parameter code = 0x6, contents in hex:
+ 00     00 06 60 04 00 00 00 00
+
+  unknown parameter code = 0x7, contents in hex:
+ 00     00 07 60 04 00 00 00 00
+
+  unknown parameter code = 0x8, contents in hex:
+ 00     00 08 60 04 00 00 00 00
+

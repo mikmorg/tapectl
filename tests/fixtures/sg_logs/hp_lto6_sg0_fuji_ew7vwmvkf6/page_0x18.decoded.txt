@@ -1,0 +1,35 @@
+Protocol Specific port page for SAS SSP  (sas-2) [0x18]
+relative target port id = 0
+  generation code = 3
+  number of phys = 1
+  phy identifier = 0
+    attached SAS device type: SAS or SATA device
+    attached reason: unknown
+    reason: unknown
+    negotiated logical link rate: 6 Gbps
+    attached initiator port: ssp=1 stp=1 smp=1
+    attached target port: ssp=0 stp=0 smp=0
+    SAS address = 0x51402ec001437f9c
+    attached SAS address = 0x500605b007f4b871
+    attached phy identifier = 7
+    Invalid DWORD count = 255
+    Running disparity error count = 255
+    Loss of DWORD synchronization count = 0
+    Phy reset problem count = 0
+relative target port id = 1
+  generation code = 3
+  number of phys = 1
+  phy identifier = 1
+    attached SAS device type: no device attached
+    attached reason: unknown
+    reason: unknown
+    negotiated logical link rate: phy enabled; unknown rate
+    attached initiator port: ssp=0 stp=0 smp=0
+    attached target port: ssp=0 stp=0 smp=0
+    SAS address = 0x51402ec001437f9d
+    attached SAS address = 0x0
+    attached phy identifier = 0
+    Invalid DWORD count = 0
+    Running disparity error count = 0
+    Loss of DWORD synchronization count = 0
+    Phy reset problem count = 0

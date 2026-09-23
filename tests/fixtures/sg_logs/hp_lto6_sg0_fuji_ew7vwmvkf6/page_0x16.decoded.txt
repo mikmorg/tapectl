@@ -1,0 +1,21 @@
+Tape diagnostics data page (ssc-3) [0x16]
+  Parameter code: 0
+    Density code: 0x58
+    Medium type: 0x0
+    Lifetime media motion hours: 27
+    Repeat: 0
+    Sense key: 0x3 [Medium Error]
+    Additional sense code: 0x14
+    Additional sense code qualifier: 0x0
+      [Additional sense: Recorded entity not found]
+    Vendor specific code qualifier: 0x508f
+    Product revision level: 859129668
+    Hours since last clean: 27
+    Operation code: 0x0
+    Service action: 0x0
+    Medium id number (in hex):
+ 00     4a 31 35 31 32 32 34 33  36 39 00 00 00 00 00 00    J151224369......
+ 10     00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00    ................
+    Timestamp origin: 0x0
+    Timestamp:
+ 00     00 00 56 9a cf 44
