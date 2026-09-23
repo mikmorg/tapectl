@@ -974,6 +974,30 @@ fn volume_write_contacted<'c>(
         )));
     }
 
+    // Issue #330: the seal is RECORDED, not inferred (ADR-0012's 2026-09-21
+    // amendment). A session that sealed and then ended `aborted` (confirm
+    // Inconclusive on an unreadable seal marker, then `volume abort`) leaves
+    // this row `initialized` with no completed write and no unresolved
+    // session, so every check above passes -- and at contact the tape's own
+    // seal probes do not parse either, so `check_tape_contact` answers
+    // `Matches` and the write would start again from BOT over a sealed
+    // volume. ADR-0003 forbids that and no flag reaches it: like
+    // `AlreadySealed`, this is an absolute refusal (ADR-0008 Tier 3 in
+    // kind -- `--force` is not consulted), not a consent tier. Placed after
+    // the unresolved-session check so an `interrupted` sealed session still
+    // gets that check's resume advice, and before any backend, MAM or
+    // drive is touched.
+    let seal_recorded: bool = conn.query_row(
+        "SELECT sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if seal_recorded {
+        return Err(TapectlError::Other(seal_recorded_refusal(
+            conn, label, volume_id,
+        )?));
+    }
+
     let units = find_staged_data(conn)?;
     if units.is_empty() {
         return Err(TapectlError::Other(
@@ -2959,6 +2983,46 @@ pub(crate) fn describe_quarantine(reason: &QuarantineReason) -> String {
              (ADR-0003: sealed volumes are immutable)"
         ),
     }
+}
+
+/// The refusal for a fresh write to a volume whose seal the catalog records
+/// (issue #330). It names `volume verify` + `volume resume` only when resume
+/// would actually re-confirm this volume's aborted session: the session is
+/// adoptable after a clean full verify
+/// ([`session::aborted_session_reconfirmable_after_verify`]) AND its frozen
+/// layout is still on disk -- `staging clean --force` can reclaim the session
+/// directory, and resume cannot re-confirm without it. The retire path is
+/// named always; it is the reuse path for any sealed cartridge.
+fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Result<String> {
+    let reconfirmable = session::aborted_session_reconfirmable_after_verify(conn, volume_id)? && {
+        let dir: Option<String> = conn
+            .query_row(
+                "SELECT session_dir FROM writes WHERE volume_id = ?1 AND status = 'aborted' \
+                 AND session_dir IS NOT NULL ORDER BY id LIMIT 1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        dir.is_some_and(|d| Path::new(&d).join(build::LAYOUT_SIDECAR).is_file())
+    };
+    let mut msg = format!(
+        "refusing to write volume \"{label}\": the catalog RECORDS its seal (a write session \
+         sealed this cartridge; `volumes.sealed_at` is set). ADR-0003: sealed volumes are \
+         immutable, there is no append, and --force cannot override this. The tape's own seal \
+         marker may not read back, but the seal is recorded, not inferred (ADR-0012)."
+    );
+    if reconfirmable {
+        msg.push_str(&format!(
+            " Its aborted session can still be re-confirmed without writing: run a full verify \
+             (`tapectl volume verify {label}`), then `tapectl volume resume {label}`."
+        ));
+    }
+    msg.push_str(&format!(
+        " To reuse the cartridge instead: retire this volume (`tapectl volume retire {label}`), \
+         bulk-erase the physical tape, then run `tapectl cartridge mark-erased` before writing \
+         to it again."
+    ));
+    Ok(msg)
 }
 
 /// A tiny, pure decision — no I/O, no `Store` — over an already-computed
@@ -11857,5 +11921,155 @@ mod tests {
         // name the flag that does.
         assert!(msg.contains("`tapectl staging clean --force`"), "{msg}");
         assert!(!msg.contains("forfeits"), "{msg}");
+    }
+
+    /// Issue #330's fixture: an `initialized` volume whose seal is (or is
+    /// not) RECORDED, with one `aborted` write session -- the state a
+    /// session that sealed, confirmed Inconclusive on an unreadable seal
+    /// marker, and was then `volume abort`ed leaves behind -- plus the
+    /// `write_aborted` event `volume abort` logs. `session_dir`, when given,
+    /// is recorded on the row (the frozen layout resume needs lives there).
+    fn seal_recorded_fixture(sealed: bool, session_dir: Option<&Path>) -> (Connection, i64) {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, mam_capacity_bytes)
+             VALUES ('L6-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', 123456)",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, 'aborted', ?4)",
+            params![
+                stage_set_id,
+                snapshot_id,
+                volume_id,
+                session_dir.map(|d| d.display().to_string())
+            ],
+        )
+        .unwrap();
+        crate::db::events::log_event(
+            &conn,
+            "volume",
+            volume_id,
+            Some("L6-SEALED"),
+            "write_aborted",
+            None,
+            None,
+            Some("operator abandoned the unfinished write session (`volume abort`)"),
+            None,
+            None,
+        )
+        .unwrap();
+        if sealed {
+            conn.execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![volume_id],
+            )
+            .unwrap();
+        }
+        (conn, volume_id)
+    }
+
+    fn write_seal_recorded(conn: &Connection, force: bool) -> TapectlError {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        volume_write(
+            conn,
+            &paths,
+            &Config::default(),
+            "L6-SEALED",
+            "/nonexistent/tapectl-seal-recorded-test-nst",
+            512 * 1024,
+            force,
+            false, // allow_missing_escrow
+        )
+        .unwrap_err()
+    }
+
+    /// Issue #330: a volume whose seal the catalog RECORDS is never written
+    /// again, whatever the tape's own seal probe would infer (ADR-0003;
+    /// ADR-0012, 2026-09-21). Refused before the device, the MAM or the
+    /// `writes` table is touched, and `--force` does not reach it. With no
+    /// frozen layout left, `volume resume` is not named: it could not
+    /// re-confirm.
+    #[test]
+    fn volume_write_refuses_a_volume_whose_seal_is_recorded_even_with_force() {
+        for force in [false, true] {
+            let (conn, volume_id) = seal_recorded_fixture(true, None);
+            let writes_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+                .unwrap();
+
+            let msg = write_seal_recorded(&conn, force).to_string();
+            assert!(msg.contains("RECORDS its seal"), "force={force}: {msg}");
+            assert!(msg.contains("ADR-0003"), "{msg}");
+            assert!(msg.contains("--force cannot override"), "{msg}");
+            assert!(msg.contains("`tapectl volume retire L6-SEALED`"), "{msg}");
+            assert!(msg.contains("cartridge mark-erased"), "{msg}");
+            assert!(
+                !msg.contains("volume resume"),
+                "no frozen layout: resume cannot re-confirm, so it must not be named: {msg}"
+            );
+
+            let writes_after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(writes_after, writes_before, "no writes row was created");
+            let (status, mam): (String, Option<i64>) = conn
+                .query_row(
+                    "SELECT status, mam_capacity_bytes FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "initialized");
+            assert_eq!(mam, Some(123456), "the MAM was not touched");
+        }
+    }
+
+    /// Issue #330: when the aborted session is still re-confirmable (its
+    /// frozen layout is on disk and resume's adoption would accept it after
+    /// a clean full verify), the refusal names that path as well.
+    #[test]
+    fn seal_recorded_refusal_names_verify_then_resume_when_the_session_can_be_reconfirmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(build::LAYOUT_SIDECAR), b"{}").unwrap();
+        let (conn, _volume_id) = seal_recorded_fixture(true, Some(dir.path()));
+
+        let msg = write_seal_recorded(&conn, false).to_string();
+        assert!(msg.contains("RECORDS its seal"), "{msg}");
+        let verify = msg
+            .find("`tapectl volume verify L6-SEALED`")
+            .unwrap_or_else(|| panic!("verify must be named: {msg}"));
+        let resume = msg
+            .find("`tapectl volume resume L6-SEALED`")
+            .unwrap_or_else(|| panic!("resume must be named: {msg}"));
+        assert!(verify < resume, "verify comes first: {msg}");
+        assert!(msg.contains("`tapectl volume retire L6-SEALED`"), "{msg}");
+    }
+
+    /// Issue #330's positive control: the same aborted session WITHOUT a
+    /// recorded seal is not refused by the seal check (an aborted session
+    /// that never sealed left nothing immutable), so the check keys on the
+    /// record, not on the aborted row.
+    #[test]
+    fn an_aborted_never_sealed_volume_is_not_refused_as_sealed() {
+        let (conn, _volume_id) = seal_recorded_fixture(false, None);
+        let msg = write_seal_recorded(&conn, false).to_string();
+        assert!(!msg.contains("RECORDS its seal"), "{msg}");
+        assert!(
+            !msg.contains("unresolved write session"),
+            "an aborted row is resolved: {msg}"
+        );
     }
 }
