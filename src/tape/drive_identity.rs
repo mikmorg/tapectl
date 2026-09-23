@@ -22,9 +22,11 @@
 //! 2. `sg_inq --page=0x80` on the sg node — the fallback when `vpd_pg80` is
 //!    absent (not every driver/drive publishes it; the real HP LTO-6's
 //!    behaviour here is unverified, see `tests/fixtures/drive_identity/README.md`).
-//! 3. The `sg_logs` identity header — the first line of every page's stdout,
-//!    which `health::collect` has concatenated into `health_logs.raw_log` on
-//!    every row ever written. It carries vendor/product/firmware (never the
+//! 3. The `sg_logs` identity header — the first line of every page's stdout
+//!    before issue #298, concatenated into `health_logs.raw_log` on every row
+//!    written until then; since #298 (`--raw` prints none) the sweep renders
+//!    it from one standard INQUIRY, byte-identical, as `raw_log`'s first line
+//!    (`crate::tape::log_pages::inquiry_header`). It carries vendor/product/firmware (never the
 //!    serial) and has been captured-but-unqueryable all along, exactly the
 //!    `tape_alerts` shape of issue #107 and the ECC-parameter shape of #120.
 //!    Used here only to fill a field sysfs did not yield, never to override
@@ -213,7 +215,7 @@ pub fn parse_sg_inq_serial(raw: &str) -> Option<String> {
 /// three fields. A page body line such as `Write error counter page  [0x2]`
 /// also splits into fields, and mistaking it for an identity would invent a
 /// drive named "Write error counter page". Lines skipped before the
-/// candidate: blanks, `collect()`'s own `=== page 0xNN ===` markers, and a
+/// candidate: blanks, the health reading's own `=== page 0xNN ===` markers, and a
 /// recorded shell echo (`$ sg_logs ...`), which is how the newer fixtures
 /// were captured.
 pub fn parse_sg_logs_identity_header(raw: &str) -> Option<DriveIdentity> {
@@ -391,7 +393,7 @@ mod tests {
     const SG_INQ: &str =
         include_str!("../../tests/fixtures/drive_identity/mhvtl_nst1_sg_inq_page80.txt");
     /// Same drive, same moment — the sg_logs capture whose line 2 is the
-    /// identity header `collect()` already concatenates into `raw_log`.
+    /// identity header pre-#298 health collection concatenated into `raw_log`.
     const MHVTL_PAGE_02: &str =
         include_str!("../../tests/fixtures/sg_logs/mhvtl_ibm_td8_page_0x02.txt");
     /// A REAL HP LTO-6, recorded in a different session. Used for header
@@ -561,8 +563,9 @@ mod tests {
 
     #[test]
     fn sg_logs_header_parses_from_a_raw_log_shaped_blob() {
-        // The production shape: `collect()` writes its own page marker and
-        // then the page's stdout, whose first line is the header.
+        // The pre-#298 production shape: the page marker, then the page's
+        // stdout, whose first line is the header. (Since #298 the header
+        // precedes the first marker; `log_pages`' tests cover that shape.)
         let raw_log = format!("=== page 0x02 ===\n{PAGE_02_NO_ECHO}");
         let id = parse_sg_logs_identity_header(&raw_log).expect("header must parse");
         assert_eq!(id.vendor.as_deref(), Some("IBM"));

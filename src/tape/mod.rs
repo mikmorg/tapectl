@@ -2,6 +2,7 @@ pub mod contact;
 pub mod drive_identity;
 pub mod health;
 pub mod ioctl;
+pub mod log_pages;
 pub mod mam;
 pub mod mam_journal;
 pub mod media_detect;

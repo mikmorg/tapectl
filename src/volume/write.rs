@@ -14,6 +14,7 @@ use crate::staging;
 use crate::tape::contact::{self, ContactGuard, ContactSite, ContactSlot, Medium, Operation};
 use crate::tape::drive_identity;
 use crate::tape::health;
+use crate::tape::log_pages;
 use crate::tape::mam_journal::{Hook, MamReads};
 use crate::util::{HashingWriter, TruncatingWriter};
 
@@ -1290,6 +1291,7 @@ fn volume_write_contacted<'c>(
         volume_id,
         contact.id(),
         health::Reading::Write,
+        Operation::VolumeWrite,
     );
 
     result
@@ -1527,6 +1529,7 @@ fn volume_resume_contacted<'c>(
         volume_id,
         contact.id(),
         health::Reading::Resume,
+        Operation::VolumeResume,
     );
 
     result
@@ -2437,6 +2440,11 @@ pub(crate) fn quarantine_on_medium_evidence(
 /// had been forcing `volume resume` to call itself `write`, and the resume
 /// call site now passes [`health::Reading::Resume`].
 ///
+/// `trigger` is the COMMAND, verbatim — the `cartridge_contacts.operation`
+/// vocabulary — which every `log_page_journal` row records (issue #298). A
+/// different list from `operation`'s reading kind; neither stands in for the
+/// other.
+///
 /// `contact_id` is the contact the caller's guard opened (issue #296): the
 /// reading names it, and the drive this collection identifies is attached to
 /// it — see [`record_health_and_drive`].
@@ -2447,21 +2455,32 @@ fn collect_health_best_effort(
     volume_id: i64,
     contact_id: Option<i64>,
     operation: health::Reading,
+    trigger: Operation,
 ) {
     if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
-        collect_and_record_health(conn, bk, Some(volume_id), contact_id, None, operation);
+        collect_and_record_health(
+            conn,
+            bk,
+            Some(volume_id),
+            contact_id,
+            None,
+            operation,
+            trigger,
+        );
     }
 }
 
-/// The hardware half of a health reading: run `sg_logs` and read the drive's
+/// The hardware half of a health reading: ONE log-page sweep
+/// ([`log_pages::sweep`] — page 0x00, then every page it lists), one
+/// standard INQUIRY for the `raw_log` identity header, and the drive's
 /// identity from the backend the caller ALREADY resolved (no second lookup
-/// to disagree with the first, #187), then hand both to
-/// [`record_health_and_drive`], which does every database write.
+/// to disagree with the first, #187); then [`record_sweep_and_health`] does
+/// every database write.
 ///
-/// Each log page is read exactly once here (ADR-0013's read-to-clear
-/// hazard): the drive identity comes from sysfs / VPD 0x80 and from the
-/// header of the text this ONE collection already returned — never from a
-/// second `sg_logs` run.
+/// Each log page is read at most once here (ADR-0013's read-to-clear
+/// hazard, issue #298): the sweep is the ONLY log-page reader, the counters
+/// are parsed from its offline decode, and the identity comes from sysfs /
+/// VPD 0x80 and an INQUIRY — never from a second `sg_logs` run.
 fn collect_and_record_health(
     conn: &Connection,
     bk: &crate::config::LtoBackendConfig,
@@ -2469,37 +2488,85 @@ fn collect_and_record_health(
     contact_id: Option<i64>,
     session_id: Option<i64>,
     reading: health::Reading,
+    trigger: Operation,
 ) {
-    let collected = match health::collect(&bk.device_sg) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            warn!(sg_device = %bk.device_sg, err = %e, "sg_logs collection failed");
-            None
-        }
-    };
+    let sweep = log_pages::sweep(&mut log_pages::SgLogs::new(&bk.device_sg));
+    let header = log_pages::inquiry_header(&bk.device_sg);
     let identity = drive_identity::read_identity(bk);
-    record_health_and_drive(
+    record_sweep_and_health(
         conn,
-        volume_id,
-        contact_id,
-        session_id,
-        reading,
-        collected.as_ref().map(|(c, raw)| (c, raw.as_str())),
+        HealthSite {
+            volume_id,
+            contact_id,
+            session_id,
+            reading,
+            trigger,
+            device_tape: &bk.device_tape,
+        },
+        &sweep,
+        header.as_deref(),
         identity,
-        &bk.device_tape,
     );
 }
 
-/// Every database write a health reading makes, with no hardware in it —
-/// split from [`collect_and_record_health`] so the attribution this issue
-/// exists for is testable by value (issue #296).
+/// Where a health reading was taken — the facts about the CALLER a sweep's
+/// rows and its `health_logs` row are attributed with.
+pub(crate) struct HealthSite<'a> {
+    pub volume_id: Option<i64>,
+    pub contact_id: Option<i64>,
+    pub session_id: Option<i64>,
+    pub reading: health::Reading,
+    pub trigger: Operation,
+    pub device_tape: &'a str,
+}
+
+/// Every database write one health collection makes, with no hardware in
+/// it (issue #298): journal EVERY page the sweep read, verbatim, against the
+/// contact (`log_page_journal`); then the `health_logs` row and the drive via
+/// [`record_health_and_drive`], from the sweep's decoded health pages and the
+/// INQUIRY identity header. Returns the `drives.id` attached, if any.
+///
+/// When the sweep read no health page there is no reading to record — the
+/// journal rows are still written, and the drive still attaches.
+pub(crate) fn record_sweep_and_health(
+    conn: &Connection,
+    site: HealthSite<'_>,
+    sweep: &log_pages::Sweep,
+    header: Option<&str>,
+    identity: drive_identity::DriveIdentity,
+) -> Option<i64> {
+    log_pages::record_sweep(
+        conn,
+        site.contact_id,
+        site.trigger.as_str(),
+        Some(site.device_tape),
+        sweep,
+    );
+    let collected = sweep.health(header);
+    record_health_and_drive(
+        conn,
+        site.volume_id,
+        site.contact_id,
+        site.session_id,
+        site.reading,
+        collected.as_ref().map(|(c, raw)| (c, raw.as_str())),
+        identity,
+        site.device_tape,
+    )
+}
+
+/// The `health_logs` and drive writes of a health reading, with no hardware
+/// in it — split from [`collect_and_record_health`] so the attribution issue
+/// #296 exists for is testable by value; [`record_sweep_and_health`] is its
+/// production caller.
 ///
 /// 1. The `health_logs` row, naming its contact (ADR-0013 §2) and, on the
 ///    verify path, its `verification_sessions` row (§3). Skipped only when
-///    `sg_logs` itself failed: there is no reading to record.
+///    the sweep read no health page: there is no reading to record.
 /// 2. The drive (ADR-0013 §1, issue #295) — AFTER the health row,
 ///    deliberately: identity capture is an addition to the record, never a
-///    precondition for it. The `sg_logs` identity header fills any field
+///    precondition for it. The identity header at the top of `raw_log` (an
+///    INQUIRY rendered as sg_logs printed it, issue #298) fills any field
 ///    sysfs did not yield. A drive with no serial records NO row — unknown
 ///    by absence, never a guess.
 /// 3. The contact's `drive_id`, by id rather than through a guard, because
@@ -2911,6 +2978,7 @@ pub fn volume_verify(
             report.contact_id,
             report.session_id,
             health::Reading::Verify,
+            Operation::VolumeVerify,
         ),
         None => {
             report.drive_health_note = Some(format!(
@@ -5320,6 +5388,149 @@ mod tests {
             .query_row("SELECT contact_id FROM health_logs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(named, Some(cid));
+    }
+
+    /// Issue #298, end to end with no hardware: the fixture drive's sweep
+    /// through [`record_sweep_and_health`] — the production writer — leaves
+    /// one `log_page_journal` row per page, ALL naming this contact and the
+    /// command; ONE health row naming the contact, whose `raw_log` still
+    /// carries the INQUIRY identity header; and the drive attached. Rows
+    /// asserted to EXIST, by value — every write here only warns on failure.
+    #[test]
+    fn a_health_sweep_journals_every_page_against_its_contact() {
+        use crate::tape::log_pages::{self, tests::FixtureSource, tests::LISTED};
+        let conn = crate::db::open_memory().unwrap();
+        let (_, other_cid) = contact_and_volume(&conn, "HS-OTHER");
+        let (vid, cid) = contact_and_volume(&conn, "HS-THIS");
+        assert_ne!(cid, other_cid, "positive control: two distinct contacts");
+        let header = "    IBM       ULT3580-TD8       2160";
+
+        let drive = record_sweep_and_health(
+            &conn,
+            HealthSite {
+                volume_id: Some(vid),
+                contact_id: Some(cid),
+                session_id: None,
+                reading: health::Reading::Write,
+                trigger: Operation::VolumeWrite,
+                device_tape: "/dev/nst-fixture",
+            },
+            &log_pages::sweep(&mut FixtureSource::default()),
+            Some(header),
+            identity_with_serial(Some("XYZZY_A1")),
+        )
+        .expect("the identity has a serial");
+
+        let journal: Vec<(u8, Option<i64>, String, i64)> = conn
+            .prepare("SELECT page_code, contact_id, trigger, ok FROM log_page_journal ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            journal,
+            LISTED
+                .iter()
+                .map(|p| (*p, Some(cid), "volume write".to_string(), 1))
+                .collect::<Vec<_>>(),
+            "every listed page, once, against THIS contact, trigger = the command"
+        );
+
+        let (contact, operation, raw_log): (Option<i64>, String, String) = conn
+            .query_row(
+                "SELECT contact_id, operation, raw_log FROM health_logs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(contact, Some(cid));
+        assert_eq!(operation, "write", "health_logs keeps the READING kind");
+        assert!(raw_log.starts_with(&format!("{header}\n=== page 0x02 ===\n")));
+        let id = drive_identity::parse_sg_logs_identity_header(&raw_log)
+            .expect("the #295 header route still resolves from raw_log");
+        assert_eq!(id.model.as_deref(), Some("ULT3580-TD8"));
+        assert_eq!(drive_of_contact(&conn, cid), Some(drive));
+        assert_eq!(drive_of_contact(&conn, other_cid), None);
+    }
+
+    /// A listed page that fails does not fail the reading: the journal has
+    /// its `ok = 0` row, the health row is still written, the drive still
+    /// attaches. Positive control: the same page from a working source is
+    /// `ok = 1` in the first sweep.
+    #[test]
+    fn a_failed_listed_page_leaves_an_ok_zero_row_and_the_reading_stands() {
+        use crate::tape::log_pages::{self, tests::FixtureSource};
+        let conn = crate::db::open_memory().unwrap();
+        let (vid, cid) = contact_and_volume(&conn, "HS-FAIL");
+        let site = |c| HealthSite {
+            volume_id: Some(vid),
+            contact_id: Some(c),
+            session_id: None,
+            reading: health::Reading::Verify,
+            trigger: Operation::VolumeVerify,
+            device_tape: "/dev/nst-fixture",
+        };
+        let (_, good_cid) = contact_and_volume(&conn, "HS-GOOD");
+        record_sweep_and_health(
+            &conn,
+            site(good_cid),
+            &log_pages::sweep(&mut FixtureSource::default()),
+            None,
+            identity_with_serial(Some("XYZZY_A1")),
+        );
+        let mut failing = FixtureSource::default();
+        failing.fail.insert(0x17);
+        let drive = record_sweep_and_health(
+            &conn,
+            site(cid),
+            &log_pages::sweep(&mut failing),
+            None,
+            identity_with_serial(Some("XYZZY_A1")),
+        );
+        let ok_of = |c: i64| -> i64 {
+            conn.query_row(
+                "SELECT ok FROM log_page_journal WHERE contact_id = ?1 AND page_code = 23",
+                params![c],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(ok_of(good_cid), 1, "positive control");
+        assert_eq!(ok_of(cid), 0);
+        let health_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM health_logs WHERE contact_id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(health_rows, 1, "the reading stands");
+        assert_eq!(drive_of_contact(&conn, cid), drive);
+        assert!(drive.is_some());
+    }
+
+    /// Each health call site journals under the COMMAND that is its
+    /// contact's operation — pinned by source scan, since the callers need a
+    /// drive. Calibrated: each call site is found first.
+    #[test]
+    fn every_health_call_site_names_its_command_as_the_trigger() {
+        const SRC: &str = include_str!("write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for (reading, trigger) in [
+            ("health::Reading::Write,", "Operation::VolumeWrite,"),
+            ("health::Reading::Resume,", "Operation::VolumeResume,"),
+            ("health::Reading::Verify,", "Operation::VolumeVerify,"),
+        ] {
+            let at = prod
+                .find(reading)
+                .unwrap_or_else(|| panic!("positive control: a call site passes {reading}"));
+            let next = prod[at + reading.len()..].trim_start();
+            assert!(
+                next.starts_with(trigger),
+                "the {reading} call site must pass {trigger} next"
+            );
+        }
     }
 
     /// Every production path that writes a health row must hand it a

@@ -291,6 +291,13 @@ fn migrations() -> Migrations<'static> {
         // backfilled. Plain CREATE, touching no other table, so no
         // `.foreign_key_check()`. See the migration header.
         M::up(include_str!("migrations/022_mam_journal.sql")),
+        // 023 creates `log_page_journal` (ADR-0013, "Two hazards"; issue
+        // #298): every SCSI log page one health sweep read -- page 0x00, then
+        // each page it lists, at most once per contact -- as the response
+        // bytes verbatim plus the offline decode. Points at the contact, like
+        // 022. Append-only, never pruned. Plain CREATE, touching no other
+        // table, so no `.foreign_key_check()`. See the migration header.
+        M::up(include_str!("migrations/023_log_page_journal.sql")),
     ])
 }
 
@@ -1625,6 +1632,21 @@ mod tests {
         conn
     }
 
+    /// The schema as of migration 022 — for 023's pin-by-difference test,
+    /// for the reason `open_memory_at_021` gives.
+    fn open_memory_at_022() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        migrations().to_version(&mut conn, 22).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, 22, "positive control: stopped at 022");
+        conn
+    }
+
     // --- Migration 021 (ADR-0013 §3: `health_logs`' ONE permitted rebuild) ---
     //
     // The #227/#264 standard in full, because `PRAGMA table_info` reports
@@ -2180,7 +2202,9 @@ mod tests {
             v
         }
         let before = objects(&open_memory_at_021());
-        let after = objects(&open_memory().unwrap());
+        // Pinned at 022, not "latest": 023 adds a table, and a comparison
+        // against latest would start measuring 023 instead of this one.
+        let after = objects(&open_memory_at_022());
         let added: Vec<(&str, &str)> = after
             .iter()
             .filter(|o| !before.contains(o))
@@ -2199,6 +2223,48 @@ mod tests {
         assert!(
             changed_or_removed.is_empty(),
             "022 must alter no existing object: {changed_or_removed:?}"
+        );
+    }
+
+    /// Migration 023 creates `log_page_journal` (and its two indexes) and
+    /// touches NOTHING else (issue #298). Pinned by difference against 022,
+    /// like 022's own test.
+    #[test]
+    fn migration_023_creates_only_log_page_journal() {
+        fn objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_master \
+                     WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                )
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|n| n.unwrap())
+                .collect();
+            v
+        }
+        let before = objects(&open_memory_at_022());
+        let after = objects(&open_memory().unwrap());
+        let added: Vec<(&str, &str)> = after
+            .iter()
+            .filter(|o| !before.contains(o))
+            .map(|o| (o.0.as_str(), o.1.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                ("index", "idx_log_page_journal_contact"),
+                ("index", "idx_log_page_journal_page"),
+                ("table", "log_page_journal"),
+            ]
+        );
+        let changed_or_removed: Vec<&(String, String, Option<String>)> =
+            before.iter().filter(|o| !after.contains(o)).collect();
+        assert!(
+            changed_or_removed.is_empty(),
+            "023 must alter no existing object: {changed_or_removed:?}"
         );
     }
 

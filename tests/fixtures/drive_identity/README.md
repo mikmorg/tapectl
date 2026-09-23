@@ -11,7 +11,7 @@ when they come from one drive.
 | `mhvtl_nst1_sysfs.txt` | `cat /sys/class/scsi_tape/nst1/device/{vendor,model,rev}` — three lines, in that order, with the SCSI space padding **preserved** |
 | `mhvtl_nst1_vpd_pg80.hex` | `xxd -p /sys/class/scsi_tape/nst1/device/vpd_pg80` — the raw VPD page 0x80 as hex, one line |
 | `mhvtl_nst1_sg_inq_page80.txt` | `sg_inq --page=0x80 /dev/sg1` — the fallback path's output |
-| `../sg_logs/mhvtl_ibm_td8_page_0x02.txt` | `sg_logs --page=0x02 /dev/sg1` — line 2 is the identity header that `collect()` already concatenates into `health_logs.raw_log` |
+| `../sg_logs/mhvtl_ibm_td8_page_0x02.txt` | `sg_logs --page=0x02 /dev/sg1` — line 2 is the identity header pre-#298 health collection concatenated into `health_logs.raw_log` (since #298 it is rendered from an INQUIRY; see `src/tape/log_pages.rs`) |
 
 What they all say: vendor `IBM`, model `ULT3580-TD8`, firmware `2160`,
 serial `XYZZY_A1`.

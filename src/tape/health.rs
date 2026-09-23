@@ -1,8 +1,12 @@
-//! sg_logs health collection for tape drives.
+//! sg_logs health counters for tape drives.
 //!
-//! Shells out to `sg_logs` (sg3-utils) and parses the human-readable output
-//! for log pages 0x02 (write errors), 0x03 (read errors), and 0x2e (tape alert).
-//! Results are persisted to the `health_logs` table for trending.
+//! Parses the human-readable decode of log pages 0x02 (write errors), 0x03
+//! (read errors) and 0x2e (tape alert) into [`HealthCounters`], persisted to
+//! the `health_logs` table for trending. The pages themselves are read by
+//! [`crate::tape::log_pages::sweep`] (issue #298): page 0x00, then every page
+//! it lists, once each per contact, journalled verbatim in
+//! `log_page_journal` and decoded OFFLINE from the stored bytes — this module
+//! parses that decode and never touches the drive.
 //!
 //! sg_logs output is human-oriented and varies across sg3-utils versions.
 //! The parser is deliberately forgiving: it greps known key phrases and
@@ -23,12 +27,8 @@
 //! health` surfaces and labels both so a summary never claims a cleaner
 //! picture than the drive is reporting.
 
-use std::process::Command;
-
+use crate::error::Result;
 use rusqlite::{params, Connection};
-use tracing::warn;
-
-use crate::error::{Result, TapectlError};
 
 /// Aggregated error counters across all parsed pages.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -113,8 +113,23 @@ pub fn parse_sg_logs_page(page: u8, raw: &str) -> HealthCounters {
 }
 
 impl HealthCounters {
+    /// Counters from `(page, decoded text)` pairs — each page through
+    /// [`parse_sg_logs_page`], merged. What the log-page sweep's health
+    /// reading computes ([`crate::tape::log_pages::Sweep::health`]); a page
+    /// no parser knows contributes nothing.
+    pub fn from_decoded_pages<'a>(
+        pages: impl IntoIterator<Item = (u8, &'a str)>,
+    ) -> HealthCounters {
+        let mut totals = HealthCounters::default();
+        for (page, text) in pages {
+            merge(&mut totals, parse_sg_logs_page(page, text));
+        }
+        totals
+    }
+
     /// Re-derive `HealthCounters` from a stored `raw_log` blob — the
-    /// concatenated per-page text `collect()` writes, delimited by
+    /// concatenated per-page text the health reading writes
+    /// ([`crate::tape::log_pages::Sweep::health`]), delimited by
     /// `=== page 0xNN ===` markers. Lets a caller recompute counters,
     /// including the two "trending" fields that are not persisted as their
     /// own columns (see the module doc), from an already-stored row without
@@ -149,41 +164,13 @@ impl HealthCounters {
     }
 }
 
-/// Parse a `=== page 0xNN ===` separator line (the format `collect()`
-/// writes) into the page number. Returns `None` for anything else, so
+/// Parse a `=== page 0xNN ===` separator line (the format the health
+/// reading writes) into the page number. Returns `None` for anything else, so
 /// ordinary log text never gets mistaken for a marker.
 fn parse_page_marker(line: &str) -> Option<u8> {
     let line = line.trim();
     let hex = line.strip_prefix("=== page 0x")?.strip_suffix(" ===")?;
     u8::from_str_radix(hex, 16).ok()
-}
-
-/// Shell out to sg_logs and collect counters from all three pages.
-///
-/// Returns aggregated counters and the concatenated raw output (for
-/// `health_logs.raw_log`). Errors from individual pages are logged as
-/// warnings and do not fail the collection — a partial result is better
-/// than none.
-pub fn collect(sg_device: &str) -> Result<(HealthCounters, String)> {
-    let mut totals = HealthCounters::default();
-    let mut combined_raw = String::new();
-
-    for page in [0x02u8, 0x03, 0x2e] {
-        match run_sg_logs(sg_device, page) {
-            Ok(raw) => {
-                let c = parse_sg_logs_page(page, &raw);
-                merge(&mut totals, c);
-                combined_raw.push_str(&format!("=== page 0x{page:02x} ===\n"));
-                combined_raw.push_str(&raw);
-                combined_raw.push('\n');
-            }
-            Err(e) => {
-                warn!(page = format!("0x{page:02x}"), err = %e, "sg_logs page collection failed");
-            }
-        }
-    }
-
-    Ok((totals, combined_raw))
 }
 
 /// What KIND of reading a `health_logs` row is — the `operation` vocabulary.
@@ -401,21 +388,6 @@ pub fn readings_by_cartridge(conn: &Connection) -> Result<Vec<CartridgeReadings>
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
-}
-
-fn run_sg_logs(sg_device: &str, page: u8) -> Result<String> {
-    let output = Command::new("sg_logs")
-        .arg(format!("--page=0x{page:02x}"))
-        .arg(sg_device)
-        .output()
-        .map_err(|e| TapectlError::Other(format!("sg_logs spawn failed: {e}")))?;
-    if !output.status.success() {
-        return Err(TapectlError::Other(format!(
-            "sg_logs page 0x{page:02x} exit {}",
-            output.status
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn merge(into: &mut HealthCounters, from: HealthCounters) {
