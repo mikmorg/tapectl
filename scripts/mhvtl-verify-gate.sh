@@ -13,6 +13,9 @@
 #      prove `volume resume` finishes each one — the recovery command that
 #      would otherwise never be rehearsed before it is needed. RUNS LAST: it
 #      erases the tape legs 1-4 wrote.
+#   Journals leg (issue #319): catalog-only checks that the forensics
+#      journals (mam_journal, log_page_journal) captured every read, once,
+#      verbatim, attributed to its contact. Runs after leg 5, reads no tape.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -868,6 +871,175 @@ check resume_verify     step_resume_verify
 check resume_restore    step_resume_restore
 check resume_after_crash step_resume_after_crash
 check tier3_floor_unconfirmed step_tier3_floor_unconfirmed
+
+# ---------- journals leg: the forensics journals (issue #319) ----------
+# Migrations 022 (`mam_journal`, #297) and 023 (`log_page_journal`, #298)
+# journal every MAM read and every sg_logs page read verbatim, against the
+# contact that took it (ADR-0013). The Rust tests exercise the capture over
+# fixtures; only a real run proves the call sites still fire, still attribute
+# the row to a contact, and still read each page exactly once. Before this
+# leg those facts were verified once, by hand, and nothing re-checked them.
+#
+# Placed here because the gate home's catalog is FINAL after leg 4: every
+# write/resume/verify/restore this gate performs has happened. rust_e2e below
+# uses its own home and adds nothing to this DB.
+#
+# Every snippet takes the DB path as argv[1] and nothing else, so each can be
+# replayed offline against a copy of a gate DB with a defect injected -- the
+# negative control for this leg is run that way, not on tape. And every one
+# asserts a NON-EMPTY input first (the leakscan lesson, issue #275): a check
+# that only asserts absence cannot tell "found nothing" from "searched
+# nothing".
+#
+# The sweep runs once per contact at the END of the command (health
+# collection after the session), so a SIGKILLed write (resume_after_crash)
+# never closes its contact and never sweeps. That is why the spine query
+# below takes CLOSED contacts only -- and why it is driven from
+# cartridge_contacts, not from the journal: a journal-driven loop cannot see
+# a contact that has zero rows.
+step_log_page_sweep_complete() {
+    python3 - "$HOME_DIR/tapectl.db" <<'PYLP_SWEEP'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+OPS = ("volume write", "volume resume", "volume verify")
+contacts = c.execute(
+    f"""SELECT id, operation FROM cartridge_contacts
+        WHERE operation IN ({",".join("?" * len(OPS))}) AND closed_at IS NOT NULL
+        ORDER BY id""", OPS).fetchall()
+# Positive control: the gate performs at least one of each, so an empty or
+# partial set means the query (or the gate) is broken, not the journal clean.
+seen = {op for _, op in contacts}
+assert len(contacts) >= 3 and seen == set(OPS), (
+    f"positive control: expected >=3 closed contacts covering every one of {OPS}; "
+    f"got {len(contacts)} covering {sorted(seen)} -- the check cannot see what it asserts about")
+bad = []
+for cid, op in contacts:
+    rows = c.execute(
+        "SELECT page_code, ok, raw FROM log_page_journal WHERE contact_id = ?", (cid,)).fetchall()
+    zero = [r for r in rows if r[0] == 0]
+    if not zero:
+        bad.append(f"contact {cid} ({op}): no page 0x00 row (journal rows for it: {len(rows)})")
+        continue
+    _, ok, raw = zero[0]
+    raw = bytes(raw) if raw is not None else b""
+    if ok != 1 or len(raw) < 4:
+        bad.append(f"contact {cid} ({op}): page 0x00 row ok={ok}, raw {len(raw)} bytes -- no page list to compare")
+        continue
+    page, sub, length = raw[0] & 0x3F, raw[1], int.from_bytes(raw[2:4], "big")
+    if page != 0 or sub != 0 or 4 + length != len(raw):
+        bad.append(f"contact {cid} ({op}): page 0x00 raw did not parse (page=0x{page:02x} "
+                   f"subpage=0x{sub:02x} length={length} raw={len(raw)} bytes: {raw.hex()})")
+        continue
+    listed = set(raw[4:]) - {0}
+    read = {r[0] for r in rows} - {0}
+    if listed != read:
+        bad.append(f"contact {cid} ({op}): page 0x00 lists {sorted(f'{p:02x}' for p in listed)} "
+                   f"but the journal read {sorted(f'{p:02x}' for p in read)}; "
+                   f"missing {sorted(f'{p:02x}' for p in listed - read)}, "
+                   f"unlisted {sorted(f'{p:02x}' for p in read - listed)}")
+assert not bad, "log-page sweep incomplete:\n  " + "\n  ".join(bad)
+print(f"{len(contacts)} closed write/resume/verify contacts, each swept exactly the pages its own 0x00 listed")
+PYLP_SWEEP
+}
+
+# ADR-0013 "Two hazards": TapeAlert (0x2E) clears on read, so a second read
+# inside one contact can return zeros and destroy the first read's evidence.
+# `sweep` promises each page at most once per contact; this is that promise.
+step_log_page_read_once() {
+    python3 - "$HOME_DIR/tapectl.db" <<'PYLP_ONCE'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+n = c.execute("SELECT COUNT(*) FROM log_page_journal").fetchone()[0]
+assert n > 0, "positive control: log_page_journal is EMPTY -- 'no duplicates' would mean 'searched nothing'"
+dups = c.execute(
+    """SELECT contact_id, trigger, printf('0x%02x', page_code), subpage_code, COUNT(*)
+       FROM log_page_journal GROUP BY contact_id, page_code, subpage_code
+       HAVING COUNT(*) > 1 ORDER BY contact_id, page_code""").fetchall()
+assert not dups, (
+    "a log page was read more than once inside one contact (read-to-clear hazard, "
+    "ADR-0013) -- (contact_id, trigger, page, subpage, reads):\n  "
+    + "\n  ".join(map(str, dups)))
+print(f"{n} log_page_journal rows, no (contact, page, subpage) read twice")
+PYLP_ONCE
+}
+
+# "Capture everything verbatim now, parse it later" (ADR-0013) is only true
+# if the bytes are there. Also pins that each raw response IS the page it is
+# filed under (byte 0 low six bits = page code), so a mis-filed capture fails.
+# tapectl_version is NOT NULL in the schema; asserted anyway as the check
+# the issue names, and so a schema change cannot quietly drop it.
+step_log_page_raw_kept() {
+    python3 - "$HOME_DIR/tapectl.db" <<'PYLP_RAW'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+rows = c.execute(
+    """SELECT id, contact_id, trigger, page_code, subpage_code, ok, raw, tapectl_version
+       FROM log_page_journal ORDER BY id""").fetchall()
+assert rows, "positive control: log_page_journal is EMPTY -- nothing to assert raw bytes about"
+bad = []
+for rid, cid, trig, page, sub, ok, raw, ver in rows:
+    tag = f"row {rid} (contact {cid}, {trig}, page 0x{page:02x})"
+    if cid is None:
+        bad.append(f"{tag}: contact_id is NULL -- the read is attributed to no contact")
+    if not ver:
+        bad.append(f"{tag}: tapectl_version is {ver!r}")
+    if ok == 1:
+        if raw is None or len(raw) == 0:
+            bad.append(f"{tag}: ok=1 but raw is {'NULL' if raw is None else 'empty'}")
+        elif (bytes(raw)[0] & 0x3F) != page:
+            bad.append(f"{tag}: raw's own page code is 0x{bytes(raw)[0] & 0x3F:02x}, filed as 0x{page:02x}")
+ok_rows = sum(1 for r in rows if r[5] == 1)
+assert ok_rows > 0, f"positive control: none of {len(rows)} log_page_journal rows is ok=1"
+assert not bad, "log_page_journal rows missing what they must keep:\n  " + "\n  ".join(bad)
+print(f"{len(rows)} log_page_journal rows ({ok_rows} ok=1): raw kept, attributed, versioned")
+PYLP_RAW
+}
+
+# mam_journal: every read attributed to the contact that took it, and every
+# successful read's stdout kept. Read-path rows are chosen by `hook`, not
+# `trigger` -- hook is the migration's fixed call-site name, trigger is free
+# text. The two read-path hooks (check_read_contact, loaded_medium_serial)
+# run inside ONE already-open contact, so a NULL there is never the
+# "refused before the contact opened" case migration 022 allows for.
+# Each row must also point at a contact whose operation IS its trigger: a
+# row attributed to the wrong contact is worse than an unattributed one.
+step_mam_journal_attributed() {
+    python3 - "$HOME_DIR/tapectl.db" <<'PYMAM'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+READ_HOOKS = ("check_read_contact", "loaded_medium_serial")
+rows = c.execute(
+    """SELECT m.id, m.contact_id, m.trigger, m.hook, m.ok, m.raw, m.tapectl_version,
+              cc.operation
+       FROM mam_journal m LEFT JOIN cartridge_contacts cc ON cc.id = m.contact_id
+       ORDER BY m.id""").fetchall()
+assert rows, "positive control: mam_journal is EMPTY -- nothing to assert attribution about"
+hooks = {r[3] for r in rows}
+assert set(READ_HOOKS) <= hooks, (
+    f"positive control: the gate runs verify and restore, so both read-path hooks "
+    f"{READ_HOOKS} must appear; got hooks {sorted(hooks)}")
+bad = []
+for rid, cid, trig, hook, ok, raw, ver, op in rows:
+    tag = f"row {rid} ({trig} / {hook}, contact {cid})"
+    if hook in READ_HOOKS and cid is None:
+        bad.append(f"{tag}: read-path MAM read has NULL contact_id")
+    if cid is not None and op != trig:
+        bad.append(f"{tag}: points at a contact whose operation is {op!r}, not {trig!r}")
+    if ok == 1 and (raw is None or len(raw) == 0):
+        bad.append(f"{tag}: ok=1 but raw is {'NULL' if raw is None else 'empty'}")
+    if not ver:
+        bad.append(f"{tag}: tapectl_version is {ver!r}")
+assert not bad, "mam_journal rows not attributed / not kept:\n  " + "\n  ".join(bad)
+n_read = sum(1 for r in rows if r[3] in READ_HOOKS)
+print(f"{len(rows)} mam_journal rows ({n_read} read-path), all attributed and kept; hooks {sorted(hooks)}")
+PYMAM
+}
+
+echo "gate: journals leg — forensics journals (issue #319)"
+check log_page_sweep_complete step_log_page_sweep_complete
+check log_page_read_once      step_log_page_read_once
+check log_page_raw_kept       step_log_page_raw_kept
+check mam_journal_attributed  step_mam_journal_attributed
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
