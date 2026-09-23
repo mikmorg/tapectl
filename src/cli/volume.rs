@@ -98,6 +98,12 @@ pub enum VolumeCommands {
     /// written, which has no meaning for a tape this session has already
     /// partly written.
     ///
+    /// An ABORTED session is adopted and re-confirmed the same way (never
+    /// written, never re-sealed) only when its seal is recorded, its
+    /// condition is ok, and a passing FULL verify is recorded after the
+    /// abort (ADR-0012, 2026-09-23); otherwise resume names the first unmet
+    /// condition and, where one exists, the command that resolves it.
+    ///
     /// Refuses any volume whose CATALOG status is not `initialized` — a
     /// volume recorded sealed, retired or erased, or whose condition is
     /// quarantined, is not a write target (ADR-0012); no flag overrides it.
@@ -121,9 +127,11 @@ pub enum VolumeCommands {
     /// never decides this on its own.
     ///
     /// The tape is never contacted (hence no --device): the cartridge is left
-    /// unsealed and physically unharmed, and the staged files stay pinned
-    /// until `staging clean` runs. The session, however, becomes unresumable
-    /// for good.
+    /// exactly as the session left it, and the staged files stay pinned
+    /// until `staging clean` runs. The session becomes ABORTED: `volume
+    /// resume` will not pick it up again unless its seal is recorded AND a
+    /// clean full verify is recorded after the abort (ADR-0012, 2026-09-23),
+    /// and a session aborted before its seal is never resumable.
     Abort {
         /// Volume label
         label: String,
@@ -425,21 +433,26 @@ fn validate_volume_status(value: &str) -> Result<()> {
 ///
 /// `clear_condition_on_clean_full_verify` (`src/volume/write.rs`) only ever
 /// writes `observed_condition`; `volumes.status` never moves here or there
-/// (that is parked for the CTO, ADR-0012). So "counts as a copy again" is
-/// only ever true in the one case this message was originally written for
-/// (`counts_as_copy` true, which after a clean clear means `status =
-/// 'sealed'`) — the other two branches are issue #280's fix, and neither
-/// one offers a remedy: an `initialized` volume stuck past a confirm that
-/// never reached the sealing `UPDATE` cannot be resumed here (`volume
-/// resume` only rehydrates an `interrupted` write, and this state's
-/// `writes` rows are `aborted` — `session.rs`'s `proves_medium_bad` arm),
-/// and naming it as one would hand the operator a command that refuses.
-fn clean_clear_message(
+/// — a medium observation never moves the operator's column (ADR-0012's
+/// 2026-09-23 amendment rejected exactly that). So "counts as a copy again"
+/// is only ever true in the one case this message was originally written
+/// for (`counts_as_copy` true, which after a clean clear means `status =
+/// 'sealed'`).
+///
+/// The remedy for a sealed-but-unconfirmed volume is `volume resume`, which
+/// re-enters `confirm` on the recorded seal (the 2026-09-21 amendment for an
+/// `interrupted` session; the 2026-09-23 amendment for an `aborted` one this
+/// very verify may just have made adoptable). It is named ONLY when
+/// `resume_would_reconfirm` — `volume::session::resume_would_reconfirm`,
+/// the same admission `volume resume` itself applies — is true, because
+/// naming it otherwise hands the operator a command that refuses.
+pub(crate) fn clean_clear_message(
     label: &str,
     previous_condition: &str,
     status: &str,
     sealed_at_set: bool,
     counts_as_copy: bool,
+    resume_would_reconfirm: bool,
 ) -> String {
     if counts_as_copy {
         format!(
@@ -475,10 +488,20 @@ fn clean_clear_message(
         } else {
             ""
         };
+        let remedy = if resume_would_reconfirm {
+            format!(
+                " With this same cartridge loaded, run `tapectl volume resume {label}`: it \
+                 re-enters the write session's confirm on the recorded seal — it never writes \
+                 or re-seals the tape — and a passing confirm is what makes the volume count \
+                 as a copy."
+            )
+        } else {
+            String::new()
+        };
         format!(
             "volume \"{label}\": a full verify read every file back and found no mismatch, so \
              its condition moves from \"{previous_condition}\" to \"ok\" — but it still does \
-             NOT count as a copy: its status is \"{status}\", not \"sealed\".{sealed_note}"
+             NOT count as a copy: its status is \"{status}\", not \"sealed\".{sealed_note}{remedy}"
         )
     }
 }
@@ -712,6 +735,20 @@ pub fn run(
                 .unwrap_or(false);
             let volume_counts_as_copy =
                 crate::policy::coverage::counts_as_copy(conn, label).unwrap_or(false);
+            // Issue #280, ADR-0012's 2026-09-23 amendment: whether `volume
+            // resume` would pick this volume up and re-confirm it NOW — read
+            // after this verify's own row is recorded, since that row may be
+            // the very evidence that makes an aborted session adoptable. The
+            // one derivation `volume resume` itself uses (#96).
+            let volume_resume_would_reconfirm: bool = conn
+                .query_row(
+                    "SELECT id FROM volumes WHERE label = ?1",
+                    [label.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+                .and_then(|id| crate::volume::session::resume_would_reconfirm(conn, id).ok())
+                .unwrap_or(false);
             if json_output {
                 // Issue #142: `failed: 3` without naming the three is the
                 // difference between an operator who knows what to re-copy
@@ -779,6 +816,10 @@ pub fn run(
                             // `eligible` on its own.
                             "counts_as_copy": volume_counts_as_copy,
                             "status": current_volume_status,
+                            // Issue #280, additive: the same answer that
+                            // decides whether the human message names
+                            // `tapectl volume resume <label>`.
+                            "resume_would_reconfirm": volume_resume_would_reconfirm,
                         })),
                         "quarantine": report.quarantine.as_ref().map(|q| {
                             // Issue #242: a verify no longer touches
@@ -896,6 +937,7 @@ pub fn run(
                                     &current_volume_status,
                                     volume_sealed_at_set,
                                     volume_counts_as_copy,
+                                    volume_resume_would_reconfirm,
                                 )
                             );
                         }
@@ -3274,7 +3316,7 @@ mod tests {
         /// function CAN say RETURNED TO SERVICE at all.
         #[test]
         fn sealed_and_cleared_says_returned_to_service_and_counts_as_a_copy() {
-            let msg = clean_clear_message("L6-0001", "quarantined", "sealed", true, true);
+            let msg = clean_clear_message("L6-0001", "quarantined", "sealed", true, true, false);
             assert!(
                 msg.contains("RETURNED TO SERVICE"),
                 "a sealed volume that now counts as a copy must say so: {msg}"
@@ -3296,7 +3338,7 @@ mod tests {
         /// and a medium observation does not undo that.
         #[test]
         fn retired_and_cleared_does_not_claim_returned_to_service() {
-            let msg = clean_clear_message("L6-0002", "quarantined", "retired", true, false);
+            let msg = clean_clear_message("L6-0002", "quarantined", "retired", true, false, false);
             assert!(
                 !msg.contains("RETURNED TO SERVICE"),
                 "a retired volume must never be told it returned to service: {msg}"
@@ -3319,16 +3361,20 @@ mod tests {
         /// Test 3: state (B) from issue #280 -- a volume left `initialized`
         /// because `SealedPending::confirm`'s `proves_medium_bad` arm never
         /// reached the sealing UPDATE, with `sealed_at` set (the tape IS
-        /// physically sealed) and every `writes` row `aborted`. Must NOT
-        /// claim RETURNED TO SERVICE, must name the actual status, and --
-        /// the specific defect the issue calls out -- must NEVER name
-        /// `volume resume` as a remedy: `resume`'s `rehydrate` only selects
-        /// `interrupted` write rows, and this state's rows are `aborted`, so
-        /// a recipe naming it would hand the operator a command that
-        /// refuses.
+        /// physically sealed) and every `writes` row `aborted`, now cleared
+        /// by this verify. ADR-0012's 2026-09-23 amendment makes `volume
+        /// resume` adopt exactly this state, so the message must NAME it --
+        /// replacing the pre-ruling test
+        /// `initialized_sealed_but_unconfirmed_does_not_claim_service_or_name_resume`,
+        /// which pinned its absence. Paired with
+        /// `volume::session::tests::resume_adopts_an_aborted_sealed_session_after_a_clean_full_verify_and_seals_it`,
+        /// which builds this state for real, computes this message's
+        /// `resume_would_reconfirm` input from it, and proves the named
+        /// resume succeeds.
         #[test]
-        fn initialized_sealed_but_unconfirmed_does_not_claim_service_or_name_resume() {
-            let msg = clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
+        fn initialized_sealed_and_resumable_names_volume_resume_without_claiming_service() {
+            let msg =
+                clean_clear_message("L6-0003", "quarantined", "initialized", true, false, true);
             assert!(
                 !msg.contains("RETURNED TO SERVICE"),
                 "an initialized, unconfirmed volume must never be told it returned to \
@@ -3343,9 +3389,8 @@ mod tests {
                 "the actual status must be named: {msg}"
             );
             assert!(
-                !msg.to_lowercase().contains("resume"),
-                "must never name `volume resume` here -- it cannot adopt an aborted \
-                 session, so naming it hands the operator a command that refuses: {msg}"
+                msg.contains("tapectl volume resume L6-0003"),
+                "resume would adopt this volume, so the message must name it: {msg}"
             );
             assert!(
                 !returned_to_service_json(true, false),
@@ -3354,12 +3399,28 @@ mod tests {
             );
         }
 
+        /// The other half of Test 3's derivation: when resume would NOT
+        /// adopt the volume (e.g. no clean full verify after the abort, or
+        /// a seal that was never recorded), naming it would hand the
+        /// operator a command that refuses -- so it is not named.
+        #[test]
+        fn initialized_sealed_but_not_resumable_does_not_name_resume() {
+            let msg =
+                clean_clear_message("L6-0003", "quarantined", "initialized", true, false, false);
+            assert!(
+                !msg.to_lowercase().contains("resume"),
+                "resume would refuse here, so it must not be named: {msg}"
+            );
+            assert!(!msg.contains("RETURNED TO SERVICE"), "{msg}");
+        }
+
         /// The `sealed_at`-set note is materially true and worth saying
         /// (the bytes ARE on the tape) precisely in state (B) -- assert it
         /// is actually said, not just that nothing false is said.
         #[test]
         fn initialized_sealed_but_unconfirmed_says_the_tape_is_physically_sealed() {
-            let msg = clean_clear_message("L6-0003", "quarantined", "initialized", true, false);
+            let msg =
+                clean_clear_message("L6-0003", "quarantined", "initialized", true, false, false);
             assert!(
                 msg.to_lowercase().contains("physically sealed"),
                 "sealed_at is set -- the tape really does carry the seal marker and bytes, \

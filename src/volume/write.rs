@@ -28,7 +28,8 @@ use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, ZoneKind,
 };
 use super::session::{
-    self, check_tape_contact, ConfirmOutcome, ContactOutcome, QuarantineReason, ResumeOutcome,
+    self, check_tape_contact, AbortedAdoption, ConfirmOutcome, ContactOutcome, QuarantineReason,
+    ResumeAdmission, ResumeOutcome,
 };
 
 /// STOP-GAP pending an explicit operator/schema decision — see the T8 report.
@@ -1371,6 +1372,16 @@ fn volume_resume_contacted<'c>(
                 status: volume_status,
             });
         }
+        // ADR-0012's 2026-09-23 amendment (#280): an `aborted` session
+        // whose seal is recorded is adoptable once a clean full verify
+        // clears the medium, so for THAT state the quarantine refusal must
+        // name the verify that resolves it — not `VolumeQuarantined`'s
+        // re-initialise remedy, which would discard a sealed tape.
+        if let ResumeAdmission::Aborted(verdict @ AbortedAdoption::ConditionNotOk { .. }) =
+            session::resume_admission(conn, volume_id)?
+        {
+            return Err(aborted_not_adoptable(conn, volume_id, label, &verdict));
+        }
         return Err(TapectlError::VolumeQuarantined {
             label: label.to_string(),
         });
@@ -1390,9 +1401,29 @@ fn volume_resume_contacted<'c>(
         });
     }
 
+    // An `interrupted` session first, exactly as before #280; then, only
+    // when there is none, an `aborted` one ADR-0012's 2026-09-23 amendment
+    // lets resume adopt (seal recorded, medium cleared by a clean full
+    // verify recorded after the abort). An adopted session can only
+    // re-enter `confirm` or quarantine — `resume_checking` refuses the
+    // write phase for it — so `finish_session` below never reaches `seal()`
+    // for it: its outcome is `Confirming` or `Quarantined`, never `Ready`.
     let session = match session::InterruptedSession::rehydrate(conn, volume_id)? {
         Some(s) => s,
-        None => return Err(nothing_to_resume(conn, volume_id, label)),
+        None => match session::resume_admission(conn, volume_id)? {
+            ResumeAdmission::Aborted(AbortedAdoption::Adoptable) => {
+                match session::InterruptedSession::adopt_aborted(conn, volume_id)? {
+                    Some(s) => s,
+                    None => return Err(nothing_to_resume(conn, volume_id, label)),
+                }
+            }
+            ResumeAdmission::Aborted(verdict) => {
+                return Err(aborted_not_adoptable(conn, volume_id, label, &verdict))
+            }
+            ResumeAdmission::Interrupted | ResumeAdmission::Nothing => {
+                return Err(nothing_to_resume(conn, volume_id, label))
+            }
+        },
     };
 
     // Snapshot before `resume` consumes the session (same reason
@@ -1546,9 +1577,12 @@ fn volume_resume_contacted<'c>(
 /// variant.
 ///
 /// It never contacts the tape (hence no device argument): the cartridge is
-/// left exactly as the interrupted session left it — unsealed, physically
-/// unharmed, and reusable after a bulk erase plus `cartridge mark-erased`.
-/// Only the `writes` rows move. `write_positions`, `volumes.status`, the
+/// left exactly as the interrupted session left it — physically unharmed;
+/// unsealed and reusable after a bulk erase plus `cartridge mark-erased`,
+/// or, when its seal is recorded (an Inconclusive confirm), sealed. Only the
+/// `writes` rows move. `aborted` is not "never resumable" since ADR-0012's
+/// 2026-09-23 amendment (#280): a session whose seal is recorded is adopted
+/// by `volume resume` once a clean full verify is recorded after the abort. `write_positions`, `volumes.status`, the
 /// staged slices and the session directory are all untouched; the staged
 /// files stay pinned until `staging clean` runs.
 ///
@@ -1602,6 +1636,20 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
         slice_count += n;
     }
     let statuses: Vec<&str> = rows.iter().map(|(_, s)| s.as_str()).collect();
+    // Issue #280: an Inconclusive confirm leaves `interrupted` rows on a
+    // tape whose seal IS recorded, so "left unsealed" is not always true.
+    let seal_recorded: bool = conn.query_row(
+        "SELECT sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    let cartridge_fact = if seal_recorded {
+        "The cartridge is NOT touched: its seal is recorded, so it stays SEALED with every byte \
+         on it, exactly as the session left it."
+    } else {
+        "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
+         bulk-erased and reused (`cartridge mark-erased`)."
+    };
 
     let facts = vec![
         format!(
@@ -1610,12 +1658,12 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
             write_ids.len(),
             statuses.join(", ")
         ),
-        "The session becomes ABORTED and can never be resumed — `tapectl volume resume` adopts \
-         only interrupted sessions."
+        "The session becomes ABORTED. `tapectl volume resume` will not pick it up again unless \
+         its seal is recorded AND a clean full verify of this volume is recorded after this \
+         abort (ADR-0012, 2026-09-23) — then resume re-enters confirm and never writes. A \
+         session aborted before its seal is never resumable."
             .to_string(),
-        "The cartridge is NOT touched: it is left unsealed and physically unharmed, so it can be \
-         bulk-erased and reused (`cartridge mark-erased`)."
-            .to_string(),
+        cartridge_fact.to_string(),
         "The staged slices stay pinned on disk; because this session's `writes` row becomes \
          ABORTED, plain `tapectl staging clean` will not release them — use `tapectl staging \
          clean --force`, or write them to another volume first."
@@ -1712,6 +1760,58 @@ fn nothing_to_resume(conn: &Connection, volume_id: i64, label: &str) -> TapectlE
          new one.",
         statuses.join(", ")
     ))
+}
+
+/// Why `volume resume` will not adopt this volume's `aborted` session —
+/// ADR-0012's 2026-09-23 amendment (#280): name the FIRST unmet condition
+/// and, where one exists, the command that resolves it. The verdict is
+/// `session::aborted_adoption`'s, never re-derived here (#96).
+fn aborted_not_adoptable(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    verdict: &AbortedAdoption,
+) -> TapectlError {
+    match verdict {
+        AbortedAdoption::NotInitialized { status } => TapectlError::VolumeNotWriteTarget {
+            label: label.to_string(),
+            status: status.clone(),
+        },
+        AbortedAdoption::NotSealed => TapectlError::Other(format!(
+            "volume \"{label}\" has no write session `volume resume` can adopt: its session was \
+             ABORTED before its seal was recorded (`volumes.sealed_at` is empty), so there is no \
+             sealed tape to re-confirm, and an unsealed aborted session is never resumable. Run \
+             `tapectl volume write {label}` to start a new one."
+        )),
+        AbortedAdoption::ConditionNotOk { condition } => TapectlError::Other(format!(
+            "volume \"{label}\": its write session was aborted AFTER its seal was recorded, so \
+             the tape is physically sealed — but its condition is \"{condition}\", and `volume \
+             resume` adopts an aborted session only once a clean full verify has cleared the \
+             medium (ADR-0012, 2026-09-23). With this cartridge loaded, run `tapectl volume \
+             verify {label}` (full by default); if it reads every file back clean, run `tapectl \
+             volume resume {label}` again. Nothing was written."
+        )),
+        AbortedAdoption::NoRecordedAbort => TapectlError::Other(format!(
+            "volume \"{label}\": its write session was aborted after its seal was recorded, but \
+             no event records WHEN it was aborted, so no verify can be shown to have come after \
+             it. `volume resume` adopts an aborted session only on a recorded clean full verify \
+             later than the abort (ADR-0012, 2026-09-23), and refuses rather than guess. No \
+             command resolves this; copy the data to another volume if it must count as a copy. \
+             Nothing was written."
+        )),
+        AbortedAdoption::NoCleanFullVerifyAfterAbort { aborted_at } => {
+            TapectlError::Other(format!(
+                "volume \"{label}\": its write session was aborted (recorded {aborted_at}) after \
+                 its seal was recorded, and no passing FULL verify of this volume is recorded \
+                 since. `volume resume` adopts an aborted session only on that evidence — its \
+                 condition reading \"ok\" is not enough (ADR-0012, 2026-09-23). With this \
+                 cartridge loaded, run `tapectl volume verify {label}` (full by default); if it \
+                 reads every file back clean, run `tapectl volume resume {label}` again. Nothing \
+                 was written."
+            ))
+        }
+        AbortedAdoption::Adoptable => nothing_to_resume(conn, volume_id, label),
+    }
 }
 
 /// Everything a write session needs from the tenant/key tables, assembled
@@ -2198,7 +2298,7 @@ fn finish_confirm(
 /// on a path issue #234 was explicitly not supposed to touch. The two acts
 /// answer to different ADRs and record different facts; sharing a writer
 /// bought nothing and cost a regression.
-fn log_quarantine(
+pub(crate) fn log_quarantine(
     conn: &Connection,
     volume_id: i64,
     label: &str,
@@ -8207,6 +8307,160 @@ mod tests {
             msg.contains("no recorded session directory"),
             "must reach rehydrate's own missing-session_dir failure, proving it passed \
              the write-target guard: {msg}"
+        );
+    }
+
+    // ---- issue #280: resume adopts an aborted, sealed, cleared session ----
+    //
+    // ADR-0012's 2026-09-23 amendment. The adoption predicate itself is
+    // pinned in `session::tests` against a real MemStore session; these pin
+    // what `volume_resume` SAYS for each unmet condition and that an
+    // adoptable state is routed through adoption rather than refused.
+
+    /// An `initialized` volume with one `aborted` writes row, `sealed_at`
+    /// as given, the given condition, and (optionally) a recorded abort an
+    /// hour ago. Returns the volume id.
+    fn seed_aborted_session(
+        conn: &Connection,
+        stage_set_id: i64,
+        label: &str,
+        sealed: bool,
+        condition: &str,
+        abort_recorded: bool,
+    ) -> i64 {
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, observed_condition, sealed_at)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', ?2,
+                     CASE WHEN ?3 THEN datetime('now', '-2 hours') END)",
+            params![label, condition, sealed],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'aborted')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+        if abort_recorded {
+            conn.execute(
+                "INSERT INTO events (timestamp, entity_type, entity_id, entity_label, action)
+                 VALUES (datetime('now', '-1 hour'), 'volume', ?1, ?2, 'write_quarantined')",
+                params![volume_id, label],
+            )
+            .unwrap();
+        }
+        volume_id
+    }
+
+    fn resume_err(conn: &Connection, label: &str) -> TapectlError {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+        volume_resume(
+            conn,
+            &paths,
+            &config,
+            label,
+            "/nonexistent/tapectl-resume-pm280-test-nst",
+            512 * 1024,
+        )
+        .unwrap_err()
+    }
+
+    /// Still quarantined: the refusal names `volume verify <label>`, not
+    /// `VolumeQuarantined`'s re-initialise remedy (which would discard a
+    /// sealed tape), and touches nothing.
+    #[test]
+    fn volume_resume_of_an_aborted_sealed_quarantined_session_names_volume_verify() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        seed_aborted_session(&conn, stage_set_id, "L6-AQ", true, "quarantined", true);
+
+        let err = resume_err(&conn, "L6-AQ");
+        assert!(
+            !matches!(err, TapectlError::VolumeQuarantined { .. }),
+            "must not offer the re-initialise remedy for a sealed aborted session: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("tapectl volume verify L6-AQ"), "{msg}");
+        assert!(
+            msg.contains("\"quarantined\""),
+            "must name the condition: {msg}"
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = (SELECT id FROM volumes WHERE label = 'L6-AQ')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "aborted", "a refused resume touches nothing");
+    }
+
+    /// Condition ok but no passing full verify recorded after the abort:
+    /// the refusal names the abort time and `volume verify <label>`.
+    #[test]
+    fn volume_resume_of_an_aborted_sealed_session_without_a_later_verify_names_volume_verify() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        seed_aborted_session(&conn, stage_set_id, "L6-ANV", true, "ok", true);
+
+        let msg = resume_err(&conn, "L6-ANV").to_string();
+        assert!(msg.contains("no passing FULL verify"), "{msg}");
+        assert!(msg.contains("tapectl volume verify L6-ANV"), "{msg}");
+    }
+
+    /// No recorded abort: refused rather than guessed, and no command is
+    /// offered as a resolution because none resolves it.
+    #[test]
+    fn volume_resume_of_an_aborted_sealed_session_with_no_recorded_abort_refuses() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        seed_aborted_session(&conn, stage_set_id, "L6-ANR", true, "ok", false);
+
+        let msg = resume_err(&conn, "L6-ANR").to_string();
+        assert!(msg.contains("no event records WHEN"), "{msg}");
+        assert!(!msg.contains("tapectl volume resume"), "{msg}");
+    }
+
+    /// Never sealed: today's refusal, now saying why.
+    #[test]
+    fn volume_resume_of_an_unsealed_aborted_session_says_it_is_never_resumable() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        seed_aborted_session(&conn, stage_set_id, "L6-AUS", false, "ok", true);
+
+        let msg = resume_err(&conn, "L6-AUS").to_string();
+        assert!(msg.contains("`volumes.sealed_at` is empty"), "{msg}");
+        assert!(msg.contains("never resumable"), "{msg}");
+        assert!(msg.contains("tapectl volume write L6-AUS"), "{msg}");
+    }
+
+    /// Every condition met: `volume_resume` routes the session through
+    /// adoption (reaching `adopt_aborted`'s rehydration, which fails here
+    /// only because this SQL fixture has no frozen session directory) —
+    /// never through a refusal.
+    #[test]
+    fn volume_resume_routes_an_adoptable_aborted_session_through_adoption() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let volume_id = seed_aborted_session(&conn, stage_set_id, "L6-ADO", true, "ok", true);
+        conn.execute(
+            "INSERT INTO verification_sessions
+                (volume_id, started_at, completed_at, verify_type, outcome)
+             VALUES (?1, datetime('now'), datetime('now'), 'full', 'passed')",
+            params![volume_id],
+        )
+        .unwrap();
+
+        let msg = resume_err(&conn, "L6-ADO").to_string();
+        assert!(
+            msg.contains("aborted write") && msg.contains("no recorded session directory"),
+            "must reach adoption's own rehydration, not a refusal: {msg}"
         );
     }
 

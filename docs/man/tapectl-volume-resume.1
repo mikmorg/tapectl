@@ -12,6 +12,8 @@ An already\-sealed tape is RE\-CONFIRMED, not refused, when the tape itself prov
 .PP
 Everything else quarantines the volume: a File 0 whose identity does not match, one that is unreadable or unparseable, no recorded pointer, a pointer disagreeing with this session, or a position that does not parse as a seal marker. There is no \-\-force: `volume write \-\-force` overrides a wrong\-cartridge finding before anything is written, which has no meaning for a tape this session has already partly written.
 .PP
+An ABORTED session is adopted and re\-confirmed the same way (never written, never re\-sealed) only when its seal is recorded, its condition is ok, and a passing FULL verify is recorded after the abort (ADR\-0012, 2026\-09\-23); otherwise resume names the first unmet condition and, where one exists, the command that resolves it.
+.PP
 Refuses any volume whose CATALOG status is not `initialized` — a volume recorded sealed, retired or erased, or whose condition is quarantined, is not a write target (ADR\-0012); no flag overrides it. That is a different question from whether the loaded TAPE carries a seal marker, which is what the re\-confirm path above is about.
 .SH OPTIONS
 .TP

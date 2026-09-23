@@ -252,12 +252,20 @@ pub struct ReadyToSeal {
 }
 
 /// SIGINT (or a startup-sweep-detected crash) stopped execution between
-/// entries. Resumable: its only operation is [`Self::resume`].
+/// entries — or, since ADR-0012's 2026-09-23 amendment (#280), an `aborted`
+/// session with a recorded seal that [`Self::adopt_aborted`] picked up for
+/// re-confirmation. Resumable: its only operation is [`Self::resume`].
 pub struct InterruptedSession {
     built: BuiltLayout,
     volume_id: i64,
     write_ids: Vec<(i64, i64)>,
     slice_write_id: HashMap<i64, i64>,
+    /// True only for a session [`Self::adopt_aborted`] picked up (ADR-0012's
+    /// 2026-09-23 amendment, #280). Such a session's seal is recorded, so
+    /// `resume_checking` can only re-enter `confirm` or quarantine; this flag
+    /// turns any path that would reach the write phase into a hard refusal
+    /// rather than trusting that it is unreachable (ADR-0003).
+    adopted_from_aborted: bool,
 }
 
 /// Terminal, not resumable: the tape is not a copy
@@ -606,6 +614,163 @@ fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
     Ok(sealed_at.is_some())
 }
 
+// ── `volume resume` adopts an aborted, sealed, cleared session (#280) ──
+
+/// Whether `volume resume` may adopt a volume's `aborted` write session —
+/// ADR-0012's 2026-09-23 amendment (issue #280, Option 2). The ONE
+/// derivation of that answer: [`InterruptedSession::adopt_aborted`] gates on
+/// it, `write::volume_resume` names its refusals from it, and `volume
+/// verify`'s clean-clear message decides whether to name `volume resume`
+/// from it (via [`resume_would_reconfirm`]) — never a second copy (#96).
+///
+/// The variants other than `Adoptable` are the amendment's conditions, in
+/// its order, and the first unmet one is the one reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortedAdoption {
+    /// Every condition holds: resume re-enters `confirm` on this session.
+    Adoptable,
+    /// `volumes.status` is not `initialized` — not a write target at all,
+    /// so resume refuses on status long before this question (ADR-0012).
+    NotInitialized { status: String },
+    /// Condition 1: `volumes.sealed_at` is NULL. The session was aborted
+    /// before its own `seal()` returned, so there is no sealed tape to
+    /// re-confirm — and the seal is RECORDED, never inferred (the
+    /// 2026-09-21 amendment). Not resumable, ever.
+    NotSealed,
+    /// Condition 2, first half: `observed_condition` is not `'ok'`.
+    /// Resolved by a clean full verify (`tapectl volume verify <label>`).
+    ConditionNotOk { condition: String },
+    /// Condition 2's timestamp has nothing to be later than: no `events`
+    /// row records this volume's session being aborted
+    /// (`write_aborted`/`write_quarantined`). Refused rather than inferred.
+    NoRecordedAbort,
+    /// Condition 2, second half: no `verification_sessions` row with
+    /// `verify_type = 'full'` and `outcome = 'passed'` STARTED strictly after
+    /// the recorded abort. `observed_condition = 'ok'` alone is not evidence
+    /// — a `volume abort`ed session's condition may never have been
+    /// quarantined at all.
+    NoCleanFullVerifyAfterAbort { aborted_at: String },
+}
+
+/// What `volume resume` finds in a volume's `writes` rows, before it
+/// touches the tape. The row-level half of resume's admission, shared by
+/// `write::volume_resume` and [`resume_would_reconfirm`] so the two cannot
+/// disagree about which session resume would pick up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeAdmission {
+    /// At least one `interrupted` row: [`InterruptedSession::rehydrate`]
+    /// adopts it, exactly as before #280.
+    Interrupted,
+    /// No `interrupted`, `planned` or `in_progress` row, at least one
+    /// `aborted` row, and [`AbortedAdoption`]'s verdict on it.
+    Aborted(AbortedAdoption),
+    /// Anything else (`planned`/`in_progress` rows, only `completed`/`failed`
+    /// rows, or none): nothing resume adopts; `write::nothing_to_resume`
+    /// names why.
+    Nothing,
+}
+
+/// The recorded time this volume's write session was aborted: the latest
+/// `events` row for the volume whose action is one of the two every
+/// abort-to-`aborted` path logs — `write_aborted` (`write::volume_abort`, in
+/// the same transaction as the status flip; `write::finish_session`'s
+/// execute-abort arm) or `write_quarantined` (`write::log_quarantine`, for
+/// confirm's Quarantined arm and resume's own divergence arms). `None` when
+/// no such row exists; the caller refuses rather than guessing.
+fn recorded_abort_time(conn: &Connection, volume_id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT MAX(timestamp) FROM events
+         WHERE entity_type = 'volume' AND entity_id = ?1
+           AND action IN ('write_aborted', 'write_quarantined')",
+        params![volume_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// ADR-0012's 2026-09-23 amendment, conditions 1 and 2, evaluated from
+/// recorded rows only — see [`AbortedAdoption`]. Condition 3 (File 0
+/// identity and the seal position agreeing with this session's layout) is
+/// the tape's to answer, and `InterruptedSession::resume_checking` keeps
+/// answering it exactly as it does for an `interrupted` session.
+///
+/// This does not look at `writes` rows; [`resume_admission`] decides
+/// whether there is an aborted session to ask about at all.
+pub fn aborted_adoption(conn: &Connection, volume_id: i64) -> Result<AbortedAdoption> {
+    let (status, sealed_at, condition): (String, Option<String>, String) = conn.query_row(
+        "SELECT status, sealed_at, observed_condition FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if status != "initialized" {
+        return Ok(AbortedAdoption::NotInitialized { status });
+    }
+    if sealed_at.is_none() {
+        return Ok(AbortedAdoption::NotSealed);
+    }
+    if condition != "ok" {
+        return Ok(AbortedAdoption::ConditionNotOk { condition });
+    }
+    let Some(aborted_at) = recorded_abort_time(conn, volume_id)? else {
+        return Ok(AbortedAdoption::NoRecordedAbort);
+    };
+    // Strictly later, and by `started_at`: the whole readback must postdate
+    // the abort. `datetime('now')` has one-second resolution, so a verify
+    // recorded in the same second as the abort is refused — the safe side.
+    let cleared_after: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM verification_sessions
+                       WHERE volume_id = ?1 AND verify_type = 'full'
+                         AND outcome = 'passed' AND started_at > ?2)",
+        params![volume_id, aborted_at],
+        |r| r.get(0),
+    )?;
+    if !cleared_after {
+        return Ok(AbortedAdoption::NoCleanFullVerifyAfterAbort { aborted_at });
+    }
+    Ok(AbortedAdoption::Adoptable)
+}
+
+/// The row-level admission — see [`ResumeAdmission`].
+pub fn resume_admission(conn: &Connection, volume_id: i64) -> Result<ResumeAdmission> {
+    let statuses: Vec<String> = conn
+        .prepare("SELECT DISTINCT status FROM writes WHERE volume_id = ?1")?
+        .query_map(params![volume_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let has = |s: &str| statuses.iter().any(|x| x == s);
+    if has("interrupted") {
+        return Ok(ResumeAdmission::Interrupted);
+    }
+    if has("planned") || has("in_progress") || !has("aborted") {
+        return Ok(ResumeAdmission::Nothing);
+    }
+    Ok(ResumeAdmission::Aborted(aborted_adoption(conn, volume_id)?))
+}
+
+/// Whether `tapectl volume resume <label>` would, right now, pick this
+/// volume's session up and re-enter `confirm` on its recorded seal — the
+/// question `volume verify`'s clean-clear message asks before it names
+/// `volume resume` (issue #280). Built only from the gates resume itself
+/// applies before touching the tape, through the same functions:
+/// `coverage::is_write_target` and `coverage::has_completed_write`, then
+/// [`resume_admission`] — `Aborted(Adoptable)`, or `Interrupted` with the
+/// seal recorded (the 2026-09-21 amendment's re-confirm).
+pub fn resume_would_reconfirm(conn: &Connection, volume_id: i64) -> Result<bool> {
+    let (status, condition): (String, String) = conn.query_row(
+        "SELECT status, observed_condition FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if !crate::policy::coverage::is_write_target(&status, &condition)
+        || crate::policy::coverage::has_completed_write(conn, volume_id)?
+    {
+        return Ok(false);
+    }
+    Ok(match resume_admission(conn, volume_id)? {
+        ResumeAdmission::Aborted(AbortedAdoption::Adoptable) => true,
+        ResumeAdmission::Interrupted => seal_recorded(conn, volume_id)?,
+        ResumeAdmission::Aborted(_) | ResumeAdmission::Nothing => false,
+    })
+}
+
 impl PlannedSession {
     /// `PlannedSession -> ExecuteOutcome`, checking for interruption via the
     /// real process-global signal flag. See [`Self::execute_checking`] for
@@ -695,15 +860,50 @@ impl InterruptedSession {
     /// reject an insert here anyway, and `layout-session.md` is explicit that
     /// resume reuses the existing rows).
     pub fn rehydrate(conn: &Connection, volume_id: i64) -> Result<Option<InterruptedSession>> {
+        Self::load(conn, volume_id, "interrupted")
+    }
+
+    /// Adopt a volume's `aborted` write session for `volume resume` —
+    /// ADR-0012's 2026-09-23 amendment (issue #280, Option 2). Returns
+    /// `Ok(None)` unless [`resume_admission`] says `Aborted(Adoptable)`: no
+    /// `interrupted`/`planned`/`in_progress` row, the seal recorded
+    /// (`volumes.sealed_at`), `observed_condition = 'ok'`, and a passing
+    /// FULL verify recorded after the recorded abort ([`aborted_adoption`]).
+    ///
+    /// The session it returns is rehydrated exactly as [`Self::rehydrate`]
+    /// rehydrates an interrupted one (the frozen Layout, never a rebuilt
+    /// one), and it is marked so that `resume_checking` can only re-enter
+    /// `confirm` or quarantine: never `reposition_for_resume`, never a data
+    /// write, never `seal()` (ADR-0003). Only a passing `confirm` then moves
+    /// its rows to `completed` and the volume to `sealed`; this method writes
+    /// nothing.
+    pub fn adopt_aborted(conn: &Connection, volume_id: i64) -> Result<Option<InterruptedSession>> {
+        if resume_admission(conn, volume_id)?
+            != ResumeAdmission::Aborted(AbortedAdoption::Adoptable)
+        {
+            return Ok(None);
+        }
+        let session = Self::load(conn, volume_id, "aborted")?;
+        // Defence in depth: `load` must hand back a session flagged as
+        // adopted, or `resume_checking`'s write-phase refusal cannot fire.
+        debug_assert!(session.as_ref().is_none_or(|s| s.adopted_from_aborted));
+        Ok(session)
+    }
+
+    /// The shared loader behind [`Self::rehydrate`] and
+    /// [`Self::adopt_aborted`]: every `writes` row of `volume_id` in
+    /// `status`, their one shared session directory, and the frozen Layout
+    /// in it.
+    fn load(conn: &Connection, volume_id: i64, status: &str) -> Result<Option<InterruptedSession>> {
         // `plan` inserts one row per unit in order, so ordering by id
         // reproduces its `write_ids` sequence exactly.
         let rows: Vec<(i64, i64, Option<String>)> = conn
             .prepare(
                 "SELECT id, snapshot_id, session_dir FROM writes
-                 WHERE volume_id = ?1 AND status = 'interrupted'
+                 WHERE volume_id = ?1 AND status = ?2
                  ORDER BY id",
             )?
-            .query_map(params![volume_id], |r| {
+            .query_map(params![volume_id, status], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -722,7 +922,7 @@ impl InterruptedSession {
             .map(|(id, _, dir)| {
                 dir.as_deref().ok_or_else(|| {
                     TapectlError::Other(format!(
-                        "volume {volume_id}: interrupted write {id} has no recorded session \
+                        "volume {volume_id}: {status} write {id} has no recorded session \
                          directory (it predates migration 006). The frozen staging files are \
                          the rewrite source; without them this session cannot be resumed, only \
                          aborted — mark its `writes` rows aborted and start a fresh write to a \
@@ -735,7 +935,7 @@ impl InterruptedSession {
         dirs.dedup();
         if dirs.len() > 1 {
             return Err(TapectlError::Other(format!(
-                "volume {volume_id}: its interrupted `writes` rows name {} different session \
+                "volume {volume_id}: its {status} `writes` rows name {} different session \
                  directories ({dirs:?}) — these are not one write session, and resuming would \
                  mix frozen files from different builds. Resolve by hand before retrying.",
                 dirs.len()
@@ -784,6 +984,7 @@ impl InterruptedSession {
             volume_id,
             write_ids,
             slice_write_id,
+            adopted_from_aborted: status == "aborted",
         }))
     }
 
@@ -862,6 +1063,21 @@ impl InterruptedSession {
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
                 .join("; ");
+            // An adopted `aborted` session (#280) is not in `interrupted`
+            // and `volume abort` refuses it (it selects only unfinished
+            // rows), so neither may be claimed or named for it.
+            if self.adopted_from_aborted {
+                return Err(TapectlError::Other(format!(
+                    "volume resume: revalidation failed, so nothing was written — the session's \
+                     `writes` rows stay `aborted` and the sealed cartridge is untouched. Causes: \
+                     {detail}. Re-entering confirm on the recorded seal needs this session's \
+                     frozen staging files and keys present; fix the cause (an unmounted staging \
+                     filesystem or a temporarily absent key are indistinguishable here from \
+                     permanent loss) and run `tapectl volume resume` again. If the inputs are \
+                     genuinely gone, this volume cannot be re-confirmed; copy its data to \
+                     another volume if it must count as a copy."
+                )));
+            }
             return Err(TapectlError::Other(format!(
                 "volume resume: revalidation failed, so nothing was written and the session was \
                  left untouched in the `interrupted` state — the cartridge is unharmed. Causes: \
@@ -992,6 +1208,22 @@ impl InterruptedSession {
                     },
                 }));
             }
+        }
+
+        // ADR-0012's 2026-09-23 amendment (#280): an adopted `aborted`
+        // session was admitted only because its seal is recorded, so the
+        // `Blank | Matches` arm above has already returned `Confirming` and
+        // the other two arms returned `Quarantined`. Reaching the write
+        // phase here would mean `sealed_at` vanished between admission and
+        // now; refuse rather than write to a cartridge ADR-0003 says is
+        // immutable.
+        if self.adopted_from_aborted {
+            return Err(TapectlError::Other(format!(
+                "volume resume: volume {} was adopted from an aborted session because its seal \
+                 is recorded, but the catalog no longer records that seal. Refusing to write: \
+                 a sealed tape is never rewritten (ADR-0003). Nothing was written.",
+                self.volume_id
+            )));
         }
 
         // 3. Two-case cursor rule (`write_positions.stage_slice_id` is NOT
@@ -1285,7 +1517,10 @@ impl SealedPending {
             // Issue #242: the chain-walk's own quarantine finding is an
             // observed fact too -- `observed_condition`, not `status`. This
             // volume never reached the transaction above, so `status` is
-            // left exactly where it was (never 'sealed').
+            // left exactly where it was (never 'sealed'). `aborted` here is
+            // not final: the seal is recorded, so once a clean full verify
+            // clears the condition `volume resume` adopts this session
+            // (`InterruptedSession::adopt_aborted`, ADR-0012 2026-09-23).
             conn.execute(
                 "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
                 params![self.volume_id],
@@ -1445,6 +1680,7 @@ fn run_entries(
                     volume_id,
                     write_ids,
                     slice_write_id,
+                    adopted_from_aborted: false,
                 }));
             }
         }
@@ -1464,6 +1700,7 @@ fn run_entries(
                 volume_id,
                 write_ids,
                 slice_write_id,
+                adopted_from_aborted: false,
             }));
         }
 
@@ -4011,6 +4248,481 @@ mod tests {
             matches!(outcome, ExecuteOutcome::Ready(_)),
             "with no park marker the session must run to Ready exactly as before"
         );
+    }
+
+    // --- issue #280: resume adopts an aborted, sealed, cleared session -----
+    //
+    // ADR-0012's 2026-09-23 amendment (Option 2). The state: confirm's
+    // Quarantined arm left `sealed_at` set, `observed_condition =
+    // 'quarantined'`, `status = 'initialized'` and every `writes` row
+    // `aborted`; a later clean FULL verify cleared the condition. Resume must
+    // adopt it and re-enter confirm, never write or seal, and refuse naming
+    // the first unmet condition otherwise.
+
+    /// A fixture that has been through execute + seal, with its rows left by
+    /// one of the two sealed-then-aborted paths. `store` is the (healed)
+    /// tape as it now reads.
+    struct SealedAborted {
+        conn: Connection,
+        keys: KeyAvailability,
+        volume_id: i64,
+        store: MemStore,
+        _slices_dir: TempDir,
+        _session_dir: TempDir,
+    }
+
+    const ADOPT_TEST_DEVICE: &str = "/nonexistent/tapectl-pm280-resume-test-nst";
+
+    /// Execute and seal on a MemStore, recording `sealed_at` exactly as
+    /// `write::finish_session` does, with the volume `initialized` as a real
+    /// write target is. Returns the pending confirm and the slice position.
+    fn sealed_pending_on_initialized_volume(f: Fixture) -> (SealedPending, SealedAborted, usize) {
+        f.conn
+            .execute(
+                "UPDATE volumes SET status = 'initialized' WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut store, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let slice_position = sealed_pending
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .expect("fixture layout always has at least one slice entry");
+        (
+            sealed_pending,
+            SealedAborted {
+                conn: f.conn,
+                keys: f.keys,
+                volume_id: f.volume_id,
+                store,
+                _slices_dir: f._slices_dir,
+                _session_dir: f._session_dir,
+            },
+            slice_position,
+        )
+    }
+
+    /// Move every abort-recording event of this volume `ago` into the past
+    /// (an SQLite modifier such as `'-1 hour'`), so a verify recorded now is
+    /// unambiguously later — `datetime('now')` has one-second resolution.
+    fn backdate_abort_events(conn: &Connection, volume_id: i64, ago: &str) {
+        let n = conn
+            .execute(
+                "UPDATE events SET timestamp = datetime('now', ?2)
+                 WHERE entity_type = 'volume' AND entity_id = ?1
+                   AND action IN ('write_aborted', 'write_quarantined')",
+                params![volume_id, ago],
+            )
+            .unwrap();
+        assert!(n > 0, "fixture premise: an abort event was recorded");
+    }
+
+    /// State (B) of issue #280: a medium-proving confirm failure
+    /// (Quarantined — `writes` aborted, condition quarantined), recorded by
+    /// the production writer `write::log_quarantine` (which `finish_confirm`
+    /// calls), an hour ago; then the tape reads clean again.
+    fn quarantined_by_confirm() -> SealedAborted {
+        let (pending, mut sa, slice_position) =
+            sealed_pending_on_initialized_volume(make_fixture());
+        let good = sa.store.files[slice_position].clone();
+        sa.store.files[slice_position][0] ^= 0xFF;
+        let q = match pending
+            .confirm(&sa.conn, &mut sa.store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Quarantined(q) => q,
+            _ => panic!("fixture premise: a flipped content byte quarantines"),
+        };
+        let _ = super::super::write::log_quarantine(&sa.conn, sa.volume_id, &q.label, &q.reason);
+        backdate_abort_events(&sa.conn, sa.volume_id, "-1 hour");
+        sa.store.files[slice_position] = good;
+        sa
+    }
+
+    /// The other sealed-then-aborted path: an Inconclusive confirm (rows
+    /// `interrupted`, condition never touched), then the operator's own
+    /// `volume abort` — an hour ago. The tape reads clean again.
+    fn operator_aborted_after_inconclusive() -> SealedAborted {
+        let (pending, mut sa, slice_position) =
+            sealed_pending_on_initialized_volume(make_fixture());
+        let good = sa.store.files[slice_position].clone();
+        sa.store.files[slice_position].truncate(5);
+        match pending
+            .confirm(&sa.conn, &mut sa.store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Inconclusive(_) => {}
+            _ => panic!("fixture premise: a short read is Inconclusive"),
+        }
+        super::super::write::volume_abort(&sa.conn, "SESSTEST", true).unwrap();
+        backdate_abort_events(&sa.conn, sa.volume_id, "-1 hour");
+        sa.store.files[slice_position] = good;
+        sa
+    }
+
+    /// A clean FULL verify, through the production verify path
+    /// (`write::volume_verify_with_store`), recorded now.
+    fn run_clean_full_verify(sa: &mut SealedAborted) {
+        let config = crate::config::Config::default();
+        let report = super::super::write::volume_verify_with_store(
+            &sa.conn,
+            &mut sa.store,
+            "SESSTEST",
+            sa.volume_id,
+            BS as usize,
+            Tier::Integrity,
+            crate::tape::contact::ContactSite::new(
+                &config,
+                crate::tape::contact::Operation::VolumeVerify,
+                ADOPT_TEST_DEVICE,
+                crate::tape::contact::Medium::NoBackend,
+            ),
+        )
+        .expect("verify should run against the MemStore");
+        assert_eq!(
+            report.failed, 0,
+            "fixture premise: the healed tape verifies clean"
+        );
+    }
+
+    fn insert_verify(sa: &SealedAborted, verify_type: &str, outcome: &str, started: &str) {
+        sa.conn
+            .execute(
+                "INSERT INTO verification_sessions
+                    (volume_id, started_at, completed_at, verify_type, outcome)
+                 VALUES (?1, datetime('now', ?2), datetime('now', ?2), ?3, ?4)",
+                params![sa.volume_id, started, verify_type, outcome],
+            )
+            .unwrap();
+    }
+
+    fn set_condition_ok(sa: &SealedAborted) {
+        sa.conn
+            .execute(
+                "UPDATE volumes SET observed_condition = 'ok' WHERE id = ?1",
+                params![sa.volume_id],
+            )
+            .unwrap();
+    }
+
+    /// THE headline: state (B), cleared by a clean full verify recorded after
+    /// the abort, is adopted by resume, re-confirmed WITHOUT a single write
+    /// or reposition (`NoWriteStore` panics on either), and a passing confirm
+    /// — the only writer of `status = 'sealed'` — makes it count as a copy.
+    ///
+    /// Paired with the clean-clear message: on this exact fixture state the
+    /// message's `resume_would_reconfirm` input is true and it names
+    /// `tapectl volume resume SESSTEST`, and the resume it names succeeds.
+    #[test]
+    fn resume_adopts_an_aborted_sealed_session_after_a_clean_full_verify_and_seals_it() {
+        let mut sa = quarantined_by_confirm();
+        run_clean_full_verify(&mut sa);
+
+        let condition: String = sa
+            .conn
+            .query_row(
+                "SELECT observed_condition FROM volumes WHERE id = ?1",
+                params![sa.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            condition, "ok",
+            "the clean full verify cleared the condition"
+        );
+        assert!(
+            !crate::policy::coverage::counts_as_copy(&sa.conn, "SESSTEST").unwrap(),
+            "precondition: not a copy until confirm passes"
+        );
+        assert_eq!(
+            resume_admission(&sa.conn, sa.volume_id).unwrap(),
+            ResumeAdmission::Aborted(AbortedAdoption::Adoptable)
+        );
+        assert!(resume_would_reconfirm(&sa.conn, sa.volume_id).unwrap());
+        let msg = crate::cli::volume::clean_clear_message(
+            "SESSTEST",
+            "quarantined",
+            "initialized",
+            true,
+            false,
+            resume_would_reconfirm(&sa.conn, sa.volume_id).unwrap(),
+        );
+        assert!(
+            msg.contains("tapectl volume resume SESSTEST"),
+            "the clean-clear message must name the resume that works: {msg}"
+        );
+
+        // `rehydrate` is unchanged: it still adopts only `interrupted` rows.
+        assert!(InterruptedSession::rehydrate(&sa.conn, sa.volume_id)
+            .unwrap()
+            .is_none());
+        let adopted = InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
+            .unwrap()
+            .expect("an aborted, sealed, cleared session must be adoptable");
+
+        let tape_before = sa.store.files.clone();
+        let mut store = NoWriteStore(std::mem::replace(&mut sa.store, MemStore::new(BS as usize)));
+        let pending = match adopted
+            .resume_checking(&sa.conn, &sa.keys, &mut store, || false)
+            .expect("resume must not error, and must not write via NoWriteStore")
+        {
+            ResumeOutcome::Confirming(p) => p,
+            ResumeOutcome::Ready(_) => panic!("an adopted sealed session must never reach Ready"),
+            ResumeOutcome::Quarantined(q) => panic!("expected Confirming, got {:?}", q.reason),
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        };
+        match pending
+            .confirm(&sa.conn, &mut store, Tier::Integrity)
+            .expect("confirm must not error")
+        {
+            ConfirmOutcome::Sealed(s) => assert_eq!(s.label, "SESSTEST"),
+            ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got {:?}", q.reason),
+            ConfirmOutcome::Inconclusive(i) => {
+                panic!(
+                    "expected Sealed, got Inconclusive: {:?}",
+                    i.evidence.mismatches
+                )
+            }
+        }
+        assert_eq!(
+            store.0.files, tape_before,
+            "the tape must be byte-identical: nothing written, nothing re-sealed"
+        );
+
+        let status: String = sa
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![sa.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "sealed");
+        let rows: Vec<(String, Option<String>)> = sa
+            .conn
+            .prepare("SELECT status, completed_at FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![sa.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|(s, c)| s == "completed" && c.is_some()),
+            "a passing confirm leaves the rows exactly as a normal one does: {rows:?}"
+        );
+        assert!(
+            crate::policy::coverage::counts_as_copy(&sa.conn, "SESSTEST").unwrap(),
+            "after the passing confirm the volume counts as a copy"
+        );
+    }
+
+    /// An adopted session whose frozen inputs are missing fails
+    /// revalidation without writing, and the message must not claim the
+    /// rows are `interrupted` or name `volume abort` (which refuses an
+    /// already-aborted session) — the #292 shape.
+    #[test]
+    fn adopted_session_revalidation_failure_names_no_refusing_command() {
+        let mut sa = quarantined_by_confirm();
+        run_clean_full_verify(&mut sa);
+        let adopted = InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
+            .unwrap()
+            .expect("fixture premise: adoptable");
+        // The operator's `staging clean --force`: the frozen slices are gone.
+        let slice = adopted
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .and_then(|e| match &e.source {
+                ContentSource::Staged(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("fixture layout carries a staged slice");
+        std::fs::remove_file(&slice).unwrap();
+
+        let mut store = NoWriteStore(std::mem::replace(&mut sa.store, MemStore::new(BS as usize)));
+        let msg = match adopted.resume_checking(&sa.conn, &sa.keys, &mut store, || false) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("revalidation must fail with a staged slice gone"),
+        };
+        assert!(msg.contains("revalidation failed"), "{msg}");
+        assert!(!msg.contains("volume abort"), "{msg}");
+        assert!(!msg.contains("`interrupted` state"), "{msg}");
+        assert!(msg.contains("stay `aborted`"), "{msg}");
+    }
+
+    /// Condition 1: the seal is RECORDED, never inferred. With `sealed_at`
+    /// NULL, everything else in place, there is nothing sealed to re-confirm.
+    #[test]
+    fn adoption_refused_when_the_seal_is_not_recorded() {
+        let mut sa = quarantined_by_confirm();
+        run_clean_full_verify(&mut sa);
+        sa.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = NULL WHERE id = ?1",
+                params![sa.volume_id],
+            )
+            .unwrap();
+        assert_eq!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::NotSealed
+        );
+        assert!(InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
+            .unwrap()
+            .is_none());
+        assert!(!resume_would_reconfirm(&sa.conn, sa.volume_id).unwrap());
+    }
+
+    /// Condition 2, first half: still quarantined (no verify has cleared it).
+    #[test]
+    fn adoption_refused_while_the_condition_is_still_quarantined() {
+        let sa = quarantined_by_confirm();
+        assert_eq!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::ConditionNotOk {
+                condition: "quarantined".to_string()
+            }
+        );
+        assert!(InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Condition 2: `observed_condition = 'ok'` alone is not evidence. An
+    /// operator's `volume abort` of a sealed Inconclusive session leaves the
+    /// condition `ok` without any verify having cleared anything.
+    #[test]
+    fn adoption_refused_for_an_operator_abort_with_no_later_verify() {
+        let sa = operator_aborted_after_inconclusive();
+        assert!(matches!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::NoCleanFullVerifyAfterAbort { .. }
+        ));
+        assert!(InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
+            .unwrap()
+            .is_none());
+        assert!(!resume_would_reconfirm(&sa.conn, sa.volume_id).unwrap());
+    }
+
+    /// A passing full verify recorded BEFORE the abort is not evidence about
+    /// the medium after it.
+    #[test]
+    fn adoption_refused_when_the_passing_verify_predates_the_abort() {
+        let sa = operator_aborted_after_inconclusive();
+        insert_verify(&sa, "full", "passed", "-2 hours");
+        assert!(matches!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::NoCleanFullVerifyAfterAbort { .. }
+        ));
+    }
+
+    /// A quick verify checks the map, not the bytes (the 2026-09-18
+    /// amendment), so it never counts.
+    #[test]
+    fn adoption_refused_when_the_later_verify_is_only_quick() {
+        let sa = quarantined_by_confirm();
+        set_condition_ok(&sa);
+        insert_verify(&sa, "quick", "passed", "+0 seconds");
+        assert!(matches!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::NoCleanFullVerifyAfterAbort { .. }
+        ));
+    }
+
+    /// A failed full verify after the abort is not a clean one.
+    #[test]
+    fn adoption_refused_when_the_later_full_verify_failed() {
+        let sa = quarantined_by_confirm();
+        set_condition_ok(&sa);
+        insert_verify(&sa, "full", "failed", "+0 seconds");
+        assert!(matches!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::NoCleanFullVerifyAfterAbort { .. }
+        ));
+    }
+
+    /// With no recorded abort time there is nothing for the verify to be
+    /// later than, and the answer is refused rather than inferred.
+    #[test]
+    fn adoption_refused_when_no_abort_is_recorded() {
+        let mut sa = quarantined_by_confirm();
+        run_clean_full_verify(&mut sa);
+        sa.conn
+            .execute(
+                "DELETE FROM events WHERE action IN ('write_aborted', 'write_quarantined')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::NoRecordedAbort
+        );
+    }
+
+    /// Positive control for the refusals above: the SAME operator-abort
+    /// fixture with a passing full verify strictly after the abort meets
+    /// every condition the amendment states, so the refusals above are
+    /// refused by the verify's timing/type/outcome and not by the fixture.
+    #[test]
+    fn operator_abort_then_a_later_clean_full_verify_is_adoptable() {
+        let mut sa = operator_aborted_after_inconclusive();
+        run_clean_full_verify(&mut sa);
+        assert_eq!(
+            aborted_adoption(&sa.conn, sa.volume_id).unwrap(),
+            AbortedAdoption::Adoptable
+        );
+        assert!(InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
+            .unwrap()
+            .is_some());
+    }
+
+    /// An aborted session that never sealed is still never adopted — the
+    /// pre-#280 behaviour for every aborted session, kept for this one.
+    #[test]
+    fn an_unsealed_aborted_session_is_never_adopted() {
+        let f = make_fixture();
+        f.conn
+            .execute(
+                "UPDATE volumes SET status = 'initialized' WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let _interrupted = planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap();
+        crate::volume::write::volume_abort(&f.conn, "SESSTEST", true).unwrap();
+        assert_eq!(
+            resume_admission(&f.conn, f.volume_id).unwrap(),
+            ResumeAdmission::Aborted(AbortedAdoption::NotSealed)
+        );
+        assert!(InterruptedSession::adopt_aborted(&f.conn, f.volume_id)
+            .unwrap()
+            .is_none());
     }
 
     /// `park_marker_from_env` is the single boundary where the variable is
