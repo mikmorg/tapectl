@@ -23,7 +23,8 @@ pub enum VolumeCommands {
         #[arg(long)]
         device: Option<String>,
         /// Overwrite a cartridge whose File 0 already identifies a
-        /// DIFFERENT volume (e.g. a mislabeled or stale tape). Refused by
+        /// DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY
+        /// (a filemark at the beginning of the tape). Refused by
         /// default (issue #27) — loading the wrong cartridge would
         /// otherwise silently overwrite it. Never overrides a cartridge
         /// that is already SEALED (ADR-0003): bulk-erase the physical tape

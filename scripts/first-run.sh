@@ -835,7 +835,7 @@ EOF
       die "volume init refused by ADR-0003 and no flag overrides it. Act on the remedy in the refusal above (for a sealed cartridge: retire, erase, cartridge mark-erased), or load a different cartridge, then re-run scripts/first-run.sh --from 13"
     else
       explain <<'EOF'
-volume init refused. The cartridge's File 0 identifies a DIFFERENT volume that is NOT sealed — a stale or foreign tape. tapectl will not overwrite one by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first. (A SEALED tape is a different case and --force would not help there; this is not that.)
+volume init refused. The cartridge's File 0 identifies a DIFFERENT volume that is NOT sealed (a stale or foreign tape), or is EMPTY (a filemark at the beginning of the tape, e.g. after `mt weof`); tapectl's refusal above says which. tapectl will not overwrite either by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first. (A SEALED tape is a different case and --force would not help there; this is not that.)
 EOF
       [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
       confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" || die "stopped"

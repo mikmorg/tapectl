@@ -89,9 +89,11 @@ usage: lifecycle-suite.sh [--scenario NAME | --all] [--device /dev/nstN]
   --erase long|short              long = mt rewind+erase (instant on mhvtl, HOURS on
                                    real LTO — never the default on a real drive).
                                    short = mt rewind+weof 1+rewind. This UNSEALS a tape;
-                                   it does NOT blank one — a read at BOT still returns
-                                   the old File 0's bytes, so `volume init` refuses it as
-                                   "present but unparseable" unless --force. Usable only
+                                   it does NOT blank one — on mhvtl a read at BOT still
+                                   returns the old File 0's bytes ("present but
+                                   unparseable"); the real HP LTO-6 reads an EMPTY File 0
+                                   (issue #327). Either way `volume init` refuses it
+                                   unless --force. Usable only
                                    where --force is in play (--single-cartridge reuse).
                                    A freshly loaded slot tape is always really erased.
   --single-cartridge              Reuse one cartridge for every "next tape" instead of
@@ -427,7 +429,10 @@ erase_tape() {
 # at BOT still returns the previous volume's bytes, and `volume init` refuses
 # that as "a present but unparseable/corrupt File 0" -- correctly, per #27
 # contact discipline and ADR-0003. Measured on mhvtl: after `short` over a
-# written tape, init refuses; after a real erase, it initialises.
+# written tape, init refuses; after a real erase, it initialises. The real HP
+# LTO-6 differs (2026-09-23): after `weof 1` at BOT it reads File 0 as EMPTY,
+# and init refuses with its own "File 0 is EMPTY" text (issue #327) -- same
+# refusal, same --force, different words.
 #
 # --single-cartridge never hit this because `vinit` passes $REUSE_FORCE
 # (--force) on that branch alone, which overrides the refusal. A freshly loaded
@@ -2322,6 +2327,9 @@ rr_volinit_volx_refused_with_force() {
 #
 #     error: refusing to write volume "VOL-H": the loaded cartridge's File 0
 #     already identifies a DIFFERENT volume ... re-run with --force
+#
+# (On the real LTO-6 the same step reads an EMPTY File 0 and the refusal says
+# "File 0 is EMPTY" instead -- issue #327. Same refusal, same remedy.)
 #
 # That is the issue #194 finding, in a scenario that had never reached this
 # step to show it (issue #198). `blank_tape` is the helper #194 added for

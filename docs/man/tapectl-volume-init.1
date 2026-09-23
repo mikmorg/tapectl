@@ -19,7 +19,7 @@ Output in JSON format
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-force\fR
-Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape). Refused by default (issue #27) — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR\-0003): bulk\-erase the physical tape and run `cartridge mark\-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010)
+Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default (issue #27) — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR\-0003): bulk\-erase the physical tape and run `cartridge mark\-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010)
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Declare the loaded medium\*(Aqs generation (e.g. LTO\-6, LTO\-7\-M8).
