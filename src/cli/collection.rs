@@ -249,7 +249,13 @@ fn cmd_sync(
             dry_run,
             &config.defaults.global_excludes,
         )?;
-        any_refused |= !report.refused.is_empty();
+        // Issue #337: a directory step 1 could not register -- an
+        // UNREGISTERED unit whose dotfile does not parse, or any other
+        // registration failure -- is a unit that will never be archived,
+        // exactly like a refused registered one (ADR-0012, 2026-09-22:
+        // "refused, and the command exits non-zero"). Printed as `error:`
+        // lines below; counted here so the exit code says so too.
+        any_refused |= !report.refused.is_empty() || !errors.is_empty();
         rows.push((lib.name.clone(), report, errors));
     }
 
@@ -698,6 +704,85 @@ pattern = ["*.tmp"]
         );
         assert_eq!(status.refused.len(), 1);
         assert_eq!(status.refused[0].unit_name, "testlib/beta");
+    }
+
+    /// Issue #337: `collection sync` meets a directory the catalog does not
+    /// know yet whose dotfile does not parse. Step 1 cannot register it, so
+    /// it will never be archived -- the command must exit non-zero, not 0.
+    /// Positive control: the same fresh collection without that directory
+    /// syncs cleanly (alpha is registered) and exits 0, so the non-zero
+    /// comes from the unregistrable unit. (Not `seed_three_unit_collection`:
+    /// its units are catalog rows with no dotfiles, a state `dotfiles =
+    /// true` never produces, and sync rightly reports each as an error.)
+    #[test]
+    fn sync_exits_non_zero_when_an_unregistered_units_dotfile_does_not_parse() {
+        for with_bad_new_unit in [true, false] {
+            let conn = db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let alpha = root.join("alpha");
+            std::fs::create_dir_all(&alpha).unwrap();
+            std::fs::write(alpha.join("f.txt"), b"hello").unwrap();
+            if with_bad_new_unit {
+                let delta = root.join("delta");
+                std::fs::create_dir_all(&delta).unwrap();
+                std::fs::write(delta.join("f.txt"), b"hello").unwrap();
+                std::fs::write(
+                    delta.join(".tapectl-unit.toml"),
+                    "[unit]\nuuid = \"u-delta\"\nname = \"testlib/delta\"\n\
+                     created = \"2026-01-01T00:00:00Z\"\ntenant = \"media\"\n\n\
+                     [excludes]\npattern = [\"*.tmp\"]\n",
+                )
+                .unwrap();
+            }
+            let mut config = Config::default();
+            config.collections.push(CollectionConfig {
+                name: "testlib".into(),
+                root: root.to_string_lossy().to_string(),
+                tenant: "media".into(),
+                unit_depth: 1,
+                exclude: vec![],
+                archive_set: None,
+                dotfiles: true,
+            });
+            let home = tempfile::tempdir().unwrap();
+            let paths = TapectlPaths::new(home.path().to_path_buf());
+
+            let code = run(
+                &conn,
+                &paths,
+                &config,
+                &CollectionCommands::Sync { dry_run: false },
+                false,
+                false,
+            )
+            .unwrap();
+            let names: Vec<String> = conn
+                .prepare("SELECT name FROM units ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                names,
+                vec!["testlib/alpha".to_string()],
+                "alpha is registered; the unparseable delta never is"
+            );
+            if with_bad_new_unit {
+                assert_ne!(
+                    code, 0,
+                    "an unregistrable unit must make sync exit non-zero"
+                );
+            } else {
+                assert_eq!(code, 0, "positive control: a clean sync exits 0");
+            }
+        }
     }
 
     /// Positive control for the test above (issue #285's own point: a
