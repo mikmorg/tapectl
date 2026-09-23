@@ -875,6 +875,87 @@ check resume_restore    step_resume_restore
 check resume_after_crash step_resume_after_crash
 check tier3_floor_unconfirmed step_tier3_floor_unconfirmed
 
+# ---------- by-id device spelling (issue #321, #313's acceptance) ----------
+# CLAUDE.md tells the operator to name the drive by serial,
+# /dev/tape/by-id/scsi-<serial>-nst, because /dev/nstN moves across reboots.
+# Every other step here spells it $TAPE_DEV, which is also what the gate
+# home's config says (device_tape = "$TAPE_DEV"), so string equality alone
+# would carry every one of them and a canonicalising resolver was never
+# exercised on tape. This step spells the SAME drive the other way and
+# asserts the contact still gets its drive, its health row and its sweep.
+#
+# It verifies $RLABEL4, not $LABEL: after leg 4 the tape holds RLABEL4 (sealed
+# by the resume in tier3_floor_unconfirmed, untouched by the refused retire)
+# and $LABEL is erased. So this step depends on tier3_floor_unconfirmed. It
+# runs BEFORE the journals leg, so the new contact is covered by
+# log_page_sweep_complete / contacts_name_their_drive as well.
+#
+# Preconditions are failures, not skips: if the config already said the by-id
+# path, string equality would carry the lookup and this would be green for
+# the wrong reason. The "before" contact id makes sure the assertions are
+# about THIS command's contact, never an earlier /dev/nstN verify's.
+step_health_by_id_device() {
+    local serial by_id before
+    serial="$(tail -c +5 "/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE_DEV")")/device/vpd_pg80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
+    [ -n "$serial" ] || { echo "cannot read the gate drive's serial from sysfs"; return 1; }
+    by_id="/dev/tape/by-id/scsi-${serial}-nst"
+    [ -e "$by_id" ] || { echo "precondition: $by_id does not exist"; return 1; }
+    [ "$(readlink -f "$by_id")" = "$(readlink -f "$TAPE_DEV")" ] || {
+        echo "precondition: $by_id -> $(readlink -f "$by_id"), not $TAPE_DEV -> $(readlink -f "$TAPE_DEV")"
+        return 1
+    }
+    [ "$by_id" != "$TAPE_DEV" ] || {
+        echo "precondition: the gate was run with TAPECTL_GATE_TAPE=$by_id; this step needs the /dev/nstN spelling in config"
+        return 1
+    }
+    if grep -E '^[[:space:]]*device_tape[[:space:]]*=' "$CFG" | grep -qF "\"$by_id\""; then
+        echo "precondition: $CFG already names $by_id as a device_tape -- string equality would carry the lookup"
+        return 1
+    fi
+    before="$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT COALESCE(MAX(id),0) FROM cartridge_contacts WHERE operation = '"'volume verify'"'").fetchone()[0])' "$HOME_DIR/tapectl.db")" \
+        || { echo "could not read the last verify contact id"; return 1; }
+    echo "by-id: $by_id -> $(readlink -f "$by_id") (config says $TAPE_DEV); last verify contact before: $before"
+    TCTL volume verify "$RLABEL4" --device "$by_id" --json | tee "$RUN/verify-by-id.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify-by-id.json" \
+        || return 1
+    python3 - "$HOME_DIR/tapectl.db" "$before" "$by_id" "$serial" <<'PYBYID'
+import sqlite3, sys
+db, before, by_id, want = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+c = sqlite3.connect(db)
+cid = c.execute(
+    "SELECT MAX(id) FROM cartridge_contacts WHERE operation = 'volume verify'").fetchone()[0]
+assert cid is not None and cid > before, (
+    f"positive control: no NEW 'volume verify' contact (max id {cid}, before {before}) -- "
+    "the assertions below would be about an earlier contact")
+device, closed_at, drive_id, serial = c.execute(
+    """SELECT cc.device, cc.closed_at, cc.drive_id, d.serial
+       FROM cartridge_contacts cc LEFT JOIN drives d ON d.id = cc.drive_id
+       WHERE cc.id = ?""", (cid,)).fetchone()
+bad = []
+if device != by_id:
+    bad.append(f"contact records device {device!r}, not the by-id spelling {by_id!r} -- "
+               "the spelling never reached tapectl")
+if closed_at is None:
+    bad.append("contact did not close")
+if drive_id is None:
+    bad.append("drive_id is NULL -- the by-id spelling found no backend at contact open")
+elif serial != want:
+    bad.append(f"drive_id names serial {serial!r}, not the gate drive {want!r}")
+n_health = c.execute("SELECT COUNT(*) FROM health_logs WHERE contact_id = ?", (cid,)).fetchone()[0]
+if n_health < 1:
+    bad.append("no health_logs row for this contact -- health collection did not find the "
+               "backend for the by-id spelling (issue #313's shape)")
+n_zero = c.execute(
+    "SELECT COUNT(*) FROM log_page_journal WHERE contact_id = ? AND page_code = 0",
+    (cid,)).fetchone()[0]
+if n_zero < 1:
+    bad.append("no log_page_journal page 0x00 row for this contact -- no sweep ran")
+assert not bad, f"by-id verify contact {cid}:\n  " + "\n  ".join(bad)
+print(f"contact {cid}: device {device}, drive {serial}, {n_health} health row(s), page 0x00 swept")
+PYBYID
+}
+check health_by_id_device step_health_by_id_device
+
 # ---------- journals leg: the forensics journals (issue #319) ----------
 # Migrations 022 (`mam_journal`, #297) and 023 (`log_page_journal`, #298)
 # journal every MAM read and every sg_logs page read verbatim, against the
