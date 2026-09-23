@@ -174,3 +174,34 @@ reporting are all deliberately **out of the gating set**. They can be added at a
 journalled data. A contact that happens before the journal exists is unrecorded forever —
 which is the CTO's own stated standard, and the whole reason the capture half gates the first
 production write and the analysis half does not.
+
+## Amendment, 2026-09-23 — read paths take a health reading too (#320)
+
+*Ruled by the CTO on 2026-09-23 ("yes" to #320's recommended option).*
+
+This ADR said **how** a log page is read (at most once per contact, journalled verbatim,
+consumers read the journal) but not **which commands** take a reading. Until now only
+`volume write`, `volume resume` and `volume verify` swept the log pages and wrote a
+`health_logs` row. The read paths took both MAM reads and, since #314, named their drive,
+but recorded no error counters.
+
+**Ruled: every read-path contact takes the same post-command sweep.** That means
+`restore unit`, `restore file`, `restore raw-volume` and `catalog rebuild --from-volume`,
+plus any other command that opens a contact to read tape data. They use the same
+`log_pages::sweep`, the same journal and the same `health_logs` row, with a new reading
+kind for restore. The operation vocabulary is free text (§4), so no migration follows from
+the kind itself.
+
+**Why:** a drive fault shows up on the read path. Read-error counters (page 0x03) taken
+during a restore are the most direct evidence this suite has for "is it the drive or the
+tape?", and #314 attributed every contact to a drive for the same reason.
+
+**Accepted costs.** One sweep per read-path contact (13 LOG SENSE on mhvtl, 22 on the HP
+LTO-6), plus one INQUIRY. If 0x2E proves to be read-to-clear, a restore now consumes the
+TapeAlert flags. Nothing is lost, because they are journalled against that contact and
+consumers read the journal (§ "Two hazards"). The once-per-contact rule is unchanged: a read
+path must not add a second sweep to a contact that already has one.
+
+**Not changed:** a command killed before it finishes takes no sweep, because collection
+runs after the command. That remains a known gap in post-command collection. It is not
+repaired by guessing.
