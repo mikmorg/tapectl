@@ -16,7 +16,7 @@
 //! `bind_cartridge`), so a tape verified quarterly for five years still reads
 //! `total_load_count = 1`.
 //!
-//! # The seam is a guard, and the guard never reads the drive
+//! # The seam is a guard, and the guard never reads the medium
 //!
 //! [`ContactGuard::open`] inserts the row; [`ContactGuard::finish`] closes it;
 //! `Drop` without a `finish` leaves `closed_at` NULL — crash-honest by
@@ -28,9 +28,22 @@
 //! **No MAM read happens in here.** The `st` driver refuses a second
 //! concurrent open, which is why every call site already performs its MAM read
 //! *before* opening its store; the opener takes the [`MamInfo`] the caller is
-//! already holding ([`Medium::Observed`]). That is also what makes the whole
-//! seam testable with no hardware: no ungated test in this module opens a
-//! device node or reads `/sys`.
+//! already holding ([`Medium::Observed`]).
+//!
+//! **The drive, on the other hand, is asked who it is — at every contact
+//! (issue #314).** ADR-0013 §1 says every record takes a drive FK, and until
+//! #314 only the paths that also collected sg_logs health ever attached one,
+//! so `volume init` and every read path recorded contacts with no drive. The
+//! identity read ([`drive_identity::read_identity`]: sysfs, VPD page 0x80, an
+//! `sg_inq` fallback on the sg node) is an INQUIRY and reads **no log page**,
+//! so it cannot disturb a read-to-clear counter — the health sweep stays the
+//! one log-page reader (issue #298). It uses the backend the caller already
+//! resolved ([`Medium::Observed`]); with none (`NoBackend`, the DR machine)
+//! nothing is asked and `drive_id` stays NULL. Ungated tests supply the
+//! identity instead ([`ContactSite::with_drive_identity`],
+//! [`ContactSlot::with_drive_identity`]); a test that opens an `Observed`
+//! contact WITHOUT one really runs the read, against its fixture's
+//! nonexistent device paths, and gets no serial.
 //!
 //! # Recording a contact can never refuse a command
 //!
@@ -60,6 +73,7 @@ use tracing::warn;
 
 use crate::config::{Config, LtoBackendConfig};
 use crate::error::Result;
+use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::mam::{MamCapture, MamInfo};
 use crate::tape::mam_journal::{Hook, MamReads};
 
@@ -69,7 +83,7 @@ use crate::tape::mam_journal::{Hook, MamReads};
 // NULL with no reason is the data loss this whole suite exists to stop. They
 // are `const` rather than inline literals so the tests can assert them BY
 // VALUE — an `is_some()` assertion cannot tell one reason from another, and
-// these are five different operator situations with five different fixes.
+// these are four different operator situations with four different fixes.
 
 /// No `[[backends.lto]]` exists at all — the rebuilt machine with keys and no
 /// `backend add` yet (ADR-0005). No backend means no `device_sg`, so no MAM
@@ -81,19 +95,13 @@ pub const REASON_NO_BACKEND_CONFIGURED: &str = "no LTO backend is configured on 
 ///
 /// Distinct from [`REASON_NO_BACKEND_CONFIGURED`] because the fixes differ:
 /// one operator needs `backend add`, the other has a `--device` that names
-/// something their config does not. Related to issue #313, which is the same
-/// absence arriving by a different route on the health path — note that
+/// something their config does not. Issue #313 was the same absence arriving
+/// by a different route on the health path, whose lookup was a raw string
+/// compare; it now resolves through `config::device_matches` too — note that
 /// `config::resolve_device` canonicalizes, so a by-id path *does* match the
 /// `/dev/nstN` it resolves to here whenever both exist; this reason therefore
 /// states the fact and does not assert a cause.
 pub const REASON_DEVICE_MATCHED_NO_BACKEND: &str = "device path matched no configured backend";
-
-/// This code path performs no MAM read at all — `restore raw-volume`, the
-/// heir/DR path (ADR-0005), which deliberately consults nothing but the tape.
-///
-/// **The contact is still recorded.** A contact is a physical fact whether or
-/// not the cartridge could be identified.
-pub const REASON_MAM_NOT_ATTEMPTED: &str = "no MAM read is attempted on this path";
 
 /// The MAM was read and carried no medium serial — a blank or unreadable
 /// chip, or a medium whose `Medium serial number` attribute is absent (the
@@ -115,12 +123,18 @@ pub const REASON_NO_MEDIUM_SERIAL: &str = "MAM read yielded no medium serial";
 /// cartridge's identity is its chip serial).
 pub const REASON_SERIAL_UNREGISTERED: &str = "medium serial matches no registered cartridge";
 
-/// Every reason, for the tests that assert the set is closed and each member
-/// distinct.
+/// Every reason, for the tests that assert the set is closed, each member
+/// distinct, and each one written by production code.
+///
+/// Removed (issue #318): `"no MAM read is attempted on this path"`, once
+/// `REASON_MAM_NOT_ATTEMPTED`, written by `restore raw-volume` until it began
+/// taking a MAM read (#316) and by nothing after. A database written before
+/// then may still hold that string; nothing validates `identity_reason`
+/// against this list (no CHECK in migration 020, no reader), so such a row
+/// stays readable exactly as stored.
 pub const IDENTITY_REASONS: &[&str] = &[
     REASON_NO_BACKEND_CONFIGURED,
     REASON_DEVICE_MATCHED_NO_BACKEND,
-    REASON_MAM_NOT_ATTEMPTED,
     REASON_NO_MEDIUM_SERIAL,
     REASON_SERIAL_UNREGISTERED,
 ];
@@ -216,7 +230,7 @@ impl Operation {
 /// What the caller learned about the loaded medium **before** it opened its
 /// store — never a fresh read.
 ///
-/// The three arms are the three ways a contact can arrive at the guard, and
+/// The two arms are the two ways a contact can arrive at the guard, and
 /// they are not interchangeable: each maps to a different `identity_reason`,
 /// which is what makes "why is `cartridge_id` NULL" answerable from the row
 /// rather than only from a code comment.
@@ -231,8 +245,6 @@ pub enum Medium<'a> {
     },
     /// A backend had to resolve before a MAM read was possible, and none did.
     NoBackend,
-    /// This path performs no MAM read at all (`restore raw-volume`).
-    NotAttempted,
 }
 
 impl<'a> Medium<'a> {
@@ -254,7 +266,7 @@ impl<'a> Medium<'a> {
     pub fn serial(&self) -> Option<&'a str> {
         match self {
             Medium::Observed { mam, .. } => mam.serial.as_deref(),
-            Medium::NoBackend | Medium::NotAttempted => None,
+            Medium::NoBackend => None,
         }
     }
 }
@@ -287,6 +299,10 @@ pub struct ContactSite<'a> {
     /// against this contact the moment it opens (issue #297). `None` for a
     /// site whose caller took no MAM read.
     mam_reads: Option<&'a MamReads<'a>>,
+    /// The drive's identity AS IF the drive had said it — the test seam
+    /// (issue #314). `None`, the production default, asks the drive itself
+    /// ([`drive_identity::read_identity`]).
+    drive_identity: Option<&'a DriveIdentity>,
 }
 
 impl<'a> ContactSite<'a> {
@@ -302,7 +318,18 @@ impl<'a> ContactSite<'a> {
             device,
             medium,
             mam_reads: None,
+            drive_identity: None,
         }
+    }
+
+    /// Answer "which drive is this?" with `identity` instead of asking the
+    /// drive — how an ungated test, which has no drive, drives the
+    /// attribution [`open`] makes (issue #314). Production never calls it.
+    ///
+    /// [`open`]: ContactSite::open
+    pub fn with_drive_identity(mut self, identity: &'a DriveIdentity) -> Self {
+        self.drive_identity = Some(identity);
+        self
     }
 
     /// Carry the MAM captures this command is holding, so [`open`] journals
@@ -335,13 +362,14 @@ impl<'a> ContactSite<'a> {
     /// — NULL if the contact's own INSERT failed: the reads happened either
     /// way, and a journal row with no contact beats no journal row.
     pub fn open<'c>(&self, conn: &'c Connection, volume_id: Option<i64>) -> ContactGuard<'c> {
-        let guard = ContactGuard::open(
+        let guard = ContactGuard::open_with_identity(
             conn,
             self.config,
             self.operation,
             self.device,
             volume_id,
             self.medium,
+            self.drive_identity,
         );
         if let Some(reads) = self.mam_reads {
             reads.attach(guard.id());
@@ -365,24 +393,56 @@ impl<'a> ContactSite<'a> {
 /// [`fill`](ContactSlot::fill)s it at the MAM read, and the entry point
 /// closes whatever is in it on the way out — including on the paths that
 /// never filled it, where closing nothing is exactly right.
-pub struct ContactSlot<'a>(Option<ContactGuard<'a>>);
+pub struct ContactSlot<'a> {
+    guard: Option<ContactGuard<'a>>,
+    /// The test seam [`ContactSite::with_drive_identity`] is for the read
+    /// paths, here for the three write paths (issue #314). `None`, the
+    /// production default, asks the drive itself.
+    drive_identity: Option<DriveIdentity>,
+}
 
 impl<'a> ContactSlot<'a> {
     pub fn empty() -> Self {
-        ContactSlot(None)
+        ContactSlot {
+            guard: None,
+            drive_identity: None,
+        }
     }
 
-    /// Record that the contact has begun, and hand back the guard so the
-    /// caller can still [`record_cartridge`](ContactGuard::record_cartridge)
-    /// on it.
-    pub fn fill(&mut self, guard: ContactGuard<'a>) -> &ContactGuard<'a> {
-        self.0.insert(guard)
+    /// See [`ContactSite::with_drive_identity`]. Production never calls it.
+    pub fn with_drive_identity(mut self, identity: DriveIdentity) -> Self {
+        self.drive_identity = Some(identity);
+        self
+    }
+
+    /// Record that the contact has begun ([`ContactGuard::open`]), and hand
+    /// back the guard so the caller can still
+    /// [`record_cartridge`](ContactGuard::record_cartridge) on it.
+    pub fn open(
+        &mut self,
+        conn: &'a Connection,
+        config: &Config,
+        operation: Operation,
+        device: &str,
+        volume_id: Option<i64>,
+        medium: Medium<'_>,
+    ) -> &ContactGuard<'a> {
+        let guard = ContactGuard::open_with_identity(
+            conn,
+            config,
+            operation,
+            device,
+            volume_id,
+            medium,
+            self.drive_identity.as_ref(),
+        );
+        self.guard.insert(guard)
     }
 
     /// Close whatever contact was made, returning the result unchanged.
-    /// A slot that was never filled closes nothing.
+    /// A slot that was never opened closes nothing.
     pub fn finish_result<T>(self, r: Result<T>) -> Result<T> {
-        match self.0 {
+        match self.guard {
             Some(guard) => guard.finish_result(r),
             None => r,
         }
@@ -416,6 +476,10 @@ pub struct ContactGuard<'a> {
 
 impl<'a> ContactGuard<'a> {
     /// Record that a contact has begun. Infallible by design.
+    ///
+    /// Asks the drive who it is (see [`open_with_identity`]).
+    ///
+    /// [`open_with_identity`]: ContactGuard::open_with_identity
     pub fn open(
         conn: &'a Connection,
         config: &Config,
@@ -424,6 +488,30 @@ impl<'a> ContactGuard<'a> {
         volume_id: Option<i64>,
         medium: Medium<'_>,
     ) -> ContactGuard<'a> {
+        Self::open_with_identity(conn, config, operation, device, volume_id, medium, None)
+    }
+
+    /// [`open`](ContactGuard::open), with the drive's identity supplied
+    /// rather than read when `given` is `Some` — the test seam.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_identity(
+        conn: &'a Connection,
+        config: &Config,
+        operation: Operation,
+        device: &str,
+        volume_id: Option<i64>,
+        medium: Medium<'_>,
+        given: Option<&DriveIdentity>,
+    ) -> ContactGuard<'a> {
+        // Which drive (ADR-0013 §1, issue #314) — asked of the backend the
+        // caller already resolved, never looked up again here. Only an
+        // Observed medium carries one: `NoBackend` is the DR machine with
+        // no `device_sg` to ask, and its contact names no drive — unknown,
+        // recorded by absence.
+        let drive_id = match medium {
+            Medium::Observed { backend, .. } => identify_drive(conn, backend, given),
+            Medium::NoBackend => None,
+        };
         let (backend_name, chip_load_count, cartridge_id, identity_reason) = match medium {
             Medium::Observed { backend, mam } => {
                 let (cartridge_id, reason) = match mam.serial.as_deref() {
@@ -448,27 +536,13 @@ impl<'a> ContactGuard<'a> {
                 };
                 (None, None, None, Some(reason))
             }
-            // The backend is still worth recording: it is contact
-            // provenance ("how was this contact made"), not drive identity,
-            // and `restore raw-volume` can perfectly well run on a machine
-            // that HAS a configured drive — it simply declines to ask the
-            // medium who it is.
-            Medium::NotAttempted => {
-                let name = config
-                    .backends
-                    .lto
-                    .iter()
-                    .find(|b| crate::config::device_matches(&b.device_tape, device))
-                    .map(|b| b.name.clone());
-                (name, None, None, Some(REASON_MAM_NOT_ATTEMPTED))
-            }
         };
 
         let inserted = conn.execute(
             "INSERT INTO cartridge_contacts
                  (cartridge_id, volume_id, drive_id, operation, device, backend_name,
                   identity_reason, chip_load_count)
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?8, ?3, ?4, ?5, ?6, ?7)",
             params![
                 cartridge_id,
                 volume_id,
@@ -477,6 +551,7 @@ impl<'a> ContactGuard<'a> {
                 backend_name,
                 identity_reason,
                 chip_load_count,
+                drive_id,
             ],
         );
         let id = match inserted {
@@ -546,9 +621,13 @@ impl<'a> ContactGuard<'a> {
     /// Attach the drive this contact talked to (ADR-0013 §1), once
     /// `drive_identity::upsert` has produced a row for it.
     ///
-    /// Only the paths that collect drive health ask the drive who it is, so
-    /// the read paths leave this NULL — which is honest: unknown is recorded
-    /// by absence, never guessed.
+    /// Every contact with a resolved backend already names its drive from
+    /// the moment it opens (issue #314, [`ContactGuard::open`]); this is the
+    /// by-guard form of [`record_drive_for`], which the health path uses to
+    /// attach the same drive again — the same serial upserts to the same
+    /// `drives` row, so that second write agrees with the first. A contact
+    /// whose drive gave no serial stays NULL: unknown is recorded by
+    /// absence, never guessed.
     pub fn record_drive(&self, drive_id: i64) {
         let Some(id) = self.id else {
             return;
@@ -613,6 +692,42 @@ impl Drop for ContactGuard<'_> {
                     "contact was not closed; closed_at stays NULL"
                 );
             }
+        }
+    }
+}
+
+/// The `drives` row for the drive `backend` names, if it will say who it is.
+///
+/// [`drive_identity::read_identity`] is sysfs + VPD page 0x80 (with an
+/// `sg_inq --page=0x80` fallback): an INQUIRY, and **no log page**. That is
+/// the whole reason it may run at every contact — the ADR-0013 hazard is a
+/// second read of a read-to-clear page such as 0x2E, and the health sweep
+/// stays the only log-page reader (issue #298).
+///
+/// Best-effort like everything here: no serial is no row and `None` (an
+/// unidentifiable drive is unknown, never guessed — [`drive_identity::upsert`]),
+/// and an upsert error warns and is `None`. Neither refuses the command.
+fn identify_drive(
+    conn: &Connection,
+    backend: &LtoBackendConfig,
+    given: Option<&DriveIdentity>,
+) -> Option<i64> {
+    let identity = match given {
+        Some(identity) => identity.clone(),
+        None => drive_identity::read_identity(backend),
+    };
+    match drive_identity::upsert(conn, &identity) {
+        Ok(Some(drive_id)) => Some(drive_id),
+        Ok(None) => {
+            warn!(
+                device = %backend.device_tape,
+                "drive identity unavailable (no serial); this contact is recorded without a drive"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(err = %e, device = %backend.device_tape, "drives upsert failed");
+            None
         }
     }
 }
@@ -858,6 +973,99 @@ mod tests {
         }
     }
 
+    /// ADR-0013 §4's writer rule, applied to the identity reasons (issue
+    /// #318): **every entry of [`IDENTITY_REASONS`] has a production
+    /// writer.** The operation scan above never covered them, and
+    /// `REASON_MAM_NOT_ATTEMPTED` outlived its last writer (`restore
+    /// raw-volume` began taking a MAM read, #316) with nothing to say so.
+    ///
+    /// Reasons are written INSIDE this file (by [`ContactGuard::open`]), so
+    /// unlike the operation scan this one reads this file too — its
+    /// production half only, with the vocabulary's own declarations (each
+    /// `pub const REASON_*` line and the `IDENTITY_REASONS` array) and every
+    /// comment line removed, so neither a definition nor a doc
+    /// cross-reference can pass for a writer. Every other source file's
+    /// production half is read as well.
+    #[test]
+    fn every_identity_reason_has_a_production_writer() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_file = src.join("tape").join("contact.rs");
+        let production = |text: &str| -> String {
+            match text.find("#[cfg(test)]\nmod tests") {
+                Some(i) => text[..i].to_string(),
+                None => text.to_string(),
+            }
+        };
+
+        // The names behind the values: parsed from the declarations, and
+        // required to be exactly the list — a declared reason missing from
+        // the list, or a listed value with no declaration, fails here.
+        let this = std::fs::read_to_string(&this_file).unwrap();
+        let declared: Vec<(String, String)> = production(&this)
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim_start().strip_prefix("pub const REASON_")?;
+                let name = format!("REASON_{}", rest.split(':').next()?);
+                let value = l.split('"').nth(1)?.to_string();
+                Some((name, value))
+            })
+            .collect();
+        let mut declared_values: Vec<&str> = declared.iter().map(|(_, v)| v.as_str()).collect();
+        let mut listed: Vec<&str> = IDENTITY_REASONS.to_vec();
+        declared_values.sort();
+        listed.sort();
+        assert_eq!(
+            declared_values, listed,
+            "IDENTITY_REASONS must be exactly the declared REASON_* constants"
+        );
+
+        let mut corpus = String::new();
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let mut prod = production(&text);
+            if entry.path() == this_file {
+                let start = prod
+                    .find("pub const IDENTITY_REASONS")
+                    .expect("the list is declared here");
+                let end = start + prod[start..].find("];").unwrap() + 2;
+                prod.replace_range(start..end, "");
+            }
+            for line in prod.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("pub const REASON_") {
+                    continue;
+                }
+                corpus.push_str(line);
+                corpus.push('\n');
+            }
+        }
+        // Positive controls on the scan itself: it read THIS file's
+        // production half (the reasons' writer) and other files' too.
+        assert!(
+            corpus.contains("fn open_with_identity") && corpus.contains("Medium::from_read("),
+            "positive control: the source scan must actually have read the writers"
+        );
+        assert!(
+            !declared.is_empty(),
+            "positive control: the declarations were parsed"
+        );
+        for (name, _) in &declared {
+            assert!(
+                corpus.contains(name.as_str()),
+                "{name} has no production writer — an identity reason no code can \
+                 record is the vocabulary-with-no-writer defect ADR-0013 §4 names"
+            );
+        }
+    }
+
     #[test]
     fn finish_records_the_closing_time_and_the_outcome() {
         let conn = crate::db::open_memory().unwrap();
@@ -936,7 +1144,7 @@ mod tests {
             Operation::VolumeWrite,
             "/dev/null",
             None,
-            Medium::NotAttempted,
+            Medium::NoBackend,
         );
         guard.finish(OUTCOME_OK, None);
         let closed: i64 = conn
@@ -995,38 +1203,6 @@ mod tests {
              share a string"
         );
         assert_eq!(row.4, "/dev/tape/by-id/scsi-NOSUCH-nst", "device verbatim");
-    }
-
-    /// `restore raw-volume` — the heir/DR path (ADR-0005), which reads no
-    /// serial at all. **The contact is a physical fact whether or not the
-    /// cartridge could be identified**, so the row exists.
-    #[test]
-    fn a_contact_on_a_path_that_reads_no_mam_names_that_reason() {
-        let conn = crate::db::open_memory().unwrap();
-        let config = config_with_backend();
-        ContactGuard::open(
-            &conn,
-            &config,
-            Operation::RestoreRawVolume,
-            "/dev/null",
-            None,
-            Medium::NotAttempted,
-        )
-        .finish(OUTCOME_OK, None);
-
-        // The mandated positive control: the row EXISTS and names its reason.
-        // "no error" alone cannot tell "recorded unidentified" from "recorded
-        // nothing" (issues #282/#284/#285/#293).
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1, "an unidentifiable contact still writes its row");
-        let row = only_row(&conn);
-        assert_eq!(row.0, None);
-        assert_eq!(row.6.as_deref(), Some(REASON_MAM_NOT_ATTEMPTED));
-        assert_eq!(row.3, "restore raw-volume");
-        // Contact provenance survives even though identity does not.
-        assert_eq!(row.5.as_deref(), Some("lto0"));
     }
 
     #[test]
@@ -1261,23 +1437,121 @@ mod tests {
         .unwrap();
         let drive_id = conn.last_insert_rowid();
 
+        // NoBackend: no drive is asked at open (issue #314), so the
+        // attachment below is the only one.
         let guard = ContactGuard::open(
             &conn,
             &config,
             Operation::VolumeWrite,
             "/dev/null",
             None,
-            Medium::NotAttempted,
+            Medium::NoBackend,
         );
         assert_eq!(
             only_row(&conn).2,
             None,
-            "precondition: a contact opens with no drive attached"
+            "precondition: a contact with no backend opens with no drive attached"
         );
         guard.record_drive(drive_id);
         guard.finish(OUTCOME_OK, None);
 
         assert_eq!(only_row(&conn).2, Some(drive_id));
+    }
+
+    fn drive(serial: Option<&str>) -> DriveIdentity {
+        DriveIdentity {
+            serial: serial.map(str::to_string),
+            vendor: Some("IBM".to_string()),
+            model: Some("ULT3580-TD8".to_string()),
+            firmware_rev: Some("0107".to_string()),
+        }
+    }
+
+    fn contact_drive_serial(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT d.serial FROM cartridge_contacts c LEFT JOIN drives d ON d.id = c.drive_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #314, at the guard: a contact names its drive the moment it
+    /// opens, from the identity read alone — not only when the command
+    /// also collects health. Asserted by the drive row's SERIAL, through
+    /// the foreign key.
+    #[test]
+    fn a_contact_opens_naming_the_drive_that_identified_itself() {
+        let conn = crate::db::open_memory().unwrap();
+        let config = config_with_backend();
+        let mam = mam_with_serial(None, None);
+        let identity = drive(Some("XYZZY_A1"));
+        ContactGuard::open_with_identity(
+            &conn,
+            &config,
+            Operation::VolumeIdentify,
+            "/dev/null",
+            None,
+            Medium::Observed {
+                backend: &backend(),
+                mam: &mam,
+            },
+            Some(&identity),
+        )
+        .finish(OUTCOME_OK, None);
+        assert_eq!(contact_drive_serial(&conn).as_deref(), Some("XYZZY_A1"));
+    }
+
+    /// No serial ⇒ NULL `drive_id` and no `drives` row: unknown is recorded
+    /// by absence, never a row keyed on what the drive DID say.
+    #[test]
+    fn a_contact_whose_drive_gave_no_serial_names_no_drive() {
+        let conn = crate::db::open_memory().unwrap();
+        let config = config_with_backend();
+        let mam = mam_with_serial(None, None);
+        let identity = drive(None);
+        ContactGuard::open_with_identity(
+            &conn,
+            &config,
+            Operation::VolumeIdentify,
+            "/dev/null",
+            None,
+            Medium::Observed {
+                backend: &backend(),
+                mam: &mam,
+            },
+            Some(&identity),
+        )
+        .finish(OUTCOME_OK, None);
+        assert_eq!(only_row(&conn).2, None);
+        let drives: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drives, 0);
+    }
+
+    /// No backend (the DR machine) ⇒ nothing to ask, so the identity is not
+    /// consulted even when one is on offer. The test two above is the
+    /// positive control: the SAME identity, with a backend, is recorded.
+    #[test]
+    fn a_contact_with_no_backend_names_no_drive() {
+        let conn = crate::db::open_memory().unwrap();
+        let identity = drive(Some("XYZZY_A1"));
+        ContactGuard::open_with_identity(
+            &conn,
+            &Config::default(),
+            Operation::CatalogRebuild,
+            "/dev/null",
+            None,
+            Medium::NoBackend,
+            Some(&identity),
+        )
+        .finish(OUTCOME_OK, None);
+        assert_eq!(only_row(&conn).2, None);
+        assert_eq!(
+            only_row(&conn).6.as_deref(),
+            Some(REASON_NO_BACKEND_CONFIGURED)
+        );
     }
 
     /// Issue #297: an inert guard still journals the MAM read it was opened

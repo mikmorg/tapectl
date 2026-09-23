@@ -11,7 +11,7 @@ use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
 use crate::staging;
-use crate::tape::contact::{self, ContactGuard, ContactSite, ContactSlot, Medium, Operation};
+use crate::tape::contact::{self, ContactSite, ContactSlot, Medium, Operation};
 use crate::tape::drive_identity;
 use crate::tape::health;
 use crate::tape::log_pages;
@@ -238,7 +238,7 @@ fn volume_init_contacted<'c>(
     // Everything from here down is inside the contact, including the six
     // ADR-0010/ADR-0012 fact refusals, each of which really did happen with
     // a tape loaded.
-    let contact = contact.fill(ContactGuard::open(
+    let contact = contact.open(
         conn,
         config,
         Operation::VolumeInit,
@@ -248,7 +248,7 @@ fn volume_init_contacted<'c>(
             backend,
             mam: &det.mam,
         },
-    ));
+    );
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeInit, Hook::VolumeInit, &det.capture);
@@ -1032,7 +1032,7 @@ fn volume_write_contacted<'c>(
     // THE CONTACT BEGINS HERE, at the same one read of the medium the three
     // refusals below consult — the `st` driver refuses a second concurrent
     // open, so there is no second reading to be had and none is taken.
-    let contact = contact.fill(ContactGuard::open(
+    let contact = contact.open(
         conn,
         config,
         Operation::VolumeWrite,
@@ -1042,7 +1042,7 @@ fn volume_write_contacted<'c>(
             backend,
             mam: &det.mam,
         },
-    ));
+    );
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &det.capture);
@@ -1459,7 +1459,7 @@ fn volume_resume_contacted<'c>(
     // THE CONTACT BEGINS HERE — resume's `det` is this contact's own reading
     // of the tape, exactly like `volume_write`'s, and the contact records
     // the same one.
-    let contact = contact.fill(ContactGuard::open(
+    let contact = contact.open(
         conn,
         config,
         Operation::VolumeResume,
@@ -1469,7 +1469,7 @@ fn volume_resume_contacted<'c>(
             backend,
             mam: &det.mam,
         },
-    ));
+    );
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeResume, Hook::VolumeResume, &det.capture);
@@ -2457,8 +2457,8 @@ fn collect_health_best_effort(
     operation: health::Reading,
     trigger: Operation,
 ) {
-    if let Some(bk) = config.backends.lto.iter().find(|b| b.device_tape == device) {
-        collect_and_record_health(
+    match health_backend(config, device) {
+        Ok(bk) => collect_and_record_health(
             conn,
             bk,
             Some(volume_id),
@@ -2466,8 +2466,37 @@ fn collect_health_best_effort(
             None,
             operation,
             trigger,
-        );
+        ),
+        Err(unattributed) => warn!("{unattributed}"),
     }
+}
+
+/// The configured backend a health collection on `device` reads through,
+/// or — when none claims it — the warning that says so.
+///
+/// `Err` is not a failure of the command: a contact happened and the
+/// catalog cannot attribute it to a drive (issue #313). It is returned
+/// rather than logged here so the "looked and matched nothing" case is
+/// assertable by value, distinct from "never looked" — the shape issues
+/// #282/#284/#285/#293 were all bitten by.
+fn health_backend<'a>(
+    config: &'a Config,
+    device: &str,
+) -> std::result::Result<&'a crate::config::LtoBackendConfig, String> {
+    config
+        .backends
+        .lto
+        .iter()
+        // The ONE resolver (`config::device_matches`, canonicalizing), the
+        // same one `resolve_device` and `ContactGuard::open` use — issue
+        // #187 was two lookups of one backend disagreeing on a spelling.
+        .find(|b| crate::config::device_matches(&b.device_tape, device))
+        .ok_or_else(|| {
+            format!(
+                "device {device} matched no configured [[backends.lto]] entry; drive health \
+                 (sg_logs) was not collected and this contact is not attributed to a drive"
+            )
+        })
 }
 
 /// The hardware half of a health reading: ONE log-page sweep
@@ -2573,7 +2602,10 @@ pub(crate) fn record_sweep_and_health(
 ///    on the verify path the guard has already closed
 ///    ([`contact::record_drive_for`]). Attempted on the sg_logs-failed path
 ///    too: a drive whose counters could not be read is still the drive that
-///    was contacted.
+///    was contacted. Since issue #314 the contact already names its drive
+///    from the moment it opened; this second attachment writes the same id
+///    (same serial, same `drives` row) and never writes NULL, so a reading
+///    that could not identify the drive leaves the open's attribution.
 ///
 /// Returns the `drives.id` attached, if any. Best-effort throughout: every
 /// failure is a warning, never an error.
@@ -2606,7 +2638,7 @@ pub(crate) fn record_health_and_drive(
         Ok(None) => {
             warn!(
                 device = %device_for_log,
-                "drive identity unavailable (no serial); this contact is recorded without a drive"
+                "drive identity unavailable (no serial) at health collection; no drive attached by this reading"
             );
             None
         }
@@ -5266,6 +5298,68 @@ mod tests {
     /// "this contact got this drive". `collect_health_best_effort` only
     /// WARNS on a failed insert, so the rows are asserted to EXIST, not
     /// inferred from the absence of an error.
+    /// Issue #314: a contact now names its drive when it OPENS; the health
+    /// path then attaches a drive again, by id. That second write must be
+    /// harmless: the same serial upserts to the same `drives` row, so the
+    /// contact's `drive_id` is unchanged and no second drive appears. And a
+    /// health reading that could NOT identify the drive must not erase the
+    /// attribution the open made — `record_health_and_drive` only ever
+    /// writes an id, never NULL.
+    #[test]
+    fn the_health_paths_second_drive_attachment_agrees_with_the_one_at_open() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('HR-OPEN', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let vid = conn.last_insert_rowid();
+        let mam = MamInfo::default();
+        let at_open = identity_with_serial(Some("HUJ808A5L4"));
+        let guard = site_observed(Operation::VolumeWrite, &mam)
+            .with_drive_identity(&at_open)
+            .open(&conn, Some(vid));
+        let cid = guard.id().expect("a live contact");
+        guard.finish(contact::OUTCOME_OK, None);
+        let opened_with = drive_of_contact(&conn, cid).expect("attributed at open");
+
+        let counters = health::HealthCounters::default();
+        let again = record_health_and_drive(
+            &conn,
+            Some(vid),
+            Some(cid),
+            None,
+            health::Reading::Write,
+            Some((&counters, "raw")),
+            identity_with_serial(Some("HUJ808A5L4")),
+            "/dev/nst-test",
+        );
+        assert_eq!(again, Some(opened_with), "same serial, same drives row");
+        assert_eq!(drive_of_contact(&conn, cid), Some(opened_with));
+
+        let unidentified = record_health_and_drive(
+            &conn,
+            Some(vid),
+            Some(cid),
+            None,
+            health::Reading::Write,
+            Some((&counters, "raw")),
+            identity_with_serial(None),
+            "/dev/nst-test",
+        );
+        assert_eq!(unidentified, None);
+        assert_eq!(
+            drive_of_contact(&conn, cid),
+            Some(opened_with),
+            "a later reading that could not identify the drive leaves the open's attribution"
+        );
+        let drives: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drives, 1);
+    }
+
     #[test]
     fn a_health_reading_names_its_contact_and_the_contact_names_its_drive() {
         let conn = crate::db::open_memory().unwrap();
@@ -5538,6 +5632,89 @@ mod tests {
     /// value above; what no ungated test can drive is the three CALLERS
     /// (`sg_logs` needs a drive), so their wiring is pinned by source scan —
     /// calibrated by a positive control that the scan found each one.
+    /// A config with ONE backend whose `device_tape` is `tape` — a real
+    /// file, so `config::device_matches` has something to canonicalize.
+    fn health_backend_config(tape: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.backends.lto.push(crate::config::LtoBackendConfig {
+            name: "by-id-drive".to_string(),
+            device_tape: tape.display().to_string(),
+            device_sg: "/nonexistent/tapectl-health-backend-sg".to_string(),
+            generation: "LTO-6".to_string(),
+            capacity_override: None,
+            usable_capacity_factor: 0.95,
+            enospc_buffer: "1GiB".to_string(),
+        });
+        config
+    }
+
+    /// Issue #313: `--device` spelled BY-ID — the form `CLAUDE.md` tells the
+    /// operator to use — must find the backend configured as `/dev/nstN`.
+    /// Before the fix the lookup was a raw string compare, so the by-id
+    /// spelling silently skipped the whole health block: no sweep, no health
+    /// row, no drive. Asserted on the resolved backend's NAME, not merely on
+    /// the absence of an error.
+    #[test]
+    fn a_by_id_device_spelling_finds_its_health_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nst = tmp.path().join("nst1");
+        std::fs::File::create(&nst).unwrap();
+        let by_id = tmp.path().join("scsi-XYZZY_A1-nst");
+        std::os::unix::fs::symlink(&nst, &by_id).unwrap();
+        let config = health_backend_config(&nst);
+
+        // Positive control: the configured spelling itself resolves.
+        assert_eq!(
+            health_backend(&config, &nst.display().to_string())
+                .unwrap()
+                .name,
+            "by-id-drive"
+        );
+        let found = health_backend(&config, &by_id.display().to_string())
+            .expect("a by-id symlink to the configured node must resolve to its backend");
+        assert_eq!(found.name, "by-id-drive");
+    }
+
+    /// The paired negative for #313: a device no backend claims is LOOKED
+    /// UP and reported — an `Err` naming the device, which the caller warns
+    /// with — distinguishable by construction from a lookup that never ran.
+    /// And `collect_health_best_effort` on it records nothing and fails
+    /// nothing.
+    #[test]
+    fn a_device_matching_no_backend_says_so_rather_than_falling_silent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nst = tmp.path().join("nst1");
+        std::fs::File::create(&nst).unwrap();
+        let other = tmp.path().join("nst7");
+        std::fs::File::create(&other).unwrap();
+        let config = health_backend_config(&nst);
+        let device = other.display().to_string();
+
+        let msg = health_backend(&config, &device)
+            .expect_err("a device naming a different node must not resolve");
+        assert!(msg.contains(&device), "the warning names the device: {msg}");
+        assert!(
+            msg.contains("not attributed to a drive"),
+            "the warning says what was lost: {msg}"
+        );
+
+        let conn = crate::db::open_memory().unwrap();
+        let (vid, cid) = contact_and_volume(&conn, "HB-NONE");
+        collect_health_best_effort(
+            &conn,
+            &config,
+            &device,
+            vid,
+            Some(cid),
+            health::Reading::Write,
+            Operation::VolumeWrite,
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "no backend, so no reading was taken");
+    }
+
     #[test]
     fn every_health_writer_passes_its_contact() {
         const SRC: &str = include_str!("write.rs");
@@ -10530,7 +10707,7 @@ mod tests {
                 let end = SRC[start..].find("\n}\n").unwrap() + start;
                 let body = &SRC[start..end];
                 assert!(!body[f.len()..].contains("\npub fn "), "{f}: scan overran");
-                let fill = body.find("contact.fill(ContactGuard::open(").unwrap();
+                let fill = body.find("contact.open(").unwrap();
                 let call =
                     format!("contact.journal_mam(Operation::{op}, Hook::{op}, &det.capture);");
                 let journal = body
@@ -10625,14 +10802,12 @@ mod tests {
                 let detect = body
                     .find("media_detect::detect(")
                     .unwrap_or_else(|| panic!("{f} no longer reads the MAM at all"));
-                let fill = body
-                    .find("contact.fill(ContactGuard::open(")
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "{f} no longer opens its contact. A write path that reaches the \
+                let fill = body.find("contact.open(").unwrap_or_else(|| {
+                    panic!(
+                        "{f} no longer opens its contact. A write path that reaches the \
                          drive and records nothing is issue #296 returning."
-                        )
-                    });
+                    )
+                });
                 assert!(
                     detect < fill,
                     "{f} must open its contact AFTER its own MAM read, from the reading it \
@@ -10641,10 +10816,18 @@ mod tests {
                      cannot happen"
                 );
                 assert_eq!(
-                    body.matches("ContactGuard::open(").count(),
+                    body.matches("contact.open(").count(),
                     1,
                     "{f} must open exactly ONE contact: one command holding the drive is \
                      one physical contact"
+                );
+                // Issue #314: through the SLOT, whose `open` carries the drive
+                // attribution (and its test seam) — a bare `ContactGuard::open`
+                // here would bypass the slot's injected identity.
+                assert_eq!(
+                    body.matches("ContactGuard::open").count(),
+                    0,
+                    "{f} must open its contact through its ContactSlot"
                 );
             }
         }
@@ -10683,6 +10866,62 @@ mod tests {
                 .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(vol, None);
+        }
+
+        /// `volume_init` through its slot, the drive answering `identity`:
+        /// the contact's drive serial (via the FK) and the `drives` count.
+        fn init_contact_drive(identity: drive_identity::DriveIdentity) -> (Option<String>, i64) {
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            let mut slot = ContactSlot::empty().with_drive_identity(identity);
+            let r = volume_init_contacted(
+                &conn,
+                &config,
+                "IC-DRIVE",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                None,
+                None,
+                &mut slot,
+            );
+            let err = slot.finish_result(r).unwrap_err().to_string();
+            assert!(err.contains("no medium serial"), "{err}");
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume init");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            let serial: Option<String> = conn
+                .query_row(
+                    "SELECT d.serial FROM cartridge_contacts c \
+                     LEFT JOIN drives d ON d.id = c.drive_id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let drives: i64 = conn
+                .query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+                .unwrap();
+            (serial, drives)
+        }
+
+        /// Issue #314: `volume init` collects no health, so its contact
+        /// never named a drive (5 of 5 NULL in the gate). It is attributed
+        /// at open, from the identity read alone — the refused init here
+        /// included: the cartridge WAS in that drive.
+        #[test]
+        fn an_init_contact_names_the_drive_it_was_made_with() {
+            let (serial, drives) = init_contact_drive(identity_with_serial(Some("XYZZY_A1")));
+            assert_eq!(serial.as_deref(), Some("XYZZY_A1"));
+            assert_eq!(drives, 1);
+        }
+
+        /// No serial: unknown by absence — NULL `drive_id`, no `drives` row.
+        #[test]
+        fn an_init_contact_with_no_drive_serial_names_no_drive() {
+            let (serial, drives) = init_contact_drive(identity_with_serial(None));
+            assert_eq!(serial, None);
+            assert_eq!(drives, 0);
         }
 
         /// The negative control for `volume init`: a label that already

@@ -153,8 +153,8 @@ pub fn restore_unit(
 /// **`site`'s medium is what the CLI read off the cartridge's MAM** (issue
 /// #316) — the same one-parameter shape as [`restore_unit_from_store`].
 /// This used to be hard-coded `Medium::NotAttempted`, so every raw-volume
-/// contact said `REASON_MAM_NOT_ATTEMPTED` ("no MAM read is attempted on this
-/// path") while the CLI arm had in fact read the MAM in `check_read_contact`
+/// contact said "no MAM read is attempted on this path" (both since removed
+/// as vocabulary with no writer, issue #318) while the CLI arm had in fact read the MAM in `check_read_contact`
 /// (issue #166) and the journal recorded that read (issue #297) — the
 /// contact denied a read its own journal rows proved. The CLI now takes the
 /// same two reads every other read path takes (ADR-0013 §5):
@@ -802,8 +802,8 @@ mod tests {
 
     /// The `ContactSite` a `MemStore` test has: no configured backend, the
     /// honest description of a machine with no drive at all (ADR-0005's DR
-    /// shape). Nothing here opens the device path; the contact seam never
-    /// reads the drive.
+    /// shape). Nothing here opens the device path: with no backend the
+    /// contact asks no drive who it is (issue #314).
     fn site(operation: Operation) -> ContactSite<'static> {
         static CFG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
         ContactSite::new(
@@ -1737,8 +1737,8 @@ mod tests {
         }
 
         /// Issue #316: where the CLI read the MAM, the contact says what the
-        /// read found — not `REASON_MAM_NOT_ATTEMPTED`, which denied a read
-        /// the journal recorded. The serial is on no registered cartridge
+        /// read found — not the since-removed "no MAM read is attempted"
+        /// reason (issue #318), which denied a read the journal recorded. The serial is on no registered cartridge
         /// (a DR catalog that never saw this tape), so the reason is
         /// `REASON_SERIAL_UNREGISTERED`, and the backend the read went
         /// through is recorded.
@@ -1763,11 +1763,6 @@ mod tests {
                 },
             );
             assert_eq!(outcome.as_deref(), Some("failed"));
-            assert_ne!(
-                reason.as_deref(),
-                Some(crate::tape::contact::REASON_MAM_NOT_ATTEMPTED),
-                "the contact denies the MAM read the CLI took (issue #316)"
-            );
             assert_eq!(
                 reason.as_deref(),
                 Some(crate::tape::contact::REASON_SERIAL_UNREGISTERED)
@@ -1803,10 +1798,148 @@ mod tests {
             assert_eq!(reason, None);
         }
 
-        /// Positive control for the assertion above: the reason column is
-        /// live on this path. With no backend configured no MAM read
-        /// happens, and the contact says exactly that — by value, so the
-        /// `assert_ne!` above cannot pass on a column that is never written.
+        // ── issue #314: every contact names its drive ──
+
+        fn drive(serial: Option<&str>) -> crate::tape::drive_identity::DriveIdentity {
+            crate::tape::drive_identity::DriveIdentity {
+                serial: serial.map(str::to_string),
+                vendor: Some("HP".to_string()),
+                model: Some("Ultrium 6-SCSI".to_string()),
+                firmware_rev: Some("35GD".to_string()),
+            }
+        }
+
+        /// The serial of the drive the one contact row names, via the FK —
+        /// `None` when `drive_id` is NULL. By VALUE: "some drive id" cannot
+        /// pass for "this drive".
+        fn contact_drive_serial(conn: &Connection) -> Option<String> {
+            conn.query_row(
+                "SELECT d.serial FROM cartridge_contacts c LEFT JOIN drives d ON d.id = c.drive_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn drive_rows(conn: &Connection) -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM drives", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        /// `restore unit` over a store, with the backend resolved and the
+        /// drive answering `identity`. Returns the contact's drive serial.
+        fn restore_unit_drive(
+            conn: &Connection,
+            identity: &crate::tape::drive_identity::DriveIdentity,
+            observed: bool,
+        ) -> Option<String> {
+            seed(conn, "RD-VOL", "rd-unit");
+            let mut store = tape_labelled("RD-VOL");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let backend = lto0();
+            let mut config = Config::default();
+            if observed {
+                config.backends.lto.push(backend.clone());
+            }
+            let mam = crate::tape::mam::MamInfo::default();
+            let medium = if observed {
+                Medium::Observed {
+                    backend: &backend,
+                    mam: &mam,
+                }
+            } else {
+                Medium::NoBackend
+            };
+            let _ = restore_unit_from_store(
+                conn,
+                &paths,
+                &Config::default(),
+                "rd-unit",
+                "RD-VOL",
+                1,
+                &dest.path().to_string_lossy(),
+                &mut store,
+                ContactSite::new(&config, Operation::RestoreUnit, "/dev/null", medium)
+                    .with_drive_identity(identity),
+            );
+            assert_eq!(only_contact(conn).0, "restore unit");
+            contact_drive_serial(conn)
+        }
+
+        /// Issue #314: `restore unit` collects no health, so before the fix
+        /// its contact never named a drive (4 of 4 NULL in the gate). The
+        /// read path is exactly where a drive fault shows up — the contact
+        /// is attributed at open, from the identity read alone.
+        #[test]
+        fn a_restore_unit_contact_names_the_drive_it_was_made_with() {
+            let conn = crate::db::open_memory().unwrap();
+            let serial = restore_unit_drive(&conn, &drive(Some("HUJ808A5L4")), true);
+            assert_eq!(serial.as_deref(), Some("HUJ808A5L4"));
+        }
+
+        /// No serial: the drive is unknown, and unknown is recorded by
+        /// absence — NULL `drive_id`, and no `drives` row invented from the
+        /// vendor/model it did give.
+        #[test]
+        fn a_restore_unit_contact_with_no_drive_serial_names_no_drive() {
+            let conn = crate::db::open_memory().unwrap();
+            assert_eq!(restore_unit_drive(&conn, &drive(None), true), None);
+            assert_eq!(drive_rows(&conn), 0, "no serial, no drives row");
+        }
+
+        /// The DR machine: no backend configured, so nothing to ask — the
+        /// identity is never consulted even when one is on offer, and the
+        /// contact names no drive. The positive control is the test two
+        /// above: the SAME identity with a backend is recorded.
+        #[test]
+        fn a_restore_unit_contact_with_no_backend_names_no_drive() {
+            let conn = crate::db::open_memory().unwrap();
+            assert_eq!(
+                restore_unit_drive(&conn, &drive(Some("HUJ808A5L4")), false),
+                None
+            );
+            assert_eq!(drive_rows(&conn), 0, "no backend, no identity read");
+        }
+
+        /// `restore raw-volume` — a second read path, the heir/DR one —
+        /// names its drive the same way, through the same seam.
+        #[test]
+        fn a_restore_raw_volume_contact_names_the_drive_it_was_made_with() {
+            let conn = crate::db::open_memory().unwrap();
+            let backend = lto0();
+            let mut config = Config::default();
+            config.backends.lto.push(backend.clone());
+            let mam = crate::tape::mam::MamInfo::default();
+            let identity = drive(Some("XYZZY_A1"));
+            let mut store = tape_labelled("RAW-DRIVE");
+            let dest = TempDir::new().unwrap();
+            let _ = restore_raw_volume(
+                &conn,
+                &mut store,
+                dest.path(),
+                None,
+                ContactSite::new(
+                    &config,
+                    Operation::RestoreRawVolume,
+                    "/dev/null",
+                    Medium::Observed {
+                        backend: &backend,
+                        mam: &mam,
+                    },
+                )
+                .with_drive_identity(&identity),
+            );
+            assert_eq!(only_contact(&conn).0, "restore raw-volume");
+            assert_eq!(contact_drive_serial(&conn).as_deref(), Some("XYZZY_A1"));
+        }
+
+        /// Positive control for
+        /// `restore_raw_volume_contact_reflects_the_mam_read_the_cli_took`:
+        /// the reason column is live on this path. With no backend
+        /// configured no MAM read happens, and the contact says exactly that
+        /// — by value, so the reason assertions there cannot pass on a
+        /// column that is never written.
         #[test]
         fn restore_raw_volume_contact_with_no_backend_says_no_read_happened() {
             let conn = crate::db::open_memory().unwrap();
