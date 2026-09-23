@@ -32,7 +32,10 @@
 set -uo pipefail
 
 # ---------- defaults ----------
-TAPE_DEV="${TAPECTL_GATE_TAPE:-/dev/nst0}"
+# No default device (2026-09-23): /dev/nst0, the old default, is now the
+# real HP LTO-6. Unset stays empty, so discovery fails and the real-drive
+# branch refuses with "--device is required".
+TAPE_DEV="${TAPECTL_GATE_TAPE:-}"
 ERASE_MODE="long"
 SINGLE_CARTRIDGE=0
 SEED=1
@@ -82,7 +85,7 @@ usage: lifecycle-suite.sh [--scenario NAME | --all] [--device /dev/nstN]
 
   --scenario NAME                 Run one scenario (see --list for names).
   --all                           Run every scenario in order.
-  --device PATH                   Tape device (default: $TAPECTL_GATE_TAPE or /dev/nst0).
+  --device PATH                   Tape device (default: $TAPECTL_GATE_TAPE; there is no fallback).
   --erase long|short              long = mt rewind+erase (instant on mhvtl, HOURS on
                                    real LTO — never the default on a real drive).
                                    short = mt rewind+weof 1+rewind. This UNSEALS a tape;
@@ -181,6 +184,7 @@ else
     for bin in lsscsi mtx mt dar age sha256sum python3 cargo shellcheck; do
         command -v "$bin" >/dev/null || die "required binary missing: $bin"
     done
+    [ -n "$TAPE_DEV" ] || die "--device (or TAPECTL_GATE_TAPE) is required; there is no default"
     [ -e "$TAPE_DEV" ] || die "$TAPE_DEV missing"
 
     # Single-drive rule (#9): one tape user at a time, across processes —

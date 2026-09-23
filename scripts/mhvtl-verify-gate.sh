@@ -27,7 +27,9 @@
 # the drive (an L6 tape for a TD6 drive).
 set -uo pipefail
 
-TAPE_DEV="${TAPECTL_GATE_TAPE:-/dev/nst0}"
+# No default device (2026-09-23): the real HP LTO-6 is now attached at
+# /dev/nst0, the old default. The drive under test is always named.
+TAPE_DEV="${TAPECTL_GATE_TAPE:-}"
 SCRATCH="${TAPECTL_GATE_SCRATCH:-/scratch/tapectl-gate}"
 LABEL="MHVTLG"
 
@@ -35,6 +37,7 @@ die() { echo "GATE PRECONDITION FAILED: $*" >&2; exit 2; }
 
 # ---------- preconditions (loud — this gate must never rot quietly) ----------
 [ "${TAPECTL_MHVTL:-}" = "1" ] || die "TAPECTL_MHVTL=1 not set"
+[ -n "$TAPE_DEV" ] || die "TAPECTL_GATE_TAPE not set — name the mhvtl drive (e.g. /dev/nst1); there is no default"
 grep -q '^mhvtl ' /proc/modules \
     || die "mhvtl module not loaded for $(uname -r) — dkms status; see docs/operator-guide.md"
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV missing — systemctl start mhvtl.target"
@@ -1036,10 +1039,36 @@ PYMAM
 }
 
 echo "gate: journals leg — forensics journals (issue #319)"
+# Every contact names the drive it was made with (issue #314), and that drive
+# is THIS gate's drive: its serial is read from sysfs for $TAPE_DEV and
+# compared by value, so a contact attributed to the wrong drive fails too.
+step_contacts_name_their_drive() {
+    local want
+    want="$(tail -c +5 "/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE_DEV")")/device/vpd_pg80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
+    python3 - "$HOME_DIR/tapectl.db" "$want" <<'PYDRIVE'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); want = sys.argv[2]
+assert want, "positive control: could not read the gate drive's own serial from sysfs"
+rows = c.execute(
+    """SELECT c.id, c.operation, c.outcome, d.serial
+       FROM cartridge_contacts c LEFT JOIN drives d ON d.id = c.drive_id
+       ORDER BY c.id""").fetchall()
+ops = {r[1] for r in rows}
+need = {"volume init", "volume write", "volume verify", "volume resume", "restore unit"}
+assert need <= ops, f"positive control: expected contacts for every one of {sorted(need)}; got {sorted(ops)}"
+bad = [r for r in rows if r[3] != want]
+assert not bad, (
+    f"contacts not attributed to the gate drive {want!r} -- (id, operation, outcome, drive serial):\n  "
+    + "\n  ".join(map(str, bad)))
+print(f"{len(rows)} contacts across {len(ops)} operations, every one names drive {want}")
+PYDRIVE
+}
+
 check log_page_sweep_complete step_log_page_sweep_complete
 check log_page_read_once      step_log_page_read_once
 check log_page_raw_kept       step_log_page_raw_kept
 check mam_journal_attributed  step_mam_journal_attributed
+check contacts_name_their_drive step_contacts_name_their_drive
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --

@@ -28,7 +28,7 @@
 # should treat that as a precondition failure, never proceed with defaults.
 set -uo pipefail
 
-TAPE_DEV="${TAPECTL_GATE_TAPE:-/dev/nst0}"
+TAPE_DEV="${TAPECTL_GATE_TAPE:-}"   # no default: /dev/nst0 is the real LTO-6 (2026-09-23)
 ENSURE_MEDIA=0
 
 while [ $# -gt 0 ]; do
@@ -42,6 +42,7 @@ done
 
 die() { echo "mhvtl-device.sh: $*" >&2; exit 2; }
 
+[ -n "$TAPE_DEV" ] || die "--tape (or TAPECTL_GATE_TAPE) is required; there is no default"
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
 for bin in lsscsi mtx; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
@@ -79,6 +80,25 @@ while read -r kind q rest; do
     esac
 done < <(grep -E '^(Library|Drive):' /etc/mhvtl/device.conf)
 [ -n "$DRIVE_Q" ] || die "no device.conf Drive matches $TAPE_DEV at $HCTL"
+
+# ---------- identity: the drive's own serial must be that Drive's serial ----------
+# The C:T:L match above ignores the SCSI host, so a REAL drive passed through
+# at an address mhvtl also uses (0:0:1:0 matches "Drive: 11 ... TARGET: 01")
+# would be taken for an mhvtl drive. Only the changer lookup's host check
+# stood between that and an mtx load. Compare identities instead: the serial
+# device.conf gives this Drive stanza against the one the kernel read from
+# the device (sysfs VPD 0x80 — no SCSI command is sent). Fails closed: an
+# unreadable serial on either side is a refusal, before any mtx side effect.
+WANT_SERIAL="$(awk -v q="$DRIVE_Q" '
+    /^(Library|Drive):/ { inq = ($1 == "Drive:" && $2 == q); next }
+    inq && /Unit serial number:/ { sub(/.*Unit serial number: */, ""); sub(/ *$/, ""); print; exit }
+' /etc/mhvtl/device.conf)"
+[ -n "$WANT_SERIAL" ] || die "device.conf Drive $DRIVE_Q has no Unit serial number"
+PG80="/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE_DEV")")/device/vpd_pg80"
+GOT_SERIAL="$(tail -c +5 "$PG80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
+[ -n "$GOT_SERIAL" ] || die "cannot read $TAPE_DEV's serial from $PG80 — refusing to treat it as mhvtl"
+[ "$GOT_SERIAL" = "$WANT_SERIAL" ] \
+    || die "$TAPE_DEV is serial '$GOT_SERIAL', not mhvtl Drive $DRIVE_Q ('$WANT_SERIAL') — NOT an mhvtl drive"
 DTE=$((DRIVE_Q - LIB_Q - 1))
 
 # ---------- changer sg node: mediumx row matching the Library's C:T:L ----------

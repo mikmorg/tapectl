@@ -35,8 +35,12 @@ use tapectl::{db, staging, tenant, unit, volume};
 /// Default tape device. Overridable via `TAPECTL_GATE_TAPE`, the same
 /// variable `scripts/mhvtl-verify-gate.sh` uses, so a machine with a
 /// different layout configures both harnesses once (issue #111).
+///
+/// There is no default: `/dev/nst0`, the old one, is now the real HP LTO-6
+/// (2026-09-23), so an unset variable must refuse, not guess.
 fn tape_dev() -> String {
-    std::env::var("TAPECTL_GATE_TAPE").unwrap_or_else(|_| "/dev/nst0".into())
+    std::env::var("TAPECTL_GATE_TAPE")
+        .expect("TAPECTL_GATE_TAPE must name the mhvtl drive (e.g. /dev/nst1); there is no default")
 }
 
 const BLOCK_SIZE: usize = 512 * 1024;

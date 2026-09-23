@@ -41,7 +41,7 @@
 # controlled re-run showed was actually a <1% wash.
 set -uo pipefail
 
-TAPE_DEV="${TAPECTL_MEASURE_TAPE:-/dev/nst0}"
+TAPE_DEV="${TAPECTL_MEASURE_TAPE:-}"   # no default: nstN numbering is unstable; name the drive by serial path
 OUT_DIR="${TAPECTL_MEASURE_OUT:-/scratch/tapectl-lto6}"
 # Payload per throughput run. 2 GiB is enough to swamp buffer effects on an
 # LTO-6 (~160 MB/s native) at ~13 s a run, and small enough not to make the
@@ -58,7 +58,7 @@ usage: lto6-measure.sh --erase-cartridge <BARCODE> [options]
                                 destroy. Cross-checked against MAM.
   --allow-unverified-barcode    Proceed when MAM will not report a barcode.
   --payload-mb <N>              Per-throughput-run payload (default 2048).
-  --device <path>               Tape device (default /dev/nst0).
+  --device <path>               Tape device (REQUIRED, e.g. /dev/tape/by-id/scsi-<serial>-nst).
   --out <dir>                   Recording directory (default /scratch/tapectl-lto6).
 
 Everything written goes to <out>/run-<timestamp>/. Nothing is read from or
@@ -88,6 +88,7 @@ die() { echo "MEASURE PRECONDITION FAILED: $*" >&2; exit 2; }
 for bin in mt dd lsscsi python3 sg_inq; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
+[ -n "$TAPE_DEV" ] || die "--device (or TAPECTL_MEASURE_TAPE) is required; there is no default"
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
 
 # Single-drive rule (#9): the same lock the mhvtl gate takes, so a measurement
