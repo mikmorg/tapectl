@@ -3415,12 +3415,21 @@ carrying    = {v: set() for v in current}
 for r in rows:
     if not isinstance(r, dict):
         fail("catalog locate row is not an object")
-    for f in ("volume", "version", "serviceable"):
+    # "warehouse_deposits" is REQUIRED, not merely read: the guard below used
+    # to test r.get("warehouse"), a key locate never emits (it serialises the
+    # field as "warehouse_deposits", src/cli/catalog.rs, pinned by the
+    # golden JSON there), so it could never fire (issue #333). Requiring the
+    # key makes a future rename fail here, loudly, instead of silently
+    # turning the guard back into a no-op.
+    for f in ("volume", "version", "serviceable", "warehouse_deposits"):
         if f not in r:
             fail("catalog locate row has no %s field" % f)
-    if r.get("warehouse"):
-        fail("a warehouse deposit exists; permute has no deposit op, so this "
-             "check no longer models what audit counts -- update it")
+    if not isinstance(r["warehouse_deposits"], list):
+        fail("catalog locate row: warehouse_deposits is not a list")
+    if r["warehouse_deposits"]:
+        fail("volume %s has a warehouse deposit (%s); permute has no deposit "
+             "op, so this check no longer models what audit counts -- update it"
+             % (r["volume"], ", ".join(map(str, r["warehouse_deposits"]))))
     v = r["version"]
     if v not in current:
         continue
