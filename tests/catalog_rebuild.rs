@@ -521,6 +521,53 @@ fn rebuild_observing(
     )
 }
 
+/// Issue #335: a rebuild whose chip serial names no registered cartridge
+/// when the contact opens, and which then registers that cartridge itself,
+/// leaves its contact row naming the cartridge -- not "medium serial matches
+/// no registered cartridge", which stopped being true when it committed.
+#[test]
+fn a_rebuild_contact_names_the_cartridge_the_rebuild_registered() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    assert_eq!(cartridge_count(&conn), 0, "premise: nothing registered yet");
+
+    let report = rebuild_observing(
+        &conn,
+        &mut vol,
+        &secret,
+        scratch.path(),
+        Some("REBUILDSERIAL"),
+    )
+    .unwrap();
+    assert!(
+        report.cartridge_registered,
+        "premise: the rebuild registered it: {report:?}"
+    );
+
+    let cartridge_id: i64 = conn
+        .query_row(
+            "SELECT id FROM cartridges WHERE serial_number = 'REBUILDSERIAL'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (contact_cartridge, reason): (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT cartridge_id, identity_reason FROM cartridge_contacts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(contact_cartridge, Some(cartridge_id));
+    assert_eq!(
+        reason, None,
+        "the stale 'matches no registered cartridge' is cleared"
+    );
+}
+
 /// Issue #296: `catalog rebuild` puts a cartridge in a drive and must say so.
 ///
 /// `operation` and `outcome` are asserted BY VALUE — a row exists either way,

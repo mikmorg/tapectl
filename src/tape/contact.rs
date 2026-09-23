@@ -641,6 +641,19 @@ impl<'a> ContactGuard<'a> {
     /// *then* and is a lie the moment the auto-registration commits. A row
     /// carrying both an identity and a reason for having none would be a
     /// contradiction the schema has no way to resolve.
+    /// [`Self::record_cartridge`] for a command that may have REGISTERED the
+    /// cartridge this contact's chip serial names after the contact opened
+    /// (issue #335: `catalog rebuild` auto-registers it, or learns the serial
+    /// onto an existing row). Looks the observed serial up again; attaches
+    /// the cartridge if one now matches, and changes nothing otherwise. Only
+    /// a chip-witnessed serial is ever passed here -- the same rule `volume
+    /// init` applies before it calls [`Self::record_cartridge`].
+    pub fn record_cartridge_by_serial(&self, serial: &str) {
+        if let Some(cartridge_id) = cartridge_for_serial(self.conn, serial) {
+            self.record_cartridge(cartridge_id);
+        }
+    }
+
     pub fn record_cartridge(&self, cartridge_id: i64) {
         let Some(id) = self.id else {
             return;
@@ -988,24 +1001,63 @@ mod tests {
             if entry.path() == this_file || entry.path().extension().is_none_or(|x| x != "rs") {
                 continue;
             }
+            // Issue #332: the production half only, comment lines dropped,
+            // exactly as the identity-reason scan below reads it — a test
+            // module or a doc cross-reference is not a writer.
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                corpus.push_str(&text);
+                let prod = match text.find("#[cfg(test)]\nmod tests") {
+                    Some(i) => &text[..i],
+                    None => &text[..],
+                };
+                for line in prod.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                    corpus.push_str(line);
+                    corpus.push('\n');
+                }
             }
         }
         // Positive control on the scan itself: a corpus that read nothing
         // would make every assertion below vacuous (issues #282/#284/#285).
         assert!(
-            corpus.contains("ContactGuard::open"),
-            "positive control: the source scan must actually have read the call sites"
+            corpus.contains("ContactSite::new("),
+            "positive control: the source scan must actually have read the production call \
+             sites (every command opens its contact through ContactSite::new)"
         );
         for op in Operation::ALL {
             let variant = format!("Operation::{op:?}");
             assert!(
-                corpus.contains(&variant),
+                contains_identifier(&corpus, &variant),
                 "{variant} has no writer outside tape/contact.rs — a vocabulary value \
                  with no writer is exactly the `read`/`clean` defect ADR-0013 §4 names"
             );
         }
+    }
+
+    /// Whether `needle` occurs in `corpus` as a WHOLE identifier path: the
+    /// character after it must not continue an identifier. Issue #332:
+    /// `Operation::VolumeCompact` is a prefix of `Operation::VolumeCompactRead`,
+    /// so a bare `contains` let the latter's writers stand in for the former.
+    fn contains_identifier(corpus: &str, needle: &str) -> bool {
+        corpus.match_indices(needle).any(|(i, _)| {
+            corpus[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
+    }
+
+    #[test]
+    fn contains_identifier_does_not_accept_a_longer_identifier() {
+        let corpus = "x(Operation::VolumeCompactRead);\ny(Operation::VolumeCompact, 1);\n";
+        assert!(contains_identifier(corpus, "Operation::VolumeCompact"));
+        assert!(!contains_identifier(
+            "x(Operation::VolumeCompactRead);",
+            "Operation::VolumeCompact"
+        ));
+        assert!(
+            contains_identifier("REASON_A", "REASON_A"),
+            "at end of input"
+        );
+        assert!(!contains_identifier("REASON_AB", "REASON_A"));
     }
 
     /// ADR-0013 §4's writer rule, applied to the identity reasons (issue
@@ -1094,7 +1146,7 @@ mod tests {
         );
         for (name, _) in &declared {
             assert!(
-                corpus.contains(name.as_str()),
+                contains_identifier(&corpus, name),
                 "{name} has no production writer — an identity reason no code can \
                  record is the vocabulary-with-no-writer defect ADR-0013 §4 names"
             );

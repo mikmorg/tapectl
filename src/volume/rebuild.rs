@@ -398,7 +398,7 @@ pub fn rebuild_from_store(
     // command's OUTPUT, not an input the contact can reference.
     let guard = site.open(conn, None);
     let contact_id = guard.id();
-    let r = guard.finish_result(rebuild_contacted(
+    let r = rebuild_contacted(
         conn,
         store,
         identities,
@@ -408,7 +408,19 @@ pub fn rebuild_from_store(
         scratch,
         device_label,
         site.medium_serial(),
-    ));
+    );
+    // Issue #335: the contact opened before the rebuild registered the
+    // cartridge its chip serial names (or learned that serial onto a row),
+    // so it recorded "medium serial matches no registered cartridge" -- true
+    // then, false once this rebuild commits. Attach it, as `volume init`
+    // does after binding. Only the chip-observed serial is used, never a
+    // File 0 claim.
+    if r.is_ok() {
+        if let Some(serial) = site.medium_serial() {
+            guard.record_cartridge_by_serial(serial);
+        }
+    }
+    let r = guard.finish_result(r);
     // The post-command health reading (issue #320), on every outcome. It
     // names no volume, as the contact names none: the row a rebuild inserts
     // is its output. On the DR machine this rebuild exists for there is
