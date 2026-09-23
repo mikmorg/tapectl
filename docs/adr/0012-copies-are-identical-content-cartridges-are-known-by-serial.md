@@ -835,3 +835,40 @@ resume actually succeeding.
 
 **Constraint, unchanged from the 2026-09-21 amendment:** until `confirm` passes, the
 volume is not a copy. `policy::coverage` remains the sole owner of that answer (#96).
+
+## Amendment, 2026-09-23 (evening) — the pre-production rulings after the real-drive rehearsal
+
+*Ruled by the CTO on 2026-09-23 in a grilling session ("ratify all"), after the queue
+emptied, the fourth adversarial review landed, and the real-drive rehearsal passed
+(`docs/runs/2026-09-23-real-drive-rehearsal.md`). Facts each ruling rests on are in that
+record and in `docs/runs/2026-09-23-lto6-capacity-measurement.md`.*
+
+1. **#323 is closed, no code change.** tapectl's own write uses native capacity 1:1 at a
+   steady feed; the 1.48 ratio came from a bursty pipe. A post-write ratio *warning*,
+   computed from what tapectl already journals, is a low follow-up (#338), not a gate.
+2. **Write throughput (#326) does not gate the first production write.** The first
+   production tape is the throughput baseline; its phase times are recorded.
+3. **Principle: nothing on the tape thread that can stall the drive.** The tape thread only
+   takes a ready block from a queue and writes it. `v2-open-questions.md` §2.4's premise
+   ("hash is free once streaming lands") is false on this hardware, but its *guarantee* (an
+   inline check that aborts before the filemark, unsealed) stays: the check moves to the
+   thread that fills the queue. L2 is never dropped. Order of work: reader thread + bounded
+   ring first; then parallelise the pre-write L1 re-hash; the `sha2` `asm` feature is a
+   secondary +33% (123 → 163 MB/s measured). home2 is a Xeon L5640 (Westmere) with no
+   SHA-NI, so there is no hardware SHA path to unlock.
+4. **The end-of-tape fill is run once, by `dd`, unattended**, to record where physical EOT
+   falls against MAM's native figure and the 2.5 TB planning figure. tapectl's own EOT
+   abort path stays proven on mhvtl only: this host cannot stage 2.5 TB, and the pre-flight
+   gate never plans past 92% of the planning figure, so the path is by design unreachable.
+5. **TapeAlert read-to-clear stays unanswered** and is not provoked. The first non-zero
+   0x2E ever journalled is surfaced by `report health` and asserted by the gate (#340), so
+   production answers the question from the journal.
+6. **Hardware coverage needing more than one cartridge** (`compaction`,
+   `cartridge-displacement`, `collection-second-copy`, `retire-and-reuse`'s own refusal
+   checks) is accepted on mhvtl for the go/no-go. A second expendable cartridge is a
+   follow-up, not a gate.
+7. **Production runs on this VM with the drive passed through**, not on home2; the
+   handoff is corrected. **One release-build rehearsal** (`first-year` on the real drive
+   with the release binary) precedes the first write, because a different binary is a
+   different artifact. That build was explicitly authorized in the same ruling.
+

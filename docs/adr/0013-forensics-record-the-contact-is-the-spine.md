@@ -205,3 +205,17 @@ path must not add a second sweep to a contact that already has one.
 **Not changed:** a command killed before it finishes takes no sweep, because collection
 runs after the command. That remains a known gap in post-command collection. It is not
 repaired by guessing.
+
+## Amendment, 2026-09-23 (evening) — every contact sweeps, `volume init` included
+
+*Ruled by the CTO on 2026-09-23 (grilling Q5, "ratify all"), after the real-drive
+rehearsal (`docs/runs/2026-09-23-real-drive-rehearsal.md`) showed every `volume init`
+contact on the HP LTO-6 with zero `log_page_journal` rows.*
+
+The read-path amendment above listed which commands sweep and left `volume init` out.
+**Ruled: the rule is "every contact takes one post-command sweep", with no exceptions
+list.** `volume init` is the first contact a cartridge gets on a drive and writes File 0;
+its reading is the baseline for that cartridge's life on that drive (page 0x17's load
+count and lifetime megabytes are most useful *before* the first write). Cost: one 22-page
+sweep per init on the HP. Tracked as #339. The once-per-contact rule is unchanged.
+

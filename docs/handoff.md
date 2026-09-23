@@ -41,7 +41,9 @@ the corrections to ADR-0010/0011's own text are dated inside them.
    reports the queue empty while anything is parked.
 2. **The adversarial review is re-run on the resulting diff**, the same way
    (`docs/audits/` gets the record), before the write — not after.
-3. **A real-drive rehearsal on an expendable cartridge on home2**, which also
+3. **A real-drive rehearsal on an expendable cartridge** (DONE 2026-09-23 on this VM with
+   the drive passed through — `docs/runs/2026-09-23-real-drive-rehearsal.md`; production runs
+   here, not on home2, ruled the same day), which also
    settles the one open measurement: MAM's maximum-capacity attribute is
    either MiB or MB (a 10 % question; the code assumes MiB). Write that
    cartridge to end-of-tape and record where ENOSPC fell.
