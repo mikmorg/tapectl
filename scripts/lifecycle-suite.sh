@@ -169,7 +169,8 @@ die() { echo "LIFECYCLE PRECONDITION FAILED: $*" >&2; exit 2; }
 # ---------- mode setup: dry-run gets placeholders, real gets the real thing ----------
 # Both branches leave behind the SAME variable set (RUN, HOME_DIR, CFG, SRC,
 # BIN, COMMANDS_LOG, SKIPPED_FILE, REPORT, TAPE_DEV, DRIVE_SG, CHG_SG, DTE,
-# GEN, LOADED_TAG, MHVTL_DISCOVERY) so every function below is mode-agnostic.
+# GEN, DRIVE_GENERATION, LOADED_TAG, MHVTL_DISCOVERY) so every function below
+# is mode-agnostic.
 if [ "$DRY_RUN" = 1 ]; then
     CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
     BIN="$CARGO_TARGET_DIR/debug/tapectl"
@@ -183,6 +184,7 @@ if [ "$DRY_RUN" = 1 ]; then
     DRIVE_SG="<DISCOVERED_SG>"; CHG_SG="<DISCOVERED_CHANGER_SG>"
     DTE="<DISCOVERED_DTE>"; GEN="<DISCOVERED_GEN>"; LOADED_TAG="<DISCOVERED_TAPE>"
     DRIVE_MODEL="<DISCOVERED_MODEL>"
+    DRIVE_GENERATION="<DISCOVERED_GENERATION>"
     MHVTL_DISCOVERY=1
     STAMP="dryrun"
 else
@@ -211,6 +213,9 @@ else
 
     if [ "$MHVTL_DISCOVERY" = 1 ]; then
         eval "$DISCOVERY"
+        # The generation the drive's [[backends.lto]] entry declares
+        # (ADR-0010: a drive declares only the one generation it is).
+        DRIVE_GENERATION="LTO-${GEN#L}"
         echo "lifecycle-suite: mhvtl drive discovered: $TAPE_DEV ($DRIVE_MODEL, sg=$DRIVE_SG) changer=$CHG_SG dte=$DTE tape=$LOADED_TAG"
     else
         echo "lifecycle-suite: device discovery did not resolve an mhvtl drive for $TAPE_DEV:" >&2
@@ -261,6 +266,16 @@ else
             "$TAPE_DEV: lsscsi names sg node '$DRIVE_SG' but sysfs names '$SYSFS_SG' — refusing to read consent from an unproven drive"
         DRIVE_MODEL="$(echo "$ROW" | awk '{print $3" "$4}')"
         CHG_SG=""; DTE=""; GEN=""; LOADED_TAG="$LOSE_SERIAL"
+        # The drive's own generation, from the model the kernel read at
+        # probe time (sysfs; no SCSI command sent). It used to be hardcoded
+        # "LTO-8" in the config below (mhvtl's generation), so since
+        # ADR-0010 every real-drive run was refused at init by the
+        # drive/media compatibility check -- the 2026-09-23 rehearsal found
+        # it. HP spells the model "Ultrium N-SCSI", IBM "ULT3580-TDN".
+        SYS_MODEL="$(cat "/sys/class/scsi_tape/$ST_NODE/device/model" 2>/dev/null || true)"
+        GEN_N="$(echo "$SYS_MODEL" | sed -n 's/.*Ultrium \([0-9]\{1,2\}\).*/\1/p; s/.*TD\([0-9]\{1,2\}\).*/\1/p' | head -1)"
+        [ -n "$GEN_N" ] || die "cannot derive the drive generation from its model '$SYS_MODEL' ($TAPE_DEV)"
+        DRIVE_GENERATION="LTO-$GEN_N"
 
         command -v sg_read_attr >/dev/null || die "sg_read_attr required to verify the named cartridge"
         MAM_TXT="$(sg_read_attr "$DRIVE_SG" 2>&1)" || die "sg_read_attr failed on $DRIVE_SG"
@@ -1193,11 +1208,12 @@ bootstrap_config() {
     scenario_dir="$(dirname "$HOME_DIR")"
     staging_dir="$scenario_dir/staging"
     mkdir -p "$staging_dir"
-    python3 - "$CFG" "$staging_dir" "$TAPE_DEV" "$DRIVE_SG" "$SINGLE_CARTRIDGE" <<'PY'
+    python3 - "$CFG" "$staging_dir" "$TAPE_DEV" "$DRIVE_SG" "$SINGLE_CARTRIDGE" \
+        "$DRIVE_GENERATION" "$MHVTL_DISCOVERY" <<'PY'
 import re
 import sys
 
-cfg, staging, tape, sg, single = sys.argv[1:6]
+cfg, staging, tape, sg, single, generation, mhvtl = sys.argv[1:8]
 _ = single  # kept for signature stability; copy policy is handled in audit_passes()
 t = open(cfg).read()
 t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
@@ -1207,6 +1223,14 @@ t = re.sub(r'(?m)^utilization_threshold *=.*$', 'utilization_threshold = 0.95', 
 # Must match an UNCOMMENTED table header: `tapectl init` now writes a
 # commented-out [[backends.lto]] example (#124b), and a plain substring test
 # sees that and concludes a backend is already configured.
+# capacity_override only on mhvtl, whose media reports no real capacity: a
+# real drive must exercise the real path (capacity from the cartridge's
+# DETECTED generation, ADR-0010), which is what a rehearsal is for.
+# 2 748 779 069 440 = 2.5 TiB exactly, written as a bare byte count on
+# purpose (issue #200): "2.5T" was once parsed BINARY by volume init and
+# DECIMAL by config validation. A bare integer is the one literal both
+# parsers read identically.
+override = 'capacity_override = "2748779069440"\n' if mhvtl == "1" else ""
 if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
     t = re.sub(r'(?m)^lto *= *\[\] *\n', "", t)
     t += f'''
@@ -1214,16 +1238,8 @@ if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
 name = "lifecycle"
 device_tape = "{tape}"
 device_sg = "{sg}"
-generation = "LTO-8"
-# 2 748 779 069 440 = 2.5 TiB exactly, written as a bare byte count on
-# purpose (issue #200). This string used to be "2.5T", parsed BINARY by
-# volume init and DECIMAL by config validation; #200 made init decimal
-# too, which would have shrunk this microcosm by 9.95%. Fixing a parser
-# drift and resizing the test microcosm are two different changes, and
-# doing both at once means a red gate cannot be attributed to either.
-# A bare integer is the one literal both parsers read identically.
-capacity_override = "2748779069440"
-usable_capacity_factor = 0.95
+generation = "{generation}"
+{override}usable_capacity_factor = 0.95
 enospc_buffer = "2G"
 '''
 open(cfg, "w").write(t)
