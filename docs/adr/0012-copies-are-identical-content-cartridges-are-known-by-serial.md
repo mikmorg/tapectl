@@ -778,3 +778,60 @@ surprising, not everywhere. It earns its place in the retire family, where an op
 reasonably expects `--force` to work and ADR-0008 deliberately withholds it. It would be
 noise on a TOML parse error, where naming the file and the bad key already tells the reader
 exactly what to do and no one expects a flag to parse a broken file for them.
+
+## Amendment, 2026-09-23 — `volume resume` adopts an aborted session whose seal is recorded and whose medium a clean verify has since cleared (#280)
+
+*Ruled by the CTO on 2026-09-22 (Option 2 of the three in #280); recorded here before
+implementation, as #280's acceptance requires.*
+
+**The state.** `SealedPending::confirm`'s **Quarantined** arm leaves a volume with its seal
+marker physically on the tape (`volumes.sealed_at` set, migration 018),
+`observed_condition = 'quarantined'`, `volumes.status = 'initialized'` and every `writes`
+row `'aborted'`. The 2026-09-18 amendment's "a passing full verify clears the condition"
+then applies. After a clean full verify the bytes are provably good on sealed media, but
+**no command could make the volume count as a copy**: `rehydrate` selects only
+`interrupted` rows, so `volume resume` could not reach it, and nothing else writes
+`status = 'sealed'`. The `Inconclusive` arm never had this problem, because it leaves its
+rows `interrupted` and the 2026-09-21 amendment's re-confirm handles it.
+
+**Ruled: `volume resume` adopts such a session and re-confirms it**, on all of the
+following, conjunctively:
+
+1. the seal is **recorded**: `volumes.sealed_at` is set (the 2026-09-21 amendment: the
+   seal is recorded, not inferred);
+2. the medium has been **cleared by evidence**: `observed_condition = 'ok'`, **and** a
+   passing full verify of this volume is recorded **after** the session was aborted. The
+   condition alone is not enough, because `volume abort` also leaves `aborted` rows, and
+   an operator's deliberate abort is not undone by a condition that was never
+   quarantined. The evidence must be a recorded row, not an inference from the current
+   state;
+3. the existing defence in depth still holds where the tape can be read: the File 0
+   identity matches and the seal position agrees with the session's own layout.
+
+When all three hold, resume skips the write phase entirely, **never** calls
+`reposition_for_resume` or `seal()`, and re-enters `confirm`, the same path the
+2026-09-21 amendment gives a recorded-sealed `interrupted` session. Only a passing
+`confirm` writes `status = 'sealed'`. **That invariant is what this option was chosen to
+protect:** a medium observation (the verify) never moves an operator column. It only
+removes the obstacle to the one command that may.
+
+If any condition fails, resume refuses, naming the first unmet condition and, where one
+exists, the command that resolves it (for example, `volume verify <label>`, which is full
+by default).
+
+**Rejected.** Option 1, where a clean verify advances `status` itself: it lets a medium
+observation move an operator column, the separation the 2026-09-17 amendment drew.
+Option 3, accepting that the volume never counts: it leaves the catalog permanently
+disagreeing with a tape somebody has successfully read back in full.
+
+**The cost, accepted explicitly.** `aborted` stops meaning "never resumable" and comes to
+mean "not resumable until the seal is recorded and a later clean full verify has cleared
+the medium". Every operator-facing sentence that says otherwise must change **in the same
+commit**, or two texts will contradict each other (#292 was filed for exactly that
+shape). In particular this covers `volume abort`'s consent block and the clean-clear
+message #280's first half landed (`c525498`), which deliberately named no remedy for this
+state. It now names `volume resume`, with a test pairing that presence against the
+resume actually succeeding.
+
+**Constraint, unchanged from the 2026-09-21 amendment:** until `confirm` passes, the
+volume is not a copy. `policy::coverage` remains the sole owner of that answer (#96).
