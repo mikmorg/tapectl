@@ -86,6 +86,8 @@ usage: lifecycle-suite.sh [--scenario NAME | --all] [--device /dev/nstN]
   --scenario NAME                 Run one scenario (see --list for names).
   --all                           Run every scenario in order.
   --device PATH                   Tape device (default: $TAPECTL_GATE_TAPE; there is no fallback).
+  TAPECTL_BIN=PATH (env)          Use this tapectl binary instead of building a debug one
+                                   (the release-build rehearsal). Must be executable.
                                    A /dev/tape/by-id/scsi-<serial>-nst symlink is accepted
                                    and is the spelling to use for a real drive (/dev/nstN
                                    numbering moves across reboots); it is resolved only
@@ -308,17 +310,28 @@ else
     # 2026-09-16 and hung for 13 minutes looking exactly like a slow build.
     # 99 gives the conflict its own exit code so it is never read as a compile
     # failure (cargo exits 101, and a bare -w reports 1, which cargo also uses).
-    flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo build --quiet
-    build_rc=$?
-    if [ "$build_rc" -eq 99 ]; then
-        die "timed out waiting for /scratch/tapectl-build.lock.
+    # TAPECTL_BIN: run a binary built elsewhere instead of building a debug
+    # one here -- the release-build rehearsal the CTO ratified on 2026-09-23
+    # ("a different binary is a different artifact"; ADR-0012 amendment of
+    # that evening, item 7). It must be an executable file; nothing else
+    # about the run changes, and the report names it.
+    if [ -n "${TAPECTL_BIN:-}" ]; then
+        BIN="$TAPECTL_BIN"
+        [ -x "$BIN" ] || die "TAPECTL_BIN=$BIN is not an executable file"
+        echo "lifecycle-suite: using TAPECTL_BIN=$BIN (no build)"
+    else
+        flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo build --quiet
+        build_rc=$?
+        if [ "$build_rc" -eq 99 ]; then
+            die "timed out waiting for /scratch/tapectl-build.lock.
    If you ran this script inside an outer 'flock /scratch/tapectl-build.lock',
    that is the cause: run it bare — the script takes the lock itself."
-    elif [ "$build_rc" -ne 0 ]; then
-        die "cargo build failed"
+        elif [ "$build_rc" -ne 0 ]; then
+            die "cargo build failed"
+        fi
+        BIN="$CARGO_TARGET_DIR/debug/tapectl"
+        [ -x "$BIN" ] || die "built binary not found at $BIN"
     fi
-    BIN="$CARGO_TARGET_DIR/debug/tapectl"
-    [ -x "$BIN" ] || die "built binary not found at $BIN"
 
     HOME_DIR="$RUN/home"; mkdir -p "$HOME_DIR"
     CFG="$HOME_DIR/config.toml"
@@ -3684,10 +3697,11 @@ run_shape() {
     if [ "$RUN_ALL" = 1 ] || [ "$SCENARIO" = "permute" ]; then
         perm=" ($STEPS permute steps)"
     fi
-    printf '%s, seed %s%s, erase %s, %s, %s' \
+    printf '%s, seed %s%s, erase %s, %s, %s%s' \
         "$scope" "$SEED" "$perm" "$ERASE_MODE" \
         "$([ "$SINGLE_CARTRIDGE" = 1 ] && echo single-cartridge || echo multi-cartridge)" \
-        "$TAPE_DEV"
+        "$TAPE_DEV" \
+        "$([ -n "${TAPECTL_BIN:-}" ] && echo ", binary $TAPECTL_BIN" || echo "")"
 }
 
 write_report_header() {
@@ -3696,6 +3710,7 @@ write_report_header() {
         echo "# lifecycle-suite run — $STAMP"
         echo
         echo "- device: \`$TAPE_DEV\`"
+        echo "- binary: \`$BIN\`$([ -n "${TAPECTL_BIN:-}" ] && echo " (TAPECTL_BIN, no build)" || echo " (debug, built by this run)")"
         if [ "$MHVTL_DISCOVERY" = 1 ]; then
             echo "- drive: $DRIVE_MODEL (sg \`$DRIVE_SG\`, changer \`$CHG_SG\`, dte $DTE)"
         else
