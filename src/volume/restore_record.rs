@@ -87,7 +87,8 @@ pub fn record(conn: &Connection, rec: &RestoreRecord<'_>) -> Option<i64> {
     let (dar_argv, dar_exit_code, dar_stdout, dar_stderr) = match rec.dar {
         Some(d) => (
             Value::Text(d.argv_json()),
-            d.exit_code.map_or(Value::Null, |c| Value::Integer(c.into())),
+            d.exit_code
+                .map_or(Value::Null, |c| Value::Integer(c.into())),
             verbatim(&d.stdout),
             verbatim(&d.stderr),
         ),
@@ -319,7 +320,11 @@ mod tests {
         assert_eq!(
             fks,
             vec![
-                ("contact_id".into(), "cartridge_contacts".into(), "id".into()),
+                (
+                    "contact_id".into(),
+                    "cartridge_contacts".into(),
+                    "id".into()
+                ),
                 ("unit_id".into(), "units".into(), "id".into()),
                 ("volume_id".into(), "volumes".into(), "id".into()),
             ]
@@ -400,10 +405,7 @@ mod tests {
         assert_eq!(r.slices_read, Some(1));
         assert_eq!(r.bytes_restored, Some(4096));
         assert_eq!(r.files_restored, Some(3));
-        assert_eq!(
-            r.dar_argv.as_deref(),
-            Some(r#"["dar","-x","/d/restore"]"#)
-        );
+        assert_eq!(r.dar_argv.as_deref(), Some(r#"["dar","-x","/d/restore"]"#));
         assert_eq!(r.dar_exit_code, Some(0));
         assert_eq!(r.dar_stdout.as_deref(), Some(" 3 inode(s) restored\n"));
         assert_eq!(r.dar_stderr.as_deref(), Some("a warning\n"));
@@ -435,7 +437,11 @@ mod tests {
         assert_eq!(rows[0].dar_stderr, None);
         assert_eq!(rows[0].dar_argv, None);
         assert_eq!(rows[0].dar_exit_code, None);
-        assert_eq!(rows[1].dar_stdout.as_deref(), Some(""), "ran, said nothing: empty");
+        assert_eq!(
+            rows[1].dar_stdout.as_deref(),
+            Some(""),
+            "ran, said nothing: empty"
+        );
         assert_eq!(rows[1].dar_stderr.as_deref(), Some(""));
     }
 

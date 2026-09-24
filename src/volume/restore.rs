@@ -2471,9 +2471,17 @@ mod tests {
             // (`restore_through_drive`, issue #306), and that path reaches
             // the store seam exactly once.
             let file = body("pub fn restore_file(");
-            assert_eq!(file.matches("restore_through_drive(").count(), 1, "positive control");
+            assert_eq!(
+                file.matches("restore_through_drive(").count(),
+                1,
+                "positive control"
+            );
             let unit = body("pub fn restore_unit(");
-            assert_eq!(unit.matches("restore_through_drive(").count(), 1, "positive control");
+            assert_eq!(
+                unit.matches("restore_through_drive(").count(),
+                1,
+                "positive control"
+            );
             let drive = body("fn restore_through_drive(");
             assert_eq!(drive.matches("restore_unit_from_store(").count(), 1);
             let seam = body("pub(crate) fn restore_unit_from_store(");
@@ -2879,14 +2887,8 @@ mod tests {
             }
 
             fn raw_volume(conn: &Connection, store: &mut MemStore, dest: &Path) -> bool {
-                restore_raw_volume(
-                    conn,
-                    store,
-                    dest,
-                    None,
-                    site(Operation::RestoreRawVolume),
-                )
-                .is_ok()
+                restore_raw_volume(conn, store, dest, None, site(Operation::RestoreRawVolume))
+                    .is_ok()
             }
 
             /// `restore raw-volume`: a clean dump is an `ok` row of kind
@@ -2934,10 +2936,7 @@ mod tests {
                 assert_eq!(r.kind, "raw-volume");
                 assert_eq!(r.outcome, "failed");
                 assert!(r.error.is_some());
-                assert_eq!(
-                    r.files_restored, None,
-                    "not known: the dump never finished"
-                );
+                assert_eq!(r.files_restored, None, "not known: the dump never finished");
                 assert_eq!(r.bytes_restored, None);
             }
         }

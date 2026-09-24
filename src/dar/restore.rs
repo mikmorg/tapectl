@@ -326,7 +326,11 @@ mod tests {
             stdout: b"\xff\xfe".to_vec(),
             stderr: Vec::new(),
         };
-        assert_eq!(killed.inodes_restored(), None, "not UTF-8: no count, no panic");
+        assert_eq!(
+            killed.inodes_restored(),
+            None,
+            "not UTF-8: no count, no panic"
+        );
     }
 
     #[test]
@@ -376,7 +380,12 @@ mod tests {
         assert_eq!(report.argv[0], "dar");
         assert_eq!(report.argv[1], "-x");
         assert!(!report.stdout.is_empty(), "dar's summary is on stdout");
-        assert_eq!(report.inodes_restored(), Some(2), "{:?}", String::from_utf8_lossy(&report.stdout));
+        assert_eq!(
+            report.inodes_restored(),
+            Some(2),
+            "{:?}",
+            String::from_utf8_lossy(&report.stdout)
+        );
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"A");
     }
 
@@ -407,7 +416,11 @@ mod tests {
         let (report, verdict) = extract_reported(dar, &archive_base, &dest);
         assert!(verdict.is_err(), "a collision is a failed restore");
         let report = report.expect("dar ran");
-        assert_eq!(report.exit_code, Some(0), "dar itself exited clean — that is the trap");
+        assert_eq!(
+            report.exit_code,
+            Some(0),
+            "dar itself exited clean — that is the trap"
+        );
         assert!(
             String::from_utf8_lossy(&report.stdout).contains(SKIPPED_MARKER),
             "the evidence is in the verbatim stdout"
