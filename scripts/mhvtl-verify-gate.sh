@@ -238,7 +238,13 @@ step_erase_scratch_tape() {
     mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
 }
 step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV"; }
-step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV"; }
+# Every `volume write` here passes --yes: it answers the quiet-host pre-flight
+# (ADR-0012, 2026-09-24 amendment, item 7), which on this VM nearly always has
+# a finding (another worker's cargo), and which a non-interactive run without
+# --yes declines as an ADR-0008 Tier-2 question. The findings still print
+# ("host check: ..." lines, never "warning: volume"). --yes reaches no other
+# question on `volume write`, and no Tier-3 refusal.
+step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV" --yes; }
 step_vol_verify() {
     TCTL volume verify "$LABEL" --device "$TAPE_DEV" --json | tee "$RUN/verify.json"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify.json"
@@ -644,7 +650,7 @@ interrupt_write_parked() { # interrupt_write_parked <label> [signal=INT]
     rm -f "$marker"
     start=$SECONDS
     TAPECTL_TEST_PAUSE_AFTER_PLAN="$marker" \
-        "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+        "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" --yes &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
         [ -e "$marker" ] && break
@@ -662,7 +668,7 @@ interrupt_write_parked() { # interrupt_write_parked <label> [signal=INT]
 interrupt_write() { # interrupt_write <label> <sql-ready> <what> [signal=INT]
     local label="$1" ready_sql="$2" what="$3" sig="${4:-INT}" pid start waited
     start=$SECONDS
-    "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+    "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" --yes &
     pid=$!
     # Wait for the condition, but never past the process exiting or 120s.
     while kill -0 "$pid" 2>/dev/null; do
@@ -851,7 +857,7 @@ interrupt_write_after_seal() { # interrupt_write_after_seal <label>
     rm -f "$marker"
     start=$SECONDS
     TAPECTL_TEST_PAUSE_AFTER_SEAL="$marker" \
-        "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" &
+        "$BIN" --home "$HOME_DIR" --config "$CFG" volume write "$label" --device "$TAPE_DEV" --yes &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
         [ -e "$marker" ] && break

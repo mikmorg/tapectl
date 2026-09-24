@@ -342,6 +342,14 @@ else
     REPORT="$RUN/REPORT.md"; : > "$REPORT"
 fi
 
+# Every command that writes a tape here (`volume write`, `volume compact-write`,
+# `quick-archive`, `collection run`) passes --yes: it answers the quiet-host
+# pre-flight (ADR-0012, 2026-09-24 amendment, item 7), which a non-interactive
+# run without --yes declines as an ADR-0008 Tier-2 question. None of those
+# commands asks anything else, and --yes reaches no Tier-3 refusal; the
+# findings still print as "host check: ..." lines. NOT added to TCTL itself:
+# the retire/mark-erased scenarios prove the Tier-2 refusal WITHOUT --yes.
+#
 # ---------- TCTL / devcmd: the two dry-run-safe primitives everything else uses ----------
 # TCTL always uses THIS run's isolated home — never ~/.tapectl (guardrail #2).
 TCTL() {
@@ -1356,7 +1364,7 @@ bootstrap_archive_v1() {
     TCTL stage create big || return 1
     next_tape "$label" || return 1
     vinit "$label" || return 1
-    TCTL volume write "$label" --device "$TAPE_DEV" || return 1
+    TCTL volume write "$label" --device "$TAPE_DEV" --yes || return 1
     TCTL volume move "$label" --to vault || return 1
     # No `cartridge register` here: since ADR-0010, `volume init` reads the
     # medium serial from MAM and registers and binds the cartridge itself.
@@ -1382,7 +1390,7 @@ bootstrap_two_volumes() {
     TCTL stage create big || return 1
     next_tape VOL-B || return 1
     vinit VOL-B || return 1
-    TCTL volume write VOL-B --device "$TAPE_DEV" || return 1
+    TCTL volume write VOL-B --device "$TAPE_DEV" --yes || return 1
     TCTL volume move VOL-B --to offsite || return 1
 }
 
@@ -1421,7 +1429,7 @@ fy_plan()      { TCTL volume plan; }
 fy_write() {
     next_tape VOL-A || return 1
     vinit VOL-A \
-    && TCTL volume write VOL-A --device "$TAPE_DEV"
+    && TCTL volume write VOL-A --device "$TAPE_DEV" --yes
 }
 fy_move()      { TCTL volume move VOL-A --to vault; }
 # ADR-0010 turned this step inside out: the operator no longer registers the
@@ -1579,7 +1587,7 @@ ev_stage_v2() { TCTL stage create photos && TCTL stage create docs && TCTL stage
 
 ev_write_volb() {
     next_tape VOL-B || return 1
-    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV"
+    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV" --yes
 }
 
 ev_restore_v1_from_vola() {
@@ -1659,7 +1667,7 @@ kr_mutate_and_stage_v2() {
 
 kr_write_volc() {
     next_tape VOL-C || return 1
-    vinit VOL-C && TCTL volume write VOL-C --device "$TAPE_DEV"
+    vinit VOL-C && TCTL volume write VOL-C --device "$TAPE_DEV" --yes
 }
 
 # --- VOL-C checks (new key), run while VOL-C is still the loaded tape ---
@@ -1807,7 +1815,7 @@ tr_write_photos_v2() {
     TCTL snapshot create photos || return 1
     TCTL stage create photos || return 1
     next_tape VOL-D || return 1
-    vinit VOL-D && TCTL volume write VOL-D --device "$TAPE_DEV"
+    vinit VOL-D && TCTL volume write VOL-D --device "$TAPE_DEV" --yes
 }
 
 tr_restore_vola_via_tctl() {
@@ -1889,7 +1897,7 @@ tor_solo_unit() {
     TCTL stage create solo || return 1
     next_tape VOL-SOLO || return 1
     vinit VOL-SOLO || return 1
-    TCTL volume write VOL-SOLO --device "$TAPE_DEV" || return 1
+    TCTL volume write VOL-SOLO --device "$TAPE_DEV" --yes || return 1
     # VOL-SOLO must be PLACED, or the next check fails for a reason this
     # scenario does not intend (issue #203, first `--all` run 2026-09-16).
     #
@@ -2082,7 +2090,7 @@ cp_write_photos_v2_on_volf() {
     TCTL snapshot create photos || return 1
     TCTL stage create photos || return 1
     next_tape VOL-F || return 1
-    vinit VOL-F && TCTL volume write VOL-F --device "$TAPE_DEV"
+    vinit VOL-F && TCTL volume write VOL-F --device "$TAPE_DEV" --yes
 }
 
 # `staging clean` is the RELEASE half of tapectl's stage-once / write-N-
@@ -2152,7 +2160,7 @@ cp_release_staging() { TCTL staging clean --force; }
 # age) for the same version.
 cp_write_photos_v2_second_copy() {
     next_tape VOL-H || return 1
-    vinit VOL-H && TCTL volume write VOL-H --device "$TAPE_DEV"
+    vinit VOL-H && TCTL volume write VOL-H --device "$TAPE_DEV" --yes
 }
 
 cp_reclaim_v1_photos() {
@@ -2197,7 +2205,7 @@ cp_compact_finish_refused_first() {
 cp_write_volg() {
     next_tape VOL-G || return 1
     vinit VOL-G || return 1
-    TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV"
+    TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV" --yes
 }
 
 # --yes because this act is now ADR-0008 Tier 2 (issue #147): finishing the
@@ -2324,7 +2332,7 @@ rr_write_second_copy_volb() {
         return $?
     fi
     next_tape VOL-B || return 1
-    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV"
+    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV" --yes
 }
 
 rr_retire_vola_succeeds_with_coverage() {
@@ -2780,7 +2788,7 @@ eo_escrow()       { TCTL key generate --escrow; }
 eo_stage()        { TCTL stage create unitA && TCTL stage create unitB; }
 eo_write() {
     next_tape VOL-EO || return 1
-    vinit VOL-EO && TCTL volume write VOL-EO --device "$TAPE_DEV"
+    vinit VOL-EO && TCTL volume write VOL-EO --device "$TAPE_DEV" --yes
 }
 
 scenario_escrow_ordering() {
@@ -2941,7 +2949,7 @@ qa_run() {
     # as a cartridge-reuse limitation. vinit supplies --force when a cartridge
     # is being reused.
     vinit VOL-Q || return 1
-    TCTL quick-archive --tenant alice --volume VOL-Q "$SRC/qa-unit" --device "$TAPE_DEV"
+    TCTL quick-archive --tenant alice --volume VOL-Q "$SRC/qa-unit" --device "$TAPE_DEV" --yes
 }
 
 scenario_quick_archive() {
@@ -3035,7 +3043,7 @@ col_plan()   { TCTL collection plan; }
 col_run_batch() {
     next_tape VOL-COL1 || return 1
     vinit VOL-COL1 || return 1
-    TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV"
+    TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV" --yes
 }
 
 # Rename-by-uuid: add a 5th folder AND rename the 3rd, in one sync. If the
@@ -3248,7 +3256,7 @@ pm_op_write_next_volume() {
     local label="VOL-PM$PM_VOL_SEQ" sd; sd="$(dirname "$HOME_DIR")"
     next_tape "$label" || return 1
     vinit "$label" || return 1
-    TCTL volume write "$label" --device "$TAPE_DEV" || return 1
+    TCTL volume write "$label" --device "$TAPE_DEV" --yes || return 1
     # Freeze the baseline for THIS volume from what was staged, not from the
     # live source (see pm_capture_staged).
     mkdir -p "$sd/pm-snapshot-$label"
@@ -3820,7 +3828,7 @@ sct_backup_while_writable() {
 
 sct_write_and_seal() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl volume write VOL-S (seals the tape; catalog now says 'sealed')"; return 0; }
-    TCTL volume write VOL-S --device "$TAPE_DEV"
+    TCTL volume write VOL-S --device "$TAPE_DEV" --yes
 }
 
 sct_stale_catalog_write_refused() {
@@ -3951,7 +3959,7 @@ cd_stage_kept() { TCTL snapshot create kept && TCTL stage create kept; }
 cd_write_kept_on_d0() {
     next_tape VOL-D0 || return 1
     vinit VOL-D0 || return 1
-    TCTL volume write VOL-D0 --device "$TAPE_DEV"
+    TCTL volume write VOL-D0 --device "$TAPE_DEV" --yes
 }
 
 cd_stage_solo() { TCTL snapshot create solo && TCTL stage create solo; }
@@ -3966,7 +3974,7 @@ cd_stage_solo() { TCTL snapshot create solo && TCTL stage create solo; }
 cd_write_both_on_d1() {
     next_tape VOL-D1 || return 1
     vinit VOL-D1 || return 1
-    TCTL volume write VOL-D1 --device "$TAPE_DEV"
+    TCTL volume write VOL-D1 --device "$TAPE_DEV" --yes
 }
 
 # The precondition the whole scenario rests on. If kept does not really have
@@ -4164,7 +4172,7 @@ csc_run_first_copy() {
     next_tape VOL-CS1 || return 1
     vinit VOL-CS1 || return 1
     if [ "$DRY_RUN" = 1 ]; then
-        TCTL collection run --collection media --batch 0 --label VOL-CS1 --device "$TAPE_DEV" --json
+        TCTL collection run --collection media --batch 0 --label VOL-CS1 --device "$TAPE_DEV" --yes --json
         echo "PLAN: assert staging_released=false and every under_copied entry is 1/2"
         return 0
     fi
@@ -4180,7 +4188,7 @@ csc_run_first_copy() {
     # writes to stderr.
     local f="$RUN/log-csc.run1.json" e="$RUN/log-csc.run1.err"
     TCTL collection run --collection media --batch 0 --label VOL-CS1 \
-        --device "$TAPE_DEV" --json >"$f" 2>"$e" || { cat "$e" "$f"; return 1; }
+        --device "$TAPE_DEV" --yes --json >"$f" 2>"$e" || { cat "$e" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { cat "$e" "$f"; return 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -4273,7 +4281,7 @@ csc_capture_staged() {
 csc_second_copy() {
     next_tape VOL-CS2 || return 1
     vinit VOL-CS2 || return 1
-    TCTL volume write VOL-CS2 --device "$TAPE_DEV"
+    TCTL volume write VOL-CS2 --device "$TAPE_DEV" --yes
 }
 
 csc_same_staged_bytes() {
