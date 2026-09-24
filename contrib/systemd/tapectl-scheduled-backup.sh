@@ -63,8 +63,9 @@ fail() {
 	exit 1
 }
 
+# At least 1: with 0 the prune below would delete the copy just written.
 case "$KEEP" in
-'' | *[!0-9]*) fail "TAPECTL_BACKUP_KEEP must be a non-negative integer, got '$KEEP'" ;;
+'' | *[!0-9]* | 0) fail "TAPECTL_BACKUP_KEEP must be an integer >= 1, got '$KEEP'" ;;
 esac
 
 ping_hc /start

@@ -136,7 +136,8 @@ fi
 
 # ================================================================ install
 printf '%stapectl systemd install%s — units from %s\n' "$B" "$R" "$SRC"
-case "$KEEP" in '' | *[!0-9]*) die "--keep must be a non-negative integer, got '$KEEP'" ;; esac
+# At least 1: with 0 the wrapper would prune the copy it just wrote.
+case "$KEEP" in '' | *[!0-9]* | 0) die "--keep must be an integer >= 1, got '$KEEP'" ;; esac
 
 # The service user is step 5's job, not this script's: creating an account
 # is a decision about the host, and the units are useless without the home
