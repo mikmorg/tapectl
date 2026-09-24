@@ -1048,8 +1048,8 @@ check health_by_id_restore step_health_by_id_restore
 # leg those facts were verified once, by hand, and nothing re-checked them.
 #
 # Placed here because the gate home's catalog is FINAL after leg 4: every
-# write/resume/verify/restore this gate performs has happened. rust_e2e below
-# uses its own home and adds nothing to this DB.
+# init/write/resume/verify/restore this gate performs has happened. rust_e2e
+# below uses its own home and adds nothing to this DB.
 #
 # Every snippet takes the DB path as argv[1] and nothing else, so each can be
 # replayed offline against a copy of a gate DB with a defect injected -- the
@@ -1069,11 +1069,14 @@ step_log_page_sweep_complete() {
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 # "restore unit" since issue #320: every read-path contact takes the same
-# post-command sweep. The other read paths (raw-volume, rebuild, identify,
+# post-command sweep. "volume init" since issue #339: ADR-0013's 2026-09-23
+# evening amendment rules that EVERY contact sweeps, init included -- the
+# rehearsal before it showed every init contact on the real drive with zero
+# journal rows. The other read paths (raw-volume, rebuild, identify,
 # read-slices, compact-read) are not exercised by this gate, and the positive
 # control below requires at least one contact of EACH listed operation -- so
 # listing one the gate never runs would fail for the wrong reason.
-OPS = ("volume write", "volume resume", "volume verify", "restore unit")
+OPS = ("volume init", "volume write", "volume resume", "volume verify", "restore unit")
 contacts = c.execute(
     f"""SELECT id, operation FROM cartridge_contacts
         WHERE operation IN ({",".join("?" * len(OPS))}) AND closed_at IS NOT NULL
@@ -1110,7 +1113,7 @@ for cid, op in contacts:
                    f"missing {sorted(f'{p:02x}' for p in listed - read)}, "
                    f"unlisted {sorted(f'{p:02x}' for p in read - listed)}")
 assert not bad, "log-page sweep incomplete:\n  " + "\n  ".join(bad)
-print(f"{len(contacts)} closed write/resume/verify/restore-unit contacts, each swept exactly the pages its own 0x00 listed")
+print(f"{len(contacts)} closed init/write/resume/verify/restore-unit contacts, each swept exactly the pages its own 0x00 listed")
 PYLP_SWEEP
 }
 

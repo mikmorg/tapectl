@@ -434,6 +434,11 @@ pub struct ContactSlot<'a> {
     /// paths, here for the three write paths (issue #314). `None`, the
     /// production default, asks the drive itself.
     drive_identity: Option<DriveIdentity>,
+    /// The test seam [`ContactSite::with_log_source`] is for the read
+    /// paths, here for `volume init`'s post-command sweep (issue #339).
+    /// `None`, the production default, runs `sg_logs` on the backend's sg
+    /// node.
+    log_source: Option<&'a std::cell::RefCell<dyn LogSource + 'a>>,
 }
 
 impl<'a> ContactSlot<'a> {
@@ -441,6 +446,7 @@ impl<'a> ContactSlot<'a> {
         ContactSlot {
             guard: None,
             drive_identity: None,
+            log_source: None,
         }
     }
 
@@ -448,6 +454,24 @@ impl<'a> ContactSlot<'a> {
     pub fn with_drive_identity(mut self, identity: DriveIdentity) -> Self {
         self.drive_identity = Some(identity);
         self
+    }
+
+    /// See [`ContactSite::with_log_source`]. Production never calls it.
+    pub fn with_log_source(mut self, source: &'a std::cell::RefCell<dyn LogSource + 'a>) -> Self {
+        self.log_source = Some(source);
+        self
+    }
+
+    /// The injected drive identity, cloned out so a caller can hold it
+    /// across [`open`](ContactSlot::open) — whose returned guard keeps the
+    /// slot borrowed for the rest of the contact. `None` in production.
+    pub(crate) fn injected_drive_identity(&self) -> Option<DriveIdentity> {
+        self.drive_identity.clone()
+    }
+
+    /// See [`ContactSlot::with_log_source`].
+    pub(crate) fn injected_log_source(&self) -> Option<&'a std::cell::RefCell<dyn LogSource + 'a>> {
+        self.log_source
     }
 
     /// Record that the contact has begun ([`ContactGuard::open`]), and hand

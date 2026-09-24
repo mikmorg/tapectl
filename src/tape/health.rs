@@ -318,6 +318,17 @@ pub enum Reading {
     /// (`log_page_journal.trigger`), where a second copy here could only
     /// disagree with it.
     Restore,
+    /// A `volume init` (issue #339, ADR-0013's 2026-09-23 evening
+    /// amendment: "every contact takes one post-command sweep, volume init
+    /// included"). Its own kind rather than `Write`, by the same rule that
+    /// gave the read paths one kind of their own: a reading's kind says
+    /// which way the tape was driven, and init drives it differently from
+    /// a write — one File 0 from BOT, nothing else — which is what makes
+    /// its reading the BASELINE for the cartridge on this drive: page
+    /// 0x17's load count and lifetime megabytes before the first data byte.
+    /// Folding it into `write` would hide exactly the row a trend wants to
+    /// start from.
+    Init,
 }
 
 impl Reading {
@@ -328,6 +339,7 @@ impl Reading {
         Reading::Resume,
         Reading::Verify,
         Reading::Restore,
+        Reading::Init,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -336,6 +348,7 @@ impl Reading {
             Reading::Resume => "resume",
             Reading::Verify => "verify",
             Reading::Restore => "restore",
+            Reading::Init => "init",
         }
     }
 }
@@ -1212,7 +1225,7 @@ Read error counter page  [0x3]
         let names: Vec<&str> = Reading::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(
             names,
-            vec!["write", "resume", "verify", "restore"],
+            vec!["write", "resume", "verify", "restore", "init"],
             "health_logs.operation is what KIND of reading a row is — a \
              different vocabulary from cartridge_contacts.operation, which is \
              the command verbatim"

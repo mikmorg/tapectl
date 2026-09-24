@@ -138,6 +138,19 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// [`media_detect::check_drive_can_write`] — moved there (issue #166) so
 /// `volume_init`, `volume_write` and `volume_resume` all reach the exact
 /// same message rather than three copies that could drift.
+///
+/// **The post-command sweep (issue #339).** ADR-0013's 2026-09-23 evening
+/// amendment rules that every contact takes ONE log-page sweep, `volume
+/// init` included — it is the first contact a cartridge gets on a drive,
+/// so its reading is the baseline every later trend starts from. It sits
+/// in [`volume_init_contacted`] after [`volume_init_in_contact`] returns:
+/// after File 0 is written, after the binding has committed and the contact
+/// has named its cartridge, and on EVERY outcome the contact saw — a
+/// refusal after the MAM read (no medium serial, an unwritable generation, a
+/// sealed tape at File 0) is swept too, as the read paths' contacts are;
+/// only a refusal BEFORE the contact opened takes none, because nothing was
+/// in the drive as far as the command is concerned. Best-effort throughout:
+/// the reading can never fail or refuse the init.
 #[allow(clippy::too_many_arguments)] // conn/config + label/device/block_size + force + the two ADR-0010 declarations
 pub fn volume_init(
     conn: &Connection,
@@ -163,8 +176,30 @@ pub fn volume_init(
         declared_media,
         cartridge_barcode,
         &mut contact,
+        InitStore::Device,
     );
     contact.finish_result(r)
+}
+
+/// How `volume init` reaches the medium once every FACT check has passed
+/// — the store seam `volume_verify_with_store` has, for init (issue #339).
+///
+/// The choice is made INSIDE [`volume_init_in_contact`], at the exact line
+/// `TapeStore::open` used to stand, so the invariant in [`volume_init`]'s
+/// doc — every fact check runs before the tape device is opened — is
+/// untouched: an injected store is simply not opened.
+///
+/// `pub` for the reason [`ContactSite::with_log_source`] is: production
+/// never constructs `Injected`, and a crate-private variant only tests build
+/// is dead code to the lib target.
+pub enum InitStore<'s> {
+    /// Production: open a [`TapeStore`] on the device, sized from the
+    /// capacity the fact checks resolved.
+    Device,
+    /// A test's store — a `MemStore` — standing in for the drive, which is
+    /// what lets init's File 0 write and its post-command sweep be proved
+    /// with no tape anywhere.
+    Injected(&'s mut dyn Store),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -183,6 +218,7 @@ fn volume_init_contacted<'c>(
     // when the medium's serial matches no row (or no serial is readable).
     cartridge_barcode: Option<&str>,
     contact: &mut ContactSlot<'c>,
+    store: InitStore<'_>,
 ) -> Result<i64> {
     // Creation-time label validation (issue #103). A label reaches the
     // filesystem too: `volume_read_slices` below joins
@@ -233,6 +269,14 @@ fn volume_init_contacted<'c>(
         )));
     }
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    // The health probe's two test seams, taken off the slot BEFORE it opens:
+    // `open` hands back a guard that keeps the slot borrowed for the rest of
+    // the contact. `None`/`None` in production — the drive answers.
+    let injected_identity = contact.injected_drive_identity();
+    let probe = HealthProbe {
+        log_source: contact.injected_log_source(),
+        identity: injected_identity.as_ref(),
+    };
     // THE CONTACT BEGINS HERE: the MAM read above is the first moment this
     // command and a cartridge were in the same drive, and `volume_id` is
     // NULL because no `volumes` row exists yet — `init` creates it below.
@@ -253,6 +297,69 @@ fn volume_init_contacted<'c>(
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeInit, Hook::VolumeInit, &det.capture);
+
+    let r = volume_init_in_contact(
+        conn,
+        label,
+        device,
+        block_size,
+        force,
+        declared_media,
+        cartridge_barcode,
+        backend,
+        drive_gen,
+        &det,
+        contact,
+        store,
+    );
+
+    // ONE post-command sweep per init contact (issue #339; ADR-0013's
+    // 2026-09-23 evening amendment: "every contact takes one post-command
+    // sweep, volume init included"), on every outcome the contact saw —
+    // the `?`s inside `volume_init_in_contact` all return HERE, so a refusal
+    // after the MAM read is swept exactly as a success is. The `TapeStore`
+    // was dropped when that function returned, so the st close (which
+    // writes the filemark that ends File 0) is INSIDE the swept window;
+    // `volume write` sweeps with its store still open. The reading names the
+    // volume when the init made one, and nothing when it refused — the
+    // contact itself names none either way, having opened before the row
+    // existed. Best-effort: nothing here can fail or refuse the init.
+    collect_health_best_effort(
+        conn,
+        config,
+        device,
+        r.as_ref().ok().copied(),
+        contact.id(),
+        health::Reading::Init,
+        Operation::VolumeInit,
+        probe,
+    );
+
+    r
+}
+
+/// Everything `volume init` does INSIDE its contact, from the fact refusals
+/// through the File 0 write — split from [`volume_init_contacted`] (issue
+/// #339) so that function can take the post-command sweep after this one
+/// returns, whichever way it returned. The body is unchanged by the split:
+/// the six ADR-0010/ADR-0012 fact checks, the capacity resolution, the
+/// store, `check_fresh_write_contact`, the one transaction that creates and
+/// binds the volume, and the provisional ID thunk.
+#[allow(clippy::too_many_arguments)]
+fn volume_init_in_contact<'c>(
+    conn: &'c Connection,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
+    declared_media: Option<&str>,
+    cartridge_barcode: Option<&str>,
+    backend: &crate::config::LtoBackendConfig,
+    drive_gen: crate::media::Generation,
+    det: &crate::tape::media_detect::Detected,
+    contact: &contact::ContactGuard<'c>,
+    store: InitStore<'_>,
+) -> Result<i64> {
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
             TapectlError::Other(format!(
@@ -313,7 +420,7 @@ fn volume_init_contacted<'c>(
     };
 
     let (generation, media_source) =
-        crate::tape::media_detect::resolve_media(&det, declared, row_gen, drive_gen)?;
+        crate::tape::media_detect::resolve_media(det, declared, row_gen, drive_gen)?;
     if !media_source.is_detected() {
         // ONE line, not two. This was `warn!` AND `eprintln!` with the same
         // text, and tracing routes WARN to stderr — so the operator saw the
@@ -372,9 +479,18 @@ fn volume_init_contacted<'c>(
     // volume_init only ever writes the provisional identity thunk; real
     // capacity gating happens in volume_write's pre-open validate.
     let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
-    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+    // The tape device opens HERE and not a line earlier (see the ordering
+    // invariant in `volume_init`'s doc); an injected store is never opened.
+    let mut opened;
+    let store: &mut dyn Store = match store {
+        InitStore::Device => {
+            opened = TapeStore::open(device, block_size, usable_bytes)?;
+            &mut opened
+        }
+        InitStore::Injected(s) => s,
+    };
 
-    check_fresh_write_contact(&mut store, label, &candidate_uuid, None, force)?;
+    check_fresh_write_contact(store, label, &candidate_uuid, None, force)?;
     // The check above read File 0 (and possibly moved the physical head on
     // real tape); undo that before the real write, which must start at BOT
     // exactly like an untouched fresh session would (`reposition_for_resume`'s
@@ -2702,10 +2818,11 @@ pub(crate) fn quarantine_on_medium_evidence(
 /// errors only logged).
 ///
 /// `operation` is the caller's own word for what it was doing, threaded
-/// through rather than hardcoded because two different commands land here.
-/// Issue #295 threaded it; migration 021 (issue #296) dropped the CHECK that
-/// had been forcing `volume resume` to call itself `write`, and the resume
-/// call site now passes [`health::Reading::Resume`].
+/// through rather than hardcoded because several different commands land
+/// here. Issue #295 threaded it; migration 021 (issue #296) dropped the CHECK
+/// that had been forcing `volume resume` to call itself `write`, and the
+/// resume call site now passes [`health::Reading::Resume`]; `volume init`
+/// passes [`health::Reading::Init`] (issue #339).
 ///
 /// `trigger` is the COMMAND, verbatim — the `cartridge_contacts.operation`
 /// vocabulary — which every `log_page_journal` row records (issue #298). A
@@ -2733,7 +2850,7 @@ fn collect_health_best_effort(
     contact_id: Option<i64>,
     operation: health::Reading,
     trigger: Operation,
-    probe: HealthProbe<'_>,
+    probe: HealthProbe<'_, '_>,
 ) {
     match health_backend(config, device) {
         Ok(bk) => collect_and_record_health(
@@ -2749,10 +2866,15 @@ fn collect_health_best_effort(
 /// A test substitutes a fixture log source and a fixed identity, the same
 /// two seams a read path's [`ContactSite`] carries
 /// ([`ContactSite::with_log_source`], [`ContactSite::with_drive_identity`]).
+///
+/// Two lifetimes, not one (issue #339): `volume init`'s slot OWNS its
+/// injected identity, so the identity borrow is a local one, while the log
+/// source is borrowed for the whole contact. One shared lifetime would
+/// force the local to outlive the contact, which it cannot.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct HealthProbe<'a> {
-    pub log_source: Option<&'a std::cell::RefCell<dyn log_pages::LogSource + 'a>>,
-    pub identity: Option<&'a drive_identity::DriveIdentity>,
+pub(crate) struct HealthProbe<'l, 'i> {
+    pub log_source: Option<&'l std::cell::RefCell<dyn log_pages::LogSource + 'l>>,
+    pub identity: Option<&'i drive_identity::DriveIdentity>,
 }
 
 /// The post-command health reading of a READ-path contact (issue #320,
@@ -2845,7 +2967,7 @@ fn collect_and_record_health(
     session_id: Option<i64>,
     reading: health::Reading,
     trigger: Operation,
-    probe: HealthProbe<'_>,
+    probe: HealthProbe<'_, '_>,
 ) {
     // An injected source stands in for the drive entirely: no `sg_logs`,
     // and no INQUIRY either (the header is an addition to the record, never
@@ -6040,6 +6162,8 @@ mod tests {
             // Issue #320: the one read-path caller takes the command from
             // its site — `compact_read` serves two commands.
             ("health::Reading::Restore,", "site.operation(),"),
+            // Issue #339: init's own kind, under its own command.
+            ("health::Reading::Init,", "Operation::VolumeInit,"),
         ] {
             let at = prod
                 .find(reading)
@@ -6159,6 +6283,9 @@ mod tests {
             ("fn volume_write_contacted", "contact.id(),"),
             ("fn volume_resume_contacted", "contact.id(),"),
             ("pub fn volume_verify(", "report.contact_id,"),
+            // Issue #339: init sweeps too, in the function that holds the
+            // guard — not in `volume_init_in_contact`, which the `?`s leave.
+            ("fn volume_init_contacted", "contact.id(),"),
         ] {
             let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
             let end = prod[start..].find("\n}\n").unwrap() + start;
@@ -11720,6 +11847,7 @@ mod tests {
                 None,
                 None,
                 &mut slot,
+                InitStore::Device,
             );
             let err = slot.finish_result(r).unwrap_err().to_string();
             assert!(err.contains("no medium serial"), "{err}");
@@ -11759,6 +11887,173 @@ mod tests {
             assert_eq!(drives, 0);
         }
 
+        /// The rows one init contact's sweep leaves, asserted by value
+        /// (issue #339): every page the fixture's 0x00 lists, once each,
+        /// against contact `cid` under the command `volume init`; and
+        /// exactly ONE `health_logs` row, of kind `init`, naming that
+        /// contact and `volume_id`. Shared by the success and the refusal
+        /// case below so both assert the SAME shape.
+        fn assert_one_init_sweep(conn: &Connection, cid: i64, volume_id: Option<i64>) {
+            use crate::tape::log_pages::tests::LISTED;
+            let journal: Vec<(u8, Option<i64>, String, i64)> = conn
+                .prepare(
+                    "SELECT page_code, contact_id, trigger, ok FROM log_page_journal ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                journal,
+                LISTED
+                    .iter()
+                    .map(|p| (*p, Some(cid), "volume init".to_string(), 1))
+                    .collect::<Vec<_>>(),
+                "one sweep: page 0x00 then every listed page, once, against THIS contact, \
+                 trigger = the command verbatim"
+            );
+            let health: Vec<(Option<i64>, String, Option<i64>)> = conn
+                .prepare("SELECT contact_id, operation, volume_id FROM health_logs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                health,
+                vec![(Some(cid), "init".to_string(), volume_id)],
+                "exactly one health_logs row, of kind 'init', naming contact {cid}"
+            );
+        }
+
+        /// Issue #339 (ADR-0013's 2026-09-23 evening amendment: "every
+        /// contact takes one post-command sweep, volume init included"),
+        /// the success case with no tape anywhere: `volume init` on a
+        /// `MemStore`, the log pages answered by a fixture drive. File 0
+        /// is written, the volume is created and bound, and THEN one sweep
+        /// — each page read exactly once (ADR-0013's read-to-clear hazard)
+        /// — leaves its journal rows and one `health_logs` row of kind
+        /// `init` naming the contact and the volume the init just made.
+        ///
+        /// Before this issue the same init left zero `log_page_journal`
+        /// rows and zero `health_logs` rows: the 2026-09-23 real-drive
+        /// rehearsal recorded exactly that for every init contact.
+        ///
+        /// Negative control (run by hand, not committed): delete the
+        /// `collect_health_best_effort(` call at the end of
+        /// `volume_init_contacted` and this fails at the journal assertion
+        /// with an empty list — which is what reverts the ruling.
+        #[test]
+        fn an_init_on_memstore_sweeps_once_after_file_zero() {
+            use crate::tape::log_pages::tests::{assert_each_page_read_once, FixtureSource};
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            // The drive is LTO-6 so it can write the LTO-6 cartridge row
+            // that arbitrates the generation (nothing is detectable on a
+            // nonexistent device, and `--cartridge` names the row).
+            let mut config = lto8_config(tmp.path());
+            config.backends.lto[0].generation = "LTO-6".into();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('MEM-INIT-1', 'LTO-6', 2500000000000, 'available')",
+                [],
+            )
+            .unwrap();
+
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let mut slot = ContactSlot::empty()
+                .with_drive_identity(identity_with_serial(Some("XYZZY_A1")))
+                .with_log_source(&src);
+            let mut store = crate::store::MemStore::new(512 * 1024);
+            let r = volume_init_contacted(
+                &conn,
+                &config,
+                "MI-NEW",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                None,
+                Some("MEM-INIT-1"),
+                &mut slot,
+                InitStore::Injected(&mut store),
+            );
+            let volume_id = slot
+                .finish_result(r)
+                .expect("init on a blank MemStore succeeds");
+
+            // The init did its job: one File 0 carrying the label, the
+            // volume row bound to the named cartridge, the contact closed ok.
+            assert_eq!(store.files.len(), 1, "exactly File 0 was written");
+            let file0 = String::from_utf8_lossy(&store.files[0]);
+            assert!(file0.contains("MI-NEW"), "File 0 is the ID thunk: {file0}");
+            let bound: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cartridge_volumes cv JOIN cartridges c ON c.id = cv.cartridge_id
+                     WHERE cv.volume_id = ?1 AND c.barcode = 'MEM-INIT-1' AND cv.unmounted_at IS NULL",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(bound, 1, "the volume is bound to the --cartridge row");
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume init");
+            assert_eq!(outcome.as_deref(), Some("ok"));
+            let cid: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+
+            // And then the one sweep, attributed to it.
+            assert_one_init_sweep(&conn, cid, Some(volume_id));
+            assert_each_page_read_once(&src.borrow().reads);
+        }
+
+        /// Issue #339, the other outcome the contact can have: a refusal
+        /// AFTER the MAM read (no medium serial and no `--cartridge`,
+        /// `require_named_cartridge`) is still a contact, and it is swept
+        /// exactly as a success is — the read paths' rule, and the point
+        /// of "every contact": an init that refused at File 0 on a sealed
+        /// tape is a contact whose counters the record wants. The reading
+        /// names no volume, because the refusal made none.
+        #[test]
+        fn a_refused_init_contact_is_swept_once_too() {
+            use crate::tape::log_pages::tests::{assert_each_page_read_once, FixtureSource};
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = lto8_config(tmp.path());
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let mut slot = ContactSlot::empty()
+                .with_drive_identity(identity_with_serial(Some("XYZZY_A1")))
+                .with_log_source(&src);
+            let r = volume_init_contacted(
+                &conn,
+                &config,
+                "IC-SWEEP",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                None,
+                None,
+                &mut slot,
+                InitStore::Device,
+            );
+            let err = slot.finish_result(r).unwrap_err().to_string();
+            assert!(err.contains("no medium serial"), "{err}");
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume init");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            let cid: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            let volumes: i64 = conn
+                .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(volumes, 0, "the refusal created no volume row to name");
+
+            assert_one_init_sweep(&conn, cid, None);
+            assert_each_page_read_once(&src.borrow().reads);
+        }
+
         /// The negative control for `volume init`: a label that already
         /// exists refuses before the MAM read, and records nothing.
         #[test]
@@ -11786,6 +12081,20 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(contact_count(&conn), 0);
+            // And no sweep either (issue #339): the sweep is per CONTACT, and
+            // a command that never reached a cartridge has none to sweep.
+            // This is the negative control for the two sweep tests above.
+            let journal: i64 = conn
+                .query_row("SELECT COUNT(*) FROM log_page_journal", [], |r| r.get(0))
+                .unwrap();
+            let health: i64 = conn
+                .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                (journal, health),
+                (0, 0),
+                "no contact, so no sweep and no reading"
+            );
         }
 
         /// `volume write` and `volume resume` cannot be driven without a tape
@@ -11888,7 +12197,10 @@ mod tests {
         #[test]
         fn volume_init_parses_capacity_override_decimally() {
             const SRC: &str = include_str!("write.rs");
-            let f = "fn volume_init_contacted";
+            // The parse lives in the inner function since issue #339 split
+            // it out of `volume_init_contacted` (which now holds only the
+            // contact and its sweep). The call moved, so the citation moved.
+            let f = "fn volume_init_in_contact";
             let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
             let end = SRC[start..].find("\n}\n").unwrap() + start;
             let body = &SRC[start..end];

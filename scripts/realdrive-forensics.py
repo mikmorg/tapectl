@@ -4,8 +4,8 @@
     scripts/realdrive-forensics.py <run>/<scenario>/home/tapectl.db <DRIVE_SERIAL>
 
 Asserts what the pass count cannot: every backend contact names that drive,
-every closed write/verify/restore contact swept exactly the pages its own
-page 0x00 listed (each ok, each ONE LOG SENSE via --maxlen), every health
+every closed init/write/resume/verify/restore contact swept exactly the pages
+its own page 0x00 listed (each ok, each ONE LOG SENSE via --maxlen), every health
 reading has counters, every volume was sized from the detected LTO-6
 generation, and the cartridge is the sanctioned one. Read-only; touches no
 device. Written for the 2026-09-23 rehearsal (docs/runs/2026-09-23-real-drive-rehearsal.md).
@@ -31,12 +31,10 @@ swept = 0
 for cid, op, outcome, serial, closed, backend, cart, reason in contacts:
     if not backend or closed is None:
         continue
-    if op == "volume init":
-        # ADR-0013's 2026-09-23 amendment lists write/resume/verify and the read
-        # paths; init is outside the ruling. Reported, not failed.
-        n = c.execute("SELECT COUNT(*) FROM log_page_journal WHERE contact_id=?", (cid,)).fetchone()[0]
-        out.append(f"note: volume init contact {cid} has {n} log-page rows (init is outside ADR-0013's sweep ruling)")
-        continue
+    # No exemption for "volume init" (issue #339): ADR-0013's 2026-09-23 evening
+    # amendment rules that EVERY contact takes one post-command sweep, init
+    # included. Before that ruling this loop reported init's row count as a
+    # note; a swept init is now checked like every other contact.
     rows = c.execute("SELECT page_code, ok, raw, tool_argv FROM log_page_journal WHERE contact_id=?", (cid,)).fetchall()
     if not rows:
         bad.append(f"contact {cid} ({op}): no log-page sweep at all"); continue
