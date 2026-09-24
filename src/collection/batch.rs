@@ -114,6 +114,10 @@ pub struct BatchExecutionReport {
 /// it. `release_if_covered` is now the one place the scope decision is
 /// made, callable directly by a test; `execute_batch_still_delegates_
 /// release_to_the_scoped_helper` pins that this function still calls it.
+///
+/// `assume_yes` answers `volume_write`'s quiet-host pre-flight for every
+/// copy (ADR-0012, 2026-09-24 amendment, item 7) — the global `--yes`.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_batch(
     conn: &Connection,
     paths: &TapectlPaths,
