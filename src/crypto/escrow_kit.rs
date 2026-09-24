@@ -11,8 +11,8 @@
 //!
 //! | file | what it is |
 //! |---|---|
-//! | `COVER.txt` | The plain-text cover sheet. The artifact with the decades-scale claim: no browser, no tooling, readable with `cat`. Carries the escrow public key in retypable Bech32. |
-//! | `escrow-kit.html` | The same content, self-contained, with the key as an inline SVG QR and print styling. Exists so the ceremony is one keystroke, because ADR-0005 requires repeating it after every write session and a ceremony with friction is one that gets skipped. |
+//! | `COVER.txt` | The plain-text cover sheet. The artifact with the decades-scale claim: no browser, no tooling, readable with `cat`. Carries the escrow IDENTITY (the public half, in retypable Bech32) and a boxed hand-fill area for the escrow SECRET, which `tapectl init` printed once and nothing on this machine holds (ADR-0005, issue #341). The public half decrypts nothing; the sheet says so and tells the operator to write the secret in. |
+//! | `escrow-kit.html` | The same content, self-contained, with the identity as an inline SVG QR and print styling. Exists so the ceremony is one keystroke, because ADR-0005 requires repeating it after every write session and a ceremony with friction is one that gets skipped. |
 //! | `catalog.db.age` | The **full** `tapectl.db`, age-encrypted to the escrow recipient. |
 //!
 //! **Why the full database and not #83's filtered `catalog.db`** (ADR-0009):
@@ -232,6 +232,15 @@ Treat the tapes as the authoritative copy.
 /// twenty years or an heir who has never heard of tapectl, so it opens with
 /// what the tapes are and what to do first, not with terminology. Pure so it
 /// is testable without touching a filesystem.
+///
+/// The sheet prints the escrow PUBLIC key only. Until issue #341 it called
+/// that value "the key" without which "the tapes cannot be decrypted" — false,
+/// a public key decrypts nothing, and the secret half is shown exactly once by
+/// `tapectl init` and stored nowhere (ADR-0005). The sheet now says what the
+/// printed value is (the identity: WHICH secret is needed) and carries a
+/// hand-fill box for the secret, so the ceremony cannot skip the one thing
+/// that makes the kit worth anything. The box geometry is pinned by the
+/// `the_secret_box_has_exactly_one_cell_per_secret_character` test.
 fn render_cover_text(f: &KitFacts) -> String {
     format!(
         "\
@@ -243,29 +252,83 @@ WHAT THIS IS
 ------------
 Somewhere with this sheet there are one or more magnetic tape
 cartridges (LTO). They hold a long-term backup of personal files:
-documents, photos, and similar. This sheet is what makes them
-readable. Without the key printed below, the tapes cannot be
+documents, photos, and similar. The tapes are encrypted. Opening
+them takes a SECRET that was shown exactly once, on the screen
+of the person who set this archive up, and was never stored on
+any computer. This sheet does two things:
+
+  1. It names WHICH secret is needed: the escrow identity
+     printed below. That printed value opens nothing by itself.
+  2. It has a box for the secret to be written in BY HAND.
+
+With the box filled in, this sheet is the key to the tapes. If
+the box is empty, look for the secret on another piece of paper
+in the same envelope. Without the secret the tapes cannot be
 decrypted by anyone -- including the people who made them.
 
-Keep this sheet. It is not a receipt; it is the key.
-
-THE RECOVERY KEY
-----------------
-Type or scan this exactly. It is case-insensitive and has a
-built-in checksum, so a mistyped character will be rejected
-rather than silently producing the wrong key.
+THE ESCROW IDENTITY (public half -- says WHICH secret is needed)
+----------------------------------------------------------------
+This is the PUBLIC half of the escrow key pair. It is safe to
+show to anyone and it cannot decrypt anything. It is printed so
+that a secret you find can be checked against it (see HOW TO
+CHECK THE PAIR) and so that a rebuilt machine can register the
+same identity (tapectl init --escrow-public-key).
 
     {key}
 
-(The same key is encoded as a QR code on the HTML version of
-this sheet, if that was printed too.)
+It is case-insensitive and has a built-in checksum, so a
+mistyped character is rejected rather than silently accepted.
+(The HTML version of this sheet also carries it as a QR code.)
+
+THE ESCROW SECRET -- WRITE IT HERE
+----------------------------------
+`tapectl init` showed the secret ONCE, when this archive was
+created. Whoever ran it copies it into this box by hand, in
+CAPITALS, one character per cell, and checks it character by
+character. It is 74 characters long and always begins
+AGE-SECRET-KEY-1 (already printed). After that prefix the
+letters B, I and O and the digit 1 never occur.
+
+  +------------------------------------------------------------+
+  |                                                            |
+  |  AGE-SECRET-KEY-1 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _  |
+  |                                                            |
+  |                   _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _  |
+  |                                                            |
+  |                   _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _      |
+  |                                                            |
+  +------------------------------------------------------------+
+
+  Written and checked by: ______________________  Date: ________
+
+WITHOUT THE SECRET THIS SHEET OPENS NOTHING. The tapes are
+encrypted to it, and so is catalog.db.age in this envelope.
+
+HOW TO CHECK THE PAIR
+---------------------
+Type the secret, alone, on one line of a file (say escrow.key)
+and run:
+
+    age-keygen -y escrow.key
+
+It prints an age1... value. That value must be identical to the
+escrow identity printed above. If it is not, either a character
+was miscopied (a wrong one is refused with \"invalid checksum\")
+or this is the secret of a different archive. The same file is
+what every recovery tool takes as its key:
+
+    ./RESTORE.sh --restore --key escrow.key --to ./out
+    age -d -i escrow.key -o catalog.db catalog.db.age
+    tapectl catalog rebuild --from-volume --device /dev/nst0 \\
+        --key escrow.key
 
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
   catalog.db.age   An encrypted index of what is on the tapes:
                    which files, on which cartridge, in which
                    location. {bytes} bytes. Decrypt it with the
-                   key above.
+                   SECRET from the box above (see HOW TO CHECK
+                   THE PAIR for the command).
 
 WHAT TO DO FIRST
 ----------------
@@ -306,9 +369,10 @@ GENERATED
 ---------
   Sealed cartridges known at generation time: {sealed}
 
-  This key is permanent. It is never rotated, and rotating the
-  day-to-day keys does not change it -- so this sheet does not
-  go stale as keys change. Only the catalog does.
+  This escrow identity is permanent. It is never rotated, and
+  rotating the day-to-day keys does not change it -- so the
+  identity and the secret on this sheet do not go stale as keys
+  change. Only the catalog does.
 
 ================================================================
 ",
@@ -324,6 +388,12 @@ GENERATED
 /// No external resources of any kind — the QR is an inline SVG, the styling
 /// is one inline `<style>`. A page that fetched anything would be a page that
 /// renders blank in the situation it exists for.
+///
+/// The QR and the boxed `age1…` at the top are the escrow IDENTITY (public
+/// half) and are captioned as such — a black box around a Bech32 string is
+/// exactly what an heir would otherwise take for "the key" (issue #341). The
+/// hand-fill box for the secret is the one inside the `<pre>` text, so there
+/// is a single place to write it on either rendering.
 fn render_cover_html(f: &KitFacts) -> Result<String> {
     let qr = qr_svg(f.escrow_public_key)?;
     let text = render_cover_text(f);
@@ -339,6 +409,9 @@ fn render_cover_html(f: &KitFacts) -> Result<String> {
           max-width: 46rem; line-height: 1.45; }}
   .qr {{ text-align: center; margin: 1.5rem 0; }}
   .qr svg {{ width: 240px; height: 240px; }}
+  .label {{ text-align: center; font-weight: bold; letter-spacing: .04em;
+            margin: .5rem 0 .25rem; }}
+  .caption {{ text-align: center; font-size: .9rem; margin: 0 0 .5rem; }}
   .key {{ font-family: ui-monospace, Menlo, Consolas, monospace;
           font-size: 1.05rem; word-break: break-all; text-align: center;
           border: 2px solid #000; padding: .75rem; margin: 1rem 0; }}
@@ -348,6 +421,10 @@ fn render_cover_html(f: &KitFacts) -> Result<String> {
 </style>
 </head>
 <body>
+<div class=\"label\">ESCROW IDENTITY (public half)</div>
+<div class=\"caption\">Says WHICH secret is needed. It is not the secret and \
+decrypts nothing by itself. The secret goes in the box marked WRITE IT HERE \
+below.</div>
 <div class=\"qr\">{qr}</div>
 <div class=\"key\">{key}</div>
 <pre>{escaped}</pre>
@@ -479,8 +556,13 @@ mod tests {
         );
     }
 
+    /// Renamed from `the_cover_sheet_carries_the_key_and_the_custody_rules`
+    /// for issue #341: the sheet never carried "the key" — it carries the
+    /// escrow PUBLIC key, which decrypts nothing, and until #341 said the
+    /// opposite. It now carries the identity, a hand-fill box for the secret,
+    /// and the custody rules; the old name would have pinned the false claim.
     #[test]
-    fn the_cover_sheet_carries_the_key_and_the_custody_rules() {
+    fn the_cover_sheet_carries_the_identity_the_secret_box_and_the_custody_rules() {
         let f = KitFacts {
             escrow_public_key: ESCROW,
             sealed_volumes: 3,
@@ -488,8 +570,16 @@ mod tests {
             warehouse_deposits: 0,
         };
         let txt = render_cover_text(&f);
-        assert!(txt.contains(ESCROW), "the key itself must be on the sheet");
+        assert!(
+            txt.contains(ESCROW),
+            "the escrow public key must be on the sheet — it is how a found secret is checked"
+        );
         for required in [
+            "ESCROW IDENTITY",
+            "public half",
+            "WRITE IT HERE",
+            "AGE-SECRET-KEY-1",
+            "age-keygen -y",
             "tamper-evident",
             "TWO copies",
             "RESTORE.sh",
@@ -500,6 +590,91 @@ mod tests {
                 "the cover sheet must mention {required:?}"
             );
         }
+    }
+
+    /// The exact phrases issue #341 found: each told an heir that the printed
+    /// `age1…` was the thing that decrypts the tapes. A blanket ban on "the
+    /// key" would be wrong — the sheet legitimately says "the key to the
+    /// tapes" about itself once the box is filled — so the pins are the
+    /// specific false sentences, with the positive controls in the test above.
+    #[test]
+    fn the_cover_sheet_never_calls_the_public_key_the_key_that_decrypts() {
+        let f = KitFacts {
+            escrow_public_key: ESCROW,
+            sealed_volumes: 3,
+            catalog_bytes: 4096,
+            warehouse_deposits: 0,
+        };
+        let txt = render_cover_text(&f);
+        for forbidden in [
+            "it is the key.",
+            "THE RECOVERY KEY",
+            "Without the key printed below",
+            "key above",
+        ] {
+            assert!(
+                !txt.contains(forbidden),
+                "the cover sheet still says {forbidden:?} about the escrow PUBLIC key (issue #341)"
+            );
+        }
+        assert!(
+            txt.contains("opens nothing by itself"),
+            "the sheet must say plainly that the printed identity decrypts nothing"
+        );
+    }
+
+    /// The hand-fill box must hold exactly one age X25519 secret: 74
+    /// characters, of which the 16-character prefix `AGE-SECRET-KEY-1` is
+    /// pre-printed, leaving 58 cells to write. Measured, not assumed: on this
+    /// machine `age-keygen` produces a 74-character secret and refuses a
+    /// lowercased or one-character-altered copy (invalid checksum). A box with
+    /// the wrong cell count would have the writer run out of room or leave a
+    /// gap, and either invites the transcription error the checksum then
+    /// catches only at recovery time.
+    #[test]
+    fn the_secret_box_has_exactly_one_cell_per_secret_character() {
+        let f = KitFacts {
+            escrow_public_key: ESCROW,
+            sealed_volumes: 0,
+            catalog_bytes: 1,
+            warehouse_deposits: 0,
+        };
+        let txt = render_cover_text(&f);
+        let start = txt
+            .find("WRITE IT HERE")
+            .expect("the secret section exists");
+        let end = txt[start..]
+            .find("Written and checked by")
+            .expect("the box is closed by the signature line")
+            + start;
+        let box_lines: Vec<&str> = txt[start..end]
+            .lines()
+            .filter(|l| l.trim_start().starts_with('|') || l.trim_start().starts_with('+'))
+            .collect();
+        assert!(
+            box_lines.len() >= 5,
+            "expected a bordered box of at least two borders and three rows, got {box_lines:?}"
+        );
+        let widths: std::collections::BTreeSet<usize> =
+            box_lines.iter().map(|l| l.chars().count()).collect();
+        assert_eq!(
+            widths.len(),
+            1,
+            "every box line must be the same width or the border is ragged: {box_lines:#?}"
+        );
+        let cells = box_lines
+            .iter()
+            .map(|l| l.matches('_').count())
+            .sum::<usize>();
+        assert_eq!(
+            cells,
+            74 - "AGE-SECRET-KEY-1".len(),
+            "the box must have one cell per secret character after the printed prefix"
+        );
+        assert!(
+            box_lines.iter().any(|l| l.contains("AGE-SECRET-KEY-1")),
+            "the prefix must be pre-printed inside the box"
+        );
     }
 
     /// `docs/operator-guide.md` records an obligation on this kit: an heir
@@ -555,7 +730,24 @@ mod tests {
         };
         let html = render_cover_html(&f).unwrap();
         assert!(html.contains("<svg"), "the QR must be inlined as SVG");
-        assert!(html.contains(ESCROW), "the key must be printed as text too");
+        assert!(
+            html.contains(ESCROW),
+            "the escrow public key must be printed as text too"
+        );
+        // Issue #341: the QR and the boxed age1… are the identity, and the
+        // page must say so, and must carry the same hand-fill box as the text.
+        assert!(
+            html.contains("ESCROW IDENTITY (public half)"),
+            "the QR/key block must be captioned as the identity, not the key"
+        );
+        assert!(
+            html.contains("WRITE IT HERE"),
+            "the HTML page must carry the hand-fill box for the secret"
+        );
+        assert!(
+            !html.contains("THE RECOVERY KEY"),
+            "the HTML page must not call the public key the recovery key"
+        );
 
         // What matters is that nothing is FETCHED. The SVG legitimately
         // carries `xmlns="http://www.w3.org/2000/svg"`, which is an XML

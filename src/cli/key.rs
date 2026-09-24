@@ -436,10 +436,21 @@ pub fn run(
                 // ADR-0005 puts the custody requirements on the printed sheet,
                 // but the operator is standing here now — and the kit has no
                 // value at all until these three things happen.
+                // The kit prints only the escrow PUBLIC key; the secret was
+                // shown once by `init` and is stored nowhere (ADR-0005), so
+                // the sheet has a box for it and this list must name that
+                // step or the printed kit opens nothing (issue #341).
                 println!("still to do, and only you can do it:");
                 println!("  1. print COVER.txt (or the HTML page)");
-                println!("  2. seal it in a tamper-evident envelope");
-                println!("  3. store copies in at least TWO independent failure domains");
+                println!(
+                    "  2. copy the escrow SECRET (AGE-SECRET-KEY-1..., shown once by `tapectl init`)"
+                );
+                println!(
+                    "     by hand into the box marked WRITE IT HERE -- the kit prints only the"
+                );
+                println!("     public half, and without the secret the sheet opens nothing");
+                println!("  3. seal it in a tamper-evident envelope");
+                println!("  4. store copies in at least TWO independent failure domains");
             }
         }
     }
