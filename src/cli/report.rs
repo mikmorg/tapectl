@@ -1415,7 +1415,14 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
             "{}",
             serde_json::to_string_pretty(&health_json(&rows)).unwrap()
         );
-    } else if rows.is_empty() {
+        return Ok(());
+    }
+    // Issue #340: before the listing, whatever `--volume` says and however
+    // many readings there are, every non-zero TapeAlert ever journalled.
+    for line in tape_alert_block(&tape_alert_sightings(conn)?) {
+        println!("{line}");
+    }
+    if rows.is_empty() {
         println!("no health logs recorded");
     } else {
         for r in &rows {
@@ -1515,6 +1522,293 @@ fn health_line(
         tape_alerts.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
         alert_note,
     )
+}
+
+// ---- issue #340: the first non-zero TapeAlert must be seen ----
+//
+// Whether the HP LTO-6 clears TapeAlert (log page 0x2E) on read is
+// unanswered because every 0x2E ever read — every capture, every rehearsal —
+// was all-zero. No code path depends on the answer (one read per contact,
+// journalled verbatim, ADR-0013). What must not happen is the first real
+// flag going by unnoticed in `alerts=1` at the end of a fifty-row listing.
+//
+// Which source is authoritative. One read of 0x2E per contact feeds BOTH
+// records (`log_pages::sweep` → `record_sweep` journals the capture; the
+// same capture's decode goes through `HealthCounters::from_decoded_pages`
+// and its flag count becomes `health_logs.tape_alerts`). So `tape_alerts` is
+// a parser's summary of the observation and the journal row IS the
+// observation: raw bytes plus the offline decode, verbatim. ADR-0013 says
+// consumers read the journal, and its §7 is the reason — a summary written by
+// one build cannot be told apart from a hardware change unless the text it
+// was parsed from is still there. The journal is therefore where the FLAGS
+// come from. Two things keep `health_logs.tape_alerts` in the DETECTION
+// anyway: `record_sweep` is best-effort (a refused insert is skipped, not
+// fatal), and rows written before migration 023 have no journal at all — for
+// those, `raw_log`'s `=== page 0x2e ===` section is the same decode and is
+// read the same way. When the two sources disagree, the line says so; that
+// disagreement is exactly the parser-bug signal §7 exists for.
+
+/// Log page 0x2E, TapeAlert (SSC-3).
+const TAPE_ALERT_PAGE: u8 = 0x2e;
+
+/// Every TapeAlert flag a decoded page 0x2E lists, in page order:
+/// `(flag number, name, raised)`.
+///
+/// sg_logs prints one line per parameter, `  <name>: <0|1>`, in parameter
+/// order, and TapeAlert's parameter code IS the flag number (1..=64,
+/// SSC-3) — so the flag number is the line's ordinal among flag lines. The
+/// two places sg_logs spells the code itself agree: "Obsolete (28h)" is the
+/// 40th line and "Reserved parameter code 0x3d" the 61st (pinned in the
+/// tests against the real HP LTO-6 decode). The header line, an identity
+/// header, and anything else without a `: 0`/`: 1` tail is not a flag line
+/// and is not counted. `": 1"` is raised — the same criterion
+/// `parse_sg_logs_page` counts `tape_alerts` by, so the two agree.
+pub(crate) fn tape_alert_flag_lines(decoded: &str) -> Vec<(u8, String, bool)> {
+    let mut out = Vec::new();
+    for line in decoded.lines() {
+        let line = line.trim();
+        let Some(idx) = line.rfind(": ") else {
+            continue;
+        };
+        let raised = match line[idx + 2..].trim() {
+            "1" => true,
+            "0" => false,
+            _ => continue,
+        };
+        let number = u8::try_from(out.len() + 1).unwrap_or(u8::MAX);
+        out.push((number, line[..idx].to_string(), raised));
+    }
+    out
+}
+
+/// The raised flags of a decoded page 0x2E: `(flag number, name)`. Empty
+/// for a page with nothing raised — and for text that is not a 0x2E decode.
+pub(crate) fn raised_tape_alert_flags(decoded: &str) -> Vec<(u8, String)> {
+    tape_alert_flag_lines(decoded)
+        .into_iter()
+        .filter(|(_, _, raised)| *raised)
+        .map(|(n, name, _)| (n, name))
+        .collect()
+}
+
+/// The `=== page 0x2e ===` section of a `health_logs.raw_log` blob (the
+/// shape `Sweep::health` writes), or `None` when the blob has none.
+fn tape_alert_section_of_raw_log(raw_log: &str) -> Option<String> {
+    let marker = format!("=== page 0x{TAPE_ALERT_PAGE:02x} ===");
+    let mut section: Option<String> = None;
+    for line in raw_log.lines() {
+        match &mut section {
+            None if line.trim() == marker => section = Some(String::new()),
+            None => {}
+            Some(_) if line.trim().starts_with("=== page 0x") => break,
+            Some(s) => {
+                s.push_str(line);
+                s.push('\n');
+            }
+        }
+    }
+    section
+}
+
+/// Where a sighting's flags were read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TapeAlertSource {
+    /// A `log_page_journal` row for page 0x2E (the observation itself).
+    Journal { row_id: i64 },
+    /// A `health_logs` row's `raw_log` — a contact the journal has no 0x2E
+    /// row for (pre-023, or a skipped insert). `row_id` is the health row.
+    HealthLog { row_id: i64 },
+}
+
+/// One contact on which page 0x2E said something was raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TapeAlertSighting {
+    /// `None` only for a pre-021 health row, which had no contact to name.
+    pub(crate) contact_id: Option<i64>,
+    /// The command verbatim (`cartridge_contacts.operation`); with no
+    /// contact, the reading kind (`health_logs.operation`).
+    pub(crate) operation: Option<String>,
+    /// When the page was read (`captured_at`), or the health row's
+    /// `logged_at` when it is the source.
+    pub(crate) at: String,
+    pub(crate) drive_serial: Option<String>,
+    pub(crate) cartridge_barcode: Option<String>,
+    /// `(flag number, name)`, page order. Empty only when
+    /// `health_logs.tape_alerts` is non-zero but no decode is left to name
+    /// the flags from.
+    pub(crate) flags: Vec<(u8, String)>,
+    /// `health_logs.tape_alerts` for the same contact — the count the
+    /// capturing build parsed. `None` when no health row recorded one.
+    pub(crate) recorded_count: Option<i64>,
+    pub(crate) source: TapeAlertSource,
+}
+
+impl TapeAlertSighting {
+    /// The journal's flags and the capturing parser's count disagree.
+    fn disagrees(&self) -> bool {
+        matches!(self.recorded_count, Some(n) if n != self.flags.len() as i64)
+    }
+}
+
+/// Every non-zero TapeAlert on record, oldest first: journal 0x2E rows with
+/// a raised flag in their decode, then `health_logs` rows with
+/// `tape_alerts > 0` whose contact the journal did not already speak for.
+/// The whole table, no `LIMIT`, no `--volume`: a TapeAlert is a drive or
+/// medium event and the first one may be older than the last fifty
+/// readings.
+pub(crate) fn tape_alert_sightings(conn: &Connection) -> Result<Vec<TapeAlertSighting>> {
+    let mut out: Vec<TapeAlertSighting> = Vec::new();
+
+    let mut stmt = conn.prepare(
+        "SELECT j.id, j.contact_id, j.captured_at, j.decoded,
+                cc.operation, d.serial, c.barcode,
+                (SELECT h.tape_alerts FROM health_logs h
+                  WHERE h.contact_id = j.contact_id ORDER BY h.id DESC LIMIT 1)
+         FROM log_page_journal j
+         LEFT JOIN cartridge_contacts cc ON cc.id = j.contact_id
+         LEFT JOIN drives d ON d.id = cc.drive_id
+         LEFT JOIN cartridges c ON c.id = cc.cartridge_id
+         WHERE j.page_code = ?1 AND j.ok = 1 AND j.decoded IS NOT NULL
+         ORDER BY j.captured_at, j.id",
+    )?;
+    let journal = stmt
+        .query_map([TAPE_ALERT_PAGE], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (row_id, contact_id, at, decoded, operation, serial, barcode, recorded) in journal {
+        let flags = raised_tape_alert_flags(&decoded);
+        // A contact whose journal shows nothing raised is not a sighting —
+        // unless its health row says otherwise, which the second query
+        // catches (`spoken_for` only excludes contacts surfaced here).
+        if flags.is_empty() {
+            continue;
+        }
+        out.push(TapeAlertSighting {
+            contact_id,
+            operation,
+            at,
+            drive_serial: serial,
+            cartridge_barcode: barcode,
+            flags,
+            recorded_count: recorded,
+            source: TapeAlertSource::Journal { row_id },
+        });
+    }
+    let spoken_for: Vec<i64> = out.iter().filter_map(|s| s.contact_id).collect();
+
+    let mut stmt = conn.prepare(
+        "SELECT h.id, h.contact_id, h.logged_at, h.operation, h.tape_alerts, h.raw_log,
+                cc.operation, d.serial, c.barcode
+         FROM health_logs h
+         LEFT JOIN cartridge_contacts cc ON cc.id = h.contact_id
+         LEFT JOIN drives d ON d.id = cc.drive_id
+         LEFT JOIN cartridges c ON c.id = cc.cartridge_id
+         WHERE h.tape_alerts > 0
+         ORDER BY h.logged_at, h.id",
+    )?;
+    let health = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (row_id, contact_id, at, kind, count, raw_log, operation, serial, barcode) in health {
+        if contact_id.is_some_and(|c| spoken_for.contains(&c)) {
+            continue;
+        }
+        let flags = raw_log
+            .as_deref()
+            .and_then(tape_alert_section_of_raw_log)
+            .map(|s| raised_tape_alert_flags(&s))
+            .unwrap_or_default();
+        out.push(TapeAlertSighting {
+            contact_id,
+            operation: operation.or(kind),
+            at,
+            drive_serial: serial,
+            cartridge_barcode: barcode,
+            flags,
+            recorded_count: Some(count),
+            source: TapeAlertSource::HealthLog { row_id },
+        });
+    }
+    // Journal rows and health rows were each in time order; interleave.
+    out.sort_by(|a, b| a.at.cmp(&b.at));
+    Ok(out)
+}
+
+/// The one line a sighting prints. Greppable prefix, every identifier the
+/// operator needs to find the contact again, and the flag numbers with
+/// their names.
+pub(crate) fn tape_alert_line(s: &TapeAlertSighting) -> String {
+    let numbers: Vec<String> = s.flags.iter().map(|(n, _)| n.to_string()).collect();
+    let names: Vec<&str> = s.flags.iter().map(|(_, name)| name.as_str()).collect();
+    let flags = if s.flags.is_empty() {
+        "flags=? (no 0x2E decode left to name them from)".to_string()
+    } else {
+        format!("flags={} ({})", numbers.join(","), names.join("; "))
+    };
+    let source = match s.source {
+        TapeAlertSource::Journal { row_id } => format!("log_page_journal#{row_id}"),
+        TapeAlertSource::HealthLog { row_id } => format!("health_logs#{row_id}"),
+    };
+    let disagreement = match s.recorded_count {
+        Some(n) if s.disagrees() => {
+            format!(" health_logs.tape_alerts={n} DISAGREES with the decode — parser bug or a later sweep, see ADR-0013 §7")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "!! TAPE ALERT contact={} op=\"{}\" at={} drive={} cartridge={} {} source={}{}",
+        s.contact_id
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into()),
+        s.operation.as_deref().unwrap_or("?"),
+        s.at,
+        s.drive_serial.as_deref().unwrap_or("-"),
+        s.cartridge_barcode.as_deref().unwrap_or("-"),
+        flags,
+        source,
+        disagreement,
+    )
+}
+
+/// The block `report health` prints ahead of its listing: one line per
+/// sighting and, once, how to answer the read-to-clear question from the
+/// journal. Empty when nothing was ever raised — which is every tape so far.
+pub(crate) fn tape_alert_block(sightings: &[TapeAlertSighting]) -> Vec<String> {
+    if sightings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = sightings.iter().map(tape_alert_line).collect();
+    lines.push(format!(
+        "   read-to-clear (issue #340): compare that contact's page 0x2E bytes with the NEXT \
+         contact's on the same drive — SELECT j.contact_id, j.captured_at, hex(j.raw) FROM \
+         log_page_journal j JOIN cartridge_contacts cc ON cc.id = j.contact_id WHERE \
+         j.page_code = {} AND cc.drive_id = <drive> ORDER BY j.captured_at, j.id; an all-zero \
+         next read with nothing done in between says the drive clears TapeAlert on read.",
+        TAPE_ALERT_PAGE
+    ));
+    lines
 }
 
 /// Per-volume capacity rows: `(label, capacity_bytes, bytes_written, status)`.
@@ -3409,6 +3703,223 @@ Read error counter page  [0x3]
                 " drive=SER-A cartridge=CART01"
             );
             assert_eq!(health_attribution(None, None), " drive=- cartridge=-");
+        }
+    }
+
+    /// Issue #340: the first non-zero TapeAlert must be seen.
+    mod tape_alert_sightings {
+        use super::*;
+
+        /// The real HP LTO-6 decode of page 0x2E (no medium loaded):
+        /// every one of the 64 flags, all zero.
+        const HP_LTO6_PAGE_2E: &str =
+            include_str!("../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia/page_0x2e.decoded.txt");
+
+        /// The same decode with two flags raised — 20 (Cleaning required)
+        /// and 36 (Drive temperature) — the shape the gate seeds.
+        fn two_raised() -> String {
+            let text = HP_LTO6_PAGE_2E
+                .replacen("  Cleaning required: 0", "  Cleaning required: 1", 1)
+                .replacen("  Drive temperature: 0", "  Drive temperature: 1", 1);
+            assert_eq!(
+                text.matches(": 1").count(),
+                2,
+                "positive control: both substitutions landed"
+            );
+            text
+        }
+
+        /// One `log_page_journal` 0x2E row for a contact, ok=1, with the
+        /// given decode. Every NOT NULL column supplied.
+        fn journal_2e(conn: &Connection, id: i64, contact_id: i64, at: &str, decoded: &str) {
+            conn.execute(
+                "INSERT INTO log_page_journal
+                     (id, captured_at, contact_id, device_sg, trigger, page_code, ok,
+                      tool_argv, raw, decoded, tapectl_version)
+                 VALUES (?1, ?2, ?3, '/dev/sg0', 'volume write', 46, 1,
+                         '[\"sg_logs\"]', X'2E000140', ?4, 'test')",
+                rusqlite::params![id, at, contact_id, decoded],
+            )
+            .unwrap();
+        }
+
+        /// The flag number is the line's ordinal, and the two places
+        /// sg_logs spells the parameter code itself agree with that —
+        /// pinned against the real drive's decode, not a synthetic one.
+        #[test]
+        fn flag_numbers_are_ordinals_and_match_the_codes_sg_logs_spells_out() {
+            let lines = tape_alert_flag_lines(HP_LTO6_PAGE_2E);
+            assert_eq!(lines.len(), 64, "SSC-3 TapeAlert has 64 flags");
+            assert_eq!(lines[0].0, 1);
+            assert_eq!(lines[0].1, "Read warning");
+            assert_eq!(lines[19], (20, "Cleaning required".to_string(), false));
+            assert_eq!(lines[35], (36, "Drive temperature".to_string(), false));
+            // sg_logs writes the code into these names: 0x28 = 40, 0x3d = 61.
+            assert_eq!(lines[39], (40, "Obsolete (28h)".to_string(), false));
+            assert_eq!(
+                lines[60],
+                (61, "Reserved parameter code 0x3d, flag".to_string(), false)
+            );
+            assert_eq!(lines[63].0, 64);
+            assert!(
+                lines.iter().all(|(_, _, raised)| !raised),
+                "the fixture is all-zero, as every real read has been"
+            );
+            assert!(raised_tape_alert_flags(HP_LTO6_PAGE_2E).is_empty());
+        }
+
+        #[test]
+        fn raised_flags_come_back_numbered_and_named() {
+            assert_eq!(
+                raised_tape_alert_flags(&two_raised()),
+                vec![
+                    (20, "Cleaning required".to_string()),
+                    (36, "Drive temperature".to_string()),
+                ]
+            );
+            // Not a 0x2E decode at all: nothing, not a false sighting.
+            assert!(raised_tape_alert_flags("    HP        Ultrium 6-SCSI    J5PZ\n").is_empty());
+            assert!(raised_tape_alert_flags("").is_empty());
+        }
+
+        /// A contact whose journal shows two flags: the line carries the
+        /// contact id, the command verbatim, the read's timestamp, the
+        /// drive serial, the cartridge barcode and both flag numbers.
+        #[test]
+        fn a_raised_flag_in_the_journal_is_a_sighting_with_every_identifier() {
+            let conn = crate::db::open_memory().unwrap();
+            super::health_attribution_rows::seed(&conn);
+            journal_2e(&conn, 40, 30, "2026-09-22 03:00:05", &two_raised());
+            conn.execute(
+                "UPDATE health_logs SET tape_alerts = 2 WHERE contact_id = 30",
+                [],
+            )
+            .unwrap();
+
+            let sightings = tape_alert_sightings(&conn).unwrap();
+            assert_eq!(
+                sightings,
+                vec![TapeAlertSighting {
+                    contact_id: Some(30),
+                    operation: Some("volume write".into()),
+                    at: "2026-09-22 03:00:05".into(),
+                    drive_serial: Some("SER-A".into()),
+                    cartridge_barcode: Some("CART01".into()),
+                    flags: vec![
+                        (20, "Cleaning required".into()),
+                        (36, "Drive temperature".into())
+                    ],
+                    recorded_count: Some(2),
+                    source: TapeAlertSource::Journal { row_id: 40 },
+                }]
+            );
+            let block = tape_alert_block(&sightings);
+            assert_eq!(block.len(), 2, "one sighting line, one read-to-clear note");
+            assert_eq!(
+                block[0],
+                "!! TAPE ALERT contact=30 op=\"volume write\" at=2026-09-22 03:00:05 \
+                 drive=SER-A cartridge=CART01 flags=20,36 (Cleaning required; Drive temperature) \
+                 source=log_page_journal#40"
+            );
+            assert!(
+                block[1].contains("read-to-clear") && block[1].contains("NEXT contact"),
+                "the note says how to answer read-to-clear from the journal: {}",
+                block[1]
+            );
+        }
+
+        /// All zero — the state of every tape so far: no line. With a
+        /// positive control that there WAS a 0x2E decode and a
+        /// `tape_alerts = 0` row to look at, so "no sighting" is "looked,
+        /// none raised", not "searched nothing".
+        #[test]
+        fn all_zero_flags_print_nothing() {
+            let conn = crate::db::open_memory().unwrap();
+            super::health_attribution_rows::seed(&conn);
+            journal_2e(&conn, 41, 30, "2026-09-22 03:00:05", HP_LTO6_PAGE_2E);
+            let n_2e: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM log_page_journal WHERE page_code = 46 AND ok = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n_2e, 1, "positive control: a 0x2E decode is on record");
+            let zero: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM health_logs WHERE tape_alerts = 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                zero, 1,
+                "positive control: a recorded-and-clean reading is on record"
+            );
+
+            let sightings = tape_alert_sightings(&conn).unwrap();
+            assert!(sightings.is_empty(), "{sightings:?}");
+            assert!(tape_alert_block(&sightings).is_empty());
+        }
+
+        /// A `health_logs` row with `tape_alerts > 0` and no journal 0x2E
+        /// row for its contact (pre-023, or a skipped insert): still
+        /// surfaced, flags named from `raw_log`'s 0x2E section, attribution
+        /// through the contact — here the drive-only one, so `cartridge=-`.
+        #[test]
+        fn a_health_row_without_a_journal_row_is_surfaced_from_raw_log() {
+            let conn = crate::db::open_memory().unwrap();
+            super::health_attribution_rows::seed(&conn);
+            let raw_log = format!(
+                "    HP        Ultrium 6-SCSI    J5PZ\n=== page 0x02 ===\nnothing here: 5\n\
+                 === page 0x2e ===\n{}\n",
+                HP_LTO6_PAGE_2E.replacen("  Hard error: 0", "  Hard error: 1", 1)
+            );
+            conn.execute(
+                "UPDATE health_logs SET tape_alerts = 1, raw_log = ?1 WHERE contact_id = 31",
+                [&raw_log],
+            )
+            .unwrap();
+
+            let sightings = tape_alert_sightings(&conn).unwrap();
+            assert_eq!(sightings.len(), 1, "{sightings:?}");
+            let s = &sightings[0];
+            assert_eq!(s.contact_id, Some(31));
+            assert_eq!(s.operation.as_deref(), Some("volume identify"));
+            assert_eq!(s.at, "2026-09-22 02:00:00");
+            assert_eq!(s.drive_serial.as_deref(), Some("SER-B"));
+            assert_eq!(s.cartridge_barcode, None);
+            assert_eq!(s.flags, vec![(3, "Hard error".to_string())]);
+            assert_eq!(s.recorded_count, Some(1));
+            assert!(matches!(s.source, TapeAlertSource::HealthLog { .. }));
+            let line = tape_alert_line(s);
+            assert!(
+                line.starts_with(
+                    "!! TAPE ALERT contact=31 op=\"volume identify\" at=2026-09-22 02:00:00 \
+                     drive=SER-B cartridge=- flags=3 (Hard error) source=health_logs#"
+                ),
+                "{line}"
+            );
+            assert!(!line.contains("DISAGREES"), "{line}");
+        }
+
+        /// The journal and the capturing parser disagree on the count: the
+        /// line says so (ADR-0013 §7 — a summary that cannot be told apart
+        /// from the observation is how a parser bug hides).
+        #[test]
+        fn a_count_that_disagrees_with_the_decode_is_said_on_the_line() {
+            let conn = crate::db::open_memory().unwrap();
+            super::health_attribution_rows::seed(&conn);
+            journal_2e(&conn, 42, 30, "2026-09-22 03:00:05", &two_raised());
+            // tape_alerts stays 0 from the seed: the parser saw none.
+            let sightings = tape_alert_sightings(&conn).unwrap();
+            assert_eq!(sightings.len(), 1);
+            assert_eq!(sightings[0].recorded_count, Some(0));
+            let line = tape_alert_line(&sightings[0]);
+            assert!(
+                line.contains("health_logs.tape_alerts=0 DISAGREES"),
+                "{line}"
+            );
         }
     }
 
