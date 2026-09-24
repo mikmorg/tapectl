@@ -197,7 +197,10 @@ tapectl unit discover
 
 `tapectl init` creates the permanent escrow recipient (ADR-0005) for you and prints
 its secret once — **transcribe that secret onto paper then, and store it in two
-independent places** (it is stored nowhere on disk). The escrow recipient must exist
+independent places** (it is stored nowhere on disk). The Heir Kit you generate
+later prints only the *public* half; its cover sheet has a box marked
+"WRITE IT HERE" for this secret, and without the secret the kit opens nothing
+(issue #341). The escrow recipient must exist
 **before the first `stage create`**, because slices are encrypted at stage time and an
 escrow registered afterwards cannot open them; `stage create` and `volume write` both
 refuse without one (issue #115). If you initialized with `--no-escrow` (to adopt an
@@ -797,18 +800,24 @@ It writes three files:
 
 | file | what to do with it |
 |---|---|
-| `COVER.txt` | **Print this.** The plain-text cover sheet, carrying the escrow key in retypable Bech32. It is the artifact with the decades-scale claim — readable with `cat` when no browser exists. |
-| `escrow-kit.html` | Same content with the key as a QR. Open it and use the browser's print dialog. Self-contained: it renders with no network. |
+| `COVER.txt` | **Print this.** The plain-text cover sheet. It carries the escrow *identity* (the public half, `age1…`, in retypable Bech32) and a boxed hand-fill area for the escrow *secret* (`AGE-SECRET-KEY-1…`), which `init` printed once and nothing on the machine holds. The printed `age1…` decrypts nothing by itself; the sheet says so. It is the artifact with the decades-scale claim — readable with `cat` when no browser exists. |
+| `escrow-kit.html` | Same content with the identity as a QR, captioned as the identity. Open it and use the browser's print dialog. Self-contained: it renders with no network. |
 | `catalog.db.age` | The whole catalog, encrypted to the escrow recipient. Put it on the media that travels with the paper. |
 
 **The command stops at the files. The rest is yours, and the kit is worth
 nothing until you do it:**
 
 1. print `COVER.txt` (and/or the HTML page);
-2. seal into a **tamper-evident envelope**;
-3. store copies in **at least two independent failure domains** — not two
+2. **copy the escrow secret by hand into the box marked "WRITE IT HERE"** —
+   the kit prints only the public half; without the secret it opens nothing.
+   Write in CAPITALS (age rejects a lowercased secret), then check the pair
+   as the sheet describes: put the secret alone on one line of a file and
+   `age-keygen -y <file>` must print exactly the `age1…` on the sheet
+   (issue #341);
+3. seal into a **tamper-evident envelope**;
+4. store copies in **at least two independent failure domains** — not two
    shelves in one building;
-4. paper in a UL-350 safe; Class-125 if stored together with tape.
+5. paper in a UL-350 safe; Class-125 if stored together with tape.
 
 **Re-run it after every write session.** A kit made before newer tapes were
 written still opens the older ones and silently misses the new — which is the
@@ -1154,6 +1163,14 @@ as `catalog.db.age`, encrypted to the escrow key. Decrypt it, then import:
 age -d -i escrow.age.key -o catalog.db catalog.db.age
 tapectl db import catalog.db
 ```
+
+`escrow.age.key` is a file you make now: the escrow *secret*
+(`AGE-SECRET-KEY-1…`, 74 characters, CAPITALS) typed alone on one line, from
+the hand-filled box on the kit's cover sheet — the kit itself prints only the
+public half. Check it before using it: `age-keygen -y escrow.age.key` must print
+exactly the `age1…` on the sheet; a miscopied character is refused with
+`invalid checksum`. The same file is the `--key` for `catalog rebuild` and for
+`RESTORE.sh`.
 
 `db import` asks for confirmation first, because it **overwrites the entire
 live database** with the file you name. That is what you want here and exactly

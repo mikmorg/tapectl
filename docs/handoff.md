@@ -154,6 +154,11 @@ the production tape) and does everything around them.
 
 - print `COVER.txt` (and/or the HTML page) — the `.txt` is the artifact with
   the decades-scale claim, readable with `cat` when no browser exists;
+- **copy the escrow secret by hand into the sheet's box marked "WRITE IT
+  HERE"** — the kit prints only the escrow *identity* (the public half); the
+  secret was shown once by `init` and is stored nowhere, and without it the
+  sheet opens nothing. Check the pair with `age-keygen -y` as the sheet says
+  (issue #341);
 - seal into **tamper-evident envelopes**;
 - distribute across **≥2 independent failure domains**;
 - storage class: UL-350 for paper, Class-125 if stored with tape;
