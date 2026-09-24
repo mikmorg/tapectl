@@ -1,5 +1,6 @@
 pub mod contact;
 pub mod drive_identity;
+pub mod feed_ratio;
 pub mod health;
 pub mod ioctl;
 pub mod log_pages;
