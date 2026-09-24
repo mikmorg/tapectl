@@ -45,6 +45,22 @@
 //! contact WITHOUT one really runs the read, against its fixture's
 //! nonexistent device paths, and gets no serial.
 //!
+//! **And the kernel's counters are read at both ends (issue #301).** The
+//! guard reads the st driver's sysfs `stats/` for the contact's device
+//! ([`st_stats`]) right after its row is inserted and again right before
+//! `closed_at` is set, journalling each reading verbatim against the contact
+//! (`st_stats_journal`, migration 025). Two readings, not one post-command
+//! reading beside the log-page sweep, because the counters are cumulative:
+//! what the contact did is the DIFFERENCE, and one reading cannot give it.
+//! It is a file read — no SCSI command, no device open — so it cannot
+//! disturb a read-to-clear log page, and it needs no backend: the DR machine
+//! with only a `--device` still gets its counters. The node is resolved from
+//! the device the command was given, the way [`drive_identity`] resolves it.
+//! Ungated tests point it at a fake tree ([`ContactSite::with_sysfs_root`],
+//! [`ContactSlot::with_sysfs_root`]); a test that does not resolves its
+//! fixture's device under the real `/sys/class/scsi_tape`, finds no such
+//! node, and records nothing.
+//!
 //! # Recording a contact can never refuse a command
 //!
 //! [`ContactGuard::open`] is infallible: a database error yields an inert
@@ -68,6 +84,8 @@
 //!   `failed` out from under it. `closed_at IS NULL` means "did not close",
 //!   and `outcome` stays NULL with it.
 
+use std::path::{Path, PathBuf};
+
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::warn;
 
@@ -77,6 +95,7 @@ use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::log_pages::LogSource;
 use crate::tape::mam::{MamCapture, MamInfo};
 use crate::tape::mam_journal::{Hook, MamReads};
+use crate::tape::st_stats::{self, Point};
 
 // ── The identity reasons ──────────────────────────────────────────────────
 //
@@ -309,6 +328,10 @@ pub struct ContactSite<'a> {
     /// the same shape as `drive_identity`. `None`, the production default,
     /// runs `sg_logs` on the backend's sg node.
     log_source: Option<&'a std::cell::RefCell<dyn LogSource + 'a>>,
+    /// Where the st statistics are read from AS IF it were
+    /// `/sys/class/scsi_tape` — the test seam for issue #301. `None`, the
+    /// production default, reads the kernel's.
+    sysfs_root: Option<&'a Path>,
 }
 
 impl<'a> ContactSite<'a> {
@@ -326,7 +349,16 @@ impl<'a> ContactSite<'a> {
             mam_reads: None,
             drive_identity: None,
             log_source: None,
+            sysfs_root: None,
         }
+    }
+
+    /// Read the st statistics (issue #301) from `<root>/<node>/stats/`
+    /// instead of the kernel's sysfs — how an ungated test gives a contact
+    /// counters with no drive. Production never calls it.
+    pub fn with_sysfs_root(mut self, root: &'a Path) -> Self {
+        self.sysfs_root = Some(root);
+        self
     }
 
     /// Answer "which drive is this?" with `identity` instead of asking the
@@ -397,7 +429,7 @@ impl<'a> ContactSite<'a> {
     /// — NULL if the contact's own INSERT failed: the reads happened either
     /// way, and a journal row with no contact beats no journal row.
     pub fn open<'c>(&self, conn: &'c Connection, volume_id: Option<i64>) -> ContactGuard<'c> {
-        let guard = ContactGuard::open_with_identity(
+        let guard = ContactGuard::open_full(
             conn,
             self.config,
             self.operation,
@@ -405,6 +437,7 @@ impl<'a> ContactSite<'a> {
             volume_id,
             self.medium,
             self.drive_identity,
+            self.sysfs_root,
         );
         if let Some(reads) = self.mam_reads {
             reads.attach(guard.id());
@@ -439,6 +472,10 @@ pub struct ContactSlot<'a> {
     /// `None`, the production default, runs `sg_logs` on the backend's sg
     /// node.
     log_source: Option<&'a std::cell::RefCell<dyn LogSource + 'a>>,
+    /// The test seam [`ContactSite::with_sysfs_root`] is for the read
+    /// paths, here for the write paths (issue #301). `None`, the production
+    /// default, reads the kernel's sysfs.
+    sysfs_root: Option<&'a Path>,
 }
 
 impl<'a> ContactSlot<'a> {
@@ -447,7 +484,14 @@ impl<'a> ContactSlot<'a> {
             guard: None,
             drive_identity: None,
             log_source: None,
+            sysfs_root: None,
         }
+    }
+
+    /// See [`ContactSite::with_sysfs_root`]. Production never calls it.
+    pub fn with_sysfs_root(mut self, root: &'a Path) -> Self {
+        self.sysfs_root = Some(root);
+        self
     }
 
     /// See [`ContactSite::with_drive_identity`]. Production never calls it.
@@ -486,7 +530,7 @@ impl<'a> ContactSlot<'a> {
         volume_id: Option<i64>,
         medium: Medium<'_>,
     ) -> &ContactGuard<'a> {
-        let guard = ContactGuard::open_with_identity(
+        let guard = ContactGuard::open_full(
             conn,
             config,
             operation,
@@ -494,6 +538,7 @@ impl<'a> ContactSlot<'a> {
             volume_id,
             medium,
             self.drive_identity.as_ref(),
+            self.sysfs_root,
         );
         self.guard.insert(guard)
     }
@@ -531,6 +576,13 @@ pub struct ContactGuard<'a> {
     /// refuse a tape command.
     id: Option<i64>,
     finished: bool,
+    /// The command and device, for the close reading's journal row.
+    operation: Operation,
+    device: String,
+    /// The st `stats/` directory resolved ONCE at open, so the close
+    /// reading reads exactly the directory the open reading did (issue
+    /// #301). `None` when the device has no usable basename.
+    stats_dir: Option<PathBuf>,
 }
 
 impl<'a> ContactGuard<'a> {
@@ -561,6 +613,25 @@ impl<'a> ContactGuard<'a> {
         volume_id: Option<i64>,
         medium: Medium<'_>,
         given: Option<&DriveIdentity>,
+    ) -> ContactGuard<'a> {
+        Self::open_full(
+            conn, config, operation, device, volume_id, medium, given, None,
+        )
+    }
+
+    /// [`open_with_identity`](ContactGuard::open_with_identity), with the st
+    /// statistics read from `sysfs_root` instead of the kernel's
+    /// `/sys/class/scsi_tape` when it is `Some` — the issue #301 test seam.
+    #[allow(clippy::too_many_arguments)]
+    fn open_full(
+        conn: &'a Connection,
+        config: &Config,
+        operation: Operation,
+        device: &str,
+        volume_id: Option<i64>,
+        medium: Medium<'_>,
+        given: Option<&DriveIdentity>,
+        sysfs_root: Option<&Path>,
     ) -> ContactGuard<'a> {
         // Which drive (ADR-0013 §1, issue #314) — asked of the backend the
         // caller already resolved, never looked up again here. Only an
@@ -620,16 +691,47 @@ impl<'a> ContactGuard<'a> {
                 None
             }
         };
+        // The kernel's counters at the contact's open (issue #301) — after
+        // the INSERT, so the reading can name its contact. Like the MAM
+        // journal, it is written even from an inert guard (`contact_id`
+        // NULL): the reading happened either way. The device's node is
+        // resolved here once and kept for the close reading.
+        let root = sysfs_root.unwrap_or(Path::new(drive_identity::SCSI_TAPE_SYSFS_ROOT));
+        let stats_dir = st_stats::stats_dir(root, device);
+        st_stats::capture(
+            conn,
+            id,
+            Point::Open,
+            operation.as_str(),
+            device,
+            stats_dir.as_deref(),
+        );
         ContactGuard {
             conn,
             id,
             finished: false,
+            operation,
+            device: device.to_string(),
+            stats_dir,
         }
     }
 
     /// Close the contact.
+    ///
+    /// Takes the closing st statistics reading first (issue #301), so a
+    /// contact with a `closed_at` always has one when its node publishes
+    /// `stats/` — and a contact dropped without `finish` has none, for the
+    /// same reason it has no outcome.
     pub fn finish(mut self, outcome: &str, detail: Option<&str>) {
         self.finished = true;
+        st_stats::capture(
+            self.conn,
+            self.id,
+            Point::Close,
+            self.operation.as_str(),
+            &self.device,
+            self.stats_dir.as_deref(),
+        );
         let Some(id) = self.id else {
             return;
         };

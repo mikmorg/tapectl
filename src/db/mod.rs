@@ -308,6 +308,13 @@ fn migrations() -> Migrations<'static> {
         // other table, so no `.foreign_key_check()`. See the migration
         // header.
         M::up(include_str!("migrations/024_restores.sql")),
+        // 025 creates `st_stats_journal` (issue #301; ADR-0012 2026-09-24
+        // amendment item 2): the st driver's per-device sysfs I/O counters,
+        // every file verbatim, read at each contact's open and close so the
+        // difference across a contact is a query. Points at the contact, like
+        // 022/023. Append-only, never pruned. Plain CREATE, touching no other
+        // table, so no `.foreign_key_check()`. See the migration header.
+        M::up(include_str!("migrations/025_st_stats_journal.sql")),
     ])
 }
 
@@ -2315,7 +2322,8 @@ mod tests {
             v
         }
         let before = objects(&open_memory_at_023());
-        let after = objects(&open_memory().unwrap());
+        // Pinned at 024, not "latest": 025 adds a table (issue #301).
+        let after = objects(&open_memory_at_version(24));
         let added: Vec<(&str, &str)> = after
             .iter()
             .filter(|o| !before.contains(o))
@@ -2336,6 +2344,80 @@ mod tests {
             changed_or_removed.is_empty(),
             "024 must alter no existing object: {changed_or_removed:?}"
         );
+    }
+
+    /// Migration 025 creates `st_stats_journal` (and its one index) and
+    /// touches NOTHING else (issue #301). Pinned by difference against the
+    /// schema one step before it — `latest - 1` rather than a literal, so the
+    /// pin survives 024 (concurrent work) being registered ahead of it, and
+    /// fails loudly if anything is ever registered AFTER it without moving
+    /// this pin.
+    #[test]
+    fn migration_025_creates_only_st_stats_journal() {
+        fn objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_master \
+                     WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                )
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|n| n.unwrap())
+                .collect();
+            v
+        }
+        let latest_conn = open_memory().unwrap();
+        let latest: usize = latest_conn
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap() as usize;
+        assert!(latest >= 24, "positive control: the chain ran ({latest})");
+        let before = objects(&open_memory_at_version(latest - 1));
+        let after = objects(&latest_conn);
+        let added: Vec<(&str, &str)> = after
+            .iter()
+            .filter(|o| !before.contains(o))
+            .map(|o| (o.0.as_str(), o.1.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                ("index", "idx_st_stats_journal_contact"),
+                ("table", "st_stats_journal"),
+            ]
+        );
+        let changed_or_removed: Vec<&(String, String, Option<String>)> =
+            before.iter().filter(|o| !after.contains(o)).collect();
+        assert!(
+            changed_or_removed.is_empty(),
+            "025 must alter no existing object: {changed_or_removed:?}"
+        );
+
+        // The CHECK on `point` is enforced, not merely declared (#227):
+        // PRAGMA table_info reports no CHECK. Positive control: the same
+        // insert with a legal point is accepted.
+        let insert = |point: &str| {
+            latest_conn.execute(
+                "INSERT INTO st_stats_journal
+                     (point, trigger, device, sysfs_dir, stats_json, tapectl_version)
+                 VALUES (?1, 'volume verify', '/dev/null', '/x/stats', '{}', 'v')",
+                [point],
+            )
+        };
+        assert!(insert("middle").is_err(), "point must be open|close");
+        insert("close").expect("positive control: a legal point is accepted");
+        // And the foreign key to the spine is enforced.
+        let bad_fk = latest_conn.execute(
+            "INSERT INTO st_stats_journal
+                 (contact_id, point, trigger, device, sysfs_dir, stats_json, tapectl_version)
+             VALUES (99999, 'open', 'volume verify', '/dev/null', '/x/stats', '{}', 'v')",
+            [],
+        );
+        assert!(bad_fk.is_err(), "contact_id must reference a real contact");
+
+        let report = crate::cli::operations::db_fsck(&latest_conn, false, false).unwrap();
+        assert!(report.integrity_ok, "integrity_check after 025");
     }
 
     #[test]

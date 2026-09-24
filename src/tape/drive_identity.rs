@@ -58,8 +58,10 @@ use rusqlite::{params, Connection};
 use crate::config::LtoBackendConfig;
 use crate::error::Result;
 
-/// Where the kernel publishes per-device SCSI identity.
-const SCSI_TAPE_SYSFS_ROOT: &str = "/sys/class/scsi_tape";
+/// Where the kernel publishes per-device SCSI identity — and, beside it
+/// under each node's `stats/`, the st driver's I/O counters
+/// ([`crate::tape::st_stats`], issue #301).
+pub(crate) const SCSI_TAPE_SYSFS_ROOT: &str = "/sys/class/scsi_tape";
 
 /// What one contact learned about the drive it talked to.
 ///
@@ -279,14 +281,30 @@ pub fn read_identity(backend: &LtoBackendConfig) -> DriveIdentity {
 /// not propagated: it falls back to the path's own basename, which is
 /// correct whenever `device_tape` is already a plain node.
 fn sysfs_device_dir(device_tape: &str) -> Option<PathBuf> {
+    Some(sysfs_device_dir_for_node(&sysfs_node_name(device_tape)?))
+}
+
+/// The tape node's own sysfs directory under `root` — `<root>/nst0` for
+/// `/dev/nst0` or any by-id symlink to it — resolved exactly as
+/// [`sysfs_device_dir`] resolves it. `root` is [`SCSI_TAPE_SYSFS_ROOT`] in
+/// production; the st statistics capture (issue #301) takes it as a
+/// parameter so its tests read a fake tree and never the real `/sys`.
+pub(crate) fn sysfs_node_dir(root: &Path, device_tape: &str) -> Option<PathBuf> {
+    Some(root.join(sysfs_node_name(device_tape)?))
+}
+
+/// The basename sysfs keys a tape node by, after canonicalising (see
+/// [`sysfs_device_dir`]).
+fn sysfs_node_name(device_tape: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(device_tape);
-    let node = canonical
-        .as_deref()
-        .unwrap_or_else(|_| Path::new(device_tape))
-        .file_name()?
-        .to_str()?
-        .to_string();
-    Some(sysfs_device_dir_for_node(&node))
+    Some(
+        canonical
+            .as_deref()
+            .unwrap_or_else(|_| Path::new(device_tape))
+            .file_name()?
+            .to_str()?
+            .to_string(),
+    )
 }
 
 /// The sg node the kernel binds to `device_tape`'s st node — the one entry
@@ -749,6 +767,24 @@ mod tests {
             Some(PathBuf::from(
                 "/sys/class/scsi_tape/nst-no-such-node/device"
             ))
+        );
+    }
+
+    /// Issue #301: the stats capture resolves the NODE directory (the
+    /// parent of `device/` and `stats/`) under an injectable root, by the
+    /// same canonicalise-with-basename-fallback rule. Pure: a fake root and
+    /// a nonexistent device path.
+    #[test]
+    fn sysfs_node_dir_is_the_node_under_the_given_root() {
+        assert_eq!(
+            sysfs_node_dir(Path::new("/fake-root"), "/dev/nst-no-such-node"),
+            Some(PathBuf::from("/fake-root/nst-no-such-node"))
+        );
+        // The same node the identity read uses, one level up.
+        assert_eq!(
+            sysfs_node_dir(Path::new(SCSI_TAPE_SYSFS_ROOT), "/dev/nst-no-such-node")
+                .map(|d| d.join("device")),
+            sysfs_device_dir("/dev/nst-no-such-node")
         );
     }
 
