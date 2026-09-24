@@ -33,3 +33,16 @@ reference-grade, and the future-self-first custody profile has no multi-party
 requirement to pay that complexity for); threshold decryption via age-plugin-sss
 (every future decrypt would depend on a pre-1.0 single-maintainer plugin surviving
 decades, and it only fits ongoing shared custody, not a one-time recovery).
+
+## Amendment, 2026-09-24 — the cover sheet names the identity and carries the secret by hand
+
+*Ruled by the CTO on 2026-09-24 (issue #341, option 2).*
+
+The Heir Kit's cover sheet prints the escrow **identity** (the public half) and says so: it
+identifies which secret is needed and decrypts nothing by itself. The sheet carries a boxed
+hand-fill area for the secret that `tapectl init` printed once, with the pair check
+(`age-keygen -y` must reproduce the printed identity). The secret is never printed by any
+command and is stored nowhere on the machine — this ADR's rule is unchanged; the sheet no
+longer claims to be what it is not. Option 1 (printing the secret) was rejected for exactly
+that reason.
+

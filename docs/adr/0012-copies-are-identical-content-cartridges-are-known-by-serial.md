@@ -872,3 +872,37 @@ record and in `docs/runs/2026-09-23-lto6-capacity-measurement.md`.*
    with the release binary) precedes the first write, because a different binary is a
    different artifact. That build was explicitly authorized in the same ruling.
 
+## Amendment, 2026-09-24 — what is done before the first production write
+
+*Ruled by the CTO on 2026-09-24 ("ratify all", with Q6 extended). The production write itself
+stays on hold until the CTO calls it.*
+
+1. **Build identity.** `tapectl --version`, every journal row's `tapectl_version` and the
+   rehearsal marker name the commit the binary was built from (`git describe --dirty` plus
+   the build date, embedded at build time). On-tape bytes do not change for this: if File 0
+   has no writer-version field today, none is added by this ruling.
+2. **Forensics items that capture otherwise-lost data land before production:** #301 (the
+   kernel's per-device tape counters at each contact) and #306 (`restore` records what it
+   did and keeps dar's report). #300 is closed as satisfied by #320 and #339. The rest of
+   the epic (#299–#311) is post-production, triaged in the order the coordinator proposed.
+3. **#326 is profiled on the first production write**, not synthetically before it.
+4. **Staging storage:** the first production cycle is small enough for today's `/scratch`;
+   a dedicated staging disk (2.5–3 TB) comes before any tape the CTO would not want split
+   across cartridges.
+5. **Catalog backups:** a timer-driven `db backup` to a second disk after every session,
+   and the heir-kit refresh after each session as the offsite copy. Rebuild-from-tape is the
+   last resort.
+6. **Installation is a formal, repeatable procedure**, so a reinstall is easy: one entry
+   point (`scripts/first-run.sh`, resumable and idempotent), an install runbook
+   (`docs/install.md`) that lists exactly what it creates and how to remove it, and the
+   systemd units (audit timer, catalog-backup timer) and the operator wrapper installed by
+   that procedure, not by hand.
+7. **The quiet-host rule is checked, not only stated:** step 13 and `volume write`'s
+   pre-flight warn when known contenders are active or the host is loaded or short of
+   memory, and ask for confirmation; never a refusal.
+8. **A second expendable cartridge** for the multi-cartridge scenarios is after the first
+   write, not a gate.
+9. **#341 is ruled option 2** (see ADR-0005's amendment of the same date).
+10. **`docs/handoff.md` and `docs/lto6-validation-checklist.md` are rewritten** to the
+    current state; dated run records stay as they are.
+
