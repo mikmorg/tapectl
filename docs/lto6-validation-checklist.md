@@ -1,193 +1,123 @@
 # LTO-6 Hardware Validation Checklist
 
-This is the procedure for the real-hardware validation session. Per the
-#16 verdict an LTO-6 drive is owned but development stays mhvtl-first; this
-session fires when phases 1–2 land and `scripts/mhvtl-verify-gate.sh` is
-fully green (empty EXPECTED_FAIL). It was dry-run against mhvtl on
-2026-07-20 (ticket #8); the annotations below record what that dry-run
-established and what only real hardware can settle.
+Rewritten 2026-09-24 (ADR-0012's 2026-09-24 amendment, item 10). This is the procedure
+for validating tapectl against a real drive and cartridge, re-runnable for any new drive,
+cartridge batch, or host. Every item below has been run on real hardware at least once;
+the record for each is named so a re-run can be compared with it. The pre-2026-09
+version of this file (v1's "layered EOT recovery" and `/dev/nst0` addressing) is
+superseded: Layout v2 has no end-of-tape salvage (ADR-0007), and no device is ever
+addressed by number.
 
-The goal of the real-hardware pass is to prove, on actual media, that
-everything mhvtl has been simulating works: fixed-block I/O, MAM
-queries, sg_logs error counters, ENOSPC behavior at end-of-tape, and
-the full write → verify → restore round-trip.
+**The drive on this VM:** the HP Ultrium 6-SCSI, serial HUJ808A5L4, passed through from
+`home2` (`docs/lto6-drive-passthrough.md`), is `/dev/tape/by-id/scsi-HUJ808A5L4-nst`.
+mhvtl's drives are `scsi-XYZZY_A*-nst`. `/dev/nstN` numbering moves across reboots and
+after module reloads; every command below takes the by-id path. The expendable test
+cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a production tape.
 
-The drive is not local to this VM: it lives on `home2` and reaches vm-desk1 by
-libvirt SCSI LUN passthrough. See `docs/lto6-drive-passthrough.md` for how that
-is wired, and — importantly — for the device-name collision with mhvtl. Address
-the real drive as `/dev/tape/by-id/scsi-HUJ808A5L4-nst` via `TAPECTL_GATE_TAPE`,
-never as `/dev/nst0`.
+## What mhvtl cannot tell you (why this session exists)
 
-## Dry-run findings (mhvtl, 2026-07-20) — read before the hardware session
+- **End of tape.** mhvtl accepts writes past its configured capacity without ENOSPC and
+  silently corrupts the overflow (dry-run 2026-07-20). Only a real drive answers where
+  host writes stop, and how.
+- **Capacity units and MAM.** mhvtl's MAM and page 0x0c/0x17 are static fictions.
+- **Feed-rate effects.** mhvtl writes to disk; a real drive speed-matches down to about
+  54 MB/s and shoe-shines below that, which costs tape.
+- **`weof` at BOT.** mhvtl returns the old File 0 bytes; the real drive reads an EMPTY
+  File 0 (issue #327). The refusal and the `--force` path are the same either way.
+- **TapeAlert read-to-clear.** Still unanswered on the HP drive (every flag has read 0);
+  `report health` surfaces the first non-zero one (#340).
 
-Baseline recordings for later diffing are in
-`docs/mhvtl-baseline-recordings.txt` (mhvtl's `sg_read_attr`, sg_logs
-pages 0x02/0x0c, and the EOT-drill result).
+## Pre-flight (no tape motion)
 
-- **The ENOSPC error path CANNOT be validated on mhvtl as configured.**
-  EOT drill (CAPACITY=500 MB tape, ~591 MB of encrypted slices): mhvtl
-  accepted every write **without returning ENOSPC**, sitting exactly at
-  its 500 MB early-warning point, and silently produced 2 unreadable
-  slices out of 10. `volume verify` caught it (8 passed / 2 failed), but
-  `volume write` reported success and marked the snapshot `current`. So
-  the ENOSPC drill below is a **real-hardware-only** check — mhvtl gives a
-  false pass by not signalling. This is the fidelity gap flagged on #26.
-- **Pre-flight device discovery is mandatory** (SCSI enumeration shuffles;
-  see #67 and `scripts/mhvtl-verify-gate.sh`): find the changer
-  (`lsscsi -g | grep mediumx`), the drive's sg node, and load a
-  generation-matched cartridge — do not assume `/dev/sg0` or slot 1.
-- **Block-size / compression pre-flight** were missing from the original
-  stub; added below.
-- The MAM/sg_logs commands work against mhvtl (recorded), so the *plumbing*
-  is validated; only the values differ on real media.
+- [ ] `ls -l /dev/tape/by-id/` shows the drive by serial; `readlink -f` it and confirm
+      the sg node from sysfs: `ls /sys/class/scsi_tape/<nstN>/device/scsi_generic/`.
+      tapectl checks this pairing itself (#329): `tapectl config check` warns and
+      `volume write` refuses if `device_sg` is not that node.
+- [ ] `mt -f <by-id> status` succeeds; `sg_inq <sg>` reports the vendor and model
+      (the model gives the drive's generation: "Ultrium 6-SCSI" → LTO-6).
+- [ ] `sg_read_attr <sg>` returns the medium serial and the capacity attributes;
+      `sg_logs --page=0x00 --maxlen=65532 --raw <sg>` lists the supported pages (22 on
+      the HP; the fixtures under `tests/fixtures/sg_logs/hp_lto6_*` are the 2026-09-23
+      captures). Read pages with `--maxlen` so each read is ONE LOG SENSE (#328); do not
+      read 0x2E by hand at all — tapectl's sweep journals it once per contact.
+- [ ] `mt -f <by-id> setblk 524288 && mt -f <by-id> status` reports the 512 KiB block
+      size. (Record: 512 K vs 1 M is a wash on this drive — 114.0 vs 114.4 MiB/s,
+      `docs/lto6-session-journal-2026-09-10.md`.)
+- [ ] Compression as found: `sg_logs`/mode page 0x0f `DCE`. tapectl disables it per
+      write; the record shows `DCE 1→0` verified.
+- [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
+- [ ] The mhvtl gate is GREEN on this binary (`TAPECTL_GATE_TAPE=/dev/nst1
+      TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 38 checks as of #338).
+- [ ] Nothing else will touch the drive: every harness takes `/tmp/tapectl-tape.lock`.
+- [ ] **The host is quiet** for the duration: CI runners and their timers paused, no
+      heavy builds on the staging disk (`docs/operator-guide.md`, "A quiet host while
+      the tape runs").
 
-## Run the measurement harness first
+## The rehearsal (the round trip, every restore path, the heir script)
 
-`scripts/lto6-measure.sh` automates the measurable half of this session —
-block-size acceptance and throughput, compression as-found state, LBP
-capability, the MAM over-report bound, and the EOD-semantics probe — and
-writes every raw command output to a recording directory.
+This replaces the hand-run round-trip of earlier versions. It erases the named cartridge.
 
 ```bash
-./scripts/lto6-measure.sh --erase-cartridge <BARCODE>
+TAPECTL_BIN=/usr/local/bin/tapectl scripts/lifecycle-suite.sh --scenario first-year \
+    --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --erase short --single-cartridge \
+    --i-will-lose-the-cartridge EW7VWMVKF6
 ```
 
-It **erases the loaded cartridge**, so it refuses to start unless you name
-that cartridge and the name matches the barcode in MAM (ADR-0008's consent
-shape: name the thing you are destroying, rather than answer a y/n prompt).
+- [ ] `first-year` GREEN (47 checks; record: 47/47 on 2026-09-23, on the debug and the
+      release binary). It writes a multi-tenant volume, verifies, and restores every unit
+      ten ways, including `RESTORE.sh` run off the tape with tenant, operator, backup and
+      escrow keys, and the raw dump.
+- [ ] Optionally every single-cartridge scenario in turn (record: 15 scenarios, 342
+      checks, 0 failed, 27 structural skips, `docs/runs/2026-09-23-real-drive-rehearsal.md`).
+      `compaction` needs four cartridges; `cartridge-displacement` and
+      `collection-second-copy` need two.
+- [ ] The forensic record: `scripts/realdrive-forensics.py <run>/<scenario>/home/tapectl.db
+      HUJ808A5L4` — every contact names the drive, every closed contact swept exactly the
+      pages page 0x00 listed, each once, raw bytes kept, counters present, the cartridge
+      sized from its detected generation (2.5e12 for LTO-6).
+- [ ] The release binary, not only debug: `TAPECTL_BIN=` as above; `first-run.sh` step 12
+      does this and records a marker per binary that step 13 requires.
 
-It deliberately does **not** perform the ENOSPC drill or the raw-recovery
-drill — those stay manual, below. It also does not attempt an LBP MODE
-SELECT: enabling LBP changes the block format the drive expects for every
-subsequent command, and a half-applied change on a cartridge you are about
-to write real data to is worse than not knowing.
+## Disaster recovery from the real tape
 
-**Finding from the mhvtl dry-run (2026-08-02):** the harness ran clean
-against mhvtl, and turned up something worth knowing before the hardware
-session. **1 MiB blocks were refused with `EBUSY` by the host's `st`
-driver even though the drive advertised a 2 MiB maximum** via READ BLOCK
-LIMITS. That is a host-side buffer limit, not a drive or medium property,
-and it is invisible from tapectl. So the §5 "512 K vs 1 M" question may not
-be answerable on a stock Linux host at all without tuning `st` first —
-check the harness's block-limits line against its write result before
-concluding anything about the medium. The EOD probe passed on mhvtl (a read
-past EOD returned no data), but that is exactly the check whose mhvtl result
-proves least; §3.2's assumption still needs the real drive.
+- [ ] Into a bare home with NO drive configured (the heir's case):
+      `tapectl --home <tmp> catalog rebuild --from-volume --device <by-id> --key <operator or escrow secret>`
+      → the units, snapshots, stage sets, writes, tenants and the cartridge appear; the
+      contact says "no LTO backend is configured on this host" (record: 2026-09-23).
+- [ ] `tapectl --home <tmp> restore unit --unit <name> --from <label> --to <dir> --device <by-id>`
+      then `diff -r --no-dereference <source> <dir>` — identical (record: 2026-09-23).
+- [ ] The heir script alone (no tapectl): `mt rewind; mt fsf 2; dd bs=512k | tr -d '\0' > RESTORE.sh`,
+      then `./RESTORE.sh --info`, `--find-envelope --key <key>`, `--restore --key <key> --to <dir>`.
+      Every key the tenant holds must open its own leg (#288). This is the lifecycle
+      suite's `restore_sh_*` checks, green on hardware.
 
-## Pre-flight
+## End of tape (measured once; re-run only for a new drive or media type)
 
-- [ ] Drive visible: `lsscsi -g | grep -i lto` shows both `/dev/nst*`
-      and `/dev/sg*` nodes.
-- [ ] Drive responds: `mt -f /dev/nst0 status` succeeds; `sg_inq
-      /dev/sg1` reports vendor/model.
-- [ ] MAM query works: `sg_read_attr -r /dev/sg1` returns real capacity
-      and serial.
-- [ ] sg_logs populated: `sg_logs --page=0x02 /dev/sg1` has non-zero
-      reads of the drive error counters.
-- [ ] dar version ≥ 2.6: `dar --version`.
-- [ ] Block size accepted: `mt -f /dev/nst0 setblk 524288 && mt -f
-      /dev/nst0 status` reports `Tape block size 524288 bytes`. (tapectl
-      writes fixed 512 KB; a drive that rejects it fails EINVAL on open.)
-- [ ] Hardware compression state recorded: check the drive's compression
-      mode page (`sg_logs` / mode select). Encrypted data is incompressible;
-      the design says compression MUST be off (#28 issues MTCOMPRESSION 0).
-      Record the as-found state for the write-throughput baseline.
-- [ ] tapectl binary and config already validated against mhvtl
-      (`scripts/mhvtl-verify-gate.sh` green with an empty EXPECTED_FAIL).
-- [ ] A known-good blank tape is loaded; label prefix set aside (e.g.
-      `LTO6-`) to distinguish from any mhvtl test labels in the DB.
+There is no EOT salvage in Layout v2: a real EOT is a clean abort to an unsealed tape,
+and the pre-flight gate (generation table × 0.92 usable) is the capacity defence. What
+to measure is where the drive stops host writes, with `scripts/lto6-fill.sh`:
 
-## Round-trip on real media
+```bash
+scripts/lto6-fill.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --i-will-lose-the-cartridge EW7VWMVKF6
+```
 
-- [ ] `tapectl volume init LTO6-0001 --device /dev/nst0`
-- [ ] Stage at least two tenants' units so the volume exercises the
-      multi-tenant envelope path.
-- [ ] `tapectl volume write LTO6-0001 --device /dev/nst0` — note any
-      warnings about block-size mismatch or compression.
-- [ ] `tapectl volume verify LTO6-0001 --device /dev/nst0` — per-slice
-      sha256 must all pass; failed count must be zero.
-- [ ] `tapectl restore unit <name> LTO6-0001 --device /dev/nst0` for
-      each tenant. `diff -r --no-dereference` against the source must be clean (see the
-      note in the raw-recovery drill on why the flag matters).
-- [ ] `tapectl report health` — drive error counters from sg_logs
-      should show write_ok >> write_corrected; no unrecovered errors.
+- [ ] One continuous stream (a chunk-per-`dd` loop stops the drive at every close and
+      measured 77 MB/s; the stream ran at 163 MB/s).
+- [ ] Record: **2,501,995,134,976 bytes accepted before ENOSPC** (2.5020 TB), 1.0008 × the
+      2.5 TB planning figure; page 0x0c BOP→EOD 2,513,648 MB; native per data byte
+      1.0047; MAM "remaining" still 101,850 MiB at ENOSPC — the early-warning reserve,
+      NOT host-writable space. Page 0x17's "used" read at EOD before a rewind is partial.
+      (`docs/runs/2026-09-23-real-drive-rehearsal.md`, "The end-of-tape fill".)
+- [ ] The capacity units: MAM's attributes are MiB; page 0x17 is decimal MB; the two
+      agree to the megabyte (`docs/runs/2026-09-23-lto6-capacity-measurement.md`, #182).
+- [ ] The feed-rate effect: 1.48 native bytes per data byte behind a bursty pipe, 1.000
+      to 1.0047 for steady feeds (#323). tapectl records the ratio after every write and
+      warns above 1.05 on a real drive (#338).
 
-## Raw-recovery drill (the killer feature)
+## After a pass
 
-Using **only** `mt`, `dd`, `age`, `dar`, and `sha256sum` — no `tapectl` —
-recover one tenant's unit end-to-end from the freshly-written tape above.
-This is the design's strongest claim; if it fails on real hardware, it is
-not done. (This is exactly the heir leg of `scripts/mhvtl-verify-gate.sh`;
-the drill here is the hardware confirmation of a leg already green on
-mhvtl. `fsf 2` assumes the layout order ID-thunk(0)/guide(1)/RESTORE.sh(2)
-— confirm with `./RESTORE.sh --info` if the count ever changes.)
-
-- [ ] Extract RESTORE.sh from tape:
-      ```
-      mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
-      dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
-      chmod +x RESTORE.sh
-      ```
-- [ ] `./RESTORE.sh --info` — layout matches what `tapectl volume verify`
-      reported (correct number of data slices, envelope count, etc.).
-- [ ] `./RESTORE.sh --find-envelope --key <tenant-key>.age.key` — decrypts
-      the correct tenant envelope and displays MANIFEST.toml with accurate
-      slice positions and checksums.
-- [ ] `./RESTORE.sh --restore --key <tenant-key>.age.key --to /tmp/recovered`
-      — full restore succeeds: all slice checksums pass, age decryption works,
-      dar extraction completes.
-- [ ] `--key` repeated with every key the tenant holds also succeeds. An
-      envelope is sealed with the key active when the volume was WRITTEN and
-      its slices with the key active when they were STAGED, so after a
-      `key rotate` between the two there is no single key that opens both —
-      each `--key` is tried independently for the envelope and for each slice
-      (issue #288). The Heir Kit should carry every key, not only the current
-      one.
-- [ ] `diff -r --no-dereference <original-source-dir> /tmp/recovered` — byte-identical.
-      (`--no-dereference` is load-bearing: plain `diff -r` follows symlinks and
-      false-fails on any source tree with a dangling link — `/usr/share/doc`
-      has them. tapectl preserves such links correctly; see #122.)
-
-## ENOSPC drill — REAL HARDWARE ONLY (mhvtl gives a false pass)
-
-The 2026-07-20 dry-run established that mhvtl (CAPACITY=500) does **not**
-return ENOSPC past capacity — it accepts the writes and silently corrupts
-the overflow slices, so this drill cannot be validated virtually (see the
-dry-run findings above). On real hardware:
-
-- [ ] Two-part expectation, post-phase-1: with the Layout/WriteSession
-      model (#21/#26) in place, a stage set whose plan exceeds available
-      capacity is **refused by Layout validation before the first byte**
-      (capacity vs plan + reserve). Confirm that refusal first — it is the
-      primary defense and the thing the dry-run proved is missing today
-      (the write silently succeeded with 2 dead slices and a `current`
-      snapshot).
-- [ ] Then the genuine-overflow case (a cartridge that fills mid-session
-      from real write growth, not a mis-planned volume): write until the
-      drive signals early-warning, and confirm tapectl performs the layered
-      EOT recovery as a Layout transition (stop slices → regenerate
-      metadata from the truncated Layout → seal), recording
-      `writes.eot_recovery` / `sacrificed_slice_id`, and that the resulting
-      tape is still self-describing (`RESTORE.sh --info` + a real restore of
-      the surviving units). Capture the drive's exact ENOSPC sense data for
-      the record — it is the input #26 could not get from mhvtl.
-
-## After a successful pass
-
-- [ ] Update `tapectl-design-v4_0.md` M7 checklist to mark
-      "Real LTO-6 hardware validation" done.
-- [ ] Add a dated entry to `docs/perf-baselines.md` with real-hardware
-      throughput numbers for the three scenarios in `tests/performance.rs`
-      (bump `TAPECTL_PERF_LARGE_MB` significantly — the design doc
-      targets 2+ TB units).
-- [ ] Note any deviations from mhvtl behavior in `CLAUDE.md`'s
-      "Current State" section so future work has context.
-
-## If something fails
-
-Don't paper over it. Capture the full drive state — `sg_logs
---page=0x02,0x03,0x0c /dev/sg1`, `mt -f /dev/nst0 status`,
-dmesg since the tape was loaded — and file it alongside the tapectl
-command that triggered the failure. The point of this pass is to
-surface differences between mhvtl and real hardware; silent workarounds
-defeat the purpose.
+- [ ] Add the run to `docs/runs/` with the numbers above re-measured.
+- [ ] If anything differs from the records here, that difference is the finding: capture
+      `sg_logs --page=0x02,0x03,0x0c --maxlen=65532 <sg>` (never 0x2E by hand),
+      `mt status`, and `dmesg` since the load, and file it with the command that produced
+      it. Silent workarounds defeat the purpose.
