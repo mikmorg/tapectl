@@ -298,6 +298,16 @@ fn migrations() -> Migrations<'static> {
         // 022. Append-only, never pruned. Plain CREATE, touching no other
         // table, so no `.foreign_key_check()`. See the migration header.
         M::up(include_str!("migrations/023_log_page_journal.sql")),
+        // 024 creates `restores` (ADR-0013 §§2, 5, 7; ADR-0012 amendment
+        // 2026-09-24 item 2; issue #306): one row per restore -- unit, file
+        // or raw-volume -- written once its contact has opened, on success
+        // and on failure alike, with what came back, where to, how it ended,
+        // and dar's stdout/stderr VERBATIM (kept as an excerpt on failure
+        // and thrown away on success until now). Points at the contact, like
+        // 022/023. Append-only, never pruned. Plain CREATE, touching no
+        // other table, so no `.foreign_key_check()`. See the migration
+        // header.
+        M::up(include_str!("migrations/024_restores.sql")),
     ])
 }
 
@@ -1647,6 +1657,21 @@ mod tests {
         conn
     }
 
+    /// The schema as of migration 023 — for 024's pin-by-difference test,
+    /// for the reason `open_memory_at_021` gives.
+    fn open_memory_at_023() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        migrations().to_version(&mut conn, 23).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, 23, "positive control: stopped at 023");
+        conn
+    }
+
     // --- Migration 021 (ADR-0013 §3: `health_logs`' ONE permitted rebuild) ---
     //
     // The #227/#264 standard in full, because `PRAGMA table_info` reports
@@ -2246,7 +2271,9 @@ mod tests {
             v
         }
         let before = objects(&open_memory_at_022());
-        let after = objects(&open_memory().unwrap());
+        // Pinned at 023, not "latest": 024 adds a table, and a comparison
+        // against latest would start measuring 024 instead of this one.
+        let after = objects(&open_memory_at_023());
         let added: Vec<(&str, &str)> = after
             .iter()
             .filter(|o| !before.contains(o))
@@ -2265,6 +2292,49 @@ mod tests {
         assert!(
             changed_or_removed.is_empty(),
             "023 must alter no existing object: {changed_or_removed:?}"
+        );
+    }
+
+    /// Migration 024 creates `restores` (and its three indexes) and touches
+    /// NOTHING else (issue #306). Pinned by difference against 023, like
+    /// 023's own test.
+    #[test]
+    fn migration_024_creates_only_restores() {
+        fn objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_master \
+                     WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                )
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|n| n.unwrap())
+                .collect();
+            v
+        }
+        let before = objects(&open_memory_at_023());
+        let after = objects(&open_memory().unwrap());
+        let added: Vec<(&str, &str)> = after
+            .iter()
+            .filter(|o| !before.contains(o))
+            .map(|o| (o.0.as_str(), o.1.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                ("index", "idx_restores_contact"),
+                ("index", "idx_restores_unit"),
+                ("index", "idx_restores_volume"),
+                ("table", "restores"),
+            ]
+        );
+        let changed_or_removed: Vec<&(String, String, Option<String>)> =
+            before.iter().filter(|o| !after.contains(o)).collect();
+        assert!(
+            changed_or_removed.is_empty(),
+            "024 must alter no existing object: {changed_or_removed:?}"
         );
     }
 
