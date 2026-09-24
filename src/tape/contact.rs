@@ -1834,6 +1834,272 @@ pub(crate) mod tests {
         );
     }
 
+    // ── The st driver's counters (issue #301) ─────────────────────────────
+    //
+    // Every test here reads a FAKE sysfs tree under a temp root — never the
+    // real `/sys` — laid out as the kernel lays it out:
+    // `<root>/<node>/stats/<file>`. The device path does not exist, so it
+    // canonicalises to nothing and resolves by basename (`nst7`).
+
+    const STATS_DEVICE: &str = "/nonexistent/tapectl-st-stats-test/nst7";
+
+    fn fake_stats(root: &std::path::Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = root.join("nst7").join("stats");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        dir
+    }
+
+    /// `(contact_id, point, trigger, device, sysfs_dir, stats_json,
+    /// errors_json, tapectl_version)`, in insertion order.
+    type StatsRow = (
+        Option<i64>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    );
+
+    fn stats_rows(conn: &Connection) -> Vec<StatsRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT contact_id, point, trigger, device, sysfs_dir, stats_json,
+                        errors_json, tapectl_version
+                   FROM st_stats_journal ORDER BY id",
+            )
+            .unwrap();
+        let v = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        v
+    }
+
+    fn json_map(text: &str) -> std::collections::BTreeMap<String, String> {
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The acceptance shape: a contact on a (fake) st node records an
+    /// `open` and a `close` reading against its own id, every file verbatim
+    /// — trailing newlines kept, nothing parsed — with the directory it
+    /// resolved and the build that wrote it. Through `ContactSite`, the
+    /// seam every read path opens its contact with.
+    #[test]
+    fn a_contact_records_open_and_close_st_stats_readings_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = [
+            ("in_flight", "0\n"),
+            ("io_ns", "2009136201991\n"),
+            ("read_byte_cnt", "524288\n"),
+            ("resid_cnt", "0\n"),
+            ("write_byte_cnt", "34302590976\n"),
+            ("write_ns", "1500000000\n"),
+        ];
+        let dir = fake_stats(tmp.path(), &files);
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+
+        let guard = ContactSite::new(
+            &config,
+            Operation::VolumeVerify,
+            STATS_DEVICE,
+            Medium::NoBackend,
+        )
+        .with_sysfs_root(tmp.path())
+        .open(&conn, None);
+        let id = guard.id().expect("a live guard");
+        guard.finish(OUTCOME_OK, None);
+
+        let rows = stats_rows(&conn);
+        assert_eq!(
+            rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            vec!["open", "close"],
+            "one reading at each end of the contact"
+        );
+        let want: std::collections::BTreeMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for row in &rows {
+            assert_eq!(row.0, Some(id), "the reading names its contact");
+            assert_eq!(row.2, "volume verify");
+            assert_eq!(row.3, STATS_DEVICE, "device verbatim");
+            assert_eq!(row.4, dir.to_string_lossy(), "the directory resolved");
+            assert_eq!(json_map(&row.5), want, "every file, byte for byte");
+            assert_eq!(row.6, None, "every file read");
+            assert_eq!(row.7, crate::build_info::VERSION);
+        }
+    }
+
+    /// Absence is no row and no failure: a device whose node publishes no
+    /// `stats/` (a MemStore, a non-st node, a kernel without st statistics)
+    /// still opens and closes its contact normally.
+    ///
+    /// Positive control in the same test: the identical contact, once the
+    /// node exists, DOES record both readings — so the zero is the absence
+    /// and not a capture that never writes.
+    #[test]
+    fn a_contact_whose_node_has_no_stats_records_no_reading_and_still_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        let site = || {
+            ContactSite::new(
+                &config,
+                Operation::RestoreUnit,
+                STATS_DEVICE,
+                Medium::NoBackend,
+            )
+            .with_sysfs_root(tmp.path())
+        };
+
+        let r: Result<()> = site().open(&conn, None).finish_result(Ok(()));
+        assert!(r.is_ok(), "no stats directory must not fail the command");
+        assert!(stats_rows(&conn).is_empty(), "absence is no row");
+        assert!(only_row(&conn).8.is_some(), "the contact still closed");
+
+        fake_stats(tmp.path(), &[("write_cnt", "3\n")]);
+        site().open(&conn, None).finish(OUTCOME_OK, None);
+        assert_eq!(
+            stats_rows(&conn)
+                .iter()
+                .map(|r| r.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["open", "close"],
+            "positive control: the same contact with a stats directory records both"
+        );
+    }
+
+    /// The point of taking two readings: what the contact did is computable
+    /// from the rows alone, by the one query migration 025's header gives.
+    /// The fake counters advance between open and close exactly as the
+    /// kernel's would across a write.
+    #[test]
+    fn the_delta_across_a_contact_is_computable_from_its_two_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fake_stats(
+            tmp.path(),
+            &[
+                ("write_byte_cnt", "1000000\n"),
+                ("write_ns", "5000\n"),
+                ("in_flight", "0\n"),
+            ],
+        );
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        let mut slot = ContactSlot::empty().with_sysfs_root(tmp.path());
+        let id = slot
+            .open(
+                &conn,
+                &config,
+                Operation::VolumeWrite,
+                STATS_DEVICE,
+                None,
+                Medium::NoBackend,
+            )
+            .id()
+            .expect("a live guard");
+
+        // The command's I/O: 512 KiB more written, 2.5 ms more spent.
+        std::fs::write(dir.join("write_byte_cnt"), "1524288\n").unwrap();
+        std::fs::write(dir.join("write_ns"), "2505000\n").unwrap();
+        let _ = slot.finish_result(Ok(()));
+
+        let (bytes, ns): (i64, i64) = conn
+            .query_row(
+                "SELECT CAST(json_extract(c.stats_json, '$.write_byte_cnt') AS INTEGER)
+                      - CAST(json_extract(o.stats_json, '$.write_byte_cnt') AS INTEGER),
+                        CAST(json_extract(c.stats_json, '$.write_ns') AS INTEGER)
+                      - CAST(json_extract(o.stats_json, '$.write_ns') AS INTEGER)
+                   FROM st_stats_journal o
+                   JOIN st_stats_journal c
+                     ON c.contact_id = o.contact_id AND c.point = 'close'
+                  WHERE o.contact_id = ?1 AND o.point = 'open'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((bytes, ns), (524_288, 2_500_000));
+
+        // And the rows still hold the text the kernel printed, not the
+        // numbers: the delta is the query's, never stored.
+        let open = json_map(&stats_rows(&conn)[0].5);
+        assert_eq!(open["write_byte_cnt"], "1000000\n");
+    }
+
+    /// A contact that never closed has its open reading and no close one —
+    /// the same honesty as its NULL `closed_at` (issue #98). Positive
+    /// control: the counterpart that finishes has both (the tests above).
+    #[test]
+    fn a_contact_dropped_without_finish_has_only_its_open_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_stats(tmp.path(), &[("io_ns", "7\n")]);
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        {
+            let _guard = ContactSite::new(
+                &config,
+                Operation::VolumeWrite,
+                STATS_DEVICE,
+                Medium::NoBackend,
+            )
+            .with_sysfs_root(tmp.path())
+            .open(&conn, None);
+        }
+        assert_eq!(
+            stats_rows(&conn)
+                .iter()
+                .map(|r| r.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["open"]
+        );
+    }
+
+    /// An inert guard (its contact INSERT refused) still journals both
+    /// readings, with `contact_id` NULL — the MAM journal's rule: the
+    /// reading happened whether or not the contact row could be written.
+    #[test]
+    fn an_inert_guard_still_journals_its_readings_without_a_contact() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_stats(tmp.path(), &[("io_ns", "7\n")]);
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        let guard = ContactSite::new(
+            &config,
+            Operation::VolumeVerify,
+            STATS_DEVICE,
+            Medium::NoBackend,
+        )
+        .with_sysfs_root(tmp.path())
+        .open(&conn, Some(99_999));
+        assert_eq!(guard.id(), None, "precondition: the FK made it inert");
+        guard.finish(OUTCOME_OK, None);
+        let rows = stats_rows(&conn);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.0, r.1.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(None, "open"), (None, "close")]
+        );
+    }
+
     /// The #227 lesson: `PRAGMA table_info` reports neither foreign keys nor
     /// CHECK constraints, so enumerating the declarations is not proof they
     /// are enforced. Both halves are asserted.
