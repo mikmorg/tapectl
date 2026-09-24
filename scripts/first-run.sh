@@ -810,6 +810,8 @@ except Exception: pass' 2>/dev/null || true)"
   tape_lock
   explain <<'EOF'
 A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. On this VM the homorg runner's timers are the known contenders; the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step.
+
+`tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
   run as_svc mt -f "$DEVICE" status || true
   if as_svc mt -f "$DEVICE" status 2>/dev/null | grep -q DR_OPEN; then die "no cartridge loaded in $DEVICE"; fi
@@ -897,6 +899,27 @@ EOF
   # operator can see what is about to be written and how much of the tape it
   # uses (issue #269).
   run tc volume plan || true
+  # ADR-0012, 2026-09-24 amendment, item 7: the quiet-host rule is CHECKED
+  # here, not only stated in the explain block above — and here, right before
+  # the WRITE confirmation, because staging's own dar load is over by now and
+  # what matters is the host the write will run on. `host check` reads /proc
+  # and systemd only and exits 1 when anything tripped; it never refuses
+  # anything. The two homorg timers are passed with --unit because unit names
+  # are host-specific and tapectl checks none by default; on a host without
+  # them systemd reports them not-found, which counts as quiet.
+  HC_OUT="$(dirname "$LOG")/host-check.out"
+  while ! run_capture "$HC_OUT" tc host check --unit homorg-db-suite.timer --unit homorg-prune-target.timer; do
+    explain <<'EOF'
+THE HOST IS NOT QUIET. Each "host check:" line above names what tripped, what it measured and the limit it crossed. A busy host does not stop the write — it costs tape (the drive stops and restarts below ~54 MB/s of feed; a bursty feed used 48% more tape on this drive) and risks the session (a process killed for memory mid-write is a clean abort, but the hours are gone). Pause what is named, then check again. The limits are [host_check] in config.toml (docs/operator-guide.md, "A quiet host while the tape runs").
+EOF
+    if grep -q "unit homorg-" "$HC_OUT"; then
+      note "pause the homorg timers for the write:   sudo systemctl stop homorg-db-suite.timer homorg-prune-target.timer"
+      note "and start them again once it is sealed:  sudo systemctl start homorg-db-suite.timer homorg-prune-target.timer"
+    fi
+    if [ "$AUTO" = 1 ]; then note "--auto: proceeding with the host NOT quiet — the findings are above and in $LOG"; break; fi
+    ask HC_ANS "press Enter to check again once the host is quiet, or type 'write' to proceed as it is (Ctrl-C stops)" ""
+    [ "$HC_ANS" = write ] && { log "host check: operator chose to write on a host that was not quiet"; break; }
+  done
   confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" "$LABEL_FROM_FLAG" || die "stopped before writing"
   # Capture init's output as well as logging it: two later steps read it back
   # -- the placeholder barcode it reports, and which refusal it gave.
@@ -986,7 +1009,13 @@ EOF
   elif [ -n "$CART_BOUND" ]; then
     ok "volume $LABEL bound to the already-registered cartridge $CART_BOUND"
   fi
-  run tc volume write "$LABEL" --device "$DEVICE" || die "write did not seal — read the output; the catalog knows exactly why"
+  # --yes answers `volume write`'s own quiet-host pre-flight (ADR-0012,
+  # 2026-09-24 item 7): the host check above asked that question moments ago,
+  # before the WRITE confirmation, and a second prompt for the same finding --
+  # or, under --auto with no terminal, a Tier-2 decline -- would add nothing.
+  # The write still PRINTS any finding it sees. --yes reaches nothing else
+  # here: volume write has no other Tier-2 question and no Tier-3 refusal.
+  run tc volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why"
   # Issue #265: a failed verify has TWO outcomes and they need opposite
   # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
   # medium bad takes the volume out of service; a drive or transport error
