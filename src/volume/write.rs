@@ -11456,7 +11456,9 @@ mod tests {
                 "one sweep: page 0x00 then every listed page, once, against THIS contact, \
                  trigger = the command verbatim"
             );
-            let health: Vec<(Option<i64>, String, Option<i64>, Option<i64>)> = conn
+            /// `(contact_id, operation, volume_id, session_id)`.
+            type HealthRow = (Option<i64>, String, Option<i64>, Option<i64>);
+            let health: Vec<HealthRow> = conn
                 .prepare(
                     "SELECT contact_id, operation, volume_id, session_id FROM health_logs \
                      ORDER BY id",
@@ -11612,7 +11614,9 @@ mod tests {
                 .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
                 .unwrap();
             let sessions: i64 = conn
-                .query_row("SELECT COUNT(*) FROM verification_sessions", [], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM verification_sessions", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(sessions, 0, "the failed verify recorded no session to name");
 
@@ -12777,7 +12781,11 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(writes, 0, "refused before `plan`: no session row");
-            assert_eq!(feed_ratio_events(&conn), 0, "no ratio for a write that sent nothing");
+            assert_eq!(
+                feed_ratio_events(&conn),
+                0,
+                "no ratio for a write that sent nothing"
+            );
 
             assert_one_write_sweep(&conn, cid, volume_id);
             assert_each_page_read_once(&src.borrow().reads);
@@ -12829,7 +12837,10 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(status, "sealed", "positive control: the write completed and sealed");
+            assert_eq!(
+                status, "sealed",
+                "positive control: the write completed and sealed"
+            );
             assert!(
                 store.files.len() > 4,
                 "positive control: the whole Layout was written: {} files",
@@ -12863,7 +12874,10 @@ mod tests {
         fn every_write_path_sweeps_in_its_contacted_function_and_never_in_its_body() {
             const SRC: &str = include_str!("write.rs");
             let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
-            assert!(prod.len() < SRC.len(), "positive control: production half separated");
+            assert!(
+                prod.len() < SRC.len(),
+                "positive control: production half separated"
+            );
             for path in ["init", "write", "resume"] {
                 let outer = format!("fn volume_{path}_contacted");
                 let inner = format!("fn volume_{path}_in_contact");
@@ -12872,7 +12886,8 @@ mod tests {
                     let end = prod[start..].find("\n}\n").unwrap() + start;
                     let body = &prod[start..end];
                     assert!(
-                        !body[f.len()..].contains("\npub fn ") && !body[f.len()..].contains("\nfn "),
+                        !body[f.len()..].contains("\npub fn ")
+                            && !body[f.len()..].contains("\nfn "),
                         "{f}: body extraction overran into another function"
                     );
                     body
