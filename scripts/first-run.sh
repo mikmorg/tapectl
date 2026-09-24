@@ -771,7 +771,7 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     if [ "${#WRAP[@]}" -gt 0 ]; then run "${WRAP[@]}" "$CMD"; else run bash -c "$CMD"; fi || die "rehearsal RED — do not write real data until this is understood"
     ok "rehearsal green"
     # B14: step 13 checks for this marker (per binary) before the first write.
-    mkdir -p "$(dirname "$LOG")"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$TEST_BARCODE" > "$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$TAPECTL" | cut -c1-16)"
+    mkdir -p "$(dirname "$LOG")"; printf '%s %s %s\n' "$(date -u +%FT%TZ)" "$TEST_BARCODE" "$("$TAPECTL" --version 2>/dev/null)" > "$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$TAPECTL" | cut -c1-16)"
     note "Eject the test cartridge (mt -f $DEVICE offline) and load the production one before step 13."
   fi
 else note "skipped"; fi

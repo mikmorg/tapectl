@@ -415,7 +415,7 @@ pub fn record(
             counters.total_rewritten,
             counters.tape_alerts,
             raw_log,
-            env!("CARGO_PKG_VERSION"),
+            crate::build_info::VERSION,
         ],
     )?;
     Ok(())
@@ -1339,7 +1339,7 @@ Read error counter page  [0x3]
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(stored.as_deref(), Some(crate::build_info::VERSION));
     }
 
     /// Issue #296's acceptance, both routes: 2 drives x 2 cartridges, every
