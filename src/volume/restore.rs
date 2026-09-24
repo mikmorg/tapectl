@@ -8,12 +8,91 @@ use tracing::{info, warn};
 use crate::config::{Config, TapectlPaths};
 use crate::crypto::keys;
 use crate::dar;
+use crate::dar::restore::DarReport;
 use crate::db::queries;
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
 use crate::tape::contact::{self, ContactSite, Medium, Operation};
 use crate::tape::mam_journal::MamReads;
 use crate::util::{HashingWriter, TruncatingWriter};
+use crate::volume::restore_record::{self, RestoreRecord};
+
+/// What a restore through `restore unit`'s one drive path is FOR — the whole
+/// unit, or one file out of it (issue #306).
+///
+/// `restore file` reaches the drive through the same seam as `restore unit`
+/// (one contact, one health reading, `Operation::RestoreUnit`), and the
+/// `restores` row it writes says `kind = 'file'`. Carrying the target through
+/// the seam, rather than having `restore_file` copy the one entry out
+/// AFTER the seam returns, puts the placing of that entry INSIDE the
+/// recorded span: a "file not found in restored unit" is then a `failed`
+/// row, not an `ok` row beside a non-zero exit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RestoreTarget<'a> {
+    /// The whole unit, extracted straight into `dest_dir`.
+    Unit { dest_dir: &'a str },
+    /// One entry: the unit is extracted into `extract_dir` (a temp
+    /// directory the caller owns) and `file_path` is placed into
+    /// `dest_dir`, the directory the operator named.
+    File {
+        file_path: &'a str,
+        dest_dir: &'a str,
+        extract_dir: &'a str,
+    },
+}
+
+impl<'a> RestoreTarget<'a> {
+    /// Where dar extracts to.
+    fn extract_dir(&self) -> &'a str {
+        match *self {
+            RestoreTarget::Unit { dest_dir } => dest_dir,
+            RestoreTarget::File { extract_dir, .. } => extract_dir,
+        }
+    }
+
+    /// The directory the operator named — what `restores.destination`
+    /// records and what the report prints.
+    fn destination(&self) -> &'a str {
+        match *self {
+            RestoreTarget::Unit { dest_dir } | RestoreTarget::File { dest_dir, .. } => dest_dir,
+        }
+    }
+
+    fn file_path(&self) -> Option<&'a str> {
+        match *self {
+            RestoreTarget::Unit { .. } => None,
+            RestoreTarget::File { file_path, .. } => Some(file_path),
+        }
+    }
+
+    /// `restores.kind`.
+    fn kind(&self) -> &'static str {
+        match self {
+            RestoreTarget::Unit { .. } => restore_record::KIND_UNIT,
+            RestoreTarget::File { .. } => restore_record::KIND_FILE,
+        }
+    }
+}
+
+/// What the contacted half of a restore measured on the way, whether or not
+/// it got to the end — the figures the `restores` row records (issue #306).
+///
+/// Filled in as the restore proceeds and read by the seam after the
+/// contact closes, so a restore that failed after three slices still says
+/// three, and one that failed inside dar still carries dar's report.
+#[derive(Debug, Default)]
+struct RestoreTrace {
+    /// Slices decrypted off the tape so far.
+    slices_read: i64,
+    /// Their plaintext byte total, as measured through the hashing writer.
+    bytes_decrypted: i64,
+    /// dar's report, whenever dar ran.
+    dar: Option<DarReport>,
+    /// `dar --version`, read once dar has run; `None` if it could not be.
+    dar_version: Option<String>,
+    /// [`RestoreTarget::File`] only: the one entry was placed.
+    placed: bool,
+}
 
 /// Removes the restore scratch directory when it goes out of scope, on every
 /// path out of [`restore_unit`] — success, `?`, panic (issue #102).
@@ -78,6 +157,36 @@ pub fn restore_unit(
     version: Option<i64>,
     dry_run: bool,
 ) -> Result<RestoreReport> {
+    restore_through_drive(
+        conn,
+        paths,
+        config,
+        unit_name,
+        volume_label,
+        RestoreTarget::Unit { dest_dir },
+        device,
+        block_size,
+        version,
+        dry_run,
+    )
+}
+
+/// [`restore_unit`] and [`restore_file`]'s one path to the drive: resolve
+/// the version, take the two MAM reads, open the store, and hand off to the
+/// store seam with the [`RestoreTarget`] that says which of the two this is.
+#[allow(clippy::too_many_arguments)]
+fn restore_through_drive(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    volume_label: &str,
+    target: RestoreTarget<'_>,
+    device: &str,
+    block_size: usize,
+    version: Option<i64>,
+    dry_run: bool,
+) -> Result<RestoreReport> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
@@ -99,7 +208,7 @@ pub fn restore_unit(
             volume_label: volume_label.to_string(),
             version: selection.version,
             slices: selection.positions.len(),
-            destination: dest_dir.to_string(),
+            destination: target.destination().to_string(),
             dry_run: true,
             success: true,
         });
@@ -129,7 +238,7 @@ pub fn restore_unit(
         unit_name,
         volume_label,
         selection.version,
-        dest_dir,
+        target,
         &mut store,
         ContactSite::new(
             config,
@@ -183,23 +292,52 @@ pub fn restore_raw_volume(
     expect_label: Option<&str>,
     site: ContactSite<'_>,
 ) -> Result<crate::volume::raw::RawRestoreReport> {
+    let started_at = restore_record::now_sqlite();
     let guard = site.open(conn, None);
     let contact_id = guard.id();
     let r = crate::volume::raw::restore_raw(store, dest, expect_label);
     // A dump whose checksums did not all verify is how this contact ENDED,
     // even though the function returns `Ok` — the CLI's exit status says the
     // same thing (`RawRestoreReport::all_verified`).
-    match &r {
-        Ok(report) if !report.all_verified() => guard.finish(
+    let (outcome, error) = match &r {
+        Ok(report) if !report.all_verified() => (
             contact::OUTCOME_FAILED,
-            Some(&format!(
+            Some(format!(
                 "{} of {} files mismatched",
                 report.mismatched_count, report.files_dumped
             )),
         ),
-        Ok(_) => guard.finish(contact::OUTCOME_OK, None),
-        Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
-    }
+        Ok(_) => (contact::OUTCOME_OK, None),
+        Err(e) => (contact::OUTCOME_FAILED, Some(e.to_string())),
+    };
+    guard.finish(outcome, error.as_deref());
+    // The restore's own record (issue #306), the same outcome as its
+    // contact. `volume_label` is what the TAPE said, or what was asked for
+    // when the dump failed before File 0 could say; `volume_id` is NULL,
+    // as on the contact: this path names no catalog row (ADR-0005).
+    let report = r.as_ref().ok();
+    restore_record::record(
+        conn,
+        &RestoreRecord {
+            contact_id,
+            volume_id: None,
+            volume_label: report.map(|rep| rep.label.as_str()).or(expect_label),
+            unit_id: None,
+            unit_name: None,
+            version: None,
+            kind: restore_record::KIND_RAW_VOLUME,
+            file_path: None,
+            destination: &dest.to_string_lossy(),
+            started_at: &started_at,
+            outcome,
+            error: error.as_deref(),
+            slices_read: None,
+            bytes_restored: report.map(|rep| rep.bytes_written as i64),
+            files_restored: report.map(|rep| rep.files_dumped as i64),
+            dar: None,
+            dar_version: None,
+        },
+    );
     // The post-command health reading (issue #320), on every outcome — a
     // dump that failed its checksums is exactly when the read-error
     // counters matter. The heir's dump itself stays `Connection`-free.
@@ -220,6 +358,11 @@ pub fn restore_raw_volume(
 /// Re-runs the unit/tenant/position lookups rather than taking them as
 /// arguments: they are three indexed reads against an open connection, and a
 /// function that cannot be called on its own is not a seam.
+///
+/// **Writes the `restores` row** (issue #306) once the contact has closed,
+/// on every outcome — this seam is where the contact opens, so it is where
+/// "after the contact opened" begins. Nothing before `site.open` records a
+/// restore: a refusal upstream of the drive is not one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_unit_from_store(
     conn: &Connection,
@@ -228,7 +371,7 @@ pub(crate) fn restore_unit_from_store(
     unit_name: &str,
     volume_label: &str,
     version: i64,
-    dest_dir: &str,
+    target: RestoreTarget<'_>,
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<RestoreReport> {
@@ -243,8 +386,10 @@ pub(crate) fn restore_unit_from_store(
             |r| r.get(0),
         )
         .optional()?;
+    let started_at = restore_record::now_sqlite();
     let guard = site.open(conn, volume_id);
     let contact_id = guard.id();
+    let mut trace = RestoreTrace::default();
     let r = guard.finish_result(restore_unit_contacted(
         conn,
         paths,
@@ -252,10 +397,48 @@ pub(crate) fn restore_unit_from_store(
         unit_name,
         volume_label,
         version,
-        dest_dir,
+        target,
         store,
         site.medium_serial(),
+        &mut trace,
     ));
+    // The restore's own record: what came back, where to, how it ended,
+    // and dar's report verbatim. Best-effort, like the contact row — the
+    // result `r` is decided and this cannot change it.
+    let (outcome, error) = match &r {
+        Ok(_) => (contact::OUTCOME_OK, None),
+        Err(e) => (contact::OUTCOME_FAILED, Some(e.to_string())),
+    };
+    let files_restored = match target {
+        RestoreTarget::Unit { .. } => trace.dar.as_ref().and_then(DarReport::inodes_restored),
+        RestoreTarget::File { .. } => trace.placed.then_some(1),
+    };
+    let unit_id = queries::get_unit_by_name(conn, unit_name)
+        .ok()
+        .flatten()
+        .map(|u| u.id);
+    restore_record::record(
+        conn,
+        &RestoreRecord {
+            contact_id,
+            volume_id,
+            volume_label: Some(volume_label),
+            unit_id,
+            unit_name: Some(unit_name),
+            version: Some(version),
+            kind: target.kind(),
+            file_path: target.file_path(),
+            destination: target.destination(),
+            started_at: &started_at,
+            outcome,
+            error: error.as_deref(),
+            slices_read: Some(trace.slices_read),
+            bytes_restored: Some(trace.bytes_decrypted),
+            files_restored,
+            dar: trace.dar.as_ref(),
+            dar_version: trace.dar_version.as_deref(),
+        },
+    );
     // ONE post-command health reading for this contact (issue #320), on
     // every outcome, naming the volume the contact names. This seam is the
     // only place `restore unit` — and `restore file`, which reaches the
@@ -264,7 +447,9 @@ pub(crate) fn restore_unit_from_store(
     r
 }
 
-/// [`restore_unit_from_store`] minus the contact bookkeeping.
+/// [`restore_unit_from_store`] minus the contact bookkeeping. Fills
+/// `trace` as it goes, so the seam can record what was measured whether or
+/// not this returns `Ok`.
 #[allow(clippy::too_many_arguments)]
 fn restore_unit_contacted(
     conn: &Connection,
@@ -273,10 +458,12 @@ fn restore_unit_contacted(
     unit_name: &str,
     volume_label: &str,
     version: i64,
-    dest_dir: &str,
+    target: RestoreTarget<'_>,
     store: &mut dyn Store,
     medium_serial: Option<&str>,
+    trace: &mut RestoreTrace,
 ) -> Result<RestoreReport> {
+    let dest_dir = target.extract_dir();
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
@@ -349,6 +536,8 @@ fn restore_unit_contacted(
             &slice_path,
         )?;
         dar_slices.push(slice_path);
+        trace.slices_read += 1;
+        trace.bytes_decrypted += plain_size as i64;
 
         info!(
             slice = i + 1,
@@ -360,16 +549,38 @@ fn restore_unit_contacted(
         );
     }
 
-    // Run dar extract
+    // Run dar extract. Its report is kept whenever it ran, on both verdicts
+    // (issue #306); the version is read only once dar has actually run, so
+    // a restore that never reached dar records no version either.
     let archive_base = restore_tmp.join("restore");
     info!("extracting dar archive to {dest_dir}");
-    dar::restore::extract(&config.dar.binary, &archive_base, Path::new(dest_dir))?;
+    let (report, verdict) =
+        dar::restore::extract_reported(&config.dar.binary, &archive_base, Path::new(dest_dir));
+    if report.is_some() {
+        trace.dar_version = dar::version::check(&config.dar.binary)
+            .ok()
+            .map(|v| v.full_string);
+    }
+    trace.dar = report;
+    verdict?;
 
     // No explicit cleanup here on purpose: `_scratch` removes the whole
     // directory on the way out. The hand-rolled version this replaces walked
     // `dar_slices`, then swept the directory for hash files, then removed the
     // directory — three steps that only ran if every `?` above succeeded.
     drop(dar_slices);
+
+    // `restore file`: place the one requested entry, inside the recorded
+    // span (see `RestoreTarget`).
+    if let RestoreTarget::File {
+        file_path,
+        dest_dir: file_dest,
+        ..
+    } = target
+    {
+        place_one_entry(Path::new(dest_dir), file_path, Path::new(file_dest))?;
+        trace.placed = true;
+    }
 
     info!(unit = unit_name, volume = volume_label, "restore complete");
 
@@ -378,7 +589,7 @@ fn restore_unit_contacted(
         volume_label: volume_label.to_string(),
         version,
         slices: positions.len(),
-        destination: dest_dir.to_string(),
+        destination: target.destination().to_string(),
         dry_run: false,
         success: true,
     })
@@ -555,40 +766,51 @@ pub fn restore_file(
     block_size: usize,
     version: Option<i64>,
 ) -> Result<()> {
-    // First do a full restore to a temp dir, then extract the single file
+    // A full restore into a temp dir, with the one requested entry placed
+    // into `dest_dir` inside the same recorded span (`RestoreTarget::File`,
+    // issue #306) — through the one drive path `restore unit` uses, so this
+    // is one contact and one reading, never two.
     let tmp = tempfile::tempdir().map_err(|e| TapectlError::Other(e.to_string()))?;
     let tmp_path = tmp.path().to_string_lossy().to_string();
 
-    restore_unit(
+    restore_through_drive(
         conn,
         paths,
         config,
         unit_name,
         volume_label,
-        &tmp_path,
+        RestoreTarget::File {
+            file_path,
+            dest_dir,
+            extract_dir: &tmp_path,
+        },
         device,
         block_size,
         version,
         false,
     )?;
+    Ok(())
+}
 
-    // Copy the requested file to dest_dir.
-    //
-    // `symlink_metadata`, not `exists()`: a unit may legitimately contain a
-    // symlink pointing outside itself, and `exists()` follows the link, so a
-    // dangling one was reported as "not found in restored unit" when it had in
-    // fact been restored correctly by dar.
-    let source_file = tmp.path().join(file_path);
+/// Copy the one entry `file_path` out of the extracted unit at `extracted`
+/// into `dest_dir` — `restore file`'s placing step.
+///
+/// `symlink_metadata`, not `exists()`: a unit may legitimately contain a
+/// symlink pointing outside itself, and `exists()` follows the link, so a
+/// dangling one was reported as "not found in restored unit" when it had in
+/// fact been restored correctly by dar.
+fn place_one_entry(extracted: &Path, file_path: &str, dest_dir: &Path) -> Result<()> {
+    let source_file = extracted.join(file_path);
     let meta = fs::symlink_metadata(&source_file).map_err(|_| {
         TapectlError::Other(format!("file \"{file_path}\" not found in restored unit"))
     })?;
 
-    let dest = Path::new(dest_dir).join(
+    let dest = dest_dir.join(
         Path::new(file_path)
             .file_name()
             .unwrap_or(std::ffi::OsStr::new(file_path)),
     );
-    fs::create_dir_all(Path::new(dest_dir))?;
+    fs::create_dir_all(dest_dir)?;
     place_restored_entry(&source_file, &meta, &dest)?;
 
     info!(file = file_path, dest = %dest.display(), "file restored");
@@ -1572,7 +1794,9 @@ mod tests {
                 "r-unit",
                 "RESTORE-WANT",
                 1,
-                &dest.path().to_string_lossy(),
+                RestoreTarget::Unit {
+                    dest_dir: &dest.path().to_string_lossy(),
+                },
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1606,7 +1830,9 @@ mod tests {
                 "r-unit",
                 "RESTORE-OK",
                 1,
-                &dest.path().to_string_lossy(),
+                RestoreTarget::Unit {
+                    dest_dir: &dest.path().to_string_lossy(),
+                },
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1640,7 +1866,9 @@ mod tests {
                 "rc-unit",
                 "RC-WANT",
                 1,
-                &dest.path().to_string_lossy(),
+                RestoreTarget::Unit {
+                    dest_dir: &dest.path().to_string_lossy(),
+                },
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1686,7 +1914,9 @@ mod tests {
                 "rc-unit",
                 "RC-OK",
                 1,
-                &dest.path().to_string_lossy(),
+                RestoreTarget::Unit {
+                    dest_dir: &dest.path().to_string_lossy(),
+                },
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1870,7 +2100,9 @@ mod tests {
                 "rd-unit",
                 "RD-VOL",
                 1,
-                &dest.path().to_string_lossy(),
+                RestoreTarget::Unit {
+                    dest_dir: &dest.path().to_string_lossy(),
+                },
                 &mut store,
                 ContactSite::new(&config, Operation::RestoreUnit, "/dev/null", medium)
                     .with_drive_identity(identity),
@@ -1998,7 +2230,9 @@ mod tests {
                 "rh-unit",
                 want,
                 1,
-                &dest.path().to_string_lossy(),
+                RestoreTarget::Unit {
+                    dest_dir: &dest.path().to_string_lossy(),
+                },
                 &mut store,
                 ContactSite::new(
                     config,
@@ -2233,12 +2467,21 @@ mod tests {
                 let end = prod[start..].find("\n}\n").unwrap() + start;
                 &prod[start..end]
             };
+            // Both entry points reach the drive through ONE path
+            // (`restore_through_drive`, issue #306), and that path reaches
+            // the store seam exactly once.
             let file = body("pub fn restore_file(");
-            assert_eq!(file.matches("restore_unit(").count(), 1, "positive control");
+            assert_eq!(file.matches("restore_through_drive(").count(), 1, "positive control");
             let unit = body("pub fn restore_unit(");
-            assert_eq!(unit.matches("restore_unit_from_store(").count(), 1);
+            assert_eq!(unit.matches("restore_through_drive(").count(), 1, "positive control");
+            let drive = body("fn restore_through_drive(");
+            assert_eq!(drive.matches("restore_unit_from_store(").count(), 1);
             let seam = body("pub(crate) fn restore_unit_from_store(");
-            for (name, b) in [("restore_file", file), ("restore_unit", unit)] {
+            for (name, b) in [
+                ("restore_file", file),
+                ("restore_unit", unit),
+                ("restore_through_drive", drive),
+            ] {
                 for forbidden in [
                     "health_after_read_contact(",
                     "collect_health",
