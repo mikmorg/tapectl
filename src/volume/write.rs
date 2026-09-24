@@ -177,29 +177,32 @@ pub fn volume_init(
         declared_media,
         cartridge_barcode,
         &mut contact,
-        InitStore::Device,
+        ContactStore::Device,
     );
     contact.finish_result(r)
 }
 
-/// How `volume init` reaches the medium once every FACT check has passed
-/// — the store seam `volume_verify_with_store` has, for init (issue #339).
+/// How a write-path contact reaches the medium once every FACT check has
+/// passed — the store seam `volume_verify_with_store` has, for `volume init`
+/// (issue #339) and `volume write` (issue #342; it was `InitStore` until the
+/// write path needed the same seam).
 ///
-/// The choice is made INSIDE [`volume_init_in_contact`], at the exact line
-/// `TapeStore::open` used to stand, so the invariant in [`volume_init`]'s
-/// doc — every fact check runs before the tape device is opened — is
-/// untouched: an injected store is simply not opened.
+/// The choice is made INSIDE [`volume_init_in_contact`] /
+/// [`volume_write_in_contact`], at the exact line `TapeStore::open` used to
+/// stand, so the invariant in [`volume_init`]'s doc — every fact check runs
+/// before the tape device is opened, and on the write path the pre-flight
+/// `validate` too — is untouched: an injected store is simply not opened.
 ///
 /// `pub` for the reason [`ContactSite::with_log_source`] is: production
 /// never constructs `Injected`, and a crate-private variant only tests build
 /// is dead code to the lib target.
-pub enum InitStore<'s> {
+pub enum ContactStore<'s> {
     /// Production: open a [`TapeStore`] on the device, sized from the
     /// capacity the fact checks resolved.
     Device,
     /// A test's store — a `MemStore` — standing in for the drive, which is
-    /// what lets init's File 0 write and its post-command sweep be proved
-    /// with no tape anywhere.
+    /// what lets init's File 0 write, a write's File 0 refusal, and their
+    /// post-command sweeps be proved with no tape anywhere.
     Injected(&'s mut dyn Store),
 }
 
@@ -219,7 +222,7 @@ fn volume_init_contacted<'c>(
     // when the medium's serial matches no row (or no serial is readable).
     cartridge_barcode: Option<&str>,
     contact: &mut ContactSlot<'c>,
-    store: InitStore<'_>,
+    store: ContactStore<'_>,
 ) -> Result<i64> {
     // Creation-time label validation (issue #103). A label reaches the
     // filesystem too: `volume_read_slices` below joins
@@ -320,8 +323,9 @@ fn volume_init_contacted<'c>(
     // the `?`s inside `volume_init_in_contact` all return HERE, so a refusal
     // after the MAM read is swept exactly as a success is. The `TapeStore`
     // was dropped when that function returned, so the st close (which
-    // writes the filemark that ends File 0) is INSIDE the swept window;
-    // `volume write` sweeps with its store still open. The reading names the
+    // writes the filemark that ends File 0) is INSIDE the swept window —
+    // as it is for `volume write` and `volume resume` since issue #342 gave
+    // them this same shape. The reading names the
     // volume when the init made one, and nothing when it refused — the
     // contact itself names none either way, having opened before the row
     // existed. Best-effort: nothing here can fail or refuse the init.
@@ -359,7 +363,7 @@ fn volume_init_in_contact<'c>(
     drive_gen: crate::media::Generation,
     det: &crate::tape::media_detect::Detected,
     contact: &contact::ContactGuard<'c>,
-    store: InitStore<'_>,
+    store: ContactStore<'_>,
 ) -> Result<i64> {
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
@@ -484,11 +488,11 @@ fn volume_init_in_contact<'c>(
     // invariant in `volume_init`'s doc); an injected store is never opened.
     let mut opened;
     let store: &mut dyn Store = match store {
-        InitStore::Device => {
+        ContactStore::Device => {
             opened = TapeStore::open(device, block_size, usable_bytes)?;
             &mut opened
         }
-        InitStore::Injected(s) => s,
+        ContactStore::Injected(s) => s,
     };
 
     check_fresh_write_contact(store, label, &candidate_uuid, None, force)?;
@@ -993,6 +997,7 @@ pub fn volume_write(
         force,
         allow_missing_escrow,
         &mut contact,
+        ContactStore::Device,
     );
     contact.finish_result(r)
 }
@@ -1015,6 +1020,7 @@ fn volume_write_contacted<'c>(
     force: bool,
     allow_missing_escrow: bool,
     contact: &mut ContactSlot<'c>,
+    store: ContactStore<'_>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
@@ -1152,12 +1158,7 @@ fn volume_write_contacted<'c>(
     // because two selections that can drift is exactly how issue #96
     // happened.
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
-    let SessionKeys {
-        keys,
-        tenants,
-        operator_public_keys,
-        escrow_public_key,
-    } = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
+    let session = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
 
     // One read of the loaded medium, serving three purposes (ADR-0010): the
     // wrong-cartridge and wrong-generation checks immediately below, the MAM
@@ -1170,10 +1171,19 @@ fn volume_write_contacted<'c>(
     // decided at init from the medium's detected generation
     // (`layout-session.md`'s validation point 1).
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
-    let mam = det.mam.clone();
+    // The health probe's two test seams, taken off the slot BEFORE it opens
+    // (issue #342, as `volume init` does): `open` hands back a guard that
+    // keeps the slot borrowed for the rest of the contact. `None`/`None` in
+    // production — the drive answers.
+    let injected_identity = contact.injected_drive_identity();
+    let probe = HealthProbe {
+        log_source: contact.injected_log_source(),
+        identity: injected_identity.as_ref(),
+    };
     // THE CONTACT BEGINS HERE, at the same one read of the medium the three
-    // refusals below consult — the `st` driver refuses a second concurrent
-    // open, so there is no second reading to be had and none is taken.
+    // refusals in `volume_write_in_contact` consult — the `st` driver refuses
+    // a second concurrent open, so there is no second reading to be had and
+    // none is taken.
     let contact = contact.open(
         conn,
         config,
@@ -1188,6 +1198,162 @@ fn volume_write_contacted<'c>(
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &det.capture);
+
+    let result = volume_write_in_contact(
+        conn,
+        config,
+        label,
+        device,
+        block_size,
+        force,
+        allow_missing_escrow,
+        StagedWrite {
+            backend,
+            volume_id,
+            volume_media_type,
+            nominal_capacity,
+            usable_bytes,
+            enospc_buffer,
+            units,
+            stage_set_ids,
+            session,
+        },
+        &det,
+        contact,
+        store,
+    );
+
+    // ONE post-command sweep per write contact (issue #342; ADR-0013:
+    // "every contact takes one post-command sweep"), on every outcome the
+    // contact saw — the `?`s inside `volume_write_in_contact` all return
+    // HERE, so a write refused at the File 0 check, at `bind_late`, at
+    // `plan` or at `execute` is swept exactly as a completed one is, and a
+    // refusal above the MAM read (no contact) sweeps nothing. The
+    // `TapeStore` was dropped when that function returned, so the st close
+    // is inside the swept window, as it is for `volume init`. Best-effort:
+    // nothing here can fail or refuse the write.
+    collect_health_best_effort(
+        conn,
+        config,
+        device,
+        Some(volume_id),
+        contact.id(),
+        health::Reading::Write,
+        Operation::VolumeWrite,
+        probe,
+    );
+
+    // Issue #338: native tape consumed per byte of data this write sent,
+    // from the sweep above — read back from `log_page_journal` by contact
+    // (every consumer reads the journal, migration 023), never a second
+    // read of the drive. Two conditions to RECORD, each a reason the ratio
+    // would be a wrong number rather than a measurement:
+    //
+    // - the write completed (`Ok`, carrying its Layout): an aborted or
+    //   interrupted write sent fewer bytes than its Layout, so the Layout
+    //   is the wrong denominator. (A quarantined write sent every byte and
+    //   only failed confirm; it is NOT special-cased and gets no ratio — a
+    //   deliberate omission, see `feed_ratio`'s module doc.)
+    // - `on_tape_bytes()` is `Ok`: every entry sized, which `validate`
+    //   already required of this same Layout before a byte was written.
+    //
+    // And one condition to WARN, which does not stop the recording:
+    // `capacity_override` is a knob for drives that lie about capacity —
+    // virtual drives (mhvtl) and the microcosm harnesses, and nothing else
+    // (ADR-0010). mhvtl lists page 0x0c and reports a BOP→EOD of 500 MB
+    // beside "0 GB written", a figure with no relation to any write, so on
+    // such a drive the row is recorded (the gate exercises the whole path,
+    // and the 16x is there to read) but the warning is suppressed and the
+    // row's `details` says why (`"suppressed": "capacity_override"`).
+    //
+    // The denominator is the WHOLE Layout, block-padded — every file from
+    // the ID thunk to the seal marker, exactly the bytes the fixed-block
+    // driver sent (run 3's `wchar` over all 14 files) — not
+    // `volumes.bytes_written`, which is slices only. It WARNS on stderr
+    // (`eprintln!`, the operator-facing channel, as the line-425 convention
+    // has it) and never touches `result`: the volume is complete and
+    // sealed; the warning is about the host.
+    if let Ok(layout_snapshot) = &result {
+        if let Ok(data_bytes) = layout_snapshot.on_tape_bytes() {
+            let suppressed = backend
+                .capacity_override
+                .as_ref()
+                .map(|_| feed_ratio::Suppression::CapacityOverride);
+            if let Some(assessment) = feed_ratio::assess_and_record(
+                conn,
+                contact.id(),
+                volume_id,
+                label,
+                data_bytes,
+                suppressed,
+            ) {
+                if assessment.warns() {
+                    eprintln!("{}", assessment.ratio.warning_text(label));
+                }
+            }
+        }
+    }
+
+    result.map(|_| ())
+}
+
+/// What `volume write` established BEFORE its contact opened — every
+/// catalog fact and refusal that needs no cartridge — handed into
+/// [`volume_write_in_contact`] as one value (issue #342).
+struct StagedWrite<'a> {
+    backend: &'a crate::config::LtoBackendConfig,
+    volume_id: i64,
+    volume_media_type: Option<String>,
+    nominal_capacity: i64,
+    usable_bytes: u64,
+    enospc_buffer: u64,
+    units: Vec<BuildUnit>,
+    stage_set_ids: Vec<i64>,
+    session: SessionKeys,
+}
+
+/// Everything `volume write` does INSIDE its contact, from the corroboration
+/// of the loaded medium through `finish_session` — split from
+/// [`volume_write_contacted`] (issue #342, the shape `volume init` took in
+/// #339) so that function can take the post-command sweep after this one
+/// returns, whichever way it returned. The body is unchanged by the split
+/// but for the store seam: the three tape-side refusals, the MAM
+/// bookkeeping, the session directory and `build()`, the pre-flight
+/// `validate`, the store, `check_fresh_write_contact`, `bind_late`, `plan`,
+/// `execute` and `finish_session`. Returns the Layout it wrote, which the
+/// caller's feed-ratio assessment needs (issue #338).
+#[allow(clippy::too_many_arguments)]
+fn volume_write_in_contact<'c>(
+    conn: &'c Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
+    allow_missing_escrow: bool,
+    staged: StagedWrite<'_>,
+    det: &crate::tape::media_detect::Detected,
+    contact: &contact::ContactGuard<'c>,
+    store: ContactStore<'_>,
+) -> Result<Layout> {
+    let StagedWrite {
+        backend,
+        volume_id,
+        volume_media_type,
+        nominal_capacity,
+        usable_bytes,
+        enospc_buffer,
+        units,
+        stage_set_ids,
+        session:
+            SessionKeys {
+                keys,
+                tenants,
+                operator_public_keys,
+                escrow_public_key,
+            },
+    } = staged;
+    let mam = det.mam.clone();
 
     // Corroborate at contact (ADR-0012, issue #193) — wrong-cartridge
     // discipline one layer earlier than the File 0 check (ADR-0010): the
@@ -1205,7 +1371,7 @@ fn volume_write_contacted<'c>(
         label,
         &binding::MediumFacts::from_serial(mam.serial.clone()),
     )?;
-    check_loaded_generation(label, &det, volume_media_type.as_deref())?;
+    check_loaded_generation(label, det, volume_media_type.as_deref())?;
 
     // ADR-0010 decision 2, issue #166: the drive/medium refusal is checked
     // at every write contact, not only at `volume_init` — a volume
@@ -1345,7 +1511,17 @@ fn volume_write_contacted<'c>(
         }
     }
 
-    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+    // The tape device opens HERE and not a line earlier (the pre-flight
+    // `validate` above and every fact check run first); an injected store
+    // is never opened (issue #342, the seam `volume init` has).
+    let mut opened;
+    let store: &mut dyn Store = match store {
+        ContactStore::Device => {
+            opened = TapeStore::open(device, block_size, usable_bytes)?;
+            &mut opened
+        }
+        ContactStore::Injected(s) => s,
+    };
 
     // Contact discipline (#27): the Layout is already built, so its real
     // seal-marker entry gives an a-priori position — unlike `volume_init`,
@@ -1357,7 +1533,7 @@ fn volume_write_contacted<'c>(
         .find(|e| matches!(e.kind, ZoneKind::SealMarker))
         .map(|e| e.position as u32);
     check_fresh_write_contact(
-        &mut store,
+        store,
         label,
         &layout_snapshot.volume_uuid,
         seal_position,
@@ -1368,7 +1544,7 @@ fn volume_write_contacted<'c>(
     // start at BOT exactly like an untouched fresh session would.
     store.reposition_for_resume(0)?;
 
-    let validated = built.into_validated(&keys, &mut store).map_err(|errs| {
+    let validated = built.into_validated(&keys, store).map_err(|errs| {
         TapectlError::Other(format!(
             "volume \"{label}\" failed validation at contact: {}",
             errs.iter()
@@ -1406,7 +1582,7 @@ fn volume_write_contacted<'c>(
         conn,
         volume_id,
         label,
-        &det,
+        det,
         volume_media_type.as_deref(),
         &backend.generation,
     )? {
@@ -1414,81 +1590,20 @@ fn volume_write_contacted<'c>(
     }
 
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
-    let execute_outcome = planned.execute(conn, &mut store)?;
+    let execute_outcome = planned.execute(conn, store)?;
 
-    let result = finish_session(
+    // The Layout comes back with `Ok` so the caller's feed ratio (issue
+    // #338) has its denominator; every `Err` returns to the caller's sweep.
+    finish_session(
         conn,
-        &mut store,
+        store,
         volume_id,
         label,
         &layout_snapshot,
         block_size as u64,
         execute_outcome.into(),
-    );
-
-    collect_health_best_effort(
-        conn,
-        config,
-        device,
-        Some(volume_id),
-        contact.id(),
-        health::Reading::Write,
-        Operation::VolumeWrite,
-        HealthProbe::default(),
-    );
-
-    // Issue #338: native tape consumed per byte of data this write sent,
-    // from the sweep above — read back from `log_page_journal` by contact
-    // (every consumer reads the journal, migration 023), never a second
-    // read of the drive. Two conditions to RECORD, each a reason the ratio
-    // would be a wrong number rather than a measurement:
-    //
-    // - `result.is_ok()`: an aborted or interrupted write sent fewer bytes
-    //   than its Layout, so the Layout is the wrong denominator. (A
-    //   quarantined write sent every byte and only failed confirm; it is
-    //   NOT special-cased and gets no ratio — a deliberate omission, see
-    //   `feed_ratio`'s module doc.)
-    // - `on_tape_bytes()` is `Ok`: every entry sized, which `validate`
-    //   already required of this same Layout before a byte was written.
-    //
-    // And one condition to WARN, which does not stop the recording:
-    // `capacity_override` is a knob for drives that lie about capacity —
-    // virtual drives (mhvtl) and the microcosm harnesses, and nothing else
-    // (ADR-0010). mhvtl lists page 0x0c and reports a BOP→EOD of 500 MB
-    // beside "0 GB written", a figure with no relation to any write, so on
-    // such a drive the row is recorded (the gate exercises the whole path,
-    // and the 16x is there to read) but the warning is suppressed and the
-    // row's `details` says why (`"suppressed": "capacity_override"`).
-    //
-    // The denominator is the WHOLE Layout, block-padded — every file from
-    // the ID thunk to the seal marker, exactly the bytes the fixed-block
-    // driver sent (run 3's `wchar` over all 14 files) — not
-    // `volumes.bytes_written`, which is slices only. It WARNS on stderr
-    // (`eprintln!`, the operator-facing channel, as the line-425 convention
-    // has it) and never touches `result`: the volume is complete and
-    // sealed; the warning is about the host.
-    if result.is_ok() {
-        if let Ok(data_bytes) = layout_snapshot.on_tape_bytes() {
-            let suppressed = backend
-                .capacity_override
-                .as_ref()
-                .map(|_| feed_ratio::Suppression::CapacityOverride);
-            if let Some(assessment) = feed_ratio::assess_and_record(
-                conn,
-                contact.id(),
-                volume_id,
-                label,
-                data_bytes,
-                suppressed,
-            ) {
-                if assessment.warns() {
-                    eprintln!("{}", assessment.ratio.warning_text(label));
-                }
-            }
-        }
-    }
-
-    result
+    )
+    .map(|()| layout_snapshot)
 }
 
 /// Resume an interrupted write session for `label` — the cross-process half
@@ -1680,6 +1795,13 @@ fn volume_resume_contacted<'c>(
     // A fact refusal on File 0 here would pre-empt the quarantine that is
     // how a resume is supposed to record a divergent tape.
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    // The health probe's two test seams, off the slot BEFORE it opens
+    // (issue #342) — see `volume_write_contacted`.
+    let injected_identity = contact.injected_drive_identity();
+    let probe = HealthProbe {
+        log_source: contact.injected_log_source(),
+        identity: injected_identity.as_ref(),
+    };
     // THE CONTACT BEGINS HERE — resume's `det` is this contact's own reading
     // of the tape, exactly like `volume_write`'s, and the contact records
     // the same one.
@@ -1697,44 +1819,29 @@ fn volume_resume_contacted<'c>(
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeResume, Hook::VolumeResume, &det.capture);
-    binding::corroborate_volume(
+
+    let result = volume_resume_in_contact(
         conn,
-        volume_id,
         label,
-        &binding::MediumFacts::from_serial(det.mam.serial.clone()),
-    )?;
-
-    // ADR-0010 decision 2, issue #166: resume never checked the drive
-    // against the medium at all — this is the gap that let an interrupted
-    // session be continued on a drive that cannot write the loaded medium,
-    // failing loudly on the first physical write instead of refusing here,
-    // free, before the store is opened. Must call `detect` itself (just
-    // above) rather than reuse one from elsewhere — resume's `det` is
-    // this contact's own reading of the tape, exactly like `volume_write`'s.
-    let medium_for_write_check = det.generation.or_else(|| {
-        volume_media_type
-            .as_deref()
-            .and_then(crate::media::Generation::parse)
-    });
-    if let Some(m) = medium_for_write_check {
-        crate::tape::media_detect::check_drive_can_write(backend, m)?;
-    }
-
-    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
-
-    info!(label, volume_id, "resuming interrupted volume write");
-    let outcome = session.resume(conn, &keys, &mut store)?;
-
-    let result = finish_session(
-        conn,
-        &mut store,
+        device,
+        block_size,
+        backend,
+        &det,
         volume_id,
-        label,
+        volume_media_type.as_deref(),
+        usable_bytes,
+        session,
         &layout_snapshot,
-        block_size as u64,
-        outcome,
+        &keys,
     );
 
+    // ONE post-command sweep per resume contact (issue #342; ADR-0013),
+    // on every outcome — the `?`s inside `volume_resume_in_contact` all
+    // return HERE, so a resume refused at corroboration, at the drive
+    // check, at `TapeStore::open` or inside `session.resume` is swept
+    // exactly as a completed one is. Same shape as `volume write` and
+    // `volume init`; best-effort, nothing here can fail the resume.
+    //
     // `'resume'` — the honest word, and the record says it from migration 021
     // (issue #296) onward. It could not before: `001_initial.sql`'s
     // `CHECK(operation IN ('write','read','verify','clean'))` was in force,
@@ -1754,10 +1861,72 @@ fn volume_resume_contacted<'c>(
         contact.id(),
         health::Reading::Resume,
         Operation::VolumeResume,
-        HealthProbe::default(),
+        probe,
     );
 
     result
+}
+
+/// Everything `volume resume` does INSIDE its contact, from the
+/// corroboration of the loaded medium through `finish_session` — split from
+/// [`volume_resume_contacted`] (issue #342, the shape `volume init` took in
+/// #339 and `volume write` takes in [`volume_write_in_contact`]) so that
+/// function can take the post-command sweep after this one returns,
+/// whichever way it returned. The body is unchanged by the split. No store
+/// seam: nothing ungated can rehydrate an interrupted session, so the
+/// production `TapeStore::open` stays inline and the once-per-contact
+/// shape is pinned by source scan.
+#[allow(clippy::too_many_arguments)]
+fn volume_resume_in_contact(
+    conn: &Connection,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    backend: &crate::config::LtoBackendConfig,
+    det: &crate::tape::media_detect::Detected,
+    volume_id: i64,
+    volume_media_type: Option<&str>,
+    usable_bytes: u64,
+    session: session::InterruptedSession,
+    layout_snapshot: &Layout,
+    keys: &KeyAvailability,
+) -> Result<()> {
+    binding::corroborate_volume(
+        conn,
+        volume_id,
+        label,
+        &binding::MediumFacts::from_serial(det.mam.serial.clone()),
+    )?;
+
+    // ADR-0010 decision 2, issue #166: resume never checked the drive
+    // against the medium at all — this is the gap that let an interrupted
+    // session be continued on a drive that cannot write the loaded medium,
+    // failing loudly on the first physical write instead of refusing here,
+    // free, before the store is opened. Must call `detect` itself (just
+    // above) rather than reuse one from elsewhere — resume's `det` is
+    // this contact's own reading of the tape, exactly like `volume_write`'s.
+    let medium_for_write_check = det
+        .generation
+        .or_else(|| volume_media_type.and_then(crate::media::Generation::parse));
+    if let Some(m) = medium_for_write_check {
+        crate::tape::media_detect::check_drive_can_write(backend, m)?;
+    }
+
+    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+
+    info!(label, volume_id, "resuming interrupted volume write");
+    let outcome = session.resume(conn, keys, &mut store)?;
+
+    // Every `Err` above and this one return to the caller's sweep.
+    finish_session(
+        conn,
+        &mut store,
+        volume_id,
+        label,
+        layout_snapshot,
+        block_size as u64,
+        outcome,
+    )
 }
 
 /// Deliberately abandon a volume's unfinished write session (issue #94) —
@@ -6413,7 +6582,7 @@ mod tests {
     /// write.
     ///
     /// Negative controls, one per assertion: move the call above the sweep
-    /// and the ordering check fails; drop `result.is_ok()` and an aborted
+    /// and the ordering check fails; drop the `Ok` gate and an aborted
     /// write gets a ratio against the wrong denominator; turn the
     /// suppression back into a skip (`capacity_override.is_none()` as a
     /// guard) and the gate's row count is zero; drop `warns()` for
@@ -6453,7 +6622,12 @@ mod tests {
             "the ratio reads THIS sweep's 0x0c back from the journal, so it must run after it"
         );
         let guard = &body[sweep..assess];
-        for needle in ["result.is_ok()", "layout_snapshot.on_tape_bytes()"] {
+        // Issue #342: the write's inner function returns its Layout with
+        // `Ok`, so the completion gate and the denominator are one `if let`.
+        for needle in [
+            "if let Ok(layout_snapshot) = &result",
+            "layout_snapshot.on_tape_bytes()",
+        ] {
             assert!(guard.contains(needle), "RECORDING is gated on `{needle}`");
         }
         assert!(
@@ -6469,8 +6643,9 @@ mod tests {
             "above the threshold and unsuppressed it WARNS on stderr, by the pinned text"
         );
         assert!(
-            body[assess..].trim_end().ends_with("result"),
-            "and hands back the write's own `result`, untouched: never an exit-code change"
+            body[assess..].trim_end().ends_with("result.map(|_| ())"),
+            "and hands back the write's own `result`, its Layout dropped and its outcome \
+             untouched: never an exit-code change"
         );
     }
 
@@ -11674,6 +11849,20 @@ mod tests {
                 0,
                 "nothing was ever in a drive: a catalog-status refusal is not a contact"
             );
+            // And no sweep either (issue #342): the sweep is per CONTACT, and
+            // a refusal above the MAM read has none to sweep. The negative
+            // control for the two write sweep tests below.
+            let journal: i64 = conn
+                .query_row("SELECT COUNT(*) FROM log_page_journal", [], |r| r.get(0))
+                .unwrap();
+            let health: i64 = conn
+                .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                (journal, health),
+                (0, 0),
+                "no contact, so no sweep and no reading"
+            );
         }
 
         /// `volume compact-write` INHERITS `volume_write`'s contact. Exactly
@@ -12164,7 +12353,7 @@ mod tests {
                 None,
                 None,
                 &mut slot,
-                InitStore::Device,
+                ContactStore::Device,
             );
             let err = slot.finish_result(r).unwrap_err().to_string();
             assert!(err.contains("no medium serial"), "{err}");
@@ -12293,7 +12482,7 @@ mod tests {
                 None,
                 Some("MEM-INIT-1"),
                 &mut slot,
-                InitStore::Injected(&mut store),
+                ContactStore::Injected(&mut store),
             );
             let volume_id = slot
                 .finish_result(r)
@@ -12352,7 +12541,7 @@ mod tests {
                 None,
                 None,
                 &mut slot,
-                InitStore::Device,
+                ContactStore::Device,
             );
             let err = slot.finish_result(r).unwrap_err().to_string();
             assert!(err.contains("no medium serial"), "{err}");
@@ -12414,6 +12603,301 @@ mod tests {
             );
         }
 
+        // ── issue #342: `volume write` sweeps once on EVERY outcome after
+        //    its contact opened, driven through the store seam ──
+
+        /// A write that gets all the way to the store: `genchk_fixture`'s
+        /// catalog plus the escrow recipient recorded on the stage set and a
+        /// REAL slice file whose `sha256_encrypted` matches, so the
+        /// pre-flight `validate` (sacred invariant 2, full-hash from disk)
+        /// passes and the seam is reached. The volume is LTO-6 and unbound;
+        /// the drive in `lto8_config` is retuned to LTO-6 so
+        /// `check_drive_can_write` passes; nothing is detectable on the
+        /// nonexistent device, so corroboration and the generation check
+        /// see absences and proceed.
+        fn swept_write_fixture(label: &str, tmp: &std::path::Path) -> (Connection, Config, i64) {
+            let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+            let escrow_pk = register_escrow(&conn);
+            set_key_fingerprints(
+                &conn,
+                stage_set_id,
+                Some(&serde_json::to_string(&vec![escrow_pk]).unwrap()),
+            );
+            let slices_dir = tmp.join("slices");
+            fs::create_dir_all(&slices_dir).unwrap();
+            let content = b"encrypted slice bytes for the sweep tests. ".repeat(8);
+            let slice_path = slices_dir.join("slice_1.age");
+            fs::write(&slice_path, &content).unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           encrypted_bytes, sha256_plain, sha256_encrypted,
+                                           staging_path)
+                 VALUES (?1, 1, ?2, ?2, ?3, ?4, ?5)",
+                params![
+                    stage_set_id,
+                    content.len() as i64,
+                    direct_hash(b"plaintext hash is not exercised here"),
+                    direct_hash(&content),
+                    slice_path.to_string_lossy(),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+                params![label],
+            )
+            .unwrap();
+            let volume_id = conn.last_insert_rowid();
+            let mut config = lto8_config(tmp);
+            config.backends.lto[0].generation = "LTO-6".into();
+            (conn, config, volume_id)
+        }
+
+        /// The rows one write contact's sweep leaves, asserted by value
+        /// (issue #342): every page the fixture's 0x00 lists, once each,
+        /// against contact `cid` under the command `volume write`; and
+        /// exactly ONE `health_logs` row, of kind `write`, naming that
+        /// contact and the volume. Shared by the completed and the refused
+        /// case so both assert the SAME shape.
+        fn assert_one_write_sweep(conn: &Connection, cid: i64, volume_id: i64) {
+            use crate::tape::log_pages::tests::LISTED;
+            let journal: Vec<(u8, Option<i64>, String, i64)> = conn
+                .prepare(
+                    "SELECT page_code, contact_id, trigger, ok FROM log_page_journal ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                journal,
+                LISTED
+                    .iter()
+                    .map(|p| (*p, Some(cid), "volume write".to_string(), 1))
+                    .collect::<Vec<_>>(),
+                "one sweep: page 0x00 then every listed page, once, against THIS contact, \
+                 trigger = the command verbatim"
+            );
+            let health: Vec<(Option<i64>, String, Option<i64>)> = conn
+                .prepare("SELECT contact_id, operation, volume_id FROM health_logs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                health,
+                vec![(Some(cid), "write".to_string(), Some(volume_id))],
+                "exactly one health_logs row, of kind 'write', naming contact {cid}"
+            );
+        }
+
+        fn feed_ratio_events(conn: &Connection) -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE action = ?1",
+                params![crate::tape::feed_ratio::EVENT_ACTION],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// Issue #342, the outcome that took no sweep at all before it: a
+        /// write REFUSED at the File 0 check — the injected store holds a
+        /// foreign volume's ID thunk, so `check_fresh_write_contact`
+        /// refuses without `--force` (ADR-0003's consent point). The drive
+        /// was opened and File 0 was read, so this is a contact; it closes
+        /// `failed` and is swept exactly as a completed write is — one
+        /// sweep, each page read once, one `write` reading naming the
+        /// contact and the volume. Nothing past the check ran: no `writes`
+        /// row (`plan` never ran) and no feed ratio (#338 records one only
+        /// for a completed write).
+        ///
+        /// Before this, `volume_write_contacted` returned with `?` at that
+        /// check, above its sweep, so this outcome left zero
+        /// `log_page_journal` rows and zero `health_logs` rows.
+        ///
+        /// Negative control (run by hand, not committed): move the
+        /// `collect_health_best_effort(` call back inside
+        /// `volume_write_in_contact` below `finish_session` and this fails
+        /// at the journal assertion with an empty list.
+        #[test]
+        fn a_write_refused_at_file_zero_by_a_foreign_identity_is_swept_once() {
+            use crate::tape::log_pages::tests::{assert_each_page_read_once, FixtureSource};
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, config, volume_id) = swept_write_fixture("SW-FOREIGN", tmp.path());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let mut slot = ContactSlot::empty()
+                .with_drive_identity(identity_with_serial(Some("XYZZY_A1")))
+                .with_log_source(&src);
+            // The loaded tape: File 0 names ANOTHER volume.
+            let mut store = MemStore::new(512 * 1024);
+            fw_put_file(
+                &mut store,
+                0,
+                fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 8),
+            );
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-FOREIGN",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            let err = slot.finish_result(r).unwrap_err().to_string();
+            assert!(
+                err.contains("WRONGVOL") && err.contains("SW-FOREIGN"),
+                "positive control: refused at the File 0 check, naming found and expected: {err}"
+            );
+            assert_eq!(
+                store.files.len(),
+                1,
+                "the refused write wrote nothing: the foreign File 0 is all the tape holds"
+            );
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume write");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail.as_deref().unwrap_or("").contains("WRONGVOL"),
+                "{detail:?}"
+            );
+            let cid: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            let writes: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(writes, 0, "refused before `plan`: no session row");
+            assert_eq!(feed_ratio_events(&conn), 0, "no ratio for a write that sent nothing");
+
+            assert_one_write_sweep(&conn, cid, volume_id);
+            assert_each_page_read_once(&src.borrow().reads);
+        }
+
+        /// Issue #342, the once-per-contact half for `volume write`: the
+        /// COMPLETED write on a blank `MemStore` — File 0 check, plan,
+        /// execute, seal, confirm — is swept exactly once (no second sweep
+        /// from the restructure), the contact closes `ok`, and #338's feed
+        /// ratio is recorded once, after the sweep, from that sweep's page
+        /// 0x0c. The drive carries a `capacity_override` so the fixture's
+        /// mhvtl 0x0c figure records with the warning suppressed rather than
+        /// printing.
+        ///
+        /// Negative control (run by hand, not committed): add a second
+        /// `collect_health_best_effort(` call in `volume_write_contacted`
+        /// and the journal assertion fails with every page twice.
+        #[test]
+        fn a_completed_write_on_memstore_is_swept_once_and_then_rated() {
+            use crate::tape::log_pages::tests::{assert_each_page_read_once, FixtureSource};
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-DONE", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let mut slot = ContactSlot::empty()
+                .with_drive_identity(identity_with_serial(Some("XYZZY_A1")))
+                .with_log_source(&src);
+            let mut store = MemStore::new(512 * 1024);
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-DONE",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r)
+                .expect("a write to a blank MemStore completes");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed", "positive control: the write completed and sealed");
+            assert!(
+                store.files.len() > 4,
+                "positive control: the whole Layout was written: {} files",
+                store.files.len()
+            );
+            let (operation, outcome, _) = only_contact(&conn);
+            assert_eq!(operation, "volume write");
+            assert_eq!(outcome.as_deref(), Some("ok"));
+            let cid: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+
+            assert_one_write_sweep(&conn, cid, volume_id);
+            assert_each_page_read_once(&src.borrow().reads);
+            assert_eq!(
+                feed_ratio_events(&conn),
+                1,
+                "one feed ratio, from this sweep's page 0x0c (issue #338)"
+            );
+        }
+
+        /// The structural statement of "once per contact" for all three
+        /// write paths (issue #342), including `volume resume`, which no
+        /// ungated test can drive past its MAM read: each `_contacted`
+        /// function — the one that holds the guard — calls
+        /// `collect_health_best_effort(` exactly once, and each `_in_contact`
+        /// function — the one whose every `?` returns to that call — calls
+        /// it never. Calibrated: every one of the six bodies is found first,
+        /// and the `_contacted` body must reach its `_in_contact`.
+        #[test]
+        fn every_write_path_sweeps_in_its_contacted_function_and_never_in_its_body() {
+            const SRC: &str = include_str!("write.rs");
+            let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(prod.len() < SRC.len(), "positive control: production half separated");
+            for path in ["init", "write", "resume"] {
+                let outer = format!("fn volume_{path}_contacted");
+                let inner = format!("fn volume_{path}_in_contact");
+                let body_of = |f: &str| -> &str {
+                    let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+                    let end = prod[start..].find("\n}\n").unwrap() + start;
+                    let body = &prod[start..end];
+                    assert!(
+                        !body[f.len()..].contains("\npub fn ") && !body[f.len()..].contains("\nfn "),
+                        "{f}: body extraction overran into another function"
+                    );
+                    body
+                };
+                let outer_body = body_of(&outer);
+                let inner_body = body_of(&inner);
+                assert!(
+                    outer_body.contains(&format!("{}(", &inner[3..])),
+                    "positive control: {outer} reaches {inner}"
+                );
+                assert_eq!(
+                    outer_body.matches("collect_health_best_effort(").count(),
+                    1,
+                    "{outer} sweeps exactly once — after {inner} returned, on every outcome"
+                );
+                assert_eq!(
+                    inner_body.matches("collect_health_best_effort(").count()
+                        + inner_body.matches("collect_and_record_health(").count(),
+                    0,
+                    "{inner} must not sweep: its `?`s return to {outer}'s one sweep, and a \
+                     sweep here is either a double or one that an early exit skips"
+                );
+            }
+        }
+
         /// `volume write` and `volume resume` cannot be driven without a tape
         /// device, so their corroboration is proved on real hardware by the
         /// mhvtl gate. This is the ungated guard that the CALL is still
@@ -12423,12 +12907,13 @@ mod tests {
         #[test]
         fn the_two_write_contacts_still_corroborate() {
             const SRC: &str = include_str!("write.rs");
-            // The INNER functions (issue #296): the public entry points are
-            // now thin contact wrappers, and the work — corroboration
-            // included — lives one call down. The call moved, so the
-            // assertion moved with it, which is what this test's own
-            // instruction below says to do.
-            for f in ["fn volume_write_contacted", "fn volume_resume_contacted"] {
+            // The INNER functions (issue #296, then #342): the public entry
+            // points are thin contact wrappers, the `_contacted` functions
+            // hold the contact and its sweep, and the work — corroboration
+            // included — lives one call down in `_in_contact`. The call
+            // moved, so the assertion moved with it, which is what this
+            // test's own instruction below says to do.
+            for f in ["fn volume_write_in_contact", "fn volume_resume_in_contact"] {
                 let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
                 // Function bodies end at the first `\n}` in column 0.
                 let end = SRC[start..].find("\n}\n").unwrap() + start;
@@ -12466,7 +12951,9 @@ mod tests {
         #[test]
         fn volume_write_records_mam_facts_only_after_the_tape_side_refusals() {
             const SRC: &str = include_str!("write.rs");
-            let f = "fn volume_write_contacted";
+            // Issue #342: the refusals and the UPDATE live in the inner
+            // function now; the ordering claim is unchanged.
+            let f = "fn volume_write_in_contact";
             let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
             let end = SRC[start..].find("\n}\n").unwrap() + start;
             let body = &SRC[start..end];
