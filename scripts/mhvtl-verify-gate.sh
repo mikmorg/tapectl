@@ -16,6 +16,11 @@
 #   Journals leg (issue #319): catalog-only checks that the forensics
 #      journals (mam_journal, log_page_journal) captured every read, once,
 #      verbatim, attributed to its contact. Runs after leg 5, reads no tape.
+#      Includes tape_alert_surfaced (issue #340): `report health` shows a
+#      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
+#      real one.
+#
+# 37 checks as of #340; the `check` lines below are the list.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -1251,6 +1256,111 @@ check log_page_read_once      step_log_page_read_once
 check log_page_raw_kept       step_log_page_raw_kept
 check mam_journal_attributed  step_mam_journal_attributed
 check contacts_name_their_drive step_contacts_name_their_drive
+
+# ---------- the first non-zero TapeAlert must be SEEN (issue #340) ----------
+# Every page 0x2E ever journalled -- every capture, every rehearsal, every
+# gate run -- has been all-zero, so `report health`'s `!! TAPE ALERT` line
+# has never fired and nothing would notice if it could not. This step makes
+# it fire on purpose. A consistent COPY of the gate catalog (sqlite's backup
+# API -- the DB is WAL mode, a plain cp can miss <db>-wal), one real closed
+# contact's 0x2E decode with two flags flipped to 1 and its health row's
+# tape_alerts set to 2, and `report health` run against a second home built
+# around that copy. The gate catalog itself is never modified.
+#
+# Positive control first: the line names THAT contact, the gate drive's
+# serial, the contact's cartridge and flags 20 and 36 by number and name.
+# Only then the negative, on the unmodified catalog: no sighting line -- and
+# it looked, proved by the listing carrying alerts=0 readings and the DB
+# carrying decoded 0x2E rows. If the unmodified catalog already carries a
+# raised flag, the seed refuses and says so: that is #340's first sighting,
+# to be read, not a defect in this step.
+step_tape_alert_surfaced() {
+    local seeded="$RUN/home-tape-alert" want picked cid barcode
+    want="$(tail -c +5 "/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE_DEV")")/device/vpd_pg80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
+    [ -n "$want" ] || { echo "cannot read the gate drive's serial from sysfs"; return 1; }
+    mkdir -p "$seeded"
+    cp "$CFG" "$seeded/config.toml"
+    # Prints "<contact id> <barcode>" for the contact it seeded.
+    picked="$(python3 - "$HOME_DIR/tapectl.db" "$seeded/tapectl.db" <<'PYSEED'
+import sqlite3, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = sqlite3.connect(src); d = sqlite3.connect(dst)
+s.backup(d)   # WAL-safe: a plain cp can miss <db>-wal and hand back a stale copy
+s.close()
+rows = d.execute(
+    """SELECT j.id, j.contact_id, j.decoded, c.barcode
+       FROM log_page_journal j
+       JOIN cartridge_contacts cc ON cc.id = j.contact_id
+       LEFT JOIN cartridges c ON c.id = cc.cartridge_id
+       WHERE j.page_code = 0x2e AND j.ok = 1 AND j.decoded IS NOT NULL
+         AND cc.closed_at IS NOT NULL
+         AND EXISTS (SELECT 1 FROM health_logs h WHERE h.contact_id = j.contact_id)
+       ORDER BY j.id DESC""").fetchall()
+assert rows, "positive control: no closed contact with both a decoded 0x2E row and a health row -- nothing to seed"
+# The premise: every 0x2E ever read is all-zero. If that stopped being true,
+# say so -- it is issue #340's first sighting, not a defect in this step.
+raised = [(jid, cid) for jid, cid, dec, _ in rows
+          if any(l.rstrip().endswith(": 1") for l in dec.splitlines())]
+nonzero = d.execute("SELECT id, contact_id, tape_alerts FROM health_logs WHERE tape_alerts > 0").fetchall()
+assert not raised and not nonzero, (
+    "the UNMODIFIED gate catalog already carries a non-zero TapeAlert -- issue #340's first "
+    f"sighting, on mhvtl: journal rows {raised}, health rows {nonzero}. Read it before touching this step.")
+jid, cid, dec, barcode = rows[0]
+flipped = dec.replace("  Cleaning required: 0", "  Cleaning required: 1", 1) \
+             .replace("  Drive temperature: 0", "  Drive temperature: 1", 1)
+assert flipped.count(": 1") == 2, "the decode did not carry both flag lines to flip"
+d.execute("UPDATE log_page_journal SET decoded = ? WHERE id = ?", (flipped, jid))
+d.execute("UPDATE health_logs SET tape_alerts = 2 WHERE contact_id = ?", (cid,))
+d.commit()
+print(cid, barcode if barcode is not None else "-")
+PYSEED
+)" || { echo "seeding the copy failed"; return 1; }
+    read -r cid barcode <<<"$picked"
+    echo "seeded copy: contact $cid (cartridge $barcode) now shows TapeAlert flags 20 and 36"
+
+    # Positive control: the seeded copy is reported, with THIS contact's
+    # identifiers -- not merely some line carrying the prefix.
+    "$BIN" --home "$seeded" --config "$seeded/config.toml" report health > "$RUN/report-health-seeded.txt" \
+        || { echo "report health against the seeded copy failed"; return 1; }
+    python3 - "$RUN/report-health-seeded.txt" "$cid" "$want" "$barcode" <<'PYPOS'
+import sys
+out = open(sys.argv[1]).read(); cid, want, barcode = sys.argv[2:5]
+lines = [l for l in out.splitlines() if l.startswith("!! TAPE ALERT ")]
+assert len(lines) == 1, f"want exactly one sighting line for the one seeded contact, got {len(lines)}:\n{out}"
+l = lines[0]
+bad = []
+for needle, what in ((f"contact={cid} ", "the seeded contact id"),
+                     (f"drive={want} ", "the gate drive's serial"),
+                     (f"cartridge={barcode} ", "the contact's cartridge"),
+                     ("flags=20,36 (Cleaning required; Drive temperature)", "both flipped flags, numbered and named"),
+                     ("source=log_page_journal#", "the journal as the source")):
+    if needle not in l:
+        bad.append(f"missing {what!r}: {needle!r}")
+if "DISAGREES" in l:
+    bad.append("the seeded count (2) matches the two flags, so no disagreement may be reported")
+assert not bad, "the sighting line is wrong:\n  " + "\n  ".join(bad) + f"\n  line: {l}"
+assert any("read-to-clear" in x for x in out.splitlines()), "the read-to-clear note is missing"
+print(f"positive control: {l}")
+PYPOS
+    [ $? -eq 0 ] || return 1
+
+    # Negative assertion, only now: the unmodified catalog prints no sighting
+    # -- and it LOOKED: alerts=0 readings in the listing, 0x2E decodes in the DB.
+    TCTL report health > "$RUN/report-health-unmodified.txt" \
+        || { echo "report health against the gate catalog failed"; return 1; }
+    python3 - "$RUN/report-health-unmodified.txt" "$HOME_DIR/tapectl.db" <<'PYNEG'
+import sqlite3, sys
+out = open(sys.argv[1]).read(); c = sqlite3.connect(sys.argv[2])
+n_2e = c.execute("SELECT COUNT(*) FROM log_page_journal WHERE page_code = 0x2e AND ok = 1 AND decoded IS NOT NULL").fetchone()[0]
+assert n_2e > 0, "positive control: no decoded 0x2E row to have looked at"
+clean = [l for l in out.splitlines() if " alerts=0" in l]
+assert clean, f"positive control: no recorded-and-clean reading (alerts=0) in the listing:\n{out}"
+hits = [l for l in out.splitlines() if l.startswith("!! TAPE ALERT ") or "read-to-clear" in l]
+assert not hits, "the unmodified catalog reports a TapeAlert sighting:\n  " + "\n  ".join(hits)
+print(f"negative: {n_2e} decoded 0x2E rows, {len(clean)} alerts=0 readings listed, no sighting line")
+PYNEG
+}
+check tape_alert_surfaced step_tape_alert_surfaced
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --

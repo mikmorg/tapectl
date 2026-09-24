@@ -69,7 +69,7 @@ What "done" requires scales with what the change touches:
 | Touches | Must be green before the next item |
 |---|---|
 | anything | unit + integration tests, clippy, fmt, CI |
-| the heir or tape path | `scripts/mhvtl-verify-gate.sh` — 26/26 |
+| the heir or tape path | `scripts/mhvtl-verify-gate.sh` — 37/37 (as of #340) |
 | the suite or lifecycle | `scripts/lifecycle-suite.sh` multi-cartridge on mhvtl |
 | bytes written to tape | a real-drive confirmation pass, batched to the end |
 

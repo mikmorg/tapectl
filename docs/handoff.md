@@ -66,10 +66,11 @@ severity-first in the queue and its ruling is ADR-0012's first paragraph.
 ## Where the project actually stands
 
 - Milestones 0–7 complete; the Layout-v2 regear landed in full (T0–T11).
-- `scripts/mhvtl-verify-gate.sh` is **GREEN 26/26 with `EXPECTED_FAIL=()`** —
-  zero slack, so any gate failure is a hard stop rather than a known-defect
-  pin. Verified across five consecutive runs on 2026-08-01 when the last
-  nondeterminism (#113) was removed.
+- `scripts/mhvtl-verify-gate.sh` runs with **`EXPECTED_FAIL=()`** — zero
+  slack, so any gate failure is a hard stop rather than a known-defect pin.
+  Verified across five consecutive runs on 2026-08-01 (26 checks then) when
+  the last nondeterminism (#113) was removed; the list has grown since and
+  stands at 37 checks as of #340 (`tape_alert_surfaced`).
 - 766 ungated tests; CI green; `cargo fmt`/`clippy -D warnings` clean.
 - **Every issue of every severity above `low` is now closed** (#69, the last
   `severity:high`, landed 2026-08-02). What remains is nine `severity:low`

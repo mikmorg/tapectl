@@ -142,8 +142,9 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
 - **Verified:** 270 ungated tests; `tests/format_v2.rs` is a keyless synthetic-heir
   acceptance suite (proves the byte layout from recorded bytes alone); mhvtl e2e 9/9
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
-  corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **26/26 against an empty
-  EXPECTED_FAIL manifest** (2026-09-10 — H7 #33 / H8 #34 are fixed and removed).
+  corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
+  EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
+  removed; 37 checks as of #340).
 
 **Next:** issues #22–#28 describe the *pre-v2* design and must be read against the
 normative set above, not implemented literally.
