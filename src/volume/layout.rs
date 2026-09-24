@@ -9,6 +9,11 @@ pub struct IdThunkV2Params<'a> {
     pub label: &'a str,
     pub uuid: &'a str,
     pub media_type: &'a str,
+    /// The writer's PACKAGE version (`CARGO_PKG_VERSION`), never the build
+    /// identity `build_info::VERSION` — File 0 is an on-tape byte and
+    /// ADR-0012 (2026-09-24 amendment, item 1) adds no writer-commit field
+    /// to it. `build_info::tests::on_tape_writer_string_is_the_package_version`
+    /// pins the `volume::write` call site.
     pub tapectl_version: &'a str,
     pub nominal_capacity: i64,
     pub mam_capacity: i64,

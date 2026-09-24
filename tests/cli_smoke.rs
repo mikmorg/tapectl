@@ -2533,3 +2533,32 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
     ]);
     assert_eq!(parsed, expected, "the whole --json document");
 }
+
+/// `tapectl --version` prints the BUILD identity — package version, the
+/// commit it was built from and the build day — not the bare package
+/// version (ADR-0012, 2026-09-24 amendment, item 1). The binary and this
+/// test come from the same build-script run, so the strings must agree
+/// exactly; clap exits before `main` touches any home, so no tempdir.
+#[test]
+fn version_flag_prints_the_build_identity() {
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--version")
+        .output()
+        .expect("run tapectl --version");
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).expect("utf-8");
+    assert_eq!(
+        text,
+        format!("tapectl {}\n", tapectl::build_info::VERSION),
+        "--version must print build_info::VERSION verbatim"
+    );
+    assert!(
+        text.starts_with(&format!("tapectl {} (", tapectl::build_info::PKG_VERSION)),
+        "the build identity leads with the package version: {text:?}"
+    );
+    assert!(
+        text.contains(tapectl::build_info::GIT_DESCRIBE)
+            && text.contains(tapectl::build_info::BUILD_DATE),
+        "the build identity names the commit and the build day: {text:?}"
+    );
+}

@@ -98,6 +98,13 @@ pub struct BuildInputs {
     /// bytes the §2.1 envelope permutation hashes.
     pub volume_uuid: String,
     pub media_type: String,
+    /// The writer's PACKAGE version (`build_info::PKG_VERSION`, i.e.
+    /// `CARGO_PKG_VERSION`) — never the build identity
+    /// (`build_info::VERSION`, commit + day). This reaches `MANIFEST.toml`,
+    /// which `tests/on_tape_golden.rs` pins byte for byte, and ADR-0012
+    /// (2026-09-24 amendment, item 1) rules that build identity changes no
+    /// on-tape byte. `build_info::tests::on_tape_writer_string_is_the_package_version`
+    /// pins the `volume::write` call site.
     pub tapectl_version: String,
     /// RFC 3339 generation timestamp for the ID thunk's `created_at` (T6
     /// review finding #5). The caller renders this once (normally

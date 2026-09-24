@@ -76,7 +76,13 @@ fn main() -> std::io::Result<()> {
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/man");
     fs::create_dir_all(&out_dir)?;
 
-    let mut cmd = Cli::command();
+    // `Cli`'s clap version is the BUILD identity (`build_info::VERSION`:
+    // package version, commit hash, build day — ADR-0012, 2026-09-24
+    // amendment). A man page documents the release, not one commit, and
+    // the CI `man-drift` job regenerates these pages and diffs them —
+    // with the hash in the `.TH` header that job would fail on every
+    // commit forever. So the pages render with the package version alone.
+    let mut cmd = Cli::command().version(tapectl::build_info::PKG_VERSION);
     cmd.build();
 
     // Top-level page.

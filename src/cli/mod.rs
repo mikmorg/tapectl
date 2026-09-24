@@ -21,9 +21,15 @@ pub mod volume;
 
 use clap::{Parser, Subcommand};
 
+// `--version` prints the build identity (`build_info::VERSION`: package
+// version, commit, build day), not the bare package version — ADR-0012,
+// 2026-09-24 amendment, item 1. `examples/gen_man.rs` overrides it back to
+// the package version so the committed man pages do not churn per commit.
+// (A `///` comment here would become clap's long_about and land in the man
+// page's DESCRIPTION — keep this a plain comment.)
 /// tapectl — Multi-Tenant Archival Storage Management System
 #[derive(Parser, Debug)]
-#[command(name = "tapectl", version, about)]
+#[command(name = "tapectl", version = crate::build_info::VERSION, about)]
 pub struct Cli {
     /// Output in JSON format
     #[arg(long, global = true)]
