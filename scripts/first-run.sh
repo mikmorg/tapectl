@@ -796,6 +796,9 @@ try:
 except Exception: pass' 2>/dev/null || true)"
   fi
   tape_lock
+  explain <<'EOF'
+A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. On this VM the homorg runner's timers are the known contenders; the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step.
+EOF
   run as_svc mt -f "$DEVICE" status || true
   if as_svc mt -f "$DEVICE" status 2>/dev/null | grep -q DR_OPEN; then die "no cartridge loaded in $DEVICE"; fi
   ask LABEL "volume label" "${LABEL:-L6-0001}"
