@@ -134,10 +134,49 @@ amendment, which names write/resume/verify and the read paths, but init does
 write File 0 and takes two MAM reads. Adding it would cost one 22-page sweep
 per init. Not changed here; it is a ruling, not a defect.
 
+## The end-of-tape fill (2026-09-24, ruled as grilling Q6)
+
+`scripts/lto6-fill.sh` on EW7VWMVKF6, one continuous `dd` stream of incompressible data
+in 512 KiB blocks from BOT until the drive refused (run `/scratch/tapectl-lto6/fill-20260924-005045`,
+00:52–05:21 UTC). A first attempt in 2 GiB chunk-per-`dd` pieces was stopped at 107 GB: each
+`dd` close made the driver write a filemark and flush, a stop-start every chunk (77 MB/s);
+the continuous stream ran at the drive's full rate.
+
+| | |
+|---|---|
+| bytes the drive accepted before ENOSPC | **2,501,995,134,976 (2.5020 TB)** |
+| host feed, steady | 155.3 MB/s over 4 h 28 min |
+| page 0x0c "Native capacity from BOP to EOD" after | 2,513,648 MB |
+| page 0x17 "Total used native capacity" after rewind | 2,513,648 MB |
+| MAM remaining [MiB]: before / after | 2,499,053 / 101,850 (used 2,397,203 MiB = 2,513,648 MB, agrees to the MB) |
+| native capacity used per data byte | **1.0047** |
+| data accepted / the 2.5 TB planning figure (ADR-0010 generation table) | **1.0008** |
+| data accepted / MAM maximum (2,499,053 MiB = 2.620 TB) | 0.9548 |
+
+**What it settles.**
+
+1. **The generation table's 2.5 TB is, to 0.08%, exactly what this cartridge holds for host
+   data.** The pre-flight gate plans against 0.92 of it, so a full tape leaves about 200 GB of
+   margin before the drive would refuse. The gate is sound; nothing to change.
+2. **MAM's "remaining capacity" is NOT host-writable space.** At ENOSPC the attribute still
+   reported 101,850 MiB (107 GB) remaining: the drive stops host writes at its early-warning
+   point and keeps that reserve (page 0x0c's "Minimum native capacity from EW to EOP", 99,008 MB
+   on this drive, is that reserve). Any plan that budgets against MAM remaining without
+   subtracting the EW reserve over-commits by ~100 GB. tapectl never did; recorded so nobody
+   starts.
+3. **A fourth #323 data point:** 1.0047 native bytes per data byte at a steady 155 MB/s, in
+   line with 1.000 at a steady 56 MB/s and 1.006 at 151 MB/s. Steadiness, not rate, is what
+   costs tape.
+4. **Page 0x17 read at EOT, before a rewind, showed a partial "used" counter** (103,077 MB
+   against 2,513,648 after the rewind). The fill script now reads it after the rewind; a
+   consumer of 0x17 at end of data should know this.
+5. The ENOSPC arrived as `dd: error writing ...: No space left on device`, rc 1, after
+   4,772,467 whole 512 KiB blocks. tapectl's own EOT path (a clean abort to an unsealed
+   tape) remains proven on mhvtl only, by design unreachable in production.
+
 ## Not done
 
-- **The ENOSPC fill** (write the cartridge to physical end of tape): 6+ hours
-  at this drive's rate; only on the CTO's word.
-- **TapeAlert read-to-clear**: needs a cartridge that raises a flag.
+- **TapeAlert read-to-clear**: needs a cartridge that raises a flag (#340 surfaces the
+  first one).
 - `compaction`, `cartridge-displacement` and `collection-second-copy` on
   hardware: need more than one cartridge.

@@ -45,8 +45,11 @@ the corrections to ADR-0010/0011's own text are dated inside them.
    the drive passed through — `docs/runs/2026-09-23-real-drive-rehearsal.md`; production runs
    here, not on home2, ruled the same day), which also
    settles the one open measurement: MAM's maximum-capacity attribute is
-   either MiB or MB (a 10 % question; the code assumes MiB). Write that
-   cartridge to end-of-tape and record where ENOSPC fell.
+   either MiB or MB (a 10 % question; the code assumes MiB) — **settled: MiB**
+   (`docs/runs/2026-09-23-lto6-capacity-measurement.md`). Write that cartridge
+   to end-of-tape and record where ENOSPC fell — **done 2026-09-24: 2.5020 TB,
+   1.0008 x the planning figure; the gate's 0.92 factor is sound**
+   (`docs/runs/2026-09-23-real-drive-rehearsal.md`, "The end-of-tape fill").
 
 **Run that rehearsal early** (ruled 2026-09-15) — whenever your week allows,
 not after the queue drains. It measures hardware facts, which none of the
