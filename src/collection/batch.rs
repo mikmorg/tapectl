@@ -122,6 +122,7 @@ pub fn execute_batch(
     copy_labels: &[String],
     device: &str,
     block_size: usize,
+    assume_yes: bool,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
         return Err(TapectlError::Other(
@@ -209,7 +210,7 @@ pub fn execute_batch(
     // silently override (issue #27).
     for label in copy_labels {
         crate::volume::write::volume_write(
-            conn, paths, config, label, device, block_size, false, false,
+            conn, paths, config, label, device, block_size, false, false, assume_yes,
         )?;
     }
 

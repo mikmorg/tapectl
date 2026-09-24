@@ -3714,6 +3714,7 @@ pub fn quick_archive(
     device: Option<&str>,
     json_output: bool,
     dry_run: bool,
+    assume_yes: bool,
 ) -> Result<()> {
     // Issue #247: quick-archive is unit init -> snapshot -> stage -> `volume
     // write`. A real preview would have to stage the unit for real and
@@ -3786,6 +3787,7 @@ pub fn quick_archive(
         512 * 1024,
         false,
         false,
+        assume_yes,
     )?;
     if json_output {
         println!(

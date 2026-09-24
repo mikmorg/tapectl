@@ -609,6 +609,7 @@ pub fn run(
                 DEFAULT_BLOCK_SIZE,
                 *force,
                 *allow_missing_escrow,
+                yes,
             )?;
             if json_output {
                 println!(
@@ -1263,6 +1264,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
+                yes,
             )?;
             if json_output {
                 println!(
@@ -1379,6 +1381,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
+                yes,
             )?;
             println!("  Write completed");
 

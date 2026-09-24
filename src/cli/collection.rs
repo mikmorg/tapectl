@@ -126,6 +126,7 @@ pub fn run(
     command: &CollectionCommands,
     json_output: bool,
     global_dry_run: bool,
+    assume_yes: bool,
 ) -> Result<i32> {
     match command {
         // `Sync` declares its OWN `--dry-run` as well. The two are OR-ed,
@@ -169,6 +170,7 @@ pub fn run(
             &crate::cli::write_device(config, device.as_deref())?,
             json_output,
             global_dry_run,
+            assume_yes,
         ),
     }
 }
@@ -428,6 +430,7 @@ fn cmd_run(
     device: &str,
     json_output: bool,
     dry_run: bool,
+    assume_yes: bool,
 ) -> Result<i32> {
     let lib = collection::find_collection(config, collection_name)?;
     // No `--generation` here: `collection run` writes to volumes that are
@@ -524,6 +527,7 @@ fn cmd_run(
         labels,
         device,
         DEFAULT_BLOCK_SIZE,
+        assume_yes,
     )?;
 
     if json_output {
@@ -685,6 +689,7 @@ pattern = ["*.tmp"]
             &CollectionCommands::Status,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_ne!(
@@ -760,6 +765,7 @@ pattern = ["*.tmp"]
                 &CollectionCommands::Sync { dry_run: false },
                 false,
                 false,
+                false,
             )
             .unwrap();
             let names: Vec<String> = conn
@@ -807,6 +813,7 @@ pattern = ["*.tmp"]
             &paths,
             &config,
             &CollectionCommands::Status,
+            false,
             false,
             false,
         )

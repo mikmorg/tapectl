@@ -4,6 +4,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod host_check;
 pub mod signal;
 pub mod startup;
 pub mod tenant;

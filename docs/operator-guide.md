@@ -279,6 +279,50 @@ So, before a write or a verify, make the host quiet (ruled 2026-09-24):
   cartridge its session (a clean abort to an unsealed tape, but the time is
   gone). Keep a few GB free.
 
+The rule is checked, not only stated (ADR-0012, 2026-09-24 amendment, item 7).
+`tapectl host check` reports the load average, available memory, memory and
+I/O pressure (`/proc/pressure/*`, `full avg60`), and any contender process or
+systemd unit, each against its limit; it exits 0 when the host is quiet and 1
+when anything tripped, and runs on a machine not yet `init`ed. `volume write`
+runs the same check after its own fact checks and before it touches the drive
+(so do `volume compact-write`, `collection run` and `quick-archive`, which
+write through it): when anything trips it prints each finding — what, what
+was measured, the limit — and asks. `--yes` answers the question (the findings
+are still printed); a session with no terminal and no `--yes` declines, as
+every ADR-0008 Tier-2 question does, rather than hang. It never refuses on its
+own account: a busy host is a warning you may accept, not a fact that stops
+the write.
+
+The limits live in `[host_check]` in config.toml (`init` writes the table
+commented out, every key at its default):
+
+| key | default | trips when |
+|---|---|---|
+| `contender_units` | `[]` | a listed systemd unit is active (a timer is active while armed) |
+| `contender_processes` | `["cargo", "rustc", "docker", "Runner.Worker"]` | a process of that exact name (`/proc/<pid>/comm`) runs |
+| `max_load_per_cpu` | `1.0` | 1-minute load / CPU count exceeds it |
+| `min_available_mb` | `2048` | `MemAvailable` is below it (0 = off) |
+| `max_memory_pressure_pct` | `10.0` | memory `full avg60` exceeds it |
+| `max_io_pressure_pct` | `10.0` | I/O `full avg60` exceeds it |
+
+The default processes are builds and CI jobs by the name they run under while
+working — not the daemons that idle beside them (`dockerd`, `buildkitd`, the
+Actions runner's `Runner.Listener`), which would trip every check on a normal
+host. Unit names are host-specific, so none are listed by default. On the
+current production VM, list the homorg timers so `volume write` checks them
+too:
+
+```toml
+[host_check]
+contender_units = ["homorg-db-suite.timer", "homorg-prune-target.timer"]
+```
+
+and pause them for the write with
+`sudo systemctl stop homorg-db-suite.timer homorg-prune-target.timer`
+(`start` them again afterwards). `tapectl host check --unit <unit>` checks a
+unit once without editing the config; `first-run.sh` step 13 does exactly that
+for these two before its WRITE confirmation.
+
 The write itself needs no supervision once it is streaming; the drive's
 counters afterwards (`report health`, page 0x17's native-used against bytes
 written — issue #338) say whether the feed held.

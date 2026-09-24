@@ -110,7 +110,117 @@ pub struct Config {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// The quiet-host check (ADR-0012, 2026-09-24 amendment, item 7): what
+    /// `tapectl host check` and `volume write`'s pre-flight look for.
+    /// `None` when the file has no `[host_check]` table — every key then
+    /// takes its default, via [`Config::host_check`]. An `Option` rather
+    /// than a defaulted struct only so a fresh `init` config does not
+    /// serialize the defaults as a live table: `init` appends
+    /// [`HOST_CHECK_EXAMPLE`], commented out, instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_check: Option<HostCheckConfig>,
 }
+
+/// `[host_check]` — what counts as a noisy host before a tape write
+/// (ADR-0012, 2026-09-24 amendment, item 7; `docs/operator-guide.md`, "A
+/// quiet host while the tape runs"). Every key is optional. A finding is a
+/// warning that asks for confirmation — never a refusal — so these are
+/// thresholds for "ask the operator", not limits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCheckConfig {
+    /// systemd units that compete with a write while they are active
+    /// (a timer is active while it is armed). Host-specific, so empty by
+    /// default; e.g. `["homorg-db-suite.timer", "homorg-prune-target.timer"]`.
+    #[serde(default)]
+    pub contender_units: Vec<String>,
+    /// Process names (`/proc/<pid>/comm`, which the kernel truncates to 15
+    /// characters) that compete with a write while they run.
+    #[serde(default = "default_contender_processes")]
+    pub contender_processes: Vec<String>,
+    /// The 1-minute load average divided by the CPU count, above which the
+    /// host is loaded.
+    #[serde(default = "default_max_load_per_cpu")]
+    pub max_load_per_cpu: f64,
+    /// `MemAvailable` below this many MiB is short of memory. 0 turns the
+    /// memory check off.
+    #[serde(default = "default_min_available_mb")]
+    pub min_available_mb: u64,
+    /// `/proc/pressure/memory`'s `full avg60` (percent of the last minute
+    /// in which every task was stalled on memory) above which memory is
+    /// under pressure.
+    #[serde(default = "default_max_pressure_pct")]
+    pub max_memory_pressure_pct: f64,
+    /// `/proc/pressure/io`'s `full avg60`, likewise for I/O.
+    #[serde(default = "default_max_pressure_pct")]
+    pub max_io_pressure_pct: f64,
+}
+
+/// Builds and CI jobs, by the name each runs under WHILE it works — not the
+/// daemons that idle beside them all day (`dockerd`, `buildkitd`,
+/// `containerd-shim`, the Actions runner's `Runner.Listener`), which would
+/// make every check on a normal host a finding. `docker` is the CLI, present
+/// only while someone is building or pulling; `Runner.Worker` is the process
+/// a GitHub Actions runner starts for a job and exits after it.
+pub const DEFAULT_CONTENDER_PROCESSES: &[&str] = &["cargo", "rustc", "docker", "Runner.Worker"];
+
+fn default_contender_processes() -> Vec<String> {
+    DEFAULT_CONTENDER_PROCESSES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+/// 1.0: the CPUs are saturated. Anything lighter is left to the contender
+/// list and the pressure figures, which measure stalls directly rather than
+/// inferring them from a queue length.
+fn default_max_load_per_cpu() -> f64 {
+    1.0
+}
+/// "Keep a few GB free" (the operator guide): a process killed for memory
+/// pressure mid-write costs the cartridge its session.
+fn default_min_available_mb() -> u64 {
+    2048
+}
+/// 10% of the last minute fully stalled. `full avg60`, not `some avg10`: a
+/// ten-second window swings with every burst of a neighbour's build, and
+/// the check asks a question the operator must answer, so it should not
+/// flicker.
+fn default_max_pressure_pct() -> f64 {
+    10.0
+}
+
+impl Default for HostCheckConfig {
+    fn default() -> Self {
+        Self {
+            contender_units: Vec::new(),
+            contender_processes: default_contender_processes(),
+            max_load_per_cpu: default_max_load_per_cpu(),
+            min_available_mb: default_min_available_mb(),
+            max_memory_pressure_pct: default_max_pressure_pct(),
+            max_io_pressure_pct: default_max_pressure_pct(),
+        }
+    }
+}
+
+/// The `[host_check]` table as `init` documents it: commented out, every
+/// key at its default. Appended after serialization for the same reason as
+/// [`LTO_BACKEND_EXAMPLE`] — TOML round-trips drop comments.
+pub const HOST_CHECK_EXAMPLE: &str = r#"
+# ---------------------------------------------------------------------------
+# Quiet-host check. `tapectl host check` and `volume write`'s pre-flight warn
+# (and ask) when these trip; they never refuse. The values shown are the
+# defaults. List this host's own contenders -- e.g. a CI runner's timers --
+# in contender_units, so `volume write` checks them too.
+# ---------------------------------------------------------------------------
+# [host_check]
+# contender_units = []            # e.g. ["homorg-db-suite.timer", "homorg-prune-target.timer"]
+# contender_processes = ["cargo", "rustc", "docker", "Runner.Worker"]
+# max_load_per_cpu = 1.0          # 1-minute load average / CPU count
+# min_available_mb = 2048         # MemAvailable floor, MiB (0 = off)
+# max_memory_pressure_pct = 10.0  # /proc/pressure/memory full avg60
+# max_io_pressure_pct = 10.0      # /proc/pressure/io full avg60
+"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -920,6 +1030,33 @@ impl Config {
                 path.display()
             ));
         }
+        // `[host_check]`: a load threshold of 0 or below would make every
+        // host "loaded", and a pressure percentage outside (0, 100] is
+        // either always or never true — each an off switch or an always-on
+        // switch wearing a threshold's clothes, refused for the same reason
+        // as `utilization_threshold` above.
+        if let Some(hc) = &self.host_check {
+            if !(hc.max_load_per_cpu.is_finite() && hc.max_load_per_cpu > 0.0) {
+                problems.push(format!(
+                    "{}: host_check.max_load_per_cpu = {} must be a number > 0 \
+                     (the 1-minute load average per CPU above which the host is loaded)",
+                    path.display(),
+                    hc.max_load_per_cpu
+                ));
+            }
+            for (key, value) in [
+                ("max_memory_pressure_pct", hc.max_memory_pressure_pct),
+                ("max_io_pressure_pct", hc.max_io_pressure_pct),
+            ] {
+                if !(value > 0.0 && value <= 100.0) {
+                    problems.push(format!(
+                        "{}: host_check.{key} = {value} must be > 0 and <= 100 \
+                         (a percentage of the last minute spent fully stalled)",
+                        path.display()
+                    ));
+                }
+            }
+        }
         problems
     }
 
@@ -1015,6 +1152,12 @@ impl Config {
         problems.extend(self.range_problems(path));
         problems.extend(self.backend_problems(path));
         problems
+    }
+
+    /// The `[host_check]` settings in force: the table as written, or every
+    /// default when the file has none.
+    pub fn host_check(&self) -> HostCheckConfig {
+        self.host_check.clone().unwrap_or_default()
     }
 
     /// Write config to file.
@@ -2310,6 +2453,113 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.logging.tracing_level(), tracing::Level::DEBUG);
         assert_eq!(cfg.logging.format, "json");
+    }
+
+    // ---- ADR-0012 2026-09-24 item 7: [host_check] ----
+
+    #[test]
+    fn host_check_absent_means_every_default() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.host_check.is_none());
+        assert_eq!(cfg.host_check(), HostCheckConfig::default());
+        assert!(cfg.host_check().contender_units.is_empty());
+        assert!(cfg
+            .host_check()
+            .contender_processes
+            .contains(&"cargo".to_string()));
+    }
+
+    #[test]
+    fn host_check_keys_parse_and_unset_ones_keep_their_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[host_check]\n\
+             contender_units = [\"homorg-db-suite.timer\"]\n\
+             max_load_per_cpu = 0.5\n\
+             min_available_mb = 4096\n",
+        )
+        .unwrap();
+        let hc = Config::load(&path).unwrap().host_check();
+        assert_eq!(hc.contender_units, ["homorg-db-suite.timer"]);
+        assert_eq!(hc.max_load_per_cpu, 0.5);
+        assert_eq!(hc.min_available_mb, 4096);
+        assert_eq!(
+            hc.contender_processes,
+            HostCheckConfig::default().contender_processes
+        );
+        assert_eq!(hc.max_io_pressure_pct, 10.0);
+    }
+
+    /// Issue #171 / ADR-0012: unknown keys are errors everywhere — the new
+    /// table is no exception.
+    #[test]
+    fn host_check_refuses_an_unknown_key_by_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[host_check]\nmax_load = 2.0\n").unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("max_load"), "{msg}");
+        assert!(msg.contains("unknown field"), "{msg}");
+        // `config check`'s lenient path names it the same way.
+        let report = crate::policy::lenient_config::check("[host_check]\nmax_load = 2.0\n", &path);
+        assert!(!report.valid);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p == "unknown key: host_check.max_load"),
+            "{:?}",
+            report.problems
+        );
+    }
+
+    #[test]
+    fn host_check_refuses_thresholds_that_are_switches() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        for (body, key) in [
+            ("max_load_per_cpu = 0.0", "host_check.max_load_per_cpu"),
+            ("max_load_per_cpu = -1.0", "host_check.max_load_per_cpu"),
+            (
+                "max_memory_pressure_pct = 0.0",
+                "host_check.max_memory_pressure_pct",
+            ),
+            (
+                "max_io_pressure_pct = 101.0",
+                "host_check.max_io_pressure_pct",
+            ),
+        ] {
+            std::fs::write(&path, format!("[host_check]\n{body}\n")).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(msg.contains(key), "{body}: {msg}");
+        }
+    }
+
+    /// `init` appends the table commented out: it must parse, declare
+    /// nothing, and leave every default in force — and a fresh config must
+    /// not serialize the defaults as a live table.
+    #[test]
+    fn the_host_check_example_is_inert_and_init_serializes_no_live_table() {
+        let mut text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("[host_check]"), "{text}");
+        text.push_str(LTO_BACKEND_EXAMPLE);
+        text.push_str(HOST_CHECK_EXAMPLE);
+        let cfg: Config = toml::from_str(&text).expect("config + examples must parse");
+        assert!(cfg.host_check.is_none());
+        // Uncommented, the example's values ARE the defaults.
+        let live: String = HOST_CHECK_EXAMPLE
+            .lines()
+            .filter_map(|l| l.strip_prefix("# "))
+            .filter(|l| l.starts_with('[') || l.contains(" = "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let cfg: Config = toml::from_str(&live).expect("uncommented example must parse");
+        assert_eq!(cfg.host_check, Some(HostCheckConfig::default()));
     }
 
     // ---- issue #215 finding 1: [compaction] range validation ----

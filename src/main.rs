@@ -160,6 +160,29 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
+    // `host check` reads /proc and systemd and nothing of the tapectl home
+    // but its `[host_check]` table (ADR-0012, 2026-09-24 amendment, item
+    // 7), so it runs before the initialization gate: `first-run.sh` and an
+    // operator can ask whether the host is quiet on a machine not yet
+    // `init`ed. A config that exists is still loaded with every check
+    // `Config::load` makes but the backend-collision one, which guards
+    // `resolve_lto_backend` — a path this command never reaches (the
+    // #261 reasoning) — so an unknown `[host_check]` key is refused here
+    // exactly as everywhere else. No config file: every default.
+    if let Commands::Host { ref command } = cli.command {
+        let cfg = if paths.config_file.exists() {
+            Some(
+                Config::load_tolerating_backend_ambiguity(&paths.config_file)
+                    .context("failed to load config")?,
+            )
+        } else {
+            None
+        };
+        let exit_code = cli::host::run(cfg.as_ref(), command, cli.json)?;
+        exit_if_nonzero(exit_code);
+        return Ok(());
+    }
+
     // Everything else requires initialization
     if !paths.is_initialized() {
         bail!("tapectl is not initialized — run `tapectl init` first");
@@ -309,7 +332,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // "work completed, non-zero status" (never an `Err`, which
             // would abort before the healthy units ran).
             let exit_code =
-                cli::collection::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
+                cli::collection::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
             exit_if_nonzero(exit_code);
         }
         Commands::Snapshot { ref command } => {
@@ -398,6 +421,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 device.as_deref(),
                 cli.json,
                 cli.dry_run,
+                cli.yes,
             )?;
         }
         Commands::Backend { ref command } => {
@@ -416,7 +440,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let exit_code = cli::config::run(&conn, &paths, command, cli.json)?;
             exit_if_nonzero(exit_code);
         }
-        Commands::Init { .. } | Commands::Completions { .. } => {
+        Commands::Init { .. } | Commands::Completions { .. } | Commands::Host { .. } => {
             unreachable!()
         }
     }
@@ -526,6 +550,11 @@ fn cmd_init(
             .context("failed to reopen config to append the backend example")?;
         f.write_all(tapectl::config::LTO_BACKEND_EXAMPLE.as_bytes())
             .context("failed to append the backend example")?;
+        // ADR-0012, 2026-09-24 amendment, item 7: the quiet-host keys,
+        // documented where the operator will look, commented out so the
+        // defaults stay the defaults.
+        f.write_all(tapectl::config::HOST_CHECK_EXAMPLE.as_bytes())
+            .context("failed to append the host-check example")?;
     }
 
     // Create database with schema

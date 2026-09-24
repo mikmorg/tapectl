@@ -7,6 +7,7 @@ pub mod collection;
 pub mod config;
 pub mod consent;
 pub mod db;
+pub mod host;
 pub mod key;
 pub mod location;
 pub mod operations;
@@ -274,6 +275,12 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+
+    /// This host's fitness to feed a tape drive (the quiet-host check)
+    Host {
+        #[command(subcommand)]
+        command: host::HostCommands,
     },
 
     /// Generate shell completions

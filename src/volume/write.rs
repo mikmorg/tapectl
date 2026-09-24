@@ -970,7 +970,10 @@ fn blocking_validation_errors(
         .partition(|e| !matches!(e, LayoutError::StageSetLacksEscrow { .. }))
 }
 
-#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow
+/// `assume_yes` answers the quiet-host pre-flight's question
+/// ([`crate::host_check::preflight`]) — the global `--yes` — and nothing
+/// else: no Tier-3 refusal and no contact check consults it.
+#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + assume_yes
 pub fn volume_write(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -980,6 +983,7 @@ pub fn volume_write(
     block_size: usize,
     force: bool,
     allow_missing_escrow: bool,
+    assume_yes: bool,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
     // `collection run` and `quick-archive` inherit — all three reach the
@@ -996,6 +1000,7 @@ pub fn volume_write(
         block_size,
         force,
         allow_missing_escrow,
+        assume_yes,
         &mut contact,
         ContactStore::Device,
     );
@@ -1019,6 +1024,7 @@ fn volume_write_contacted<'c>(
     block_size: usize,
     force: bool,
     allow_missing_escrow: bool,
+    assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
 ) -> Result<()> {
@@ -1159,6 +1165,21 @@ fn volume_write_contacted<'c>(
     // happened.
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let session = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
+
+    // The quiet-host pre-flight (ADR-0012, 2026-09-24 amendment, item 7):
+    // "warn when known contenders are active or the host is loaded or short
+    // of memory, and ask for confirmation; never a refusal". After every
+    // fact check above — a write that would be refused anyway is refused
+    // for its own reason, not asked about the host first — and before the
+    // first touch of the drive (`detect` just below), so a "no" leaves no
+    // contact, no MAM read and no sweep behind. Consent is the ADR-0008
+    // Tier-2 helper: `--yes` answers it, and a session with no terminal and
+    // no `--yes` declines rather than hanging.
+    crate::host_check::preflight(
+        &config.host_check(),
+        &format!("volume write \"{label}\""),
+        assume_yes,
+    )?;
 
     // One read of the loaded medium, serving three purposes (ADR-0010): the
     // wrong-cartridge and wrong-generation checks immediately below, the MAM
@@ -4595,7 +4616,9 @@ fn compact_read_contacted(
 
 /// Compact-write: write staged compaction slices to destination volume.
 /// Reuses the normal write pipeline — staged data from compact-read is
-/// treated the same as any other staged data.
+/// treated the same as any other staged data. `assume_yes` answers
+/// `volume_write`'s quiet-host pre-flight.
+#[allow(clippy::too_many_arguments)]
 pub fn compact_write(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -4604,6 +4627,7 @@ pub fn compact_write(
     device: &str,
     block_size: usize,
     allow_missing_escrow: bool,
+    assume_yes: bool,
 ) -> Result<()> {
     // The normal volume_write picks up all staged data. `force` is not
     // exposed here (out of scope for #27, which is narrowly about
@@ -4619,6 +4643,7 @@ pub fn compact_write(
         block_size,
         false,
         allow_missing_escrow,
+        assume_yes,
     )
 }
 
@@ -6510,6 +6535,43 @@ mod tests {
         assert_eq!(rows, 0, "no backend, so no reading was taken");
     }
 
+    /// ADR-0012, 2026-09-24 amendment, item 7: `volume write` asks about a
+    /// noisy host AFTER its fact checks (a write refused for its own reason
+    /// is not first asked about the host) and BEFORE the first touch of the
+    /// drive (a "no" leaves no contact behind). Pinned by position in the
+    /// one function every write path reaches — `volume write`, `compact-
+    /// write`, `collection run` and `quick-archive` all go through it.
+    #[test]
+    fn the_host_preflight_sits_between_the_fact_checks_and_the_drive() {
+        const SRC: &str = include_str!("write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let f = "fn volume_write_contacted<'c>(";
+        let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+        let end = prod[start..].find("\n}\n").unwrap() + start;
+        let body = &prod[start..end];
+        let at = |needle: &str| {
+            let hits = body.matches(needle).count();
+            assert_eq!(hits, 1, "{needle}: expected once in {f}, found {hits}");
+            body.find(needle).unwrap()
+        };
+        let preflight = at("crate::host_check::preflight(");
+        let last_fact = at("assemble_session_keys(conn,");
+        let staged = at("find_staged_data(conn)?");
+        let drive = at("crate::tape::media_detect::detect(device");
+        assert!(
+            staged < preflight && last_fact < preflight,
+            "the host pre-flight must follow the fact checks"
+        );
+        assert!(
+            preflight < drive,
+            "the host pre-flight must precede the first touch of the drive"
+        );
+        assert!(
+            body[preflight..].contains("assume_yes"),
+            "the pre-flight must be answered by the caller's --yes"
+        );
+    }
+
     #[test]
     fn every_health_writer_passes_its_contact() {
         const SRC: &str = include_str!("write.rs");
@@ -8159,6 +8221,7 @@ mod tests {
             512 * 1024,
             true,  // --force
             false, // --allow-missing-escrow
+            true,  // --yes: the host pre-flight is not under test here
         )
         .expect_err("force must not bypass pre-write validation");
         let msg = err.to_string();
@@ -8242,6 +8305,7 @@ mod tests {
                 512 * 1024,
                 false, // force
                 false, // allow_missing_escrow
+                true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
 
@@ -8342,6 +8406,7 @@ mod tests {
             512 * 1024,
             false, // force
             false, // allow_missing_escrow
+            true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
 
@@ -8439,6 +8504,7 @@ mod tests {
             512 * 1024,
             false, // force
             false, // allow_missing_escrow
+            true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
 
@@ -8597,6 +8663,7 @@ mod tests {
             512 * 1024,
             false,
             false,
+            true,
         )
         .expect_err("no staged data exists, so this must fail at a LATER check");
 
@@ -8806,6 +8873,7 @@ mod tests {
             512 * 1024,
             false,
             false,
+            true,
         )
         .expect_err("no backend is configured, so this must fail at backend resolution");
 
@@ -9321,6 +9389,7 @@ mod tests {
                 512 * 1024,
                 force,
                 false,
+                true,
             )
             .unwrap_err();
             let msg = err.to_string();
@@ -9541,6 +9610,7 @@ mod tests {
             512 * 1024,
             false,
             false,
+            true,
         )
         .unwrap_err();
 
@@ -10503,6 +10573,7 @@ mod tests {
                 512 * 1024,
                 false, // --force
                 false, // --allow-missing-escrow
+                true,  // --yes: the host pre-flight is not under test here
             )
             .expect_err("the escrow gap must refuse before the device is touched");
             assert!(
@@ -11803,6 +11874,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                true,
             )
             .unwrap_err()
             .to_string();
@@ -11846,6 +11918,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                true,
             )
             .unwrap_err();
             assert_eq!(
@@ -11887,6 +11960,7 @@ mod tests {
                 GENCHK_DEVICE,
                 512 * 1024,
                 false,
+                true, // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
 
@@ -11938,6 +12012,7 @@ mod tests {
                 &["WC-COLL".to_string()],
                 GENCHK_DEVICE,
                 512 * 1024,
+                true, // --yes: the host pre-flight is not under test here
             )
             .unwrap_err()
             .to_string();
@@ -12082,6 +12157,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                true,
             )
             .unwrap_err();
             identify_like_the_cli(&conn, &config).unwrap();
@@ -12754,6 +12830,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
             );
@@ -12825,6 +12902,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
             );
@@ -13198,6 +13276,7 @@ mod tests {
             512 * 1024,
             force,
             false, // allow_missing_escrow
+            true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err()
     }

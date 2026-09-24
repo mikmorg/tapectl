@@ -66,7 +66,7 @@ pub fn confirm(action: &str, facts: &[String], assume_yes: bool) -> Result<()> {
 /// ever touching a real file descriptor. `read_answer` is only ever
 /// invoked from the `is_tty` branch; tests prove the non-TTY branch never
 /// reaches it by passing a closure that panics if called.
-fn confirm_with(
+pub(crate) fn confirm_with(
     action: &str,
     facts: &[String],
     assume_yes: bool,

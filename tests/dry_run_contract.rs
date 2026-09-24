@@ -147,6 +147,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // its scope past #241's "the argument lists of the `cli::<mod>::run(...)`
     // dispatch calls" fence to cover these four call sites too.
     (&["export"], Verdict::Honours),
+    // host check: reads /proc and systemd, writes nothing anywhere (ADR-0012,
+    // 2026-09-24 amendment, item 7).
+    (&["host", "check"], Verdict::ReadOnly),
     (&["import"], Verdict::Honours),
     (&["init"], Verdict::Honours),
     (
