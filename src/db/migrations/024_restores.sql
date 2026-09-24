@@ -65,7 +65,12 @@
 -- `bytes_restored`, `files_restored`, `slices_read` -- MEASURED, PER KIND
 -- ---------------------------------------------------------------------
 -- All nullable: NULL means "not known", which a failure before the figure
--- existed is. Never 0 for "did not look" (migration 009's rule).
+-- existed is. Never 0 for "did not look" (migration 009's rule). For
+-- `unit`/`file`, `slices_read` and `bytes_restored` are running tallies
+-- kept from the moment the contact opened, so a restore refused at the
+-- contact or failing on the key load records 0 -- a measurement: none
+-- were read. For `raw-volume` the figures come from the dump's own report,
+-- and are NULL when the dump did not finish.
 --   unit, file  -- `slices_read` is the number of slices decrypted off the
 --                  tape; `bytes_restored` their plaintext byte total, as
 --                  measured through the hashing writer -- the dar archive's
