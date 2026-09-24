@@ -23,7 +23,9 @@
 #       serial required; runs as YOU). Ruled required before the first write
 #       (ADR-0012, 2026-09-23): a different binary is a different artifact.
 #   13  the first production tape: snapshot → stage → init → write → verify
-#   14  what to do next
+#   14  the systemd timers (weekly audit, daily catalog backup to a second
+#       disk) and the /usr/local/bin/tapectl-op wrapper, via
+#       scripts/install-systemd.sh — then what to do next
 #
 # Steps 1-4 run as you (they need your toolchain and sudo). Steps 5-11 and 13
 # run tapectl as the service user through one seam, `as_svc`; step 12 runs as
@@ -35,8 +37,13 @@
 # the source on 2026-09-24; if a flag drifts, the failing command prints the
 # real help.
 #
+# docs/install.md is the runbook for this script: what each step creates on
+# the host, how to resume, re-run, move and uninstall.
+#
 # Testing this script against mhvtl (never the real drive) is done with a binary
-# the service user can execute (your home is not traversable by it):
+# the service user can execute (your home is not traversable by it). Under
+# --home, step 14 only PRINTS the installer's plan (--dry-run): a throwaway
+# home never installs host-wide timers.
 #   install -m 0755 target/debug/tapectl /scratch/fr-bin/tapectl
 #   scripts/first-run.sh --auto --home /tmp/fr-home --tapectl /scratch/fr-bin/tapectl \
 #       --device /dev/tape/by-id/scsi-XYZZY_A1-nst --sg /dev/sg1 --generation LTO-8 --label L6-TEST \
@@ -54,8 +61,10 @@ DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; K
 LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
 SKIP_BUILD=0; SKIP_TESTS=0
 SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
+BACKUP_DIR="/var/backups/tapectl"  # step 14: where the daily `db backup` copies go
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  # The step list ends at the "then what to do next" line; keep the range on it.
+  sed -n '2,/then what to do next/p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Options:
@@ -77,6 +86,8 @@ Options:
   --kit-out DIR     heir kit output dir (default ~/heir-kit)
   --barcode S       the step-12 TEST cartridge's MEDIUM SERIAL (what its chip reports; sg_read_attr
                     prints it) — required for the rehearsal under --auto
+  --backup-dir DIR  where step 14's daily catalog backup writes (default $BACKUP_DIR;
+                    put it on a SECOND disk)
   --skip-build      do not build/install (use the resolved binary as-is)
   --skip-tests      skip the ungated test suite
   -h, --help
@@ -99,6 +110,7 @@ while [ $# -gt 0 ]; do
     --location) LOCATION="$2"; shift 2 ;;
     --kit-out) KIT_OUT="$2"; shift 2 ;;
     --barcode) TEST_BARCODE="$2"; BARCODE_FROM_FLAG=1; shift 2 ;;
+    --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --user) SVC_USER="$2"; shift 2 ;;
@@ -1035,10 +1047,28 @@ fi
 }
 
 # ================================================================ step 14
-hdr 14 "Next"
+hdr 14 "Timers, the operator wrapper, and what comes next"
+explain <<EOF
+Two timers and a wrapper finish the installation (ADR-0012, 2026-09-24): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to $BACKUP_DIR, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it is on the same one. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op is \`sudo -u $SVC_USER -H tapectl\`, so you need not type the prefix. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it touches a tape. docs/install.md is the runbook.
+EOF
+INSTALL_ARGS=(--tapectl "$TAPECTL" --backup-dir "$BACKUP_DIR")
+if [ "$SVC_MODE" = 1 ]; then INSTALL_ARGS+=(--user "$SVC_USER"); else INSTALL_ARGS+=(--user "$USER"); fi
+WRAPPER_INSTALLED=0
+if [ -n "$HOME_DIR" ]; then
+  # A rehearsal against a throwaway home must not leave host-wide timers
+  # pointing at it. Show the plan; the real run (no --home) installs.
+  note "rehearsal home ($HOME_DIR): host-wide timers are NOT installed for a throwaway home — this is the plan only"
+  run bash "$REPO/scripts/install-systemd.sh" --dry-run --tapectl-home "$HOME_DIR" "${INSTALL_ARGS[@]}" || note "(install-systemd.sh --dry-run failed — read the output)"
+elif confirm "Install the audit and backup timers and /usr/local/bin/tapectl-op now (sudo)?"; then
+  if run bash "$REPO/scripts/install-systemd.sh" "${INSTALL_ARGS[@]}"; then
+    [ -x /usr/local/bin/tapectl-op ] && WRAPPER_INSTALLED=1
+    ok "timers installed — systemctl list-timers 'tapectl-*' shows them"
+  else note "install-systemd.sh failed — fix what it printed and re-run it by hand: scripts/install-systemd.sh ${INSTALL_ARGS[*]}"; fi
+else note "skipped — later: scripts/install-systemd.sh ${INSTALL_ARGS[*]}"; fi
 SUDO_PREFIX="$( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )"
+OP_CMD="${SUDO_PREFIX}tapectl"; [ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-op"
 cat <<EOF
-   • Every tapectl command from now on: ${SUDO_PREFIX}tapectl <command>   (alias it). Its home: $EFFECTIVE_HOME
+   • Every tapectl command from now on: ${OP_CMD} <command>$( [ "$WRAPPER_INSTALLED" = 1 ] || printf '   (alias it)' ). Its home: $EFFECTIVE_HOME
    • A restore destination must be writable by ${SVC_USER}; new unit trees need the same ACL grant as step 11.
    • Eject with: ${SUDO_PREFIX}mt -f ${DEVICE:-<device>} offline. Write the label on the cartridge.
      Then tell the catalog what the sticker says (ADR-0012 — the serial stays its identity):
@@ -1046,10 +1076,12 @@ cat <<EOF
    • Second copy, other location: the staged slices are still on disk, so load a fresh cartridge,
      \`tapectl volume init <label-2>\`, \`tapectl volume write <label-2>\`, then \`volume move <label-2> --to <other shelf>\`.
      (Only if staging was cleaned: load tape 1 first and \`volume read-slices --from ${LABEL:-<label>} --unit <unit>\` per unit.)
-   • \`tapectl audit\` weekly — contrib/systemd/ has a timer; its User=/HOME= default to the service user.
+   • \`tapectl audit\` runs weekly and the catalog is copied daily to $BACKUP_DIR (systemctl list-timers 'tapectl-*');
+     after each session: sudo systemctl start tapectl-backup.service, and regenerate the heir kit (step 9).
    • \`tapectl report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
      \`report health\` shows the drive's error counters from every tape contact (ADR-0013).
    • Disaster recovery, the whole procedure: docs/operator-guide.md, "Disaster Recovery".
+   • Reinstall, move to another host, uninstall: docs/install.md.
    • This script is resumable: scripts/first-run.sh --from N. Log: $LOG
 EOF
 ok "done"
