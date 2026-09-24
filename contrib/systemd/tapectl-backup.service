@@ -22,7 +22,7 @@ Environment=HOME=/var/lib/tapectl
 # — a backup on the disk that holds the original is not a backup — and it
 # must exist, owned by the service user, before the first run:
 # ProtectSystem=strict below makes every path not listed in ReadWritePaths=
-# read-only, and a missing ReadWritePaths= entry fails the unit at start.
+# read-only, so a directory named here but not there cannot be written.
 # scripts/install-systemd.sh --backup-dir DIR creates it and rewrites all
 # three lines together.
 Environment=TAPECTL_BACKUP_DIR=/var/backups/tapectl
