@@ -3520,12 +3520,14 @@ pub fn volume_verify(
     // never errors when `device` is given) — the same `None => 0` fallback
     // as before covers that case, and costs nothing, since verify only reads.
     //
-    // Resolved ONCE (issue #187): a second, raw-string lookup used to find
-    // the sg node for `sg_logs` health collection below, and a by-id
+    // Canonicalising resolver (issue #187): a raw-string lookup used to
+    // find the sg node for `sg_logs` health collection, and a by-id
     // `--device` — the RECOMMENDED form, per the device-numbering hazard —
     // matched the canonicalising resolver here but missed that one, so
-    // health collection was silently skipped with no word said. Both the
-    // capacity factor and the sg node now come from this one resolution.
+    // health collection was silently skipped with no word said. The sweep
+    // now resolves its backend inside the seam through `health_backend`,
+    // the same `device_matches` this uses (issue #342), so the two cannot
+    // disagree on a spelling.
     let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
     let (_, backend) = crate::config::resolve_device(config, Some(device))?;
     let usable_bytes = match backend {
@@ -3552,7 +3554,11 @@ pub fn volume_verify(
     let observed = binding::loaded_medium(config, device, &reads);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
-    let mut report = volume_verify_with_store(
+    // The post-command sweep is INSIDE the seam since issue #342 — see
+    // `volume_verify_with_store`. Nothing here may run between the seam
+    // returning and this function returning that could shadow its result:
+    // the sweep already ran on whichever outcome the `?` propagates.
+    volume_verify_with_store(
         conn,
         &mut store,
         label,
@@ -3566,51 +3572,30 @@ pub fn volume_verify(
             Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
         )
         .with_mam_reads(&reads),
-    )?;
-
-    // Best-effort sg_logs health collection. Advisory only, and deliberately
-    // OUTSIDE the store-injectable half: it needs the drive's sg node, which
-    // a `MemStore` does not have.
-    //
-    // Issue #187: the SAME resolved `backend` as above, not a second
-    // raw-string lookup — and when none resolves, SAY so rather than
-    // silently recording nothing.
-    match backend {
-        // `session_id` (issue #295) and `contact_id` (issue #296) are both
-        // carried OUT of `volume_verify_with_store` on the report, because
-        // the session is created and the contact closed inside it — before
-        // this collection runs. The reading names both; the drive attaches
-        // to the (already closed) contact by id.
-        Some(bk) => collect_and_record_health(
-            conn,
-            bk,
-            Some(volume_id),
-            report.contact_id,
-            report.session_id,
-            health::Reading::Verify,
-            Operation::VolumeVerify,
-            HealthProbe::default(),
-        ),
-        None => {
-            report.drive_health_note = Some(format!(
-                "no [[backends.lto]] entry configured for device {device}; drive health \
-                 (sg_logs) was not collected. The verification above is unaffected."
-            ));
-        }
-    }
-
-    Ok(report)
+    )
 }
 
 /// [`volume_verify`] minus the tape device: everything from the front-index
-/// read through the `verification_sessions` / `verification_results` rows.
+/// read through the `verification_sessions` / `verification_results` rows,
+/// and the one post-command sweep.
 ///
 /// Split out for the reason ADR-0006 gives generally and
 /// [`volume_identify`] already demonstrates: with a `&mut dyn Store` the
 /// whole verify path — including its DB bookkeeping — is exercisable against
 /// a `MemStore` with no hardware, which is how issue #142's per-mismatch
-/// recording is tested at all. `volume_verify` keeps the drive-only parts
-/// (opening the device, sg_logs health collection).
+/// recording is tested at all. `volume_verify` keeps the drive-only part
+/// (opening the device).
+///
+/// The sweep moved in here from `volume_verify` (issue #342): out there it
+/// sat after `volume_verify_with_store(..)?`, so a verify that FAILED — a
+/// front index that would not read, a store error — closed its contact
+/// `failed` and took no sweep and no `health_logs` row, on precisely the
+/// contact whose read-error counters the record most wants. In here it runs
+/// after the guard has closed, on every outcome, the same shape as
+/// [`health_after_read_contact`]; and it can be driven with a `MemStore`
+/// and a fixture drive through the site's two probe seams, which the old
+/// placement ("needs the drive's sg node, which a `MemStore` does not
+/// have") predated.
 pub(crate) fn volume_verify_with_store(
     conn: &Connection,
     store: &mut dyn Store,
@@ -3650,9 +3635,48 @@ pub(crate) fn volume_verify_with_store(
         Err(e) => guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string())),
     }
     // Carried out on the report (issue #296): the guard is gone after this,
-    // and `volume_verify`'s health collection still has to name the contact.
+    // and the operator reads it back from `volume verify --json`.
     if let Ok(report) = &mut r {
         report.contact_id = contact_id;
+    }
+
+    // ONE post-command sweep per verify contact (ADR-0013: "every contact
+    // takes one post-command sweep"), on EVERY outcome — `r` is a value
+    // here, not a `?`, so a failed verify is swept exactly as a clean one.
+    // Post-command and attached by contact id, the guard having closed
+    // above. Best-effort throughout: nothing here can fail the verify.
+    //
+    // Issue #187: the ONE canonicalising resolver (`health_backend`), the
+    // same one `volume write`/`volume resume` use, so a by-id `--device`
+    // finds its backend — and when none resolves, SAY so on the report
+    // rather than silently recording nothing (the DR machine with keys and
+    // no `backend add`, ADR-0005: the verify itself is unaffected).
+    // `session_id` (issue #295) names the `verification_sessions` row a
+    // completed verify made; a failed one made none.
+    match health_backend(site.config(), site.device()) {
+        Ok(bk) => collect_and_record_health(
+            conn,
+            bk,
+            Some(volume_id),
+            contact_id,
+            r.as_ref().ok().and_then(|report| report.session_id),
+            health::Reading::Verify,
+            Operation::VolumeVerify,
+            HealthProbe {
+                log_source: site.injected_log_source(),
+                identity: site.injected_drive_identity(),
+            },
+        ),
+        Err(unattributed) => {
+            warn!("{unattributed}");
+            if let Ok(report) = &mut r {
+                report.drive_health_note = Some(format!(
+                    "no [[backends.lto]] entry configured for device {}; drive health \
+                     (sg_logs) was not collected. The verification above is unaffected.",
+                    site.device()
+                ));
+            }
+        }
     }
     r
 }
@@ -6331,10 +6355,29 @@ mod tests {
             "health::record must have ONE production caller, record_health_and_drive — a \
              second writer is a second place to forget the contact"
         );
+        // Issue #342: verify sweeps INSIDE its store seam now, after the
+        // guard closes — `volume_verify` itself takes none, or a verify
+        // contact would be swept twice. Pinned below the loop.
+        let verify_outer = {
+            let f = "pub fn volume_verify(";
+            let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+            let end = prod[start..].find("\n}\n").unwrap() + start;
+            &prod[start..end]
+        };
+        assert!(
+            !verify_outer[..].contains("\npub(crate) fn ")
+                && verify_outer.contains("volume_verify_with_store("),
+            "body extraction: volume_verify still reaches its seam and nothing else"
+        );
+        assert!(
+            !verify_outer.contains("collect_health_best_effort(")
+                && !verify_outer.contains("collect_and_record_health("),
+            "volume_verify must take no sweep of its own: the seam takes the one (issue #342)"
+        );
         for (f, needle) in [
             ("fn volume_write_contacted", "contact.id(),"),
             ("fn volume_resume_contacted", "contact.id(),"),
-            ("pub fn volume_verify(", "report.contact_id,"),
+            ("pub(crate) fn volume_verify_with_store(", "contact_id,"),
             // Issue #339: init sweeps too, in the function that holds the
             // guard — not in `volume_init_in_contact`, which the `?`s leave.
             ("fn volume_init_contacted", "contact.id(),"),
@@ -11205,14 +11248,76 @@ mod tests {
             }
         }
 
-        /// The once-per-contact rule from the other side: `volume verify`
-        /// takes its reading OUTSIDE its store seam (`volume_verify`, after
-        /// the seam returns), so the seam must take none — or a verify
-        /// contact would be swept twice. The seam is driven with a drive it
-        /// COULD sweep, and the source is never asked.
+        /// The rows one verify contact's sweep leaves, asserted by value
+        /// (issue #342): every page the fixture's 0x00 lists, once each,
+        /// against contact `cid` under the command `volume verify`; and
+        /// exactly ONE `health_logs` row, of kind `verify`, naming that
+        /// contact, `volume_id` and `session_id` (the `verification_sessions`
+        /// row, ADR-0013 §3 — `None` when the verify never made one). Shared
+        /// by the completed and the failed case so both assert the SAME
+        /// shape.
+        fn assert_one_verify_sweep(
+            conn: &Connection,
+            cid: i64,
+            volume_id: i64,
+            session_id: Option<i64>,
+        ) {
+            use crate::tape::log_pages::tests::LISTED;
+            let journal: Vec<(u8, Option<i64>, String, i64)> = conn
+                .prepare(
+                    "SELECT page_code, contact_id, trigger, ok FROM log_page_journal ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                journal,
+                LISTED
+                    .iter()
+                    .map(|p| (*p, Some(cid), "volume verify".to_string(), 1))
+                    .collect::<Vec<_>>(),
+                "one sweep: page 0x00 then every listed page, once, against THIS contact, \
+                 trigger = the command verbatim"
+            );
+            let health: Vec<(Option<i64>, String, Option<i64>, Option<i64>)> = conn
+                .prepare(
+                    "SELECT contact_id, operation, volume_id, session_id FROM health_logs \
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                health,
+                vec![(Some(cid), "verify".to_string(), Some(volume_id), session_id)],
+                "exactly one health_logs row, of kind 'verify', naming contact {cid}"
+            );
+        }
+
+        /// Issue #342: `volume verify`'s post-command sweep lives INSIDE its
+        /// store seam now, after the guard closes, so the completed verify
+        /// on a `MemStore` is swept exactly once — each page read once
+        /// (ADR-0013's read-to-clear hazard), the reading naming the contact,
+        /// the volume and the `verification_sessions` row the verify made.
+        /// The seam is driven with a drive it can sweep (`swept_config`
+        /// claims [`TEST_DEVICE`]), the log pages answered by a fixture.
+        ///
+        /// This inverts the pre-#342 test in this spot, which asserted the
+        /// seam took NO reading because `volume_verify` took it outside the
+        /// seam after a `?` — the `?` that skipped the sweep on every failed
+        /// verify. `volume_verify` now takes none of its own; see
+        /// `every_health_writer_passes_its_contact` for the no-double pin.
+        ///
+        /// Negative control (run by hand, not committed): move the sweep
+        /// back out to `volume_verify` and this fails at the journal
+        /// assertion with an empty list.
         #[test]
-        fn the_verify_seam_takes_no_reading_of_its_own() {
-            use crate::tape::log_pages::tests::FixtureSource;
+        fn a_completed_verify_on_memstore_is_swept_once_inside_its_seam() {
+            use crate::tape::log_pages::tests::{assert_each_page_read_once, FixtureSource};
             let conn = crate::db::open_memory().unwrap();
             let data = b"verify seam health fixture bytes. ".repeat(4);
             seed_one_slice_fixture(
@@ -11229,6 +11334,7 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let config = swept_config(tmp.path());
             let src = std::cell::RefCell::new(FixtureSource::default());
+            let identity = identity_with_serial(Some("XYZZY_A1"));
             let report = volume_verify_with_store(
                 &conn,
                 &mut store,
@@ -11242,15 +11348,101 @@ mod tests {
                     TEST_DEVICE,
                     Medium::NoBackend,
                 )
+                .with_drive_identity(&identity)
                 .with_log_source(&src),
             )
             .unwrap();
-            assert!(report.contact_id.is_some(), "positive control: a contact");
-            assert!(src.borrow().reads.is_empty(), "the seam swept");
-            let rows: i64 = conn
-                .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+            assert_eq!(report.failed, 0, "positive control: a clean verify");
+            let cid = report.contact_id.expect("positive control: a contact");
+            let session_id = report
+                .session_id
+                .expect("positive control: a completed verify records its session");
+            assert_eq!(only_contact(&conn).1.as_deref(), Some("ok"));
+            assert!(
+                report.drive_health_note.is_none(),
+                "a backend that resolves must not report health as skipped: {:?}",
+                report.drive_health_note
+            );
+
+            assert_one_verify_sweep(&conn, cid, v, Some(session_id));
+            assert_each_page_read_once(&src.borrow().reads);
+        }
+
+        /// Issue #342, the outcome that took no sweep at all before it: a
+        /// verify whose STORE fails — here an empty `MemStore`, so File 0 is
+        /// an absence (lenient) and the front-index read at File 3 is the
+        /// error — returns `Err` from the seam, closes its contact `failed`,
+        /// and is swept exactly as a completed verify is. A read error at
+        /// File 3 is precisely the contact whose read-error counters (page
+        /// 0x03) the record wants. No `verification_sessions` row exists,
+        /// so the reading names no session.
+        ///
+        /// Before this, `volume_verify` swept after `volume_verify_with_store(..)?`,
+        /// so this outcome left zero `log_page_journal` rows and zero
+        /// `health_logs` rows.
+        ///
+        /// Negative control (run by hand, not committed): put the sweep
+        /// back behind a `?` — sweep only on `Ok` — and this fails at the
+        /// journal assertion with an empty list.
+        #[test]
+        fn a_verify_that_failed_on_a_store_error_is_swept_once_too() {
+            use crate::tape::log_pages::tests::{assert_each_page_read_once, FixtureSource};
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"verify seam health fixture bytes. ".repeat(4);
+            seed_one_slice_fixture(
+                &conn,
+                "VSE-VOL",
+                "vse-unit",
+                4,
+                &data,
+                "completed",
+                "staged",
+            );
+            let v = volume_id(&conn, "VSE-VOL");
+            let mut store = MemStore::new(4096);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = swept_config(tmp.path());
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let identity = identity_with_serial(Some("XYZZY_A1"));
+            let err = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VSE-VOL",
+                v,
+                4096,
+                Tier::Integrity,
+                ContactSite::new(
+                    &config,
+                    Operation::VolumeVerify,
+                    TEST_DEVICE,
+                    Medium::NoBackend,
+                )
+                .with_drive_identity(&identity)
+                .with_log_source(&src),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("no file recorded at position 3"),
+                "positive control: the store itself failed the verify: {err}"
+            );
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume verify");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail.as_deref().unwrap_or("").contains("position 3"),
+                "the contact's detail is the store error: {detail:?}"
+            );
+            let cid: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(rows, 0);
+            let sessions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM verification_sessions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(sessions, 0, "the failed verify recorded no session to name");
+
+            assert_one_verify_sweep(&conn, cid, v, None);
+            assert_each_page_read_once(&src.borrow().reads);
         }
 
         /// Every read seam takes its reading through the ONE helper, once,
