@@ -182,7 +182,7 @@ pub fn restore_raw(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::MemStore;
     use crate::volume::layout::{
@@ -201,7 +201,7 @@ mod tests {
     /// `format.rs`'s own test fixture shape. Returns the store plus the raw
     /// plaintext bytes of the data slice (position 4) for byte-identity
     /// assertions.
-    fn build_synthetic_tape(label: &str, data_bytes: &[u8]) -> MemStore {
+    pub(crate) fn build_synthetic_tape(label: &str, data_bytes: &[u8]) -> MemStore {
         let data_hash = sha256_hex(data_bytes);
         // The id_thunk/guide/restore_sh entries deliberately carry no
         // size/hash in this fixture — they're not what these tests are

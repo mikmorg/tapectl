@@ -255,7 +255,7 @@ mod tests {
             bytes_restored: Some(4096),
             files_restored: Some(3),
             dar,
-            dar_version: Some("dar version 2.7.13"),
+            dar_version: Some("2.7.13"),
         }
     }
 
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(r.dar_exit_code, Some(0));
         assert_eq!(r.dar_stdout.as_deref(), Some(" 3 inode(s) restored\n"));
         assert_eq!(r.dar_stderr.as_deref(), Some("a warning\n"));
-        assert_eq!(r.dar_version.as_deref(), Some("dar version 2.7.13"));
+        assert_eq!(r.dar_version.as_deref(), Some("2.7.13"));
         assert_eq!(r.tapectl_version, env!("CARGO_PKG_VERSION"));
     }
 

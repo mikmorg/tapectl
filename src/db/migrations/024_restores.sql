@@ -91,8 +91,9 @@
 -- (NULL when killed by a signal or never run). A dar that exited 0 but
 -- declined to overwrite a file (issue #51) is a `failed` row with a clean
 -- exit code and the "not restored (user choice)" lines in `dar_stdout` --
--- which is precisely why the report is kept. `dar_version` is `dar
--- --version` at the time, NULL when dar never ran or it could not be read.
+-- which is precisely why the report is kept. `dar_version` is the version
+-- `dar --version` reported at the time, as `dar::version::check` parses it
+-- (`2.7.13`); NULL when dar never ran or it could not be read.
 --
 -- `tapectl_version` is the build that wrote the row (ADR-0013 §7).
 --

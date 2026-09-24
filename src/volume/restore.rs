@@ -2527,5 +2527,419 @@ mod tests {
                 "a NULL cartridge_id with no reason is the data loss #296 exists to stop"
             );
         }
+
+        // ── issue #306: the RESTORE's own record ──
+
+        mod record {
+            use super::*;
+            use crate::volume::restore_record::{rows, RestoreRow};
+
+            /// A real restore fixture: `seed`'s catalog, a real dar archive
+            /// of two files (one slice) encrypted to a key saved in
+            /// `paths.keys_dir`, and a MemStore whose File 0 names `label`
+            /// and whose File 1 is that ciphertext. The seeded slice row and
+            /// position are rewritten to the real values, so the restore
+            /// runs end to end: tape read, sha256, decrypt, `dar -x`.
+            ///
+            /// Returns the store and the plaintext slice length.
+            fn real_fixture(
+                conn: &Connection,
+                paths: &TapectlPaths,
+                label: &str,
+                unit: &str,
+            ) -> (MemStore, u64) {
+                seed(conn, label, unit);
+                paths.ensure_dirs().unwrap();
+                let kp = keys::generate_and_save(&paths.keys_dir, "t1", "primary").unwrap();
+
+                let work = TempDir::new().unwrap();
+                let src = work.path().join("src");
+                fs::create_dir_all(&src).unwrap();
+                fs::write(src.join("a.txt"), b"alpha").unwrap();
+                fs::write(src.join("b.txt"), b"bravo").unwrap();
+                let base = work.path().join("arch");
+                let created = std::process::Command::new("dar")
+                    .arg("-c")
+                    .arg(&base)
+                    .arg("-R")
+                    .arg(&src)
+                    .arg("-Q")
+                    .output()
+                    .unwrap();
+                assert!(created.status.success(), "dar -c failed in test setup");
+                let plain = fs::read(work.path().join("arch.1.dar")).unwrap();
+                let cipher = encrypt_to(&plain, std::slice::from_ref(&kp.public_key));
+
+                let mut store = tape_labelled(label);
+                store
+                    .execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
+                    .unwrap();
+                conn.execute(
+                    "UPDATE stage_slices SET size_bytes = ?1, encrypted_bytes = ?2,
+                            sha256_plain = ?3, sha256_encrypted = ?4",
+                    params![
+                        plain.len() as i64,
+                        cipher.len() as i64,
+                        direct_hash(&plain),
+                        direct_hash(&cipher)
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE write_positions SET position = '1', sha256_on_volume = ?1",
+                    params![direct_hash(&cipher)],
+                )
+                .unwrap();
+                (store, plain.len() as u64)
+            }
+
+            fn only_row(conn: &Connection) -> RestoreRow {
+                let mut all = rows(conn).unwrap();
+                assert_eq!(all.len(), 1, "one restore is one row: {all:?}");
+                all.remove(0)
+            }
+
+            fn id_of(conn: &Connection, sql: &str) -> i64 {
+                conn.query_row(sql, [], |r| r.get(0)).unwrap()
+            }
+
+            /// The success row, and the POSITIVE CONTROL for every failure
+            /// test below: a clean restore records a row too, with dar's
+            /// report present and non-empty and the counts measured — so
+            /// these tests distinguish "records restores" from "records
+            /// failures".
+            #[test]
+            fn a_clean_restore_unit_records_one_ok_row_with_dar_report_and_counts() {
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                let (mut store, plain_len) = real_fixture(&conn, &paths, "RR-OK", "rr-unit");
+                let dest = TempDir::new().unwrap();
+                let dest_str = dest.path().to_string_lossy().to_string();
+
+                let report = restore_unit_from_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rr-unit",
+                    "RR-OK",
+                    1,
+                    RestoreTarget::Unit {
+                        dest_dir: &dest_str,
+                    },
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                )
+                .expect("a clean restore");
+                assert_eq!(report.slices, 1);
+                // The row's `ok` is backed by a real extract.
+                assert_eq!(fs::read(dest.path().join("a.txt")).unwrap(), b"alpha");
+                assert_eq!(fs::read(dest.path().join("b.txt")).unwrap(), b"bravo");
+
+                let r = only_row(&conn);
+                assert_eq!(r.kind, "unit");
+                assert_eq!(r.outcome, "ok");
+                assert_eq!(r.error, None);
+                assert_eq!(
+                    r.contact_id,
+                    Some(id_of(&conn, "SELECT id FROM cartridge_contacts")),
+                    "the contact is the spine"
+                );
+                assert_eq!(
+                    r.volume_id,
+                    Some(id_of(&conn, "SELECT id FROM volumes WHERE label = 'RR-OK'"))
+                );
+                assert_eq!(r.volume_label.as_deref(), Some("RR-OK"));
+                assert_eq!(
+                    r.unit_id,
+                    Some(id_of(&conn, "SELECT id FROM units WHERE name = 'rr-unit'"))
+                );
+                assert_eq!(r.unit_name.as_deref(), Some("rr-unit"));
+                assert_eq!(r.version, Some(1));
+                assert_eq!(r.file_path, None);
+                assert_eq!(r.destination, dest_str);
+                assert!(r.finished_at >= r.started_at);
+                assert_eq!(r.slices_read, Some(1));
+                assert_eq!(r.bytes_restored, Some(plain_len as i64));
+                assert_eq!(r.files_restored, Some(2), "dar's own inode count");
+                assert_eq!(r.dar_exit_code, Some(0));
+                assert!(r
+                    .dar_argv
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(r#"["dar","-x","#));
+                let stdout = r.dar_stdout.expect("dar ran: its report is kept");
+                assert!(
+                    !stdout.is_empty(),
+                    "positive control: the report is non-empty"
+                );
+                assert!(stdout.contains("2 inode(s) restored"), "{stdout}");
+                assert!(r.dar_stderr.is_some(), "stderr kept too, even if empty");
+                // `dar::version::check`'s parsed spelling, e.g. `2.7.13`.
+                let ver = r.dar_version.expect("dar ran, so its version was read");
+                assert!(
+                    ver.split('.').count() == 3 && ver.split('.').all(|p| p.parse::<u32>().is_ok()),
+                    "{ver}"
+                );
+                assert_eq!(r.tapectl_version, env!("CARGO_PKG_VERSION"));
+            }
+
+            /// `restore file` is ONE row of kind `file` under `restore
+            /// unit`'s one contact, naming the directory the operator gave
+            /// — never the temp directory the unit was extracted into.
+            #[test]
+            fn a_restore_file_records_one_file_row_naming_the_operators_destination() {
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                let (mut store, _) = real_fixture(&conn, &paths, "RF-OK", "rf-unit");
+                let extract = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+                let dest_str = dest.path().to_string_lossy().to_string();
+
+                restore_unit_from_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rf-unit",
+                    "RF-OK",
+                    1,
+                    RestoreTarget::File {
+                        file_path: "b.txt",
+                        dest_dir: &dest_str,
+                        extract_dir: &extract.path().to_string_lossy(),
+                    },
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                )
+                .expect("a clean file restore");
+                assert_eq!(fs::read(dest.path().join("b.txt")).unwrap(), b"bravo");
+                assert!(
+                    !dest.path().join("a.txt").exists(),
+                    "only the one file lands in the operator's destination"
+                );
+
+                assert_eq!(
+                    only_contact(&conn),
+                    ("restore unit".to_string(), Some("ok".to_string()))
+                );
+                let r = only_row(&conn);
+                assert_eq!(r.kind, "file");
+                assert_eq!(r.outcome, "ok");
+                assert_eq!(r.file_path.as_deref(), Some("b.txt"));
+                assert_eq!(r.destination, dest_str);
+                assert_eq!(r.files_restored, Some(1));
+                assert!(!r.dar_stdout.unwrap().is_empty());
+            }
+
+            /// The placing step is inside the recorded span: a file the unit
+            /// does not contain is a `failed` row (and a failed contact),
+            /// not an `ok` row beside a non-zero exit — and dar's report is
+            /// still there, because dar did run.
+            #[test]
+            fn a_restore_file_whose_entry_is_missing_records_a_failed_row() {
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                let (mut store, _) = real_fixture(&conn, &paths, "RF-MISS", "rf-unit");
+                let extract = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+
+                let err = restore_unit_from_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rf-unit",
+                    "RF-MISS",
+                    1,
+                    RestoreTarget::File {
+                        file_path: "nope.txt",
+                        dest_dir: &dest.path().to_string_lossy(),
+                        extract_dir: &extract.path().to_string_lossy(),
+                    },
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("not found in restored unit"), "{err}");
+
+                assert_eq!(only_contact(&conn).1.as_deref(), Some("failed"));
+                let r = only_row(&conn);
+                assert_eq!(r.kind, "file");
+                assert_eq!(r.outcome, "failed");
+                assert!(
+                    r.error
+                        .as_deref()
+                        .unwrap()
+                        .contains("not found in restored unit"),
+                    "{:?}",
+                    r.error
+                );
+                assert_eq!(r.files_restored, None, "nothing was placed");
+                assert_eq!(r.slices_read, Some(1), "the tape WAS read");
+                assert!(!r.dar_stdout.unwrap().is_empty(), "dar ran and said so");
+            }
+
+            /// A restore that fails AFTER its contact opened — here on the
+            /// key load, the injected error — records a `failed` row naming
+            /// the error, with NULL for dar's report because dar never ran.
+            #[test]
+            fn a_restore_failing_after_the_contact_opened_records_a_failed_row() {
+                let conn = crate::db::open_memory().unwrap();
+                seed(&conn, "RR-NOKEY", "rr-unit");
+                let mut store = tape_labelled("RR-NOKEY");
+                let dest = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(dest.path().to_path_buf());
+
+                let err = restore_unit_from_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rr-unit",
+                    "RR-NOKEY",
+                    1,
+                    RestoreTarget::Unit {
+                        dest_dir: &dest.path().to_string_lossy(),
+                    },
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("no secret keys"), "{err}");
+
+                let r = only_row(&conn);
+                assert_eq!(r.kind, "unit");
+                assert_eq!(r.outcome, "failed");
+                assert_eq!(r.error.as_deref(), Some(err.as_str()));
+                assert_eq!(
+                    r.contact_id,
+                    Some(id_of(&conn, "SELECT id FROM cartridge_contacts"))
+                );
+                assert_eq!(r.slices_read, Some(0), "measured: none were read");
+                assert_eq!(r.dar_stdout, None, "dar never ran: NULL, not empty");
+                assert_eq!(r.dar_stderr, None);
+                assert_eq!(r.dar_exit_code, None);
+                assert_eq!(r.dar_version, None);
+                assert_eq!(r.files_restored, None);
+            }
+
+            /// A wrong-tape refusal happens at the contact, so it is
+            /// recorded as a failed restore too.
+            #[test]
+            fn a_restore_refused_for_the_wrong_tape_records_a_failed_row() {
+                let conn = crate::db::open_memory().unwrap();
+                seed(&conn, "RR-WANT", "rr-unit");
+                let mut store = tape_labelled("RR-LOADED");
+                let dest = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(dest.path().to_path_buf());
+                let _ = restore_unit_from_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rr-unit",
+                    "RR-WANT",
+                    1,
+                    RestoreTarget::Unit {
+                        dest_dir: &dest.path().to_string_lossy(),
+                    },
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                );
+                let r = only_row(&conn);
+                assert_eq!(r.outcome, "failed");
+                assert!(r.error.as_deref().unwrap().contains("wrong tape"));
+                assert_eq!(r.volume_label.as_deref(), Some("RR-WANT"));
+            }
+
+            /// A refusal BEFORE the contact — a dry run, here — is not a
+            /// restore and writes no row. The positive control is every
+            /// test above.
+            #[test]
+            fn a_dry_run_writes_no_row() {
+                let conn = crate::db::open_memory().unwrap();
+                seed(&conn, "RR-DRY", "rr-unit");
+                let dest = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(dest.path().to_path_buf());
+                restore_unit(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rr-unit",
+                    "RR-DRY",
+                    &dest.path().to_string_lossy(),
+                    "/nonexistent/tapectl-dry-run",
+                    4096,
+                    None,
+                    true,
+                )
+                .unwrap();
+                assert!(rows(&conn).unwrap().is_empty());
+            }
+
+            fn raw_volume(conn: &Connection, store: &mut MemStore, dest: &Path) -> bool {
+                restore_raw_volume(
+                    conn,
+                    store,
+                    dest,
+                    None,
+                    site(Operation::RestoreRawVolume),
+                )
+                .is_ok()
+            }
+
+            /// `restore raw-volume`: a clean dump is an `ok` row of kind
+            /// `raw-volume`, carrying the tape's own label and the measured
+            /// dump, and no dar report (a raw dump runs no dar).
+            #[test]
+            fn a_clean_raw_volume_dump_records_an_ok_row() {
+                let conn = crate::db::open_memory().unwrap();
+                let data = b"raw-volume slice bytes".to_vec();
+                let mut store = crate::volume::raw::tests::build_synthetic_tape("RAW-OK", &data);
+                let dest = TempDir::new().unwrap();
+                assert!(raw_volume(&conn, &mut store, dest.path()));
+
+                let r = only_row(&conn);
+                assert_eq!(r.kind, "raw-volume");
+                assert_eq!(r.outcome, "ok");
+                assert_eq!(
+                    r.volume_label.as_deref(),
+                    Some("RAW-OK"),
+                    "the tape's own claim"
+                );
+                assert_eq!(r.volume_id, None, "raw-volume names no catalog row");
+                assert_eq!(r.unit_name, None);
+                assert_eq!(r.files_restored, Some(6));
+                assert!(r.bytes_restored.unwrap() > data.len() as i64);
+                assert_eq!(r.slices_read, None);
+                assert_eq!(r.dar_stdout, None);
+                assert_eq!(r.destination, dest.path().to_string_lossy());
+                assert_eq!(
+                    r.contact_id,
+                    Some(id_of(&conn, "SELECT id FROM cartridge_contacts"))
+                );
+            }
+
+            /// A raw dump that fails (File 0 only, no front index) records a
+            /// `failed` row with the error.
+            #[test]
+            fn a_failed_raw_volume_dump_records_a_failed_row() {
+                let conn = crate::db::open_memory().unwrap();
+                let mut store = tape_labelled("RAW-BAD");
+                let dest = TempDir::new().unwrap();
+                assert!(!raw_volume(&conn, &mut store, dest.path()));
+
+                let r = only_row(&conn);
+                assert_eq!(r.kind, "raw-volume");
+                assert_eq!(r.outcome, "failed");
+                assert!(r.error.is_some());
+                assert_eq!(
+                    r.files_restored, None,
+                    "not known: the dump never finished"
+                );
+                assert_eq!(r.bytes_restored, None);
+            }
+        }
     }
 }
