@@ -2418,6 +2418,11 @@ mod tests {
 
         let report = crate::cli::operations::db_fsck(&latest_conn, false, false).unwrap();
         assert!(report.integrity_ok, "integrity_check after 025");
+        assert!(
+            report.issues.is_empty(),
+            "db fsck must be clean after 025: {:?}",
+            report.issues
+        );
     }
 
     #[test]
