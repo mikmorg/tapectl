@@ -1436,6 +1436,49 @@ fn volume_write_contacted<'c>(
         HealthProbe::default(),
     );
 
+    // Issue #338: native tape consumed per byte of data this write sent,
+    // from the sweep above — read back from `log_page_journal` by contact
+    // (every consumer reads the journal, migration 023), never a second
+    // read of the drive. Three conditions, each a reason the ratio would be
+    // a wrong number rather than a measurement:
+    //
+    // - `result.is_ok()`: an aborted or interrupted write sent fewer bytes
+    //   than its Layout, so the Layout is the wrong denominator. (A
+    //   quarantined write sent every byte and only failed confirm; it is
+    //   NOT special-cased and gets no ratio — a deliberate omission, see
+    //   `feed_ratio`'s module doc.)
+    // - `capacity_override.is_none()`: that knob exists for drives that lie
+    //   about capacity — virtual drives (mhvtl) and the microcosm harnesses,
+    //   and nothing else (ADR-0010). mhvtl lists page 0x0c and reports a
+    //   BOP→EOD of 500 MB beside "0 GB written", a figure with no relation
+    //   to any write; a drive that cannot be trusted about capacity cannot
+    //   be read for a capacity ratio.
+    // - `on_tape_bytes()` is `Ok`: every entry sized, which `validate`
+    //   already required of this same Layout before a byte was written.
+    //
+    // The denominator is the WHOLE Layout, block-padded — every file from
+    // the ID thunk to the seal marker, exactly the bytes the fixed-block
+    // driver sent (run 3's `wchar` over all 14 files) — not
+    // `volumes.bytes_written`, which is slices only. It WARNS on stderr
+    // (`eprintln!`, the operator-facing channel, as the line-425 convention
+    // has it) and never touches `result`: the volume is complete and
+    // sealed; the warning is about the host.
+    if result.is_ok() && backend.capacity_override.is_none() {
+        if let Ok(data_bytes) = layout_snapshot.on_tape_bytes() {
+            if let Some(ratio) = crate::tape::feed_ratio::assess_and_record(
+                conn,
+                contact.id(),
+                volume_id,
+                label,
+                data_bytes,
+            ) {
+                if ratio.exceeds_threshold() {
+                    eprintln!("{}", ratio.warning_text(label));
+                }
+            }
+        }
+    }
+
     result
 }
 
@@ -6304,6 +6347,73 @@ mod tests {
                 "{f} must pass its contact ({needle}) to the health collection"
             );
         }
+    }
+
+    /// Issue #338: the feed-ratio assessment runs AFTER `volume write`'s
+    /// post-command sweep, in the same function that holds the contact, and
+    /// under exactly the three conditions its comment names. Pinned on the
+    /// source because the production probe (`HealthProbe::default()`) asks
+    /// the drive, so the wiring cannot be driven from a unit test; the
+    /// module's own tests prove the computation and the events row.
+    ///
+    /// Negative controls, one per assertion: move the call above the sweep
+    /// and the ordering check fails; drop `result.is_ok()` and an aborted
+    /// write gets a ratio against the wrong denominator; drop
+    /// `capacity_override.is_none()` and every mhvtl gate write warns at
+    /// ~16x from mhvtl's static 500 MB; add a second caller and the
+    /// one-caller count fails.
+    #[test]
+    fn the_feed_ratio_is_assessed_once_after_the_write_sweep_under_its_three_guards() {
+        const SRC: &str = include_str!("write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.len() < SRC.len(),
+            "positive control: production half separated"
+        );
+        assert_eq!(
+            prod.matches("feed_ratio::assess_and_record(").count(),
+            1,
+            "ONE production caller: `volume write`. `volume resume` is a documented residual, \
+             not a second caller to add silently"
+        );
+        let f = "fn volume_write_contacted";
+        let start = prod.find(f).unwrap();
+        let end = prod[start..].find("\n}\n").unwrap() + start;
+        let body = &prod[start..end];
+        assert!(
+            !body[f.len()..].contains("\npub fn "),
+            "body extraction overran into another function"
+        );
+        let sweep = body
+            .find("collect_health_best_effort(")
+            .expect("positive control: the write still sweeps");
+        let assess = body
+            .find("feed_ratio::assess_and_record(")
+            .expect("the write assesses its feed ratio");
+        assert!(
+            assess > sweep,
+            "the ratio reads THIS sweep's 0x0c back from the journal, so it must run after it"
+        );
+        let guard = &body[sweep..assess];
+        for needle in [
+            "result.is_ok()",
+            "backend.capacity_override.is_none()",
+            "layout_snapshot.on_tape_bytes()",
+        ] {
+            assert!(
+                guard.contains(needle),
+                "the assessment is gated on `{needle}`"
+            );
+        }
+        assert!(
+            body[assess..].contains("ratio.exceeds_threshold()")
+                && body[assess..].contains("eprintln!(\"{}\", ratio.warning_text(label))"),
+            "above the threshold it WARNS on stderr, by the pinned text"
+        );
+        assert!(
+            body[assess..].trim_end().ends_with("result"),
+            "and hands back the write's own `result`, untouched: never an exit-code change"
+        );
     }
 
     /// A mismatch at a METADATA position is counted by the session and has
