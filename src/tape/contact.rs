@@ -827,7 +827,7 @@ fn cartridge_for_serial(conn: &Connection, serial: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::LtoBackendConfig;
 
@@ -1060,7 +1060,10 @@ mod tests {
     /// character after it must not continue an identifier. Issue #332:
     /// `Operation::VolumeCompact` is a prefix of `Operation::VolumeCompactRead`,
     /// so a bare `contains` let the latter's writers stand in for the former.
-    fn contains_identifier(corpus: &str, needle: &str) -> bool {
+    /// Shared with `tape::health`'s reading-vocabulary scan (issue #342),
+    /// which has the same prefix hazard (`Reading::Write` is not a prefix
+    /// of anything today, but a bare `contains` is the #332 shape).
+    pub(crate) fn contains_identifier(corpus: &str, needle: &str) -> bool {
         corpus.match_indices(needle).any(|(i, _)| {
             corpus[i + needle.len()..]
                 .chars()

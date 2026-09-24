@@ -1231,9 +1231,31 @@ Read error counter page  [0x3]
              the command verbatim"
         );
 
-        let corpus = source_of("volume/write.rs");
-        // Positive control on the scan: a corpus that read nothing would make
-        // every assertion below vacuous (issues #282/#284/#285).
+        // Issue #342 (the #332 class): the PRODUCTION half only, comment
+        // lines dropped, matched as whole identifiers — exactly as
+        // `tape::contact`'s operation-vocabulary scan reads its corpus. The
+        // whole file used to be scanned, so a `health::Reading::X,` literal
+        // in write.rs's own test module satisfied this for a kind no
+        // production path writes: the test module is not a writer, and
+        // neither is a doc comment naming the variant.
+        let full = source_of("volume/write.rs");
+        let prod = match full.find("#[cfg(test)]\nmod tests") {
+            Some(i) => &full[..i],
+            None => &full[..],
+        };
+        let corpus: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        // Positive controls on the scan: the test half was really cut off,
+        // and the production half really holds the call sites — a corpus
+        // that read nothing would make every assertion below vacuous
+        // (issues #282/#284/#285).
+        assert!(
+            prod.len() < full.len(),
+            "positive control: write.rs's test module was separated from its production half"
+        );
         assert!(
             corpus.contains("collect_health_best_effort"),
             "positive control: the source scan must actually have read the call sites"
@@ -1241,12 +1263,43 @@ Read error counter page  [0x3]
         for reading in Reading::ALL {
             let variant = format!("Reading::{reading:?}");
             assert!(
-                corpus.contains(&variant),
-                "{variant} has no writer in src/volume/write.rs — a vocabulary \
+                crate::tape::contact::tests::contains_identifier(&corpus, &variant),
+                "{variant} has no PRODUCTION writer in src/volume/write.rs — a vocabulary \
                  value with no writer is exactly the `read`/`clean` defect \
                  ADR-0013 §4 names, and it is a FINDING, not a row to add"
             );
         }
+    }
+
+    /// The scan above must not be satisfiable from write.rs's test module
+    /// (issue #342): a corpus cut the same way, given a variant that only a
+    /// test-module line names, must NOT find it — and the same variant on a
+    /// production line must be found. Both halves on one synthetic corpus,
+    /// so a scan that stopped cutting would fail the first assertion.
+    #[test]
+    fn a_test_module_literal_cannot_satisfy_the_reading_vocabulary_scan() {
+        let synthetic = "fn prod() { x(health::Reading::Write, 1); }\n\
+                         // health::Reading::Init, in a comment is not a writer\n\
+                         #[cfg(test)]\nmod tests {\n    fn t() { y(health::Reading::Verify,); }\n}\n";
+        let prod = synthetic.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let corpus: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        use crate::tape::contact::tests::contains_identifier;
+        assert!(
+            contains_identifier(&corpus, "Reading::Write"),
+            "positive control: a production writer is found"
+        );
+        assert!(
+            !contains_identifier(&corpus, "Reading::Verify"),
+            "a literal that lives only in the test module must not count as a writer"
+        );
+        assert!(
+            !contains_identifier(&corpus, "Reading::Init"),
+            "a literal that lives only in a comment must not count as a writer"
+        );
     }
 
     /// ADR-0013 §7: every row records the observer. "Parse it later" requires
