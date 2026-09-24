@@ -19,23 +19,28 @@
 #    9  the Heir Kit — generate, print, seal, two failure domains
 #   10  a shelf location for cartridges
 #   11  tenants and units: who owns which paths; the service user is granted read by ACL
-#   12  OPTIONAL rehearsal on a TEST cartridge (erases it — barcode required; runs as YOU)
+#   12  rehearsal on a TEST cartridge with the INSTALLED binary (erases it —
+#       serial required; runs as YOU). Ruled required before the first write
+#       (ADR-0012, 2026-09-23): a different binary is a different artifact.
 #   13  the first production tape: snapshot → stage → init → write → verify
 #   14  what to do next
 #
 # Steps 1-4 run as you (they need your toolchain and sudo). Steps 5-11 and 13
 # run tapectl as the service user through one seam, `as_svc`; step 12 runs as
-# you because the lifecycle suite builds its own binary. `--no-service-user`
-# turns the seam off and runs everything as you, the pre-2026-09-13 behaviour.
+# you (the lifecycle suite needs your login to open the drive) and runs the
+# installed binary through TAPECTL_BIN, so what it proves is what step 13
+# uses. `--no-service-user` turns the seam off and runs everything as you.
 #
-# Every `tapectl` flag here was taken from the binary's own --help on
-# 2026-09-12; if a flag drifts, the failing command prints the real help.
+# Every `tapectl` flag here was checked against the binary's own --help and
+# the source on 2026-09-24; if a flag drifts, the failing command prints the
+# real help.
 #
 # Testing this script against mhvtl (never the real drive) is done with a binary
 # the service user can execute (your home is not traversable by it):
 #   install -m 0755 target/debug/tapectl /scratch/fr-bin/tapectl
 #   scripts/first-run.sh --auto --home /tmp/fr-home --tapectl /scratch/fr-bin/tapectl \
 #       --device /dev/tape/by-id/scsi-XYZZY_A1-nst --sg /dev/sg1 --generation LTO-8 --label L6-TEST \
+#       --barcode <mtx VolumeTag> --location home-rack --kit-out /scratch/fr-kit \
 #       --tenant alice --unit-path /tmp/fr-src/photos --skip-build --skip-tests
 set -euo pipefail
 
@@ -46,6 +51,7 @@ TO=99
 TAPECTL=""             # binary; resolved in step 0 unless given
 AUTO=0                 # accept defaults for non-destructive prompts
 DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; TEST_BARCODE=""; DGEN=""
+LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
 SKIP_BUILD=0; SKIP_TESTS=0
 SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
 usage() {
@@ -69,7 +75,8 @@ Options:
   --unit-path DIR   first unit directory (default asked)
   --location NAME   shelf location name (default asked; e.g. home-rack)
   --kit-out DIR     heir kit output dir (default ~/heir-kit)
-  --barcode S       TEST cartridge barcode for the step-12 rehearsal (required for it under --auto)
+  --barcode S       the step-12 TEST cartridge's MEDIUM SERIAL (what its chip reports; sg_read_attr
+                    prints it) — required for the rehearsal under --auto
   --skip-build      do not build/install (use the resolved binary as-is)
   --skip-tests      skip the ungated test suite
   -h, --help
@@ -85,13 +92,13 @@ while [ $# -gt 0 ]; do
     --device) DEVICE="$2"; shift 2 ;;
     --sg) SG="$2"; shift 2 ;;
     --generation) DGEN="$2"; shift 2 ;;
-    --label) LABEL="$2"; shift 2 ;;
+    --label) LABEL="$2"; LABEL_FROM_FLAG=1; shift 2 ;;
     --operator) OPERATOR="$2"; shift 2 ;;
     --tenant) TENANT="$2"; shift 2 ;;
     --unit-path) UNIT_PATH="$2"; shift 2 ;;
     --location) LOCATION="$2"; shift 2 ;;
     --kit-out) KIT_OUT="$2"; shift 2 ;;
-    --barcode) TEST_BARCODE="$2"; shift 2 ;;
+    --barcode) TEST_BARCODE="$2"; BARCODE_FROM_FLAG=1; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     --user) SVC_USER="$2"; shift 2 ;;
@@ -137,10 +144,15 @@ confirm() {
   read -r -p "   $1 [y/N] " ans </dev/tty || true
   [[ "$ans" =~ ^[Yy] ]]
 }
-# confirm_destructive "question" "word" → the user must type the word. --auto counts only if the word was supplied via flags.
+# confirm_destructive "question" "word" [from_flag] → the user must type the
+# word. Under --auto it counts ONLY when the caller says the word came from a
+# command-line flag (from_flag=1): a default is never consent to erase.
 confirm_destructive() {
   local ans
-  if [ "$AUTO" = 1 ]; then printf '   %s [auto: typed "%s" via flags]\n' "$1" "$2"; return 0; fi
+  if [ "$AUTO" = 1 ]; then
+    if [ "${3:-0}" = 1 ]; then printf '   %s [auto: "%s" supplied via a flag]\n' "$1" "$2"; return 0; fi
+    printf '   %s [auto: "%s" was NOT supplied via a flag — refusing under --auto]\n' "$1" "$2"; return 1
+  fi
   read -r -p "   $1 — type $2 to proceed: " ans </dev/tty || true
   [ "$ans" = "$2" ]
 }
@@ -177,12 +189,39 @@ run_capture_json() {
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
 tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
+# derive_nodes: NST/NSTN (the canonical st node) and SG (the sg node the
+# kernel binds to it) from $DEVICE. Step 6 computes these; every later step
+# that needs them recomputes them here, so `--from 8/12/13 --device X`
+# does not run with empty values (a `backend add --device-sg ""` was possible).
+derive_nodes() {
+  [ -n "$DEVICE" ] || die "no device chosen — pass --device, or run with --from 6"
+  [ -e "$DEVICE" ] || die "$DEVICE does not exist"
+  NST="$(readlink -f "$DEVICE")"; NSTN="$(basename "$NST")"
+  if [ -z "$SG" ]; then
+    SGN="$(ls "/sys/class/scsi_tape/$NSTN/device/scsi_generic/" 2>/dev/null | head -1)"
+    [ -n "$SGN" ] && SG="/dev/$SGN"
+  fi
+}
+# tape_lock: the one-tape-user rule every harness honours (the gate, the
+# lifecycle suite, lto6-measure, lto6-fill). Step 13 takes it for its writes;
+# step 12 must NOT (the suite takes it itself, and a parent holding it would
+# deadlock the child -- flock is per open file description).
+tape_lock() { exec 9>/tmp/tapectl-tape.lock; flock -n 9 || die "another process holds the tape lock (/tmp/tapectl-tape.lock) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
 # The DRIVE's own generation, parsed from its INQUIRY product id (issue #178).
 # shellcheck source=lib/drive-generation.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/drive-generation.sh"
 # The heir kit is YOUR artifact to print, but escrow-kit chmods its out dir 0700
 # as whoever runs it. Hand the dir to the service user for the write, take it back after.
-kit_prepare() { mkdir -p "$1"; [ "$SVC_MODE" = 1 ] && sudo chown -R "$SVC_USER" "$1"; return 0; }
+kit_prepare() {
+  mkdir -p "$1"
+  [ "$SVC_MODE" = 1 ] || return 0
+  # The kit dir may sit under your home, which the service user cannot
+  # traverse (your home is 0750): give every ancestor traverse-only (x), the
+  # same shape grant_read uses, then hand the dir itself over for the write.
+  local p; p="$(dirname "$1")"
+  while [ "$p" != / ] && [ -n "$p" ]; do as_svc test -x "$p" || sudo setfacl -m "u:$SVC_USER:x" "$p" || return 1; p="$(dirname "$p")"; done
+  sudo chown -R "$SVC_USER" "$1"
+}
 kit_finish()  { [ "$SVC_MODE" = 1 ] && sudo chown -R "$USER" "$1"; return 0; }
 # grant_read PATH: make PATH readable (tree) and its top dir writable (the
 # .tapectl-unit.toml dotfile) by the service user, via ACLs; ancestors get x.
@@ -295,11 +334,11 @@ hdr 3 "Build tapectl"
 skip_if || {
 if [ "$SKIP_BUILD" = 1 ]; then note "--skip-build"; else
 explain <<'EOF'
-Everything validated on mhvtl and on the real drive so far ran the debug binary — it is the proven artifact. A release build is the same source with optimisation on: markedly faster at the sha256 hashing and age encryption a multi-hundred-gigabyte write is made of. Build release for production, then run one real-drive rehearsal on it (step 12) before you trust it with data, because a different binary is a different artifact. Install it to /usr/local/bin: the service user cannot execute a binary under your home.
+Production runs the RELEASE binary: the same source with optimisation on, and it matters here — staging hashes and encrypts every byte, and a debug build does that roughly ten times slower than release (a 20 GiB stage took 19 minutes on the release binary on this host, 2026-09-23; the debug attempt was abandoned). A release binary of master a51b744 passed the real-drive rehearsal on 2026-09-23 (lifecycle first-year with TAPECTL_BIN, 47/47 on the HP LTO-6, run-20260923-213608), so the build is a proven artifact — but the one you build now is a new one, which is why step 12 rehearses it on a test cartridge before step 13 trusts it with data. Install it to /usr/local/bin: the service user cannot execute a binary under your home.
 EOF
 if confirm "Build the release binary now (cargo build --release; a few minutes)?"; then
   toolchain_check
-  ( cd "$REPO" && run cargo build --release )
+  ( cd "$REPO" && run flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo build --release ) || die "release build failed (exit 99 = timed out waiting for /scratch/tapectl-build.lock: another build is linking)"
   TAPECTL="$REPO/target/release/tapectl"
   [ -x "$TAPECTL" ] || TAPECTL="${CARGO_TARGET_DIR:-$REPO/target}/release/tapectl"
   if confirm "Install it to /usr/local/bin/tapectl (sudo)?"; then run sudo install -m 0755 "$TAPECTL" /usr/local/bin/tapectl; TAPECTL=/usr/local/bin/tapectl; fi
@@ -316,9 +355,9 @@ hdr 4 "The ungated test suite"
 skip_if || {
 if [ "$SKIP_TESTS" = 1 ]; then note "--skip-tests"; else
 explain <<'EOF'
-`cargo test` runs ~900 tests that need no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
+`cargo test` runs about 1,960 tests that need no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
 EOF
-if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && run cargo test ) || die "the suite is red on this machine — stop here and look"; ok "suite green"; fi
+if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && run flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo test ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
 fi
 }
 
@@ -351,13 +390,28 @@ fi
 hdr 6 "Find the tape drive — by serial, never by number"
 skip_if || {
 explain <<'EOF'
-/dev/nstN numbers move across reboots on any host with more than one SCSI device. The stable name is the serial under /dev/tape/by-id/. tapectl's config stores that path. Nothing in this step touches the tape.
+/dev/nstN numbers move across reboots on any host with more than one SCSI device. The stable name is the serial under /dev/tape/by-id/. tapectl's config stores that path. The drive's second node, /dev/sgN, is where health pages and the cartridge chip (MAM) are read; it moves too, so it is taken from the kernel's own binding of the tape node (sysfs), and tapectl re-checks that pairing every time it resolves the drive — `config check` warns and `volume write` refuses if the two nodes ever name different drives. Nothing in this step touches the tape.
 EOF
 run ls -l /dev/tape/by-id/ || note "(no /dev/tape/by-id — is a drive attached?)"
 command -v lsscsi >/dev/null 2>&1 && run lsscsi -g || true
 if [ -z "$DEVICE" ]; then
-  DEF=""; for f in /dev/tape/by-id/*-nst; do case "$f" in *XYZZY*) ;; *) [ -e "$f" ] && { DEF="$(basename "$f")"; break; } ;; esac; done
-  ask DEVICE "by-id path of the drive (…-nst, the non-rewinding node)" "${DEF:+/dev/tape/by-id/$DEF}"
+  # The default must be a REAL drive. mhvtl drives carry a `scsi-XYZZY_*`
+  # link but also a WWN alias (`scsi-3502233...`) that sorts first, so
+  # excluding the XYZZY spelling alone offered an mhvtl drive as the default
+  # (found 2026-09-24). Exclude every link whose target an mhvtl link also
+  # points at, and offer a default only when exactly one real drive remains.
+  declare -A VIRT=(); for f in /dev/tape/by-id/*XYZZY*; do [ -e "$f" ] && VIRT["$(readlink -f "$f")"]=1; done
+  REAL=(); for f in /dev/tape/by-id/*-nst; do
+    [ -e "$f" ] || continue; t="$(readlink -f "$f")"; [ -n "${VIRT[$t]:-}" ] && continue
+    case "$f" in *XYZZY*) continue ;; esac; REAL+=("$f")
+  done
+  DEF=""; if [ "${#REAL[@]}" -ge 1 ]; then
+    # several links (serial, WWN) may name ONE drive; collapse by target
+    declare -A SEEN=(); TGTS=0; for f in "${REAL[@]}"; do t="$(readlink -f "$f")"; [ -n "${SEEN[$t]:-}" ] || { SEEN[$t]=1; TGTS=$((TGTS+1)); }; done
+    if [ "$TGTS" -eq 1 ]; then for f in "${REAL[@]}"; do case "$f" in *scsi-3*) ;; *) DEF="$f"; break ;; esac; done; DEF="${DEF:-${REAL[0]}}"
+    else note "${TGTS} real drives found — no default; name the one you mean"; fi
+  else note "no real (non-mhvtl) drive found under /dev/tape/by-id"; fi
+  ask DEVICE "by-id path of the drive (…-nst, the non-rewinding node; the serial spelling, not the WWN)" "$DEF"
 fi
 [ -e "$DEVICE" ] || die "$DEVICE does not exist"
 NST="$(readlink -f "$DEVICE")"; NSTN="$(basename "$NST")"
@@ -434,7 +488,7 @@ EOF
   fi
 else
 explain <<'EOF'
-`tapectl init` creates the database, config and the operator tenant — and mints the permanent ESCROW IDENTITY (ADR-0005): the one key that is a recipient of every tape and is never rotated. Its SECRET half is printed ONCE, to your terminal, and stored nowhere on this machine. Have paper ready; write it down before you do anything else. It later goes on the Heir Kit's cover sheet (step 9), which is how an heir — or you, on a rebuilt machine — gets back in.
+`tapectl init` creates the database, config and the operator tenant — and mints the permanent ESCROW IDENTITY (ADR-0005): the one key that is a recipient of every tape and is never rotated. Its SECRET half is printed ONCE, to your terminal, and stored nowhere on this machine. Have paper ready; write it down before you do anything else. The Heir Kit (step 9) prints only the PUBLIC half — keep the handwritten secret in the same sealed envelope as the printed cover sheet; together they are how an heir — or you, on a rebuilt machine — gets back in.
 
 If you are REBUILDING a machine and already hold the original escrow key, do NOT let init mint a new one: answer with the original public key below and it is adopted instead (no command can replace a registered escrow identity later).
 
@@ -449,17 +503,23 @@ EOF
   else run_nolog tc init --operator "$OPERATOR"; fi
   note "Written down? It will not be shown again."
 fi
+explain <<'EOF'
+Two read-only checks close the step. `config check` parses config.toml the way every command will, names any key this version does not know (unknown keys are errors, never ignored), checks the drive's two device nodes exist and belong to one drive, and warns about staging space. `db fsck` runs SQLite's own integrity check (which covers every CHECK and NOT NULL constraint) plus a foreign-key check, and is the same check to run after any restore of the database from backup.
+EOF
 run tc config check || note "config check reported something — read it; advisory, exit code above"
 run tc db fsck || true
 explain <<'EOF'
-STAGING SPACE. `stage create` writes every encrypted slice of a unit to the staging directory before anything goes to tape, so it needs room for the largest batch you will write in one session — up to a full cartridge (2.5 TB for LTO-6) if you fill tapes in one go. init writes a default path into config.toml that may not exist, or may not be the service user's to write to. Put staging on a filesystem with the space, owned by the user that runs tapectl.
+STAGING SPACE. `stage create` writes every encrypted slice of a unit to the staging directory before anything goes to tape, so it needs room for everything one tape will hold: a sealed volume is never appended to, so every tape is written in one session, and the staging space caps what each tape can contain (2.5 TB for a full LTO-6; on this VM /scratch is 295 GB, so plan smaller tapes or add storage). init writes a default path into config.toml that may not exist, or may not be the service user's to write to. Put staging on a filesystem with the space, owned by the user that runs tapectl.
 EOF
 CFG="$EFFECTIVE_HOME/config.toml"
 SD="$(as_svc sed -n '/^\[staging\]/,/^\[/{s/^directory *= *"\(.*\)"/\1/p}' "$CFG" | head -1)"
 SD_DEF="$SD"
 if [ -z "$SD" ] || ! as_svc test -d "$SD" || ! as_svc test -w "$SD"; then
   note "staging.directory is '${SD:-<unset>}' — $( [ -z "$SD" ] && echo unset || { [ -d "$SD" ] && echo "not writable by $SVC_USER" || echo "does not exist"; } )"
-  [ "$AUTO" = 1 ] && SD_DEF="$EFFECTIVE_HOME/staging"
+  # The home is usually on the root filesystem (small on this VM: / is
+  # 22 GB); a big writable filesystem is the right default when one exists.
+  if [ -d /scratch ] && [ -w /scratch ] || sudo test -w /scratch 2>/dev/null; then SD_DEF="/scratch/tapectl-staging"; else SD_DEF="$EFFECTIVE_HOME/staging"; fi
+  for cand in "$SD" "$SD_DEF"; do [ -n "$cand" ] && { d="$cand"; while [ ! -d "$d" ]; do d="$(dirname "$d")"; done; note "$cand: $(df -h "$d" | awk 'NR==2{print $4" free on "$6}')"; }; done
 fi
 ask SD_NEW "staging directory (needs space for a full tape's slices)" "$SD_DEF"
 if [ "$SD_NEW" != "$SD" ]; then
@@ -481,8 +541,16 @@ ok "home ready at $EFFECTIVE_HOME"
 hdr 8 "Register the drive as a backend"
 skip_if || {
 CFG="$EFFECTIVE_HOME/config.toml"
-if as_svc grep -q '^\[\[backends.lto\]\]' "$CFG" 2>/dev/null; then ok "a [[backends.lto]] entry already exists in $CFG"; run as_svc grep -A5 '^\[\[backends.lto\]\]' "$CFG" || true
+if as_svc grep -q '^\[\[backends.lto\]\]' "$CFG" 2>/dev/null; then
+  ok "a [[backends.lto]] entry already exists in $CFG"; run as_svc grep -A5 '^\[\[backends.lto\]\]' "$CFG" || true
+  derive_nodes
+  CFG_TAPE="$(as_svc sed -n 's/^device_tape *= *"\(.*\)"/\1/p' "$CFG" | head -1)"
+  if [ -n "$CFG_TAPE" ] && [ "$(readlink -f "$CFG_TAPE" 2>/dev/null)" != "$NST" ]; then
+    note "config's device_tape ($CFG_TAPE) is not the drive you chose ($DEVICE -> $NST); there is no backend edit — fix config.toml by hand, or re-run step 6 with the configured drive"
+  fi
+  run tc config check || note "config check reported something — read it (an sg/tape pairing warning here becomes a refusal at the write)"
 else
+  derive_nodes
 explain <<'EOF'
 `backend add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. You declare what the DRIVE is — its own generation — and nothing about the tapes you will feed it: each cartridge's generation is read from its density code when the volume is initialised, and that is what fixes the tape's capacity. So one LTO-6 drive handles LTO-5 and LTO-6 cartridges with nothing to change between them, and media the drive cannot write is refused before the tape is touched (ADR-0010).
 EOF
@@ -552,7 +620,7 @@ fi
 hdr 9 "The Heir Kit"
 skip_if || {
 explain <<'EOF'
-`key escrow-kit` writes three files: COVER.txt (the escrow key in retypable Bech32 plus instructions — the decades-scale artifact, readable with cat), escrow-kit.html (the same with a QR, for printing from a browser) and catalog.db.age (the whole catalog encrypted to the escrow key). Yours to do afterwards: PRINT COVER.txt, seal it in tamper-evident envelopes, and keep copies in at least two independent failure domains. Generate it now, before any data — `audit` will remind you (escrow_kit_stale, a warning) after every write, which is the cue to regenerate with the real catalog.
+`key escrow-kit` writes three files: COVER.txt (the escrow key in retypable Bech32 plus instructions — the decades-scale artifact, readable with cat), escrow-kit.html (the same with a QR, for printing from a browser) and catalog.db.age (the whole catalog encrypted to the escrow key). Yours to do afterwards: PRINT COVER.txt, put the handwritten escrow SECRET from step 7 in the same envelope (the kit prints only the public key; without the secret it opens nothing), seal it tamper-evident, and keep copies in at least two independent failure domains. Generate it now, before any data — `audit` will remind you (escrow_kit_stale, a warning) after every write, which is the cue to regenerate with the real catalog.
 EOF
 ask KIT_OUT "kit output directory" "${KIT_OUT:-$HOME/heir-kit}"
 if [ -f "$KIT_OUT/COVER.txt" ] && ! confirm "A kit already exists in $KIT_OUT — regenerate?"; then ok "keeping the existing kit"; else
@@ -631,6 +699,10 @@ EOF
         if [ -z "$WR" ] || [ "$WR" = "[]" ]; then
           as_svc sed -i "s|^watch_roots *= *\[\]|watch_roots = [\"$UP\"]|" "$CFG" \
             || note "could not add $UP to watch_roots — add it by hand and run: tapectl unit discover"
+        elif ! printf '%s' "$WR" | grep -qF "\"$UP\""; then
+          # a second adopted unit: append inside the existing list
+          as_svc sed -i "s|^\(watch_roots *= *\[.*\)\]|\1, \"$UP\"]|" "$CFG" \
+            || note "could not append $UP to watch_roots — add it by hand and run: tapectl unit discover"
         fi
         run tc unit discover || note "(unit discover found nothing — check watch_roots in $CFG)"
       else
@@ -644,7 +716,7 @@ done
 run tc tenant list || true
 run tc unit list || true
 explain <<'EOF'
-Folder-per-unit alternative — add to config.toml, then `tapectl collection sync`:
+Folder-per-unit alternative. `init` writes `collections = []` near the top of config.toml; DELETE that line first (a `[[collections]]` table beside it is a duplicate key and the config stops loading — `config check` says so). Then add, and run `tapectl collection sync`:
 
   [[collections]]
   name       = "alice-photos"       # unit names become "alice-photos/<folder>"
@@ -661,30 +733,33 @@ EOF
 }
 
 # ================================================================ step 12
-hdr 12 "OPTIONAL rehearsal on a TEST cartridge (erases it)"
+hdr 12 "Rehearsal on a TEST cartridge with the installed binary (erases it)"
 skip_if || {
 explain <<'EOF'
-Before real data, the lifecycle suite can run a whole simulated first year — write, verify, every restore path including the heir script off the tape — on a cartridge you are willing to lose. It ERASES that cartridge. It needs its barcode typed exactly, cross-checked against the cartridge's MAM. This is the step that proves the drive, the host's st driver and the binary you built agree.
+Before real data, the lifecycle suite runs a whole simulated first year — write, verify, every restore path including the heir script off the tape — on a cartridge you are willing to lose. It ERASES that cartridge. It needs the cartridge's medium serial (the one its chip reports; `sg_read_attr` prints it below) typed exactly, and refuses if the loaded cartridge reports a different one. This is the step that proves the drive, the host's st driver and the binary step 13 will use agree — it runs the INSTALLED binary (TAPECTL_BIN), not a build of its own — and it is required before the first production write (ADR-0012, ruled 2026-09-23).
 
-This step runs as YOU, not the service user: the suite builds its own debug binary with your toolchain and uses throwaway homes under /scratch. It only needs your login to be able to open the drive.
+It runs as YOU, not the service user, with throwaway homes under /scratch; it only needs your login to be able to open the drive. It takes about three minutes on an LTO-6.
 EOF
-if ! command -v age >/dev/null 2>&1; then note "skipped: the rehearsal runs RESTORE.sh off the tape, which needs the age CLI (step 2 explains how to install it)"
+derive_nodes
+if ! command -v age >/dev/null 2>&1; then note "skipped: the rehearsal runs RESTORE.sh off the tape, which needs the age CLI (step 2 explains how to install it) — step 13 will ask you to confirm writing without it"
 elif [ "$AUTO" = 1 ] && [ -z "$TEST_BARCODE" ]; then note "skipped under --auto: no --barcode given (erasing a cartridge is never a default)"
 elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
-  NST="$(readlink -f "$DEVICE")"; DEVGRP="$(stat -c %G "$NST")"; WRAP=()
-  if ! { [ -r "$NST" ] && [ -w "$NST" ]; }; then
-    note "$USER cannot open $NST ($(stat -c '%A %U:%G' "$NST"))"
+  DEVGRP="$(stat -c %G "$NST")"; WRAP=()
+  if ! { [ -r "$NST" ] && [ -w "$NST" ] && [ -r "$SG" ] && [ -w "$SG" ]; }; then
+    note "$USER cannot open $NST and $SG ($(stat -c '%A %U:%G' "$NST"); $(stat -c '%A %U:%G' "$SG")) — the suite needs both (tape I/O, and MAM/health through sg)"
     svc_in_group "$USER" "$DEVGRP" || { confirm "sudo usermod -aG $DEVGRP $USER (takes effect at your next login)?" && run sudo usermod -aG "$DEVGRP" "$USER"; }
     svc_in_group "$USER" "$DEVGRP" || die "$USER is not in group $DEVGRP — cannot run the rehearsal"
     WRAP=(sg "$DEVGRP" -c)   # this login predates the membership; sg opens a shell with it now
   fi
   if [ -n "$SG" ]; then run sudo sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true; fi
-  ask TEST_BARCODE "barcode/serial of the TEST cartridge in the drive (it will be erased)" "$TEST_BARCODE"
+  ask TEST_BARCODE "medium serial of the TEST cartridge in the drive, as printed above (it will be erased)" "$TEST_BARCODE"
   [ -n "$TEST_BARCODE" ] || die "no barcode given"
-  if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE"; then
-    CMD="cd '$REPO' && bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
+  if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE" "$BARCODE_FROM_FLAG"; then
+    CMD="cd '$REPO' && TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
     if [ "${#WRAP[@]}" -gt 0 ]; then run "${WRAP[@]}" "$CMD"; else run bash -c "$CMD"; fi || die "rehearsal RED — do not write real data until this is understood"
     ok "rehearsal green"
+    # B14: step 13 checks for this marker (per binary) before the first write.
+    mkdir -p "$(dirname "$LOG")"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$TEST_BARCODE" > "$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$TAPECTL" | cut -c1-16)"
     note "Eject the test cartridge (mt -f $DEVICE offline) and load the production one before step 13."
   fi
 else note "skipped"; fi
@@ -699,18 +774,33 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
 [ "$NV" != 0 ] && note "$NV volume(s) already in the catalog." && { confirm "Write another tape now?" || { ok "nothing to do"; FROM=14; }; }
 if [ "$FROM" -le 13 ]; then
 explain <<'EOF'
-The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` runs dar, hashes, encrypts to every recipient and writes slices to staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and reads the seal back. A sealed volume is immutable: there is no append. Then `volume verify --full` reads every byte back against the front index, which turns the tape's claims into checked evidence.
+The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` runs dar, hashes, encrypts to every recipient and writes slices to staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and, before it seals, reads EVERY byte back and checks it against the plan (confirm). A sealed volume is immutable: there is no append. `volume verify --full` afterwards is a second, independent full read — the first entry in this tape's verification history, which `report verify-status` and the audit build on; on a full tape it takes as long as the write did.
 
 `volume init` also reads the loaded cartridge: its generation from the density code, which fixes this tape's capacity and is checked against what the drive can write, and its medium serial, which binds the volume to a cartridge in the catalog (ADR-0010). Nothing to set for a mixed LTO-5/LTO-6 shelf — each tape is planned against its own size.
 
 Label convention: something you can write on the cartridge, e.g. L6-0001.
 EOF
-  [ -n "$DEVICE" ] || die "no device — run with --from 6"
+  derive_nodes
+  # B14: the rehearsal on THIS binary is required before the first production
+  # write (ADR-0012, 2026-09-23). A marker per binary hash; interactive
+  # override only, never under --auto.
+  if [ ! -e "$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$TAPECTL" | cut -c1-16)" ]; then
+    note "no green step-12 rehearsal is recorded for this binary ($TAPECTL)"
+    [ "$AUTO" = 1 ] && die "the rehearsal is required before the first production write — run step 12 (or re-run with --from 12)"
+    confirm "Write to a production cartridge WITHOUT a rehearsal on this binary?" || die "run step 12 first: scripts/first-run.sh --from 12 --to 12"
+  fi
+  if [ -z "$LOCATION" ]; then
+    LOCATION="$(tc location list --json 2>/dev/null | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("locations",[]); print(rows[0].get("name","") if rows else "")
+except Exception: pass' 2>/dev/null || true)"
+  fi
+  tape_lock
   run as_svc mt -f "$DEVICE" status || true
   if as_svc mt -f "$DEVICE" status 2>/dev/null | grep -q DR_OPEN; then die "no cartridge loaded in $DEVICE"; fi
   ask LABEL "volume label" "${LABEL:-L6-0001}"
   explain <<'EOF'
-THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and wears the serial as a placeholder barcode until you replace it. Put the sticker on whenever you like, before or after this write, with `cartridge relabel`; the command is printed below once the cartridge is registered. Registering by hand FIRST is the one thing not to do: init matches on the serial, finds no row carrying it, and registers a second cartridge — two rows for one tape, with your label on the one the catalog is not using.
+THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and wears the serial as a placeholder barcode until you replace it. Put the sticker on whenever you like, before or after this write, with `cartridge relabel`; the command is printed below once the cartridge is registered. Do not register it by hand first WITHOUT its serial: init matches on the serial, finds no row carrying it, and registers a second cartridge — two rows for one tape, with your label on the one the catalog is not using. (`cartridge register --serial <medium serial>` is matched; a bare barcode is not.)
 EOF
   UNITS="$(tc unit list --json 2>/dev/null | python3 -c 'import json,sys
 try:
@@ -782,6 +872,9 @@ PY
     fi
     die "stage failed for $u"
   done <<< "$UNITS"
+  explain <<'EOF'
+`staging status` lists what is staged and what it weighs; `volume plan` totals it against the drive's generation and estimates how many tapes it needs. It is an ESTIMATE (it says so): the authoritative figure is the capacity `volume init` records once it has detected the loaded cartridge, and the gate that refuses an over-full plan is inside `volume write`, before any byte is written. If the estimate already says more than one tape, stage fewer units now — nothing has been written yet.
+EOF
   run tc staging status || true
   # `volume plan` reads the staged stage_sets and totals their encrypted size
   # against the drive -- the authoritative estimate, and the script never ran
@@ -789,12 +882,22 @@ PY
   # operator can see what is about to be written and how much of the tape it
   # uses (issue #269).
   run tc volume plan || true
-  confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" || die "stopped before writing"
+  confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" "$LABEL_FROM_FLAG" || die "stopped before writing"
   # Capture init's output as well as logging it: two later steps read it back
   # -- the placeholder barcode it reports, and which refusal it gave.
   INIT_OUT="$(dirname "$LOG")/volume-init-$LABEL.out"
   if ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
-    if grep -q "no medium serial" "$INIT_OUT"; then
+    if grep -q "already exists" "$INIT_OUT"; then
+      # Re-entering after an interrupted run: the volume row exists. Only an
+      # `initialized` one (init done, nothing written) may go straight to the
+      # write; anything else needs a new label.
+      VSTAT="$(tc volume list --json 2>/dev/null | python3 -c 'import json,sys
+try:
+  print(next((v.get("status","") for v in json.load(sys.stdin) if v.get("label")==sys.argv[1]), ""))
+except Exception: print("")' "$LABEL" 2>/dev/null || true)"
+      if [ "$VSTAT" = "initialized" ]; then note "volume $LABEL is already initialised and unwritten — continuing to the write"
+      else die "volume $LABEL already exists (status: ${VSTAT:-unknown}) — choose a new label: scripts/first-run.sh --from 13 --label <new>"; fi
+    elif grep -q "cannot tell which physical cartridge" "$INIT_OUT"; then
       # ADR-0012: with no readable serial the operator must name the cartridge,
       # and that is their word -- there is no default to fall back on and no
       # flag that could supply one, so --auto stops here rather than guessing.
@@ -816,6 +919,14 @@ EOF
         run tc cartridge register --barcode "$CARTRIDGE" --generation "$CGEN" || die "cartridge register failed"
       fi
       run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --cartridge "$CARTRIDGE" || die "volume init failed"
+    elif grep -q "is not the drive device_tape" "$INIT_OUT"; then
+      # Issue #329: the config's device_sg is not the sg node the kernel
+      # binds to device_tape (numbering moved since step 8). A config fact,
+      # not a consent question -- --force would fail identically.
+      explain <<'EOF'
+volume init refused before touching the tape: the drive's two device nodes in config.toml no longer name the same drive (/dev/sgN numbering moved, usually after a reboot). The refusal above names the sg node the kernel binds to the tape node. Edit [[backends.lto]] in config.toml so device_sg is that node (`tapectl config show` prints it; `tapectl config check` confirms the fix), then re-run with --from 13.
+EOF
+      die "volume init refused: device_sg does not belong to device_tape — fix the [[backends.lto]] entry, then re-run scripts/first-run.sh --from 13"
     elif grep -q "ADR-0003" "$INIT_OUT"; then
       # The SEALED case, split out from the mismatch case below (issue #223).
       #
@@ -830,25 +941,35 @@ EOF
       # tapectl's refusal already says what to do, so this does not repeat it;
       # it stops rather than offering a flag that cannot work.
       explain <<'EOF'
-volume init was refused by an ADR-0003 rule — almost always because the loaded cartridge already carries a SEALED volume. This is not a consent question and --force does not reach it: every ADR-0003 refusal says so itself, because a sealed volume is immutable and there is no append. Read the refusal above; it names the remedy for the case you hit. For a sealed cartridge that is: retire the volume on it, bulk-erase the physical tape, then `tapectl cartridge mark-erased` before writing to it again. If you did not expect a sealed tape here, `tapectl volume identify --device <dev>` will say what it actually holds.
+volume init was refused by an ADR-0003 rule — the loaded cartridge already carries a SEALED volume. This is not a consent question and --force does not reach it: a sealed volume is immutable and there is no append. The likeliest case right after step 12 is that the TEST cartridge is still in the drive: unload it and load the production one. If the sealed volume is one THIS catalog knows, the remedy is to retire it, bulk-erase the physical tape, then `tapectl cartridge mark-erased`. If it is a tape no catalog of yours knows (a test volume from a throwaway home), a physical erase alone suffices — after `mt -f <dev> rewind; mt -f <dev> weof 1` the tape reads as an EMPTY File 0 and `--force` applies. `tapectl volume identify --device <dev>` says what the tape holds.
 EOF
       die "volume init refused by ADR-0003 and no flag overrides it. Act on the remedy in the refusal above (for a sealed cartridge: retire, erase, cartridge mark-erased), or load a different cartridge, then re-run scripts/first-run.sh --from 13"
-    else
+    elif grep -qE "identifies a DIFFERENT volume|File 0 is EMPTY" "$INIT_OUT"; then
+      # The only two refusals --force can override (write.rs
+      # decide_fresh_write_contact: IdentityMismatch and EmptyFileZero).
       explain <<'EOF'
 volume init refused. The cartridge's File 0 identifies a DIFFERENT volume that is NOT sealed (a stale or foreign tape), or is EMPTY (a filemark at the beginning of the tape, e.g. after `mt weof`); tapectl's refusal above says which. tapectl will not overwrite either by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first. (A SEALED tape is a different case and --force would not help there; this is not that.)
 EOF
       [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
-      confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" || die "stopped"
+      confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" "$LABEL_FROM_FLAG" || die "stopped"
       run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --force || die "volume init failed"
+    else
+      # Everything else (no cartridge loaded, a generation the drive cannot
+      # write, a retired or displaced cartridge, a barcode collision, ...) is
+      # a fact --force does not change; the refusal names its own remedy.
+      die "volume init refused for a reason no flag overrides — read the refusal above, act on it, then re-run scripts/first-run.sh --from 13"
     fi
   fi
   # The cartridge this volume is now bound to, from init's own report lines
   # (src/volume/write.rs `report_binding`). Best-effort: a missing line costs
   # the operator a printed hint, never the write.
-  CART_BOUND="$(sed -n 's/^cartridge \(.*\) auto-registered from MAM.*/\1/p; s/^volume "[^"]*" bound to cartridge \(.*\)$/\1/p' "$INIT_OUT" | head -1)"
-  if [ -n "$CART_BOUND" ]; then
-    ok "cartridge $CART_BOUND registered from its chip; that serial is its placeholder barcode"
-    note "When you put a sticker on it:  tapectl cartridge relabel $CART_BOUND <your-barcode>"
+  CART_NEW="$(sed -n 's/^cartridge \(.*\) auto-registered from MAM.*/\1/p' "$INIT_OUT" | head -1)"
+  CART_BOUND="${CART_NEW:-$(sed -n 's/^volume "[^"]*" bound to cartridge \(.*\)$/\1/p' "$INIT_OUT" | head -1)}"
+  if [ -n "$CART_NEW" ]; then
+    ok "cartridge $CART_NEW registered from its chip; that serial is its placeholder barcode"
+    note "When you put a sticker on it:  tapectl cartridge relabel $CART_NEW <your-barcode>"
+  elif [ -n "$CART_BOUND" ]; then
+    ok "volume $LABEL bound to the already-registered cartridge $CART_BOUND"
   fi
   run tc volume write "$LABEL" --device "$DEVICE" || die "write did not seal — read the output; the catalog knows exactly why"
   # Issue #265: a failed verify has TWO outcomes and they need opposite
@@ -899,7 +1020,7 @@ EOF
     esac
   fi
   explain <<'EOF'
-`audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge: `volume read-slices` + `volume write`, or just stage again.
+`audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge, and the staged slices are still on disk (a write does not release them): load a fresh cartridge and run `volume init <label-2>` then `volume write <label-2>`. Only if staging was already cleaned do you need `volume read-slices --from <label-1>` (with the FIRST tape loaded) to bring the slices back before writing the second.
 EOF
   run tc audit || true
   if [ -n "$LOCATION" ]; then run tc volume move "$LABEL" --to "$LOCATION" || true; fi
@@ -919,10 +1040,12 @@ cat <<EOF
    • Eject with: ${SUDO_PREFIX}mt -f ${DEVICE:-<device>} offline. Write the label on the cartridge.
      Then tell the catalog what the sticker says (ADR-0012 — the serial stays its identity):
      ${SUDO_PREFIX}tapectl cartridge relabel ${CART_BOUND:-<medium-serial>} <the-barcode-you-wrote>
-   • Second copy, other location: load a fresh cartridge, \`tapectl volume read-slices --from ${LABEL:-<label>} --unit <unit>\`
-     for each unit (or stage again), then \`volume write\` a new label and \`volume move --to <other shelf>\`.
+   • Second copy, other location: the staged slices are still on disk, so load a fresh cartridge,
+     \`tapectl volume init <label-2>\`, \`tapectl volume write <label-2>\`, then \`volume move <label-2> --to <other shelf>\`.
+     (Only if staging was cleaned: load tape 1 first and \`volume read-slices --from ${LABEL:-<label>} --unit <unit>\` per unit.)
    • \`tapectl audit\` weekly — contrib/systemd/ has a timer; its User=/HOME= default to the service user.
-   • \`tapectl report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions.
+   • \`tapectl report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
+     \`report health\` shows the drive's error counters from every tape contact (ADR-0013).
    • Disaster recovery, the whole procedure: docs/operator-guide.md, "Disaster Recovery".
    • This script is resumable: scripts/first-run.sh --from N. Log: $LOG
 EOF
