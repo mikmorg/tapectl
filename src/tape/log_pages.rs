@@ -603,7 +603,9 @@ impl JournalRow {
                 .as_ref()
                 .map_or(Value::Null, |b| Value::Blob(b.clone())),
             decoded: capture.decoded.clone(),
-            tapectl_version: env!("CARGO_PKG_VERSION"),
+            // The BUILD identity (commit + day), not the package version:
+            // ADR-0012, 2026-09-24 amendment, item 1.
+            tapectl_version: crate::build_info::VERSION,
         }
     }
 }
@@ -1939,7 +1941,8 @@ pub(crate) mod tests {
                 )
             );
             assert_eq!(row.10.as_deref(), Some("Version string: 1.81 20200110"));
-            assert_eq!(row.11, env!("CARGO_PKG_VERSION"));
+            assert_eq!(row.11, crate::build_info::VERSION);
+            assert!(row.11.starts_with(env!("CARGO_PKG_VERSION")));
             assert_eq!(row.12, None);
         }
         let p37 = rows.iter().find(|r| r.0 == 0x37).unwrap();

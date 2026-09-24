@@ -532,7 +532,7 @@ mod tests {
             tool_version: None,
             raw: rusqlite::types::Value::Blob(vec![0x0c, 0, 0, 0]),
             decoded: decoded.map(str::to_string),
-            tapectl_version: env!("CARGO_PKG_VERSION"),
+            tapectl_version: crate::build_info::VERSION,
         };
         log_pages::insert(conn, &row).unwrap();
     }
@@ -754,7 +754,7 @@ mod tests {
             tool_version: None,
             raw: rusqlite::types::Value::Blob(vec![0x0c, 0, 0, 0]),
             decoded: Some(synthetic_0x0c(1_480)),
-            tapectl_version: env!("CARGO_PKG_VERSION"),
+            tapectl_version: crate::build_info::VERSION,
         };
         log_pages::insert(&conn, &row).unwrap();
         assert_eq!(

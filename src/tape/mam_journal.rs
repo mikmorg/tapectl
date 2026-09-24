@@ -151,7 +151,9 @@ impl JournalRow {
             tool_version: capture.tool_version.clone(),
             raw,
             parsed_json,
-            tapectl_version: env!("CARGO_PKG_VERSION"),
+            // The BUILD identity (commit + day), not the package version:
+            // ADR-0012, 2026-09-24 amendment, item 1.
+            tapectl_version: crate::build_info::VERSION,
         }
     }
 }
@@ -695,7 +697,11 @@ mod tests {
         assert_eq!(v["medium_density_code"]["value"], 0x5a);
         assert_eq!(v["medium_density_code"]["text"], "0x5a");
         assert_eq!(row.serial_as_read.as_deref(), Some("EW7VWMVKF6"));
-        assert_eq!(row.tapectl_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(row.tapectl_version, crate::build_info::VERSION);
+        assert!(
+            row.tapectl_version.starts_with(env!("CARGO_PKG_VERSION")),
+            "journal rows record the build identity, which leads with the package version"
+        );
         assert_eq!(row.tool_argv, r#"["sg_read_attr","/dev/sg-test"]"#);
         assert_eq!(row.tool_version.as_deref(), Some("version: 1.13 20191220"));
         assert_eq!(row.captured_at, "2026-09-22 12:00:00");
