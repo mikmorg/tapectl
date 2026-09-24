@@ -5,12 +5,13 @@
 
 Asserts what the pass count cannot: every backend contact names that drive,
 every closed init/write/resume/verify/restore contact swept exactly the pages
-its own page 0x00 listed (each ok, each ONE LOG SENSE via --maxlen), every health
+its own page 0x00 listed (each ok, each ONE LOG SENSE via --maxlen) and read the
+st driver's sysfs counters at its open and its close (issue #301), every health
 reading has counters, every volume was sized from the detected LTO-6
 generation, and the cartridge is the sanctioned one. Read-only; touches no
 device. Written for the 2026-09-23 rehearsal (docs/runs/2026-09-23-real-drive-rehearsal.md).
 """
-import sqlite3, sys
+import json, sqlite3, sys
 db, want_serial = sys.argv[1], sys.argv[2]
 c = sqlite3.connect(db)
 out, bad = [], []
@@ -52,6 +53,29 @@ for cid, op, outcome, serial, closed, backend, cart, reason in contacts:
         bad.append(f"contact {cid} ({op}): pages not ok: {notok}")
     swept += 1
 out.append(f"{swept} backend contacts each swept exactly the pages their own 0x00 listed (all ok, all --maxlen)")
+# 2b. st driver counters (issue #301): every closed backend contact read the
+# kernel's sysfs stats/ at its open AND its close -- a real st node always
+# publishes them, so a missing reading is a capture that did not happen.
+n_stats = c.execute("SELECT COUNT(*) FROM st_stats_journal").fetchone()[0]
+if not n_stats:
+    bad.append("positive control: st_stats_journal is EMPTY -- no contact read the kernel counters")
+paired, wrote = 0, 0
+for cid, op, outcome, serial, closed, backend, cart, reason in contacts:
+    if not backend or closed is None:
+        continue
+    rows = c.execute("SELECT point, stats_json, errors_json FROM st_stats_journal WHERE contact_id=?", (cid,)).fetchall()
+    points = sorted(r[0] for r in rows)
+    if points != ["close", "open"]:
+        bad.append(f"contact {cid} ({op}): st stats readings {points}, want exactly one open and one close"); continue
+    s = {p: json.loads(j) for p, j, _ in rows}
+    if not s["open"] or not s["close"]:
+        bad.append(f"contact {cid} ({op}): an st stats reading carries no files"); continue
+    if any(e for *_, e in rows):
+        bad.append(f"contact {cid} ({op}): st stats files unreadable: {[e for *_, e in rows if e]}")
+    paired += 1
+    if int(s["close"].get("write_byte_cnt", "0")) > int(s["open"].get("write_byte_cnt", "0")):
+        wrote += 1
+out.append(f"{paired} backend contacts each read the st counters at open and close ({wrote} of them moved write_byte_cnt)")
 # 3. health readings: counters present (NULL means not read)
 h = c.execute("""SELECT operation, contact_id, total_corrected, total_uncorrected, tape_alerts FROM health_logs""").fetchall()
 nulls = [r for r in h if r[3] is None or r[4] is None]
