@@ -152,6 +152,11 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
         })
         .unwrap_or_default();
 
+    // ADR-0012, 2026-09-24 amendment, item 7: the quiet-host limits in
+    // force — whether the file has a `[host_check]` table, and what the
+    // check will actually use. Display only; validation is `report`'s.
+    let host_check = loaded.map(|cfg| (cfg.host_check.is_some(), cfg.host_check()));
+
     if json_output {
         print_json(
             &report,
@@ -165,6 +170,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &tape_device_checks,
             &unsupported_compression_hits,
             &capacity_override_hits,
+            host_check.as_ref(),
         );
     } else {
         print_human(
@@ -180,6 +186,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &tape_device_checks,
             &unsupported_compression_hits,
             &capacity_override_hits,
+            host_check.as_ref(),
         );
     }
 
@@ -203,6 +210,7 @@ fn print_json(
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
     unsupported_compression_hits: &[crate::policy::compression_capability::UnsupportedCompressionHit],
     capacity_override_hits: &[&str],
+    host_check: Option<&(bool, crate::config::HostCheckConfig)>,
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
         .iter()
@@ -338,6 +346,10 @@ fn print_json(
             "tape_devices": tape_devices_json,
             "unsupported_compression": unsupported_compression_json,
             "capacity_override_backends": capacity_override_hits,
+            "host_check": host_check.map(|(present, hc)| serde_json::json!({
+                "table_present": present,
+                "effective": hc,
+            })),
         })
     );
 }
@@ -356,6 +368,7 @@ fn print_human(
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
     unsupported_compression_hits: &[crate::policy::compression_capability::UnsupportedCompressionHit],
     capacity_override_hits: &[&str],
+    host_check: Option<&(bool, crate::config::HostCheckConfig)>,
 ) {
     if report.valid {
         println!("config: valid");
@@ -439,5 +452,63 @@ fn print_human(
              for virtual drives (mhvtl) only; a real drive's capacity should \
              come from the loaded cartridge's detected generation (ADR-0010)."
         );
+    }
+    if let Some((present, hc)) = host_check {
+        println!("{}", describe_host_check(*present, hc));
+    }
+}
+
+/// `config check`'s one line on the quiet-host limits in force (ADR-0012,
+/// 2026-09-24 amendment, item 7) — where they come from, then each value,
+/// so the operator can see what `volume write`'s pre-flight will ask about
+/// without reading the source for the defaults.
+pub(crate) fn describe_host_check(present: bool, hc: &crate::config::HostCheckConfig) -> String {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    format!(
+        "host check ({}): units {}; processes {}; max load {:.2}/CPU; min available {} MiB; \
+         max memory pressure {:.2}%; max I/O pressure {:.2}% — `tapectl host check` runs it",
+        if present {
+            "[host_check]"
+        } else {
+            "defaults, no [host_check] table"
+        },
+        list(&hc.contender_units),
+        list(&hc.contender_processes),
+        hc.max_load_per_cpu,
+        hc.min_available_mb,
+        hc.max_memory_pressure_pct,
+        hc.max_io_pressure_pct,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HostCheckConfig;
+
+    #[test]
+    fn config_check_names_the_host_check_limits_and_where_they_come_from() {
+        let line = describe_host_check(false, &HostCheckConfig::default());
+        assert!(line.contains("defaults, no [host_check] table"), "{line}");
+        assert!(line.contains("units none"), "{line}");
+        assert!(
+            line.contains("cargo, rustc, docker, Runner.Worker"),
+            "{line}"
+        );
+        assert!(line.contains("min available 2048 MiB"), "{line}");
+
+        let hc = HostCheckConfig {
+            contender_units: vec!["homorg-db-suite.timer".into()],
+            ..HostCheckConfig::default()
+        };
+        let line = describe_host_check(true, &hc);
+        assert!(line.starts_with("host check ([host_check])"), "{line}");
+        assert!(line.contains("units homorg-db-suite.timer"), "{line}");
     }
 }
