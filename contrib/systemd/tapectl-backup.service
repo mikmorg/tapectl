@@ -1,0 +1,53 @@
+[Unit]
+Description=tapectl catalog backup (db backup to a second disk, no tape)
+Documentation=file:/usr/share/doc/tapectl/install.md
+# Ordering only — the backup needs no network at all.
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# tapectl resolves its config root purely from $HOME (src/config.rs), so BOTH
+# of these must be set and must match the account whose ~/.tapectl holds the
+# database. A systemd service has no inherited $HOME; leave it out and the run
+# resolves a config root you did not intend. The defaults are the service user
+# scripts/first-run.sh creates (step 5); scripts/install-systemd.sh rewrites
+# them (and ReadWritePaths= below) for --user/--home, so edit the INSTALLED
+# copy through that script rather than by hand.
+User=tapectl
+Environment=HOME=/var/lib/tapectl
+
+# Where the copies go, and how many to keep (ADR-0012, 2026-09-24 amendment,
+# item 5: "to a second disk"). The directory must be OUTSIDE the tapectl home
+# — a backup on the disk that holds the original is not a backup — and it
+# must exist, owned by the service user, before the first run:
+# ProtectSystem=strict below makes every path not listed in ReadWritePaths=
+# read-only, and a missing ReadWritePaths= entry fails the unit at start.
+# scripts/install-systemd.sh --backup-dir DIR creates it and rewrites all
+# three lines together.
+Environment=TAPECTL_BACKUP_DIR=/var/backups/tapectl
+Environment=TAPECTL_BACKUP_KEEP=14
+
+# Private keys are NOT copied by default (issue #40): a key copy makes the
+# backup destination a key-escrow point. Set to 1 only for a destination you
+# keep as secret as the home itself.
+#Environment=TAPECTL_BACKUP_INCLUDE_KEYS=1
+
+# Optional healthchecks.io-style endpoint. Leave unset for no pinging.
+#Environment=TAPECTL_HEALTHCHECK_URL=https://hc-ping.com/YOUR-UUID
+
+# Absolute path to the wrapper (adjust to wherever you installed it).
+ExecStart=/usr/local/lib/tapectl/tapectl-scheduled-backup.sh
+
+# No tape device, no writes outside the tapectl home and the backup
+# directory. The home itself must be writable: the database is in WAL mode,
+# so even a read-only open writes the -wal/-shm sidecars beside tapectl.db.
+# No ProtectHome= — a --user of a regular account would put the home under
+# /home and ProtectHome would hide it.
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tapectl/.tapectl /var/backups/tapectl
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

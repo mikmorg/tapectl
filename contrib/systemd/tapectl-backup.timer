@@ -1,0 +1,30 @@
+[Unit]
+Description=Daily tapectl catalog backup
+Documentation=file:/usr/share/doc/tapectl/install.md
+
+[Timer]
+# Daily, in the small hours: after the day's write session and before the
+# next one, so every session's catalog changes are on the second disk within
+# a day. A session that ends at 18:00 is backed up at 03:00; for a copy the
+# moment a session ends, `sudo systemctl start tapectl-backup.service` — a
+# timer cannot know when you are done, and the ruling asks for "after every
+# session" (ADR-0012, 2026-09-24 amendment, item 5).
+#
+# Opening the database runs the startup sweep, which marks an `in_progress`
+# write session `interrupted` (fully resumable, revalidated on resume) — the
+# same cosmetic caveat as the audit timer. Keep this outside your usual write
+# window; an overnight write that is still running at 03:00 gets one spurious
+# "recovered orphaned write sessions" event and nothing else.
+OnCalendar=*-*-* 03:00:00
+
+# A machine that was off at 03:00 still needs its backup — catch up on the
+# next boot rather than silently skipping a day.
+Persistent=true
+
+# Nothing here is time-critical; spread the start a little.
+RandomizedDelaySec=15m
+
+Unit=tapectl-backup.service
+
+[Install]
+WantedBy=timers.target
