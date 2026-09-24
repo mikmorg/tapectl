@@ -253,6 +253,36 @@ requires — while everything already safely on tape is freed. `--force`
 releases the retained ones too, and is wider than the gate it overrides: it
 also drops staged data for sets never written to any tape.
 
+### A quiet host while the tape runs
+
+An LTO-6 drive streams at up to 160 MB/s and *stops and restarts* whenever the
+host feeds it slower than about 54 MB/s. Every restart costs tape as well as
+time: on the real HP LTO-6 a bursty feed used 1.48 bytes of tape per byte of
+data, a steady one 1.00 (`docs/runs/2026-09-23-lto6-capacity-measurement.md`,
+issue #323). `volume write` and `volume verify` each move every byte of the
+tape through this machine, for as long as the data takes — hours for a full
+cartridge.
+
+So, before a write or a verify, make the host quiet (ruled 2026-09-24):
+
+- Pause anything that competes for CPU, memory or the staging disk: CI runners
+  and their systemd timers, container builds, other backups, test suites. On
+  the current production VM the homorg runner's `homorg-db-suite.timer` and
+  `homorg-prune-target.timer` are the known contenders; the 2026-09-24
+  end-of-tape fill ran clean only with both paused and the runner idle.
+- Do not start heavy disk I/O on the filesystem that holds staging.
+- Nothing else touches the drive. Every tapectl harness — the mhvtl gate, the
+  lifecycle suite, `lto6-measure.sh`, `lto6-fill.sh` — and `first-run.sh`
+  step 13 take `/tmp/tapectl-tape.lock` before using it; a second user is
+  refused, not queued.
+- Memory matters too: a process killed for memory pressure mid-write costs the
+  cartridge its session (a clean abort to an unsealed tape, but the time is
+  gone). Keep a few GB free.
+
+The write itself needs no supervision once it is streaming; the drive's
+counters afterwards (`report health`, page 0x17's native-used against bytes
+written — issue #338) say whether the feed held.
+
 ### Check What's Pending
 
 ```bash
