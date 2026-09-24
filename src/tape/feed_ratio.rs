@@ -55,6 +55,17 @@
 //! and never from a second sweep. A drive that does not list page 0x0c, or
 //! a decode without the line (the no-medium capture has none), makes the
 //! ratio `None` — nothing recorded, nothing warned.
+//!
+//! **Recording and warning are split** ([`Suppression`]). mhvtl DOES list
+//! page 0x0c and reports a BOP→EOD of 500 MB beside "0 GB written" — a
+//! figure with no relation to any write, which against a 30 MB gate write
+//! is a 16x ratio. On a drive with a `capacity_override` (ADR-0010: virtual
+//! drives and the microcosm harnesses, nothing else — a drive that lies
+//! about capacity cannot be read for a capacity ratio) the row is still
+//! RECORDED, so the gate exercises the whole path and a reader can see the
+//! 16x, but the warning is suppressed and the row's `details` says why
+//! (`"suppressed": "capacity_override"`). A real drive has no override and
+//! warns.
 
 use rusqlite::{Connection, OptionalExtension};
 use tracing::warn;
@@ -157,20 +168,63 @@ impl FeedRatio {
             threshold = FEED_RATIO_WARN_THRESHOLD,
         )
     }
+}
 
-    /// The `events.details` JSON: both facts, the verdict and the threshold
-    /// it was judged against.
+/// Why a ratio above the threshold draws no warning. The row is recorded
+/// either way; this only gates the stderr line, and is written into the
+/// row's `details` so a reader knows why a 16x drew nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Suppression {
+    /// The drive has a `capacity_override` — virtual drives (mhvtl) and the
+    /// microcosm harnesses, and nothing else (ADR-0010). mhvtl's page 0x0c
+    /// reports a static BOP→EOD unrelated to any write; a drive that lies
+    /// about capacity cannot be read for a capacity ratio.
+    CapacityOverride,
+}
+
+impl Suppression {
+    /// The `details.suppressed` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Suppression::CapacityOverride => "capacity_override",
+        }
+    }
+}
+
+/// One write's ratio together with the verdict on it: recorded always,
+/// warned only when above the threshold AND not suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assessment {
+    pub ratio: FeedRatio,
+    pub suppressed: Option<Suppression>,
+}
+
+impl Assessment {
+    /// Whether the operator warning is printed — and what `details.warned`
+    /// records, so the row never claims a warning that did not appear.
+    pub fn warns(&self) -> bool {
+        self.ratio.exceeds_threshold() && self.suppressed.is_none()
+    }
+
+    /// The `events.details` JSON: both facts, the verdict, the threshold it
+    /// was judged against, and — only when set — why a warning was
+    /// suppressed. The key is ABSENT on an unsuppressed row, not null, so a
+    /// query for `json_extract(details, '$.suppressed')` finds exactly the
+    /// suppressed ones.
     pub fn details_json(&self, contact_id: i64) -> String {
-        serde_json::json!({
+        let mut details = serde_json::json!({
             "source_page": "0x0c",
-            "native_bop_to_eod_mb": self.native_bop_to_eod_mb,
-            "data_bytes": self.data_bytes,
-            "ratio": self.ratio(),
+            "native_bop_to_eod_mb": self.ratio.native_bop_to_eod_mb,
+            "data_bytes": self.ratio.data_bytes,
+            "ratio": self.ratio.ratio(),
             "threshold": FEED_RATIO_WARN_THRESHOLD,
-            "warned": self.exceeds_threshold(),
+            "warned": self.warns(),
             "contact_id": contact_id,
-        })
-        .to_string()
+        });
+        if let Some(s) = self.suppressed {
+            details["suppressed"] = serde_json::Value::String(s.as_str().to_string());
+        }
+        details.to_string()
     }
 }
 
@@ -210,16 +264,19 @@ pub fn journalled_0x0c_decode(conn: &Connection, contact_id: i64) -> Result<Opti
 /// `None` — nothing recorded, nothing to warn about — when the contact
 /// could not be named (the sweep's rows carry a NULL contact id and cannot
 /// be attributed), when the sweep journalled no usable page 0x0c, when the
-/// decode has no BOP→EOD line, or when nothing was sent. Best-effort
-/// throughout: a refused INSERT warns in the log and the ratio is still
-/// returned, so the operator warning does not depend on the bookkeeping.
+/// decode has no BOP→EOD line, or when nothing was sent. `suppressed` does
+/// NOT stop the recording — it is written into the row and gates only the
+/// caller's warning ([`Assessment::warns`]). Best-effort throughout: a
+/// refused INSERT warns in the log and the assessment is still returned,
+/// so the operator warning does not depend on the bookkeeping.
 pub fn assess_and_record(
     conn: &Connection,
     contact_id: Option<i64>,
     volume_id: i64,
     label: &str,
     data_bytes: u64,
-) -> Option<FeedRatio> {
+    suppressed: Option<Suppression>,
+) -> Option<Assessment> {
     let contact_id = contact_id?;
     let decoded = match journalled_0x0c_decode(conn, contact_id) {
         Ok(d) => d,
@@ -229,6 +286,7 @@ pub fn assess_and_record(
         }
     };
     let ratio = from_decoded_0x0c(decoded.as_deref(), data_bytes)?;
+    let assessment = Assessment { ratio, suppressed };
     if let Err(e) = events::log_event(
         conn,
         "volume",
@@ -238,12 +296,12 @@ pub fn assess_and_record(
         Some(EVENT_FIELD),
         None,
         Some(&format!("{:.4}", ratio.ratio())),
-        Some(&ratio.details_json(contact_id)),
+        Some(&assessment.details_json(contact_id)),
         None,
     ) {
         warn!(err = %e, "events insert for the feed ratio failed");
     }
-    Some(ratio)
+    Some(assessment)
 }
 
 #[cfg(test)]
@@ -314,11 +372,13 @@ mod tests {
     fn the_mhvtl_capture_lists_0x0c_with_a_figure_unrelated_to_any_write() {
         // The brief for #338 assumed mhvtl has no page 0x0c. It does, and
         // its BOP→EOD is 500 MB beside "0 GB" written. This is WHY
-        // `volume write` skips the ratio on a drive with a
-        // `capacity_override` (virtual drives only, ADR-0010): mhvtl's 500
-        // MB against a 30 MB gate write would warn at 16x on every run.
-        // Negative control: if mhvtl ever reports a real BOP→EOD, this
-        // assertion is what says the guard can be revisited.
+        // `volume write` SUPPRESSES the warning on a drive with a
+        // `capacity_override` (virtual drives only, ADR-0010) while still
+        // recording the row: mhvtl's 500 MB against a 30 MB gate write is
+        // 16x on every run — see `a_capacity_override_drive_is_recorded_
+        // but_not_warned`. Negative control: if mhvtl ever reports a real
+        // BOP→EOD, this assertion is what says the suppression can be
+        // revisited.
         assert_eq!(parse_native_bop_to_eod_mb(MHVTL_0X0C), Some(500));
         assert!(MHVTL_0X0C.contains("Data bytes written to media by WRITE commands: 0 GB"));
     }
@@ -510,10 +570,11 @@ mod tests {
         journal_0x0c(&conn, cid, Some(&synthetic_0x0c(1_480)), true);
         journal_0x0c(&conn, other, Some(&synthetic_0x0c(1_000)), true);
 
-        let r = assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000)
+        let a = assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000, None)
             .expect("a journalled 0x0c with the line is computable");
-        assert_eq!(r.native_bop_to_eod_mb, 1_480);
-        assert!(r.exceeds_threshold());
+        assert_eq!(a.ratio.native_bop_to_eod_mb, 1_480);
+        assert!(a.ratio.exceeds_threshold());
+        assert!(a.warns(), "a real drive (no suppression) at 1.48 warns");
 
         let rows = events_for(&conn, vid);
         assert_eq!(rows.len(), 1, "one events row per assessment");
@@ -527,6 +588,10 @@ mod tests {
         assert_eq!(details["threshold"], FEED_RATIO_WARN_THRESHOLD);
         assert_eq!(details["warned"], true);
         assert_eq!(details["contact_id"], cid);
+        assert!(
+            details.get("suppressed").is_none(),
+            "an unsuppressed row has NO `suppressed` key, not a null one"
+        );
     }
 
     #[test]
@@ -539,8 +604,9 @@ mod tests {
         let cid = contact(&conn);
         journal_0x0c(&conn, cid, Some(&synthetic_0x0c(RUN_3_NATIVE_MB)), true);
 
-        let r = assess_and_record(&conn, Some(cid), vid, "M323A1", RUN_3_DATA_BYTES).unwrap();
-        assert!(!r.exceeds_threshold());
+        let a = assess_and_record(&conn, Some(cid), vid, "M323A1", RUN_3_DATA_BYTES, None).unwrap();
+        assert!(!a.ratio.exceeds_threshold());
+        assert!(!a.warns());
         let rows = events_for(&conn, vid);
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -551,6 +617,78 @@ mod tests {
         let details: serde_json::Value =
             serde_json::from_str(rows[0].2.as_deref().unwrap()).unwrap();
         assert_eq!(details["warned"], false);
+        assert!(details.get("suppressed").is_none());
+    }
+
+    #[test]
+    fn a_capacity_override_drive_is_recorded_but_not_warned() {
+        // The mhvtl shape, end to end: its static 500 MB against a 30 MB
+        // gate write is 16.67x. On a drive with a `capacity_override` the
+        // row IS recorded — so the gate exercises the whole path and the
+        // 16x is visible to a reader — but no warning is drawn, and the row
+        // says why. Negative controls: fold the suppression back into a
+        // skip and `events` is empty here; drop `suppressed` from
+        // `warns()` and `warned` reads true; write `"suppressed": null`
+        // instead of omitting the key and the unsuppressed tests fail.
+        let conn = crate::db::open_memory().unwrap();
+        let vid = volume(&conn, "GATE1");
+        let cid = contact(&conn);
+        journal_0x0c(&conn, cid, Some(MHVTL_0X0C), true);
+
+        let data_bytes = 30_000_000;
+        let a = assess_and_record(
+            &conn,
+            Some(cid),
+            vid,
+            "GATE1",
+            data_bytes,
+            Some(Suppression::CapacityOverride),
+        )
+        .expect("recorded even though suppressed");
+        assert_eq!(a.ratio.native_bop_to_eod_mb, 500);
+        assert!(
+            a.ratio.exceeds_threshold(),
+            "positive control: 16x IS above 1.05"
+        );
+        assert!(!a.warns(), "but a suppressed assessment does not warn");
+        assert_eq!(a.suppressed, Some(Suppression::CapacityOverride));
+
+        let rows = events_for(&conn, vid);
+        assert_eq!(rows.len(), 1, "recorded, not skipped");
+        assert_eq!(rows[0].1.as_deref(), Some("16.6667"));
+        let details: serde_json::Value =
+            serde_json::from_str(rows[0].2.as_deref().unwrap()).unwrap();
+        assert_eq!(details["source_page"], "0x0c");
+        assert_eq!(details["native_bop_to_eod_mb"], 500);
+        assert_eq!(details["data_bytes"], data_bytes);
+        assert_eq!(
+            details["warned"], false,
+            "the row never claims a warning that did not appear"
+        );
+        assert_eq!(details["suppressed"], "capacity_override");
+    }
+
+    #[test]
+    fn a_real_drive_shaped_write_at_1_48x_warns_and_records_it() {
+        // The other half of the split: no override (a real drive), 1.48x
+        // → warns, and the row says warned=true with no `suppressed`.
+        // Negative control: suppress unconditionally and `warns()` is
+        // false here.
+        let conn = crate::db::open_memory().unwrap();
+        let vid = volume(&conn, "REAL1");
+        let cid = contact(&conn);
+        journal_0x0c(&conn, cid, Some(&synthetic_0x0c(1_480)), true);
+        let a = assess_and_record(&conn, Some(cid), vid, "REAL1", 1_000_000_000, None).unwrap();
+        assert!(a.warns());
+        assert_eq!(a.suppressed, None);
+        assert!(a
+            .ratio
+            .warning_text("REAL1")
+            .starts_with("warning: volume \"REAL1\""));
+        let details: serde_json::Value =
+            serde_json::from_str(events_for(&conn, vid)[0].2.as_deref().unwrap()).unwrap();
+        assert_eq!(details["warned"], true);
+        assert!(details.get("suppressed").is_none());
     }
 
     #[test]
@@ -564,7 +702,7 @@ mod tests {
         let vid = volume(&conn, "V1");
         let cid = contact(&conn);
         assert_eq!(
-            assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000),
+            assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000, None),
             None
         );
         assert!(
@@ -575,7 +713,7 @@ mod tests {
         // A 0x0c row whose read failed.
         journal_0x0c(&conn, cid, None, false);
         assert_eq!(
-            assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000),
+            assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000, None),
             None
         );
         assert!(events_for(&conn, vid).is_empty());
@@ -583,14 +721,14 @@ mod tests {
         // A 0x0c that decoded without the line (no medium).
         journal_0x0c(&conn, cid, Some(HP_NOMEDIA_0X0C), true);
         assert_eq!(
-            assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000),
+            assess_and_record(&conn, Some(cid), vid, "V1", 1_000_000_000, None),
             None
         );
         assert!(events_for(&conn, vid).is_empty());
 
         // Positive control: the same contact with a real line IS computed.
         journal_0x0c(&conn, cid, Some(HP_LOADED_0X0C), true);
-        assert!(assess_and_record(&conn, Some(cid), vid, "V1", 23_000_000).is_some());
+        assert!(assess_and_record(&conn, Some(cid), vid, "V1", 23_000_000, None).is_some());
         assert_eq!(events_for(&conn, vid).len(), 1);
     }
 
@@ -620,7 +758,7 @@ mod tests {
         };
         log_pages::insert(&conn, &row).unwrap();
         assert_eq!(
-            assess_and_record(&conn, None, vid, "V1", 1_000_000_000),
+            assess_and_record(&conn, None, vid, "V1", 1_000_000_000, None),
             None
         );
         assert!(events_for(&conn, vid).is_empty());

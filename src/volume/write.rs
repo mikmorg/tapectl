@@ -13,6 +13,7 @@ use crate::policy::coverage;
 use crate::staging;
 use crate::tape::contact::{self, ContactSite, ContactSlot, Medium, Operation};
 use crate::tape::drive_identity;
+use crate::tape::feed_ratio;
 use crate::tape::health;
 use crate::tape::log_pages;
 use crate::tape::mam_journal::{Hook, MamReads};
@@ -1439,22 +1440,25 @@ fn volume_write_contacted<'c>(
     // Issue #338: native tape consumed per byte of data this write sent,
     // from the sweep above — read back from `log_page_journal` by contact
     // (every consumer reads the journal, migration 023), never a second
-    // read of the drive. Three conditions, each a reason the ratio would be
-    // a wrong number rather than a measurement:
+    // read of the drive. Two conditions to RECORD, each a reason the ratio
+    // would be a wrong number rather than a measurement:
     //
     // - `result.is_ok()`: an aborted or interrupted write sent fewer bytes
     //   than its Layout, so the Layout is the wrong denominator. (A
     //   quarantined write sent every byte and only failed confirm; it is
     //   NOT special-cased and gets no ratio — a deliberate omission, see
     //   `feed_ratio`'s module doc.)
-    // - `capacity_override.is_none()`: that knob exists for drives that lie
-    //   about capacity — virtual drives (mhvtl) and the microcosm harnesses,
-    //   and nothing else (ADR-0010). mhvtl lists page 0x0c and reports a
-    //   BOP→EOD of 500 MB beside "0 GB written", a figure with no relation
-    //   to any write; a drive that cannot be trusted about capacity cannot
-    //   be read for a capacity ratio.
     // - `on_tape_bytes()` is `Ok`: every entry sized, which `validate`
     //   already required of this same Layout before a byte was written.
+    //
+    // And one condition to WARN, which does not stop the recording:
+    // `capacity_override` is a knob for drives that lie about capacity —
+    // virtual drives (mhvtl) and the microcosm harnesses, and nothing else
+    // (ADR-0010). mhvtl lists page 0x0c and reports a BOP→EOD of 500 MB
+    // beside "0 GB written", a figure with no relation to any write, so on
+    // such a drive the row is recorded (the gate exercises the whole path,
+    // and the 16x is there to read) but the warning is suppressed and the
+    // row's `details` says why (`"suppressed": "capacity_override"`).
     //
     // The denominator is the WHOLE Layout, block-padded — every file from
     // the ID thunk to the seal marker, exactly the bytes the fixed-block
@@ -1463,17 +1467,22 @@ fn volume_write_contacted<'c>(
     // (`eprintln!`, the operator-facing channel, as the line-425 convention
     // has it) and never touches `result`: the volume is complete and
     // sealed; the warning is about the host.
-    if result.is_ok() && backend.capacity_override.is_none() {
+    if result.is_ok() {
         if let Ok(data_bytes) = layout_snapshot.on_tape_bytes() {
-            if let Some(ratio) = crate::tape::feed_ratio::assess_and_record(
+            let suppressed = backend
+                .capacity_override
+                .as_ref()
+                .map(|_| feed_ratio::Suppression::CapacityOverride);
+            if let Some(assessment) = feed_ratio::assess_and_record(
                 conn,
                 contact.id(),
                 volume_id,
                 label,
                 data_bytes,
+                suppressed,
             ) {
-                if ratio.exceeds_threshold() {
-                    eprintln!("{}", ratio.warning_text(label));
+                if assessment.warns() {
+                    eprintln!("{}", assessment.ratio.warning_text(label));
                 }
             }
         }
@@ -6350,20 +6359,26 @@ mod tests {
     }
 
     /// Issue #338: the feed-ratio assessment runs AFTER `volume write`'s
-    /// post-command sweep, in the same function that holds the contact, and
-    /// under exactly the three conditions its comment names. Pinned on the
-    /// source because the production probe (`HealthProbe::default()`) asks
-    /// the drive, so the wiring cannot be driven from a unit test; the
-    /// module's own tests prove the computation and the events row.
+    /// post-command sweep, in the same function that holds the contact,
+    /// RECORDED under the two conditions its comment names and WARNED only
+    /// when the drive has no `capacity_override` (the suppression travels
+    /// into the row). Pinned on the source because the production probe
+    /// (`HealthProbe::default()`) asks the drive, so the wiring cannot be
+    /// driven from a unit test; the module's own tests prove the
+    /// computation, the events row and the suppression; the mhvtl gate's
+    /// `feed_ratio_recorded` step proves the wiring on a real (virtual)
+    /// write.
     ///
     /// Negative controls, one per assertion: move the call above the sweep
     /// and the ordering check fails; drop `result.is_ok()` and an aborted
-    /// write gets a ratio against the wrong denominator; drop
-    /// `capacity_override.is_none()` and every mhvtl gate write warns at
-    /// ~16x from mhvtl's static 500 MB; add a second caller and the
-    /// one-caller count fails.
+    /// write gets a ratio against the wrong denominator; turn the
+    /// suppression back into a skip (`capacity_override.is_none()` as a
+    /// guard) and the gate's row count is zero; drop `warns()` for
+    /// `exceeds_threshold()` and every mhvtl gate write warns at ~16x from
+    /// mhvtl's static 500 MB; add a second caller and the one-caller count
+    /// fails.
     #[test]
-    fn the_feed_ratio_is_assessed_once_after_the_write_sweep_under_its_three_guards() {
+    fn the_feed_ratio_is_assessed_once_after_the_write_sweep_recorded_always_warned_unsuppressed() {
         const SRC: &str = include_str!("write.rs");
         let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(
@@ -6395,20 +6410,20 @@ mod tests {
             "the ratio reads THIS sweep's 0x0c back from the journal, so it must run after it"
         );
         let guard = &body[sweep..assess];
-        for needle in [
-            "result.is_ok()",
-            "backend.capacity_override.is_none()",
-            "layout_snapshot.on_tape_bytes()",
-        ] {
-            assert!(
-                guard.contains(needle),
-                "the assessment is gated on `{needle}`"
-            );
+        for needle in ["result.is_ok()", "layout_snapshot.on_tape_bytes()"] {
+            assert!(guard.contains(needle), "RECORDING is gated on `{needle}`");
         }
         assert!(
-            body[assess..].contains("ratio.exceeds_threshold()")
-                && body[assess..].contains("eprintln!(\"{}\", ratio.warning_text(label))"),
-            "above the threshold it WARNS on stderr, by the pinned text"
+            !guard.contains("capacity_override.is_none()")
+                && guard.contains("feed_ratio::Suppression::CapacityOverride"),
+            "a `capacity_override` SUPPRESSES the warning and is written into the row; it does \
+             not skip the recording, or the mhvtl gate could never exercise this path"
+        );
+        assert!(
+            body[assess..].contains("assessment.warns()")
+                && body[assess..]
+                    .contains("eprintln!(\"{}\", assessment.ratio.warning_text(label))"),
+            "above the threshold and unsuppressed it WARNS on stderr, by the pinned text"
         );
         assert!(
             body[assess..].trim_end().ends_with("result"),
