@@ -19,10 +19,14 @@
 //! deliberately NOT this — see `build_info::PKG_VERSION`.
 //!
 //! Re-run policy: emitting any `rerun-if-changed` switches cargo from "re-run
-//! on any package change" to "re-run only on these", so the list below must
-//! cover everything the describe string depends on — HEAD and the ref it
-//! points at (the commit), the index and the source tree (the `-dirty`
-//! suffix). Paths come from `git rev-parse --git-path`, never a literal
+//! on any package change" to "re-run only on these". The list covers HEAD and
+//! the ref it points at (the commit), the index, and the files that compile
+//! into the binary (`src`, `tests`, `examples`, `Cargo.*`, `build.rs`). Known
+//! gap: `--dirty` reflects ANY tracked file, so an edit confined to e.g.
+//! `docs/` or `scripts/` leaves a stale `-dirty` state until the next watched
+//! change or commit — accepted, because those files do not change the binary
+//! and watching them would recompile the crate on every doc edit.
+//! Paths come from `git rev-parse --git-path`, never a literal
 //! `.git/HEAD`: in a linked worktree `.git` is a FILE pointing at
 //! `.git/worktrees/<name>/`, and per-worktree HEAD lives there while the
 //! branch ref lives in the common dir. Only paths that exist are emitted —

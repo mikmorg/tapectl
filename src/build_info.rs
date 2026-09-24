@@ -124,9 +124,17 @@ mod tests {
             "expected the ID-thunk and BuildInputs writer strings in volume/write.rs to be \
              env!(\"CARGO_PKG_VERSION\") — on-tape bytes must not carry the build identity"
         );
-        assert!(
-            !write_rs.contains("build_info::VERSION"),
-            "volume/write.rs must never write build_info::VERSION to tape (ADR-0012 item 1)"
-        );
+        // Only the assignment forms: a comment in write.rs explaining why the
+        // build identity stays off the tape must not trip this.
+        for forbidden in [
+            "tapectl_version: crate::build_info::VERSION",
+            "tapectl_version: build_info::VERSION",
+        ] {
+            assert!(
+                !write_rs.contains(forbidden),
+                "volume/write.rs must never write build_info::VERSION to tape \
+                 (ADR-0012 item 1): found `{forbidden}`"
+            );
+        }
     }
 }
