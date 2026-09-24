@@ -20,7 +20,7 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# 38 checks as of #338; the `check` lines below are the list.
+# 39 checks as of #301; the `check` lines below are the list.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -361,6 +361,44 @@ PYFEED
         return 1
     fi
     echo "no 'warning: volume' line in any step log (suppressed on the gate's drive)"
+}
+
+# Issue #301: every contact journals the st driver's per-device sysfs
+# counters (/sys/class/scsi_tape/<node>/stats/*) verbatim at its open and
+# its close, so the I/O one command did is a difference of two rows. mhvtl's
+# drives go through the real st driver, so the gate's contacts carry genuine
+# readings -- without this step the capture is proven only by unit tests on a
+# fake sysfs. Positive control first: closed contacts exist.
+step_st_stats_recorded() {
+    python3 - "$HOME_DIR/tapectl.db" <<'PYST'
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+contacts = c.execute(
+    """SELECT id, operation FROM cartridge_contacts
+       WHERE closed_at IS NOT NULL ORDER BY id""").fetchall()
+assert contacts, "positive control: no closed contact -- nothing to assert st readings about"
+bad, moved = [], 0
+for cid, op in contacts:
+    rows = c.execute(
+        "SELECT point, stats_json, errors_json FROM st_stats_journal WHERE contact_id = ? ORDER BY id",
+        (cid,)).fetchall()
+    points = [r[0] for r in rows]
+    if points != ["open", "close"]:
+        bad.append(f"contact {cid} ({op}): readings {points}, expected ['open', 'close']"); continue
+    o, cl = (json.loads(r[1]) for r in rows)
+    if not o or set(o) != set(cl):
+        bad.append(f"contact {cid} ({op}): open/close file sets differ or are empty"); continue
+    if any(r[2] for r in rows):
+        bad.append(f"contact {cid} ({op}): errors_json set: {[r[2] for r in rows]}")
+    for k in ("read_byte_cnt", "write_byte_cnt"):
+        if k in o and int(cl[k].strip()) < int(o[k].strip()):
+            bad.append(f"contact {cid} ({op}): {k} went backwards ({o[k].strip()} -> {cl[k].strip()})")
+    if any(int(cl[k].strip()) > int(o[k].strip()) for k in ("read_byte_cnt", "write_byte_cnt") if k in o):
+        moved += 1
+assert not bad, "st_stats_journal wrong:\n  " + "\n  ".join(bad)
+assert moved > 0, "positive control: no contact's byte counters moved between open and close -- the readings are not measuring I/O"
+print(f"{len(contacts)} closed contacts each carry an open and a close st reading; {moved} show bytes moved across the contact")
+PYST
 }
 
 check init            step_init
@@ -1422,6 +1460,7 @@ PYNEG
 }
 check tape_alert_surfaced step_tape_alert_surfaced
 check feed_ratio_recorded step_feed_ratio_recorded
+check st_stats_recorded step_st_stats_recorded
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --

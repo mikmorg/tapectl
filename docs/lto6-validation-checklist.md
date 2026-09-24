@@ -47,7 +47,7 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
       write; the record shows `DCE 1→0` verified.
 - [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
 - [ ] The mhvtl gate is GREEN on this binary (`TAPECTL_GATE_TAPE=/dev/nst1
-      TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 38 checks as of #338).
+      TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 39 checks as of #301).
 - [ ] Nothing else will touch the drive: every harness takes `/tmp/tapectl-tape.lock`.
 - [ ] **The host is quiet** for the duration: CI runners and their timers paused, no
       heavy builds on the staging disk (`docs/operator-guide.md`, "A quiet host while

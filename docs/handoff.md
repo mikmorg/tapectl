@@ -9,7 +9,7 @@ It answers one question: **which remaining work needs a person, and which does n
 
 Every pre-production gate the CTO set is met. The `review-2026-09-13` queue is empty
 (four adversarial review rounds, the last recorded in
-`docs/audits/2026-09-23-preproduction-review-4.md`). The mhvtl gate is GREEN 38/38 with
+`docs/audits/2026-09-23-preproduction-review-4.md`). The mhvtl gate is GREEN 39/39 with
 `EXPECTED_FAIL=()`; the lifecycle suite is GREEN across all 16 scenarios on mhvtl. The
 real-drive rehearsal ran on 2026-09-23 on the HP LTO-6 passed through to this VM
 (`docs/runs/2026-09-23-real-drive-rehearsal.md`): 15 lifecycle scenarios, 342 checks,
