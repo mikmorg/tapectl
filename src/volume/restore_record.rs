@@ -125,7 +125,7 @@ pub fn record(conn: &Connection, rec: &RestoreRecord<'_>) -> Option<i64> {
             dar_stdout,
             dar_stderr,
             rec.dar_version,
-            env!("CARGO_PKG_VERSION"),
+            crate::build_info::VERSION,
         ],
     );
     match inserted {
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(r.dar_stdout.as_deref(), Some(" 3 inode(s) restored\n"));
         assert_eq!(r.dar_stderr.as_deref(), Some("a warning\n"));
         assert_eq!(r.dar_version.as_deref(), Some("2.7.13"));
-        assert_eq!(r.tapectl_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(r.tapectl_version, crate::build_info::VERSION);
     }
 
     /// NULL means dar never ran; "" means it ran and said nothing. The two

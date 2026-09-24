@@ -2689,7 +2689,7 @@ mod tests {
                     ver.split('.').count() == 3 && ver.split('.').all(|p| p.parse::<u32>().is_ok()),
                     "{ver}"
                 );
-                assert_eq!(r.tapectl_version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(r.tapectl_version, crate::build_info::VERSION);
             }
 
             /// `restore file` is ONE row of kind `file` under `restore
