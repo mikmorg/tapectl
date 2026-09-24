@@ -2093,9 +2093,7 @@ pub(crate) mod tests {
         guard.finish(OUTCOME_OK, None);
         let rows = stats_rows(&conn);
         assert_eq!(
-            rows.iter()
-                .map(|r| (r.0, r.1.as_str()))
-                .collect::<Vec<_>>(),
+            rows.iter().map(|r| (r.0, r.1.as_str())).collect::<Vec<_>>(),
             vec![(None, "open"), (None, "close")]
         );
     }
