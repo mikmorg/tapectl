@@ -20,7 +20,7 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# 37 checks as of #340; the `check` lines below are the list.
+# 38 checks as of #338; the `check` lines below are the list.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -303,6 +303,66 @@ step_restore_C() {
 }
 
 echo "gate: leg 1 — tapectl round trip"
+# Issue #338: after every completed `volume write`, the feed ratio (native
+# tape consumed per data byte, page 0x0c BOP->EOD over the Layout's on-tape
+# bytes) is RECORDED as an `events` row whether or not it warns. On mhvtl
+# page 0x0c is a static 500 MB figure, so the ratio is nonsense (~16x) and
+# the warning is suppressed by the drive's `capacity_override` -- but the
+# row must still be there, with `details.suppressed` saying why, or the
+# wiring is proven by nothing the gate runs (a source pin only). Positive
+# control first: at least one completed write contact exists.
+step_feed_ratio_recorded() {
+    python3 - "$HOME_DIR/tapectl.db" <<'PYFEED'
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+writes = c.execute(
+    """SELECT id FROM cartridge_contacts
+       WHERE operation = 'volume write' AND outcome = 'ok' AND closed_at IS NOT NULL
+       ORDER BY id""").fetchall()
+assert writes, "positive control: no completed 'volume write' contact -- nothing to assert a ratio about"
+rows = c.execute(
+    """SELECT id, entity_id, entity_label, new_value, details FROM events
+       WHERE action = 'write_feed_ratio' ORDER BY id""").fetchall()
+assert rows, (f"no write_feed_ratio event at all, yet {len(writes)} write contact(s) completed -- "
+              "the #338 assessment is not wired (or its journal read-back found no page 0x0c)")
+bad = []
+by_contact = {}
+for rid, vid, label, val, det in rows:
+    tag = f"event {rid} (volume {label})"
+    try:
+        d = json.loads(det or "")
+    except Exception as e:
+        bad.append(f"{tag}: details is not JSON ({e})"); continue
+    for k in ("source_page", "native_bop_to_eod_mb", "data_bytes", "ratio", "threshold", "warned", "contact_id"):
+        if k not in d:
+            bad.append(f"{tag}: details lacks {k!r}")
+    if d.get("source_page") != "0x0c":
+        bad.append(f"{tag}: source_page {d.get('source_page')!r}, expected '0x0c'")
+    if d.get("warned") is not False:
+        bad.append(f"{tag}: warned={d.get('warned')!r} on mhvtl (capacity_override set) -- must be false")
+    if d.get("suppressed") != "capacity_override":
+        bad.append(f"{tag}: suppressed={d.get('suppressed')!r}, expected 'capacity_override' on the gate's drive")
+    if d.get("data_bytes", 0) <= 0:
+        bad.append(f"{tag}: data_bytes {d.get('data_bytes')!r} is not positive")
+    by_contact.setdefault(d.get("contact_id"), []).append(rid)
+for (cid,) in writes:
+    n = len(by_contact.get(cid, []))
+    if n != 1:
+        bad.append(f"write contact {cid}: {n} write_feed_ratio event(s), expected exactly one")
+assert not bad, "write_feed_ratio events wrong:\n  " + "\n  ".join(bad)
+print(f"{len(rows)} write_feed_ratio event(s) for {len(writes)} completed write contact(s): "
+      f"recorded, unwarned, suppressed=capacity_override")
+PYFEED
+    # No warning may have reached stderr on mhvtl: the suppression is the
+    # point. The gate captures every step's output under $RUN/log-*.txt.
+    if grep -l "warning: volume" "$RUN"/log-*.txt 2>/dev/null | grep -q .; then
+        echo "a 'warning: volume' line reached stderr on mhvtl despite capacity_override:" >&2
+        grep -H "warning: volume" "$RUN"/log-*.txt >&2
+        return 1
+    fi
+    echo "no 'warning: volume' line in any step log (suppressed on the gate's drive)"
+}
+
 check init            step_init
 check tenants         step_tenants
 check units           step_units
@@ -1361,6 +1421,7 @@ print(f"negative: {n_2e} decoded 0x2E rows, {len(clean)} alerts=0 readings liste
 PYNEG
 }
 check tape_alert_surfaced step_tape_alert_surfaced
+check feed_ratio_recorded step_feed_ratio_recorded
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --

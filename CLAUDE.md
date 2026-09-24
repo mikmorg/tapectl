@@ -144,7 +144,7 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
   corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
   EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 37 checks as of #340).
+  removed; 38 checks as of #338).
 
 **Next:** issues #22–#28 describe the *pre-v2* design and must be read against the
 normative set above, not implemented literally.

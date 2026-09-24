@@ -70,7 +70,7 @@ severity-first in the queue and its ruling is ADR-0012's first paragraph.
   slack, so any gate failure is a hard stop rather than a known-defect pin.
   Verified across five consecutive runs on 2026-08-01 (26 checks then) when
   the last nondeterminism (#113) was removed; the list has grown since and
-  stands at 37 checks as of #340 (`tape_alert_surfaced`).
+  stands at 38 checks as of #338 (`tape_alert_surfaced`, `feed_ratio_recorded`).
 - 766 ungated tests; CI green; `cargo fmt`/`clippy -D warnings` clean.
 - **Every issue of every severity above `low` is now closed** (#69, the last
   `severity:high`, landed 2026-08-02). What remains is nine `severity:low`
