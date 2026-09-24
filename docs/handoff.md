@@ -1,6 +1,6 @@
 # Handoff: where tapectl stands, and what only you can do
 
-Rewritten 2026-09-24 (master after `d3c514e`), ruled by the CTO that day (ADR-0012's
+Rewritten 2026-09-24 (master `04e254c` and later), ruled by the CTO that day (ADR-0012's
 2026-09-24 amendment, item 10). Earlier versions of this file are in git history; they
 are dated records of the 2026-08 and 2026-09-14 states and are superseded by this one.
 It answers one question: **which remaining work needs a person, and which does not?**
@@ -48,22 +48,28 @@ and starts only when the CTO says so.
   restore-path changes and in batches otherwise; the lifecycle suite's measured-green
   invocation is `--all --device /dev/nst1 --erase short` on mhvtl.
 
-## What remains before the first production write (all ruled 2026-09-24)
+## What was done before the first production write (ruled 2026-09-24) — ALL DONE
 
-Agent work, in flight or queued; none needs the CTO's hands:
+Verified together on master `04e254c` (2026-09-24): 2054 tests, the mhvtl gate GREEN 39/39,
+lifecycle `--all` GREEN (412 checks, 402 passed, 0 failed, 10 structural skips), and
+`scripts/first-run.sh` end to end on mhvtl.
 
-1. **Build identity** — `--version` and every journal row name the commit the binary was
-   built from; on-tape bytes unchanged.
-2. **#301** (kernel per-device tape counters at each contact) and **#306** (`restore`
-   records what it did, keeps dar's report) — the two forensics items whose data is lost
-   if not captured. #300 is closed as satisfied by #320 and #339.
-3. **#342** — `volume write`/`verify` sweep on every outcome after the contact opened.
-4. **A formal install procedure** — `docs/install.md`, `scripts/install-systemd.sh`, the
-   audit and catalog-backup timers and the `tapectl-op` wrapper, all installed by
-   `first-run.sh`, all removable.
-5. **The quiet-host check** — step 13 and `volume write`'s pre-flight warn when known
-   contenders are active or the host is loaded, and ask; never a refusal.
-6. **This file and `docs/lto6-validation-checklist.md` rewritten** to the current state.
+1. **Build identity** — `tapectl --version` and every journal row name the commit
+   (`0.1.0 (<sha>, <date>)`); on-tape bytes unchanged (pinned by test).
+2. **#301** — every contact journals the st driver's sysfs counters at its open and close
+   (migration 025; gate step `st_stats_recorded`). **#306** — every restore writes a
+   `restores` row with dar's report verbatim (migration 024). #300 closed as satisfied.
+3. **#342** — write, resume and verify sweep on every outcome after the contact opened.
+4. **The install procedure** — `docs/install.md`, `scripts/install-systemd.sh`, the audit
+   and catalog-backup timers and the `tapectl-op` wrapper, installed by `first-run.sh`
+   step 14 and removable by `--uninstall`.
+5. **The quiet-host check** — `tapectl host check`; `volume write` asks when the host is
+   loaded, short of memory or running a listed contender; step 13 shows the findings and
+   the pause commands. A warning and a question, never a refusal.
+6. **This file and `docs/lto6-validation-checklist.md`** rewritten to the current state.
+
+Follow-ups filed, all post-production: #343 (dar's `-c` report at staging), #344 (MTIOCGET
+and sense capture).
 
 ## Only you can do these
 
