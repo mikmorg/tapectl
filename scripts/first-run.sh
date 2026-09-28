@@ -434,7 +434,7 @@ if [ "$SKIP_TESTS" = 1 ]; then note "--skip-tests"; else
 explain <<'EOF'
 `cargo test` runs about 1,960 tests that need no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
 EOF
-if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && PATH="$(dar_path_prefix)$PATH" run flock -w 1200 -E 99 "$BUILD_LOCK" cargo test ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
+if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && PATH="$(dar_path_prefix)$PATH" run flock -w 1200 -E 99 "$BUILD_LOCK" cargo test </dev/null ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
 fi
 }
 

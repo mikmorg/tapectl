@@ -1747,11 +1747,10 @@ fn run_deposit(
 /// This is NOT routed through `cli::consent::confirm`. That is the Tier-2
 /// y/N gate; this is a VALUE the operator has to supply, and there is no
 /// safe default to assume — `--yes` cannot invent a label. So the terminal
-/// check is the same (`std::io::IsTerminal`, no new dependency) and the
+/// check is the same (`consent::stdin_is_terminal`, false in a test build) and the
 /// override is `--to`.
 fn resolve_compact_destination(to: Option<&str>) -> Result<String> {
-    use std::io::IsTerminal;
-    resolve_compact_destination_with(to, std::io::stdin().is_terminal(), || {
+    resolve_compact_destination_with(to, crate::cli::consent::stdin_is_terminal(), || {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         Ok(input)

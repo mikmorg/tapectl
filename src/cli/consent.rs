@@ -47,18 +47,23 @@ use crate::error::{Result, TapectlError};
 /// asked ABOUT — which reads as an arbitrary block the moment a gate turns
 /// on something less obvious than zero copies (issue #147 added exactly
 /// such a gate: "left with 1 copy, below its policy of 2").
+/// Whether stdin is an interactive terminal — the one place the answer is
+/// read. In a unit-test build it is always `false`: `cargo test` does NOT
+/// capture stdin, so a suite run from a terminal (first-run.sh step 4 on
+/// home2, 2026-09-28) otherwise reaches a real prompt in every test that
+/// calls a gated command with `assume_yes: false` — the prompt reads the
+/// terminal, and the "refuses without consent" assertions fail or hang.
+/// Tests that need the interactive branch inject it through `confirm_with`.
+pub(crate) fn stdin_is_terminal() -> bool {
+    !cfg!(test) && std::io::stdin().is_terminal()
+}
+
 pub fn confirm(action: &str, facts: &[String], assume_yes: bool) -> Result<()> {
-    confirm_with(
-        action,
-        facts,
-        assume_yes,
-        std::io::stdin().is_terminal(),
-        || {
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            Ok(input)
-        },
-    )
+    confirm_with(action, facts, assume_yes, stdin_is_terminal(), || {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        Ok(input)
+    })
 }
 
 /// [`confirm`] with the TTY check and the stdin read both injected, so

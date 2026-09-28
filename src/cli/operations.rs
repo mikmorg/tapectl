@@ -6052,10 +6052,10 @@ mod tests {
         #[test]
         fn non_interactive_without_consent_refuses_and_changes_nothing() {
             let (conn, cart_id, vol_id) = setup(false);
-            // assume_yes=false, force=false. `confirm()` reads the real
-            // `stdin().is_terminal()`, which is false under `cargo test`'s
-            // captured stdin -- and `cli::consent`'s own tests prove that
-            // branch never attempts a read.
+            // assume_yes=false, force=false. `confirm()` asks
+            // `consent::stdin_is_terminal()`, which is false in a test build
+            // whatever stdin is (cargo test does not capture stdin) -- and
+            // `cli::consent`'s own tests prove that branch never reads.
             let err = cartridge_retire(
                 &conn,
                 &Config::default(),
