@@ -176,46 +176,113 @@ pub fn rename_unit(conn: &Connection, current_name: &str, new_name: &str) -> Res
         Some(unit.tenant_id),
     )?;
 
-    // Update dotfile if path exists.
-    //
-    // Failures here are WARNED, not swallowed (issue #110). The rename has
-    // already been committed to the database, so a dotfile that does not get
-    // rewritten leaves the unit's on-disk identity stale -- and the operator
-    // has no other signal that it happened. It is deliberately not an error:
-    // the database is authoritative for the name, and failing the whole
-    // rename after it has been recorded would be worse than a stale dotfile.
-    // But silence was wrong; the two failure modes are named separately
-    // because they need different fixes (unreadable/corrupt file vs an
-    // unwritable one).
-    if let Some(ref path) = unit.current_path {
-        let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
-        if dotfile_path.exists() {
-            match dotfile::read_dotfile(&dotfile_path) {
-                Ok(mut df) => {
-                    df.name = new_name.to_string();
-                    if let Err(e) = dotfile::write_dotfile(&dotfile_path, &df) {
-                        warn!(
-                            path = %dotfile_path.display(),
-                            error = %e,
-                            new_name,
-                            "unit renamed in the database, but its .tapectl-unit.toml \
-                             could not be rewritten — the dotfile still carries the old \
-                             name and must be corrected by hand"
-                        );
-                    }
-                }
-                Err(e) => warn!(
-                    path = %dotfile_path.display(),
-                    error = %e,
-                    new_name,
-                    "unit renamed in the database, but its .tapectl-unit.toml could not \
-                     be read, so the name on disk is now stale"
-                ),
-            }
-        }
-    }
+    rewrite_dotfile(
+        unit.current_path.as_deref(),
+        &DotfileChange {
+            done: "renamed",
+            stale_when_unwritten: "the old name",
+            stale_when_unreadable: "the name on disk is now stale",
+        },
+        |df| df.name = new_name.to_string(),
+    );
 
     Ok(())
+}
+
+/// Add and remove tags on `unit`, then mirror the resulting set into its
+/// `.tapectl-unit.toml` (issue #359). Returns the tag set the database now
+/// holds.
+///
+/// The dotfile's `tags` are what `unit discover` and `collection sync`
+/// register when they adopt a unit the database does not know yet, so a
+/// dotfile left behind by `unit tag` would quietly bring the old tags back
+/// on a rebuilt catalog. The whole resulting set is written (not just the
+/// delta), so a dotfile that had drifted from the database is corrected too.
+/// The dotfile rewrite follows `rename_unit`'s rule: warned, never fatal.
+pub fn tag_unit(
+    conn: &Connection,
+    unit: &crate::db::models::Unit,
+    add: &[String],
+    remove: &[String],
+) -> Result<Vec<String>> {
+    for tag in add {
+        queries::add_tag_to_unit(conn, unit.id, tag)?;
+    }
+    for tag in remove {
+        queries::remove_tag_from_unit(conn, unit.id, tag)?;
+    }
+    let tags = queries::get_tags_for_unit(conn, unit.id)?;
+
+    rewrite_dotfile(
+        unit.current_path.as_deref(),
+        &DotfileChange {
+            done: "re-tagged",
+            stale_when_unwritten: "the old tags",
+            stale_when_unreadable: "the tags on disk are now stale",
+        },
+        |df| df.tags = tags.clone(),
+    );
+    Ok(tags)
+}
+
+/// How to word the warning when a database change could not be mirrored
+/// into the unit's dotfile. See `rewrite_dotfile`.
+struct DotfileChange {
+    /// Past participle for "unit ___ in the database" ("renamed").
+    done: &'static str,
+    /// What the unwritten dotfile still carries ("the old name").
+    stale_when_unwritten: &'static str,
+    /// The consequence of an unreadable dotfile ("the name on disk is now
+    /// stale").
+    stale_when_unreadable: &'static str,
+}
+
+/// Read -> mutate -> write the dotfile under `current_path`, after a change
+/// the database has ALREADY committed. Absent path or absent dotfile: nothing
+/// to do.
+///
+/// Failures are WARNED, not swallowed and not returned (issue #110). The
+/// database is authoritative, and failing the command after the change has
+/// been recorded would be worse than a stale dotfile -- but silence was
+/// wrong; the operator has no other signal. The two failure modes are named
+/// separately because they need different fixes (an unreadable or corrupt
+/// file vs an unwritable one). The round trip goes through
+/// `dotfile::read_dotfile`/`write_dotfile`, which model every `[policy]` key,
+/// so nothing the mutation does not touch is lost (issue #212).
+fn rewrite_dotfile(
+    current_path: Option<&str>,
+    change: &DotfileChange,
+    mutate: impl FnOnce(&mut dotfile::UnitDotfile),
+) {
+    let Some(path) = current_path else {
+        return;
+    };
+    let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
+    if !dotfile_path.exists() {
+        return;
+    }
+    match dotfile::read_dotfile(&dotfile_path) {
+        Ok(mut df) => {
+            mutate(&mut df);
+            if let Err(e) = dotfile::write_dotfile(&dotfile_path, &df) {
+                warn!(
+                    path = %dotfile_path.display(),
+                    error = %e,
+                    "unit {} in the database, but its .tapectl-unit.toml could not be \
+                     rewritten — the dotfile still carries {} and must be corrected by hand",
+                    change.done,
+                    change.stale_when_unwritten,
+                );
+            }
+        }
+        Err(e) => warn!(
+            path = %dotfile_path.display(),
+            error = %e,
+            "unit {} in the database, but its .tapectl-unit.toml could not be read, so {}",
+            change.done,
+            change.stale_when_unreadable,
+        ),
+    }
 }
 
 /// Generate an auto-name from a filesystem path.

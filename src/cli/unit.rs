@@ -351,13 +351,8 @@ pub fn run(
                 }
                 return Ok(());
             }
-            for tag in add {
-                queries::add_tag_to_unit(conn, unit.id, tag)?;
-            }
-            for tag in remove {
-                queries::remove_tag_from_unit(conn, unit.id, tag)?;
-            }
-            let tags = queries::get_tags_for_unit(conn, unit.id)?;
+            // Issue #359: the database AND the unit's dotfile.
+            let tags = crate::unit::tag_unit(conn, &unit, add, remove)?;
             if json_output {
                 println!("{}", serde_json::json!({"name": unit.name, "tags": tags}));
             } else {
@@ -700,5 +695,148 @@ mod tests {
 
         show_dirty_status(&conn, "unit1", false, &[]).expect("plain output must succeed");
         show_dirty_status(&conn, "unit1", true, &[]).expect("json output must succeed");
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    //! Issue #359(a): `unit tag` must leave the unit's dotfile agreeing
+    //! with the database, exactly as `unit rename` does -- otherwise a
+    //! later adoption (`unit discover`, `collection sync`) or rebuild from
+    //! the dotfile restores the tags the operator removed.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn harness() -> (Connection, TempDir, TapectlPaths) {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        (conn, tmp, paths)
+    }
+
+    fn run_cmd(conn: &Connection, paths: &TapectlPaths, cmd: UnitCommands) {
+        run(conn, paths, &Config::default(), &cmd, false, false).unwrap();
+    }
+
+    #[test]
+    fn unit_tag_writes_the_resulting_tags_into_the_dotfile() {
+        let (conn, tmp, paths) = harness();
+        let src = tmp.path().join("photos");
+        std::fs::create_dir_all(&src).unwrap();
+        run_cmd(
+            &conn,
+            &paths,
+            UnitCommands::Init {
+                path: src.to_string_lossy().to_string(),
+                tenant: "alice".into(),
+                name: Some("photos".into()),
+                tag: vec!["old".into()],
+                archive_set: None,
+            },
+        );
+        let dotfile_path = src.join(".tapectl-unit.toml");
+        // Hand-set a policy key, to prove the rewrite round-trips it.
+        let mut raw = std::fs::read_to_string(&dotfile_path).unwrap();
+        raw.push_str("\n[policy]\nslice_size = \"500M\"\n");
+        std::fs::write(&dotfile_path, raw).unwrap();
+
+        run_cmd(
+            &conn,
+            &paths,
+            UnitCommands::Tag {
+                name: "photos".into(),
+                add: vec!["family".into(), "vacation".into()],
+                remove: vec!["old".into()],
+            },
+        );
+
+        let df = crate::unit::dotfile::read_dotfile(&dotfile_path).unwrap();
+        assert_eq!(
+            df.tags,
+            vec!["family".to_string(), "vacation".to_string()],
+            "the dotfile must carry the tag set the database now holds"
+        );
+        assert_eq!(
+            df.slice_size.as_deref(),
+            Some("500M"),
+            "rewriting the tags must not drop a [policy] key"
+        );
+        let unit = queries::get_unit_by_name(&conn, "photos").unwrap().unwrap();
+        assert_eq!(queries::get_tags_for_unit(&conn, unit.id).unwrap(), df.tags);
+    }
+
+    /// A dry run changes nothing -- neither the database nor the dotfile.
+    #[test]
+    fn unit_tag_dry_run_leaves_the_dotfile_alone() {
+        let (conn, tmp, paths) = harness();
+        let src = tmp.path().join("photos");
+        std::fs::create_dir_all(&src).unwrap();
+        run_cmd(
+            &conn,
+            &paths,
+            UnitCommands::Init {
+                path: src.to_string_lossy().to_string(),
+                tenant: "alice".into(),
+                name: Some("photos".into()),
+                tag: vec!["old".into()],
+                archive_set: None,
+            },
+        );
+        let dotfile_path = src.join(".tapectl-unit.toml");
+        let before = std::fs::read_to_string(&dotfile_path).unwrap();
+        run(
+            &conn,
+            &paths,
+            &Config::default(),
+            &UnitCommands::Tag {
+                name: "photos".into(),
+                add: vec!["new".into()],
+                remove: vec!["old".into()],
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&dotfile_path).unwrap(), before);
+    }
+
+    /// A unit whose dotfile is corrupt still gets its tags changed in the
+    /// database -- the same warn-not-fail rule as `unit rename` (issue
+    /// #110): the database is authoritative and has already committed.
+    #[test]
+    fn unit_tag_with_an_unreadable_dotfile_still_tags_in_the_database() {
+        let (conn, tmp, paths) = harness();
+        let src = tmp.path().join("photos");
+        std::fs::create_dir_all(&src).unwrap();
+        run_cmd(
+            &conn,
+            &paths,
+            UnitCommands::Init {
+                path: src.to_string_lossy().to_string(),
+                tenant: "alice".into(),
+                name: Some("photos".into()),
+                tag: vec![],
+                archive_set: None,
+            },
+        );
+        std::fs::write(src.join(".tapectl-unit.toml"), "not [ valid toml = =").unwrap();
+        run_cmd(
+            &conn,
+            &paths,
+            UnitCommands::Tag {
+                name: "photos".into(),
+                add: vec!["family".into()],
+                remove: vec![],
+            },
+        );
+        let unit = queries::get_unit_by_name(&conn, "photos").unwrap().unwrap();
+        assert_eq!(
+            queries::get_tags_for_unit(&conn, unit.id).unwrap(),
+            vec!["family".to_string()]
+        );
     }
 }
