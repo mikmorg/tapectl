@@ -1338,8 +1338,9 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 /// Routes through the shared ADR-0004 predicate
 /// (`policy::coverage::eligible`): a write's own `status = 'completed'`
 /// only proves its volume was sealed at write time, not that it still is.
-/// The audit's volume-level compaction check: every volume whose live-byte
-/// utilization has fallen below `threshold` yields one `compaction_candidate`
+/// The audit's volume-level compaction check: every volume whose live data
+/// has fallen below `threshold` of the archive data written to it, AND
+/// which holds some reclaimable data, yields one `compaction_candidate`
 /// warning.
 ///
 /// Group-A (issue #96): compaction targets a *finished* volume, so the
@@ -1350,45 +1351,29 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 /// indistinguishable from a clean result. That is the failure ADR-0001
 /// exists to prevent.
 ///
+/// Issue #353: the ratio and the candidate rule are
+/// [`crate::cli::report::CompactionRow`]'s — the same derivation `report
+/// compaction-candidates` prints — measured over slice data only, never
+/// `volumes.bytes_written` (which includes the fixed per-volume metadata
+/// and made every small fresh volume look half dead).
+///
 /// The caller keeps the `unit_filter.is_none()` gate: this is a volume-level
 /// check and must not start firing for `audit --unit X`.
 fn compaction_findings(conn: &Connection, threshold: f64) -> Result<Vec<AuditFinding>> {
-    let sql = format!(
-        "SELECT v.label, v.bytes_written,
-                SUM(CASE WHEN s.status NOT IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as live_bytes
-         FROM volumes v
-         JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
-         JOIN stage_sets sts ON sts.id = w.stage_set_id
-         JOIN snapshots s ON s.id = sts.snapshot_id
-         JOIN stage_slices ss ON ss.stage_set_id = sts.id
-         WHERE {}
-         GROUP BY v.id",
-        crate::policy::coverage::eligible("v")
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let candidates: Vec<(String, i64, i64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut findings = Vec::new();
-    for (label, total, live) in &candidates {
-        if *total > 0 {
-            let utilization = *live as f64 / *total as f64;
-            if utilization < threshold {
-                findings.push(AuditFinding {
-                    unit: format!("volume:{label}"),
-                    check: "compaction_candidate".into(),
-                    message: format!(
-                        "utilization {:.0}% < {:.0}% threshold",
-                        utilization * 100.0,
-                        threshold * 100.0
-                    ),
-                    action: format!("tapectl volume compact-read {label}"),
-                });
-            }
-        }
-    }
-    Ok(findings)
+    Ok(crate::cli::report::compaction_candidate_rows(conn)?
+        .into_iter()
+        .filter(|row| row.is_candidate(threshold))
+        .map(|row| AuditFinding {
+            unit: format!("volume:{}", row.label),
+            check: "compaction_candidate".into(),
+            message: format!(
+                "{}, below the {:.0}% compaction threshold",
+                row.describe_utilization(),
+                threshold * 100.0
+            ),
+            action: format!("tapectl volume compact-read {}", row.label),
+        })
+        .collect())
 }
 
 // `Scope::Archive` adapters for the three archive-wide functions above: same
@@ -1996,6 +1981,45 @@ mod tests {
             );
             assert_eq!(findings[0].unit, "volume:SEAL01");
             assert_eq!(findings[0].check, "compaction_candidate");
+        }
+
+        /// Issue #353: a freshly written volume whose archive data is small
+        /// next to its fixed metadata (ID thunk, guide, RESTORE.sh, front
+        /// index, envelopes, seal marker — all counted in
+        /// `volumes.bytes_written`) used to read as "utilization 10%" and
+        /// was told to `compact-read`, which reclaims nothing. With no
+        /// reclaimable/purged slices on it there is nothing to compact.
+        #[test]
+        fn compaction_check_never_flags_a_fresh_volume_with_no_dead_slices() {
+            let (conn, unit_id) = setup();
+            // 1000 bytes written, of which only 100 are slice data, all live.
+            seed_written_volume(&conn, unit_id, "FRESH1", "sealed", 1000, 100, 0);
+
+            let findings = compaction_findings(&conn, 0.50).unwrap();
+            assert!(
+                findings.is_empty(),
+                "a volume with no reclaimable data is never a compaction candidate: {findings:?}"
+            );
+        }
+
+        /// Issue #353: the percentage is live archive data over all archive
+        /// data written to the volume — fixed metadata excluded — and the
+        /// message says so, rather than a bare "utilization N%".
+        #[test]
+        fn compaction_message_says_what_the_percentage_measures() {
+            let (conn, unit_id) = setup();
+            // bytes_written (5000) is deliberately NOT live + dead (1000):
+            // the percentage must come from the slice data alone.
+            seed_written_volume(&conn, unit_id, "SEAL09", "sealed", 5000, 300, 700);
+
+            let findings = compaction_findings(&conn, 0.50).unwrap();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].message,
+                "live data is 30% of the archive data on this volume \
+                 (300 B live, 700 B in reclaimable/purged snapshots), \
+                 below the 50% compaction threshold"
+            );
         }
 
         // --- policy_unresolvable action text (issue #114) -----------------
@@ -3716,6 +3740,35 @@ mod tests {
                 "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
                  VALUES (?1, ?2, ?3, 'completed')",
                 params![stage_set2_id, snap2_id, vol2_id],
+            )
+            .unwrap();
+            // Issue #353: utilization is live data over the archive data
+            // written (never `bytes_written`), and a volume with nothing
+            // reclaimable is never a candidate — so the 10% needs real dead
+            // data: a reclaimable version holding 900 of the 1000 bytes.
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 0, 'full', 'reclaimable', '/src2')",
+                params![unit2_id],
+            )
+            .unwrap();
+            let dead_snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![dead_snap_id],
+            )
+            .unwrap();
+            let dead_stage_set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (?1, 0, 900, 900, 'p', 'e')",
+                params![dead_stage_set_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![dead_stage_set_id, dead_snap_id, vol2_id],
             )
             .unwrap();
 

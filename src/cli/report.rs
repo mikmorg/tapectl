@@ -2060,12 +2060,73 @@ fn report_events(
     Ok(())
 }
 
-/// Compaction-candidate rows: `(label, total_bytes, live_bytes,
-/// reclaimable_bytes)`. Group-A (issue #96): compaction only ever targets a
-/// *finished* volume, so this is the ADR-0004 `sealed` predicate.
-fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<(String, i64, i64, i64)>> {
+/// One sealed volume's archive-data accounting for compaction (issue #353).
+///
+/// Every figure here is SLICE data (`stage_slices.encrypted_bytes` of the
+/// stage sets completed-written to the volume). The volume's fixed
+/// metadata — ID thunk, system guide, RESTORE.sh, front index, envelopes,
+/// seal marker — is deliberately left out: `volumes.bytes_written` counts
+/// it, and dividing live data by that total made every small, freshly
+/// written volume read as "half dead" and advised a `compact-read` that
+/// would reclaim nothing. Compaction can only ever free the bytes of
+/// reclaimable/purged snapshots, so those are what the ratio is against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionRow {
+    pub label: String,
+    /// Slice bytes of snapshots that are still live (not reclaimable or
+    /// purged) — what a compaction would have to carry forward.
+    pub live_bytes: i64,
+    /// Slice bytes of reclaimable/purged snapshots — what a compaction
+    /// would free.
+    pub reclaimable_bytes: i64,
+}
+
+impl CompactionRow {
+    /// All archive data ever written to the volume: live + reclaimable.
+    pub fn data_bytes(&self) -> i64 {
+        self.live_bytes + self.reclaimable_bytes
+    }
+
+    /// Live data as a fraction of [`Self::data_bytes`]; 1.0 for a volume
+    /// holding no slice data at all (nothing to reclaim).
+    pub fn utilization(&self) -> f64 {
+        let data = self.data_bytes();
+        if data > 0 {
+            self.live_bytes as f64 / data as f64
+        } else {
+            1.0
+        }
+    }
+
+    /// Whether this volume is a compaction candidate under `threshold`.
+    /// A volume with NO reclaimable data is never one, whatever its ratio:
+    /// compacting it frees nothing (issue #353).
+    pub fn is_candidate(&self, threshold: f64) -> bool {
+        self.reclaimable_bytes > 0 && self.utilization() < threshold
+    }
+
+    /// What the percentage measures, in words — shared by `audit`'s
+    /// `compaction_candidate` finding and `report compaction-candidates`
+    /// so the two can never describe the number differently.
+    pub fn describe_utilization(&self) -> String {
+        format!(
+            "live data is {:.0}% of the archive data on this volume ({} live, {} in \
+             reclaimable/purged snapshots)",
+            self.utilization() * 100.0,
+            crate::util::format_bytes_binary(self.live_bytes),
+            crate::util::format_bytes_binary(self.reclaimable_bytes),
+        )
+    }
+}
+
+/// Compaction rows for every sealed volume holding completed writes, least
+/// utilized first. Group-A (issue #96): compaction only ever targets a
+/// *finished* volume, so this is the ADR-0004 `sealed` predicate. The one
+/// derivation behind both `report compaction-candidates` and `audit`'s
+/// `compaction_candidate` check (issue #353) — never a second copy.
+pub(crate) fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<CompactionRow>> {
     let sql = format!(
-        "SELECT v.label, v.bytes_written,
+        "SELECT v.label,
                 SUM(CASE WHEN s.status NOT IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as live_bytes,
                 SUM(CASE WHEN s.status IN ('reclaimable','purged') THEN ss.encrypted_bytes ELSE 0 END) as reclaimable_bytes
          FROM volumes v
@@ -2075,13 +2136,17 @@ fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<(String, i64, i64,
          JOIN stage_slices ss ON ss.stage_set_id = sts.id
          WHERE {}
          GROUP BY v.id
-         ORDER BY live_bytes * 1.0 / NULLIF(v.bytes_written, 0) ASC",
+         ORDER BY live_bytes * 1.0 / NULLIF(live_bytes + reclaimable_bytes, 0) ASC, v.label ASC",
         crate::policy::coverage::eligible("v")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok(CompactionRow {
+                label: row.get(0)?,
+                live_bytes: row.get(1)?,
+                reclaimable_bytes: row.get(2)?,
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -2099,46 +2164,30 @@ fn report_compaction_candidates(
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(label, total, live, reclaimable)| {
-                let util = if *total > 0 {
-                    *live as f64 / *total as f64
-                } else {
-                    1.0
-                };
+            .map(|r| {
                 serde_json::json!({
-                    "volume": label, "total_bytes": total, "live_bytes": live,
-                    "reclaimable_bytes": reclaimable, "utilization": util,
-                    "flagged": util < threshold,
+                    "volume": r.label, "data_bytes": r.data_bytes(), "live_bytes": r.live_bytes,
+                    "reclaimable_bytes": r.reclaimable_bytes, "utilization": r.utilization(),
+                    "flagged": r.is_candidate(threshold),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         let mut flagged = 0;
-        for (label, total, live, reclaimable) in &rows {
-            let util = if *total > 0 {
-                *live as f64 / *total as f64
-            } else {
-                1.0
-            };
-            let flag = if util < threshold {
+        for r in &rows {
+            let flag = if r.is_candidate(threshold) {
+                flagged += 1;
                 " *** CANDIDATE ***"
             } else {
                 ""
             };
-            if util < threshold {
-                flagged += 1;
-            }
-            println!(
-                "  {label}: {:.0}% utilized ({} live, {} reclaimable){flag}",
-                util * 100.0,
-                crate::util::format_bytes_binary(*live),
-                crate::util::format_bytes_binary(*reclaimable),
-            );
+            println!("  {}: {}{flag}", r.label, r.describe_utilization());
         }
         if flagged == 0 {
             println!(
-                "no compaction candidates (threshold: {:.0}%)",
+                "no compaction candidates (threshold: live data below {:.0}% of the archive \
+                 data on a volume)",
                 threshold * 100.0
             );
         }
@@ -3289,8 +3338,34 @@ mod tests {
                 1,
                 "a sealed volume must be evaluated, got {rows:?}"
             );
-            assert_eq!(rows[0].0, "SEAL01");
-            assert_eq!((rows[0].1, rows[0].2, rows[0].3), (1000, 100, 900));
+            assert_eq!(
+                rows[0],
+                CompactionRow {
+                    label: "SEAL01".into(),
+                    live_bytes: 100,
+                    reclaimable_bytes: 900,
+                }
+            );
+            assert!(rows[0].is_candidate(0.50));
+        }
+
+        /// Issue #353: the ratio is slice data only. `bytes_written` (here
+        /// 1000, mostly fixed metadata) is not the denominator, and a volume
+        /// with nothing reclaimable is never flagged — `report
+        /// compaction-candidates` and `audit` share this rule.
+        #[test]
+        fn compaction_rows_measure_archive_data_not_bytes_written() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "FRESH2", "sealed", 1000, 100, 0);
+
+            let rows = compaction_candidate_rows(&conn).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].data_bytes(), 100);
+            assert!((rows[0].utilization() - 1.0).abs() < f64::EPSILON);
+            assert!(
+                !rows[0].is_candidate(0.99),
+                "no reclaimable data means nothing to compact, at any threshold"
+            );
         }
 
         #[test]
