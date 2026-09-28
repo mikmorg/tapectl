@@ -1,5 +1,10 @@
 # LTO-6 Drive Passthrough (home2 → vm-desk1)
 
+> **2026-09-28:** production moved to home2 (ADR-0012), and the drive's hostdev is
+> detached from `vm-desk1` by `contrib/hosts/home2-prep.sh`. This page is how to lend it
+> back for a real-drive session; the hostdev fragment is `contrib/hosts/home2-lto6-hostdev.xml`.
+> The controller stays attached. Detach the drive again before any production contact.
+
 How the real HP LTO-6 drive reaches the development VM, why it is wired
 this way, and what to watch out for. Applied 2026-09-10.
 

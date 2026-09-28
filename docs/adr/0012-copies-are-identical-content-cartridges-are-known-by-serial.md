@@ -906,3 +906,40 @@ stays on hold until the CTO calls it.*
 10. **`docs/handoff.md` and `docs/lto6-validation-checklist.md` are rewritten** to the
     current state; dated run records stay as they are.
 
+
+## Amendment, 2026-09-28 — production runs on home2, not on the VM
+
+*Ruled by the CTO on 2026-09-28, answering the readiness review of that day. It replaces
+item 7 of the 2026-09-23 (evening) amendment ("production runs on this VM with the drive
+passed through"). The host facts it rests on were surveyed read-only that day and are
+recorded in `contrib/hosts/home2.profile` and `contrib/hosts/home2-prep.sh`.*
+
+1. **The production host is home2**, the Dom-0 (Debian 10, kernel 4.19), not `vm-desk1`.
+   The drive belongs to one host: its SCSI hostdev is **detached from `vm-desk1`**, because
+   the two hosts share no tape lock and a drive visible to both is a drive two writers can
+   open. `vm-desk1` keeps mhvtl; a real-drive session there means re-attaching the hostdev
+   (`contrib/hosts/home2-lto6-hostdev.xml`) and detaching it before the next production
+   contact.
+2. **The 2026-09-13 home on home2 is deleted, not adopted.** It was initialised before
+   ADR-0010 and minted an escrow identity no tape carries (its catalog records no volume).
+   The escrow identity of production is minted by the fresh `init`, at the Heir Kit ceremony.
+3. **Placement on home2:** the tapectl home on `/srv/archive_meta` (the service user's home
+   moves there; `/var` is 95% full); staging on `/srv/acache/tapectl-staging` (acache goes back
+   to root:root); the catalog backup on `/srv/local_backup/tapectl`, a different array from
+   the home and LUKS-encrypted like it — the backup is the catalog only, never keys.
+4. **dar 2.7.21 is built into `/usr/local`** with libdar linked statically, and named in
+   `[dar] binary`. Buster's 2.6.2 meets the floor but was never under the current suite.
+5. **Tenants are rings of trust held as keys:** the operator `mikmorg`, then `parents`, then
+   `family`. A unit belongs to one tenant; "the parents can read family data" is the family
+   key in the parents' hands, never one unit encrypted to two tenants.
+6. **The first production tape is all of `/srv/keepsake/original-data` (~1.3 TB)**, as the
+   collection `keepsake` owned by `family`, one unit per folder. This overrides item 4 of the
+   2026-09-24 amendment ("the first production cycle is small"): the staging disk is there
+   (~2.3 TB free). Expected at the measured #326 rates: ~20 h staging, ~40 h write + confirm,
+   a verify of similar length, then the write again for copy 2.
+7. **No contender units on home2:** nothing there touches acache or the drive. The load and
+   memory checks stay; memory and I/O pressure cannot be measured on 4.19 (no PSI), and
+   `host check` now says so in its verdict.
+8. **Cartridges carry no barcode stickers yet.** Each is known by its chip serial, which
+   `volume init` records as its placeholder barcode (as ruled on 2026-09-14);
+   `cartridge relabel` applies the sticker later.

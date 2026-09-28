@@ -1,0 +1,13 @@
+<!-- The HP LTO-6 as vm-desk1 saw it: a SCSI hostdev from home2's scsi_host4
+     (the PERC's SAS port), target 4, unit 0. contrib/hosts/home2-prep.sh
+     detaches it (production owns the drive from home2); to lend it back to
+     vm-desk1 for a real-drive session, on home2:
+       virsh -c qemu:///system attach-device vm-desk1 contrib/hosts/home2-lto6-hostdev.xml --live
+     and detach it again before the next production contact. The two hosts
+     share no tape lock. Check `lsscsi -H` first: the host number can move. -->
+<hostdev mode='subsystem' type='scsi' managed='no' rawio='yes'>
+  <source>
+    <adapter name='scsi_host4'/>
+    <address bus='0' target='4' unit='0'/>
+  </source>
+</hostdev>

@@ -43,12 +43,9 @@
 # Testing this script against mhvtl (never the real drive) is done with a binary
 # the service user can execute (your home is not traversable by it). Under
 # --home, step 14 only PRINTS the installer's plan (--dry-run): a throwaway
-# home never installs host-wide timers.
-#   install -m 0755 target/debug/tapectl /scratch/fr-bin/tapectl
-#   scripts/first-run.sh --auto --home /tmp/fr-home --tapectl /scratch/fr-bin/tapectl \
-#       --device /dev/tape/by-id/scsi-XYZZY_A1-nst --sg /dev/sg1 --generation LTO-8 --label L6-TEST \
-#       --barcode <mtx VolumeTag> --location home-rack --kit-out /scratch/fr-kit \
-#       --tenant alice --unit-path /tmp/fr-src/photos --skip-build --skip-tests
+# home never installs host-wide timers. The recipe is in the profile that
+# drives it: contrib/hosts/vm-desk1-mhvtl.profile (a production host has its
+# own, e.g. contrib/hosts/home2.profile).
 set -euo pipefail
 
 # ---------------------------------------------------------------- arguments
@@ -62,6 +59,28 @@ LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
 SKIP_BUILD=0; SKIP_TESTS=0
 SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
 BACKUP_DIR="/var/backups/tapectl"  # step 14: where the daily `db backup` copies go
+# Host-specific defaults. A --profile file (contrib/hosts/*.profile) sets these;
+# flags given on the command line still win. Empty = the built-in behaviour.
+WORK_DIR=""            # build lock + step-12 rehearsal workspace; default /scratch if present, else ~/.cache/tapectl
+STAGING_DIR=""         # step 7: staging.directory default
+DAR_BIN=""             # step 2/4/7: the dar to check, test with and write into [dar] binary
+SVC_HOME_WANT=""       # step 5: home for a NEW service user (default /var/lib/<user>)
+LOCATIONS=()           # step 10: "name|description" — the first is the shelf step 13 moves tape 1 to
+TENANTS=()             # step 11: "name|description" — non-operator tenants to create
+COLLECTIONS=()         # step 11: "name|root|tenant|unit_depth" — [[collections]] to configure and sync
+# CONTENDER_UNITS is left UNSET here on purpose: unset means "this VM's homorg
+# timers" (the historical default, step 13); a profile that declares it — even
+# as () — replaces that list.
+PROFILE=""
+# The profile is sourced BEFORE the flags are parsed, so every flag overrides it.
+for ((i = 1; i <= $#; i++)); do
+  if [ "${!i}" = "--profile" ]; then j=$((i + 1)); PROFILE="${!j:-}"; fi
+done
+if [ -n "$PROFILE" ]; then
+  [ -r "$PROFILE" ] || { echo "--profile $PROFILE is not readable" >&2; exit 2; }
+  # shellcheck disable=SC1090
+  . "$PROFILE"
+fi
 usage() {
   # The step list ends at the "then what to do next" line; keep the range on it.
   sed -n '2,/then what to do next/p' "$0" | sed 's/^# \{0,1\}//'
@@ -88,6 +107,13 @@ Options:
                     prints it) — required for the rehearsal under --auto
   --backup-dir DIR  where step 14's daily catalog backup writes (default $BACKUP_DIR;
                     put it on a SECOND disk)
+  --profile FILE    host defaults (contrib/hosts/<host>.profile): the values below, plus
+                    LOCATIONS, TENANTS, COLLECTIONS and CONTENDER_UNITS lists. Flags override it.
+  --work-dir DIR    build lock and step-12 rehearsal workspace (default /scratch if it exists,
+                    else ~/.cache/tapectl)
+  --staging DIR     default for staging.directory in step 7
+  --dar PATH        the dar binary: checked in step 2, first on PATH for the step-4 suite,
+                    written to [dar] binary in step 7 (default: dar on PATH)
   --skip-build      do not build/install (use the resolved binary as-is)
   --skip-tests      skip the ungated test suite
   -h, --help
@@ -115,6 +141,10 @@ while [ $# -gt 0 ]; do
     --skip-tests) SKIP_TESTS=1; shift ;;
     --user) SVC_USER="$2"; shift 2 ;;
     --no-service-user) SVC_MODE=0; shift ;;
+    --profile) shift 2 ;;   # already sourced above
+    --work-dir) WORK_DIR="$2"; shift 2 ;;
+    --staging) STAGING_DIR="$2"; shift 2 ;;
+    --dar) DAR_BIN="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -122,6 +152,15 @@ done
 
 # ---------------------------------------------------------------- plumbing
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# WORK_DIR: /scratch keeps the lock path every harness on the dev VM shares
+# (/scratch/tapectl-build.lock); a host without /scratch gets a private one
+# instead of a flock that cannot open its file (home2, 2026-09-26).
+if [ -z "$WORK_DIR" ]; then
+  if [ -d /scratch ] && [ -w /scratch ]; then WORK_DIR=/scratch; else WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tapectl"; fi
+fi
+mkdir -p "$WORK_DIR" || { echo "cannot create work dir $WORK_DIR" >&2; exit 2; }
+BUILD_LOCK="$WORK_DIR/tapectl-build.lock"
+DAR="${DAR_BIN:-dar}"
 if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; Y=$'\e[33m'; G=$'\e[32m'; RD=$'\e[31m'; else B=""; D=""; R=""; Y=""; G=""; RD=""; fi
 [ "$SVC_MODE" = 1 ] && [ "$SVC_USER" = "$USER" ] && SVC_MODE=0
 # as_svc: THE privilege seam. Every tapectl invocation and every read/write of
@@ -251,8 +290,30 @@ EOF
   run sudo setfacl -m "u:$SVC_USER:rwX" "$1" || return 1
   as_svc test -r "$1" && as_svc test -w "$1" && as_svc test -x "$1"
 }
+# grant_collection ROOT DEPTH: grant_read's shape for a folder-per-unit root —
+# read on the whole tree (and by default on what is added later), traverse on
+# the ancestors, and write on each unit folder (DEPTH below ROOT) only, which
+# is where `collection sync` puts each unit's .tapectl-unit.toml.
+grant_collection() {
+  [ "$SVC_MODE" = 1 ] || return 0
+  local root="$1" depth="$2" p
+  case "$root" in /*) ;; *) note "collection root $root is not an absolute path"; return 1 ;; esac
+  explain <<EOF
+$SVC_USER needs read on $root (every file is snapshotted and staged) and write on each unit folder $depth level(s) below it (the .tapectl-unit.toml dotfile). The grant is POSIX ACLs only — owners, groups and modes stay exactly as they are. A large tree takes a while to walk.
+EOF
+  confirm "Grant $SVC_USER read on $root and write on its unit folders (setfacl)?" || return 1
+  p="$(dirname "$root")"
+  while [ "$p" != / ] && [ -n "$p" ]; do as_svc test -x "$p" || run sudo setfacl -m "u:$SVC_USER:x" "$p" || return 1; p="$(dirname "$p")"; done
+  run sudo setfacl -R -m "u:$SVC_USER:rX" "$root" || { note "setfacl failed — a filesystem without ACL support?"; return 1; }
+  run sudo setfacl -R -d -m "u:$SVC_USER:rX" "$root" || return 1
+  run sudo find "$root" -mindepth "$depth" -maxdepth "$depth" -type d -exec setfacl -m "u:$SVC_USER:rwX" {} + || return 1
+  as_svc test -r "$root" && as_svc test -x "$root"
+}
 skip_if() { [ "$FROM" -gt "$STEP" ] && { note "skipped (--from $FROM)"; return 0; }; return 1; }
 vercmp_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+# dar_path_prefix: "DIR:" when --dar names a dar outside PATH's first hit, so the
+# step-4 suite (whose fixtures run plain `dar`) tests the dar production uses.
+dar_path_prefix() { [ -n "$DAR_BIN" ] && printf '%s:' "$(dirname "$DAR_BIN")"; return 0; }
 # rustup's env is loaded here, not only in step 1, so --from 3 never falls
 # through to a distro cargo that cannot parse edition 2021.
 # shellcheck disable=SC1091
@@ -269,6 +330,8 @@ toolchain_check() {
 # ================================================================ step 0
 printf '%stapectl first run%s — repo %s\n' "$B" "$R" "$REPO"
 printf 'home: %s   log: %s\n' "$EFFECTIVE_HOME" "$LOG"
+[ -n "$PROFILE" ] && printf 'profile: %s\n' "$PROFILE"
+printf 'work dir: %s   dar: %s\n' "$WORK_DIR" "$DAR"
 printf 'service user: %s\n' "$( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER (every tapectl command runs as it)" || echo "none — running as $USER" )"
 if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
   if [ -z "$HOME_DIR" ] && as_svc test -e "$EFFECTIVE_HOME/tapectl.db" 2>/dev/null && [ "$FROM" -le 7 ]; then
@@ -311,7 +374,9 @@ explain <<'EOF'
 tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages and the cartridge's MAM. `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 11. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
 EOF
 MISSING=()
-for t in dar mt sg_read_attr sg_logs setfacl python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
+for t in mt sg_read_attr sg_logs setfacl python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
+if [ -n "$DAR_BIN" ]; then [ -x "$DAR_BIN" ] || die "--dar $DAR_BIN is not executable (on home2, contrib/hosts/home2-prep.sh builds it)"
+else command -v dar >/dev/null 2>&1 || MISSING+=(dar); fi
 if [ "${#MISSING[@]}" -gt 0 ]; then
   note "missing: ${MISSING[*]}"
   explain <<'EOF'
@@ -333,12 +398,12 @@ EOF
     run age --version
   else note "continuing without age — the step-12 rehearsal will be unavailable until it is installed"; fi
 fi
-DARV="$(dar --version 2>&1 | sed -n 's/.*dar version \([0-9.]*\).*/\1/p' | head -1)"
-[ -n "$DARV" ] || DARV="$(dar --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+DARV="$("$DAR" --version </dev/null 2>&1 | sed -n 's/.*dar version \([0-9.]*\).*/\1/p' | head -1)"
+[ -n "$DARV" ] || DARV="$("$DAR" --version </dev/null 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 [ -n "$DARV" ] || die "could not read dar's version (dar --version)"
 vercmp_ge "$DARV" "2.6.0" || die "dar $DARV is too old; tapectl needs >= 2.6"
 vercmp_ge "$DARV" "2.7.20" || note "dar $DARV works; 2.7.20+ is recommended (bookworm ships 2.7.x)"
-ok "dar $DARV, mt, sg3-utils, setfacl, python3, lsscsi present$(command -v age >/dev/null 2>&1 && echo ", age present" || echo "; age ABSENT (heir-path script and rehearsal only)")"
+ok "dar $DARV ($DAR), mt, sg3-utils, setfacl, python3, lsscsi present$(command -v age >/dev/null 2>&1 && echo ", age present" || echo "; age ABSENT (heir-path script and rehearsal only)")"
 }
 
 # ================================================================ step 3
@@ -350,7 +415,7 @@ Production runs the RELEASE binary: the same source with optimisation on, and it
 EOF
 if confirm "Build the release binary now (cargo build --release; a few minutes)?"; then
   toolchain_check
-  ( cd "$REPO" && run flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo build --release ) || die "release build failed (exit 99 = timed out waiting for /scratch/tapectl-build.lock: another build is linking)"
+  ( cd "$REPO" && run flock -w 1200 -E 99 "$BUILD_LOCK" cargo build --release ) || die "release build failed (exit 99 = timed out waiting for $BUILD_LOCK: another build is linking)"
   TAPECTL="$REPO/target/release/tapectl"
   [ -x "$TAPECTL" ] || TAPECTL="${CARGO_TARGET_DIR:-$REPO/target}/release/tapectl"
   if confirm "Install it to /usr/local/bin/tapectl (sudo)?"; then run sudo install -m 0755 "$TAPECTL" /usr/local/bin/tapectl; TAPECTL=/usr/local/bin/tapectl; fi
@@ -369,7 +434,7 @@ if [ "$SKIP_TESTS" = 1 ]; then note "--skip-tests"; else
 explain <<'EOF'
 `cargo test` runs about 1,960 tests that need no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
 EOF
-if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && run flock -w 1200 -E 99 /scratch/tapectl-build.lock cargo test ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
+if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && PATH="$(dar_path_prefix)$PATH" run flock -w 1200 -E 99 "$BUILD_LOCK" cargo test ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
 fi
 }
 
@@ -383,9 +448,13 @@ WHY A SERVICE USER. The tapectl home holds the operator private key, every tenan
 Its needs are exactly three, and each is granted where it arises: membership of the group that owns the drive nodes (step 6), read on the trees it archives (per unit, by ACL, step 11), and ownership of the staging directory (step 7). Restore needs no root — dar runs with -O — but a restore destination must be writable by $SVC_USER.
 EOF
 if id "$SVC_USER" >/dev/null 2>&1; then ok "user $SVC_USER exists: $(id "$SVC_USER")"
+  if [ -n "$SVC_HOME_WANT" ] && [ "$(svc_home)" != "$SVC_HOME_WANT" ]; then
+    die "$SVC_USER's home is $(svc_home) but the profile wants $SVC_HOME_WANT — move it first (on home2: contrib/hosts/home2-prep.sh), then re-run with --from 5"
+  fi
 else
-  confirm "Create system user $SVC_USER (home /var/lib/$SVC_USER, shell nologin)?" || die "no service user — re-run with --no-service-user to run tapectl as $USER"
-  run sudo useradd --system --create-home --home-dir "/var/lib/$SVC_USER" --shell /usr/sbin/nologin --comment "tapectl archival service" "$SVC_USER"
+  SVC_HOME_NEW="${SVC_HOME_WANT:-/var/lib/$SVC_USER}"
+  confirm "Create system user $SVC_USER (home $SVC_HOME_NEW, shell nologin)?" || die "no service user — re-run with --no-service-user to run tapectl as $USER"
+  run sudo useradd --system --create-home --home-dir "$SVC_HOME_NEW" --shell /usr/sbin/nologin --comment "tapectl archival service" "$SVC_USER"
 fi
 SVC_HOME="$(svc_home)"; [ -n "$SVC_HOME" ] || die "no home directory for $SVC_USER"
 [ -d "$SVC_HOME" ] || { run sudo mkdir -p "$SVC_HOME"; run sudo chown "$SVC_USER" "$SVC_HOME"; }
@@ -521,16 +590,20 @@ EOF
 run tc config check || note "config check reported something — read it; advisory, exit code above"
 run tc db fsck || true
 explain <<'EOF'
-STAGING SPACE. `stage create` writes every encrypted slice of a unit to the staging directory before anything goes to tape, so it needs room for everything one tape will hold: a sealed volume is never appended to, so every tape is written in one session, and the staging space caps what each tape can contain (2.5 TB for a full LTO-6; on this VM /scratch is 295 GB, so plan smaller tapes or add storage). init writes a default path into config.toml that may not exist, or may not be the service user's to write to. Put staging on a filesystem with the space, owned by the user that runs tapectl.
+STAGING SPACE. `stage create` writes every encrypted slice of a unit to the staging directory before anything goes to tape, so it needs room for everything one tape will hold: a sealed volume is never appended to, so every tape is written in one session, and the staging space caps what each tape can contain (2.5 TB for a full LTO-6, 2.3 TB after the planning margin; the free space printed below caps each tape, so plan smaller tapes or add storage). init writes a default path into config.toml that may not exist, or may not be the service user's to write to. Put staging on a filesystem with the space, owned by the user that runs tapectl.
 EOF
 CFG="$EFFECTIVE_HOME/config.toml"
 SD="$(as_svc sed -n '/^\[staging\]/,/^\[/{s/^directory *= *"\(.*\)"/\1/p}' "$CFG" | head -1)"
 SD_DEF="$SD"
+# A profile's staging directory is the default even when the config's current
+# one works: the profile is the decision about this host.
+[ -n "$STAGING_DIR" ] && [ "$SD" != "$STAGING_DIR" ] && SD_DEF="$STAGING_DIR" && note "profile staging directory: $STAGING_DIR (config has '${SD:-<unset>}')"
 if [ -z "$SD" ] || ! as_svc test -d "$SD" || ! as_svc test -w "$SD"; then
   note "staging.directory is '${SD:-<unset>}' — $( [ -z "$SD" ] && echo unset || { [ -d "$SD" ] && echo "not writable by $SVC_USER" || echo "does not exist"; } )"
   # The home is usually on the root filesystem (small on this VM: / is
   # 22 GB); a big writable filesystem is the right default when one exists.
-  if [ -d /scratch ] && [ -w /scratch ] || sudo test -w /scratch 2>/dev/null; then SD_DEF="/scratch/tapectl-staging"; else SD_DEF="$EFFECTIVE_HOME/staging"; fi
+  if [ -n "$STAGING_DIR" ]; then SD_DEF="$STAGING_DIR"
+  elif [ -d /scratch ] && [ -w /scratch ] || sudo test -w /scratch 2>/dev/null; then SD_DEF="/scratch/tapectl-staging"; else SD_DEF="$EFFECTIVE_HOME/staging"; fi
   for cand in "$SD" "$SD_DEF"; do [ -n "$cand" ] && { d="$cand"; while [ ! -d "$d" ]; do d="$(dirname "$d")"; done; note "$cand: $(df -h "$d" | awk 'NR==2{print $4" free on "$6}')"; }; done
 fi
 ask SD_NEW "staging directory (needs space for a full tape's slices)" "$SD_DEF"
@@ -546,6 +619,17 @@ fi
 as_svc test -w "$SD_NEW" || die "staging directory $SD_NEW is not writable by $( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER" || echo "$USER" )"
 run as_svc df -h "$SD_NEW"
 ok "staging at $SD_NEW"
+if [ -n "$DAR_BIN" ]; then
+  # [dar] binary: the dar every tapectl command runs, whatever PATH the caller
+  # (sudo's secure_path, a systemd unit) happens to have.
+  CUR_DAR="$(as_svc sed -n '/^\[dar\]/,/^\[/{s/^binary *= *"\(.*\)"/\1/p}' "$CFG" | head -1)"
+  if [ "$CUR_DAR" != "$DAR_BIN" ]; then
+    as_svc sed -i "/^\[dar\]/,/^\[/{s|^binary *= *\".*\"|binary = \"$DAR_BIN\"|}" "$CFG"
+    as_svc grep -q "^binary = \"$DAR_BIN\"" "$CFG" || die "could not set [dar] binary in $CFG — edit it by hand"
+  fi
+  run tc config check || true
+  ok "dar: $DAR_BIN"
+fi
 ok "home ready at $EFFECTIVE_HOME"
 }
 
@@ -654,11 +738,25 @@ EXISTING="$(tc location list --json 2>/dev/null | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("locations",[]); print(" ".join(r.get("name","") for r in rows))
 except Exception: pass' 2>/dev/null || true)"
+if [ "${#LOCATIONS[@]}" -gt 0 ]; then
+  # The profile names every place; the first is the shelf beside the drive,
+  # where step 13 records tape 1. Copy 2 goes to the second.
+  for spec in "${LOCATIONS[@]}"; do
+    LNAME="${spec%%|*}"; LDESC="${spec#*|}"; [ "$LDESC" = "$spec" ] && LDESC=""
+    case " $EXISTING " in
+      *" $LNAME "*) ok "location $LNAME already exists" ;;
+      *) run tc location add "$LNAME" ${LDESC:+-d "$LDESC"} ;;
+    esac
+  done
+  [ -n "$LOCATION" ] || LOCATION="${LOCATIONS[0]%%|*}"
+  ok "tape 1 goes to $LOCATION"
+else
 ask LOCATION "location name" "${LOCATION:-${EXISTING%% *}}"; [ -n "$LOCATION" ] || ask LOCATION "location name" "home-rack"
 case " $EXISTING " in
   *" $LOCATION "*) ok "location $LOCATION already exists" ;;
   *) ask LDESC "description" "the rack next to the drive"; run tc location add "$LOCATION" -d "$LDESC" ;;
 esac
+fi
 }
 
 # ================================================================ step 11
@@ -683,6 +781,48 @@ try:
 except Exception: print(0)' 2>/dev/null || echo 0)"
 [ "$NT" != 0 ] && note "$NT non-operator tenant(s) exist already."
 ADD_MORE=1
+if [ "${#TENANTS[@]}" -gt 0 ] || [ "${#COLLECTIONS[@]}" -gt 0 ]; then
+  # The profile's tenants and collections. Idempotent: an existing tenant or
+  # an already-configured collection is left alone, so --from 11 is safe.
+  EXIST_T=" $(tc tenant list --json 2>/dev/null | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("tenants",[]); print(" ".join(r.get("name","") for r in rows))
+except Exception: pass' 2>/dev/null || true) "
+  for spec in "${TENANTS[@]}"; do
+    TNAME="${spec%%|*}"; TDESC="${spec#*|}"; [ "$TDESC" = "$spec" ] && TDESC="$TNAME's data"
+    case "$EXIST_T" in
+      *" $TNAME "*) ok "tenant $TNAME already exists" ;;
+      *) run tc tenant add "$TNAME" -d "$TDESC" || die "tenant add $TNAME failed" ;;
+    esac
+  done
+  CFG="$EFFECTIVE_HOME/config.toml"
+  for spec in "${COLLECTIONS[@]}"; do
+    IFS='|' read -r CNAME CROOT CTEN CDEPTH <<< "$spec"
+    CDEPTH="${CDEPTH:-1}"
+    { [ -n "$CNAME" ] && [ -n "$CROOT" ] && [ -n "$CTEN" ]; } || die "COLLECTIONS entry '$spec' is not name|root|tenant|unit_depth"
+    [ -d "$CROOT" ] || sudo test -d "$CROOT" || die "collection $CNAME: $CROOT is not a directory"
+    grant_collection "$CROOT" "$CDEPTH" || die "$SVC_USER cannot read $CROOT — not configuring collection $CNAME"
+    if as_svc grep -qE "^name *= *\"$CNAME\"" "$CFG"; then
+      ok "collection $CNAME is already in config.toml"
+    else
+      # init writes `collections = []`; a [[collections]] table beside it is a
+      # duplicate key and the config stops loading, so the empty one goes first.
+      as_svc sed -i '/^collections *= *\[\] *$/d' "$CFG"
+      printf '\n[[collections]]\nname       = "%s"\nroot       = "%s"\ntenant     = "%s"\nunit_depth = %s\n' \
+        "$CNAME" "$CROOT" "$CTEN" "$CDEPTH" | as_svc tee -a "$CFG" >/dev/null
+      tc config show >/dev/null 2>&1 || die "config.toml does not load after adding collection $CNAME — read: tapectl config check"
+      ok "collection $CNAME: $CROOT (tenant $CTEN, a unit per folder at depth $CDEPTH)"
+    fi
+  done
+  if [ "${#COLLECTIONS[@]}" -gt 0 ]; then
+    run tc collection sync --dry-run || die "collection sync --dry-run failed"
+    if confirm "Register those units now (collection sync writes a .tapectl-unit.toml into each folder)?"; then
+      run tc collection sync --yes || die "collection sync failed"
+    fi
+  fi
+  NT=$((NT + ${#TENANTS[@]}))
+  if [ "$AUTO" = 1 ] || ! confirm "Add more tenants or units by hand?"; then ADD_MORE=0; fi
+fi
 while [ "$ADD_MORE" = 1 ]; do
   if [ "$NT" != 0 ] && [ "$AUTO" = 1 ]; then break; fi
   if [ "$NT" != 0 ] && ! confirm "Add a tenant?"; then break; fi
@@ -750,7 +890,7 @@ skip_if || {
 explain <<'EOF'
 Before real data, the lifecycle suite runs a whole simulated first year — write, verify, every restore path including the heir script off the tape — on a cartridge you are willing to lose. It ERASES that cartridge. It needs the cartridge's medium serial (the one its chip reports; `sg_read_attr` prints it below) typed exactly, and refuses if the loaded cartridge reports a different one. This is the step that proves the drive, the host's st driver and the binary step 13 will use agree — it runs the INSTALLED binary (TAPECTL_BIN), not a build of its own — and it is required before the first production write (ADR-0012, ruled 2026-09-23).
 
-It runs as YOU, not the service user, with throwaway homes under /scratch; it only needs your login to be able to open the drive. It takes about three minutes on an LTO-6.
+It runs as YOU, not the service user, with throwaway homes under the work directory (--work-dir; /scratch on the dev VM); it only needs your login to be able to open the drive. It takes about three minutes on an LTO-6.
 EOF
 derive_nodes
 if ! command -v age >/dev/null 2>&1; then note "skipped: the rehearsal runs RESTORE.sh off the tape, which needs the age CLI (step 2 explains how to install it) — step 13 will ask you to confirm writing without it"
@@ -767,7 +907,7 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
   ask TEST_BARCODE "medium serial of the TEST cartridge in the drive, as printed above (it will be erased)" "$TEST_BARCODE"
   [ -n "$TEST_BARCODE" ] || die "no barcode given"
   if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE" "$BARCODE_FROM_FLAG"; then
-    CMD="cd '$REPO' && TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
+    CMD="cd '$REPO' && PATH='$(dar_path_prefix)$PATH' TAPECTL_LIFECYCLE_OUT='$WORK_DIR/tapectl-lifecycle' TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
     if [ "${#WRAP[@]}" -gt 0 ]; then run "${WRAP[@]}" "$CMD"; else run bash -c "$CMD"; fi || die "rehearsal RED — do not write real data until this is understood"
     ok "rehearsal green"
     # B14: step 13 checks for this marker (per binary) before the first write.
@@ -801,6 +941,16 @@ EOF
     [ "$AUTO" = 1 ] && die "the rehearsal is required before the first production write — run step 12 (or re-run with --from 12)"
     confirm "Write to a production cartridge WITHOUT a rehearsal on this binary?" || die "run step 12 first: scripts/first-run.sh --from 12 --to 12"
   fi
+  # Staging, the write and its confirm read run for hours to days (issue #326: ~56 MB/s
+  # write, ~16 MB/s confirm). A dropped SSH session kills it: a clean abort to
+  # an unsealed tape, but the hours are gone.
+  if [ -z "${TMUX:-}" ] && [ -z "${STY:-}" ] && [ -n "${SSH_CONNECTION:-}" ]; then
+    note "this shell is an SSH session outside tmux/screen — if the connection drops, the write dies with it"
+    [ "$AUTO" = 1 ] || confirm "Continue anyway? (safer: Ctrl-C, start tmux, re-run with --from 13)" || die "stopped: re-run inside tmux with --from 13"
+  fi
+  # The profile's first location is the shelf beside the drive; the catalog's
+  # own list is sorted by name, so its first row can be the offsite one.
+  [ -z "$LOCATION" ] && [ "${#LOCATIONS[@]}" -gt 0 ] && LOCATION="${LOCATIONS[0]%%|*}"
   if [ -z "$LOCATION" ]; then
     LOCATION="$(tc location list --json 2>/dev/null | python3 -c 'import json,sys
 try:
@@ -809,7 +959,7 @@ except Exception: pass' 2>/dev/null || true)"
   fi
   tape_lock
   explain <<'EOF'
-A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. On this VM the homorg runner's timers are the known contenders; the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step.
+A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step.
 
 `tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
@@ -908,13 +1058,21 @@ EOF
   # are host-specific and tapectl checks none by default; on a host without
   # them systemd reports them not-found, which counts as quiet.
   HC_OUT="$(dirname "$LOG")/host-check.out"
-  while ! run_capture "$HC_OUT" tc host check --unit homorg-db-suite.timer --unit homorg-prune-target.timer; do
+  # Unset = the dev VM's homorg timers (the historical default); a profile
+  # that declares CONTENDER_UNITS, even empty, replaces the list.
+  # `declare -p`, not ${CONTENDER_UNITS+set}: the latter is empty for a
+  # declared-but-empty array, so a profile's `CONTENDER_UNITS=()` read as unset
+  # and brought the dev VM's timers back (found by the 2026-09-28 mhvtl run).
+  if ! declare -p CONTENDER_UNITS >/dev/null 2>&1; then CONTENDER_UNITS=(homorg-db-suite.timer homorg-prune-target.timer); fi
+  HC_ARGS=(); for u in "${CONTENDER_UNITS[@]}"; do HC_ARGS+=(--unit "$u"); done
+  while ! run_capture "$HC_OUT" tc host check "${HC_ARGS[@]}"; do
     explain <<'EOF'
 THE HOST IS NOT QUIET. Each "host check:" line above names what tripped, what it measured and the limit it crossed. A busy host does not stop the write — it costs tape (the drive stops and restarts below ~54 MB/s of feed; a bursty feed used 48% more tape on this drive) and risks the session (a process killed for memory mid-write is a clean abort, but the hours are gone). Pause what is named, then check again. The limits are [host_check] in config.toml (docs/operator-guide.md, "A quiet host while the tape runs").
 EOF
-    if grep -q "unit homorg-" "$HC_OUT"; then
-      note "pause the homorg timers for the write:   sudo systemctl stop homorg-db-suite.timer homorg-prune-target.timer"
-      note "and start them again once it is sealed:  sudo systemctl start homorg-db-suite.timer homorg-prune-target.timer"
+    TRIPPED=(); for u in "${CONTENDER_UNITS[@]}"; do grep -qF "unit $u" "$HC_OUT" && TRIPPED+=("$u"); done
+    if [ "${#TRIPPED[@]}" -gt 0 ]; then
+      note "pause them for the write:               sudo systemctl stop ${TRIPPED[*]}"
+      note "and start them again once it is sealed:  sudo systemctl start ${TRIPPED[*]}"
     fi
     if [ "$AUTO" = 1 ]; then note "--auto: proceeding with the host NOT quiet — the findings are above and in $LOG"; break; fi
     ask HC_ANS "press Enter to check again once the host is quiet, or type 'write' to proceed as it is (Ctrl-C stops)" ""

@@ -70,6 +70,52 @@ prompt under `--auto` counts only when the word it asks for came from a flag
 to `~/.local/state/tapectl/first-run.log` (yours, never inside the service
 user's home); step 7's `init` output is deliberately not logged.
 
+### Host profiles
+
+A host's answers — its drive, where the home, staging and backups go, which dar,
+its locations, tenants and collections — can live in a profile instead of on the
+command line:
+
+```bash
+scripts/first-run.sh --profile contrib/hosts/<host>.profile
+```
+
+The profile is a bash file of variables, sourced before the flags are parsed, so
+any flag still wins. Beyond the flags' own values (`DEVICE`, `OPERATOR`,
+`BACKUP_DIR`, `KIT_OUT`, `LABEL`, `TEST_BARCODE`, …) it can set:
+
+| Variable | Used in | What it does |
+|---|---|---|
+| `WORK_DIR` (`--work-dir`) | 3, 4, 12 | the build lock and the rehearsal's throwaway homes; default `/scratch` if it exists, else `~/.cache/tapectl` |
+| `STAGING_DIR` (`--staging`) | 7 | the default for `staging.directory` |
+| `DAR_BIN` (`--dar`) | 2, 4, 7, 12 | the dar that is checked, tested against, and written into `[dar] binary` |
+| `SVC_HOME_WANT` | 5 | the service user's home; step 5 refuses if an existing account's home differs |
+| `LOCATIONS=("name\|description" …)` | 10 | every shelf; tape 1 is recorded at the first |
+| `TENANTS=("name\|description" …)` | 11 | non-operator tenants, created if missing |
+| `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | granted by ACL, written as `[[collections]]`, then `collection sync` |
+| `CONTENDER_UNITS=(…)` | 13 | the systemd units `host check` treats as contenders; unset means the dev VM's homorg timers |
+
+**home2** (the production host, ADR-0012's 2026-09-28 amendment) has a one-time
+preparation first, dry-run by default:
+
+```bash
+contrib/hosts/home2-prep.sh            # prints what it would do
+contrib/hosts/home2-prep.sh --apply    # does it, asking before each part
+tmux new -s tapectl
+scripts/first-run.sh --profile contrib/hosts/home2.profile --to 6
+scripts/first-run.sh --profile contrib/hosts/home2.profile --from 7 --to 12   # paper ready for the escrow secret
+tmux clear-history                     # the secret is in the scrollback
+# unload the test cartridge, load a production one
+scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13
+```
+
+The prep's last part installs `/etc/sudoers.d/tapectl-operator`, which lets the
+operator run commands *as the service user* (and only as it) without a password.
+Every `tapectl` call in `first-run.sh` goes through `sudo -u tapectl`, and on a
+host whose sudo asks for a password the verify that follows a days-long write
+would otherwise wait at a prompt until sudo gives up.
+
+
 ---
 
 ## 3. What each step creates on the host

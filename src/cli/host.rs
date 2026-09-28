@@ -130,6 +130,23 @@ pub fn render_human(
         out.push_str(REMEDY);
         out.push('\n');
     }
+    // "quiet" above means quiet on what was MEASURED. A kernel without PSI
+    // (before 4.20; home2 runs 4.19) cannot report pressure at all, and a
+    // verdict that only reads as quiet would hide that half the check is off.
+    let unmeasured: Vec<&str> = [
+        ("memory pressure", snapshot.memory_full_avg60),
+        ("I/O pressure", snapshot.io_full_avg60),
+    ]
+    .iter()
+    .filter(|(_, v)| v.is_none())
+    .map(|(what, _)| *what)
+    .collect();
+    if !unmeasured.is_empty() {
+        out.push_str(&format!(
+            "host check: {} not measured (no /proc/pressure: PSI needs Linux 4.20+) — watch the staging disk yourself\n",
+            unmeasured.join(" and ")
+        ));
+    }
     out
 }
 
@@ -177,8 +194,14 @@ mod tests {
         let out = render_human(&snapshot(), &HostCheckConfig::default(), &[]);
         assert!(out.contains("3.20 over 16 CPUs = 0.20/CPU"), "{out}");
         assert!(out.contains("6630 MiB"), "{out}");
-        // A missing PSI file is said, not hidden.
+        // A missing PSI file is said, not hidden — in its row AND in the
+        // verdict, which would otherwise read as a clean bill of health.
         assert!(out.contains("not available"), "{out}");
+        assert!(
+            out.contains("host check: I/O pressure not measured"),
+            "{out}"
+        );
+        assert!(!out.contains("memory pressure not measured"), "{out}");
         assert!(out.contains("host check: quiet"), "{out}");
         assert!(!out.contains(REMEDY), "{out}");
     }

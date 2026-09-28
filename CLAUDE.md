@@ -149,8 +149,11 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
 **Next:** issues #22–#28 describe the *pre-v2* design and must be read against the
 normative set above, not implemented literally.
 
+**Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
+this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install.
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
-LTO-6 is passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
+LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
 open hardware questions are answered there — block size 512 K vs 1 M is a wash, MAM
 over-report is +2 MiB. `scripts/lifecycle-suite.sh` (13 scenarios x a 10-method
@@ -206,8 +209,8 @@ Two suites are gated (they skip at runtime unless the env var is set):
 # mhvtl end-to-end round-trip + on-tape tenant isolation. Tests are #[ignore], so
 # pass --ignored.
 #
-# DEVICE NUMBERING IS NOT STABLE: this VM also has a real LTO-6 passed through, and
-# a reboot can hand it /dev/nst0. Always set TAPECTL_GATE_TAPE. Discovery fails
+# DEVICE NUMBERING IS NOT STABLE: the real LTO-6 may be lent to this VM (production
+# owns it from home2 since 2026-09-28; ADR-0012), and a reboot can hand it /dev/nst0. Always set TAPECTL_GATE_TAPE. Discovery fails
 # closed on a non-mhvtl device, so an unset value aborts rather than writing to the
 # real drive — but do not rely on that. Check `ls -l /dev/tape/by-id/` after a boot:
 # scsi-HUJ808A5L4-nst is the REAL drive; scsi-XYZZY_A* are mhvtl.

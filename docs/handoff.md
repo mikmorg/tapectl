@@ -5,6 +5,14 @@ Rewritten 2026-09-24 (master `04e254c` and later), ruled by the CTO that day (AD
 are dated records of the 2026-08 and 2026-09-14 states and are superseded by this one.
 It answers one question: **which remaining work needs a person, and which does not?**
 
+> **2026-09-28 — production moved to home2** (ADR-0012's amendment of that date). The
+> readiness review found that no production install ever existed on `vm-desk1` (only the
+> mhvtl rehearsal under `--home`), and a 2026-09-13 pre-redesign attempt on home2 left a
+> stale home, binary and a chowned `/srv/acache`. The CTO moved production to home2. The
+> procedure is now `contrib/hosts/home2-prep.sh --apply`, then
+> `scripts/first-run.sh --profile contrib/hosts/home2.profile` from step 1 (`docs/install.md`,
+> "Host profiles"). Items below that say "this VM" are superseded where they conflict.
+
 ## The state, in one paragraph
 
 Every pre-production gate the CTO set is met. The `review-2026-09-13` queue is empty
@@ -73,10 +81,13 @@ and sense capture).
 
 ## Only you can do these
 
-1. **Say when.** The production write is your call. The procedure is
-   `scripts/first-run.sh` from a bare machine, or `--from 13` on this one; it builds the
-   release binary, rehearses it on the test cartridge (step 12 is required; the marker is
-   per binary), then writes, verifies, audits and refreshes the heir kit.
+1. **Say when.** The production write is your call. The procedure, on home2, is
+   `contrib/hosts/home2-prep.sh --apply`, then
+   `scripts/first-run.sh --profile contrib/hosts/home2.profile` from step 1 (every step
+   detects work already done). It builds the release binary, rehearses it on the test
+   cartridge (step 12 is required; the marker is per binary and per host), then writes,
+   verifies, audits and refreshes the heir kit. Run it inside tmux: the first tape
+   (~1.3 TB) is days at the drive.
 2. **The Heir Kit ceremony.** The kit prints the escrow *identity*; you copy the secret
    `tapectl init` showed you once into the sheet's box by hand, check the pair with
    `age-keygen -y` as the sheet says, seal, and keep two copies in independent failure
@@ -85,11 +96,10 @@ and sense capture).
    production. Have at least two production cartridges so copy 2 follows copy 1 the same
    day (staging still holds the slices: `volume init <label-2>`, `volume write <label-2>`,
    `volume move --to <offsite>`); register two locations first.
-4. **Storage.** Each tape holds what staging can hold in one session; `/scratch` today is
-   about 90 GB. Attach a dedicated staging disk (2.5–3 TB) before any tape you would not
-   want split across cartridges (ruled: after the first small cycle).
-5. **A quiet host.** For every write and verify, pause the CI runner's timers and heavy
-   lanes on this VM (`docs/operator-guide.md`, "A quiet host while the tape runs").
+4. **Storage.** Each tape holds what staging can hold in one session; on home2 staging
+   is `/srv/acache/tapectl-staging` (~2.3 TB free).
+5. **A quiet host.** Nothing on home2 touches acache or the drive (2026-09-28); keep it so
+   for every write and verify (`docs/operator-guide.md`, "A quiet host while the tape runs").
 6. **Two follow-ups when convenient:** a second expendable cartridge for the
    multi-cartridge scenarios on hardware; the write-throughput work (#326) profiled on the
    first production tape, then the reader-thread change.
@@ -105,9 +115,13 @@ and sense capture).
 - `/dev/nstN` numbering moves across reboots; the real drive is
   `/dev/tape/by-id/scsi-HUJ808A5L4-nst`; mhvtl drives are `scsi-XYZZY_A*`. Every harness
   and `first-run.sh` refuse to default to a device.
+- The drive belongs to home2. Lending it to `vm-desk1` means attaching
+  `contrib/hosts/home2-lto6-hostdev.xml` there; the two hosts share no tape lock, so detach
+  it again before any production contact.
 - MAM's "remaining capacity" is not host-writable space: the drive stops host writes at its
   early-warning point with ~107 GB still "remaining". tapectl plans against the generation
   table times 0.92, never against MAM remaining.
 - A bursty host feed costs tape (1.48 native bytes per data byte measured); a steady one
   does not. Keep the host quiet.
-- The tape lock is `/tmp/tapectl-tape.lock`; a second user is refused, not queued.
+- The tape lock is `/tmp/tapectl-tape.lock`, per host; a second user on the same host is
+  refused, not queued.
