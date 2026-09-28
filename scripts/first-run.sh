@@ -181,18 +181,30 @@ note()    { printf '   %s%s%s\n' "$Y" "$*" "$R"; }
 ok()      { printf '   %s✓ %s%s\n' "$G" "$*" "$R"; }
 die()     { printf '   %s✗ %s%s\n' "$RD" "$*" "$R" >&2; exit 1; }
 log()     { mkdir -p "$(dirname "$LOG")"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
+# tty_read VAR "prompt": one line from the terminal. -e gives readline, so an
+# arrow key or Home edits the line instead of landing in the answer as an
+# escape sequence; whatever control bytes still arrive (a bracketed paste, a
+# stray ESC) are stripped, then the answer is trimmed. Found on home2,
+# 2026-09-28: step 6 read an answer that printed as nothing and died on it.
+tty_read() {
+  local __v="$1" __a=""
+  read -e -r -p "$2" __a </dev/tty || true
+  __a="$(printf '%s' "$__a" | sed -e 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' | tr -d '[:cntrl:]')"
+  __a="${__a#"${__a%%[![:space:]]*}"}"; __a="${__a%"${__a##*[![:space:]]}"}"
+  printf -v "$__v" '%s' "$__a"
+}
 # ask VAR "prompt" "default"
 ask() {
   local __v="$1" prompt="$2" def="${3:-}" ans
   if [ "$AUTO" = 1 ] && [ -n "$def" ]; then printf -v "$__v" '%s' "$def"; printf '   %s [auto: %s]\n' "$prompt" "$def"; return; fi
-  read -r -p "   $prompt${def:+ [$def]}: " ans </dev/tty || true
+  tty_read ans "   $prompt${def:+ [$def]}: "
   printf -v "$__v" '%s' "${ans:-$def}"
 }
 # confirm "question" → 0 yes / 1 no. Non-destructive: --auto says yes.
 confirm() {
   local ans
   if [ "$AUTO" = 1 ]; then printf '   %s [auto: yes]\n' "$1"; return 0; fi
-  read -r -p "   $1 [y/N] " ans </dev/tty || true
+  tty_read ans "   $1 [y/N] "
   [[ "$ans" =~ ^[Yy] ]]
 }
 # confirm_destructive "question" "word" [from_flag] → the user must type the
@@ -204,7 +216,7 @@ confirm_destructive() {
     if [ "${3:-0}" = 1 ]; then printf '   %s [auto: "%s" supplied via a flag]\n' "$1" "$2"; return 0; fi
     printf '   %s [auto: "%s" was NOT supplied via a flag — refusing under --auto]\n' "$1" "$2"; return 1
   fi
-  read -r -p "   $1 — type $2 to proceed: " ans </dev/tty || true
+  tty_read ans "   $1 — type $2 to proceed: "
   [ "$ans" = "$2" ]
 }
 # run: echo, log, execute (stdout+stderr go to the terminal AND the log)
@@ -500,8 +512,15 @@ if [ -z "$SG" ]; then
   SGN="$(ls "/sys/class/scsi_tape/$NSTN/device/scsi_generic/" 2>/dev/null | head -1)"
   [ -n "$SGN" ] && SG="/dev/$SGN"
   ask SG "matching SCSI-generic node (for health and MAM)" "$SG"
+  SG_DEF="${SGN:+/dev/$SGN}"
+  # A wrong answer is asked again, not fatal: %q shows what was actually read.
+  while [ ! -e "$SG" ] && [ "$AUTO" != 1 ]; do
+    note "$(printf '%q' "$SG") does not exist — press Enter for ${SG_DEF:-<none found>}, or type the node"
+    SG=""; ask SG "matching SCSI-generic node (for health and MAM)" "$SG_DEF"
+    [ -n "$SG" ] || break
+  done
 fi
-[ -e "$SG" ] || die "$SG does not exist"
+[ -e "$SG" ] || die "$(printf '%q' "$SG") does not exist"
 if [ "$SVC_MODE" = 1 ]; then
   for node in "$NST" "$SG"; do
     g="$(stat -c %G "$node")"
