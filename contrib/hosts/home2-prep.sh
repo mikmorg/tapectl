@@ -84,12 +84,12 @@ case "$NST_DEV" in
   */4:0:4:0) ok "the LTO-6 is nst0 at 4:0:4:0 here — scsi_host4 target 4 unit 0, as $HOSTDEV_XML says" ;;
   *) die "nst0 is not at 4:0:4:0 (${NST_DEV:-absent}) — the SCSI numbering moved; fix $HOSTDEV_XML (lsscsi -g) before detaching" ;;
 esac
-if virsh -c qemu:///system dumpxml "$VM" 2>/dev/null | grep -q "adapter name='scsi_host4'"; then
+if virsh -c qemu:///system dumpxml "$VM" 2>/dev/null | grep "adapter name='scsi_host4'" >/dev/null; then
   note "$VM still has the drive as a hostdev: two hosts can open it, and they share no tape lock"
   note "before detaching: nothing on $VM may be using it (no gate, lifecycle suite, fill or tapectl run)"
   if part "Detach the LTO-6 from $VM now (live and persistent)?"; then
     run virsh -c qemu:///system detach-device "$VM" "$HOSTDEV_XML" --live --config
-    [ "$APPLY" = 1 ] && { virsh -c qemu:///system dumpxml "$VM" | grep -q "adapter name='scsi_host4'" && die "still attached — read virsh's output"; ok "detached"; }
+    [ "$APPLY" = 1 ] && { virsh -c qemu:///system dumpxml "$VM" | grep "adapter name='scsi_host4'" >/dev/null && die "still attached — read virsh's output"; ok "detached"; }
   fi
 else ok "$VM does not have the drive"; fi
 
@@ -157,13 +157,13 @@ if part "Create $BACKUP (tapectl, 0700)?"; then run sudo install -d -o "$SVC" -g
 # ------------------------------------------------------------------ 6
 hdr "6  Packages"
 PKGS=(mtx g++ make pkg-config zlib1g-dev libbz2-dev liblzo2-dev liblzma-dev libzstd-dev liblz4-dev librsync-dev libgcrypt20-dev libgpg-error-dev libargon2-dev)
-MISSING=(); for p in "${PKGS[@]}"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || MISSING+=("$p"); done
+MISSING=(); for p in "${PKGS[@]}"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep "ok installed" >/dev/null || MISSING+=("$p"); done
 if [ "${#MISSING[@]}" = 0 ]; then ok "all present"
 elif part "apt-get install ${MISSING[*]}?"; then run sudo apt-get install -y "${MISSING[@]}"; fi
 
 # ------------------------------------------------------------------ 7
 hdr "7  dar $DAR_VER in /usr/local (libdar static)"
-if [ -x /usr/local/bin/dar ] && /usr/local/bin/dar --version </dev/null 2>&1 | grep -q "dar version $DAR_VER"; then ok "/usr/local/bin/dar is $DAR_VER"
+if [ -x /usr/local/bin/dar ] && /usr/local/bin/dar --version </dev/null 2>&1 | grep "dar version $DAR_VER" >/dev/null; then ok "/usr/local/bin/dar is $DAR_VER"
 elif part "Download, verify, build and install dar $DAR_VER (a few minutes)?"; then
   run mkdir -p "$WORK"
   run curl -fsSL -o "$WORK/dar-$DAR_VER.tar.gz" "$DAR_URL"
@@ -179,8 +179,8 @@ elif part "Download, verify, build and install dar $DAR_VER (a few minutes)?"; t
   run make -C "$WORK/dar-$DAR_VER" -j"$(nproc)"
   run sudo make -C "$WORK/dar-$DAR_VER" install-strip
   if [ "$APPLY" = 1 ]; then
-    /usr/local/bin/dar --version </dev/null 2>&1 | grep -q "dar version $DAR_VER" || die "/usr/local/bin/dar is not $DAR_VER after install"
-    ldd /usr/local/bin/dar | grep -q libdar && die "/usr/local/bin/dar links a shared libdar — the static build did not take"
+    /usr/local/bin/dar --version </dev/null 2>&1 | grep "dar version $DAR_VER" >/dev/null || die "/usr/local/bin/dar is not $DAR_VER after install"
+    ldd /usr/local/bin/dar | grep libdar >/dev/null && die "/usr/local/bin/dar links a shared libdar — the static build did not take"
     # every compression tapectl can ask dar for must be compiled in
     NO="$(/usr/local/bin/dar -V </dev/null 2>&1 | grep -E 'compression \(.*: *NO' || true)"
     [ -z "$NO" ] || die "dar $DAR_VER lacks: $NO"

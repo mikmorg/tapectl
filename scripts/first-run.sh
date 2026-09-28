@@ -168,7 +168,7 @@ if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; Y=$'\e[33m'; G=$'\e[32m'; 
 # rest of the script stays you, with sudo for root work.
 as_svc()   { if [ "$SVC_MODE" = 1 ]; then sudo -u "$SVC_USER" -H "$@"; else "$@"; fi; }
 svc_home() { if [ "$SVC_MODE" = 1 ]; then { getent passwd "$SVC_USER" 2>/dev/null || true; } | cut -d: -f6; else printf '%s' "$HOME"; fi; }
-svc_in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"; }
+svc_in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -x "$2" >/dev/null; }
 compute_home() { local h; h="$(svc_home)"; EFFECTIVE_HOME="${HOME_DIR:-${h:-/var/lib/$SVC_USER}/.tapectl}"; }
 compute_home
 # The log is yours, never inside the service user's home (which you cannot enter).
@@ -851,7 +851,7 @@ EOF
         if [ -z "$WR" ] || [ "$WR" = "[]" ]; then
           as_svc sed -i "s|^watch_roots *= *\[\]|watch_roots = [\"$UP\"]|" "$CFG" \
             || note "could not add $UP to watch_roots — add it by hand and run: tapectl unit discover"
-        elif ! printf '%s' "$WR" | grep -qF "\"$UP\""; then
+        elif ! printf '%s' "$WR" | grep -F "\"$UP\"" >/dev/null; then
           # a second adopted unit: append inside the existing list
           as_svc sed -i "s|^\(watch_roots *= *\[.*\)\]|\1, \"$UP\"]|" "$CFG" \
             || note "could not append $UP to watch_roots — add it by hand and run: tapectl unit discover"
@@ -964,7 +964,7 @@ A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops 
 `tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
   run as_svc mt -f "$DEVICE" status || true
-  if as_svc mt -f "$DEVICE" status 2>/dev/null | grep -q DR_OPEN; then die "no cartridge loaded in $DEVICE"; fi
+  if as_svc mt -f "$DEVICE" status 2>/dev/null | grep DR_OPEN >/dev/null; then die "no cartridge loaded in $DEVICE"; fi
   ask LABEL "volume label" "${LABEL:-L6-0001}"
   explain <<'EOF'
 THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and wears the serial as a placeholder barcode until you replace it. Put the sticker on whenever you like, before or after this write, with `cartridge relabel`; the command is printed below once the cartridge is registered. Do not register it by hand first WITHOUT its serial: init matches on the serial, finds no row carrying it, and registers a second cartridge — two rows for one tape, with your label on the one the catalog is not using. (`cartridge register --serial <medium serial>` is matched; a bare barcode is not.)
@@ -1103,7 +1103,7 @@ EOF
       [ "$AUTO" = 1 ] && die "volume init could read no medium serial; naming a cartridge is your word, re-run scripts/first-run.sh --from 13 interactively"
       ask CARTRIDGE "no serial readable — name this cartridge (the barcode on its sticker)"
       [ -n "$CARTRIDGE" ] || die "no cartridge named"
-      if ! tc cartridge list --json 2>/dev/null | grep -q "\"$CARTRIDGE\""; then
+      if ! tc cartridge list --json 2>/dev/null | grep "\"$CARTRIDGE\"" >/dev/null; then
         CGEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
         if [ -n "$CGEN" ]; then note "the loaded medium reports $CGEN"; else note "could not read the medium's density from the drive"; fi
         # DGEN is now the DRIVE's identity, so `${CGEN:-$DGEN}` is exactly
