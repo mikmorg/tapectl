@@ -77,7 +77,7 @@ pub fn run(
     json_output: bool,
 ) -> Result<()> {
     match command {
-        ReportCommands::Summary => report_summary(conn, json_output),
+        ReportCommands::Summary => report_summary(conn, config, json_output),
         ReportCommands::FireRisk => report_fire_risk(conn, config, json_output),
         ReportCommands::Copies { unit } => report_copies(conn, unit.as_deref(), json_output),
         ReportCommands::TapeOnly { unit } => report_tape_only(conn, unit.as_deref(), json_output),
@@ -87,7 +87,7 @@ pub fn run(
             json_output,
             &config.defaults.global_excludes,
         ),
-        ReportCommands::Pending => report_pending(conn, json_output),
+        ReportCommands::Pending => report_pending(conn, config, json_output),
         ReportCommands::VerifyStatus { volume } => {
             report_verify_status(conn, volume.as_deref(), json_output)
         }
@@ -251,53 +251,115 @@ fn in_service_bytes_written(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
-fn report_summary(conn: &Connection, json_output: bool) -> Result<()> {
-    let unit_count: i64 = conn.query_row(
+/// The figures behind `report summary`, gathered once so the text and JSON
+/// forms (and the tests) read the same numbers.
+///
+/// Issue #352: each count says what it counts. `tenants` excludes the
+/// operator (an identity, not a tenant whose data is archived); `volumes`
+/// is [`in_service_volume_count`], i.e. volumes holding data — not the
+/// `active` status, which only `db import` sets; and the staging line
+/// separates stage sets that still owe a copy (the same selection as
+/// `report pending`, [`staged_set_rows`]) from those merely held in
+/// staging until `staging clean` releases them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Summary {
+    pub tenants: i64,
+    pub units: i64,
+    pub snapshots: i64,
+    pub volumes: i64,
+    pub writes: i64,
+    pub total_bytes: i64,
+    /// Every `staged` stage set, written or not.
+    pub staged_held: i64,
+    /// The subset of [`Self::staged_held`] whose version still has fewer
+    /// copies than its unit's resolved `min_copies`.
+    pub staged_owing: i64,
+}
+
+impl Summary {
+    pub(crate) fn text_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            "tapectl summary".to_string(),
+            format!("  Tenants:    {} (the operator not counted)", self.tenants),
+            format!("  Units:      {} active", self.units),
+            format!("  Snapshots:  {}", self.snapshots),
+            format!(
+                "  Volumes:    {} holding data (retired, erased, missing and quarantined \
+                 not counted)",
+                self.volumes
+            ),
+            format!("  Writes:     {} completed", self.writes),
+            format!(
+                "  Total data: {} on tape",
+                crate::util::format_bytes_binary(self.total_bytes)
+            ),
+        ];
+        if self.staged_held > 0 {
+            let owing = if self.staged_owing == 0 {
+                "none owe a copy (`tapectl staging clean` releases them)".to_string()
+            } else {
+                format!(
+                    "{} still owe a copy (`tapectl report pending` lists them)",
+                    self.staged_owing
+                )
+            };
+            lines.push(format!(
+                "  Staging:    {} stage set(s) held, {owing}",
+                self.staged_held
+            ));
+        }
+        lines
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tenants": self.tenants, "units": self.units, "snapshots": self.snapshots,
+            "volumes": self.volumes, "writes": self.writes, "total_bytes": self.total_bytes,
+            "stage_sets_held": self.staged_held,
+            "stage_sets_owing_a_copy": self.staged_owing,
+        })
+    }
+}
+
+pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
+    let units: i64 = conn.query_row(
         "SELECT COUNT(*) FROM units WHERE status = 'active'",
         [],
         |r| r.get(0),
     )?;
-    let tenant_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tenants WHERE status = 'active'",
+    let tenants: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tenants WHERE status = 'active' AND is_operator = 0",
         [],
         |r| r.get(0),
     )?;
-    let snapshot_count: i64 = conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?;
-    let volume_count: i64 = in_service_volume_count(conn)?;
-    let write_count: i64 = conn.query_row(
+    let snapshots: i64 = conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?;
+    let volumes: i64 = in_service_volume_count(conn)?;
+    let writes: i64 = conn.query_row(
         "SELECT COUNT(*) FROM writes WHERE status = 'completed'",
         [],
         |r| r.get(0),
     )?;
     let total_bytes: i64 = in_service_bytes_written(conn)?;
-    let staged_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'",
-        [],
-        |r| r.get(0),
-    )?;
+    let staged = staged_set_rows(conn, config)?;
+    Ok(Summary {
+        tenants,
+        units,
+        snapshots,
+        volumes,
+        writes,
+        total_bytes,
+        staged_held: staged.len() as i64,
+        staged_owing: staged.iter().filter(|r| r.owes_a_copy()).count() as i64,
+    })
+}
 
+fn report_summary(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    let summary = summarize(conn, config)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "units": unit_count, "tenants": tenant_count, "snapshots": snapshot_count,
-                "volumes": volume_count, "writes": write_count, "total_bytes": total_bytes,
-                "staged_pending": staged_count,
-            })
-        );
+        println!("{}", summary.json());
     } else {
-        println!("tapectl summary");
-        println!("  Tenants:    {tenant_count}");
-        println!("  Units:      {unit_count} active");
-        println!("  Snapshots:  {snapshot_count}");
-        println!("  Volumes:    {volume_count} active");
-        println!("  Writes:     {write_count} completed");
-        println!(
-            "  Total data: {} on tape",
-            crate::util::format_bytes_binary(total_bytes)
-        );
-        if staged_count > 0 {
-            println!("  Pending:    {staged_count} stage set(s) awaiting write");
+        for line in summary.text_lines() {
+            println!("{line}");
         }
     }
     Ok(())
@@ -957,17 +1019,58 @@ fn report_dirty(
     Ok(())
 }
 
-fn report_pending(conn: &Connection, json_output: bool) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT u.name, s.version, ss.status, ss.num_slices, ss.total_encrypted_size
+/// One stage set still held in staging (`stage_sets.status = 'staged'`),
+/// with where its version's coverage stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedSetRow {
+    pub unit: String,
+    pub version: i64,
+    pub slices: Option<i64>,
+    pub size: Option<i64>,
+    /// Copies of this stage set's VERSION ([`crate::policy::coverage::copy_count_expr`],
+    /// snapshot scope — a copy is identical content, counted per version,
+    /// ADR-0012).
+    pub copies: i64,
+    /// The unit's resolved `min_copies` ([`crate::policy::resolve`]), or
+    /// `None` when its policy cannot be resolved — `audit` reports that as
+    /// `policy_unresolvable`; here it counts as owing, the conservative
+    /// reading for a list of outstanding work.
+    pub min_copies: Option<i64>,
+}
+
+impl StagedSetRow {
+    /// Whether this stage set's version still needs another copy.
+    pub fn owes_a_copy(&self) -> bool {
+        match self.min_copies {
+            Some(min) => self.copies < min,
+            None => true,
+        }
+    }
+}
+
+/// Every `staged` stage set with its version's copy count and its unit's
+/// resolved `min_copies` — the ONE selection behind `report pending` and
+/// `report summary`'s staging line (issue #352), so the two can never
+/// disagree about what still owes a copy. A stage set stays `staged` after
+/// its writes until `staging clean` releases it (it can become the next
+/// copy), so "staged" alone never meant "awaiting write".
+pub(crate) fn staged_set_rows(conn: &Connection, config: &Config) -> Result<Vec<StagedSetRow>> {
+    let copies =
+        crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
+            scope: crate::policy::coverage::CoverageScope::Snapshot { id_expr: "s.id" },
+            exclude_volume: None,
+        });
+    let sql = format!(
+        "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size, {copies}
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
          WHERE ss.status = 'staged'
-         ORDER BY u.name",
-    )?;
-    type Row = (String, i64, String, Option<i64>, Option<i64>);
-    let rows: Vec<Row> = stmt
+         ORDER BY u.name, s.version, ss.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    type Row = (String, i64, Option<i64>, Option<i64>, i64);
+    let raw: Vec<Row> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -979,23 +1082,79 @@ fn report_pending(conn: &Connection, json_output: bool) -> Result<()> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    let mut min_by_unit: std::collections::HashMap<String, Option<i64>> = Default::default();
+    let mut rows = Vec::with_capacity(raw.len());
+    for (unit, version, slices, size, copies) in raw {
+        let min_copies = match min_by_unit.get(&unit) {
+            Some(m) => *m,
+            None => {
+                let m = match queries::get_unit_by_name(conn, &unit)? {
+                    Some(u) => match crate::policy::resolve(conn, config, &u) {
+                        Ok(p) => Some(p.min_copies),
+                        Err(crate::error::TapectlError::PolicyUnresolvable { .. }) => None,
+                        Err(e) => return Err(e),
+                    },
+                    None => None,
+                };
+                min_by_unit.insert(unit.clone(), m);
+                m
+            }
+        };
+        rows.push(StagedSetRow {
+            unit,
+            version,
+            slices,
+            size,
+            copies,
+            min_copies,
+        });
+    }
+    Ok(rows)
+}
+
+fn report_pending(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    let all = staged_set_rows(conn, config)?;
+    let released = all.iter().filter(|r| !r.owes_a_copy()).count();
+    let rows: Vec<&StagedSetRow> = all.iter().filter(|r| r.owes_a_copy()).collect();
+
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, ver, status, slices, size)| {
-                serde_json::json!({"unit": name, "version": ver, "status": status, "slices": slices, "size": size})
+            .map(|r| {
+                serde_json::json!({
+                    "unit": r.unit, "version": r.version, "status": "staged",
+                    "slices": r.slices, "size": r.size,
+                    "copies": r.copies, "min_copies": r.min_copies,
+                })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else if rows.is_empty() {
-        println!("no pending stage sets");
     } else {
-        println!("pending writes:");
-        for (name, ver, _status, slices, size) in &rows {
+        if rows.is_empty() {
+            println!("no stage set owes a copy");
+        } else {
+            println!("stage sets that still owe a copy:");
+            for r in &rows {
+                let policy = match r.min_copies {
+                    Some(min) => format!("{} of {min} copies", r.copies),
+                    None => format!(
+                        "{} copies, policy unresolvable (see `tapectl audit`)",
+                        r.copies
+                    ),
+                };
+                println!(
+                    "  {} v{}: {} slices, {} — {policy}",
+                    r.unit,
+                    r.version,
+                    r.slices.unwrap_or(0),
+                    crate::util::format_bytes_binary(r.size.unwrap_or(0)),
+                );
+            }
+        }
+        if released > 0 {
             println!(
-                "  {name} v{ver}: {} slices, {}",
-                slices.unwrap_or(0),
-                crate::util::format_bytes_binary(size.unwrap_or(0)),
+                "{released} more stage set(s) have all their copies and are only held in \
+                 staging (`tapectl staging clean` releases them)"
             );
         }
     }
@@ -3232,6 +3391,191 @@ mod tests {
         fn compaction_candidates_still_runs_unchanged() {
             let (conn, _unit) = setup("rep-sup-compact", 2, "sealed", "active");
             report_compaction_candidates(&conn, &Config::default(), false).unwrap();
+        }
+    }
+
+    /// Issue #352: `report summary` said "Pending: 4 stage set(s) awaiting
+    /// write" for four stage sets each written twice (they stay `staged`
+    /// until `staging clean` releases them), "Volumes: 2 active" for two
+    /// SEALED volumes, and "Tenants: 3" for two tenants plus the operator.
+    mod issue352_summary_says_what_it_counts {
+        use super::*;
+
+        fn add_unit(
+            conn: &Connection,
+            tenant_id: i64,
+            name: &str,
+            archive_set: Option<i64>,
+        ) -> i64 {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status, archive_set_id)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active', ?4)",
+                params![format!("uuid-{name}"), name, tenant_id, archive_set],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        }
+
+        /// One `staged` stage set of a v1 snapshot in `snapshot_status`,
+        /// completed-written to each of `volumes`.
+        fn add_staged_set(conn: &Connection, unit_id: i64, snapshot_status: &str, volumes: &[i64]) {
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', ?2, '/src')",
+                params![unit_id, snapshot_status],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices, total_encrypted_size)
+                 VALUES (?1, 'staged', 524288, 1, 2048)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            for vol in volumes {
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss_id, snap_id, vol],
+                )
+                .unwrap();
+            }
+        }
+
+        fn add_volume(conn: &Connection, label: &str, status: &str) -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, bytes_written, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 1024, ?2)",
+                params![label, status],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        }
+
+        /// The operator plus two tenants; two sealed volumes and a retired
+        /// one; four staged sets:
+        ///   - `docs`   written to both sealed volumes: 2 of 2 copies, owes none;
+        ///   - `photos` written to one: 1 of 2, owes a copy;
+        ///   - `music`  never written (snapshot still `created`): owes a copy;
+        ///   - `vault`  written to both, but its archive set's `min_copies`
+        ///     is 3 — the RESOLVED policy, not the default — so it owes one.
+        fn fixture() -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let alice = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('bob', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let bob = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO archive_sets (name, min_copies) VALUES ('triple', 3)",
+                [],
+            )
+            .unwrap();
+            let triple = conn.last_insert_rowid();
+
+            let va = add_volume(&conn, "L6-A", "sealed");
+            let vb = add_volume(&conn, "L6-B", "sealed");
+            add_volume(&conn, "L6-OLD", "retired");
+
+            let docs = add_unit(&conn, alice, "docs", None);
+            add_staged_set(&conn, docs, "current", &[va, vb]);
+            let photos = add_unit(&conn, alice, "photos", None);
+            add_staged_set(&conn, photos, "current", &[va]);
+            let music = add_unit(&conn, bob, "music", None);
+            add_staged_set(&conn, music, "created", &[]);
+            let vault = add_unit(&conn, bob, "vault", Some(triple));
+            add_staged_set(&conn, vault, "current", &[va, vb]);
+            conn
+        }
+
+        #[test]
+        fn pending_rows_are_the_stage_sets_that_still_owe_a_copy() {
+            let conn = fixture();
+            let config = Config::default();
+            let rows = staged_set_rows(&conn, &config).unwrap();
+            assert_eq!(rows.len(), 4, "every staged set is accounted for: {rows:?}");
+            let owing: Vec<(&str, i64, Option<i64>)> = rows
+                .iter()
+                .filter(|r| r.owes_a_copy())
+                .map(|r| (r.unit.as_str(), r.copies, r.min_copies))
+                .collect();
+            assert_eq!(
+                owing,
+                vec![
+                    ("music", 0, Some(2)),
+                    ("photos", 1, Some(2)),
+                    ("vault", 2, Some(3)),
+                ],
+                "docs (2 of 2 copies) owes nothing; vault's archive set asks for 3"
+            );
+        }
+
+        #[test]
+        fn summary_text_says_what_each_count_counts() {
+            let conn = fixture();
+            let summary = summarize(&conn, &Config::default()).unwrap();
+            assert_eq!(
+                summary.text_lines(),
+                vec![
+                    "tapectl summary".to_string(),
+                    "  Tenants:    2 (the operator not counted)".to_string(),
+                    "  Units:      4 active".to_string(),
+                    "  Snapshots:  4".to_string(),
+                    "  Volumes:    2 holding data (retired, erased, missing and quarantined \
+                     not counted)"
+                        .to_string(),
+                    "  Writes:     5 completed".to_string(),
+                    "  Total data: 2.0 KiB on tape".to_string(),
+                    "  Staging:    4 stage set(s) held, 3 still owe a copy (`tapectl report \
+                     pending` lists them)"
+                        .to_string(),
+                ]
+            );
+        }
+
+        /// The session the issue was found in: every staged set already
+        /// has its copies. Nothing is pending; the sets are only waiting
+        /// to be released.
+        #[test]
+        fn fully_copied_stage_sets_are_not_reported_as_owing() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            let va = add_volume(&conn, "L6-A", "sealed");
+            let vb = add_volume(&conn, "L6-B", "sealed");
+            for name in ["a", "b", "c", "d"] {
+                let unit = add_unit(&conn, tid, name, None);
+                add_staged_set(&conn, unit, "current", &[va, vb]);
+            }
+
+            let summary = summarize(&conn, &Config::default()).unwrap();
+            assert_eq!(
+                summary.text_lines().last().unwrap(),
+                "  Staging:    4 stage set(s) held, none owe a copy (`tapectl staging clean` \
+                 releases them)"
+            );
+            assert!(staged_set_rows(&conn, &Config::default())
+                .unwrap()
+                .iter()
+                .all(|r| !r.owes_a_copy()));
         }
     }
 

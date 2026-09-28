@@ -1046,8 +1046,9 @@ fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> 
                     row.modified.len(),
                 ),
                 action: format!(
-                    "tapectl snapshot create {} && tapectl stage create {} && tapectl volume write <LABEL>",
-                    unit.name, unit.name
+                    "tapectl snapshot create {0} && tapectl stage create {0} && \
+                     tapectl volume init <LABEL> && tapectl volume write <LABEL>",
+                    unit.name
                 ),
             });
         } else if row.state == "unreadable" {
@@ -2710,6 +2711,14 @@ mod tests {
             assert_eq!(warnings.len(), 1, "exactly one warning (dirty) is expected");
             assert_eq!(warnings[0].check, "dirty");
             assert_eq!(warnings[0].unit, "dirty_unit");
+            // Issue #352: every other write remedy initialises a volume
+            // first; a sealed volume never takes a second write (ADR-0003),
+            // so `volume write` without `volume init` fails as pasted.
+            assert_eq!(
+                warnings[0].action,
+                "tapectl snapshot create dirty_unit && tapectl stage create dirty_unit && \
+                 tapectl volume init <LABEL> && tapectl volume write <LABEL>"
+            );
         }
 
         /// A never-archived (`PendingReason::New`) unit must NOT trigger
