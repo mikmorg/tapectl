@@ -133,16 +133,16 @@ pub fn sync_collection(
     Ok((report, errors))
 }
 
-/// Directories at exactly `unit_depth` below `root`, excluding any whose
-/// basename matches one of `lib.exclude`'s glob patterns (e.g. `*.partial`,
-/// so an in-flight copy isn't registered as a unit mid-transfer).
+/// Directories at exactly `unit_depth` below `root`, excluding any that
+/// `lib.exclude` excludes (e.g. `*.partial`, so an in-flight copy isn't
+/// registered as a unit mid-transfer). Matched by the shared
+/// `staging::exclude` rule (issue #359): case-insensitive like every other
+/// exclude, a plain pattern against the candidate's own name, and a
+/// directory pattern (`name/`) against the candidate and every directory
+/// between it and the root, so the whole subtree is excluded.
 fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> Vec<PathBuf> {
     let depth = lib.unit_depth.max(1);
-    let patterns: Vec<glob::Pattern> = lib
-        .exclude
-        .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
+    let excludes = crate::staging::exclude::Excludes::new(root, &lib.exclude);
 
     WalkDir::new(root)
         .follow_links(false)
@@ -151,10 +151,7 @@ fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_dir())
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy();
-            !patterns.iter().any(|p| p.matches(&name))
-        })
+        .filter(|e| !excludes.excludes_unit_dir(e.path()))
         .map(|e| e.path().to_path_buf())
         .collect()
 }
@@ -593,6 +590,53 @@ mod tests {
         assert!(queries::get_unit_by_name(&conn, "testlib/beta.partial")
             .unwrap()
             .is_none());
+    }
+
+    /// Issue #359: a collection's `exclude` follows the one exclude rule --
+    /// case-insensitive, like `global_excludes` and a dotfile's `[excludes]`.
+    #[test]
+    fn collection_excludes_ignore_case() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        std::fs::create_dir_all(root.path().join("Beta.PARTIAL")).unwrap();
+
+        let lib = test_lib(root.path(), "media"); // exclude = ["*.partial"]
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(report.created, 1, "only alpha; Beta.PARTIAL is excluded");
+        assert!(queries::get_unit_by_name(&conn, "testlib/Beta.PARTIAL")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Issue #359: a directory pattern (`name/`) in a collection's `exclude`
+    /// excludes that directory's whole subtree -- the directory itself when
+    /// it is a candidate, and every candidate below it at a deeper
+    /// `unit_depth`.
+    #[test]
+    fn a_collection_directory_pattern_excludes_the_whole_subtree() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for d in ["shows/alpha", "shows/@eaDir", "Trash/old", "Trash/older"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+
+        let mut lib = test_lib(root.path(), "media");
+        lib.unit_depth = 2;
+        lib.exclude = vec!["trash/".to_string(), "@eadir/".to_string()];
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(report.created, 1, "only shows/alpha survives");
+        assert!(queries::get_unit_by_name(&conn, "testlib/shows/alpha")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

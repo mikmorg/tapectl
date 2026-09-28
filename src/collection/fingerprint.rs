@@ -865,6 +865,68 @@ mod tests {
         }
     }
 
+    /// Issue #359: a directory pattern (`name/`) prunes that directory's
+    /// whole subtree -- in both walks alike, from either pattern layer, and
+    /// ignoring case like every other exclude.
+    #[test]
+    fn both_walks_prune_a_directory_pattern_subtree_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &tmp.path().join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: "u-1".into(),
+                name: "fixture".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "t".into(),
+                archive_set: None,
+                checksum_mode: None,
+                compression: None,
+                slice_size: None,
+                warehouse_copies: None,
+                exclude_patterns: vec![".cache/".into()],
+            },
+        )
+        .unwrap();
+        let global_excludes = vec!["node_modules/".to_string()];
+        for d in [".cache/deep", "src/.CACHE", "web/node_modules/pkg", "keep"] {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        for f in [
+            ".cache/c1",
+            ".cache/deep/c2",
+            "src/.CACHE/c3",
+            "web/node_modules/pkg/index.js",
+            "web/app.js",
+            "keep/k.txt",
+        ] {
+            std::fs::write(tmp.path().join(f), f.as_bytes()).unwrap();
+        }
+
+        let mut from_directory = crate::staging::walk_directory_relative_paths_for_test(
+            tmp.path().to_str().unwrap(),
+            &global_excludes,
+        )
+        .unwrap();
+        from_directory.sort();
+        let from_fingerprint: Vec<String> = walk_fingerprint(tmp.path(), &global_excludes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+
+        assert_eq!(from_directory, from_fingerprint);
+        assert_eq!(
+            from_fingerprint,
+            vec![
+                ".tapectl-unit.toml".to_string(),
+                "keep/k.txt".to_string(),
+                "web/app.js".to_string(),
+            ],
+            "everything under .cache/ (any case, any depth) and node_modules/ must be gone"
+        );
+    }
+
     #[test]
     fn walk_fingerprint_with_no_excludes_at_all_behaves_exactly_as_before() {
         // The true no-excludes case (issue #49 trap: "do NOT break units
