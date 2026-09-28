@@ -360,10 +360,14 @@ WHAT TO DO FIRST
     not two shelves in one building.
   * Paper: a UL-350 rated safe. If stored together with tape,
     Class-125 (tape is far less heat-tolerant than paper).
-  * REFRESH after each writing session. A kit made before newer
-    tapes were written still opens the older ones and silently
-    misses the new. Running `tapectl audit` will warn when this
-    sheet has fallen behind the tapes.
+  * REFRESH after each writing session. The secret opens EVERY
+    tape ever written -- it is a recipient of all of them, old
+    and new. What goes stale is catalog.db.age in this envelope:
+    it lists only the volumes that existed when this kit was
+    made (see GENERATED). For a tape written later, rebuild the
+    catalog from that tape (tapectl catalog rebuild
+    --from-volume) or generate a fresh kit. Running
+    `tapectl audit` warns when this kit has fallen behind.
 
 GENERATED
 ---------
@@ -716,6 +720,67 @@ mod tests {
             !txt.contains("CLOUD"),
             "a tape-only archive must not get a cloud section"
         );
+    }
+
+    /// Issue #351: the CUSTODY section told the kit's keeper that a kit made
+    /// before newer tapes were written "still opens the older ones and
+    /// silently misses the new". False — the escrow identity is a recipient
+    /// of every write (ADR-0005), so the secret in the box opens every tape
+    /// ever written. What falls behind is only `catalog.db.age`, which the
+    /// GENERATED section of the same sheet already said ("Only the catalog
+    /// does"). The printed sheet contradicted itself on the one page an heir
+    /// relies on; this pins CUSTODY to the truth and to GENERATED.
+    #[test]
+    fn the_custody_section_says_the_secret_opens_every_tape_and_only_the_catalog_goes_stale() {
+        let f = KitFacts {
+            escrow_public_key: ESCROW,
+            sealed_volumes: 3,
+            catalog_bytes: 4096,
+            warehouse_deposits: 0,
+        };
+        let txt = render_cover_text(&f);
+        let start = txt
+            .find("CUSTODY -- FOR WHOEVER MAINTAINS THIS")
+            .expect("the sheet must have a CUSTODY section");
+        let end = txt[start..]
+            .find("\nGENERATED\n")
+            .map(|i| start + i)
+            .expect("CUSTODY must be followed by GENERATED");
+        let custody_raw = &txt[start..end];
+        // The sheet is wrapped at 64 columns; compare prose, not line breaks.
+        let custody = custody_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for required in [
+            "opens EVERY tape ever written",
+            "catalog.db.age",
+            "catalog rebuild --from-volume",
+            "generate a fresh kit",
+            "tapectl audit",
+        ] {
+            assert!(
+                custody.contains(required),
+                "CUSTODY must say {required:?} (issue #351); it says: {custody}"
+            );
+        }
+        for forbidden in ["silently misses", "opens the older ones", "misses the new"] {
+            assert!(
+                !txt.contains(forbidden),
+                "the sheet still says {forbidden:?} — the escrow secret opens every tape; \
+                 only the catalog goes stale (issue #351)"
+            );
+        }
+        // Consistent with GENERATED, which must keep saying the same thing.
+        assert!(
+            txt[end..].contains("Only the catalog does."),
+            "GENERATED must still say only the catalog goes stale"
+        );
+        // The sheet's own width: every CUSTODY line fits the 64-column rule.
+        for line in custody_raw.lines() {
+            assert!(
+                line.chars().count() <= 64,
+                "CUSTODY line wider than the sheet's 64 columns: {line:?}"
+            );
+        }
     }
 
     /// The page has to render with no network and no filesystem beyond
