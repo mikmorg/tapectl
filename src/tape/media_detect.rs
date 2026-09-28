@@ -202,6 +202,49 @@ pub fn probe_no_medium(device_tape: &str) -> bool {
     }
 }
 
+/// The one refusal every tape-touching command gives on an empty drive
+/// (issue #355): [`probe_no_medium`], turned into
+/// [`TapectlError::NoCartridgeLoaded`] — "no cartridge loaded in <device>".
+///
+/// Until #355 only `volume init` asked (issue #152). Every other command's
+/// first contact with the drive was a blocking `open()` — `detect`'s density
+/// fallback, or the store itself — which on an empty drive waits out the st
+/// driver's `ST_BLOCK_SECONDS` (~2 minutes) and then fails with a bare
+/// `tape I/O error` that never says the drive is simply empty.
+///
+/// Where it runs, so that nothing a command does precedes it:
+/// - every READ path: as the first act of [`check_read_contact`], which all
+///   eight of them call before anything else touches the drive
+///   (`every_read_path_holds_both_reads_for_its_contact` counts them) — and
+///   before that function's no-backend early return, so the DR machine with
+///   keys and no `backend add` (ADR-0005) is covered too;
+/// - every WRITE path (`volume init`, `volume write` and everything built on
+///   it, `volume resume`): before its own `detect`, and before `volume
+///   write`'s quiet-host question — an empty drive is refused for its own
+///   reason, not asked about first.
+///
+/// A physical fact, not a risk judgement: no `--force` reaches it — there is
+/// nothing for one to override.
+pub fn ensure_medium_loaded(device_tape: &str) -> Result<()> {
+    ensure_medium_loaded_with(device_tape, probe_no_medium)
+}
+
+/// [`ensure_medium_loaded`] with the probe injected — the same testing
+/// discipline as `cli::consent::confirm_with`: the refusal can be proved with
+/// no drive at all, because the only hardware fact in it is the probe's
+/// answer.
+pub fn ensure_medium_loaded_with(
+    device_tape: &str,
+    no_medium: impl FnOnce(&str) -> bool,
+) -> Result<()> {
+    if no_medium(device_tape) {
+        return Err(TapectlError::NoCartridgeLoaded {
+            device: device_tape.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// `GMT_DR_OPEN(x)`, `<linux/mtio.h>`: `(x) & 0x00040000`, "door open (no
 /// tape)". Split out from [`probe_no_medium`] purely so the bit-test logic is
 /// callable with a literal `i64` in tests, with no device involved at all.
@@ -506,7 +549,26 @@ pub fn check_drive_can_read(backend: &LtoBackendConfig, medium: Generation) -> R
 /// attempted (no backend resolved). Production callers go through
 /// [`crate::tape::mam_journal::MamReads::check_read_contact`], which holds
 /// the capture for the contact.
+///
+/// **An empty drive is refused FIRST** (issue #355), before the backend is
+/// even resolved: [`ensure_medium_loaded`] is this function's first act, so
+/// the no-backend early return cannot skip it (that path's blocking
+/// open is the store's, a few lines later in every caller), and a refusal
+/// carries no capture — no MAM read was taken, so none is journalled.
 pub fn check_read_contact(config: &Config, device: &str) -> (Option<MamCapture>, Result<()>) {
+    check_read_contact_with(config, device, probe_no_medium)
+}
+
+/// [`check_read_contact`] with the no-medium probe injected (see
+/// [`ensure_medium_loaded_with`]). Production passes [`probe_no_medium`].
+pub fn check_read_contact_with(
+    config: &Config,
+    device: &str,
+    no_medium: impl FnOnce(&str) -> bool,
+) -> (Option<MamCapture>, Result<()>) {
+    if let Err(e) = ensure_medium_loaded_with(device, no_medium) {
+        return (None, Err(e));
+    }
     let backend = match crate::config::resolve_device(config, Some(device)) {
         Ok((_, backend)) => backend,
         Err(e) => return (None, Err(e)),
@@ -893,5 +955,185 @@ mod tests {
         // No backend, so no sg node, so no MAM read — and no capture to
         // journal (issue #297): absence of a read, not a failed one.
         assert!(capture.is_none());
+    }
+
+    // ---- issue #355: every read path refuses an empty drive at once ----
+
+    /// A backend whose device nodes cannot exist, so any MAM read or density
+    /// read it reaches fails immediately rather than touching hardware.
+    fn config_with_backend(device_tape: &str) -> Config {
+        let mut config = Config::default();
+        config.backends.lto.push(LtoBackendConfig {
+            name: "lto0".into(),
+            device_tape: device_tape.into(),
+            device_sg: "/nonexistent/tapectl-no-medium-sg".into(),
+            generation: "LTO-6".into(),
+            capacity_override: None,
+            usable_capacity_factor: 1.0,
+            enospc_buffer: "0".into(),
+        });
+        config
+    }
+
+    const EMPTY_DRIVE: &str = "/nonexistent/tapectl-no-medium-nst";
+
+    /// The refusal itself, with the text `volume init` has printed since
+    /// #152 — the one every command now shares.
+    #[test]
+    fn ensure_medium_loaded_names_the_device_when_the_probe_says_empty() {
+        let err = ensure_medium_loaded_with(EMPTY_DRIVE, |_| true).unwrap_err();
+        assert!(
+            matches!(&err, TapectlError::NoCartridgeLoaded { device } if device == EMPTY_DRIVE),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("no cartridge loaded in {EMPTY_DRIVE}")
+        );
+        // Positive control: a probe that answers "loaded" (or "couldn't
+        // tell") lets the command proceed.
+        ensure_medium_loaded_with(EMPTY_DRIVE, |_| false).unwrap();
+    }
+
+    /// The probe is asked about the device the command was given — not the
+    /// backend's `device_tape`, which a by-id `--device` does not
+    /// string-match.
+    #[test]
+    fn the_probe_is_asked_about_the_commands_own_device() {
+        let config = config_with_backend("/nonexistent/some-other-spelling");
+        let mut asked = None;
+        let _ = check_read_contact_with(&config, EMPTY_DRIVE, |d| {
+            asked = Some(d.to_string());
+            false
+        });
+        assert_eq!(asked.as_deref(), Some(EMPTY_DRIVE));
+    }
+
+    /// A configured drive, empty: refused with the named error, and BEFORE
+    /// the MAM read — no capture comes back, so nothing is journalled for a
+    /// read that never happened.
+    #[test]
+    fn a_read_path_refuses_an_empty_drive_before_its_mam_read() {
+        let config = config_with_backend(EMPTY_DRIVE);
+        let (capture, verdict) = check_read_contact_with(&config, EMPTY_DRIVE, |_| true);
+        let err = verdict.expect_err("an empty drive must be refused");
+        assert!(
+            matches!(err, TapectlError::NoCartridgeLoaded { .. }),
+            "{err:?}"
+        );
+        assert!(
+            capture.is_none(),
+            "the refusal precedes the MAM read: {capture:?}"
+        );
+
+        // Positive control: the same drive answering "loaded" DOES take the
+        // MAM read (a failed one, on these paths) — so `None` above is the
+        // refusal's doing, not a fixture that never reads.
+        let (capture, verdict) = check_read_contact_with(&config, EMPTY_DRIVE, |_| false);
+        verdict.expect("nothing detected, so nothing to refuse");
+        assert!(capture.is_some(), "a loaded drive's MAM read is captured");
+    }
+
+    /// The DR machine — keys, no `backend add` (ADR-0005) — used to leave
+    /// this function before any check at all, and its first drive contact
+    /// was the store's blocking open. The empty-drive refusal must not be
+    /// skipped by that early return.
+    #[test]
+    fn the_no_backend_dr_path_refuses_an_empty_drive_too() {
+        let config = Config::default();
+        let (capture, verdict) = check_read_contact_with(&config, EMPTY_DRIVE, |_| true);
+        assert!(
+            matches!(verdict, Err(TapectlError::NoCartridgeLoaded { .. })),
+            "{verdict:?}"
+        );
+        assert!(capture.is_none());
+        // ...while a loaded drive keeps the DR leniency exactly as it was.
+        let (capture, verdict) = check_read_contact_with(&config, EMPTY_DRIVE, |_| false);
+        verdict.unwrap();
+        assert!(capture.is_none());
+    }
+
+    /// The production entry point is the injected one with the real probe —
+    /// pinned by source, because the real probe cannot answer "empty" with
+    /// no drive attached.
+    #[test]
+    fn check_read_contact_is_the_probed_variant() {
+        const SRC: &str = include_str!("media_detect.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.len() < SRC.len(),
+            "positive control: split found tests"
+        );
+        let f = "pub fn check_read_contact(";
+        let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+        let end = prod[start..].find("\n}\n").unwrap() + start;
+        assert!(
+            prod[start..end].contains("check_read_contact_with(config, device, probe_no_medium)"),
+            "check_read_contact must run the real no-medium probe"
+        );
+        let f = "pub fn check_read_contact_with(";
+        let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+        let body = &prod[start..prod[start..].find("\n}\n").unwrap() + start];
+        let probe = body
+            .find("ensure_medium_loaded_with(device, no_medium)")
+            .expect("check_read_contact_with must run the probe");
+        let resolve = body.find("resolve_device(").expect("resolves a backend");
+        assert!(
+            probe < resolve,
+            "the probe must precede backend resolution, or the no-backend path skips it"
+        );
+    }
+
+    /// The write paths reach the drive through their own `detect`, not
+    /// through `check_read_contact`, so each carries the probe itself —
+    /// `volume init` (issue #152), and since issue #355 `volume write` (and
+    /// with it compact-write, `volume compact`'s step 2, `collection run`
+    /// and `quick-archive`, which all go through it) and `volume resume`.
+    ///
+    /// Pinned by source: the real probe cannot answer "empty" with no drive
+    /// attached, and every one of these functions needs a fully staged
+    /// catalog to get as far as the drive at all. The same shape as
+    /// `the_host_preflight_sits_between_the_fact_checks_and_the_drive`.
+    #[test]
+    fn every_write_path_probes_for_an_empty_drive_before_detect() {
+        const SRC: &str = include_str!("../volume/write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.len() < SRC.len(),
+            "positive control: split found tests"
+        );
+        let probe = "crate::tape::media_detect::ensure_medium_loaded(device)?;";
+        let drive = "crate::tape::media_detect::detect(device";
+        for f in [
+            "fn volume_init_contacted<'c>(",
+            "fn volume_write_contacted<'c>(",
+            "fn volume_resume_contacted<'c>(",
+        ] {
+            let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+            let end = prod[start..].find("\n}\n").unwrap() + start;
+            let body = &prod[start..end];
+            assert_eq!(body.matches(probe).count(), 1, "{f}: probes exactly once");
+            assert_eq!(body.matches(drive).count(), 1, "{f}: one detect");
+            assert!(
+                body.find(probe) < body.find(drive),
+                "{f}: the probe must precede the first blocking open (detect)"
+            );
+        }
+        // `volume write` asks the quiet-host question before the drive; an
+        // empty drive is refused for its own reason before that question.
+        let f = "fn volume_write_contacted<'c>(";
+        let start = prod.find(f).unwrap();
+        let body = &prod[start..prod[start..].find("\n}\n").unwrap() + start];
+        let preflight = body.find("crate::host_check::preflight(").unwrap();
+        assert!(
+            body.find(probe).unwrap() < preflight,
+            "an empty drive is refused before the host pre-flight asks anything"
+        );
+        // One refusal text: no production caller builds its own from the
+        // bare probe any more.
+        assert!(
+            !prod.contains("probe_no_medium("),
+            "write.rs must use ensure_medium_loaded, not the bare probe"
+        );
     }
 }

@@ -171,6 +171,18 @@ pub enum TapectlError {
     #[error("tape I/O error: {0}")]
     TapeIo(String),
 
+    /// The drive reported no cartridge in place (`GMT_DR_OPEN`), answered by
+    /// the non-blocking probe every tape-touching command runs before its
+    /// first blocking open (issue #152 for `volume init`, issue #355 for the
+    /// rest). Its own variant, not a `TapeIo`: nothing was read or written,
+    /// the fix is to load a cartridge, and `volume verify` maps it — like
+    /// every verify that reached no verdict — to its "inconclusive" exit
+    /// code rather than to the one that means the medium is bad (issue #356).
+    ///
+    /// The text is the one `volume init` has printed since #152; keep it.
+    #[error("no cartridge loaded in {device}")]
+    NoCartridgeLoaded { device: String },
+
     // General
     #[error("not initialized — run `tapectl init` first")]
     NotInitialized,

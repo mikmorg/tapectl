@@ -266,12 +266,9 @@ fn volume_init_contacted<'c>(
     //
     // A physical fact, not a risk judgement, same as `can_write` below:
     // `--force` is deliberately NOT consulted. An empty drive has nothing
-    // for `--force` to override.
-    if crate::tape::media_detect::probe_no_medium(device) {
-        return Err(TapectlError::Other(format!(
-            "no cartridge loaded in {device}"
-        )));
-    }
+    // for `--force` to override. The one shared refusal since issue #355 —
+    // every tape-touching command gives the same one.
+    crate::tape::media_detect::ensure_medium_loaded(device)?;
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
     // The health probe's two test seams, taken off the slot BEFORE it opens:
     // `open` hands back a guard that keeps the slot borrowed for the rest of
@@ -1166,6 +1163,15 @@ fn volume_write_contacted<'c>(
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let session = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
 
+    // An empty drive is refused here, at once, by name (issue #355) — after
+    // every fact check above, so a write refused for its own reason still
+    // says that reason, and before the quiet-host question below, so the
+    // operator is not asked about the host for a write that cannot start.
+    // Non-blocking: no MAM read, no contact, nothing left behind. Without
+    // it the first touch of an empty drive was `detect`'s blocking density
+    // open, a ~2 minute stall ending in a bare I/O error.
+    crate::tape::media_detect::ensure_medium_loaded(device)?;
+
     // The quiet-host pre-flight (ADR-0012, 2026-09-24 amendment, item 7):
     // "warn when known contenders are active or the host is loaded or short
     // of memory, and ask for confirmation; never a refusal". After every
@@ -1815,6 +1821,12 @@ fn volume_resume_contacted<'c>(
     // identity mismatch onto DIVERGENCE → quarantine (`layout-session.md`).
     // A fact refusal on File 0 here would pre-empt the quarantine that is
     // how a resume is supposed to record a divergent tape.
+    //
+    // An empty drive first, by name and at once (issue #355): `detect`'s
+    // density fallback is a blocking open that waits out the st driver's
+    // ~2 minute no-medium timeout. Nothing about the session is touched by
+    // this refusal — reload the cartridge and resume again.
+    crate::tape::media_detect::ensure_medium_loaded(device)?;
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
     // The health probe's two test seams, off the slot BEFORE it opens
     // (issue #342) — see `volume_write_contacted`.
