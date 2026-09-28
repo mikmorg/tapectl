@@ -349,6 +349,28 @@ if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
   if [ -z "$HOME_DIR" ] && as_svc test -e "$EFFECTIVE_HOME/tapectl.db" 2>/dev/null && [ "$FROM" -le 7 ]; then
     note "$EFFECTIVE_HOME is already initialised. This script will detect that in step 7 and not re-init."
   fi
+  # Keys renamed since a home may have been initialised (ADR-0012, 2026-09-28
+  # amendment; issue #348): [defaults] min_copies_for_tape_only → min_copies and
+  # min_locations_for_tape_only → min_locations, same meaning. The new binary
+  # refuses the old names, and a re-entry at --from 12/13 never reaches step 7's
+  # config probe — so the fixup lives here, where every run passes.
+  CFG0="$EFFECTIVE_HOME/config.toml"
+  if as_svc test -f "$CFG0" 2>/dev/null \
+     && as_svc grep -qE '^[[:space:]]*min_(copies|locations)_for_tape_only[[:space:]]*=' "$CFG0" 2>/dev/null; then
+    note "$CFG0 uses key names this tapectl renamed (same meaning):"
+    note "  min_copies_for_tape_only → min_copies,  min_locations_for_tape_only → min_locations"
+    if confirm "Rename them in place now (the old file is kept beside it)?"; then
+      run as_svc cp "$CFG0" "$CFG0.pre-rename-$(date +%Y%m%d-%H%M%S)"
+      run as_svc sed -i -E \
+        -e 's/^([[:space:]]*)min_copies_for_tape_only([[:space:]]*=)/\1min_copies\2/' \
+        -e 's/^([[:space:]]*)min_locations_for_tape_only([[:space:]]*=)/\1min_locations\2/' "$CFG0"
+      as_svc grep -qE '^[[:space:]]*min_(copies|locations)_for_tape_only[[:space:]]*=' "$CFG0" \
+        && die "the rename did not take — edit [defaults] in $CFG0 by hand"
+      ok "config keys renamed"
+    else
+      note "left as is — every tapectl command will refuse this config until the two keys are renamed"
+    fi
+  fi
 fi
 resolve_tapectl() {
   if [ -n "$TAPECTL" ]; then [ -x "$TAPECTL" ] || die "--tapectl $TAPECTL is not executable"; return; fi
