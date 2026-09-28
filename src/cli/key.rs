@@ -7,6 +7,7 @@ use tabled::{Table, Tabled};
 
 use crate::config::TapectlPaths;
 use crate::crypto::keys;
+use crate::db::models::EncryptionKey;
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 
@@ -100,12 +101,13 @@ pub enum KeyCommands {
 }
 
 /// Table-only: `key list --json` serializes `db::models::EncryptionKey`
-/// directly (already `Serialize`, and richer than this display row -- it
-/// carries `id`/`tenant_id`/`public_key` and the untruncated fingerprint
-/// that `KeyRow` reformats for the table), so there is no hand-rolled JSON
-/// derived from `KeyRow` to keep in sync. The `Serialize` derive and its pin
-/// below exist for structural parity with the other ten row structs;
-/// nothing in `run()` calls it.
+/// (already `Serialize`, and richer than this display row -- it carries
+/// `id`/`tenant_id`/`public_key` and the untruncated fingerprint that
+/// `KeyRow` reformats for the table) through [`key_list_json`], so there is
+/// no hand-rolled JSON derived from `KeyRow` to keep in sync. The `Serialize`
+/// derive and its pin below exist for structural parity with the other ten
+/// row structs; nothing in `run()` calls it. Both renderings take the Type
+/// from [`displayed_key_type`], never from the stored column alone.
 #[derive(Tabled, Serialize)]
 struct KeyRow {
     #[tabled(rename = "Alias")]
@@ -194,15 +196,18 @@ pub fn run(
             let t = crate::tenant::require_tenant(conn, tenant)?;
             let key_list = queries::list_keys_for_tenant(conn, t.id)?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&key_list).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&key_list_json(&key_list)).unwrap()
+                );
             } else if key_list.is_empty() {
                 println!("no keys found for tenant \"{tenant}\"");
             } else {
                 let rows: Vec<KeyRow> = key_list
                     .into_iter()
                     .map(|k| KeyRow {
+                        key_type: displayed_key_type(&k).to_string(),
                         alias: k.alias,
-                        key_type: k.key_type,
                         is_active: if k.is_active {
                             "yes".into()
                         } else {
@@ -693,6 +698,38 @@ pub fn print_escrow_secret_warning(public_key: &str, secret_key: &str) {
     eprintln!();
     eprintln!("================================================================================");
     eprintln!();
+}
+
+/// The Type `key list` shows for a key (issue #350): `escrow` for the
+/// permanent escrow recipient (ADR-0005), the stored `key_type` otherwise.
+///
+/// The escrow row's stored `key_type` is `'primary'` — not a choice, a
+/// constraint: migration 001's `CHECK(key_type IN ('primary','backup'))`
+/// has no room for `'escrow'`, and migration 003 added `is_escrow` without
+/// rebuilding the table to widen it. Printed verbatim, that made the one key
+/// that is a recipient of every tape look like an ordinary tenant primary.
+/// `is_escrow` is the fact; this is where it reaches the operator.
+fn displayed_key_type(k: &EncryptionKey) -> &str {
+    if k.is_escrow {
+        "escrow"
+    } else {
+        &k.key_type
+    }
+}
+
+/// `key list --json`: every `EncryptionKey` field as stored, except
+/// `key_type`, which says `escrow` on the escrow row ([`displayed_key_type`])
+/// — the same label the table shows. `is_escrow` stays alongside it.
+fn key_list_json(keys: &[EncryptionKey]) -> serde_json::Value {
+    serde_json::Value::Array(
+        keys.iter()
+            .map(|k| {
+                let mut v = serde_json::to_value(k).expect("EncryptionKey serializes");
+                v["key_type"] = serde_json::json!(displayed_key_type(k));
+                v
+            })
+            .collect(),
+    )
 }
 
 fn truncate_fingerprint(fp: &str) -> String {
