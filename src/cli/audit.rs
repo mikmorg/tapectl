@@ -1311,14 +1311,21 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         |r| r.get(0),
     )?;
 
+    // Issue #351: what goes stale is the kit's CATALOG, never its key. The
+    // escrow identity is a recipient of every tape ever written (ADR-0005),
+    // so the kit's secret opens these volumes too; only `catalog.db.age`, the
+    // snapshot taken at generation time, does not list them. Saying the kit
+    // "misses" new tapes tells an heir not to try the one key that works.
     if stale_count > 0 {
         return Ok(vec![AuditFinding {
             unit: "archive".into(),
             check: "escrow_kit_stale".into(),
             message: format!(
-                "{stale_count} volume(s) were sealed after the last heir kit \
-                 ({last_kit}); the printed kit still opens older tapes and silently \
-                 misses these"
+                "{stale_count} volume(s) were sealed after the last heir kit ({last_kit}): \
+                 the kit's escrow secret still opens them (it is a recipient of every tape), \
+                 but the kit's encrypted catalog (catalog.db.age) does not list them — \
+                 regenerate the kit, or rebuild the catalog from those tapes with \
+                 `tapectl catalog rebuild --from-volume`"
             ),
             action: "tapectl key escrow-kit --out <dir>".to_string(),
         }]);
@@ -2161,8 +2168,12 @@ mod tests {
             );
         }
 
-        /// The case ADR-0005 names in so many words: the paper still opens
-        /// the old tapes and silently misses the new ones.
+        /// A tape sealed after the kit was generated makes the kit stale —
+        /// but only its CATALOG (issue #351). The escrow secret is a
+        /// recipient of every tape ever written, so it still opens the new
+        /// one; what the kit lacks is `catalog.db.age`'s record of it. The
+        /// message must say exactly that, never that the kit "misses" the
+        /// new tapes: an heir told the secret cannot open a tape may not try.
         #[test]
         fn escrow_kit_check_fires_when_a_tape_was_sealed_after_the_kit() {
             let (conn, unit_id) = setup();
@@ -2179,6 +2190,29 @@ mod tests {
             let findings = escrow_kit_findings(&conn).unwrap();
             assert_eq!(findings.len(), 1, "a tape sealed after the kit is stale");
             assert_eq!(findings[0].check, "escrow_kit_stale");
+            let message = &findings[0].message;
+            let kit_date: String = conn
+                .query_row(
+                    "SELECT MAX(timestamp) FROM events WHERE action = 'escrow_kit_generated'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                *message,
+                format!(
+                    "1 volume(s) were sealed after the last heir kit ({kit_date}): the kit's \
+                     escrow secret still opens them (it is a recipient of every tape), but the \
+                     kit's encrypted catalog (catalog.db.age) does not list them — regenerate \
+                     the kit, or rebuild the catalog from those tapes with `tapectl catalog \
+                     rebuild --from-volume`"
+                )
+            );
+            assert!(
+                !message.contains("misses"),
+                "the secret opens every tape; only the catalog is stale: {message}"
+            );
+            assert_eq!(findings[0].action, "tapectl key escrow-kit --out <dir>");
         }
 
         /// A sealed volume whose write carries NO completion timestamp
