@@ -47,6 +47,53 @@ fn validate_compression_capability(value: &str, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Parse a `--required-locations` value (comma-separated) and refuse any
+/// name that is not a registered location (issue #348).
+///
+/// A policy naming a location nobody registered can never be met, and
+/// nothing downstream says why — `audit` just reports the unit short of
+/// locations forever. So `create` and `edit` refuse it here, naming each
+/// unknown name, what IS registered, and the command that registers one.
+/// An empty entry (`"a,,b"`, a trailing comma) is refused the same way: it
+/// can only be a typo. Runs before either command's dry-run return, so a dry
+/// run refuses exactly what the real run would (#241).
+fn parse_required_locations(conn: &Connection, value: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = value.split(',').map(|s| s.trim().to_string()).collect();
+    if names.iter().any(|n| n.is_empty()) {
+        return Err(TapectlError::Other(format!(
+            "--required-locations {value:?} contains an empty location name — \
+             give a comma-separated list such as \"home-rack,offsite\""
+        )));
+    }
+    let registered: Vec<String> = conn
+        .prepare("SELECT name FROM locations ORDER BY name")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let unknown: Vec<String> = names
+        .iter()
+        .filter(|n| !registered.contains(n))
+        .map(|n| format!("\"{n}\""))
+        .collect();
+    if !unknown.is_empty() {
+        let known = if registered.is_empty() {
+            "no locations are registered yet".to_string()
+        } else {
+            format!("registered locations: {}", registered.join(", "))
+        };
+        let what = if unknown.len() == 1 {
+            "which is not a registered location"
+        } else {
+            "which are not registered locations"
+        };
+        return Err(TapectlError::Other(format!(
+            "--required-locations names {}, {what} ({known}). Register a location \
+             first with `tapectl location add <name>`, or fix the spelling.",
+            unknown.join(", "),
+        )));
+    }
+    Ok(names)
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ArchiveSetCommands {
     /// Create a new archive set policy
@@ -56,7 +103,8 @@ pub enum ArchiveSetCommands {
         /// Minimum copy count
         #[arg(long)]
         min_copies: Option<i64>,
-        /// Required locations (comma-separated)
+        /// Required locations (comma-separated); each must be a registered
+        /// location (`tapectl location add`)
         #[arg(long)]
         required_locations: Option<String>,
         /// Encryption enabled
@@ -90,7 +138,8 @@ pub enum ArchiveSetCommands {
         /// Minimum copy count
         #[arg(long)]
         min_copies: Option<i64>,
-        /// Required locations (comma-separated)
+        /// Required locations (comma-separated); each must be a registered
+        /// location (`tapectl location add`)
         #[arg(long)]
         required_locations: Option<String>,
         /// Encryption enabled
@@ -244,10 +293,11 @@ pub fn run(
                 // hours later at unit-write time with a raw SQLite error.
                 crate::config::validate_checksum_mode(m).map_err(TapectlError::Other)?;
             }
-            let locations_json = required_locations.as_ref().map(|locs| {
-                let arr: Vec<&str> = locs.split(',').map(|s| s.trim()).collect();
-                serde_json::to_string(&arr).unwrap()
-            });
+            let locations_json = required_locations
+                .as_ref()
+                .map(|locs| parse_required_locations(conn, locs))
+                .transpose()?
+                .map(|arr| serde_json::to_string(&arr).unwrap());
             let slice_bytes = slice_size
                 .as_ref()
                 .map(|s| crate::staging::parse_size_to_bytes(s))
@@ -324,6 +374,11 @@ pub fn run(
             if let Some(m) = checksum_mode {
                 crate::config::validate_checksum_mode(m).map_err(TapectlError::Other)?;
             }
+            let locations_json = required_locations
+                .as_ref()
+                .map(|locs| parse_required_locations(conn, locs))
+                .transpose()?
+                .map(|arr| serde_json::to_string(&arr).unwrap());
             let id: i64 = conn
                 .query_row(
                     "SELECT id FROM archive_sets WHERE name = ?1",
@@ -414,9 +469,7 @@ pub fn run(
                     None,
                 )?;
             }
-            if let Some(locs) = required_locations {
-                let arr: Vec<&str> = locs.split(',').map(|s| s.trim()).collect();
-                let json = serde_json::to_string(&arr).unwrap();
+            if let Some(json) = locations_json {
                 tx.execute(
                     "UPDATE archive_sets SET required_locations = ?1, updated_at = datetime('now') WHERE id = ?2",
                     params![json, id],
@@ -1143,6 +1196,131 @@ fi
             )
             .unwrap(),
             1
+        );
+    }
+
+    fn add_location(conn: &Connection, name: &str) {
+        conn.execute("INSERT INTO locations (name) VALUES (?1)", params![name])
+            .unwrap();
+    }
+
+    fn create_with_locations(name: &str, locations: &str) -> ArchiveSetCommands {
+        let mut cmd = create_cmd(name, None, None);
+        if let ArchiveSetCommands::Create {
+            required_locations, ..
+        } = &mut cmd
+        {
+            *required_locations = Some(locations.to_string());
+        } else {
+            unreachable!("create_cmd always returns Create");
+        }
+        cmd
+    }
+
+    fn stored_locations(conn: &Connection, name: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT required_locations FROM archive_sets WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #348: `--required-locations` naming a location nobody
+    /// registered was accepted, so the policy could never be met and nothing
+    /// said why. `create` refuses it by name — before the dry-run return
+    /// too, since a dry run must refuse what the real run refuses (#241).
+    #[test]
+    fn create_refuses_a_required_location_that_is_not_registered() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        add_location(&conn, "home-rack");
+
+        for dry_run in [true, false] {
+            let err = run(
+                &conn,
+                &config,
+                &create_with_locations("cold", "home-rack, offsite"),
+                false,
+                dry_run,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("\"offsite\""),
+                "must name the unknown one: {err}"
+            );
+            assert!(
+                err.contains("home-rack"),
+                "must name what IS registered: {err}"
+            );
+            assert!(
+                err.contains("location add"),
+                "must say how to fix it: {err}"
+            );
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_sets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a refused create must write nothing");
+
+        // Positive control: the registered name alone is accepted and stored.
+        run(
+            &conn,
+            &config,
+            &create_with_locations("cold", "home-rack"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_locations(&conn, "cold").as_deref(),
+            Some(r#"["home-rack"]"#)
+        );
+    }
+
+    /// Issue #348, the `edit` half: an unknown name is refused and the
+    /// stored list is left exactly as it was.
+    #[test]
+    fn edit_refuses_a_required_location_that_is_not_registered() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        add_location(&conn, "home-rack");
+        add_location(&conn, "bank");
+        run(
+            &conn,
+            &config,
+            &create_with_locations("cold", "home-rack"),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let edit = |locations: &str| ArchiveSetCommands::Edit {
+            name: "cold".to_string(),
+            min_copies: None,
+            required_locations: Some(locations.to_string()),
+            encrypt: None,
+            compression: None,
+            checksum_mode: None,
+            slice_size: None,
+            verify_interval_days: None,
+            warehouse_copies: None,
+            description: None,
+        };
+        let err = run(&conn, &config, &edit("home-rack,ofsite"), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"ofsite\""), "{err}");
+        assert_eq!(
+            stored_locations(&conn, "cold").as_deref(),
+            Some(r#"["home-rack"]"#)
+        );
+
+        run(&conn, &config, &edit("home-rack,bank"), false, false).unwrap();
+        assert_eq!(
+            stored_locations(&conn, "cold").as_deref(),
+            Some(r#"["home-rack","bank"]"#)
         );
     }
 
