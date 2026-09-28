@@ -926,7 +926,10 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
   ask TEST_BARCODE "medium serial of the TEST cartridge in the drive, as printed above (it will be erased)" "$TEST_BARCODE"
   [ -n "$TEST_BARCODE" ] || die "no barcode given"
   if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE" "$BARCODE_FROM_FLAG"; then
-    CMD="cd '$REPO' && PATH='$(dar_path_prefix)$PATH' TAPECTL_LIFECYCLE_OUT='$WORK_DIR/tapectl-lifecycle' TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
+    # /usr/sbin:/sbin: Debian installs mtx there and leaves both off a normal
+    # user's PATH; the suite's precondition check wants mtx even on a real
+    # drive (home2, 2026-09-28).
+    CMD="cd '$REPO' && PATH='$(dar_path_prefix)$PATH:/usr/sbin:/sbin' TAPECTL_LIFECYCLE_OUT='$WORK_DIR/tapectl-lifecycle' TAPECTL_BIN='$TAPECTL' bash scripts/lifecycle-suite.sh --scenario first-year --device '$DEVICE' --erase short --single-cartridge --i-will-lose-the-cartridge '$TEST_BARCODE'"
     if [ "${#WRAP[@]}" -gt 0 ]; then run "${WRAP[@]}" "$CMD"; else run bash -c "$CMD"; fi || die "rehearsal RED — do not write real data until this is understood"
     ok "rehearsal green"
     # B14: step 13 checks for this marker (per binary) before the first write.
