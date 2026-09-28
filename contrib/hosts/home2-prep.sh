@@ -113,11 +113,15 @@ print(c.execute("select count(*) from volumes").fetchone()[0])' "$OLD_TH/tapectl
     run sudo rm -rf "$OLD_TH"
   fi
 else ok "no tapectl home at $OLD_TH"; fi
-if [ -e /usr/local/bin/tapectl ]; then
+# Only the pre-redesign binary: it predates build identity, so its --version
+# has no "(<commit>, <date>)". The one first-run step 3 installs has it and
+# must never be offered for removal on a re-run of this script.
+if [ -e /usr/local/bin/tapectl ] && ! /usr/local/bin/tapectl --version 2>/dev/null | grep '(' >/dev/null; then
   note "/usr/local/bin/tapectl is $(/usr/local/bin/tapectl --version 2>/dev/null || echo '?'), built $(stat -c %y /usr/local/bin/tapectl | cut -d' ' -f1) — first-run step 3 installs the current one"
   if part "Remove it, so nothing pre-redesign can run by accident?"; then run sudo rm -f /usr/local/bin/tapectl; fi
 fi
-if [ -e "$STATE/first-run.log" ]; then
+# Once only: after the first set-aside, first-run.log is the current run's log.
+if [ -e "$STATE/first-run.log" ] && [ ! -e "$STATE/first-run.log.pre-2026-09-28" ]; then
   if part "Set the old first-run log aside (first-run.log.pre-2026-09-28)?"; then run mv "$STATE/first-run.log" "$STATE/first-run.log.pre-2026-09-28"; fi
 fi
 
