@@ -121,14 +121,14 @@ To read the next file (the full recovery guide):
 
     mt -f /dev/nst0 setblk 524288
     mt -f /dev/nst0 fsf 1
-    dd if=/dev/nst0 bs=512k | tr -d '\\0' > GUIDE.md
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > GUIDE.md
     less GUIDE.md
 
 If you just read this file and the tape is already positioned
 past it, read the next file directly:
 
     mt -f /dev/nst0 setblk 524288
-    dd if=/dev/nst0 bs=512k | tr -d '\\0' > GUIDE.md
+    dd if=/dev/nst0 bs=512k | tr -d '\0' > GUIDE.md
 
 The guide explains everything: what tools you need, how to find
 your encryption key, and how to recover your data step by step.
@@ -2147,6 +2147,54 @@ mod tests {
         );
     }
 
+    /// File 0 is the first thing a finder reads, and its "read the guide"
+    /// command must strip the NUL block padding and nothing else. It is in a
+    /// raw string, where `'\\0'` stays two backslashes: `tr -d '\\0'` then
+    /// deleted every backslash and every digit 0 and kept the NULs ("2026"
+    /// became "226"). Found 2026-09-28 by the docs pass. This runs the
+    /// thunk's own `tr` words through a shell, so it tests what the reader
+    /// types, not how the source spells it.
+    #[test]
+    fn id_thunk_guide_command_strips_nuls_and_keeps_zeros() {
+        let params = IdThunkV2Params {
+            label: "TEST01",
+            uuid: "11111111-2222-3333-4444-555555555555",
+            media_type: "LTO-6",
+            tapectl_version: "0.2.0",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 27,
+            mam_manufacturer: "IBM",
+            mam_serial: "SERIAL1",
+            mam_length: 846,
+            mam_loads: 5,
+            created_at: "2026-07-22T20:09:00Z",
+            cartridge_identity_source: None,
+        };
+        let s = generate_id_thunk_v2(&params);
+        let tr_cmds: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("GUIDE.md") && l.contains("tr -d"))
+            .map(|l| {
+                let from = l.find("tr -d").unwrap();
+                let to = l[from..].find(" >").map(|i| from + i).unwrap_or(l.len());
+                &l[from..to]
+            })
+            .collect();
+        assert_eq!(tr_cmds.len(), 2, "both guide-read commands found: {s}");
+        for tr in tr_cmds {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf 'Guide 2026 v0.1\\n\\0\\0\\0' | {tr}"))
+                .output()
+                .expect("sh runs");
+            assert_eq!(
+                out.stdout, b"Guide 2026 v0.1\n",
+                "`{tr}` must remove the NUL padding and keep every 0"
+            );
+        }
+    }
+
     #[test]
     fn id_thunk_v2_is_byte_identical_across_two_calls_given_the_same_created_at() {
         // T6 review finding #5: before `created_at` was injectable, the ID
@@ -2212,13 +2260,21 @@ mod tests {
             cartridge_identity_source: None,
         };
         let rendered = generate_id_thunk_v2(&params);
+        // 2026-09-28: the two guide-read commands were corrected from
+        // `tr -d '\\0'` (deleted every 0 digit, kept the NULs) to
+        // `tr -d '\0'` — see `id_thunk_guide_command_strips_nuls_and_keeps_zeros`.
+        // The pin keeps its meaning: undo exactly that correction and the
+        // bytes must still be the pre-field output, so nothing else moved.
+        let good = "tr -d '\\0' > GUIDE.md";
+        assert_eq!(rendered.matches(good).count(), 2, "{rendered}");
+        let pre_fix = rendered.replace(good, "tr -d '\\\\0' > GUIDE.md");
         let mut h = Sha256::new();
-        h.update(rendered.as_bytes());
+        h.update(pre_fix.as_bytes());
         let digest = format!("{:x}", h.finalize());
         assert_eq!(
             digest, "1fb03cbe041201afb2f47c77f60c1504eb94d8ea14df2d53b9ffae8f45fcd373",
             "the absent case must render exactly as it did before \
-             cartridge_identity_source existed"
+             cartridge_identity_source existed (apart from the tr correction)"
         );
 
         // ...and the present case differs by exactly one inserted line, in
