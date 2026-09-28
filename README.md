@@ -1,254 +1,170 @@
 # tapectl
 
-Multi-tenant archival storage management for LTO tape and exportable encrypted directories.
+**Long-term, encrypted, multi-tenant archiving to LTO tape — built so the tapes can be
+read back decades later, by someone else, without tapectl.**
 
-tapectl manages the full lifecycle of archiving data to LTO tape: directory scanning, dar archive creation, age encryption, tape writing with self-describing volume layouts, verification, restore, and policy compliance auditing.
+tapectl turns directories into encrypted archives (`dar` + `age`), plans each tape
+before writing it, writes it in one verified session, and keeps a catalog of what is
+where: which files, which version, which cartridge, on which shelf, in how many
+copies. Every tape carries its own recovery instructions, so the data outlives the
+software, the database and the machine that wrote it.
 
-## Features
+```mermaid
+flowchart LR
+    D["/media/family/photos/2019-italy<br/>(a unit)"] -->|snapshot create| S[Snapshot<br/>what exists, fast]
+    S -->|stage create| G["Staging<br/>dar archive → sha256 → age encrypt"]
+    G -->|volume write| T1[("Tape L6-0001<br/>home shelf")]
+    G -->|volume write| T2[("Tape L6-0002<br/>offsite")]
+    T1 & T2 -->|audit| A{{copies, places,<br/>verification age}}
+```
 
-- **Three-phase pipeline**: `snapshot create` (fast metadata scan) -> `stage create` (dar archive + age encrypt) -> `volume write` (tape I/O)
-- **Multi-tenant isolation**: zero content metadata in plaintext on tape; tenant envelopes use age trial-decryption
-- **Self-describing volumes**: every tape is fully restorable without the database or tapectl itself (via RESTORE.sh)
-- **Policy engine**: archive sets with 3-level resolution (unit dotfile > archive set > system defaults), compliance audit with action plans
-- **Compaction workflow**: read live slices from underutilized tapes, rewrite to new tapes, retire old ones
-- **Full audit trail**: every state change logged with old/new values
-- **13 report types**: summary, fire-risk, copies, tape-only, dirty, pending, verify-status, health, capacity, age, events, compaction-candidates, supersedable
-- **FTS5 catalog search**: fast full-text search across all archived file paths
+## Why tapectl
 
-## Prerequisites
+- **Self-describing tapes.** Each tape begins with a plaintext guide, a `RESTORE.sh`
+  and a map of every file on it. With the right key, the data comes back with `mt`,
+  `dd`, `age` and `dar` alone — no database, no tapectl.
+- **Tenants that cannot read each other.** Family, business, a friend's backups: each
+  tenant has its own keys, and nothing about a tenant's content — not even file
+  names — is written to tape in plaintext.
+- **A key you can put in an envelope.** A permanent *escrow* key, printed once and kept
+  on paper, can decrypt every tape and rebuild the whole catalog from the tapes if the
+  machine is lost. The printed **Heir Kit** tells whoever finds it what to do.
+- **Plan first, write once.** The whole tape is planned before the first byte; the
+  write reads every byte back before sealing; a sealed tape is never appended to.
+- **It knows where everything is.** Copies, locations, versions and verification
+  history are tracked, and `audit` tells you what is short of your policy and the
+  exact command that fixes it.
 
-- Rust 1.94+ (for building; pinned via rust-toolchain.toml)
-- `dar` >= 2.6 (recommended 2.7.20+) for archive creation/extraction
-- `mhvtl` for development/testing (virtual tape library)
-- LTO tape drive + `mt-st` for production use
-
-## Build
+## A taste
 
 ```bash
-cargo build --release
-cargo test
+TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst                 # your drive, by serial
+
+tapectl init --operator mike                             # write the printed escrow secret on paper
+tapectl backend add --name lto6 --device-tape "$TAPE" --device-sg /dev/sg1 --generation LTO-6
+tapectl tenant add family -d "family photos and letters"
+tapectl unit init-bulk /media/family/photos --tenant family
+
+tapectl snapshot create family/photos/2019-italy         # fast: what is there
+tapectl stage create family/photos/2019-italy            # dar + sha256 + age, into staging
+tapectl volume init L6-0001 --device "$TAPE"             # reads the cartridge's chip
+tapectl volume write L6-0001 --device "$TAPE"            # plan, write, read back, seal
+tapectl volume verify L6-0001 --device "$TAPE" --full
+
+tapectl audit --action-plan                              # "has 1 copies, needs 2" — and the fix
+tapectl restore unit --unit family/photos/2019-italy --from L6-0001 --to /tmp/restore --device "$TAPE"
 ```
 
-The binary is at `target/release/tapectl`.
+The [walkthrough](docs/walkthrough.md) runs a complete session like this — two tapes,
+two places, a restore, the Heir Kit and a disaster-recovery rehearsal — with the real
+output of every command.
 
-## Quick Start
+## Requirements
 
-The guided route: `scripts/first-run.sh` walks from a bare machine to the first
-sealed tape — toolchain, `dar`, build, tests, a `tapectl` service user that
-owns the keys and catalog, finding the drive by serial, `init` (with the escrow
-secret explained before it is printed), the Heir Kit, tenants and units (each
-tree granted to the service user by ACL), an optional rehearsal on a test
-cartridge, and the first write with `verify --full`. Resumable with `--from N`;
-`--home DIR` rehearses against a throwaway home; `--no-service-user` runs
-everything as you. The manual route follows.
+- **Linux** with the kernel `st` tape driver, and an **LTO drive** (tested on an HP
+  LTO-6; one drive writes every generation it supports — each cartridge's generation is
+  read from the cartridge). A virtual library ([mhvtl](docs/operator-guide.md)) works for
+  trying things out.
+- **`dar` ≥ 2.6** (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`.
+- **`age`** is needed only by the on-tape `RESTORE.sh` (the heir's path) and the
+  installer's rehearsal; tapectl itself encrypts with the `rage` library.
+- Staging space for one tape's worth of data (up to ~2.3 TB for a full LTO-6).
+- Rust 1.94 to build (pinned in `rust-toolchain.toml`).
 
-One drive handles more than one LTO generation. Declare what the drive *is*
-(`generation = "LTO-6"`); each cartridge's own generation is read from its
-density code when the volume is initialised, and that is what fixes the tape's
-capacity and whether the drive may write it at all.
+## Install
 
+The guided route builds a release binary, creates a dedicated `tapectl` service user
+to own the keys and catalog, finds the drive by serial, walks you through the escrow
+key and the Heir Kit, rehearses on a test cartridge, and writes your first tape:
 
 ```bash
-# Initialize tapectl (creates ~/.tapectl with DB, config, operator keys)
-tapectl init --operator mike
-
-# Register a storage location
-tapectl location add home-rack --description "Home server rack"
-
-# Add a tenant
-tapectl tenant add mike --description "Personal media"
-
-# Register a directory as an archival unit
-tapectl unit init /media/tv/breaking-bad --tenant mike --tag tv --tag drama
-
-# Or bulk-register all subdirectories
-tapectl unit init-bulk /media/tv --tenant mike --tag tv
-
-# Create a snapshot (fast directory walk)
-tapectl snapshot create tv/breaking-bad/s01
-
-# Stage for tape (dar archive + age encrypt)
-tapectl stage create tv/breaking-bad/s01
-
-# Initialize a tape volume
-tapectl volume init L6-0001 --device /dev/nst0
-
-# Write to tape
-tapectl volume write L6-0001 --device /dev/nst0
-
-# Verify
-tapectl volume verify L6-0001 --device /dev/nst0
-
-# Or do it all in one step
-tapectl quick-archive /media/tv/new-show --tenant mike --volume L6-0001
+git clone https://github.com/mikmorg/tapectl && cd tapectl
+scripts/first-run.sh            # resumable: --from N / --to N; --help lists every step
 ```
 
-## Command Reference
-
-```
-tapectl init                    Bootstrap DB, config, operator tenant + keys
-tapectl tenant                  add, list, info, reassign, delete
-tapectl key                     generate, list, export, import, rotate, escrow-kit
-tapectl unit                    init, init-bulk, list, status, tag, rename,
-                                discover, check-integrity, mark-tape-only
-tapectl snapshot                create, list, diff, delete, mark-reclaimable, purge
-tapectl stage                   create, list, info
-tapectl staging                 status, clean
-tapectl volume                  init, write, resume, abort, verify, identify,
-                                list, info, move, retire, read-slices, plan,
-                                deposit, compact-read, compact-write,
-                                compact-finish, compact
-tapectl cartridge               register, edit, relabel, list, info, move, retire,
-                                unretire, mark-erased
-tapectl archive-set             create, edit, list, info, sync
-tapectl audit                   Policy compliance (--action-plan, --json)
-tapectl catalog                 ls, search, locate, stats, rebuild
-tapectl location                add, list, info, rename
-tapectl report                  summary, fire-risk, copies, tape-only, dirty,
-                                pending, verify-status, health, capacity, age,
-                                events, compaction-candidates, supersedable
-tapectl restore                 unit, file, raw-volume
-tapectl export                  Encrypted slices to directory
-tapectl import                  Pre-existing volume into DB
-tapectl collection              sync, status, plan, run
-tapectl backend                 add
-tapectl quick-archive           Create + stage + write in one flow
-tapectl db                      backup, fsck, export, import, stats
-tapectl config                  show, check
-tapectl completions             Shell completion generation
-```
-
-All commands support `--json` for machine-readable output.
-
-## Volume Layout
-
-Each tape is self-describing. **Layout Version 2** (ADR-0007) is the current
-format; the normative description is `docs/design/volume-format-v2.md` and this
-table is a summary of it, not a second source of truth.
-
-| Position | Contents | Encrypted? |
-|----------|----------|-----------|
-| 0 | ID thunk (label, uuid, layout pointers, `[media]`) | No |
-| 1 | System guide (recovery manual) | No |
-| 2 | RESTORE.sh (automated recovery) | No |
-| 3 | **Front index** — every file's position, type, size, ciphertext sha256 | No |
-| 4..M | Envelopes: tenant (shuffled), then dual operator | Per-tenant / Operator |
-| M+1..N | Data slices (dar + age) | Tenant+Operator |
-| N+1 | **Seal marker** — binds the front index; written only at seal | No |
-
-Two v2 properties the v1 table above it used to obscure, and both are load-bearing:
-**envelopes come before slices**, and a plaintext front index at position 3 plus a
-trailing seal marker replace v1's mini-index. End-of-tape salvage does not exist —
-a real EOT is a clean abort to an unsealed tape (ADR-0007 rejected §2.9/Appendix C).
-
-*This section documented the superseded v1 10-file layout until 2026-09-17
-(issue #216), roughly fourteen months after the v2 regear replaced it.*
-
-## Configuration
-
-System config at `~/.tapectl/config.toml`:
-
-```toml
-[dar]
-binary = "/opt/dar/bin/dar"
-
-[staging]
-directory = "/mnt/staging"
-
-[defaults]
-slice_size = "2400G"
-encrypt = true
-min_copies_for_tape_only = 2
-min_locations_for_tape_only = 2
-
-[compaction]
-utilization_threshold = 0.50
-```
-
-Per-unit config at `.tapectl-unit.toml` in each directory.
-
-## Architecture
-
-```
-src/
-  cli/          Clap-based subcommands (21 modules)
-  collection/   Folder-per-unit source roots: sync, plan, run
-  db/           SQLite with WAL, forward-only migrations, FTS5;
-                ontape_catalog.rs is the operator envelope's catalog.db
-  policy/       3-level resolver; coverage.rs (copy/location SQL),
-                escrow.rs (escrow coverage: covered / unknown / gap)
-  store.rs      The Store seam (ADR-0006): TapeStore, MemStore
-  unit/         Archival units, dotfiles, discovery
-  staging/      dar + age pipeline, sha256 validation
-  volume/       Layout v2: build, session (typestate write), format
-                (front index / seal / ID thunk parsers), manifest
-                (MANIFEST.toml both directions), envelope (reads one
-                back), restore_script (RESTORE.sh from named awk
-                fragments), rebuild (catalog rebuild), raw, restore
-  tape/         Linux st driver via ioctl
-  crypto/       age multi-recipient encryption
-  dar/          dar subprocess wrapper, XML catalog parsing
-  tenant/       Multi-tenant management
-  config.rs     TOML config parsing
-  error.rs      Error types + exit codes
-  signal.rs     SIGINT handling
-```
-
-## Testing
-
-Default `cargo test` runs unit tests, integration tests, the tenant-
-isolation crypto tests, and library-level failure-mode tests — none
-require tape hardware or mhvtl:
-
-```bash
-cargo test
-```
-
-**`dar` must be installed and on `PATH`.** The ungated suite is not
-hermetic: 13 tests build and extract real archives, so they need the same
-`dar >= 2.6` the tool itself requires (Debian/Ubuntu: `sudo apt install
-dar`). `tests/test_dependencies.rs` checks this once and fails with
-instructions naming what would otherwise break, rather than letting the
-absence surface as a dozen unexplained archive errors.
-
-Two gated test suites exist for heavier validation:
-
-```bash
-# mhvtl end-to-end round-trip, tenant isolation on real tape layout,
-# health log collection. DEVICE NUMBERING IS NOT STABLE across reboots on a
-# host that also has a real drive: always set TAPECTL_GATE_TAPE, and check
-# `ls -l /dev/tape/by-id/` first (scsi-XYZZY_A* are mhvtl).
-TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 \
-    cargo test --test mhvtl_e2e -- --ignored --nocapture
-
-# The two operator-level suites on mhvtl: the 27-check verification gate
-# (its sixth leg runs tests/mhvtl_e2e.rs, which nothing routine invoked until
-# issue #259), and the lifecycle suite (years of use in minutes, 16
-# scenarios, a 10-way restore matrix). Both are documented in docs/.
-TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 scripts/mhvtl-verify-gate.sh
-scripts/lifecycle-suite.sh --scenario first-year --device /dev/nst1
-
-# Performance scenarios (many files, many units, large file).
-# Gated because a full run takes ~2 minutes.
-TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
-    --ignored --nocapture --test-threads=1
-```
+[docs/install.md](docs/install.md) is the runbook: what each step creates, how to
+resume, reinstall, move to a new host, or uninstall. To build by hand:
+`cargo build --release` (binary at `target/release/tapectl`).
 
 ## Documentation
 
-- `docs/operator-guide.md` — day-to-day operations, worked examples
-- `docs/perf-baselines.md` — performance regression baselines
-- `docs/lto6-validation-checklist.md` — real-hardware validation steps
-- `docs/man/` — generated man pages (`man -l docs/man/tapectl.1`)
-- `tapectl-design-v4_0.md` — full design document and implementation
-  reference
+| If you want to… | Read |
+|---|---|
+| See a whole session, start to finish | [Walkthrough](docs/walkthrough.md) |
+| Understand the model: tenants, units, snapshots, volumes, copies | [Concepts](docs/concepts.md) |
+| Install it properly | [Install](docs/install.md) |
+| Run it day to day: archive, copy, restore, compact, audit | [Operator guide](docs/operator-guide.md) |
+| Configure it: every `config.toml` key, collections, policy | [Configuration](docs/configuration.md) |
+| Understand the keys, the Heir Kit, and recover from a disaster | [Keys and recovery](docs/keys-and-recovery.md) |
+| Make sense of a refusal or an error | [Troubleshooting](docs/troubleshooting.md) |
+| Look up a command or flag | [Command reference](docs/cli/README.md) |
+| Know exactly what is on a tape | [On-tape format v2](docs/design/volume-format-v2.md) |
 
-Regenerate man pages after any CLI change:
+The full index, including design records and test procedures, is
+[docs/README.md](docs/README.md).
+
+## What is on a tape
+
+Every tape uses **Layout Version 2**
+([specification](docs/design/volume-format-v2.md)):
+
+| File | Contents | Encrypted? |
+|---|---|---|
+| 0 | ID thunk: label, uuid, where the index is, the cartridge's identity | No |
+| 1 | Recovery guide (Markdown, written for a human or an AI assistant) | No |
+| 2 | `RESTORE.sh` — scripted recovery | No |
+| 3 | Front index: every file's position, type, size and ciphertext sha256 | No |
+| 4 … | Envelopes: one per tenant (file lists, restore recipe), then the operator's two (the catalog) | Yes |
+| … | Data slices (`dar` archives) | Yes |
+| last | Seal marker: binds the front index; written only when the tape is complete | No |
+
+Nothing in the plaintext files says what the data *is* — no names, no paths, no
+tenants. A tape without its seal marker was never finished and says so.
+
+## Status
+
+tapectl is in its first production use (2026). The on-tape format is frozen and pinned
+by byte-level tests; changes to it are deliberate decisions recorded as
+[ADRs](docs/adr/). It has been validated end to end on a real HP LTO-6 — writes,
+verification, every restore path including the heir's script off the tape, catalog
+rebuild from tape, and a measured end-of-tape fill.
+
+## Development
 
 ```bash
-cargo run --example gen_man
+cargo check --all-targets
+cargo test                      # ~2,000 tests; needs `dar` on PATH, no tape hardware
+cargo clippy --all-targets      # must stay warning-clean
+cargo fmt --check
+scripts/check-docs.py           # every `tapectl …` example in the docs must parse
 ```
+
+After a CLI change, regenerate the references:
+`cargo run --example gen_man` (man pages, `docs/man/`) and
+`cargo run --example gen_cli_md` (Markdown, `docs/cli/`; a test fails while it is
+stale).
+
+Gated suites need a virtual tape library ([mhvtl](docs/operator-guide.md)). They
+take the `/dev/nstN` of an **LTO-8** emulated drive, named explicitly — numbering is
+not stable across reboots, so look it up first (`ls -l /dev/tape/by-id/`: the
+`scsi-XYZZY_A*` links are mhvtl; `lsscsi` shows which are `ULT3580-TD8`). Discovery
+refuses anything that is not mhvtl, so a real drive is never written by mistake.
+
+```bash
+TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
+    cargo test --test mhvtl_e2e -- --ignored --nocapture
+TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
+    scripts/mhvtl-verify-gate.sh        # the operator-level verification gate
+scripts/lifecycle-suite.sh --help       # years of use in minutes, on a virtual library
+```
+
+Code map: `src/cli/` (commands), `src/db/` (SQLite catalog, migrations),
+`src/staging/` (dar + age pipeline), `src/volume/` (the v2 layout, the write session,
+verify, restore, catalog rebuild), `src/tape/` (st driver ioctls, cartridge memory),
+`src/policy/` (copies, escrow coverage, audit), `src/collection/` (folder-per-unit
+sources). Design records: [docs/adr/](docs/adr/), [docs/design/](docs/design/),
+[CONTEXT.md](CONTEXT.md) (the vocabulary).
 
 ## License
 
-See LICENSE file.
+See [LICENSE](LICENSE).

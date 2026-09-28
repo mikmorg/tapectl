@@ -16,8 +16,9 @@ Every `tapectl` flag below was checked against the binary's own `--help` on
 and `--backup-dir` move the ones they name, and the script prints the
 effective values at its start.
 
-The production host is this VM (`vm-desk1`, the HP LTO-6 passed through —
-`docs/lto6-drive-passthrough.md`). Where a fact is specific to it, this says so.
+Facts specific to one machine live in its **host profile** (§2, "Host profiles"):
+the production host, home2, is described by `contrib/hosts/home2.profile` and prepared
+by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
 
 ---
 
@@ -37,10 +38,10 @@ The production host is this VM (`vm-desk1`, the HP LTO-6 passed through —
 | a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 asks for its medium serial and refuses any other cartridge |
 | free space for staging | a tape is written in one session, so staging must hold everything one tape will carry (2.5 TB for a full LTO-6) | step 7 shows what is free and asks |
 
-On vm-desk1: `/` is 22 GB (the staging default is therefore `/scratch/tapectl-staging`,
-which the script proposes when `/scratch` exists), `/scratch` (`/dev/vdb`) is the
-only other disk, and `/var/backups` is on `/`. See §7 for what that means for
-`--backup-dir`.
+Staging and backups need thought on any host whose root filesystem is small: when
+`/scratch` exists the script proposes `/scratch/tapectl-staging`, otherwise a directory
+under the tapectl home — pass `--staging` (or set `STAGING_DIR` in a profile) to put it
+on a big disk, and see §7 for `--backup-dir`.
 
 ---
 
@@ -131,7 +132,7 @@ service user through `sudo -u tapectl -H`; the script has one seam for that
 | 3 build | `target/release/tapectl` in the repo, then **`/usr/local/bin/tapectl`** — the binary's home; the service user cannot execute anything under your home | root, 0755 | `tapectl --version` |
 | 4 tests | nothing on the host (`cargo test`, ~2–3 min, needs only `dar`) | — | the script stops if red |
 | 5 service user | system account **`tapectl`**, home `/var/lib/tapectl`, shell `/usr/sbin/nologin`, comment "tapectl archival service" | — | `id tapectl` |
-| 6 the drive | `tapectl` added to the group owning `/dev/nst*` and `/dev/sg*` (`tape` on vm-desk1) via `usermod -aG` | — | `sudo -u tapectl -H mt -f <by-id> status` |
+| 6 the drive | `tapectl` added to the group owning `/dev/nst*` and `/dev/sg*` (usually `tape`) via `usermod -aG` | — | `sudo -u tapectl -H mt -f <by-id> status` |
 | 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys; the staging directory (asked; default proposal `/scratch/tapectl-staging` when `/scratch` exists, else `<home>/staging`), created and `chown tapectl` | home 0700 `tapectl`; staging `tapectl` | `sudo -u tapectl -H tapectl config check`, `db fsck` |
 | 8 backend | a `[[backends.lto]]` table appended to `config.toml`: `device_tape` (by-id), `device_sg`, `generation` (from the drive's INQUIRY product id, never from the loaded cartridge — ADR-0010) | in the 0600 config | `tapectl config show` |
 | 9 heir kit | `~/heir-kit/` (**yours**; `--kit-out` moves it): `COVER.txt`, `escrow-kit.html`, `catalog.db.age` | you, 0700 | print `COVER.txt`, hand-write the secret on it, seal, two failure domains |
@@ -298,10 +299,10 @@ home must be writable even for a read: the database is in WAL mode.
 makes the destination a key-escrow point; `TAPECTL_BACKUP_INCLUDE_KEYS=1` in
 the installed service turns it on for a destination you keep as secret as the
 home). The directory must be outside the tapectl home (refused) and should be
-on a **second disk** (warned, never refused — ADR-0012, item 5). On vm-desk1
-the default is on `/`, the same filesystem as the home, and `/scratch`
-(`/dev/vdb`) is the only other disk; the script says so at install time, and
-`--backup-dir` is how you move it when the second disk exists.
+on a **second disk** (warned, never refused — ADR-0012, item 5). The
+default, `/var/backups/tapectl`, is usually on the same filesystem as the home; the
+script says so at install time, and `--backup-dir` is how you move it to a second
+disk.
 
 **After a session.** A timer cannot know when a write session ended, and the
 ruling asks for a backup "after every session":

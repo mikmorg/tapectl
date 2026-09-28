@@ -24,7 +24,7 @@ scripts/lifecycle-suite.sh --all --seed 3
 
 # a real single-cartridge LTO-6 drive — every flag below is required
 scripts/lifecycle-suite.sh --scenario retire-and-reuse \
-    --device /dev/nst0 --erase short --single-cartridge \
+    --device /dev/tape/by-id/scsi-<SERIAL>-nst --erase short --single-cartridge \
     --i-will-lose-the-cartridge <MEDIUM_SERIAL_FROM_sg_read_attr>
 
 # plan only — no build, no discovery, no lock, executes nothing

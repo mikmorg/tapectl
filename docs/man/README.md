@@ -1,7 +1,8 @@
 # tapectl man pages
 
 These pages are generated from the clap command definitions in
-`src/cli/mod.rs`. They are committed so users and package builders can
+`src/cli/mod.rs`. Reading on GitHub? The same reference is rendered as Markdown in
+[docs/cli/](../cli/README.md). They are committed so users and package builders can
 read them without needing `clap_mangen` installed.
 
 ## View a page without installing

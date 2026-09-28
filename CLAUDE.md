@@ -177,11 +177,17 @@ The crate is a **dual lib + bin target**: `src/main.rs` is a thin wrapper and al
 lives in the `tapectl` library crate (`src/lib.rs`). Integration tests import `tapectl::`
 directly, so keep command logic in library modules, not `main.rs`.
 
-Regenerate man pages after any CLI (clap) change:
+Regenerate both command references after any CLI (clap) change:
 
 ```bash
-cargo run --example gen_man   # writes docs/man/*.1
+cargo run --example gen_man      # writes docs/man/*.1
+cargo run --example gen_cli_md   # writes docs/cli/*.md (tests/cli_md_fresh.rs fails while stale)
 ```
+
+User-facing docs are checked against the binary: `scripts/check-docs.py` (every
+`tapectl …` line in a shell block must name real subcommands and flags; whole
+`config.toml` examples must pass `config check`; `--self-test` is its positive
+control). Run it with clippy/fmt before committing a docs or CLI change.
 
 ## Testing
 
@@ -213,8 +219,11 @@ Two suites are gated (they skip at runtime unless the env var is set):
 # owns it from home2 since 2026-09-28; ADR-0012), and a reboot can hand it /dev/nst0. Always set TAPECTL_GATE_TAPE. Discovery fails
 # closed on a non-mhvtl device, so an unset value aborts rather than writing to the
 # real drive — but do not rely on that. Check `ls -l /dev/tape/by-id/` after a boot:
-# scsi-HUJ808A5L4-nst is the REAL drive; scsi-XYZZY_A* are mhvtl.
-TAPECTL_GATE_TAPE=/dev/nst1 TAPECTL_MHVTL=1 \
+# scsi-HUJ808A5L4-nst is the REAL drive; scsi-XYZZY_A* are mhvtl. The gate and
+# mhvtl_e2e want an LTO-8 emulation (ULT3580-TD8, `lsscsi`) by its /dev/nstN
+# spelling — since the 2026-09-26 reboot that is nst3/nst4 (A1/A2); nst1/nst2 are TD6
+# and the gate's LTO-8 backend refuses their LTO-6 media.
+TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_e2e -- --ignored --nocapture
 
 # Performance scenarios (thousands of files, large archives); ~2 min. This is the one
