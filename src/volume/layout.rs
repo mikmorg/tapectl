@@ -179,7 +179,7 @@ pub fn generate_system_guide_v2(label: &str, total_files: i32) -> String {
 
 This document describes how to recover data from this tape without
 tapectl or its database. All you need is: mt, dd, age, dar, sha256sum,
-head, and truncate.
+head, truncate, and tar.
 
 ## Quick Reference
 
@@ -205,6 +205,7 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
 - `dar` (dar.linux.free.fr) — archive extraction
 - `sha256sum` (coreutils) — integrity verification
 - `head`, `truncate` (coreutils) — trimming block padding to exact sizes
+- `tar` — unpacking your decrypted envelope (it is a tar archive)
 
 ## Which device?
 
@@ -368,7 +369,7 @@ padding can be defeated without knowing the exact size:
 /// `key = value` lines, the §3.1 grammar contract); every value read from a
 /// plaintext tape metadata zone goes through `require_uint` before it
 /// reaches arithmetic, `fsf`, or `seq` (S2 hardening, carried over from v1).
-/// Tools used: mt, dd, age, dar, sha256sum, head, truncate, plus standard
+/// Tools used: mt, dd, age, dar, sha256sum, head, truncate, tar, plus standard
 /// coreutils (awk/sed/grep/tr) — no TOML collection, per the grammar contract.
 /// **`--key` is repeatable (issue #288, CTO ruling 2026-09-22).** A volume's
 /// tenant envelope is sealed at WRITE time to the tenant's then-current public
@@ -548,7 +549,7 @@ is_uint() {
 
 # ---- prerequisite check ----
 
-for tool in mt dd age sha256sum dar head truncate; do
+for tool in mt dd age sha256sum dar head truncate tar; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 
@@ -2809,7 +2810,16 @@ sha256_encrypted = \"bbb\"
         // so the stubs are never executed either.
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for tool in ["mt", "dd", "age", "dar", "sha256sum", "head", "truncate"] {
+        for tool in [
+            "mt",
+            "dd",
+            "age",
+            "dar",
+            "sha256sum",
+            "head",
+            "truncate",
+            "tar",
+        ] {
             let stub = bin.join(tool);
             std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2898,7 +2908,16 @@ sha256_encrypted = \"bbb\"
 
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for tool in ["mt", "dd", "age", "dar", "sha256sum", "head", "truncate"] {
+        for tool in [
+            "mt",
+            "dd",
+            "age",
+            "dar",
+            "sha256sum",
+            "head",
+            "truncate",
+            "tar",
+        ] {
             let body = if tool == "mt" || tool == "dd" {
                 "#!/bin/sh\nif [ -n \"${TAPECTL_TEST_SENTINEL:-}\" ]; then \
                  : >\"$TAPECTL_TEST_SENTINEL\"; fi\nexit 0\n"
@@ -3338,6 +3357,100 @@ sha256_encrypted = \"bbb\"
         assert!(
             s.contains("--restore $(keys_args) --to /your/destination"),
             "the restore hint must echo all the keys"
+        );
+    }
+
+    /// Find `name` on the test process's own PATH, for building a PATH that
+    /// holds exactly the tools a test chooses and nothing else.
+    fn host_tool(name: &str) -> std::path::PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("test host has no `{name}` on PATH"))
+    }
+
+    /// Issue #349, CTO ruling 2026-09-28: RESTORE.sh unpacks the decrypted
+    /// envelope with `tar xf -`, so an heir without `tar` must be told so up
+    /// front by the prerequisite check, not meet a confusing failure after
+    /// the tape has already been read and decrypted.
+    ///
+    /// Executed, not grepped: the script runs on a PATH holding every other
+    /// tool the check demands (inert stubs, plus the real `mktemp`/`rm` the
+    /// preamble uses) and no `tar`. The positive control adds a `tar` stub to
+    /// the same PATH and must get past the check — without it, a failure
+    /// here could just mean the stripped PATH broke something else.
+    #[test]
+    fn restore_sh_refuses_up_front_when_tar_is_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("tapectl-notar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sh = dir.join("RESTORE.sh");
+        std::fs::write(&sh, generate_restore_script_v2("NOTAR1", 20)).unwrap();
+        for tool in ["mt", "dd", "age", "dar", "sha256sum", "head", "truncate"] {
+            let stub = bin.join(tool);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for tool in ["mktemp", "rm"] {
+            std::os::unix::fs::symlink(host_tool(tool), bin.join(tool)).unwrap();
+        }
+        let bash = host_tool("bash");
+        let run = || -> (i32, String) {
+            let o = Command::new(&bash)
+                .arg(&sh)
+                .env("PATH", &bin)
+                .output()
+                .expect("spawn script");
+            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.code().unwrap_or(-1), text)
+        };
+
+        let (code, text) = run();
+        assert_eq!(code, 1, "no tar on PATH must be a fatal exit:\n{text}");
+        assert!(
+            text.contains("missing required tool: tar"),
+            "the prerequisite check must name tar:\n{text}"
+        );
+
+        // Positive control: the same PATH plus tar gets past the check (a
+        // bare invocation is a friendly no-op that exits 0).
+        let stub = bin.join("tar");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (code, text) = run();
+        assert_eq!(
+            code, 0,
+            "control: with tar present the check passes:\n{text}"
+        );
+        assert!(!text.contains("missing required tool"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #349: File 1 is where an heir learns what to install before
+    /// touching the tape, so it must name `tar` wherever it lists the tools.
+    #[test]
+    fn the_guide_names_tar_among_the_tools() {
+        let guide = generate_system_guide_v2("TOOLS1", 20);
+        let intro = guide
+            .split_once("All you need is:")
+            .and_then(|(_, rest)| rest.split_once("\n\n"))
+            .map(|(list, _)| list)
+            .expect("the guide states its tool list up front");
+        assert!(intro.contains("tar"), "intro tool list omits tar: {intro}");
+        let section = guide
+            .split_once("## Tools Required")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(body, _)| body)
+            .expect("the guide has a Tools Required section");
+        assert!(
+            section.lines().any(|l| l.starts_with("- `tar`")),
+            "Tools Required must list tar:\n{section}"
         );
     }
 }
