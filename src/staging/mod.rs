@@ -345,6 +345,43 @@ fn stage_create_inner(
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
+    // Issue #354 (c): the recipient list is a pure database read, so it is
+    // built — and every refusal it can raise is raised — here, before the
+    // `stage_sets` INSERT and before dar, beside the escrow check above. It
+    // used to be built at the top of the encryption loop, after dar had
+    // archived the whole unit, so a tenant with no active keys cost a full
+    // dar run to discover.
+    let tenant_keys = queries::get_active_keys_for_tenant(conn, unit.tenant_id)?;
+    // Refuse rather than silently encrypt operator-only: a tenant with zero
+    // active keys (e.g. an interrupted rotation, pre-H13 fix) would otherwise
+    // produce slices the tenant can never decrypt themselves.
+    if tenant_keys.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "tenant for unit \"{}\" has no active keys — refusing to encrypt \
+             (the tenant could not decrypt its own data); run `tapectl key rotate` \
+             or restore the tenant's keys first",
+            unit.name
+        )));
+    }
+    let operator = queries::get_operator_tenant(conn)?
+        .ok_or_else(|| TapectlError::Other("no operator tenant".into()))?;
+    let operator_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
+
+    let all_pubkeys: Vec<String> = tenant_keys
+        .iter()
+        .chain(operator_keys.iter())
+        .map(|k| k.public_key.clone())
+        .collect();
+    // ADR-0005: every recipient list gets the escrow public key appended
+    // (a no-op if it's already present; its absence was refused above).
+    let all_pubkeys = queries::recipient_list_with_escrow(conn, all_pubkeys)?;
+    // Parse every recipient now, for the same reason: a malformed public key
+    // in the database would otherwise surface from the first slice's
+    // `encrypt_file_streaming`, after dar. The encryptor itself is rebuilt
+    // per slice (age draws a fresh file key each time); this one is only the
+    // check.
+    build_encryptor(&all_pubkeys)?;
+
     let staging_dir = Path::new(&config.staging.directory);
     if !staging_dir.exists() {
         fs::create_dir_all(staging_dir)?;
@@ -508,32 +545,9 @@ fn stage_create_inner(
         params![catalog_base.to_string_lossy().to_string(), stage_set_id],
     )?;
 
-    // Step 4: Encrypt slices
+    // Step 4: Encrypt slices, to the recipient list built (and checked)
+    // before dar ran.
     info!("encrypting slices");
-    let tenant_keys = queries::get_active_keys_for_tenant(conn, unit.tenant_id)?;
-    // Refuse rather than silently encrypt operator-only: a tenant with zero
-    // active keys (e.g. an interrupted rotation, pre-H13 fix) would otherwise
-    // produce slices the tenant can never decrypt themselves.
-    if tenant_keys.is_empty() {
-        return Err(TapectlError::Other(format!(
-            "tenant for unit \"{}\" has no active keys — refusing to encrypt \
-             (the tenant could not decrypt its own data); run `tapectl key rotate` \
-             or restore the tenant's keys first",
-            unit.name
-        )));
-    }
-    let operator = queries::get_operator_tenant(conn)?
-        .ok_or_else(|| TapectlError::Other("no operator tenant".into()))?;
-    let operator_keys = queries::get_active_keys_for_tenant(conn, operator.id)?;
-
-    let all_pubkeys: Vec<String> = tenant_keys
-        .iter()
-        .chain(operator_keys.iter())
-        .map(|k| k.public_key.clone())
-        .collect();
-    // ADR-0005: every recipient list gets the escrow public key appended
-    // (no-op if none is registered yet, or if it's already present).
-    let all_pubkeys = queries::recipient_list_with_escrow(conn, all_pubkeys)?;
 
     // fingerprint == public_key by construction for every key in this system
     // (see crypto::keys::generate_keypair and `key import`), so the recorded
@@ -2294,17 +2308,23 @@ mod tests {
 
     // ── issue #54: stage failure hygiene ──
 
-    /// Proves the leak: a tenant with zero active keys makes `stage_create`
-    /// fail *after* `dar -c` has written every plaintext `.dar` slice (and
-    /// after catalog extraction) but *before* the encryption loop starts —
-    /// the worst case, where every slice is orphaned as plaintext. Before
-    /// the change-2 fix, those `.dar` files are never cleaned up.
+    /// Proves the leak: a failure *after* `dar -c` has written every
+    /// plaintext `.dar` slice but *before* the encryption loop starts — the
+    /// worst case, where every slice is orphaned as plaintext. Before the
+    /// change-2 fix, those `.dar` files are never cleaned up.
+    ///
+    /// The failure is injected at catalog extraction: `catalogs_dir` is a
+    /// regular FILE, so creating the per-unit catalog directory under it
+    /// fails (ENOTDIR — no permission bits involved, so it holds as root
+    /// too). This test used to inject it with a tenant that had no active
+    /// keys, until issue #354 moved that refusal before dar — where it can
+    /// no longer orphan anything, which is the point of moving it.
     #[test]
     fn stage_create_failure_orphans_plaintext_dar_slices() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
-        let paths = TapectlPaths::new(home);
+        let mut paths = TapectlPaths::new(home);
         paths.ensure_dirs().unwrap();
 
         let conn = crate::db::open(&paths.db_file).unwrap();
@@ -2317,17 +2337,14 @@ mod tests {
         config.staging.directory = staging_dir.to_string_lossy().into_owned();
 
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
-        let alice_id = crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
         // Issue #115: `stage_create` refuses without a registered escrow.
         register_test_escrow(&conn);
 
-        // Strip alice's active keys so stage_create's "no active keys"
-        // refusal fires after dar has already produced plaintext slices.
-        conn.execute(
-            "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1",
-            params![alice_id],
-        )
-        .unwrap();
+        // The injected post-dar failure (see the doc comment).
+        let catalogs_file = tmp.path().join("catalogs-is-a-file");
+        fs::write(&catalogs_file, b"not a directory").unwrap();
+        paths.catalogs_dir = catalogs_file;
 
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
@@ -2353,7 +2370,23 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "expected stage_create to fail on zero active keys"
+            "expected stage_create to fail creating the catalog directory"
+        );
+
+        // Positive control: the failure must have come AFTER dar, or there
+        // were never any plaintext slices to leak and the assertion below
+        // would pass vacuously. `dar_command` is recorded right after a
+        // successful `dar -c`.
+        let dar_ran: bool = conn
+            .query_row(
+                "SELECT dar_command IS NOT NULL FROM stage_sets WHERE snapshot_id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            dar_ran,
+            "the injected failure must land after dar -c, got: {result:?}"
         );
 
         let leaked: Vec<_> = fs::read_dir(&staging_dir)
@@ -2575,6 +2608,66 @@ mod tests {
         assert!(
             msg.contains("key generate --escrow") && msg.contains("key import --escrow"),
             "the refusal must name both ways to register one: {msg}"
+        );
+        assert!(
+            !msg.contains("dar-must-never-run"),
+            "the refusal must precede the dar run, not follow it: {msg}"
+        );
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "the refusal must precede the stage_sets INSERT — no orphan row \
+             for the startup sweep to find and mark 'failed'"
+        );
+
+        let left_in_staging: Vec<String> = fs::read_dir(&config.staging.directory)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left_in_staging.is_empty(),
+            "nothing may reach the staging directory before the refusal: {left_in_staging:?}"
+        );
+    }
+
+    /// Issue #354 (c): a tenant with no active keys is refused BEFORE dar,
+    /// the same way the escrow refusal above is. It used to be checked at
+    /// the top of the encryption loop — after `dar -c` had archived the
+    /// whole unit and the catalog had been extracted — so a large unit
+    /// spent its entire dar run to reach a refusal that needed nothing but
+    /// a database read.
+    ///
+    /// Same two "when" halves as the escrow test: dar never starts (its
+    /// binary is a path that cannot exist, so reaching it would change the
+    /// error), and no `stage_sets` row is left for the startup sweep.
+    #[test]
+    fn stage_create_refuses_a_tenant_with_no_active_keys_before_dar_runs() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        conn.execute(
+            "UPDATE encryption_keys SET is_active = 0
+             WHERE tenant_id = (SELECT id FROM tenants WHERE name = 'alice')",
+            [],
+        )
+        .unwrap();
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+
+        fs::write(src.join("f.txt"), b"content that must never reach dar").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+
+        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no active keys"),
+            "expected the no-active-keys refusal, got: {msg}"
         );
         assert!(
             !msg.contains("dar-must-never-run"),
