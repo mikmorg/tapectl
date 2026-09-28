@@ -383,9 +383,7 @@ fn stage_create_inner(
     build_encryptor(&all_pubkeys)?;
 
     let staging_dir = Path::new(&config.staging.directory);
-    if !staging_dir.exists() {
-        fs::create_dir_all(staging_dir)?;
-    }
+    prepare_staging_dir(staging_dir)?;
 
     // Check staging space (basic check)
     let source_size = snapshot.total_size.unwrap_or(0);
@@ -569,7 +567,8 @@ fn stage_create_inner(
         let info = encrypt_file_streaming(slice_path, &encrypted_path, &all_pubkeys)?;
 
         // Remove unencrypted slice
-        fs::remove_file(slice_path)?;
+        fs::remove_file(slice_path)
+            .map_err(|e| staging_io_error("cannot remove plaintext slice", slice_path, e))?;
 
         conn.execute(
             "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
@@ -1008,6 +1007,38 @@ fn get_unit_for_snapshot(conn: &Connection, snapshot: &models::Snapshot) -> Resu
     .ok_or_else(|| TapectlError::Other("unit not found".into()))
 }
 
+/// An io failure on a staging path, as an error that names the operation
+/// and the path (issue #354).
+///
+/// A bare `?` on an `io::Error` becomes `TapectlError::Io`, whose `#[from]`
+/// makes the io error its `source()` as well as its Display — and
+/// `error::exit_with_error` prints the whole chain (`{:#}`), so the operator
+/// saw `Permission denied (os error 13): Permission denied (os error 13)`:
+/// the same text twice and no path. `Other` carries no source, so the io
+/// text appears exactly once, after the path it happened to.
+fn staging_io_error(operation: &str, path: &Path, e: std::io::Error) -> TapectlError {
+    TapectlError::Other(format!("{operation} {}: {e}", path.display()))
+}
+
+/// Make sure `stage create` can use `staging_dir` at all: create it if it is
+/// missing, then prove it is writable by creating (and at once removing) a
+/// file in it (issue #354).
+///
+/// Writability is tested by doing the write, the way `config check`'s
+/// `policy::depth_check::check_staging` does, because mode bits lie under
+/// root, ACLs and read-only mounts. Without the probe an unwritable
+/// directory passed every check here and failed inside dar — after the
+/// whole sha256 validation pass over the source.
+fn prepare_staging_dir(staging_dir: &Path) -> Result<()> {
+    fs::create_dir_all(staging_dir)
+        .map_err(|e| staging_io_error("cannot create staging directory", staging_dir, e))?;
+    let probe = staging_dir.join(format!(".tapectl-stage-probe-{}", std::process::id()));
+    fs::write(&probe, b"tapectl stage create probe")
+        .map_err(|e| staging_io_error("cannot write to staging directory", staging_dir, e))?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
+}
+
 fn check_staging_space(staging_dir: &Path, source_size: i64) -> Result<()> {
     // Basic check: warn if available space is less than 3x source size
     // (dar slices + encrypted copies before cleanup)
@@ -1149,7 +1180,16 @@ pub fn encrypt_file_streaming(
     if result.is_err() {
         let _ = fs::remove_file(output_path);
     }
-    result
+    // Issue #354: an io failure here (ENOSPC writing the `.age` into
+    // staging is the likely one) names both files and the operation, once.
+    result.map_err(|e| match e {
+        TapectlError::Io(io) => TapectlError::Other(format!(
+            "cannot encrypt {} to {}: {io}",
+            input_path.display(),
+            output_path.display()
+        )),
+        other => other,
+    })
 }
 
 fn encrypt_file_streaming_inner(
@@ -2692,6 +2732,126 @@ mod tests {
             left_in_staging.is_empty(),
             "nothing may reach the staging directory before the refusal: {left_in_staging:?}"
         );
+    }
+
+    /// Render an error exactly as `error::exit_with_error` does for the
+    /// operator: `{:#}` on the anyhow error, which walks the `source()`
+    /// chain. Asserting on `err.to_string()` alone would never see issue
+    /// #354's doubled io text — that is the outer Display only.
+    fn as_operator_sees_it(err: TapectlError) -> String {
+        format!("{:#}", anyhow::Error::from(err))
+    }
+
+    /// How many times an io error's `(os error N)` text appears — once is
+    /// right; twice is the `TapectlError::Io` chain-doubling of issue #354.
+    fn os_error_mentions(msg: &str) -> usize {
+        msg.matches("(os error").count()
+    }
+
+    /// Issue #354 (a): a staging directory that cannot be created is named,
+    /// with the operation, and the io text is printed once. It used to reach
+    /// the operator as `error: Not a directory (os error 20): Not a directory
+    /// (os error 20)` — twice, and with no path.
+    ///
+    /// The parent is a regular file (ENOTDIR), so no permission bits are
+    /// involved and this holds under root too.
+    #[test]
+    fn an_uncreatable_staging_directory_is_named_with_the_operation() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let not_a_dir = tmp.path().join("a-regular-file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        let staging = not_a_dir.join("staging");
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+
+        fs::write(src.join("f.txt"), b"content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let msg = as_operator_sees_it(err);
+        assert!(
+            msg.contains(&*staging.to_string_lossy()),
+            "the error must name the staging directory: {msg}"
+        );
+        assert!(
+            msg.contains("cannot create staging directory"),
+            "the error must name the operation: {msg}"
+        );
+        assert_eq!(
+            os_error_mentions(&msg),
+            1,
+            "the io error must be printed once, not doubled: {msg}"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "refused before the stage_sets INSERT");
+    }
+
+    /// Issue #354 (a): a staging directory that exists but cannot be written
+    /// is refused before anything else touches it — named, with the
+    /// operation. It used to pass every check, spend the whole sha256
+    /// validation pass over the source, and only then fail inside dar.
+    ///
+    /// Permission bits do not bind root, so the test skips there (the
+    /// ENOTDIR test above is the root-safe half of this behaviour).
+    #[test]
+    fn an_unwritable_staging_directory_is_refused_before_dar_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: permission bits do not bind root");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let staging = PathBuf::from(&config.staging.directory);
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o500)).unwrap();
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+
+        fs::write(src.join("f.txt"), b"content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let result = stage_create(&conn, &paths, &config, snap_id);
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        let msg = as_operator_sees_it(result.unwrap_err());
+        assert!(
+            msg.contains("cannot write to staging directory")
+                && msg.contains(&*staging.to_string_lossy()),
+            "the error must name the operation and the directory: {msg}"
+        );
+        assert!(
+            !msg.contains("dar-must-never-run"),
+            "the refusal must precede the dar run: {msg}"
+        );
+        assert_eq!(os_error_mentions(&msg), 1, "printed once: {msg}");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "refused before the stage_sets INSERT");
+    }
+
+    /// Issue #354 (a), the encryption half: the `.age` file is written into
+    /// the staging directory, and a failure there (ENOSPC is the likely one
+    /// in practice) must name both slice paths and the operation, once.
+    #[test]
+    fn a_slice_encryption_io_failure_names_the_paths_once() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("slice.1.dar");
+        fs::write(&input, b"plaintext slice").unwrap();
+        let output = tmp.path().join("no-such-dir").join("slice.1.dar.age");
+        let kp = crate::crypto::keys::generate_keypair();
+
+        let Err(err) = encrypt_file_streaming(&input, &output, &[kp.public_key]) else {
+            panic!("encrypting into a directory that does not exist must fail");
+        };
+        let msg = as_operator_sees_it(err);
+        assert!(
+            msg.contains(&*output.to_string_lossy()) && msg.contains(&*input.to_string_lossy()),
+            "the error must name the slice and its .age: {msg}"
+        );
+        assert!(msg.contains("cannot encrypt"), "names the operation: {msg}");
+        assert_eq!(os_error_mentions(&msg), 1, "printed once: {msg}");
     }
 
     /// The complement of the refusal above, and the ordering story issue
