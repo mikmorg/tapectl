@@ -5389,7 +5389,7 @@ mod tests {
         fn no_gate_at_all_when_every_version_stays_at_or_above_policy() {
             let conn = setup_live(true);
             let mut config = crate::config::Config::default();
-            config.defaults.min_copies_for_tape_only = 1;
+            config.defaults.min_copies = 1;
             compact_finish(&conn, &config, "L6-SRC", false)
                 .expect("one surviving copy meets a min_copies of 1");
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");

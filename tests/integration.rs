@@ -41,8 +41,8 @@ encrypt = true
 preserve_xattrs = true
 preserve_acls = true
 preserve_fsa = true
-min_copies_for_tape_only = 2
-min_locations_for_tape_only = 2
+min_copies = 2
+min_locations = 2
 "#,
             staging = staging_dir.display()
         ),
@@ -2386,8 +2386,8 @@ encrypt = true
 preserve_xattrs = true
 preserve_acls = true
 preserve_fsa = true
-min_copies_for_tape_only = 2
-min_locations_for_tape_only = 2
+min_copies = 2
+min_locations = 2
 
 [discovery]
 watch_roots = ["{bogus_root_str}"]

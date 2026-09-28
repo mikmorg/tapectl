@@ -1,15 +1,17 @@
 //! Advisory scan for keys present in `config.toml` that no struct declares.
 //!
 //! Distinct from [`crate::policy::decorative`], which surfaces keys that ARE
-//! parsed but have no reader yet. These are never parsed at all: serde ignores
-//! unknown fields, so a plausible-looking setting can sit in a config for years
-//! doing exactly nothing, with `config check` reporting `config: valid`.
+//! parsed but have no reader yet. These are never parsed at all. Since issue
+//! #171 an unknown key is a hard load error, so `config check` already reports
+//! it as a problem; what this scan adds is the REMEDIATION for keys whose
+//! history is known.
 //!
-//! That is not hypothetical. `[defaults] min_copies` reads like the general
-//! copy requirement and is not one — the requirement comes from
-//! `min_copies_for_tape_only`, and `min_copies` belongs to an
-//! `[[archive_sets]]` entry (issue #129, found when a lifecycle run set it to
-//! relax a copy policy and audit went on reporting the old threshold).
+//! The keys with a history are the two issue #348 renamed:
+//! `min_copies_for_tape_only` → `min_copies` and `min_locations_for_tape_only`
+//! → `min_locations` (the list lives in `config::RENAMED_DEFAULTS_KEYS`, shared
+//! with the load-time refusal). Before that rename, issue #129 had the inverse
+//! problem — `[defaults] min_copies` read like the copy requirement and was
+//! not one; it now is.
 //!
 //! Advisory only, like every other scan here: it never changes `config check`'s
 //! exit code (ADR-0004's spirit — reporting, not blocking).
@@ -20,7 +22,8 @@
 /// One key found in the file that no struct field claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownKeyHit {
-    /// Dotted path as the user would write it, e.g. `defaults.min_copies`.
+    /// Dotted path as the user would write it, e.g.
+    /// `defaults.min_copies_for_tape_only`.
     pub key: String,
 }
 
@@ -42,8 +45,8 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "dirty_on_metadata_change",
     "global_excludes",
     "large_file_warn_threshold",
-    "min_copies_for_tape_only",
-    "min_locations_for_tape_only",
+    "min_copies",
+    "min_locations",
     "warehouse_copies",
 ];
 
@@ -93,12 +96,16 @@ pub fn describe(hit: &UnknownKeyHit) -> String {
     // operator looking for a subtle behaviour change when the config simply
     // will not load. What this adds over the generic refusal is the
     // REMEDIATION, which is the only reason the scan survives #173.
-    if hit.key == "defaults.min_copies" {
-        "[defaults].min_copies is not a setting (#129) — the config will not load while \
-         it is present. The copy requirement comes from \
-         [defaults].min_copies_for_tape_only; a per-set override goes on an \
-         [[archive_sets]] entry as min_copies."
-            .to_string()
+    let key = hit.key.trim_start_matches("defaults.");
+    if let Some((old, new)) = crate::config::RENAMED_DEFAULTS_KEYS
+        .iter()
+        .find(|(old, _)| *old == key)
+    {
+        format!(
+            "[defaults].{old} was renamed to [defaults].{new} (#348) — the config will not \
+             load while the old name is present. Rename the key; its meaning and value \
+             are unchanged."
+        )
     } else {
         format!(
             "[defaults].{} is not a recognised setting — the config will not load while \
@@ -112,20 +119,35 @@ pub fn describe(hit: &UnknownKeyHit) -> String {
 mod tests {
     use super::*;
 
-    /// The #129 case: a setting that reads like the general copy requirement,
-    /// is not one, and produced no diagnostic at all.
+    /// Issue #348: the two renamed keys are reported with the new name to
+    /// use, and the new names themselves — `min_copies` was #129's
+    /// not-a-setting — are real fields now and report nothing.
     #[test]
-    fn min_copies_in_defaults_is_reported_with_the_real_knob_named() {
-        let hits = scan("[defaults]\nmin_copies = 2\nslice_size = \"10G\"\n");
+    fn the_old_tape_only_names_are_reported_with_the_new_key_named() {
+        let hits = scan(
+            "[defaults]\nmin_copies_for_tape_only = 2\nmin_locations_for_tape_only = 2\n\
+             slice_size = \"10G\"\n",
+        );
         assert_eq!(
             hits,
-            vec![UnknownKeyHit {
-                key: "defaults.min_copies".into()
-            }]
+            vec![
+                UnknownKeyHit {
+                    key: "defaults.min_copies_for_tape_only".into()
+                },
+                UnknownKeyHit {
+                    key: "defaults.min_locations_for_tape_only".into()
+                },
+            ]
         );
         let msg = describe(&hits[0]);
-        assert!(msg.contains("min_copies_for_tape_only"), "{msg}");
-        assert!(msg.contains("archive_sets"), "{msg}");
+        assert!(msg.contains("renamed to [defaults].min_copies "), "{msg}");
+        let msg = describe(&hits[1]);
+        assert!(
+            msg.contains("renamed to [defaults].min_locations "),
+            "{msg}"
+        );
+
+        assert!(scan("[defaults]\nmin_copies = 2\nmin_locations = 2\n").is_empty());
     }
 
     #[test]

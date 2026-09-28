@@ -455,6 +455,46 @@ fn a_collections_or_archive_sets_table_appended_to_a_fresh_init_config_loads() {
     assert!(stdout.contains("config: valid"), "{stdout}");
 }
 
+/// Issue #348 (CTO ruling 2026-09-28): `init` writes the renamed `[defaults]`
+/// keys `min_copies` / `min_locations`, and a config still carrying the old
+/// `*_for_tape_only` names is refused by `config check` with the new names
+/// in the message — the operator's own copy of an older config must say
+/// what to change, not just "unknown field".
+#[test]
+fn init_writes_min_copies_and_min_locations_and_the_old_names_are_refused() {
+    let home = TempDir::new().expect("tempdir");
+    let init_out = run_tapectl(home.path(), &["init", "--no-escrow"]);
+    assert!(
+        init_out.status.success(),
+        "tapectl init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let cfg_path = home.path().join(".tapectl").join("config.toml");
+    let written = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(written.contains("\nmin_copies = 2\n"), "{written}");
+    assert!(written.contains("\nmin_locations = 2\n"), "{written}");
+    assert!(!written.contains("_for_tape_only"), "{written}");
+
+    let old = written
+        .replace("\nmin_copies = 2\n", "\nmin_copies_for_tape_only = 2\n")
+        .replace(
+            "\nmin_locations = 2\n",
+            "\nmin_locations_for_tape_only = 2\n",
+        );
+    std::fs::write(&cfg_path, old).unwrap();
+    let check = run_tapectl(home.path(), &["config", "check"]);
+    assert!(
+        !check.status.success(),
+        "a config with the pre-#348 names must not pass config check"
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("config: INVALID"), "{stdout}");
+    assert!(
+        stdout.contains("defaults.min_copies and defaults.min_locations"),
+        "the refusal must name both new keys: {stdout}"
+    );
+}
+
 /// Acceptance criterion (issue #172): "`logging.level = \"debug\"` actually
 /// changes the emitted level". Exercised against the real binary rather than
 /// only the pure `LoggingConfig::tracing_level` unit test in `config.rs`, to
@@ -2423,7 +2463,7 @@ fn staging_clean_json_retained_report_is_one_parseable_document() {
 
     let config_path = home.path().join(".tapectl").join("config.toml");
     let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
-    cfg.defaults.min_copies_for_tape_only = 2;
+    cfg.defaults.min_copies = 2;
     cfg.save(&config_path).expect("save edited config");
 
     seed_one_completed_copy_stage_set(home.path(), "PM244-JSON");
@@ -2476,7 +2516,7 @@ fn staging_clean_force_still_overrides_the_under_copied_refusal() {
 
     let config_path = home.path().join(".tapectl").join("config.toml");
     let mut cfg = tapectl::config::Config::load(&config_path).expect("load freshly-init'd config");
-    cfg.defaults.min_copies_for_tape_only = 2;
+    cfg.defaults.min_copies = 2;
     cfg.save(&config_path).expect("save edited config");
 
     seed_one_completed_copy_stage_set(home.path(), "PM244-FORCE");

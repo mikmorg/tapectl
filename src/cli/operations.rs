@@ -2287,8 +2287,8 @@ pub fn unit_mark_tape_only(
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
-    let min_copies = config.defaults.min_copies_for_tape_only;
-    let min_locations = config.defaults.min_locations_for_tape_only;
+    let min_copies = config.defaults.min_copies;
+    let min_locations = config.defaults.min_locations;
 
     // Count copies and locations. ADR-0004: a write's own `status =
     // 'completed'` only proves the volume was sealed AT WRITE TIME —
@@ -4007,8 +4007,8 @@ mod tests {
     /// also having to fabricate volumes/writes/locations fixtures.
     fn config_with_zero_tape_only_thresholds() -> Config {
         let mut config = Config::default();
-        config.defaults.min_copies_for_tape_only = 0;
-        config.defaults.min_locations_for_tape_only = 0;
+        config.defaults.min_copies = 0;
+        config.defaults.min_locations = 0;
         config
     }
 
@@ -4754,7 +4754,7 @@ mod tests {
 
         fn config_with_min_copies(n: i32) -> Config {
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = n;
+            config.defaults.min_copies = n;
             config
         }
 
@@ -5319,7 +5319,7 @@ mod tests {
         /// check).
         fn config_isolating_copy_count() -> Config {
             let mut config = Config::default();
-            config.defaults.min_locations_for_tape_only = 0;
+            config.defaults.min_locations = 0;
             config
         }
 
@@ -5376,8 +5376,8 @@ mod tests {
             let (conn, _unit_id, _vol) =
                 crate::policy::coverage::tests::setup_unit_with_deposit("active");
             let config = Config::default();
-            assert_eq!(config.defaults.min_copies_for_tape_only, 2);
-            assert_eq!(config.defaults.min_locations_for_tape_only, 2);
+            assert_eq!(config.defaults.min_copies, 2);
+            assert_eq!(config.defaults.min_locations, 2);
             unit_mark_tape_only(&conn, &config, "photos", false, false).expect(
                 "one sealed tape at home plus a warehouse deposit at glacier is 2 copies in 2 locations",
             );
@@ -5729,8 +5729,8 @@ mod tests {
             // which would otherwise refuse below the default threshold of
             // 2 -- zero out the thresholds so the command reaches the
             // evidence display unconditionally.
-            config.defaults.min_copies_for_tape_only = 0;
-            config.defaults.min_locations_for_tape_only = 0;
+            config.defaults.min_copies = 0;
+            config.defaults.min_locations = 0;
             unit_mark_tape_only(&conn, &config, "mv-thin-cli", false, false)
                 .expect("command must succeed and compute the thinnest-version display");
             let thinnest = thinnest_current_version(&conn, unit_id).unwrap().unwrap();

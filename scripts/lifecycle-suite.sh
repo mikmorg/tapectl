@@ -1215,8 +1215,8 @@ restore_matrix() {
 # multiple slices without a separate archive-set. `compaction.
 # utilization_threshold` is raised for every scenario (harmless — only the
 # `compaction` scenario ever calls `volume compact*`) so that scenario
-# doesn't need its own config pass. `min_copies_for_tape_only` /
-# `min_locations_for_tape_only` are already 2/2 in a fresh `init`, matching
+# doesn't need its own config pass. `min_copies` /
+# `min_locations` are already 2/2 in a fresh `init`, matching
 # what `tape-only-and-reclaim` needs — no override required (verified via
 # `tapectl init` in an isolated home).
 bootstrap_config() {

@@ -76,7 +76,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 
     // Start with system defaults
     let mut policy = ResolvedPolicy {
-        min_copies: defaults.min_copies_for_tape_only as i64,
+        min_copies: defaults.min_copies as i64,
         required_locations: Vec::new(),
         encrypt: defaults.encrypt,
         compression: defaults.compression.clone(),
@@ -563,10 +563,7 @@ slice_size = "500M"
         let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
 
         let p = resolve(&conn, &config, &unit).expect("an absent dotfile defers upward");
-        assert_eq!(
-            p.min_copies,
-            config.defaults.min_copies_for_tape_only as i64
-        );
+        assert_eq!(p.min_copies, config.defaults.min_copies as i64);
     }
 
     /// A dotfile that is PRESENT but not valid TOML is corruption, and the

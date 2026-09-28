@@ -2319,7 +2319,7 @@ mod tests {
         /// reason — exactly the trap the doc comments below call out.
         fn config_without_min_copies() -> Config {
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 0;
+            config.defaults.min_copies = 0;
             config
         }
 
@@ -2363,7 +2363,7 @@ mod tests {
             )
             .unwrap();
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 0;
+            config.defaults.min_copies = 0;
 
             let (violations, _warnings) = collect_findings(&conn, &config, Some("photos")).unwrap();
             let f = violations
@@ -2394,7 +2394,7 @@ mod tests {
             let (conn, _unit_id, _vol) =
                 crate::policy::coverage::tests::setup_unit_with_deposit("active");
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 0;
+            config.defaults.min_copies = 0;
             assert_eq!(config.defaults.warehouse_copies, 0);
             let (violations, warnings) = collect_findings(&conn, &config, Some("photos")).unwrap();
             assert!(

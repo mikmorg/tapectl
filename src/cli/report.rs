@@ -2664,7 +2664,7 @@ mod tests {
             // The fixture unit has no dotfile and no archive set, so the
             // resolved threshold IS the default (issue #106).
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 3;
+            config.defaults.min_copies = 3;
             let rows = fire_risk_rows(&conn, &config).unwrap();
             let row = rows
                 .iter()
@@ -2699,7 +2699,7 @@ mod tests {
             .unwrap();
 
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 2;
+            config.defaults.min_copies = 2;
 
             let rows = fire_risk_rows(&conn, &config).unwrap();
             let row = rows
@@ -2734,7 +2734,7 @@ mod tests {
             .unwrap();
 
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 5;
+            config.defaults.min_copies = 5;
 
             let rows = fire_risk_rows(&conn, &config).unwrap();
             assert!(
@@ -2778,7 +2778,7 @@ mod tests {
             let (conn, _unit_id, _vol) =
                 crate::policy::coverage::tests::setup_unit_with_deposit("active");
             let mut config = Config::default();
-            config.defaults.min_copies_for_tape_only = 2;
+            config.defaults.min_copies = 2;
             let rows = fire_risk_rows(&conn, &config).unwrap();
             assert!(
                 !rows.iter().any(|r| r.unit == "photos"),

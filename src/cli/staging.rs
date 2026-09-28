@@ -578,7 +578,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.defaults.min_copies_for_tape_only = min_copies;
+        config.defaults.min_copies = min_copies;
         config
     }
 

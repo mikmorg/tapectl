@@ -426,7 +426,7 @@ mod tests {
         seed_unit_with_one_completed_copy(&conn, "testlib/alpha");
 
         let mut config = Config::default();
-        config.defaults.min_copies_for_tape_only = 1;
+        config.defaults.min_copies = 1;
 
         let batch = one_unit_batch("testlib/alpha");
 
@@ -451,7 +451,7 @@ mod tests {
         seed_unit_with_one_completed_copy(&conn, "testlib/alpha");
 
         let mut config = Config::default();
-        config.defaults.min_copies_for_tape_only = 2;
+        config.defaults.min_copies = 2;
 
         let batch = one_unit_batch("testlib/alpha");
 
@@ -497,7 +497,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.defaults.min_copies_for_tape_only = min_copies;
+        config.defaults.min_copies = min_copies;
         config
     }
 

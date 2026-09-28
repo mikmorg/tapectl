@@ -100,8 +100,9 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     // fails to strictly load — at which point `report.problems` already
     // names the same key via its own "unknown key: …" entries. This scan is
     // no longer reachable on a config that loads cleanly; kept for its
-    // `[defaults]`-specific remediation text (e.g. `min_copies`'s "the real
-    // knob is …") which `report.problems`'s generic message does not carry.
+    // `[defaults]`-specific remediation text (e.g. the issue #348 renames,
+    // "min_copies_for_tape_only was renamed to min_copies") which
+    // `report.problems`'s generic message does not carry.
     let unknown_key_hits = crate::policy::unknown_keys::scan(&toml_str);
 
     // Advisory scan (issue #50/#92 precedent): `preserve_acls = false`

@@ -426,10 +426,16 @@ pub struct DefaultsConfig {
     pub global_excludes: Vec<String>,
     #[serde(default = "default_large_file_warn")]
     pub large_file_warn_threshold: String,
+    /// The copy requirement every unit starts from — the bottom layer of
+    /// `policy::resolve`, which an `[[archive_sets]]` entry's `min_copies`
+    /// overrides. Named `min_copies_for_tape_only` before issue #348; the
+    /// old name is refused at load with the rename to make.
     #[serde(default = "default_min_copies")]
-    pub min_copies_for_tape_only: i32,
+    pub min_copies: i32,
+    /// How many distinct locations a unit's copies must span. Named
+    /// `min_locations_for_tape_only` before issue #348.
     #[serde(default = "default_min_locations")]
-    pub min_locations_for_tape_only: i32,
+    pub min_locations: i32,
     /// ADR-0006: how many WAREHOUSE copies a unit should carry, as the
     /// bottom layer of the three-level policy chain. 0 means "tape only is
     /// fine" — LTO is the primary line and the irreplaceable core earns
@@ -484,8 +490,8 @@ impl Default for DefaultsConfig {
                 "*.tmp".into(),
             ],
             large_file_warn_threshold: default_large_file_warn(),
-            min_copies_for_tape_only: default_min_copies(),
-            min_locations_for_tape_only: default_min_locations(),
+            min_copies: default_min_copies(),
+            min_locations: default_min_locations(),
             warehouse_copies: 0,
         }
     }
@@ -1238,9 +1244,10 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
 /// than just those fields: with `min_free_for_append` already deleted,
 /// `strategy`/`fill_threshold` were `PackingConfig`'s only members, and
 /// `format` was `LabelsConfig`'s only member. Every "deleted outright"
-/// message says why there is nowhere for the value to go. Issue #129 found
-/// `defaults.min_copies` reads like the general copy requirement and is not
-/// one, so its message names the real knob. As of issue #171 / ADR-0012,
+/// message says why there is nowhere for the value to go. Issue #348
+/// RENAMED `defaults.min_copies_for_tape_only` / `.min_locations_for_tape_only`
+/// to `defaults.min_copies` / `.min_locations`, so their message names the
+/// new keys. As of issue #171 / ADR-0012,
 /// EVERY section carries `#[serde(deny_unknown_fields)]`, so serde alone
 /// would already reject all of these — this pre-scan exists to say
 /// something more useful than "unknown field" for the keys whose history we
@@ -1354,16 +1361,20 @@ fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
     None
 }
 
-/// The `[defaults]` half of [`stale_lto_fields_message`] (issue #129,
-/// carried forward by #171): `min_copies` reads like the general copy
-/// requirement and is not one — the real knob is
-/// `defaults.min_copies_for_tape_only`, and a per-set override goes on an
-/// `[[archive_sets]]` entry as `min_copies`. This used to be an ADVISORY
-/// `config check` note (`policy::unknown_keys`) while `[defaults]` merely
-/// warned about unknown keys; #171 makes an unknown key in `[defaults]` a
-/// hard load error like every other section, so the friendly remediation
-/// has to live here or vanish behind serde's generic "unknown field"
-/// message.
+/// The `[defaults]` half of [`stale_lto_fields_message`].
+///
+/// Issue #348 (CTO ruling 2026-09-28; ADR-0012, 2026-09-28 amendment):
+/// `min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
+/// `min_copies` / `min_locations`. The old names said "tape-only", but the
+/// copy requirement is the bottom layer of every unit's policy
+/// (`policy::resolve`), not a tape-only rule — the name misled operators.
+/// Same meaning, same values: a stale config is refused with the rename to
+/// make, never silently reinterpreted. This inverts issue #129's refusal,
+/// which turned `defaults.min_copies` away because it was then NOT the real
+/// knob; it now is.
+///
+/// Both old names get the one message, naming both new keys, because a
+/// config written by an older `init` carries both.
 ///
 /// `hash` is issue #172's fourth deletion: every checksum path is sha256,
 /// hardcoded (`sha2` crate, `checksum_mode` governs WHEN it runs, never
@@ -1371,14 +1382,27 @@ fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
 /// non-default value in the first place.
 fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
     let defaults = value.get("defaults")?.as_table()?;
-    if defaults.contains_key("min_copies") {
-        return Some(
-            "defaults.min_copies is not a setting (issue #129) — the general copy \
-             requirement is defaults.min_copies_for_tape_only; a per-set override \
-             goes on an [[archive_sets]] entry as min_copies. Delete the line, or \
-             rename it to min_copies_for_tape_only if that is what you meant."
-                .to_string(),
-        );
+    let renamed: Vec<&str> = RENAMED_DEFAULTS_KEYS
+        .iter()
+        .filter(|(old, _)| defaults.contains_key(*old))
+        .map(|(old, _)| *old)
+        .collect();
+    if !renamed.is_empty() {
+        return Some(format!(
+            "defaults.{} renamed (issue #348): the keys are now defaults.min_copies and \
+             defaults.min_locations, with the same meaning — the copy and location \
+             requirement every unit starts from (an [[archive_sets]] entry's min_copies \
+             overrides it). Rename {}; the values carry over unchanged.",
+            match renamed.as_slice() {
+                [one] => format!("{one} was"),
+                _ => format!("{} were", renamed.join(" and defaults.")),
+            },
+            if renamed.len() == 1 {
+                "the line"
+            } else {
+                "the lines"
+            },
+        ));
     }
     if defaults.contains_key("hash") {
         return Some(
@@ -1391,6 +1415,15 @@ fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
     }
     None
 }
+
+/// `[defaults]` keys renamed by issue #348, old name first. Shared by the
+/// load-time refusal ([`stale_defaults_fields_message`]) and `config
+/// check`'s `[defaults]` scan (`policy::unknown_keys`), so the two cannot
+/// disagree about what the new names are.
+pub const RENAMED_DEFAULTS_KEYS: &[(&str, &str)] = &[
+    ("min_copies_for_tape_only", "min_copies"),
+    ("min_locations_for_tape_only", "min_locations"),
+];
 
 /// Membership check shared by every ADR-0012 boundary validator (issue
 /// #171): compression, checksum mode, and each `--status` filter across the
@@ -2057,6 +2090,51 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("format"), "{msg}");
         assert!(msg.contains("removed"), "{msg}");
+    }
+
+    /// Issue #348 (CTO ruling 2026-09-28): `[defaults]
+    /// min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
+    /// `min_copies` / `min_locations` — same meaning, the bottom policy layer
+    /// for every unit. A config still carrying either old name is refused
+    /// with a message naming the new ones, one key at a time or both at once.
+    #[test]
+    fn a_config_carrying_the_old_tape_only_names_is_refused_naming_the_new_keys() {
+        for body in [
+            "[defaults]\nmin_copies_for_tape_only = 3\n",
+            "[defaults]\nmin_locations_for_tape_only = 1\n",
+            "[defaults]\nmin_copies_for_tape_only = 3\nmin_locations_for_tape_only = 1\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(msg.contains("renamed"), "{body:?} -> {msg}");
+            assert!(
+                msg.contains("defaults.min_copies ") || msg.contains("defaults.min_copies,"),
+                "must name the new copy key: {body:?} -> {msg}"
+            );
+            assert!(
+                msg.contains("defaults.min_locations"),
+                "must name the new location key: {body:?} -> {msg}"
+            );
+        }
+    }
+
+    /// The positive control for the refusal above: the new names load, and
+    /// the values reach the fields every policy reader uses.
+    #[test]
+    fn a_config_with_the_new_min_copies_and_min_locations_names_loads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[defaults]\nmin_copies = 3\nmin_locations = 1\n").unwrap();
+        let cfg = Config::load(&path).expect("the renamed keys must load");
+        assert_eq!(cfg.defaults.min_copies, 3);
+        assert_eq!(cfg.defaults.min_locations, 1);
+
+        let serialized = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(serialized.contains("min_copies = 2"), "{serialized}");
+        assert!(serialized.contains("min_locations = 2"), "{serialized}");
+        assert!(!serialized.contains("_for_tape_only"), "{serialized}");
     }
 
     #[test]
