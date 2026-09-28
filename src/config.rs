@@ -90,7 +90,12 @@ pub struct Config {
     #[serde(default)]
     pub backends: BackendsConfig,
 
-    #[serde(default)]
+    // Skipped when empty for the same reason as `BackendsConfig::lto` (issue
+    // #345): an inline `archive_sets = []` makes a later `[[archive_sets]]`
+    // table a duplicate key, so the operator's documented move — append a
+    // table to the file `init` wrote — broke every command. An absent key
+    // deserializes to the same empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_sets: Vec<ArchiveSetConfig>,
 
     #[serde(default)]
@@ -102,7 +107,8 @@ pub struct Config {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
 
-    #[serde(default)]
+    /// Skipped when empty — see `archive_sets` above (issue #345).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<CollectionConfig>,
 
     #[serde(default)]

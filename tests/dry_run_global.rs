@@ -398,14 +398,9 @@ fn home_with_a_collection_ready_to_run() -> (TempDir, TempDir) {
     }
 
     let cfg = home.path().join(".tapectl").join("config.toml");
-    let written = std::fs::read_to_string(&cfg).unwrap();
-    // `init` writes a root-level `collections = []`; the array-of-tables
-    // form below would be a duplicate key on top of it.
-    let mut text = written.replace("collections = []\n", "");
-    assert_ne!(
-        text, written,
-        "fixture assumption broken — init no longer writes `collections = []`"
-    );
+    // Since issue #345 `init` writes no `collections = []` stub, so the
+    // array-of-tables form below appends cleanly.
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
     text.push_str(&format!(
         r#"
 [[backends.lto]]
@@ -632,9 +627,7 @@ fn a_global_dry_run_before_collection_sync_registers_nothing() {
     std::fs::write(root.path().join("alpha").join("f.dat"), b"hello").unwrap();
 
     let cfg = home.path().join(".tapectl").join("config.toml");
-    let written = std::fs::read_to_string(&cfg).unwrap();
-    let mut text = written.replace("collections = []\n", "");
-    assert_ne!(text, written, "fixture assumption broken");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
     text.push_str(&format!(
         "\n[[collections]]\nname = \"microlib\"\nroot = \"{}\"\ntenant = \"media\"\nunit_depth = 1\n",
         root.path().display()

@@ -412,6 +412,49 @@ fn init_config_show_roundtrip_exits_zero_with_no_deleted_keys() {
     }
 }
 
+/// Issue #345: `init` serialised the two empty arrays as inline keys,
+/// `collections = []` and `archive_sets = []`, so appending the documented
+/// `[[collections]]` / `[[archive_sets]]` table made the file a duplicate
+/// key and every command stopped loading it. The operator's move — append
+/// a table to a fresh config — must just work.
+#[test]
+fn a_collections_or_archive_sets_table_appended_to_a_fresh_init_config_loads() {
+    let home = TempDir::new().expect("tempdir");
+    let init_out = run_tapectl(home.path(), &["init", "--no-escrow"]);
+    assert!(
+        init_out.status.success(),
+        "tapectl init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let cfg_path = home.path().join(".tapectl").join("config.toml");
+    let written = std::fs::read_to_string(&cfg_path).unwrap();
+    for stub in ["collections = []", "archive_sets = []"] {
+        assert!(
+            !written.contains(stub),
+            "init still writes {stub:?}, which a later table collides with:\n{written}"
+        );
+    }
+
+    let root = TempDir::new().unwrap();
+    let appended = format!(
+        "{written}\n[[collections]]\nname = \"media\"\nroot = \"{}\"\ntenant = \"media\"\n\
+         unit_depth = 1\n\n[[archive_sets]]\nname = \"cold\"\nmin_copies = 3\n",
+        root.path().display()
+    );
+    std::fs::write(&cfg_path, appended).unwrap();
+
+    let check = run_tapectl(home.path(), &["config", "check"]);
+    assert!(
+        check.status.success(),
+        "config check refused a fresh config with one table appended: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("config: valid"), "{stdout}");
+}
+
 /// Acceptance criterion (issue #172): "`logging.level = \"debug\"` actually
 /// changes the emitted level". Exercised against the real binary rather than
 /// only the pure `LoggingConfig::tracing_level` unit test in `config.rs`, to
