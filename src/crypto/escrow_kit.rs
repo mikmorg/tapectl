@@ -322,6 +322,9 @@ what every recovery tool takes as its key:
     tapectl catalog rebuild --from-volume --device /dev/nst0 \\
         --key escrow.key
 
+(/dev/nst0 is only an example: list the drives on the machine you
+are using with `ls -l /dev/tape/by-id/` and use yours everywhere.)
+
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
   catalog.db.age   An encrypted index of what is on the tapes:
@@ -351,7 +354,8 @@ WHAT TO DO FIRST
        tapectl restore raw-volume --device /dev/nst0 --to ./out
        tapectl volume identify --device /dev/nst0
 
-   The first works with no database at all.
+   The first works with no database at all. /dev/nst0 is only an
+   example: `ls -l /dev/tape/by-id/` lists the drives you have.
 
 {warehouse}CUSTODY -- FOR WHOEVER MAINTAINS THIS
 -------------------------------------

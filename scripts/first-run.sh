@@ -595,7 +595,7 @@ EOF
       # the moment a config field is added. --no-escrow so the throwaway home
       # mints no identity and prints no secret (ADR-0005).
       CFG_TMP="$(as_svc mktemp -d)" || die "could not make a temp dir"
-      as_svc "$TAPECTL" --home "$CFG_TMP" --config "$CFG_TMP/config.toml" init --no-escrow >/dev/null 2>&1 \
+      as_svc "$TAPECTL" --home "$CFG_TMP" --config "$CFG_TMP/config.toml" init --no-escrow --operator config-template >/dev/null 2>&1 \
         || { as_svc rm -rf "$CFG_TMP"; die "could not generate a fresh config; the original is untouched"; }
       as_svc cp "$CFG_TMP/config.toml" "$EFFECTIVE_HOME/config.toml" \
         || { as_svc rm -rf "$CFG_TMP"; die "could not install the fresh config; the original is at $CFG_BAK"; }

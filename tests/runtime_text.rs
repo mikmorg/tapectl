@@ -437,12 +437,21 @@ fn runtime_strings_carry_no_issue_numbers() {
             }
         }
     }
-    // Positive controls: the scan read the source, and it sees inside the
-    // multi-line raw strings the on-tape files are built from — each of
-    // them names issues in its shell comments.
+    // Real offenders are reported FIRST, so a tree that also happens to be
+    // small cannot hide them behind the scan-size control below.
     assert!(
-        literals > 5000,
-        "the scan found only {literals} string literals"
+        offenders.is_empty(),
+        "runtime text an operator reads carries issue numbers (say the why in words, or \
+         cite the ADR; comments and tests may keep theirs):\n{}",
+        offenders.join("\n")
+    );
+    // Positive controls: the scan read the source (thousands of literals —
+    // a floor well below today's ~5,000 so ordinary refactors do not trip
+    // it), and it sees inside the multi-line raw strings the on-tape files
+    // are built from — each of them names issues in its shell comments.
+    assert!(
+        literals > 2000,
+        "the scan found only {literals} string literals — is it reading src/?"
     );
     for file in ON_TAPE_TEXT {
         assert!(
@@ -452,12 +461,6 @@ fn runtime_strings_carry_no_issue_numbers() {
              allowance and it should be removed from ON_TAPE_TEXT"
         );
     }
-    assert!(
-        offenders.is_empty(),
-        "runtime text an operator reads carries issue numbers (say the why in words, or \
-         cite the ADR; comments and tests may keep theirs):\n{}",
-        offenders.join("\n")
-    );
 }
 
 #[test]

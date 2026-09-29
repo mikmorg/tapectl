@@ -284,8 +284,8 @@ impl Summary {
             format!("  Units:      {} active", self.units),
             format!("  Snapshots:  {}", self.snapshots),
             format!(
-                "  Volumes:    {} holding data (retired, erased, missing and quarantined \
-                 not counted)",
+                "  Volumes:    {} holding data (retired, erased and quarantined not \
+                 counted)",
                 self.volumes
             ),
             format!("  Writes:     {} completed", self.writes),
@@ -3550,8 +3550,8 @@ mod tests {
                     "  Tenants:    2 (the operator not counted)".to_string(),
                     "  Units:      4 active".to_string(),
                     "  Snapshots:  4".to_string(),
-                    "  Volumes:    2 holding data (retired, erased, missing and quarantined \
-                     not counted)"
+                    "  Volumes:    2 holding data (retired, erased and quarantined not \
+                     counted)"
                         .to_string(),
                     "  Writes:     5 completed".to_string(),
                     "  Total data: 2.0 KiB on tape".to_string(),

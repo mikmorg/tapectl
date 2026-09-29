@@ -4584,12 +4584,6 @@ mod tests {
         );
     }
 
-    /// Issue #41: `write_stage_report` and `secure_catalog_files` tested
-    /// directly and hermetically — no dar binary, no full `stage_create`
-    /// pipeline — per the same reasoning `crypto::keys`'s tests already
-    /// apply to secret keys: a permission bug belongs to the function that
-    /// sets (or fails to set) the mode, not to everything that happens to
-    /// call it three layers up.
     /// Issue #361: what `stage create` leaves in `<home>/stage-reports/` is
     /// a stage report, in its header as well as its directory — "receipt"
     /// now means only the recipient list a stage set was encrypted to
@@ -4624,6 +4618,12 @@ mod tests {
         assert!(!text.to_lowercase().contains("receipt"), "{text}");
     }
 
+    /// Issue #41: `write_stage_report` and `secure_catalog_files` tested
+    /// directly and hermetically — no dar binary, no full `stage_create`
+    /// pipeline — per the same reasoning `crypto::keys`'s tests already
+    /// apply to secret keys: a permission bug belongs to the function that
+    /// sets (or fails to set) the mode, not to everything that happens to
+    /// call it three layers up.
     mod file_custody {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
