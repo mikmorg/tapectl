@@ -141,7 +141,7 @@ Accepted by every command, before or after the subcommand.
 | [`backend`](backend.md) | Tape drive backends |
 | &nbsp;&nbsp;[`backend add`](backend.md#tapectl-backend-add) | Add an LTO tape drive to the config |
 | [`db`](db.md) | Database operations |
-| &nbsp;&nbsp;[`db backup`](db.md#tapectl-db-backup) | Backup database, and optionally keys, and catalogs |
+| &nbsp;&nbsp;[`db backup`](db.md#tapectl-db-backup) | Back up the database, and optionally the private key directory |
 | &nbsp;&nbsp;[`db fsck`](db.md#tapectl-db-fsck) | Check database integrity |
 | &nbsp;&nbsp;[`db export`](db.md#tapectl-db-export) | Export database as JSON |
 | &nbsp;&nbsp;[`db import`](db.md#tapectl-db-import) | Import database from backup |

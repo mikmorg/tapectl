@@ -12,7 +12,7 @@ tapectl db [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`backup`](#tapectl-db-backup) — Backup database, and optionally keys, and catalogs
+- [`backup`](#tapectl-db-backup) — Back up the database, and optionally the private key directory
 - [`fsck`](#tapectl-db-fsck) — Check database integrity
 - [`export`](#tapectl-db-export) — Export database as JSON
 - [`import`](#tapectl-db-import) — Import database from backup
@@ -20,7 +20,7 @@ tapectl db [OPTIONS] <COMMAND>
 
 ### tapectl db backup
 
-Backup database, and optionally keys, and catalogs
+Back up the database, and optionally the private key directory
 
 ```text
 tapectl db backup [OPTIONS] --to <TO>
@@ -28,8 +28,8 @@ tapectl db backup [OPTIONS] --to <TO>
 
 **Options**
 
-- `--to <TO>` *(required)* — Destination path
-- `--include-keys` — Also copy the private key directory to `<dest>.keys`. Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...) — issue #40
+- `--to <TO>` *(required)* — The backup file to write. Its directory must already exist
+- `--include-keys` — Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`--to /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...) — issue #40
 
 ### tapectl db fsck
 

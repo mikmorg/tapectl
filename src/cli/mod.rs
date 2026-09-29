@@ -332,16 +332,18 @@ pub enum BackendCommands {
 /// Database operations.
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Backup database, and optionally keys, and catalogs
+    /// Back up the database, and optionally the private key directory
     Backup {
-        /// Destination path
+        /// The backup file to write. Its directory must already exist
         #[arg(long)]
         to: String,
-        /// Also copy the private key directory to `<dest>.keys`. Off by
-        /// default — the database alone is the common backup case.
-        /// Private key material copied this way must be treated as secret
-        /// wherever the destination ends up (USB stick, network share,
-        /// cloud-synced folder, ...) — issue #40.
+        /// Also copy the private key directory, into a directory beside
+        /// the backup named for it with its extension replaced by `.keys`
+        /// (`--to /mnt/usb/tapectl.db` copies the keys to
+        /// `/mnt/usb/tapectl.keys/`). Off by default — the database alone
+        /// is the common backup case. Private key material copied this way
+        /// must be treated as secret wherever the destination ends up (USB
+        /// stick, network share, cloud-synced folder, ...) — issue #40.
         #[arg(long)]
         include_keys: bool,
     },

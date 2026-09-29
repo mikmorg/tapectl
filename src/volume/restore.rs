@@ -496,11 +496,19 @@ fn restore_unit_contacted(
     fs::create_dir_all(&restore_tmp)?;
     let _scratch = RestoreScratch(restore_tmp.clone());
 
-    // Load all secret keys for trial-decryption (tenant + operator)
-    let mut identities = keys::load_all_identities(&paths.keys_dir, &tenant.name)?;
+    // Load every secret key the tenant owns, and the operator's, for trial
+    // decryption. Ownership comes from the catalog's key rows, so tenant
+    // `family` no longer also loads tenant `family-old`'s keys; with no row
+    // (after `catalog rebuild`) a file goes to every tenant it may belong to,
+    // so a tenant's own key is never withheld (issue #350, keys::KeyOwners).
+    let mut identities = keys::load_tenant_identities(conn, &paths.keys_dir, &tenant.name)?;
     if !tenant.is_operator {
         if let Some(operator) = queries::get_operator_tenant(conn)? {
-            identities.extend(keys::load_all_identities(&paths.keys_dir, &operator.name)?);
+            identities.extend(keys::load_tenant_identities(
+                conn,
+                &paths.keys_dir,
+                &operator.name,
+            )?);
         }
     }
     if identities.is_empty() {
@@ -2556,9 +2564,22 @@ mod tests {
                 label: &str,
                 unit: &str,
             ) -> (MemStore, u64) {
+                real_fixture_keyed(conn, paths, label, unit, "t1", "primary")
+            }
+
+            /// [`real_fixture`] with the slice encrypted to key file
+            /// `{key_tenant}-{key_alias}.age.key` instead of `t1-primary`.
+            fn real_fixture_keyed(
+                conn: &Connection,
+                paths: &TapectlPaths,
+                label: &str,
+                unit: &str,
+                key_tenant: &str,
+                key_alias: &str,
+            ) -> (MemStore, u64) {
                 seed(conn, label, unit);
                 paths.ensure_dirs().unwrap();
-                let kp = keys::generate_and_save(&paths.keys_dir, "t1", "primary").unwrap();
+                let kp = keys::generate_and_save(&paths.keys_dir, key_tenant, key_alias).unwrap();
 
                 let work = TempDir::new().unwrap();
                 let src = work.path().join("src");
@@ -2690,6 +2711,74 @@ mod tests {
                     "{ver}"
                 );
                 assert_eq!(r.tapectl_version, crate::build_info::VERSION);
+            }
+
+            /// Issue #350(d) at the restore path: tenant `t1` must not
+            /// decrypt with tenant `t1-old`'s key just because `t1-` prefixes
+            /// its file name. The slice is encrypted ONLY to
+            /// `t1-old-primary.age.key`. Positive control first: with no key
+            /// row (the `catalog rebuild` case) the file name cannot say
+            /// whose it is, so `t1` gets it and the restore succeeds — the
+            /// loader never withholds a key it cannot prove is another
+            /// tenant's. Then the catalog's row says it is `t1-old`'s, and
+            /// the same restore of `t1` finds no key of its own.
+            #[test]
+            fn restore_loads_only_the_keys_the_catalog_says_are_the_tenants() {
+                let restore = |conn: &Connection, paths: &TapectlPaths, store: &mut MemStore| {
+                    let dest = TempDir::new().unwrap();
+                    let dest_str = dest.path().to_string_lossy().to_string();
+                    restore_unit_from_store(
+                        conn,
+                        paths,
+                        &Config::default(),
+                        "kk-unit",
+                        "KK-1",
+                        1,
+                        RestoreTarget::Unit {
+                            dest_dir: &dest_str,
+                        },
+                        store,
+                        site(Operation::RestoreUnit),
+                    )
+                };
+
+                // Control: no key rows.
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                let (mut store, _) =
+                    real_fixture_keyed(&conn, &paths, "KK-1", "kk-unit", "t1-old", "primary");
+                restore(&conn, &paths, &mut store)
+                    .expect("control: with no key row, t1 may own t1-old-primary");
+
+                // The catalog says the key is t1-old's.
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                let (mut store, _) =
+                    real_fixture_keyed(&conn, &paths, "KK-1", "kk-unit", "t1-old", "primary");
+                let old = crate::db::queries::insert_tenant(&conn, "t1-old", None, false).unwrap();
+                let public = fs::read_to_string(paths.keys_dir.join("t1-old-primary.age.pub"))
+                    .unwrap()
+                    .trim()
+                    .to_string();
+                crate::db::queries::insert_key(
+                    &conn,
+                    old,
+                    "t1-old-primary",
+                    &public,
+                    &public,
+                    "primary",
+                    None,
+                )
+                .unwrap();
+                let err = restore(&conn, &paths, &mut store)
+                    .expect_err("t1 decrypted with t1-old's key")
+                    .to_string();
+                assert!(
+                    err.contains("no secret keys found for tenant \"t1\""),
+                    "{err}"
+                );
             }
 
             /// `restore file` is ONE row of kind `file` under `restore

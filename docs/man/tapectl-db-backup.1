@@ -2,24 +2,24 @@
 .el .ds Aq '
 .TH tapectl-db-backup 1  "tapectl-db-backup " 
 .SH NAME
-tapectl\-db\-backup \- Backup database, and optionally keys, and catalogs
+tapectl\-db\-backup \- Back up the database, and optionally the private key directory
 .SH SYNOPSIS
 \fBtapectl db backup\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-dry\-run\fR] [\fB\-\-include\-keys\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Backup database, and optionally keys, and catalogs
+Back up the database, and optionally the private key directory
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-to\fR \fI<TO>\fR
-Destination path
+The backup file to write. Its directory must already exist
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
 .TP
 \fB\-\-include\-keys\fR
-Also copy the private key directory to `<dest>.keys`. Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud\-synced folder, ...) — issue #40
+Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`\-\-to /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud\-synced folder, ...) — issue #40
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

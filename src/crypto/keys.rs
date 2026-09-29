@@ -110,43 +110,6 @@ pub fn key_paths(
     (pub_path, key_path)
 }
 
-/// Load all secret keys for a tenant from disk as age identities.
-///
-/// Scans `keys_dir` for files matching `{tenant_name}-*.age.key` and parses
-/// each into an `age::x25519::Identity`. Returns an empty vec if no key files
-/// are found — the caller decides whether that's an error.
-///
-/// **Superseded by [`load_tenant_identities`] (issue #350).** Tenant names
-/// may contain `-`, so this prefix scan hands tenant `family` every key of
-/// tenant `family-old` as well. Kept only until its last caller
-/// (`volume::restore`) moves to the successor; do not add new callers.
-pub fn load_all_identities(
-    keys_dir: &Path,
-    tenant_name: &str,
-) -> Result<Vec<age::x25519::Identity>> {
-    let prefix = format!("{tenant_name}-");
-    let mut identities = Vec::new();
-
-    let entries = match fs::read_dir(keys_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(identities),
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with(&prefix) && name_str.ends_with(".age.key") {
-            let secret_str = read_secret_key(&entry.path())?;
-            let identity: age::x25519::Identity = secret_str.parse().map_err(|e| {
-                TapectlError::Encryption(format!("invalid key in {}: {e}", entry.path().display()))
-            })?;
-            identities.push(identity);
-        }
-    }
-
-    Ok(identities)
-}
-
 /// Which key files under `keys/` belong to which tenant (issue #350).
 ///
 /// A key file is `{alias}.age.key`, and an alias is `{tenant}-{short}` — but
@@ -407,28 +370,6 @@ mod tests {
         assert!(matches!(err, TapectlError::KeyAlreadyExists(_)));
     }
 
-    #[test]
-    fn load_all_identities_finds_multiple_keys() {
-        let tmp = TempDir::new().unwrap();
-        // Simulate pre-rotation + post-rotation keys
-        generate_and_save(tmp.path(), "alice", "primary").unwrap();
-        generate_and_save(tmp.path(), "alice", "backup").unwrap();
-        generate_and_save(tmp.path(), "alice", "rotated-primary").unwrap();
-
-        let ids = load_all_identities(tmp.path(), "alice").unwrap();
-        assert_eq!(ids.len(), 3);
-    }
-
-    #[test]
-    fn load_all_identities_ignores_other_tenants() {
-        let tmp = TempDir::new().unwrap();
-        generate_and_save(tmp.path(), "alice", "primary").unwrap();
-        generate_and_save(tmp.path(), "bob", "primary").unwrap();
-
-        let ids = load_all_identities(tmp.path(), "alice").unwrap();
-        assert_eq!(ids.len(), 1);
-    }
-
     /// The catalog a restore sees, as far as key ownership goes: tenant rows,
     /// plus whichever key rows it has (`keys` = (alias, tenant, active)).
     fn catalog(tenants: &[&str], keys: &[(&str, &str, bool)]) -> Connection {
@@ -466,7 +407,8 @@ mod tests {
 
     /// Issue #350(d): tenant names may contain `-`, so `family`'s prefix
     /// `family-` also matches every one of `family-old`'s key files. The
-    /// old loader is kept as the positive control: it still shows the hazard.
+    /// same files with no key rows are the positive control: the file names
+    /// alone still show the hazard, so it is the rows that settle it.
     #[test]
     fn tenant_family_does_not_load_tenant_family_old_keys() {
         let tmp = TempDir::new().unwrap();
@@ -480,10 +422,13 @@ mod tests {
             ],
         );
 
+        let rowless = catalog(&["op", "family", "family-old"], &[]);
         assert_eq!(
-            load_all_identities(tmp.path(), "family").unwrap().len(),
+            load_tenant_identities(&rowless, tmp.path(), "family")
+                .unwrap()
+                .len(),
             2,
-            "control: the prefix scan is the hazard this test exists for"
+            "control: without key rows the file names alone give family both"
         );
         assert_eq!(
             publics(&load_tenant_identities(&conn, tmp.path(), "family").unwrap()),
@@ -602,12 +547,5 @@ mod tests {
         assert!(load_tenant_identities(&conn, tmp.path(), "nobody")
             .unwrap()
             .is_empty());
-    }
-
-    #[test]
-    fn load_all_identities_empty_for_missing_tenant() {
-        let tmp = TempDir::new().unwrap();
-        let ids = load_all_identities(tmp.path(), "nobody").unwrap();
-        assert!(ids.is_empty());
     }
 }

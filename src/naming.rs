@@ -6,11 +6,12 @@
 //! Three identifiers the operator types are interpolated into paths:
 //!
 //! - **Tenant name** → key files. `crypto::keys::key_paths` builds
-//!   `{keys_dir}/{tenant_name}-{alias}.age.key`, and
-//!   `load_all_identities` finds a tenant's keys by prefix-matching
-//!   `{tenant_name}-`. A name containing `/` or `..` writes a **private
-//!   key** outside `keys/`; a name containing `-` in the wrong place can
-//!   shadow another tenant's prefix scan.
+//!   `{keys_dir}/{tenant_name}-{alias}.age.key`. A name containing `/` or
+//!   `..` writes a **private key** outside `keys/`. A name containing `-`
+//!   makes a file name ambiguous (`family-old-primary` is either `family`'s
+//!   `old-primary` or `family-old`'s `primary`); `load_tenant_identities`
+//!   settles that from the catalog's key rows, and with no row gives the
+//!   file to every tenant it may belong to (issue #350).
 //! - **Unit name** and **volume label** → the read-slices staging
 //!   directory. `volume::write` joins
 //!   `{staging}/clone-{from_label}-{unit_name}`.
