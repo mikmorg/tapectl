@@ -1213,7 +1213,7 @@ mod tests {
         // v1: one completed write.
         conn.execute(
             "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
-             VALUES (?1, 1, 'superseded', '/tmp/u', 1, 10)",
+             VALUES (?1, 1, 'current', '/tmp/u', 1, 10)",
             params![unit_id],
         )
         .unwrap();

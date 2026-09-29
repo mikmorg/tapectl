@@ -733,8 +733,7 @@ pub fn check_nesting_conflict_excluding(
     path: &str,
     exclude_unit_id: Option<i64>,
 ) -> Result<Option<String>> {
-    let mut stmt =
-        conn.prepare("SELECT id, name, current_path FROM units WHERE status != 'retired'")?;
+    let mut stmt = conn.prepare("SELECT id, name, current_path FROM units")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -930,8 +929,8 @@ mod tests {
         let tid = insert_tenant(&conn, "op", None, true).unwrap();
         insert_unit(&conn, "u1", "u1", tid, None, "/a", "mtime_size", true).unwrap();
         insert_unit(&conn, "u2", "u2", tid, None, "/b", "mtime_size", true).unwrap();
-        // Mark one retired
-        conn.execute("UPDATE units SET status='retired' WHERE name='u2'", [])
+        // Mark one missing (any status but 'active')
+        conn.execute("UPDATE units SET status='missing' WHERE name='u2'", [])
             .unwrap();
         assert_eq!(count_active_units_for_tenant(&conn, tid).unwrap(), 1);
     }

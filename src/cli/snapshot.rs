@@ -20,8 +20,7 @@ pub enum SnapshotCommands {
         /// Filter by unit name
         #[arg(long)]
         unit: Option<String>,
-        /// Filter by status (created, staged, current, superseded,
-        /// reclaimable, purged, failed)
+        /// Filter by status (created, staged, current, reclaimable, purged)
         #[arg(long)]
         status: Option<String>,
     },
@@ -125,16 +124,11 @@ fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
-/// `snapshots.status`'s CHECK constraint (`src/db/migrations/001_initial.sql`).
-const SNAPSHOT_STATUSES: &[&str] = &[
-    "created",
-    "staged",
-    "current",
-    "superseded",
-    "reclaimable",
-    "purged",
-    "failed",
-];
+/// `snapshots.status`'s CHECK constraint
+/// (`src/db/migrations/026_drop_unwritten_states.sql`, which dropped
+/// `superseded` and `failed`: nothing ever wrote either, issue #362). Pinned
+/// to the live schema by `snapshot_statuses_equal_the_live_check`.
+const SNAPSHOT_STATUSES: &[&str] = &["created", "staged", "current", "reclaimable", "purged"];
 
 /// `snapshot list --status` is a usage error when it names anything other
 /// than one of `SNAPSHOT_STATUSES` (issue #171, ADR-0012).
@@ -408,6 +402,16 @@ mod tests {
         assert!(msg.contains("curent"), "{msg}");
         assert!(msg.contains("current"), "{msg}");
         assert!(msg.contains("reclaimable"), "{msg}");
+    }
+
+    /// Issue #362: the `--status` closed set is the live CHECK, not a copy
+    /// of a migration that a later one superseded (`superseded`/`failed`
+    /// sat here long after anything could have set them).
+    #[test]
+    fn snapshot_statuses_equal_the_live_check() {
+        let mut ours: Vec<String> = SNAPSHOT_STATUSES.iter().map(|s| s.to_string()).collect();
+        ours.sort();
+        assert_eq!(ours, crate::db::live_status_check("snapshots"));
     }
 
     #[test]

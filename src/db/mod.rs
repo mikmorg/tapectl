@@ -80,6 +80,41 @@ pub(crate) fn open_memory_at_version(version: usize) -> Connection {
     conn
 }
 
+/// The values `table.status`'s CHECK admits in the LIVE schema (every
+/// migration applied), sorted -- for pinning a hand-copied closed set (a
+/// `--status` filter's list, a classifier's cases) to the schema instead of
+/// to a migration file that a later migration supersedes (issue #362: the
+/// `is_write_target` pin read 017's text and kept passing after the CHECK
+/// moved on).
+#[cfg(test)]
+pub(crate) fn live_status_check(table: &str) -> Vec<String> {
+    let conn = open_memory().unwrap();
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("no table {table:?} in the live schema: {e}"));
+    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle = "CHECK(status IN (";
+    let start = flat
+        .find(needle)
+        .unwrap_or_else(|| panic!("no `{needle}` on {table}: {flat}"))
+        + needle.len();
+    let end = flat[start..]
+        .find(')')
+        .expect("the status CHECK closes its IN (...) list")
+        + start;
+    let mut set: Vec<String> = flat[start..end]
+        .split(',')
+        .map(|t| t.trim().trim_matches('\'').to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    set.sort();
+    set
+}
+
 /// Set WAL mode and other pragmas.
 fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -731,13 +766,16 @@ mod tests {
         names
     }
 
-    /// (a) A fresh DB migrates cleanly to latest; the extended CHECK carries every legacy
-    /// status plus the two new ones, and encryption_keys gained is_escrow (default 0).
+    /// (a) A fresh DB migrates cleanly to latest, and encryption_keys gained is_escrow
+    /// (default 0); 003's extended CHECK carries every legacy status plus the two new ones.
+    /// The CHECK half reads the 003 schema itself, not latest: 017 moved 'quarantined'
+    /// out of the column and 026 dropped 'blank'/'missing' (issue #362), so a "latest"
+    /// read here would be pinning whatever the newest rebuild happens to say.
     #[test]
     fn test_migration_003_fresh_db_reaches_latest() {
         let conn = open_memory().unwrap();
 
-        let sql: String = conn
+        let sql: String = open_memory_at_003()
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='volumes'",
                 [],
@@ -2373,10 +2411,9 @@ mod tests {
 
     /// Migration 025 creates `st_stats_journal` (and its one index) and
     /// touches NOTHING else (issue #301). Pinned by difference against the
-    /// schema one step before it — `latest - 1` rather than a literal, so the
-    /// pin survives 024 (concurrent work) being registered ahead of it, and
-    /// fails loudly if anything is ever registered AFTER it without moving
-    /// this pin.
+    /// schema one step before it. It read `latest` and `latest - 1` while it
+    /// was the newest migration; 026 moved it to the literal 24 -> 25 it
+    /// always meant (issue #362).
     #[test]
     fn migration_025_creates_only_st_stats_journal() {
         fn objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
@@ -2393,12 +2430,10 @@ mod tests {
                 .collect();
             v
         }
-        let latest_conn = open_memory().unwrap();
-        let latest: usize = latest_conn
-            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-            .unwrap() as usize;
-        assert!(latest >= 24, "positive control: the chain ran ({latest})");
-        let before = objects(&open_memory_at_version(latest - 1));
+        // Pinned to exactly 024 -> 025 now that 026 is registered after it
+        // (issue #362) -- the "latest - 1" form this used would measure 026.
+        let latest_conn = open_memory_at_version(25);
+        let before = objects(&open_memory_at_version(24));
         let after = objects(&latest_conn);
         let added: Vec<(&str, &str)> = after
             .iter()
@@ -2841,8 +2876,8 @@ mod tests {
     fn test_migration_017_observed_condition_is_closed_and_defaults_ok() {
         let conn = open_memory().unwrap();
         conn.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes)
-             VALUES ('L6-DEFAULT', 'lto', 'lto0', 'LTO-6', 2500000000000)",
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('L6-DEFAULT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
             [],
         )
         .unwrap();
@@ -2856,15 +2891,15 @@ mod tests {
         assert_eq!(default_condition, "ok");
 
         conn.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, observed_condition)
-             VALUES ('L6-QUAR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'quarantined')",
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition)
+             VALUES ('L6-QUAR', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 'quarantined')",
             [],
         )
         .unwrap_or_else(|e| panic!("'quarantined' should be a legal observed_condition: {e}"));
 
         let err = conn.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, observed_condition)
-             VALUES ('L6-BAD', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sketchy')",
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, observed_condition)
+             VALUES ('L6-BAD', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 'sketchy')",
             [],
         );
         assert!(
@@ -2945,14 +2980,14 @@ mod tests {
         );
 
         conn.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, uuid)
-             VALUES ('V-1', 'lto', 'lto0', 'LTO-6', 2500000000000, '11111111-1111-1111-1111-111111111111')",
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, uuid)
+             VALUES ('V-1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', '11111111-1111-1111-1111-111111111111')",
             [],
         )
         .unwrap();
         let dup = conn.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, uuid)
-             VALUES ('V-2', 'lto', 'lto0', 'LTO-6', 2500000000000, '11111111-1111-1111-1111-111111111111')",
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, uuid)
+             VALUES ('V-2', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', '11111111-1111-1111-1111-111111111111')",
             [],
         );
         assert!(
@@ -2993,8 +3028,8 @@ mod tests {
         );
 
         let err = after.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, location_id)
-             VALUES ('V-dangling', 'lto', 'lto0', 'LTO-6', 2500000000000, 99999)",
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status, location_id)
+             VALUES ('V-dangling', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', 99999)",
             [],
         );
         assert!(

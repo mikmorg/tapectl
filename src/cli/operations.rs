@@ -1709,21 +1709,19 @@ pub fn cartridge_mark_erased(
     Ok(())
 }
 
-/// `volumes.status` values migration 017's CHECK still admits
-/// (`017_volume_observed_condition.sql`) -- `'quarantined'` was retired
-/// there as a legal value, not merely deprecated. A status recovered from
-/// `events.old_value` is checked against this SAME set before ever being
-/// written back to `status`, for the identical reason 017's own migrating
-/// subquery does (see its header): an unfiltered read of pre-017 history
-/// can legally carry `'quarantined'`, and writing that straight back trips
-/// the CHECK (issue #250).
-const LEGAL_VOLUME_STATUSES: [&str; 8] = [
-    "blank",
+/// `volumes.status` values the live CHECK admits -- migration 026's
+/// (`026_drop_unwritten_states.sql`, issue #362), which dropped `'blank'`
+/// and `'missing'` after 017 had dropped `'quarantined'`. A status recovered
+/// from `events.old_value` is checked against this SAME set before ever
+/// being written back to `status`, for the identical reason 017's own
+/// migrating subquery does (see its header): an unfiltered read of older
+/// history can legally carry a value the CHECK no longer admits, and
+/// writing that straight back trips it (issue #250).
+const LEGAL_VOLUME_STATUSES: [&str; 6] = [
     "initialized",
     "active",
     "full",
     "retired",
-    "missing",
     "erased",
     "sealed",
 ];
@@ -5783,11 +5781,6 @@ mod tests {
         }
 
         #[test]
-        fn mark_tape_only_refuses_when_second_volume_is_missing() {
-            mark_tape_only_refuses_for_status("missing");
-        }
-
-        #[test]
         fn mark_tape_only_counts_two_sealed_volumes_as_two() {
             let (conn, _unit_id) = setup_unit_with_two_volumes("mto-both-sealed", "sealed");
             let config = config_isolating_copy_count();
@@ -5854,8 +5847,9 @@ mod tests {
                 .expect("Tier 2 must be --force-overridable, unlike Tier 3");
         }
 
-        /// tenant + unit + TWO snapshots: v1 ('superseded', the one to be
-        /// marked reclaimable) and v2 ('current', the superseding
+        /// tenant + unit + TWO snapshots: v1 ('current', the one to be
+        /// marked reclaimable -- a newer version never demotes its
+        /// predecessor, issue #362) and v2 ('current', the superseding
         /// snapshot whose coverage `snapshot_mark_reclaimable` actually
         /// measures) + v2's 'staged' stage_set completed-written to two
         /// volumes, same SEALED / `second_volume_status` shape as
@@ -5878,7 +5872,7 @@ mod tests {
 
             conn.execute(
                 "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
-                 VALUES (?1, 1, 'full', 'superseded', '/src')",
+                 VALUES (?1, 1, 'full', 'current', '/src')",
                 params![unit_id],
             )
             .unwrap();
@@ -6033,11 +6027,6 @@ mod tests {
         }
 
         #[test]
-        fn mark_reclaimable_refuses_when_second_volume_is_missing() {
-            mark_reclaimable_refuses_for_status("missing");
-        }
-
-        #[test]
         fn mark_reclaimable_counts_two_sealed_volumes_as_two() {
             let (conn, _unit_id) = setup_reclaimable_fixture("rec-both-sealed", "sealed");
             let config = Config::default();
@@ -6095,7 +6084,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(status, "superseded", "nothing was marked");
+            assert_eq!(status, "current", "nothing was marked");
         }
 
         /// Issue #348: the consent gate's non-interactive refusal says
@@ -8694,8 +8683,8 @@ mod tests {
         .unwrap();
         let slice_valid_id = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
-             VALUES ('vol1', 'lto', 'drive0', 1000000)",
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('vol1', 'lto', 'drive0', 1000000, 'sealed')",
             [],
         )
         .unwrap();

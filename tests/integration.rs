@@ -182,8 +182,9 @@ fn test_snapshot_lifecycle() {
     .unwrap();
     let snap_id = conn.last_insert_rowid();
 
-    // Lifecycle: created -> staged -> current -> superseded -> reclaimable -> purged
-    for status in &["staged", "current", "superseded", "reclaimable", "purged"] {
+    // Lifecycle: created -> staged -> current -> reclaimable -> purged ('superseded' never had
+    // a writer and left the schema in migration 026, issue #362)
+    for status in &["staged", "current", "reclaimable", "purged"] {
         conn.execute(
             "UPDATE snapshots SET status = ?1 WHERE id = ?2",
             rusqlite::params![status, snap_id],
@@ -1444,20 +1445,21 @@ fn test_duplicate_volume_label_rejected() {
     let (_tmp, conn, _home) = setup();
 
     conn.execute(
-        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
-         VALUES ('TAPE001', 'lto', 'lto6', 2500000000000)",
+        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+         VALUES ('TAPE001', 'lto', 'lto6', 2500000000000, 'initialized')",
         [],
     )
     .unwrap();
 
     let result = conn.execute(
-        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
-         VALUES ('TAPE001', 'lto', 'lto6', 2500000000000)",
+        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+         VALUES ('TAPE001', 'lto', 'lto6', 2500000000000, 'initialized')",
         [],
     );
+    let err = result.expect_err("duplicate volume label must be rejected by UNIQUE constraint");
     assert!(
-        result.is_err(),
-        "duplicate volume label must be rejected by UNIQUE constraint"
+        err.to_string().contains("UNIQUE"),
+        "rejected by the label's UNIQUE constraint, not some other one: {err}"
     );
 }
 

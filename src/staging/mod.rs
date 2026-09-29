@@ -132,7 +132,7 @@ pub fn snapshot_create_detailed(
                         status: latest_status,
                     });
                 }
-                // superseded/reclaimable/purged/failed: a dead row. Content
+                // reclaimable/purged: a dead row. Content
                 // happening to match it is coincidence, not identity —
                 // mint fresh rather than resurrect it.
                 _ => {}

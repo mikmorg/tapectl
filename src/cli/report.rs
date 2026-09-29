@@ -2700,8 +2700,8 @@ mod tests {
         }
 
         /// Issue #336: a session-less volume that holds nothing to verify
-        /// is not listed as "never verified" -- erased, retired, missing,
-        /// blank and plain initialized. Positive controls: a sealed one, a
+        /// is not listed as "never verified" -- erased, retired and plain
+        /// initialized. Positive controls: a sealed one, a
         /// legacy `full` one, a quarantined sealed one (verify is what
         /// clears quarantine) and an `initialized` one whose seal is
         /// recorded all still appear; an erased volume WITH a session keeps
@@ -2719,7 +2719,7 @@ mod tests {
                 )
                 .unwrap();
             };
-            for status in ["erased", "retired", "missing", "blank", "initialized"] {
+            for status in ["erased", "retired", "initialized"] {
                 seed(&format!("GONE-{status}"), status, false, "ok");
             }
             seed("GONE-erased-sealed", "erased", true, "ok");
@@ -3223,11 +3223,6 @@ mod tests {
         #[test]
         fn copies_rows_excludes_an_erased_volume() {
             assert_copies_rows_excludes_status("erased");
-        }
-
-        #[test]
-        fn copies_rows_excludes_a_missing_volume() {
-            assert_copies_rows_excludes_status("missing");
         }
 
         #[test]

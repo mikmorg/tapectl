@@ -331,8 +331,8 @@ pub enum VolumeCommands {
     /// inventory is a tape you forgot you had. `--status` narrows; nothing is
     /// hidden without it.
     List {
-        /// Only volumes in this status (blank, initialized, active, full,
-        /// retired, missing, erased, sealed). Every status is shown when
+        /// Only volumes in this status (initialized, active, full, retired,
+        /// erased, sealed). Every status is shown when
         /// omitted. A medium's CONDITION (e.g. quarantined) is its own fact
         /// now (ADR-0012, the 2026-09-17 amendment) and is shown in its own
         /// column/line, not filterable here.
@@ -403,19 +403,19 @@ pub enum DepositCommands {
 }
 
 /// `volumes.status`'s CHECK constraint
-/// (`src/db/migrations/017_volume_observed_condition.sql`, which last
-/// rewrote it and is the schema's current word on it). `quarantined` is
-/// deliberately absent: ADR-0012's 2026-09-17 amendment ("the status column
-/// is the operator's; a medium's condition is its own fact", issue #242)
-/// moved it to `volumes.observed_condition` — it left this CHECK entirely,
-/// it was not merely renamed within it.
+/// (`src/db/migrations/026_drop_unwritten_states.sql`, which last rewrote it
+/// and is the schema's current word on it: `blank` and `missing` left there,
+/// nothing ever wrote either, issue #362). `quarantined` is deliberately
+/// absent: ADR-0012's 2026-09-17 amendment ("the status column is the
+/// operator's; a medium's condition is its own fact", issue #242) moved it to
+/// `volumes.observed_condition` in 017 — it left this CHECK entirely, it was
+/// not merely renamed within it. Pinned to the live schema by
+/// `volume_statuses_equal_the_live_check`.
 const VOLUME_STATUSES: &[&str] = &[
-    "blank",
     "initialized",
     "active",
     "full",
     "retired",
-    "missing",
     "erased",
     "sealed",
 ];
@@ -3528,6 +3528,16 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("ADR-0012"), "{msg}");
             assert!(msg.contains("observed_condition"), "{msg}");
+        }
+
+        /// Issue #362: the `--status` closed set is the live CHECK, not a
+        /// copy of a migration that a later one superseded (`blank` and
+        /// `missing` sat here long after anything could have set them).
+        #[test]
+        fn volume_statuses_equal_the_live_check() {
+            let mut ours: Vec<String> = VOLUME_STATUSES.iter().map(|s| s.to_string()).collect();
+            ours.sort();
+            assert_eq!(ours, crate::db::live_status_check("volumes"));
         }
 
         #[test]

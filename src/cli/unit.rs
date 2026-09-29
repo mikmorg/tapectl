@@ -44,7 +44,7 @@ pub enum UnitCommands {
         /// Filter by tenant name
         #[arg(long)]
         tenant: Option<String>,
-        /// Filter by status (active, tape_only, missing, retired)
+        /// Filter by status (active, tape_only, missing)
         #[arg(long)]
         status: Option<String>,
         /// Filter by tag
@@ -130,8 +130,10 @@ struct UnitRow {
     tags: String,
 }
 
-/// `units.status`'s CHECK constraint (`src/db/migrations/001_initial.sql`).
-const UNIT_STATUSES: &[&str] = &["active", "tape_only", "missing", "retired"];
+/// `units.status`'s CHECK constraint (`src/db/migrations/026_drop_unwritten_states.sql`,
+/// which dropped `retired`: nothing ever wrote it, issue #362). Pinned to the
+/// live schema by `unit_statuses_equal_the_live_check`.
+const UNIT_STATUSES: &[&str] = &["active", "tape_only", "missing"];
 
 /// `unit list --status` is a usage error when it names anything other than
 /// one of `UNIT_STATUSES` (issue #171, ADR-0012) — an unrecognised value
@@ -599,6 +601,16 @@ mod tests {
         assert!(msg.contains("actve"), "{msg}");
         assert!(msg.contains("active"), "{msg}");
         assert!(msg.contains("tape_only"), "{msg}");
+    }
+
+    /// Issue #362: the `--status` closed set is the live CHECK, not a copy
+    /// of a migration that a later one superseded (`retired` sat here long
+    /// after anything could have set it).
+    #[test]
+    fn unit_statuses_equal_the_live_check() {
+        let mut ours: Vec<String> = UNIT_STATUSES.iter().map(|s| s.to_string()).collect();
+        ours.sort();
+        assert_eq!(ours, crate::db::live_status_check("units"));
     }
 
     #[test]

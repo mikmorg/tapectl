@@ -104,7 +104,8 @@ fn render(
 }
 
 /// Every per-unit check's `statuses` except `dirty` (issue #138): `active`,
-/// `tape_only` and `missing` are audited; `retired` never is. `tape_only`
+/// `tape_only` and `missing` -- every unit status there is (`retired`, which
+/// no check audited, left the schema in migration 026, issue #362). `tape_only`
 /// means "the source is deleted; the tape is all there is", which is the
 /// moment coverage/encryption/verify-age/escrow matter most, and `missing`
 /// ("source path gone, not yet declared tape-only") is the same situation
@@ -979,8 +980,8 @@ fn check_no_archive(
 /// own gate) rules out `'current'` as the unit's latest snapshot status —
 /// `session.rs` only sets it at seal, i.e. once a completed write exists,
 /// which would make `copy_count` at least 1 — so the only statuses left
-/// to branch on are `'created'`, a dead status (`'superseded'`,
-/// `'reclaimable'`, `'purged'`, `'failed'`), no snapshot at all, or
+/// to branch on are `'created'`, a dead status (`'reclaimable'`,
+/// `'purged'`), no snapshot at all, or
 /// `'staged'`:
 ///   - no snapshot / `'created'` / dead: the pre-existing chain already
 ///     works. `snapshot create` either mints the unit's first version or
@@ -1670,24 +1671,18 @@ mod tests {
         }
     }
 
-    /// `retired` is the operator saying the unit no longer matters; it is
-    /// the one status the coverage checks leave alone.
+    /// Issue #362: `retired` -- the one unit status the coverage checks
+    /// left alone -- never had a writer and left the schema in migration
+    /// 026, so every status a unit can have is audited. Pinned to the live
+    /// CHECK so a status added later is a decision here, not a silent gap.
     #[test]
-    fn a_retired_unit_is_not_audited() {
-        let (conn, unit_id) = setup_unit_with_two_volumes("u-retired", "retired");
-        conn.execute(
-            "UPDATE units SET status = 'retired' WHERE id = ?1",
-            params![unit_id],
-        )
-        .unwrap();
-        let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
-        assert!(
-            violations
-                .iter()
-                .chain(warnings.iter())
-                .all(|f| f.unit != "u-retired"),
-            "a retired unit produced findings"
-        );
+    fn every_unit_status_the_schema_permits_is_audited() {
+        let mut audited: Vec<String> = ACTIVE_TAPE_ONLY_MISSING
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        audited.sort();
+        assert_eq!(audited, crate::db::live_status_check("units"));
     }
 
     /// Issue #73 / ADR-0006: a recorded warehouse deposit is a copy and a
@@ -1735,11 +1730,6 @@ mod tests {
     #[test]
     fn copy_count_excludes_an_erased_volume() {
         assert_copy_count_excludes_status("erased");
-    }
-
-    #[test]
-    fn copy_count_excludes_a_missing_volume() {
-        assert_copy_count_excludes_status("missing");
     }
 
     #[test]
@@ -3665,16 +3655,19 @@ mod tests {
         /// The #138 property, now enforced as data instead of documented as
         /// prose: every per-unit check except `dirty` covers `tape_only`
         /// and `missing` alongside `active`; `dirty` covers only `active`;
-        /// and nothing ever covers `retired`.
+        /// and every status named is one the live schema permits (issue
+        /// #362: this used to say "nothing ever covers `retired`", a status
+        /// migration 026 dropped).
         #[test]
         fn per_unit_scope_is_data_not_prose() {
+            let legal = crate::db::live_status_check("units");
             let mut saw_per_unit = 0;
             for check in CHECKS {
                 if let Scope::PerUnit { statuses, .. } = &check.scope {
                     saw_per_unit += 1;
                     assert!(
-                        !statuses.contains(&"retired"),
-                        "`{}` must never audit retired units: {statuses:?}",
+                        statuses.iter().all(|s| legal.iter().any(|l| l == s)),
+                        "`{}` names a unit status the schema does not have: {statuses:?}",
                         check.name
                     );
                     if check.name == "dirty" {
@@ -3781,9 +3774,7 @@ mod tests {
         /// `CHECKS`'s own order says. This fixture puts every firing
         /// per-unit check on a SINGLE unit (mixing units would make the
         /// global order unit-major-then-check-minor, not pure table order)
-        /// plus one archive-wide check tied to a second, `retired` unit
-        /// (excluded from the per-unit loop entirely, so its volume
-        /// contributes only to the archive-wide query and nothing else).
+        /// plus one archive-wide check on a volume of that same unit.
         #[test]
         fn findings_order_is_table_order() {
             const ESCROW_KEY: &str = "age1escrowescrowescrow";
@@ -3801,7 +3792,8 @@ mod tests {
 
             // Unit under test: one sealed, UNENCRYPTED volume with a
             // recipient list that does not include the escrow key.
-            // Triggers copy_count (V, 1 < default min_copies 2) and
+            // Triggers copy_count (V, 2 < min_copies 3 -- the second copy
+            // is ORDVOL-COMPACT below) and
             // encryption (V, unencrypted on an in-service volume): both
             // scope to the CURRENT snapshot only.
             conn.execute(
@@ -3839,7 +3831,7 @@ mod tests {
             )
             .unwrap();
 
-            // A second, SUPERSEDED snapshot for the SAME unit, encrypted,
+            // An older, RECLAIMABLE snapshot for the SAME unit, encrypted,
             // with a recipient list that does not include the escrow key.
             // `escrow_coverage`'s underlying query
             // (`policy::escrow::stage_set_coverage`) has no snapshot-status
@@ -3851,7 +3843,7 @@ mod tests {
             // violation above already owns that fact).
             conn.execute(
                 "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
-                 VALUES (?1, 2, 'full', 'superseded', '/src-old')",
+                 VALUES (?1, 0, 'full', 'reclaimable', '/src-old')",
                 params![unit_id],
             )
             .unwrap();
@@ -3877,82 +3869,49 @@ mod tests {
             )
             .unwrap();
 
-            // A second unit, `retired` (excluded from the per-unit loop
-            // entirely — see `a_retired_unit_is_not_audited` above), whose
-            // sealed volume at 10% utilization exists solely to trigger the
-            // archive-wide `compaction_candidate` check without adding a
-            // second eligible volume to `order-test` (which would push its
-            // copy_count to 2 and silence that violation).
-            conn.execute(
-                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
-                 VALUES ('uuid-order2', 'order-test-2', ?1, 'mtime_size', 1, 'retired')",
-                params![tid],
-            )
-            .unwrap();
-            let unit2_id = conn.last_insert_rowid();
+            // The archive-wide `compaction_candidate` check needs a sealed
+            // volume at 10% utilization. It holds this same unit's data
+            // (issue #362: it used to hang off a second, `retired` unit,
+            // "excluded from the per-unit loop entirely", and `retired` is
+            // no longer a status): 100 B of the current v1 and 900 B of the
+            // reclaimable v0. Both stage sets name the escrow key, so
+            // neither `encryption` nor `escrow_coverage` gains a finding;
+            // it is v1's second copy, which is why `min_copies` is 3 below.
+            // Issue #353: utilization is live data over the archive data
+            // written (never `bytes_written`), and a volume with nothing
+            // reclaimable is never a candidate -- hence the dead 900 B.
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, bytes_written, status)
                  VALUES ('ORDVOL-COMPACT', 'lto', 'lto0', 'LTO-6', 1000000, 1000, 'sealed')",
                 [],
             )
             .unwrap();
-            let vol2_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
-                 VALUES (?1, 1, 'full', 'current', '/src2')",
-                params![unit2_id],
-            )
-            .unwrap();
-            let snap2_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
-                params![snap2_id],
-            )
-            .unwrap();
-            let stage_set2_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
-                 VALUES (?1, 0, 100, 100, 'p', 'e')",
-                params![stage_set2_id],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
-                 VALUES (?1, ?2, ?3, 'completed')",
-                params![stage_set2_id, snap2_id, vol2_id],
-            )
-            .unwrap();
-            // Issue #353: utilization is live data over the archive data
-            // written (never `bytes_written`), and a volume with nothing
-            // reclaimable is never a candidate — so the 10% needs real dead
-            // data: a reclaimable version holding 900 of the 1000 bytes.
-            conn.execute(
-                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
-                 VALUES (?1, 0, 'full', 'reclaimable', '/src2')",
-                params![unit2_id],
-            )
-            .unwrap();
-            let dead_snap_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
-                params![dead_snap_id],
-            )
-            .unwrap();
-            let dead_stage_set_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
-                 VALUES (?1, 0, 900, 900, 'p', 'e')",
-                params![dead_stage_set_id],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
-                 VALUES (?1, ?2, ?3, 'completed')",
-                params![dead_stage_set_id, dead_snap_id, vol2_id],
-            )
-            .unwrap();
+            let compact_vol_id = conn.last_insert_rowid();
+            for (snapshot, bytes) in [(snap_id, 100_i64), (old_snap_id, 900)] {
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+                     VALUES (?1, 'staged', 524288, 1, ?2)",
+                    params![snapshot, format!(r#"["{ESCROW_KEY}"]"#)],
+                )
+                .unwrap();
+                let set_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+                     VALUES (?1, 0, ?2, ?2, 'p', 'e')",
+                    params![set_id, bytes],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![set_id, snapshot, compact_vol_id],
+                )
+                .unwrap();
+            }
 
-            let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+            let mut config = Config::default();
+            config.defaults.min_copies = 3;
+            let (violations, warnings) = collect_findings(&conn, &config, None).unwrap();
 
             let index_of = |name: &str| -> usize {
                 let canonical = match name {

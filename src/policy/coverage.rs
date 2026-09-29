@@ -7,9 +7,9 @@
 //! It is set exactly once, at confirm time, in the same transaction that
 //! flips `volumes.status` to `'sealed'` (`src/volume/session.rs`) — so
 //! `completed` implies "this volume was sealed at write time." But
-//! `volumes.status` keeps moving afterwards (`retired`, `erased`, and —
-//! schema-legal though no writer currently sets it — `missing`;
-//! `src/db/migrations/003_v2_lifecycle.sql`) — `quarantined` is NOT among
+//! `volumes.status` keeps moving afterwards (`retired`, `erased`;
+//! `src/db/migrations/026_drop_unwritten_states.sql` is the live set) —
+//! `quarantined` is NOT among
 //! them: ADR-0012's 2026-09-17 amendment (issue #242) moved it to
 //! `volumes.observed_condition`, a separate column [`eligible`] also
 //! consults (see [`condition_ok`]) — while the
@@ -101,7 +101,7 @@ fn condition_ok(volume_alias: &str) -> String {
 ///   cartridge exists and holds bytes. Dropping it here would silently
 ///   under-report physical media — trading one under-report for another.
 ///
-/// Both exclude `retired`/`erased`/`missing`/`quarantined`: media that is
+/// Both exclude `retired`/`erased`/`quarantined`: media that is
 /// gone, wiped, or untrusted is neither a copy nor live inventory. Since
 /// issue #242, "quarantined" is a value of `observed_condition`, not
 /// `status` — [`condition_ok`] carries that exclusion now, alongside the
@@ -142,8 +142,8 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
 /// `active`/`full`/`sealed` for inventory/capacity accounting — none of
 /// those are write targets. `active` is written only by `tapectl import`
 /// (a tape written elsewhere, not a v2 write session); `full` is the
-/// pre-renovation sealed-equivalent; `blank`/`missing` have no writer at
-/// all. A `sealed` volume is never written again (ADR-0003), and
+/// pre-renovation sealed-equivalent (`blank`/`missing`, which never had a
+/// writer, left the schema in migration 026). A `sealed` volume is never written again (ADR-0003), and
 /// `retired`/`erased` are catalog facts that make writing wrong regardless
 /// of what the loaded tape looks like. `quarantined` is NOT a `status`
 /// value (ADR-0012's 2026-09-17 amendment, issue #242) — it is the
@@ -256,11 +256,11 @@ pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::R
 /// Tier 2 at most, exactly as it is for [`eligible`].
 ///
 /// The "not gone" half is written as an EXCLUSION of
-/// `retired`/`missing`/`erased` ([`status_not_in`]), not an inclusion list,
+/// `retired`/`erased` ([`status_not_in`]), not an inclusion list,
 /// so a future `volumes.status` value cannot silently drop out of the
-/// Tier-3 floor by omission — migration 017's full legal set is `blank`,
-/// `initialized`, `active`, `full`, `retired`, `missing`, `erased`,
-/// `sealed` (`017_volume_observed_condition.sql`).
+/// Tier-3 floor by omission — migration 026's full legal set is
+/// `initialized`, `active`, `full`, `retired`, `erased`, `sealed`
+/// (`026_drop_unwritten_states.sql`).
 ///
 /// **Must NOT be used for copy counting.** An unconfirmed volume is not a
 /// Copy (ADR-0004) and must not contribute to `min_copies`,
@@ -272,7 +272,7 @@ pub fn holds_sealed_bytes(volume_alias: &str) -> String {
     format!(
         "(({alias}.status = 'sealed' OR {alias}.sealed_at IS NOT NULL) AND {not_gone} AND {cond})",
         alias = volume_alias,
-        not_gone = status_not_in(volume_alias, &["retired", "missing", "erased"]),
+        not_gone = status_not_in(volume_alias, &["retired", "erased"]),
         cond = condition_ok(volume_alias)
     )
 }
@@ -283,18 +283,18 @@ pub fn holds_sealed_bytes(volume_alias: &str) -> String {
 ///
 /// Bytes: legacy `active`/`full`, `sealed`, or a recorded seal on a volume
 /// whose confirm never landed (`sealed_at` set while `initialized` -- the
-/// state [`holds_sealed_bytes`] also widens to). Not gone: `retired`,
-/// `missing` and `erased` media is not verified. Unlike
+/// state [`holds_sealed_bytes`] also widens to). Not gone: `retired`
+/// and `erased` media is not verified. Unlike
 /// [`holds_sealed_bytes`] this does NOT exclude a quarantined condition: a
 /// quarantined volume is exactly one to verify, since a clean full verify is
-/// what clears it (ADR-0012, 2026-09-17). `blank`/`initialized` without a
-/// recorded seal hold nothing to verify.
+/// what clears it (ADR-0012, 2026-09-17). `initialized` without a
+/// recorded seal holds nothing to verify.
 pub fn holds_bytes_to_verify(volume_alias: &str) -> String {
     format!(
         "(({in_bytes} OR {alias}.sealed_at IS NOT NULL) AND {not_gone})",
         in_bytes = status_in(volume_alias, &["active", "full", "sealed"]),
         alias = volume_alias,
-        not_gone = status_not_in(volume_alias, &["retired", "missing", "erased"]),
+        not_gone = status_not_in(volume_alias, &["retired", "erased"]),
     )
 }
 
@@ -335,7 +335,7 @@ pub fn write_reaches_tape(write_alias: &str) -> String {
 /// uses it to decide whether to name `tapectl volume resume <label>` as the
 /// cheapest first act in its refusal text. It answers a narrower question
 /// than [`holds_sealed_bytes`] (which also excludes
-/// `retired`/`missing`/`erased` and consults [`condition_ok`]): this
+/// `retired`/`erased` and consults [`condition_ok`]): this
 /// function does not need those exclusions, because by the time
 /// `refuse_last_eligible_copy` runs, `volume_label` is already the specific
 /// volume the operator is trying to retire, not a candidate being filtered
@@ -531,7 +531,8 @@ fn scoped_deposits(q: &CoverageQuery, projection: &str) -> String {
 /// **Per-version rule (issue #153, ADR-0012).** `snapshots.status`
 /// permits more than one `'current'` row per unit at once — each sealed
 /// write promotes its snapshot to `'current'` and never demotes its
-/// predecessor (`'superseded'` has zero production writers). A newer
+/// predecessor (`'superseded'` never had a writer and left the schema in
+/// migration 026). A newer
 /// Version is not a copy of an older one, so when `q.scope` is
 /// [`CoverageScope::Unit`] with `current_only: true`, this is NOT the
 /// union of eligible volumes across every current snapshot (that would
@@ -1307,8 +1308,8 @@ pub(crate) mod tests {
     // version, not the union of volumes across versions ──
     //
     // `session.rs` promotes each sealed snapshot to `'current'` and never
-    // demotes its predecessor (`'superseded'` has zero production
-    // writers — CONTEXT.md:106 calls it vestigial), so a unit can have
+    // demotes its predecessor (`'superseded'` never had a writer and
+    // left the schema in migration 026), so a unit can have
     // MULTIPLE `'current'` snapshots at once. The pre-fix expressions
     // UNIONed eligible volumes across every current snapshot, which
     // counts "how many volumes hold ANY version of this unit" rather
@@ -1603,49 +1604,29 @@ pub(crate) mod tests {
     /// the CURRENT authority, not 003 — reading the superseded file would
     /// keep passing with 'quarantined' still in `statuses`, silently
     /// pinning a status set the live schema no longer has.
+    ///
+    /// Repointed again, to the LIVE schema (issue #362): reading 017's
+    /// text is the same trap one migration later -- 026 dropped `blank`
+    /// and `missing` and this pin kept passing against 017. Reading the
+    /// migrated schema itself means the next migration cannot strand it.
     #[test]
     fn is_write_target_admits_exactly_initialized() {
-        const LIFECYCLE_SQL: &str =
-            include_str!("../db/migrations/017_volume_observed_condition.sql");
-        let statuses = [
-            "blank",
-            "initialized",
-            "active",
-            "full",
-            "retired",
-            "missing",
-            "erased",
-            "sealed",
-        ];
+        let statuses = ["initialized", "active", "full", "retired", "erased", "sealed"];
 
-        // Pull the literal set out of `CHECK(status IN (...))` and pin it
-        // against `statuses` by SET EQUALITY, not mere containment -- a
-        // one-directional "does each of my eight appear somewhere in the
-        // file" check would keep passing after a ninth status was added to
-        // the CHECK and never classified here, which is exactly the drift
-        // this pin exists to catch.
-        let marker = "CHECK(status IN (";
-        let start = LIFECYCLE_SQL
-            .find(marker)
-            .expect("017_volume_observed_condition.sql must still define the status CHECK")
-            + marker.len();
-        let end = LIFECYCLE_SQL[start..]
-            .find(')')
-            .expect("the status CHECK must close its IN (...) list")
-            + start;
-        let mut schema_statuses: Vec<&str> = LIFECYCLE_SQL[start..end]
-            .split(',')
-            .map(|s| s.trim().trim_matches('\''))
-            .collect();
-        schema_statuses.sort_unstable();
-        let mut pinned_statuses: Vec<&str> = statuses.to_vec();
+        // The live `CHECK(status IN (...))` set, pinned against `statuses`
+        // by SET EQUALITY, not mere containment -- a one-directional "does
+        // each of mine appear somewhere" check would keep passing after a
+        // new status was added to the CHECK and never classified here,
+        // which is exactly the drift this pin exists to catch.
+        let schema_statuses = crate::db::live_status_check("volumes");
+        let mut pinned_statuses: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
         pinned_statuses.sort_unstable();
         assert_eq!(
             schema_statuses, pinned_statuses,
-            "the `volumes.status` CHECK in db/migrations/017_volume_observed_condition.sql no \
-             longer matches the set `is_write_target_admits_exactly_initialized` \
-             classifies -- a status was added or removed without updating \
-             is_write_target (and this test) to account for it"
+            "the live `volumes.status` CHECK no longer matches the set \
+             `is_write_target_admits_exactly_initialized` classifies -- a status was \
+             added or removed without updating is_write_target (and this test) to \
+             account for it"
         );
 
         for status in statuses {
