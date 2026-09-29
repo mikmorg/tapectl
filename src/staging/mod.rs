@@ -543,6 +543,12 @@ fn stage_create_inner(
     // state; see exclude::dotfile_patterns's doc comment for why).
     let mut dar_exclude_patterns = config.defaults.global_excludes.clone();
     dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&snapshot.source_path))?);
+    // Issue #359 (c): split into dar's two mask kinds, so what dar archives
+    // is exactly what `walk_directory` recorded — a plain pattern is a `-X`
+    // basename mask as before, and a directory pattern (`name/`) becomes the
+    // `-P` prune masks `name` and `*/name`. Handed to `-X` raw, `name/`
+    // matched nothing in dar and the subtree reached tape uncatalogued.
+    let dar_masks = exclude::dar_masks(&dar_exclude_patterns);
 
     let dar_result = dar::create::create_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
@@ -550,8 +556,8 @@ fn stage_create_inner(
         archive_base: &archive_base,
         slice_size: &slice_size,
         compression: &compression,
-        exclude_patterns: &dar_exclude_patterns,
-        exclude_paths: &[],
+        exclude_patterns: &dar_masks.exclude,
+        exclude_paths: &dar_masks.prune,
         preserve_xattrs: resolved.preserve_xattrs,
         preserve_fsa: resolved.preserve_fsa,
     })?;
@@ -1711,16 +1717,26 @@ fn walk_directory(
 
     let base = Path::new(path);
     // Issue #49 items 3+5: global excludes + the unit's own dotfile exclude
-    // patterns, compiled once per walk (not per entry). Directories are
-    // never tested against these (see `exclude::is_excluded`'s doc comment
-    // — this mirrors dar's own `-X`, which cannot exclude directories
-    // either).
+    // patterns, compiled once per walk (not per entry). A plain pattern never
+    // matches a directory (dar's own `-X` rule); a directory pattern
+    // (`name/`, issue #359) prunes the subtree below `name`, which dar
+    // receives as `-P` masks (`exclude::dar_masks`, in `stage_create`).
     let exclude_compiled = exclude::effective_compiled(base, global_excludes)?;
     let mut entries = Vec::new();
     let mut total_size: i64 = 0;
     let mut file_count: i64 = 0;
 
-    for entry in WalkDir::new(base).follow_links(false) {
+    // Issue #359 (c): a directory INSIDE a pruned subtree is neither
+    // recorded nor descended — dar's `-P` + `-D` store the pruned directory
+    // itself, empty, and nothing below it. The pruned directory's own entry
+    // passes (`excludes_dir_entry` keeps it) and its non-directory children
+    // are dropped by `is_excluded` below. `file_type()` here is the lstat
+    // type (`follow_links(false)`), the same fact `is_dir` is below.
+    let walker = WalkDir::new(base)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !(e.file_type().is_dir() && exclude_compiled.excludes_dir_entry(e.path())));
+    for entry in walker {
         let entry = entry.map_err(|e| TapectlError::Other(e.to_string()))?;
         let rel_path = entry
             .path()
@@ -1740,12 +1756,11 @@ fn walk_directory(
 
         // Issue #49: a non-directory entry matching an exclude pattern is
         // dropped before any further work (symlink-target read, manifest
-        // row) — dar will never archive it (once stage_create's -X masks
-        // include this same pattern, see the dar_exclude_patterns merge
-        // above in stage_create), so the manifest/files table must not
-        // record it either. Checked before the file_type classification
-        // below so an excluded entry costs nothing beyond the basename
-        // match.
+        // row) — dar will never archive it (`stage_create` hands dar the
+        // same patterns, as `-X` and `-P` masks via `exclude::dar_masks`),
+        // so the manifest/files table must not record it either. Checked
+        // before the file_type classification below so an excluded entry
+        // costs nothing beyond the pattern match.
         if !is_dir && exclude::is_excluded(entry.path(), &exclude_compiled) {
             continue;
         }
@@ -3858,6 +3873,89 @@ mod tests {
             dar_command.contains("Thumbs.db"),
             "config.defaults.global_excludes must still reach dar, got: {dar_command}"
         );
+    }
+
+    /// Issue #359 (c): a directory pattern (`name/`) keeps the subtree out
+    /// of the DAR ARCHIVE, not only out of the manifest, the `files` table
+    /// and the dirty scan. Before, `stage_create` handed dar every pattern
+    /// as a raw `-X` basename mask and no `-P` prune, so `.cache/` matched
+    /// nothing in dar and the cache's bytes were archived, encrypted and
+    /// written to tape while the catalog said they were not there.
+    ///
+    /// The archive is read back through the isolated catalog dar extracted
+    /// from it (`stage_sets.catalog_path` — the plaintext slices are gone
+    /// once encrypted): `dar -l` lists every entry the archive holds. The
+    /// pruned directory itself stays, empty (`-D`), in the archive and in
+    /// the manifest alike; a directory INSIDE it is in neither.
+    #[test]
+    fn a_directory_exclude_keeps_the_subtree_out_of_the_dar_archive() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) =
+            setup_unit_with_excludes(&tmp, vec![".cache/".to_string()]);
+        fs::write(src.join("keep.txt"), b"kept content").unwrap();
+        fs::create_dir_all(src.join(".cache/deepdir")).unwrap();
+        fs::write(src.join(".cache/cached-top.bin"), b"cache bytes").unwrap();
+        fs::write(src.join(".cache/deepdir/cached-deep.bin"), b"deeper").unwrap();
+        fs::create_dir_all(src.join("sub/.cache")).unwrap();
+        fs::write(src.join("sub/.cache/cached-nested.bin"), b"nested").unwrap();
+        fs::write(src.join("sub/kept-nested.txt"), b"kept too").unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
+
+        let catalog: String = conn
+            .query_row(
+                "SELECT catalog_path FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let out = std::process::Command::new("dar")
+            .arg("-l")
+            .arg(&catalog)
+            .arg("-Q")
+            .output()
+            .expect("dar must be on PATH (tests/test_dependencies.rs)");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        // Positive control: the listing is real and holds what was kept.
+        for kept in ["keep.txt", "kept-nested.txt", ".cache"] {
+            assert!(listing.contains(kept), "{kept} must be archived: {listing}");
+        }
+        for pruned in [
+            "cached-top.bin",
+            "cached-deep.bin",
+            "cached-nested.bin",
+            "deepdir",
+        ] {
+            assert!(
+                !listing.contains(pruned),
+                "`.cache/` must keep {pruned} out of the archive: {listing}"
+            );
+        }
+
+        // The manifest agrees with the archive, directories included.
+        let recorded = |path: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = ?2",
+                params![snap_id, path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(recorded(".cache"), 1, "the pruned directory itself is kept");
+        assert_eq!(recorded("sub/.cache"), 1, "at any depth");
+        assert_eq!(
+            recorded(".cache/deepdir"),
+            0,
+            "a directory inside a pruned subtree is not recorded, as dar -D does not store it"
+        );
+        assert_eq!(recorded(".cache/cached-top.bin"), 0);
     }
 
     #[test]

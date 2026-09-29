@@ -10,12 +10,12 @@
 //! from the same effective pattern list (globals + dotfile), and
 //! `collection::sync` matches a collection's own `exclude` here too.
 //!
-//! **NOT YET WIRED (issue #359):** `stage_create` still hands dar every
-//! pattern as a raw `-X` mask and passes no `-P` prune masks, and
-//! `walk_directory` does not yet ask `excludes_dir_entry`. Until both
-//! change, a directory pattern (`name/`) keeps the subtree's files out of
-//! the manifest, the `files` table and the dirty scan, but NOT out of the
-//! dar archive -- it does not keep those bytes off tape.
+//! `stage_create` hands dar these patterns split by [`dar_masks`] (`-X`
+//! for plain patterns, `-P` prunes for directory patterns), and
+//! `walk_directory` prunes with `Excludes::excludes_dir_entry`, so a
+//! directory pattern (`name/`) keeps the subtree out of the dar archive as
+//! well as out of the manifest, the `files` table and the dirty scan
+//! (issue #359).
 //!
 //! ## The one exclude rule (issue #359)
 //!
@@ -42,9 +42,9 @@
 //!  - **A directory pattern** (`name/`, e.g. `.cache/`, `node_modules/`)
 //!    excludes that directory's **whole subtree**, at any depth below the
 //!    walk root: an entry is excluded when any component of its path below
-//!    the root matches `name`. dar must receive it as the prune masks
-//!    `-P name` and `-P */name` (`dar_masks` -- not yet passed by
-//!    `stage_create`, see above): `-P` matches the path relative to `-R`,
+//!    the root matches `name`. dar receives it as the prune masks
+//!    `-P name` and `-P */name` (`dar_masks`, passed by `stage_create`):
+//!    `-P` matches the path relative to `-R`,
 //!    its `*` spans `/`, and `-D` keeps the pruned directory itself as an
 //!    empty directory — so `excludes_dir_entry` keeps that directory's own
 //!    entry and drops only what is inside it. Like `-P`, the rule does not
@@ -215,10 +215,9 @@ impl Excludes {
 /// True if the NON-directory entry `path` is excluded by `set` — see
 /// `Excludes::excludes_file` and the module doc comment. Both walks
 /// (`staging::walk_directory`, `collection::fingerprint::walk_fingerprint`)
-/// call this for every non-directory entry. A directory entry is to be
-/// `Excludes::excludes_dir_entry`'s question once `walk_directory` asks it
-/// (not yet -- see the module doc comment); `walk_fingerprint` skips
-/// directories altogether.
+/// call this for every non-directory entry. A directory entry is
+/// `Excludes::excludes_dir_entry`'s question, which `walk_directory` asks
+/// to prune the walk; `walk_fingerprint` skips directories altogether.
 pub fn is_excluded(path: &Path, set: &Excludes) -> bool {
     set.excludes_file(path)
 }
@@ -609,7 +608,7 @@ mod tests {
         );
     }
 
-    /// The end-to-end parity proof for the masks `stage_create` must hand
+    /// The end-to-end parity proof for the masks `stage_create` hands
     /// dar: an archive made with `dar_masks` holds exactly the regular files
     /// `staging::walk_directory` records under the same patterns. Runs the
     /// real dar (a hard dependency of the ungated suite, issue #43).
