@@ -13,6 +13,24 @@ It answers one question: **which remaining work needs a person, and which does n
 > `scripts/first-run.sh --profile contrib/hosts/home2.profile` from step 1 (`docs/install.md`,
 > "Host profiles"). Items below that say "this VM" are superseded where they conflict.
 
+> **2026-09-29 — the pre-production pass landed** (master `21212a1`; ADR-0012's
+> 2026-09-29 amendment). The documentation pass's 18 issues (#345–#362) are fixed and
+> closed except #360 (a CTO question), with the File 0 `tr` fix (#349's neighbour) and
+> the `tar` check in RESTORE.sh. Verified together: 2214 tests, the mhvtl gate GREEN
+> **40/40** (new: `empty_drive_refused`), `lifecycle-suite --all` GREEN (399 passed,
+> 13 structural skips), `first-run.sh` end to end on mhvtl, migration 026 on a real
+> populated catalog. Residual non-blocking items: #363. What changes on home2:
+> 1. **Back up the catalog with the binary you have, before pulling** — the new binary
+>    applies migration 026 on its first run:
+>    `sudo -u tapectl -H tapectl db backup --to /srv/local_backup/tapectl/pre-026.db`
+> 2. `git pull`, then `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 3 --to 4`.
+>    Step 0 offers to rename `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only`
+>    to `min_copies`/`min_locations` in place — answer y (the new binary refuses the old names).
+> 3. `… --from 12 --to 12` — the rehearsal again (a new binary is a new artifact; it erases
+>    EW7VWMVKF6).
+> 4. `… --from 13` — the first production tape. `volume verify` now exits 2 only when the
+>    medium is proven bad and 3 when inconclusive.
+
 ## The state, in one paragraph
 
 Every pre-production gate the CTO set is met. The `review-2026-09-13` queue is empty
