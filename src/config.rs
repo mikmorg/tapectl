@@ -40,7 +40,7 @@ pub fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> Result<()>
         .open(path)?;
     file.write_all(contents)?;
     // `.mode()` on `OpenOptions` only applies when `O_CREAT` actually
-    // creates a new inode. If `path` already existed (e.g. a receipt
+    // creates a new inode. If `path` already existed (e.g. a stage report
     // regenerated on a re-run), `open()` reuses the existing inode and its
     // existing permission bits survive untouched — so force the mode
     // explicitly too, otherwise a stale, looser mode from a prior run can
@@ -1698,9 +1698,16 @@ pub struct TapectlPaths {
     pub db_file: PathBuf,
     pub keys_dir: PathBuf,
     pub catalogs_dir: PathBuf,
-    pub receipts_dir: PathBuf,
+    /// The per-stage-set text reports `stage create` writes (slice sizes
+    /// and hashes). Not "receipts": that word means the recipient list a
+    /// stage set was encrypted to (CONTEXT.md, issue #361).
+    pub stage_reports_dir: PathBuf,
     pub logs_dir: PathBuf,
 }
+
+/// The directory stage reports lived in before issue #361, moved to
+/// [`TapectlPaths::stage_reports_dir`] once by [`TapectlPaths::ensure_dirs`].
+const LEGACY_STAGE_REPORTS_DIR: &str = "receipts";
 
 impl TapectlPaths {
     pub fn new(home: PathBuf) -> Self {
@@ -1709,7 +1716,7 @@ impl TapectlPaths {
             db_file: home.join("tapectl.db"),
             keys_dir: home.join("keys"),
             catalogs_dir: home.join("catalogs"),
-            receipts_dir: home.join("receipts"),
+            stage_reports_dir: home.join("stage-reports"),
             logs_dir: home.join("logs"),
             home,
         }
@@ -1729,7 +1736,7 @@ impl TapectlPaths {
     /// (freshly created or pre-existing) to 0700.
     ///
     /// Issue #41: `~/.tapectl` holds the plaintext content-metadata index
-    /// (`tapectl.db`, receipts, dar catalogs) the on-tape format works hard
+    /// (`tapectl.db`, stage reports, dar catalogs) the on-tape format works hard
     /// to keep out of plaintext — leaving the directory tree at whatever
     /// the process umask hands out (0755 on a stock single-user box)
     /// contradicts that. Tightening runs every call, not just on first
@@ -1739,17 +1746,48 @@ impl TapectlPaths {
     /// does not own (e.g. a shared multi-user box) only logs a warning
     /// rather than aborting an otherwise-fine command.
     pub fn ensure_dirs(&self) -> Result<()> {
+        // Before the create loop, or it would create an empty
+        // stage-reports/ first and the "both exist" rule below would then
+        // block the move for good.
+        self.move_legacy_stage_reports_dir();
         for dir in [
             &self.home,
             &self.keys_dir,
             &self.catalogs_dir,
-            &self.receipts_dir,
+            &self.stage_reports_dir,
             &self.logs_dir,
         ] {
             std::fs::create_dir_all(dir)?;
             secure_path(dir, 0o700);
         }
         Ok(())
+    }
+
+    /// Issue #361: a home created before the rename keeps its stage
+    /// reports in `<home>/receipts/`. Move that directory to
+    /// `stage_reports_dir` once — only when the new one does not exist yet.
+    /// When both exist, both are left exactly as they are (nothing is
+    /// merged) and new reports go to `stage-reports/`.
+    ///
+    /// Never fails the caller, like the rest of `ensure_dirs`: a rename
+    /// that cannot happen (permissions, a read-only home) is a warning, and
+    /// the create loop then makes an empty `stage-reports/` beside the old
+    /// directory — the same "both exist" state an operator can resolve by
+    /// hand.
+    fn move_legacy_stage_reports_dir(&self) {
+        let legacy = self.home.join(LEGACY_STAGE_REPORTS_DIR);
+        if !legacy.is_dir() || self.stage_reports_dir.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::rename(&legacy, &self.stage_reports_dir) {
+            tracing::warn!(
+                from = %legacy.display(),
+                to = %self.stage_reports_dir.display(),
+                error = %e,
+                "could not move the stage-report directory to its new name; \
+                 new stage reports go to the new directory, the old ones stay where they are"
+            );
+        }
     }
 
     /// Check if tapectl has been initialized (DB exists).
@@ -1763,7 +1801,7 @@ mod tests {
     //! Issue #41: `~/.tapectl` was created with no explicit mode anywhere,
     //! so it ends up whatever the process umask hands out — on a stock
     //! single-user box (umask 022) that's 0755 dirs / 0644 files, which
-    //! leaves the plaintext content-metadata index (tapectl.db, receipts,
+    //! leaves the plaintext content-metadata index (tapectl.db, stage reports,
     //! dar catalogs) world-readable. These tests assert actual mode bits,
     //! never "does it not error", since that's exactly the class of test
     //! that would pass whether or not the fix is present.
@@ -1784,7 +1822,7 @@ mod tests {
             ("home", &paths.home),
             ("keys_dir", &paths.keys_dir),
             ("catalogs_dir", &paths.catalogs_dir),
-            ("receipts_dir", &paths.receipts_dir),
+            ("stage_reports_dir", &paths.stage_reports_dir),
             ("logs_dir", &paths.logs_dir),
         ]
     }
@@ -1852,6 +1890,68 @@ mod tests {
             mode_of(&home),
             0o700,
             "a pre-existing 0755 home dir must be tightened to 0700"
+        );
+    }
+
+    // --- receipts/ -> stage-reports/ (issue #361) ---------------------------
+    //
+    // "Receipt" means the recipient list a stage set was encrypted to
+    // (CONTEXT.md); the per-stage-set text files are stage reports, in
+    // <home>/stage-reports/. An existing home's <home>/receipts/ is moved
+    // there once, by `ensure_dirs` (every initialized command runs it).
+
+    #[test]
+    fn ensure_dirs_creates_stage_reports_not_receipts() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join(".tapectl");
+        TapectlPaths::new(home.clone()).ensure_dirs().unwrap();
+        assert!(home.join("stage-reports").is_dir());
+        assert!(!home.join("receipts").exists());
+    }
+
+    #[test]
+    fn ensure_dirs_moves_a_legacy_receipts_dir_to_stage_reports_once() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join(".tapectl");
+        let legacy = home.join("receipts");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("20260901_7.txt"), b"old report").unwrap();
+
+        let paths = TapectlPaths::new(home.clone());
+        paths.ensure_dirs().unwrap();
+
+        let moved = home.join("stage-reports").join("20260901_7.txt");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"old report");
+        assert!(
+            !legacy.exists(),
+            "the legacy directory was moved, not copied"
+        );
+        assert_eq!(mode_of(&home.join("stage-reports")), 0o700);
+
+        // Idempotent: a second run finds nothing to move and changes nothing.
+        paths.ensure_dirs().unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"old report");
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn ensure_dirs_leaves_both_when_stage_reports_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join(".tapectl");
+        let legacy = home.join("receipts");
+        let current = home.join("stage-reports");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(legacy.join("old.txt"), b"old").unwrap();
+        std::fs::write(current.join("new.txt"), b"new").unwrap();
+
+        TapectlPaths::new(home.clone()).ensure_dirs().unwrap();
+
+        assert_eq!(std::fs::read(legacy.join("old.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(current.join("new.txt")).unwrap(), b"new");
+        assert!(
+            !current.join("old.txt").exists(),
+            "nothing is merged when both exist"
         );
     }
 

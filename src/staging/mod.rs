@@ -765,10 +765,10 @@ fn stage_create_inner(
 
     tx.commit()?;
 
-    // Receipt writing is filesystem work and must not sit inside a DB
+    // The stage report is filesystem work and must not sit inside a DB
     // transaction — done here, after commit, along with the creation event.
-    let receipt = generate_receipt(conn, stage_set_id, &unit, &snapshot, &tenant)?;
-    let _receipt_path = write_stage_receipt(paths, stage_set_id, &receipt)?;
+    let report = generate_stage_report(conn, stage_set_id, &unit, &snapshot, &tenant)?;
+    let _report_path = write_stage_report(paths, stage_set_id, &report)?;
 
     events::log_created(
         conn,
@@ -918,24 +918,26 @@ fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i6
     );
 }
 
-/// Write a stage receipt to `paths.receipts_dir` (creating it if needed)
-/// and return the path written.
+/// Write a stage report to `paths.stage_reports_dir` (creating it if
+/// needed) and return the path written. Called a "receipt" until issue
+/// #361 — that word now means only the recipient list a stage set was
+/// encrypted to (CONTEXT.md).
 ///
-/// Issue #41: receipts hold the same plaintext content-metadata index
+/// Issue #41: stage reports hold the same plaintext content-metadata index
 /// `tapectl.db` does (unit/tenant names, paths, sizes, checksums) — they
 /// get `write_private_file`'s 0600-from-creation treatment instead of a
 /// plain `fs::write` at whatever mode the process umask hands out.
 /// Factored out of `stage_create` so it's testable without a real dar
 /// binary or a full stage pipeline.
-fn write_stage_receipt(paths: &TapectlPaths, stage_set_id: i64, receipt: &str) -> Result<PathBuf> {
-    let receipt_path = paths.receipts_dir.join(format!(
+fn write_stage_report(paths: &TapectlPaths, stage_set_id: i64, report: &str) -> Result<PathBuf> {
+    let report_path = paths.stage_reports_dir.join(format!(
         "{}_{}.txt",
         chrono::Utc::now().format("%Y%m%d"),
         stage_set_id
     ));
-    fs::create_dir_all(&paths.receipts_dir)?;
-    crate::config::write_private_file(&receipt_path, receipt.as_bytes(), 0o600)?;
-    Ok(receipt_path)
+    fs::create_dir_all(&paths.stage_reports_dir)?;
+    crate::config::write_private_file(&report_path, report.as_bytes(), 0o600)?;
+    Ok(report_path)
 }
 
 /// Best-effort tighten every regular file dar's `-C` catalog extraction
@@ -944,7 +946,7 @@ fn write_stage_receipt(paths: &TapectlPaths, stage_set_id: i64, receipt: &str) -
 /// dar writes these itself via subprocess, so unlike `write_private_file`
 /// there's no `open()` call under our control to set the mode at creation
 /// time — this tightens what dar produced after the fact instead. Same
-/// content-metadata exposure as issue #41's `tapectl.db`/receipts, just
+/// content-metadata exposure as issue #41's `tapectl.db`/stage reports, just
 /// produced by an external process. Non-fatal by design (`secure_path`):
 /// a directory listing failure here must not sink an otherwise-successful
 /// stage.
@@ -1603,7 +1605,7 @@ fn backfill_checksums(
     Ok(())
 }
 
-fn generate_receipt(
+fn generate_stage_report(
     conn: &Connection,
     stage_set_id: i64,
     unit: &models::Unit,
@@ -1627,26 +1629,26 @@ fn generate_receipt(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    let mut receipt = String::new();
-    receipt.push_str("tapectl staging receipt\n");
-    receipt.push_str("======================\n\n");
-    receipt.push_str(&format!("Unit:     {} ({})\n", unit.name, unit.uuid));
-    receipt.push_str(&format!("Tenant:   {}\n", tenant.name));
-    receipt.push_str(&format!("Snapshot: v{}\n", snapshot.version));
-    receipt.push_str(&format!("Stage:    {stage_set_id}\n"));
-    receipt.push_str(&format!(
+    let mut report = String::new();
+    report.push_str("tapectl stage report\n");
+    report.push_str("====================\n\n");
+    report.push_str(&format!("Unit:     {} ({})\n", unit.name, unit.uuid));
+    report.push_str(&format!("Tenant:   {}\n", tenant.name));
+    report.push_str(&format!("Snapshot: v{}\n", snapshot.version));
+    report.push_str(&format!("Stage:    {stage_set_id}\n"));
+    report.push_str(&format!(
         "Date:     {}\n\n",
         chrono::Utc::now().to_rfc3339()
     ));
-    receipt.push_str("Slices:\n");
+    report.push_str("Slices:\n");
 
     for (num, plain, enc, hash_p, hash_e) in &slices {
-        receipt.push_str(&format!(
+        report.push_str(&format!(
             "  #{num}: {plain} bytes -> {enc} bytes\n    plain:     {hash_p}\n    encrypted: {hash_e}\n",
         ));
     }
 
-    Ok(receipt)
+    Ok(report)
 }
 
 /// Parse an operator-facing size string (e.g. `"10G"`, `"500M"`, or a bare
@@ -4582,7 +4584,7 @@ mod tests {
         );
     }
 
-    /// Issue #41: `write_stage_receipt` and `secure_catalog_files` tested
+    /// Issue #41: `write_stage_report` and `secure_catalog_files` tested
     /// directly and hermetically — no dar binary, no full `stage_create`
     /// pipeline — per the same reasoning `crypto::keys`'s tests already
     /// apply to secret keys: a permission bug belongs to the function that
@@ -4603,28 +4605,33 @@ mod tests {
         }
 
         #[test]
-        fn write_stage_receipt_creates_file_at_0600() {
+        fn write_stage_report_creates_file_at_0600() {
             let tmp = TempDir::new().unwrap();
             let paths = test_paths(&tmp);
 
-            let path = write_stage_receipt(&paths, 42, "receipt body\n").unwrap();
+            let path = write_stage_report(&paths, 42, "report body\n").unwrap();
 
             assert!(path.exists());
-            assert_eq!(fs::read_to_string(&path).unwrap(), "receipt body\n");
-            assert_eq!(mode_of(&path), 0o600, "receipt should be 0600");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "report body\n");
+            assert_eq!(mode_of(&path), 0o600, "stage report should be 0600");
         }
 
         #[test]
-        fn write_stage_receipt_creates_receipts_dir_if_missing() {
+        fn write_stage_report_creates_stage_reports_dir_if_missing() {
             let tmp = TempDir::new().unwrap();
             // Deliberately do NOT call ensure_dirs — this exercises
-            // write_stage_receipt's own fs::create_dir_all.
+            // write_stage_report's own fs::create_dir_all.
             let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
-            assert!(!paths.receipts_dir.exists());
+            assert!(!paths.stage_reports_dir.exists());
 
-            let path = write_stage_receipt(&paths, 7, "body").unwrap();
+            let path = write_stage_report(&paths, 7, "body").unwrap();
 
             assert!(path.exists());
+            // Issue #361: under <home>/stage-reports/, not <home>/receipts/.
+            assert_eq!(
+                path.parent().unwrap(),
+                tmp.path().join(".tapectl").join("stage-reports")
+            );
             assert_eq!(mode_of(&path), 0o600);
         }
 

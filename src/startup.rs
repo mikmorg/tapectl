@@ -244,7 +244,7 @@ fn empty_path_error(flag: &str) -> TapectlError {
 pub fn ambiguous_config_notice(home: &Path) -> String {
     format!(
         "warning: --config given without --home: the tapectl home (database, keys, \
-         catalogs, receipts) is being taken from the config file's parent directory. \
+         catalogs, stage reports) is being taken from the config file's parent directory. \
          Pass --home to say that explicitly. home={}",
         home.display()
     )

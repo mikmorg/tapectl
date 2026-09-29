@@ -53,7 +53,8 @@ pub struct Cli {
     /// Path to config file.
     ///
     /// NOTE: on its own this ALSO relocates the whole tapectl home to the
-    /// config file's parent directory — database, keys, staging, receipts.
+    /// config file's parent directory — database, keys, staging, stage
+    /// reports.
     /// That is how every test harness gets an isolated home, so it still
     /// works, but it is surprising enough that it now warns. Use --home
     /// when you mean "operate on a different archive", and --config only
@@ -61,7 +62,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// tapectl home directory: database, keys, catalogs, receipts, logs.
+    /// tapectl home directory: database, keys, catalogs, stage-reports, logs.
     ///
     /// Defaults to ~/.tapectl. The config file is taken from
     /// <home>/config.toml unless --config overrides it. Also settable as
