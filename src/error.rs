@@ -22,16 +22,19 @@ pub const EXIT_ERROR: i32 = 2;
 /// exited 2, and a script — the systemd timers' health ping, `first-run.sh`
 /// step 13 — could tell them apart only by parsing `--json`. Now 2 is
 /// reachable from `volume verify` ONLY through a quarantine; every other
-/// failure is [`EXIT_VERIFY_INCONCLUSIVE`].
+/// failure is [`EXIT_VERIFY_INCONCLUSIVE`] — every error the command
+/// returns, and a command line that does not parse, whose usage error clap
+/// would otherwise exit 2 with (`main`'s `parse_error_exit_code`).
 pub const EXIT_VERIFY_MEDIUM_BAD: i32 = 2;
 
 /// `volume verify`: INCONCLUSIVE — the verify reached no verdict about the
 /// medium and the volume is untouched. A drive or transport failure (a read
 /// error, a short read, an unreadable front index), a refusal before the
 /// tape was read (no cartridge loaded, the wrong tape, a drive that cannot
-/// read this generation, an unknown label, `--dry-run`), or any other error
-/// the command stopped on. The remedy is the drive, the cartridge in it, or
-/// the command line — then verify again. Issue #356.
+/// read this generation, an unknown label, `--dry-run`), a command line
+/// that does not parse (a missing label, a mistyped flag), or any other
+/// error the command stopped on. The remedy is the drive, the cartridge in
+/// it, or the command line — then verify again. Issue #356.
 pub const EXIT_VERIFY_INCONCLUSIVE: i32 = 3;
 
 #[derive(Error, Debug)]

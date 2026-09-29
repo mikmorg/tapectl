@@ -157,8 +157,9 @@ pub enum VolumeCommands {
     /// THE MEDIUM BAD: the volume is quarantined and no longer counts as a
     /// copy — write its content to another cartridge. 3 = inconclusive: a
     /// drive or transport failure, or an error before any verdict (no
-    /// cartridge loaded, the wrong tape, an unknown label); the volume is
-    /// untouched — check the drive and verify again.
+    /// cartridge loaded, the wrong tape, an unknown label, a mistyped
+    /// command line); the volume is untouched — check the drive and verify
+    /// again.
     Verify {
         /// Volume label
         label: String,
@@ -1948,7 +1949,8 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
 /// Decided from the parsed command, before it runs, so that `main` maps
 /// every error the invocation can return — including the ones raised
 /// before this module is reached (the database, the config) — and not only
-/// those from the verify itself.
+/// those from the verify itself. A verify command line that does not parse
+/// never gets this far; `main`'s `parse_error_exit_code` gives it 3 too.
 pub fn error_exit_code(command: &VolumeCommands) -> i32 {
     match command {
         VolumeCommands::Verify { .. } => crate::error::EXIT_VERIFY_INCONCLUSIVE,

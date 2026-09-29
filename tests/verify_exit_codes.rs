@@ -11,9 +11,9 @@
 //! evidence exits 3 — is unit-tested beside `verify_exit_code` in
 //! `src/cli/volume.rs`, on the same `quarantine` field the message and
 //! `--json` read. What only the binary can show is the ERROR half: `main`
-//! maps every error of a `volume verify` invocation to 3 and leaves every
-//! other command's errors at 2. No tape is touched: the drive paths here do
-//! not exist.
+//! maps every error of a `volume verify` invocation to 3 — a command line
+//! that does not parse included — and leaves every other command's errors
+//! at 2. No tape is touched: the drive paths here do not exist.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -138,4 +138,82 @@ fn a_refused_dry_run_verify_exits_3() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A `volume verify` command line that does not PARSE is not a finding about
+/// any medium either. Until the review of #356 caught it, clap's own exit
+/// code for a usage error — 2 — leaked through, so a script with a missing
+/// label or a mistyped flag got the code that now means "retire this
+/// cartridge". Every shape of parse failure clap reports for a verify is
+/// covered: a missing required argument, an unknown flag, a flag missing its
+/// value, a conflict, an extra positional, and a global flag before the
+/// subcommand (the lenient reparse must still find `volume verify` behind
+/// it). No home is needed: the parse fails before one is touched.
+#[test]
+fn a_verify_command_line_that_does_not_parse_exits_3() {
+    let home = TempDir::new().unwrap();
+    for (args, says) in [
+        (
+            &["volume", "verify"][..],
+            "required arguments were not provided",
+        ),
+        (
+            &["volume", "verify", "L6-X", "--bogus"][..],
+            "unexpected argument",
+        ),
+        (
+            &["volume", "verify", "L6-X", "--device"][..],
+            "a value is required",
+        ),
+        (
+            &["volume", "verify", "L6-X", "--full", "--quick"][..],
+            "cannot be used with",
+        ),
+        (
+            &["volume", "verify", "L6-X", "L6-Y"][..],
+            "unexpected argument",
+        ),
+        (&["--json", "volume", "verify"][..], "required arguments"),
+        (
+            &["--home", "/nonexistent/h", "volume", "verify", "--bogus"][..],
+            "unexpected argument",
+        ),
+    ] {
+        let out = tapectl(home.path(), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(says),
+            "{args:?}: clap's own message is printed unchanged: {stderr}"
+        );
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {stderr}");
+    }
+}
+
+/// The mapping is for `volume verify` only: `--help` stays 0, and a usage
+/// error on any other command — a sibling volume subcommand, the `volume`
+/// group itself, the top level — keeps clap's 2. This is the positive
+/// control for the test above: without it, a blanket "usage errors exit 3"
+/// would pass that test too.
+#[test]
+fn only_verify_usage_errors_exit_3_and_help_still_exits_0() {
+    let home = TempDir::new().unwrap();
+    let out = tapectl(home.path(), &["volume", "verify", "--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Exit status"));
+
+    for args in [
+        &["volume", "info"][..],
+        &["volume", "identify", "--bogus"][..],
+        &["volume", "--bogus"][..],
+        &["volume", "verfy", "L6-X"][..],
+        &["--bogus"][..],
+    ] {
+        let out = tapectl(home.path(), args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

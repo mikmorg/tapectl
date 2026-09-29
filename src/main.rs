@@ -1,13 +1,26 @@
 use tapectl::{cli, config, db, error, signal, startup, tenant};
 
+use std::ffi::OsString;
+
 use anyhow::{bail, Context};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use cli::{Cli, Commands, ConfigCommands};
 use config::{Config, TapectlPaths};
 
 fn main() {
-    let cli = Cli::parse();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Exactly `clap::Error::exit`, with the code decided here: it
+            // prints the message unchanged (help and version to stdout, a
+            // usage error to stderr) and exits.
+            let code = parse_error_exit_code(&err, &args);
+            let _ = err.print();
+            std::process::exit(code);
+        }
+    };
 
     // Issue #172: peek `[logging]` before installing the subscriber, so
     // `logging.level`/`logging.format` actually govern it instead of only
@@ -52,7 +65,9 @@ fn main() {
     // Decided before `run` consumes `cli` (issue #356): `volume verify`'s
     // exit contract reserves 2 for "the medium is proven bad", so every
     // error that invocation returns — its own, or the database's or the
-    // config's before it ever ran — exits 3, "inconclusive", instead.
+    // config's before it ever ran — exits 3, "inconclusive", instead. (A
+    // verify whose command line did not parse already exited 3 above, in
+    // `parse_error_exit_code`.)
     let error_code = error_exit_code(&cli.command);
     if let Err(err) = run(cli) {
         error::exit_with_error_code(&err, error_code);
@@ -66,6 +81,46 @@ fn error_exit_code(command: &Commands) -> i32 {
         Commands::Volume { command } => cli::volume::error_exit_code(command),
         _ => error::EXIT_ERROR,
     }
+}
+
+/// The exit code for a command line that did not parse (issue #356).
+///
+/// clap's own is 0 for `--help`/`--version` and 2 for a usage error, and 2
+/// is what `volume verify` now reserves for "the medium is proven bad, the
+/// volume is quarantined". A verify whose command line is wrong — a missing
+/// label, a mistyped flag — has read nothing and proved nothing, so it exits
+/// [`error::EXIT_VERIFY_INCONCLUSIVE`], exactly as every other error of a
+/// verify invocation does ([`error_exit_code`]). Every other command keeps
+/// clap's code, and help keeps 0.
+///
+/// A failed parse leaves no [`Cli`] to ask which command it was, so the
+/// same arguments are parsed again leniently (`ignore_errors`), which keeps
+/// the subcommand chain clap had matched before it hit the error. Scanning
+/// argv by hand instead would have to know which global flags take a value
+/// (`--home X volume verify`); the lenient parse knows because it IS the
+/// definition. If even that cannot place the invocation under `volume
+/// verify` — `volume verfy`, say — clap's code stands.
+fn parse_error_exit_code(err: &clap::Error, args: &[OsString]) -> i32 {
+    if err.use_stderr() && is_volume_verify_invocation(args) {
+        error::EXIT_VERIFY_INCONCLUSIVE
+    } else {
+        err.exit_code()
+    }
+}
+
+/// Whether `args` (argv, program name first) names `volume verify`, whether
+/// or not the rest of it parses.
+fn is_volume_verify_invocation(args: &[OsString]) -> bool {
+    let Ok(matches) = Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(args)
+    else {
+        return false;
+    };
+    matches!(
+        matches.subcommand(),
+        Some(("volume", volume)) if volume.subcommand_name() == Some("verify")
+    )
 }
 
 /// Install the global tracing subscriber (issue #45/H10 — closes the "no
