@@ -4219,7 +4219,7 @@ mod tests {
     fn mark_tape_only_refuses_a_never_archived_unit_even_with_zero_min_copies() {
         // The copy-count check catches a never-archived unit only
         // INCIDENTALLY: zero completed writes fails `copy_count <
-        // min_copies` at the default of 2. But min_copies_for_tape_only is
+        // min_copies` at the default of 2. But defaults.min_copies is
         // operator-configurable, and at 0 that comparison passes vacuously
         // (0 < 0 is false) — which is exactly what
         // `config_with_zero_tape_only_thresholds` sets up. Without an
@@ -5543,8 +5543,8 @@ mod tests {
             (conn, unit_id)
         }
 
-        /// `min_copies_for_tape_only` at its default (2);
-        /// `min_locations_for_tape_only` zeroed to isolate the copy-count
+        /// `defaults.min_copies` at its default (2);
+        /// `defaults.min_locations` zeroed to isolate the copy-count
         /// gate from the location-count gate — neither volume above sets
         /// `location_id`, so without this override `location_count` would
         /// also read 0 and every refusal below would be "insufficient

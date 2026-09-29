@@ -2392,7 +2392,7 @@ mod tests {
             (conn, unit_id)
         }
 
-        /// A `Config` with `min_copies_for_tape_only` zeroed out, so the
+        /// A `Config` with `defaults.min_copies` zeroed out, so the
         /// `copy_count` check (min_copies default 2) never fires in these
         /// fixtures, which intentionally have 0 or 1 eligible (`sealed`)
         /// copies. Without this, `copy_count`'s violation/warning noise

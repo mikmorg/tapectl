@@ -846,8 +846,9 @@ except Exception: pass' 2>/dev/null || true) "
     if as_svc grep -qE "^name *= *\"$CNAME\"" "$CFG"; then
       ok "collection $CNAME is already in config.toml"
     else
-      # init writes `collections = []`; a [[collections]] table beside it is a
-      # duplicate key and the config stops loading, so the empty one goes first.
+      # init no longer writes `collections = []` (issue #345), but a config
+      # written by an older init still carries it, and a [[collections]] table
+      # beside it is a duplicate key — so an empty one goes first if present.
       as_svc sed -i '/^collections *= *\[\] *$/d' "$CFG"
       printf '\n[[collections]]\nname       = "%s"\nroot       = "%s"\ntenant     = "%s"\nunit_depth = %s\n' \
         "$CNAME" "$CROOT" "$CTEN" "$CDEPTH" | as_svc tee -a "$CFG" >/dev/null
@@ -909,7 +910,7 @@ done
 run tc tenant list || true
 run tc unit list || true
 explain <<'EOF'
-Folder-per-unit alternative. `init` writes `collections = []` near the top of config.toml; DELETE that line first (a `[[collections]]` table beside it is a duplicate key and the config stops loading — `config check` says so). Then add, and run `tapectl collection sync`:
+Folder-per-unit alternative. Add a `[[collections]]` table to config.toml (a config written by an older init may carry `collections = []` near the top — delete that line first, or the file stops loading with a duplicate key; `config check` says so), then run `tapectl collection sync`:
 
   [[collections]]
   name       = "alice-photos"       # unit names become "alice-photos/<folder>"

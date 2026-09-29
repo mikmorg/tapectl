@@ -447,7 +447,7 @@ pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<F
     //
     // That matters because both commands answer one question — "is this unit
     // under-covered?" — and before this they could DISAGREE: `audit` resolved
-    // per unit while fire-risk applied `defaults.min_copies_for_tape_only` to
+    // per unit while fire-risk applied `defaults.min_copies` (then named `min_copies_for_tape_only`) to
     // everything. The one an operator glances at was the wrong one.
     //
     // The old `OR copies = 0` is gone with it. Once the threshold is a real
@@ -2904,7 +2904,7 @@ mod tests {
 
         /// Issue #106, the defect itself: an archive set demanding MORE
         /// copies than the global default must put the unit at risk. Before
-        /// this, fire-risk applied `defaults.min_copies_for_tape_only` to
+        /// this, fire-risk applied `defaults.min_copies` (then named `min_copies_for_tape_only`) to
         /// every unit while `audit` resolved per unit — so the two commands
         /// answered the same question differently, and the one an operator
         /// glances at was the wrong one.
