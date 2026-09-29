@@ -424,9 +424,14 @@ pub enum CoverageScope<'a> {
         id_expr: &'a str,
         current_only: bool,
     },
-    /// One specific snapshot's coverage, by `stage_sets.snapshot_id`.
-    /// `snapshot mark-reclaimable` is the only caller: it measures the
-    /// SUPERSEDING snapshot, not the unit as a whole.
+    /// One specific snapshot's coverage, by `stage_sets.snapshot_id` — one
+    /// version's copies (ADR-0012: a copy is identical content, counted
+    /// per version), not the unit as a whole. It is the building block of
+    /// every per-version question: the MIN that [`CoverageScope::Unit`]
+    /// takes across current versions, [`missing_required_locations`],
+    /// [`versions_at_stake`], `snapshot mark-reclaimable` (the SUPERSEDING
+    /// snapshot), `report pending`/`report summary` (a stage set's own
+    /// version) and `unit mark-tape-only`'s thinnest-version line.
     Snapshot { id_expr: &'a str },
 }
 
