@@ -717,10 +717,7 @@ fn distinct_names(required: &[String]) -> Vec<&String> {
 }
 
 /// The names in `wanted` not in `present`, in `wanted`'s order.
-fn absent_from(
-    wanted: Vec<&String>,
-    present: &std::collections::HashSet<String>,
-) -> Vec<String> {
+fn absent_from(wanted: Vec<&String>, present: &std::collections::HashSet<String>) -> Vec<String> {
     wanted
         .into_iter()
         .filter(|name| !present.contains(name.as_str()))

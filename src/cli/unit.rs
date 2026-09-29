@@ -1088,8 +1088,7 @@ mod mark_tape_only_consent_tests {
     /// against a `[defaults] min_copies` of 3 — below policy, not dirty and
     /// not never-archived, so only the Tier-2 copy shortfall can stop it.
     fn below_policy() -> (Connection, TempDir, TapectlPaths, Config) {
-        let (conn, _unit, _vol) =
-            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        let (conn, _unit, _vol) = crate::policy::coverage::tests::setup_unit_with_deposit("active");
         let tmp = TempDir::new().unwrap();
         let paths = TapectlPaths::new(tmp.path().join("home"));
         let mut config = Config::default();

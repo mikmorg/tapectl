@@ -709,7 +709,13 @@ pub(crate) mod tests {
     #[test]
     fn required_locations_are_checked_by_name_not_by_count() {
         let (conn, _unit) = setup("sup-named", 2, "sealed", "active");
-        let unit = place_and_require(&conn, "sup-named", "home", "garage", r#"["home","offsite"]"#);
+        let unit = place_and_require(
+            &conn,
+            "sup-named",
+            "home",
+            "garage",
+            r#"["home","offsite"]"#,
+        );
         match assess(&conn, &Config::default(), &unit, 1).unwrap() {
             ReclaimVerdict::Blocked {
                 superseding_version,

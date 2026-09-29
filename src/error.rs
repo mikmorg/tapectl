@@ -318,10 +318,7 @@ mod tests {
     #[test]
     fn an_io_error_reaches_the_operator_once() {
         let err: TapectlError = std::io::Error::from_raw_os_error(13).into();
-        assert_eq!(
-            as_operator_sees_it(err),
-            "Permission denied (os error 13)"
-        );
+        assert_eq!(as_operator_sees_it(err), "Permission denied (os error 13)");
     }
 
     /// The same for an io error carrying its own message (what
