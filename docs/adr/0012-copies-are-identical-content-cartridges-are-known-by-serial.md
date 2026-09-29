@@ -943,3 +943,42 @@ recorded in `contrib/hosts/home2.profile` and `contrib/hosts/home2-prep.sh`.*
 8. **Cartridges carry no barcode stickers yet.** Each is known by its chip serial, which
    `volume init` records as its placeholder barcode (as ruled on 2026-09-14);
    `cartridge relabel` applies the sticker later.
+
+## Amendment, 2026-09-29 — the documentation pass's findings, ruled before the first production write
+
+*Ruled by the CTO on 2026-09-28/29, on the issues the documentation pass filed (#345–#362).
+The work is on the `preprod` integration and lands on master together, before home2
+writes L6-0001.*
+
+1. **#349 — RESTORE.sh demands `tar`.** It runs `tar xf -` on an envelope but did not
+   check for it up front. The prerequisite loop gains `tar`, File 1's tool list names it,
+   and `tests/on_tape_golden.rs` is re-pinned a second time under this ruling — the test
+   proves only that one line moved. The same reasoning as the first re-pin applies: before
+   the first production tape is the cheapest moment the change will ever have.
+2. **#356 — `volume verify` exit codes.** 0 = passed; 2 = verify failed and proved the
+   MEDIUM bad (the volume is quarantined); 3 = inconclusive (drive or transport; the volume
+   is untouched). An empty drive is inconclusive (3). Scripts no longer need `--json` to
+   tell the two failures apart.
+3. **#346 — archive sets: config wins, omitted keys untouched.** `archive-set sync` writes
+   only the keys each `[[archive_sets]]` table names; values set by `archive-set edit` for
+   keys the TOML omits are left alone. Every accepted key is persisted and settable.
+4. **#348 — the copy requirement is `[defaults] min_copies`.** `min_copies_for_tape_only` /
+   `min_locations_for_tape_only` are renamed `min_copies` / `min_locations` with the same
+   meaning; the old names are refused with a message naming the new ones (reversing issue
+   #129's refusal of `defaults.min_copies`, whose objection was that it was dead, not its
+   name). `first-run.sh` offers the rename in place at step 0. `unit mark-tape-only` and
+   `snapshot mark-reclaimable` gate on the unit's resolved policy and named locations,
+   through the Tier-2 consent gate (`--yes` or `--force` confirm in advance) — except that a
+   version no current version supersedes stays `--force`-only: releasing a unit's only
+   current version is not a shortfall a prompt may accept.
+5. **#362, #361 — schema and vocabulary cleaned now, not after.** States nothing sets leave
+   the CHECK constraints (migration 026); a hand-edited row carrying one fails the migration
+   loudly rather than being remapped; `volumes.status` has no default. **Receipt** keeps one
+   meaning — the recipient list (`stage_sets.key_fingerprints`); the per-stage-set text files
+   become *stage reports* in `stage-reports/` (an existing `receipts/` is moved once), and
+   `volume info` says *Writes*.
+6. **Pending: #360.** Whether `catalog rebuild` (or a repair) may move an `initialized` row
+   to `sealed` from a proven seal marker when no `writes` row exists. The 2026-09-16
+   correction above rejects it, and the seal marker cannot prove confirm passed; it stays a
+   CTO question. Until then the operator guide says to back up the catalog at the end of
+   every write session.
