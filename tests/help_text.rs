@@ -78,3 +78,20 @@ fn help_text_carries_no_issue_numbers() {
         offenders.join("\n")
     );
 }
+
+#[test]
+fn help_examples_never_name_a_numbered_tape_device() {
+    let offenders: Vec<String> = all_help_texts()
+        .into_iter()
+        .filter(|(_, text)| {
+            text.contains("--device /dev/nst") || text.contains("--device-tape /dev/nst")
+        })
+        .map(|(path, text)| format!("{path}: {text}"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "help examples must use /dev/tape/by-id/…-nst — /dev/nstN numbering is not \
+         stable across reboots:\n{}",
+        offenders.join("\n")
+    );
+}

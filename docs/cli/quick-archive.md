@@ -6,7 +6,7 @@
 
 Quick archive: create + stage + write in one flow
 
-The volume must already exist — run `tapectl volume init LABEL --device /dev/nstN` first. This command creates the unit, snapshot and stage set, but not the volume.
+The volume must already exist — run `tapectl volume init LABEL --device /dev/tape/by-id/<drive>-nst` first. This command creates the unit, snapshot and stage set, but not the volume.
 
 ```text
 tapectl quick-archive [OPTIONS] --tenant <TENANT> --volume <VOLUME> <PATH>
