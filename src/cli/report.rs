@@ -296,7 +296,14 @@ impl Summary {
         ];
         if self.staged_held > 0 {
             let owing = if self.staged_owing == 0 {
-                "none owe a copy (`tapectl staging clean` releases them)".to_string()
+                // Per VERSION, as `report pending` scores it; `staging
+                // clean` releases per UNIT (the MIN across current
+                // versions) and keeps a held set whose unit is short on
+                // another version, so this names the command that
+                // decides and promises no outcome.
+                "none owe a copy of their own version (`tapectl staging clean` decides \
+                 which can be released)"
+                    .to_string()
             } else {
                 format!(
                     "{} still owe a copy (`tapectl report pending` lists them)",
@@ -1114,7 +1121,6 @@ pub(crate) fn staged_set_rows(conn: &Connection, config: &Config) -> Result<Vec<
 
 fn report_pending(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
     let all = staged_set_rows(conn, config)?;
-    let released = all.iter().filter(|r| !r.owes_a_copy()).count();
     let rows: Vec<&StagedSetRow> = all.iter().filter(|r| r.owes_a_copy()).collect();
 
     if json_output {
@@ -1130,35 +1136,49 @@ fn report_pending(conn: &Connection, config: &Config, json_output: bool) -> Resu
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        if rows.is_empty() {
-            println!("no stage set owes a copy");
-        } else {
-            println!("stage sets that still owe a copy:");
-            for r in &rows {
-                let policy = match r.min_copies {
-                    Some(min) => format!("{} of {min} copies", r.copies),
-                    None => format!(
-                        "{} copies, policy unresolvable (see `tapectl audit`)",
-                        r.copies
-                    ),
-                };
-                println!(
-                    "  {} v{}: {} slices, {} — {policy}",
-                    r.unit,
-                    r.version,
-                    r.slices.unwrap_or(0),
-                    crate::util::format_bytes_binary(r.size.unwrap_or(0)),
-                );
-            }
-        }
-        if released > 0 {
-            println!(
-                "{released} more stage set(s) have all their copies and are only held in \
-                 staging (`tapectl staging clean` releases them)"
-            );
+        for line in pending_text_lines(&all) {
+            println!("{line}");
         }
     }
     Ok(())
+}
+
+/// `report pending`'s text form, from the whole [`staged_set_rows`]
+/// selection: the stage sets that still owe a copy, then a count of those
+/// only held in staging. Separate from the printing so a test pins the
+/// wording.
+fn pending_text_lines(all: &[StagedSetRow]) -> Vec<String> {
+    let released = all.iter().filter(|r| !r.owes_a_copy()).count();
+    let owing: Vec<&StagedSetRow> = all.iter().filter(|r| r.owes_a_copy()).collect();
+    let mut lines = Vec::new();
+    if owing.is_empty() {
+        lines.push("no stage set owes a copy".to_string());
+    } else {
+        lines.push("stage sets that still owe a copy:".to_string());
+        for r in owing {
+            let policy = match r.min_copies {
+                Some(min) => format!("{} of {min} copies", r.copies),
+                None => format!(
+                    "{} copies, policy unresolvable (see `tapectl audit`)",
+                    r.copies
+                ),
+            };
+            lines.push(format!(
+                "  {} v{}: {} slices, {} — {policy}",
+                r.unit,
+                r.version,
+                r.slices.unwrap_or(0),
+                crate::util::format_bytes_binary(r.size.unwrap_or(0)),
+            ));
+        }
+    }
+    if released > 0 {
+        lines.push(format!(
+            "{released} more stage set(s) have every copy their own version needs and are \
+             only held in staging (`tapectl staging clean` decides which can be released)"
+        ));
+    }
+    lines
 }
 
 /// One row of `report verify-status`: one volume's verification session —
@@ -3569,13 +3589,85 @@ mod tests {
             let summary = summarize(&conn, &Config::default()).unwrap();
             assert_eq!(
                 summary.text_lines().last().unwrap(),
-                "  Staging:    4 stage set(s) held, none owe a copy (`tapectl staging clean` \
-                 releases them)"
+                "  Staging:    4 stage set(s) held, none owe a copy of their own version \
+                 (`tapectl staging clean` decides which can be released)"
             );
             assert!(staged_set_rows(&conn, &Config::default())
                 .unwrap()
                 .iter()
                 .all(|r| !r.owes_a_copy()));
+        }
+
+        /// A held stage set's own version can have every copy while its
+        /// UNIT still falls short on another current version — here v1,
+        /// whose stage set is long released, lost a copy; v2 is staged with
+        /// 2 of 2. `staging clean` scores the unit (the MIN across current
+        /// versions) and keeps v2, so neither report may say it releases
+        /// them: they name the command that decides, and promise nothing.
+        #[test]
+        fn a_version_with_its_copies_is_not_promised_a_release() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            let va = add_volume(&conn, "L6-A", "sealed");
+            let vb = add_volume(&conn, "L6-B", "sealed");
+            let unit = add_unit(&conn, tid, "photos", None);
+            for (version, ss_status, volumes) in
+                [(1, "cleaned", vec![va]), (2, "staged", vec![va, vb])]
+            {
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, ?2, 'full', 'current', '/src')",
+                    params![unit, version],
+                )
+                .unwrap();
+                let snap = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices,
+                                             total_encrypted_size)
+                     VALUES (?1, ?2, 524288, 1, 2048)",
+                    params![snap, ss_status],
+                )
+                .unwrap();
+                let ss = conn.last_insert_rowid();
+                for vol in volumes {
+                    conn.execute(
+                        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                         VALUES (?1, ?2, ?3, 'completed')",
+                        params![ss, snap, vol],
+                    )
+                    .unwrap();
+                }
+            }
+
+            let rows = staged_set_rows(&conn, &Config::default()).unwrap();
+            assert_eq!(rows.len(), 1, "only v2 is held: {rows:?}");
+            assert!(!rows[0].owes_a_copy(), "v2 has 2 of 2 copies: {rows:?}");
+
+            let staging_line = summarize(&conn, &Config::default())
+                .unwrap()
+                .text_lines()
+                .pop()
+                .unwrap();
+            assert_eq!(
+                staging_line,
+                "  Staging:    1 stage set(s) held, none owe a copy of their own version \
+                 (`tapectl staging clean` decides which can be released)"
+            );
+            assert_eq!(
+                pending_text_lines(&rows),
+                vec![
+                    "no stage set owes a copy".to_string(),
+                    "1 more stage set(s) have every copy their own version needs and are \
+                     only held in staging (`tapectl staging clean` decides which can be \
+                     released)"
+                        .to_string(),
+                ]
+            );
         }
     }
 
