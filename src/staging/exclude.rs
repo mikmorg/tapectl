@@ -10,6 +10,13 @@
 //! from the same effective pattern list (globals + dotfile), and
 //! `collection::sync` matches a collection's own `exclude` here too.
 //!
+//! **NOT YET WIRED (issue #359):** `stage_create` still hands dar every
+//! pattern as a raw `-X` mask and passes no `-P` prune masks, and
+//! `walk_directory` does not yet ask `excludes_dir_entry`. Until both
+//! change, a directory pattern (`name/`) keeps the subtree's files out of
+//! the manifest, the `files` table and the dirty scan, but NOT out of the
+//! dar archive -- it does not keep those bytes off tape.
+//!
 //! ## The one exclude rule (issue #359)
 //!
 //! Every exclude pattern — `[defaults] global_excludes`, a unit dotfile's
@@ -35,13 +42,14 @@
 //!  - **A directory pattern** (`name/`, e.g. `.cache/`, `node_modules/`)
 //!    excludes that directory's **whole subtree**, at any depth below the
 //!    walk root: an entry is excluded when any component of its path below
-//!    the root matches `name`. dar receives it as the prune masks `-P name`
-//!    and `-P */name` (`dar_masks`): `-P` matches the path relative to `-R`,
+//!    the root matches `name`. dar must receive it as the prune masks
+//!    `-P name` and `-P */name` (`dar_masks` -- not yet passed by
+//!    `stage_create`, see above): `-P` matches the path relative to `-R`,
 //!    its `*` spans `/`, and `-D` keeps the pruned directory itself as an
 //!    empty directory — so `excludes_dir_entry` keeps that directory's own
 //!    entry and drops only what is inside it. Like `-P`, the rule does not
 //!    distinguish a file from a directory: a FILE named `.cache` is excluded
-//!    by `.cache/` too, so the manifest and the archive agree. Components
+//!    by `.cache/` too, so the manifest and the archive can agree. Components
 //!    ABOVE the walk root are never consulted (a unit living under
 //!    `~/.cache/` is not excluded wholesale). Before #359 a `name/` pattern
 //!    matched nothing at all (a basename never contains `/`), so honouring
@@ -207,8 +215,10 @@ impl Excludes {
 /// True if the NON-directory entry `path` is excluded by `set` — see
 /// `Excludes::excludes_file` and the module doc comment. Both walks
 /// (`staging::walk_directory`, `collection::fingerprint::walk_fingerprint`)
-/// call this for every non-directory entry; a directory entry is
-/// `Excludes::excludes_dir_entry`'s question.
+/// call this for every non-directory entry. A directory entry is to be
+/// `Excludes::excludes_dir_entry`'s question once `walk_directory` asks it
+/// (not yet -- see the module doc comment); `walk_fingerprint` skips
+/// directories altogether.
 pub fn is_excluded(path: &Path, set: &Excludes) -> bool {
     set.excludes_file(path)
 }
