@@ -1022,14 +1022,18 @@ impl Config {
     /// (e.g. `1.5`) is already refused by `toml::from_str` before this
     /// method ever runs — not re-validated here.
     ///
-    /// `utilization_threshold` is compared against a `live_bytes /
-    /// total_bytes` ratio that is always in `[0, 1]`
-    /// (`cli::audit::compaction_findings`,
-    /// `cli::report::report_compaction_candidates`), as `utilization <
-    /// threshold`. `0` or a negative threshold makes that comparison
-    /// always false — no volume is ever flagged, compaction-candidate
-    /// detection is silently disabled — and a threshold above `1.0` makes
-    /// it always true, flagging every written volume regardless of actual
+    /// `utilization_threshold` is compared against a volume's utilization:
+    /// its live archive data as a share of its archive data, `live /
+    /// (live + reclaimable)`, where reclaimable is the encrypted bytes of
+    /// its `reclaimable`/`purged` snapshots — always in `[0, 1]`
+    /// (`cli::report::CompactionRow::utilization`, shared by
+    /// `cli::audit::compaction_findings` and `report
+    /// compaction-candidates`, issue #353). A volume is a candidate when
+    /// `utilization < threshold` AND it has any reclaimable data at all.
+    /// `0` or a negative threshold makes that comparison always false — no
+    /// volume is ever flagged, compaction-candidate detection is silently
+    /// disabled — and a threshold above `1.0` is indistinguishable from
+    /// `1.0`: both flag every volume with any reclaimable data, whatever its
     /// utilization. The valid range is `(0.0, 1.0]`; `1.0` is a legitimate
     /// "flag anything with any reclaimable space at all" choice, `0.0` is
     /// not a legitimate "never flag anything" choice — that is an off
@@ -1052,8 +1056,9 @@ impl Config {
         if !(threshold > 0.0 && threshold <= 1.0) {
             problems.push(format!(
                 "{}: compaction.utilization_threshold = {threshold} must be > 0.0 and <= 1.0 \
-                 (it is compared against a live/total byte ratio that never exceeds 1.0; \
-                 0 or negative silently disables compaction-candidate detection)",
+                 (it is compared against a volume's live archive data as a share of its \
+                 live plus reclaimable archive data, which never exceeds 1.0; 0 or negative \
+                 silently disables compaction-candidate detection)",
                 path.display()
             ));
         }

@@ -218,7 +218,13 @@ pub enum TapectlError {
     #[error("operation interrupted")]
     Interrupted,
 
-    #[error("{0}")]
+    /// `transparent`, not `"{0}"`: with `#[from]`, a `"{0}"` Display made the
+    /// io error BOTH this variant's text and its `source()`, so the
+    /// operator's `{:#}` rendering (`exit_with_error`) printed it twice —
+    /// `Permission denied (os error 13): Permission denied (os error 13)`
+    /// (issue #354). `transparent` forwards Display and `source()` to the io
+    /// error itself: its text once, then only a cause it genuinely carries.
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     /// A layer of the 3-level policy chain could not be resolved (issue
@@ -291,4 +297,38 @@ pub fn exit_with_error(err: &anyhow::Error) -> ! {
 pub fn exit_with_error_code(err: &anyhow::Error, code: i32) -> ! {
     eprintln!("error: {err:#}");
     process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Render an error exactly as [`exit_with_error`] prints it: `{:#}` on
+    /// the anyhow error, which walks the `source()` chain. `to_string()`
+    /// alone is the outer Display only and never shows a doubled chain.
+    fn as_operator_sees_it(err: TapectlError) -> String {
+        format!("{:#}", anyhow::Error::from(err))
+    }
+
+    /// Issue #354 (a), systemic: every `std::io::Error` that reached the
+    /// operator through `?` printed twice — `Permission denied (os error
+    /// 13): Permission denied (os error 13)` — because the variant's Display
+    /// IS the io error's text and `#[from]` also made that io error its
+    /// `source()`, so `{:#}` printed it again as the cause.
+    #[test]
+    fn an_io_error_reaches_the_operator_once() {
+        let err: TapectlError = std::io::Error::from_raw_os_error(13).into();
+        assert_eq!(
+            as_operator_sees_it(err),
+            "Permission denied (os error 13)"
+        );
+    }
+
+    /// The same for an io error carrying its own message (what
+    /// `io::Error::other` and friends build), not only a raw errno.
+    #[test]
+    fn a_custom_io_error_reaches_the_operator_once() {
+        let err: TapectlError = std::io::Error::other("staging disk went away").into();
+        assert_eq!(as_operator_sees_it(err), "staging disk went away");
+    }
 }
