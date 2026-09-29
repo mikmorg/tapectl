@@ -971,7 +971,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
 [ "$NV" != 0 ] && note "$NV volume(s) already in the catalog." && { confirm "Write another tape now?" || { ok "nothing to do"; FROM=14; }; }
 if [ "$FROM" -le 13 ]; then
 explain <<'EOF'
-The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` runs dar, hashes, encrypts to every recipient and writes slices to staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and, before it seals, reads EVERY byte back and checks it against the plan (confirm). A sealed volume is immutable: there is no append. `volume verify --full` afterwards is a second, independent full read — the first entry in this tape's verification history, which `report verify-status` and the audit build on; on a full tape it takes as long as the write did.
+The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` hashes every source file, runs dar, and encrypts the archive once (age: one random file key per slice, wrapped for each recipient in a small header) into slices in staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and, before it seals, reads EVERY byte back and checks it against the plan (confirm). A sealed volume is immutable: there is no append. `volume verify --full` afterwards is a second, independent full read — the first entry in this tape's verification history, which `report verify-status` and the audit build on; on a full tape it takes as long as the write did.
 
 `volume init` also reads the loaded cartridge: its generation from the density code, which fixes this tape's capacity and is checked against what the drive can write, and its medium serial, which binds the volume to a cartridge in the catalog (ADR-0010). Nothing to set for a mixed LTO-5/LTO-6 shelf — each tape is planned against its own size.
 
@@ -1023,8 +1023,8 @@ except Exception: pass' 2>/dev/null || true)"
   # Issue #269: this used to be ONE confirm covering both phases, and then a
   # single loop doing snapshot+stage per unit. Two problems on production day.
   #
-  # The operator agreed to the EXPENSIVE phase (dar + hashing + encryption to
-  # every recipient, hours and a lot of staging disk) before anything had told
+  # The operator agreed to the EXPENSIVE phase (hashing, dar and one encryption
+  # pass over the data, hours and a lot of staging disk) before anything had told
   # them how much data that was -- and the authoritative capacity check is the
   # pre-flight gate inside `volume write`, which runs AFTER all of it. Too much
   # source for the cartridge meant discovering it at the end.
@@ -1042,7 +1042,7 @@ except Exception: pass' 2>/dev/null || true)"
     run tc snapshot create "$u" || die "snapshot failed for $u"
   done <<< "$UNITS"
   explain <<'EOF'
-Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it runs dar over every unit, hashes, encrypts to every recipient and writes the slices to your staging directory. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13.
+Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it reads and hashes every file, runs dar over every unit, and encrypts each archive once (the recipients only add a few hundred bytes of header each, not another pass), writing the slices to your staging directory. That is several full passes over the data. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13.
 EOF
   confirm "Stage them now? (runs dar + encryption, writes to staging)" || die "stopped before staging"
   # Issue #283: this loop MUST tolerate a unit that is already staged. The
