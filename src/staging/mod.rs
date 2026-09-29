@@ -3711,6 +3711,16 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert!(left.is_empty(), "nothing left in staging: {left:?}");
+
+        // The way past the refusal it names: the version is still unstaged
+        // (`created`, which `stage create <unit>` selects), and the same
+        // stage with `--yes` goes ahead beside the refused row.
+        assert_eq!(get_snapshot(&conn, snap_id).unwrap().status, "created");
+        config.dar.binary = "dar".to_string();
+        let mut notices = Vec::new();
+        stage_create_reporting(&conn, &paths, &config, snap_id, true, &mut notices)
+            .expect("re-run with --yes, the refused stage proceeds");
+        assert_eq!(get_snapshot(&conn, snap_id).unwrap().status, "staged");
     }
 
     /// Issue #52 change 2 — the self-match trap. `snapshot_create` for an
