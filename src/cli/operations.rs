@@ -5631,6 +5631,41 @@ mod tests {
                 "the dry-run JSON must name the version the floor protects: {json:?}"
             );
         }
+
+        /// Issue #357: the Tier-2 location fact names the required
+        /// locations as a plain list — not Rust's `{:?}` of a Vec
+        /// (`["home", "offsite"]`), which also contains `"home", "offsite"`,
+        /// so the parenthesised form is what is asserted. Two copies stay
+        /// elsewhere (min_copies is met), neither in a location, so the
+        /// location fact is the one that gates.
+        #[test]
+        fn tier2_location_fact_lists_the_required_locations_in_words() {
+            let (conn, _) = setup_sealed("L6-WHERE", 2);
+            conn.execute(
+                "INSERT INTO archive_sets (name, required_locations)
+                 VALUES ('placed', '[\"home\",\"offsite\"]')",
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE name = 'unitA'",
+                params![set_id],
+            )
+            .unwrap();
+
+            let err = volume_retire(&conn, &Config::default(), "L6-WHERE", false, false, false)
+                .expect_err("zero locations against two required must gate");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("location(s), below its policy of 2 (home, offsite)"),
+                "the required locations, listed plainly: {msg}"
+            );
+            assert!(
+                !msg.contains("[\"home\""),
+                "no Debug rendering of the location list: {msg}"
+            );
+        }
     }
 
     /// Issue #89 / ADR-0004: copy-count derivations must re-qualify

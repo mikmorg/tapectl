@@ -373,6 +373,14 @@ mod tests {
             msg.contains('4'),
             "error must surface what was actually found: {msg}"
         );
+        // Issue #357: the list in words, not Rust's `{:?}` of a Vec — the
+        // Debug form `[1, 2, 4]` contains "1, 2, 4" too, so the period that
+        // follows the list is what tells them apart.
+        assert!(
+            msg.contains("all parsed slice numbers: 1, 2, 4."),
+            "the parsed slice numbers, listed plainly: {msg}"
+        );
+        assert!(!msg.contains('['), "no Debug rendering of the list: {msg}");
     }
 
     #[test]

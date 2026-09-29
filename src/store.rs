@@ -1753,6 +1753,26 @@ mod tests {
             "{:?}",
             evidence.mismatches
         );
+
+        // Issue #357: `actual` is what `volume verify` prints as "found" and
+        // records in verification_results — the violation in words, never
+        // Rust's `{:?}` (`PositionOutOfSequence { index: .., .. }`).
+        let found: Vec<&str> = evidence
+            .mismatches
+            .iter()
+            .filter(|m| m.kind == MismatchKind::FrontIndexInconsistent)
+            .map(|m| m.actual.as_str())
+            .collect();
+        assert!(
+            found.iter().any(|a| a.contains("claims position 0")),
+            "the duplicated position-0 entry must be named in words: {found:?}"
+        );
+        for actual in &found {
+            assert!(
+                !actual.contains('{') && !actual.contains("PositionOutOfSequence"),
+                "a consistency violation must not reach the operator as Debug output: {actual}"
+            );
+        }
     }
 
     #[test]

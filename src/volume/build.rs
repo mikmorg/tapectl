@@ -1607,6 +1607,25 @@ mod tests {
             "expected the hollow data_slice entry (missing size/hash) to trip \
              format::validate_consistency; got {errs:?}"
         );
+
+        // Issue #357: the violations reach the operator in words, joined —
+        // not as Rust's `{:?}` of the Vec (`[MissingSize { position: 4 }, ..]`).
+        let message = errs
+            .iter()
+            .find_map(|e| match e {
+                LayoutError::GeneratedZoneInconsistent { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            message.contains("position 4 carries no size_bytes")
+                && message.contains("position 4 carries no sha256_encrypted"),
+            "both hollow-entry violations, in words: {message}"
+        );
+        assert!(
+            !message.contains('[') && !message.contains('{') && !message.contains("MissingSize"),
+            "no Debug rendering of the violation list: {message}"
+        );
     }
 
     // ── PLAN.toml wiring (T8, format §8) ──

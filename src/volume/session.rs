@@ -943,6 +943,19 @@ impl InterruptedSession {
         Ok(session)
     }
 
+    /// [`Self::load`]'s refusal when one volume's `writes` rows in `status`
+    /// name more than one session directory. The directories are listed
+    /// plainly, comma-separated — Rust's `{:?}` of the Vec until issue #357.
+    fn session_dirs_disagree(volume_id: i64, status: &str, dirs: &[&str]) -> TapectlError {
+        TapectlError::Other(format!(
+            "volume {volume_id}: its {status} `writes` rows name {} different session \
+             directories ({}) — these are not one write session, and resuming would \
+             mix frozen files from different builds. Resolve by hand before retrying.",
+            dirs.len(),
+            dirs.join(", ")
+        ))
+    }
+
     /// The shared loader behind [`Self::rehydrate`] and
     /// [`Self::adopt_aborted`]: every `writes` row of `volume_id` in
     /// `status`, their one shared session directory, and the frozen Layout
@@ -987,13 +1000,7 @@ impl InterruptedSession {
         dirs.sort_unstable();
         dirs.dedup();
         if dirs.len() > 1 {
-            return Err(TapectlError::Other(format!(
-                "volume {volume_id}: its {status} `writes` rows name {} different session \
-                 directories ({}) — these are not one write session, and resuming would \
-                 mix frozen files from different builds. Resolve by hand before retrying.",
-                dirs.len(),
-                dirs.join(", ")
-            )));
+            return Err(Self::session_dirs_disagree(volume_id, status, &dirs));
         }
         let session_dir = Path::new(dirs[0]).to_path_buf();
 
@@ -2340,6 +2347,20 @@ mod tests {
             }
         };
         assert_eq!(aborted.volume_id, f.volume_id);
+        // Issue #357: the abort reason reaches the operator in words — the
+        // recorded hash itself, not Rust's `{:?}` of an Option
+        // (`expected Some("ab12…")`).
+        assert!(
+            aborted.reason.starts_with("hash mismatch at position ")
+                && aborted.reason.contains(", got "),
+            "{}",
+            aborted.reason
+        );
+        assert!(
+            !aborted.reason.contains("Some(") && !aborted.reason.contains('"'),
+            "no Debug rendering of the recorded hash: {}",
+            aborted.reason
+        );
 
         // The tape stays UNSEALED: no seal marker was ever written, because
         // seal() was never called (sacred invariant 1 — only seal() can
@@ -4983,6 +5004,27 @@ mod tests {
             park_marker_from_env().is_none(),
             "TAPECTL_TEST_PAUSE_AFTER_PLAN must not be set in the test environment; \
              if this fails, something is exporting it and every write is parking"
+        );
+    }
+
+    /// Issue #357: the conflicting session directories are listed plainly,
+    /// not as Rust's `{:?}` of a Vec (`["/a", "/b"]`).
+    #[test]
+    fn session_dirs_disagree_lists_the_directories_in_words() {
+        let msg = InterruptedSession::session_dirs_disagree(
+            7,
+            "interrupted",
+            &["/scratch/session-a", "/scratch/session-b"],
+        )
+        .to_string();
+        assert!(
+            msg.contains("name 2 different session directories \
+                 (/scratch/session-a, /scratch/session-b)"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains('[') && !msg.contains("\"/scratch"),
+            "no Debug rendering of the directory list: {msg}"
         );
     }
 }
