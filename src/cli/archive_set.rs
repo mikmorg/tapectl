@@ -127,16 +127,19 @@ pub struct PolicyArgs {
     /// system default".
     #[arg(long)]
     pub warehouse_copies: Option<i64>,
-    /// Keep extended attributes in the archive (true/false)
+    /// Keep extended attributes, and the POSIX ACLs stored as them
+    /// (true/false; false drops them all)
     #[arg(long)]
     pub preserve_xattrs: Option<bool>,
-    /// Keep POSIX ACLs (true/false)
+    /// Keep POSIX ACLs (true/false). No effect of its own: ACLs follow
+    /// --preserve-xattrs
     #[arg(long)]
     pub preserve_acls: Option<bool>,
-    /// Keep filesystem-specific attributes (true/false)
+    /// Keep filesystem-specific attributes such as chattr flags (true/false)
     #[arg(long)]
     pub preserve_fsa: Option<bool>,
-    /// Treat a metadata-only change as making a unit dirty (true/false)
+    /// Treat a metadata-only change as making a unit dirty (true/false).
+    /// Not read yet: dirty detection compares path, size and mtime only
     #[arg(long)]
     pub dirty_on_metadata_change: Option<bool>,
     /// Description

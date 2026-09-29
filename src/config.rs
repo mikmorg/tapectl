@@ -386,6 +386,10 @@ impl LtoBackendConfig {
     }
 }
 
+/// One `[[archive_sets]]` table. Every key but `name` is optional; `archive-set
+/// sync` writes exactly the keys a table names and leaves the others as they
+/// are in the database (issue #346). The keys mean what their `[defaults]`
+/// namesakes mean (see [`DefaultsConfig`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveSetConfig {
@@ -414,12 +418,23 @@ pub struct DefaultsConfig {
     pub checksum_mode: String,
     #[serde(default = "default_true")]
     pub encrypt: bool,
+    /// Archive extended attributes — and with them POSIX ACLs, which Linux
+    /// stores as extended attributes. `false` drops them all (dar `-u "*"`,
+    /// issue #347; it used to add `-am`, which never touched them).
     #[serde(default = "default_true")]
     pub preserve_xattrs: bool,
+    /// No effect of its own: dar has no separate ACL switch, so ACLs follow
+    /// `preserve_xattrs` (issue #50). `config check` notes a value that
+    /// disagrees with it (`policy::subsumed`).
     #[serde(default = "default_true")]
     pub preserve_acls: bool,
+    /// Archive filesystem-specific attributes (Linux chattr flags). `false`
+    /// passes dar `--fsa-scope none` (issue #347).
     #[serde(default = "default_true")]
     pub preserve_fsa: bool,
+    /// Resolved by the policy chain but read by nothing yet: dirty
+    /// detection compares path, size and mtime only. `config check` notes
+    /// `true` (`policy::decorative`, issue #347).
     #[serde(default)]
     pub dirty_on_metadata_change: bool,
     #[serde(default)]

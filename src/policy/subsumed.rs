@@ -3,17 +3,25 @@
 //!
 //! `preserve_acls` is documented (v4.0 §7 / §1363) and has an
 //! `archive_sets` column, but **dar exposes no independent ACL switch**.
-//! On Linux, dar carries ACLs as Extended Attributes whenever EA support
-//! is compiled in, and tapectl passes no `-u`/`-U` EA-exclusion mask — so
-//! ACLs are preserved unconditionally, and `preserve_acls = false` cannot
-//! be honored without also discarding every xattr the operator never
-//! asked to lose.
+//! On Linux, POSIX ACLs ARE Extended Attributes (`system.posix_acl_*`), and
+//! dar carries them with every other EA. So ACLs follow `preserve_xattrs`
+//! exactly: kept while it is on, dropped when it is off — `false` passes
+//! dar `-u "*"`, which excludes every EA (`dar::create`, issue #347; before
+//! #347 `preserve_xattrs` did nothing at all and EAs were kept regardless).
 //!
 //! The ratified resolution is to keep the knob and make the no-op
 //! **visible** rather than silent — the #92 precedent: surface a dead
-//! knob, do not quietly delete operator-facing surface. Only `false` is
-//! reported: `true` already matches what actually happens, so saying
-//! anything about it would be noise.
+//! knob, do not quietly delete operator-facing surface. A layer is
+//! reported when its effective `preserve_acls` DISAGREES with its effective
+//! `preserve_xattrs`, in either direction:
+//!
+//! - `preserve_acls = false` beside `preserve_xattrs = true`: the ACLs are
+//!   kept anyway (the #50 case).
+//! - `preserve_acls = true` beside `preserve_xattrs = false`: the ACLs are
+//!   dropped anyway (possible since #347 made `false` real).
+//!
+//! When the two agree, what the operator asked for is what happens, and
+//! saying anything would be noise.
 //!
 //! Like [`crate::policy::shadowing`], this advises and never rewrites,
 //! and it must never affect `config check`'s exit code.
@@ -22,39 +30,63 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 
-/// One place `preserve_acls = false` is set but cannot take effect.
+/// One policy layer whose `preserve_acls` cannot take effect because its
+/// `preserve_xattrs` says the opposite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubsumedAcls {
     /// Human-facing origin, e.g. `"defaults"` or `"archive set \"media\""`.
     pub source: String,
+    /// The `preserve_acls` value in force at that layer — the one that
+    /// cannot take effect.
+    pub preserve_acls: bool,
 }
 
-/// Every layer that sets `preserve_acls = false`, which is not achievable.
+/// Every layer whose effective `preserve_acls` disagrees with its effective
+/// `preserve_xattrs`.
 ///
-/// Reads `config.defaults` and the `archive_sets` table. Dotfiles are not
-/// scanned: `preserve_acls` is not among the fields `unit init` writes,
-/// so a dotfile carrying it is a hand-edit, and walking every unit's
-/// filesystem path for one advisory line is not worth the I/O here —
-/// `shadowing::scan` already owns the dotfile walk if that changes.
+/// Reads `config.defaults` and the `archive_sets` table; an archive set's
+/// NULL column inherits `[defaults]`, exactly as `policy::resolve` does, so
+/// a set that turns only `preserve_xattrs` off is judged on the
+/// `preserve_acls` it inherits. A set that sets neither column is covered by
+/// the `defaults` line. Dotfiles are not scanned: a dotfile's `[policy]`
+/// table accepts neither key (`unit::dotfile::PolicySection`).
 pub fn scan(config: &Config, conn: &Connection) -> Vec<SubsumedAcls> {
     let mut out = Vec::new();
+    let defaults = &config.defaults;
 
-    if !config.defaults.preserve_acls {
+    if defaults.preserve_acls != defaults.preserve_xattrs {
         out.push(SubsumedAcls {
             source: "defaults".to_string(),
+            preserve_acls: defaults.preserve_acls,
         });
     }
 
     // A missing table (fresh DB) is not an error for an advisory scan.
-    let mut stmt = match conn.prepare("SELECT name FROM archive_sets WHERE preserve_acls = 0") {
+    let mut stmt = match conn.prepare(
+        "SELECT name, preserve_xattrs, preserve_acls FROM archive_sets
+         WHERE preserve_xattrs IS NOT NULL OR preserve_acls IS NOT NULL
+         ORDER BY name",
+    ) {
         Ok(s) => s,
         Err(_) => return out,
     };
-    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-        for name in rows.flatten() {
-            out.push(SubsumedAcls {
-                source: format!("archive set \"{name}\""),
-            });
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for (name, xattrs, acls) in rows.flatten() {
+            let xattrs = xattrs.map_or(defaults.preserve_xattrs, |v| v != 0);
+            let acls = acls.map_or(defaults.preserve_acls, |v| v != 0);
+            if acls != xattrs {
+                out.push(SubsumedAcls {
+                    source: format!("archive set \"{name}\""),
+                    preserve_acls: acls,
+                });
+            }
         }
     }
 
@@ -65,12 +97,22 @@ pub fn scan(config: &Config, conn: &Connection) -> Vec<SubsumedAcls> {
 /// without a `Connection` — and so `config check`'s `--json` arm and its
 /// text arm can never drift apart.
 pub fn describe(hit: &SubsumedAcls) -> String {
-    format!(
-        "note: {} sets preserve_acls = false, which cannot take effect — dar has no independent \
-         ACL switch, so ACLs ride Extended Attributes and are preserved whenever preserve_xattrs \
-         is on. Use preserve_xattrs to control this.",
-        hit.source
-    )
+    if hit.preserve_acls {
+        format!(
+            "note: {} has preserve_acls = true, which cannot take effect — preserve_xattrs = \
+             false drops every extended attribute, and on Linux ACLs are extended attributes \
+             (dar has no separate ACL switch). Set preserve_xattrs = true to keep them.",
+            hit.source
+        )
+    } else {
+        format!(
+            "note: {} sets preserve_acls = false, which cannot take effect — dar has no \
+             independent ACL switch, so ACLs ride Extended Attributes and are preserved \
+             whenever preserve_xattrs is on. Use preserve_xattrs to control this (false drops \
+             every extended attribute, not only ACLs).",
+            hit.source
+        )
+    }
 }
 
 #[cfg(test)]
@@ -127,10 +169,68 @@ mod tests {
         assert_eq!(hits[0].source, "archive set \"media\"");
     }
 
+    /// Issue #347 made `preserve_xattrs = false` real (dar `-u "*"`), which
+    /// drops ACLs too — so `preserve_acls = true` beside it cannot take
+    /// effect either, and saying nothing would let ACLs vanish silently.
+    #[test]
+    fn preserve_acls_true_beside_preserve_xattrs_false_is_reported() {
+        let mut config = Config::default();
+        config.defaults.preserve_xattrs = false;
+        config.defaults.preserve_acls = true;
+        let hits = scan(&config, &conn_without_archive_sets());
+        assert_eq!(
+            hits,
+            vec![SubsumedAcls {
+                source: "defaults".to_string(),
+                preserve_acls: true,
+            }]
+        );
+        let line = describe(&hits[0]);
+        assert!(line.contains("preserve_acls = true"), "{line}");
+        assert!(line.contains("preserve_xattrs = false"), "{line}");
+    }
+
+    /// Both off agree — ACLs are dropped, as asked — so nothing to say.
+    #[test]
+    fn preserve_acls_and_preserve_xattrs_both_false_report_nothing() {
+        let mut config = Config::default();
+        config.defaults.preserve_xattrs = false;
+        config.defaults.preserve_acls = false;
+        assert!(scan(&config, &conn_without_archive_sets()).is_empty());
+    }
+
+    /// An archive set is judged on its EFFECTIVE pair: a set that only
+    /// turns `preserve_xattrs` off inherits `preserve_acls = true` from
+    /// `[defaults]`, and that combination cannot take effect.
+    #[test]
+    fn an_archive_set_is_judged_on_what_it_inherits_too() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO archive_sets (name, preserve_xattrs) VALUES ('bare', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_sets (name, preserve_xattrs, preserve_acls) \
+             VALUES ('consistent', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let hits = scan(&Config::default(), &conn);
+        assert_eq!(
+            hits,
+            vec![SubsumedAcls {
+                source: "archive set \"bare\"".to_string(),
+                preserve_acls: true,
+            }]
+        );
+    }
+
     #[test]
     fn the_advisory_names_the_source_and_the_real_control() {
         let line = describe(&SubsumedAcls {
             source: "defaults".to_string(),
+            preserve_acls: false,
         });
         assert!(line.contains("defaults"));
         assert!(

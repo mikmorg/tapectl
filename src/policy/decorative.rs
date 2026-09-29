@@ -1,28 +1,38 @@
-//! Advisory scan for config keys that are parsed but not yet consumed by
-//! any write-path code — the `#92`/`#50` precedent (`docs/design-errata.md`):
-//! surface a dead knob and never change `config check`'s exit code.
+//! Advisory scan for config keys that are parsed but not consumed by any
+//! code — the `#92`/`#50` precedent (`docs/design-errata.md`): surface a
+//! dead knob and never change `config check`'s exit code.
 //!
-//! **There are currently no such keys, and `scan` returns nothing.** That is
-//! the honest state of the config, not an oversight — but be clear about
-//! WHY it is empty: `scan` is a hand-maintained match, not a detector. It
-//! only ever reports a key someone has already noticed and added an arm
-//! for; it cannot discover an unwired key by inspecting `Config` itself.
-//! The 2026-09-13 post-redesign review (`docs/audits/`) found this the hard
-//! way — `scan`'s own doc comment claimed "every decorative-key occurrence
-//! in a loaded config" while SIX keys sat in `Config` with no reader and
-//! zero of them were listed here. Three (below) were spec W4's; issue #172
-//! found the other three: `packing.strategy`, `packing.fill_threshold` and
-//! `defaults.hash` join the delete list below. The audit's count of six
-//! also included `logging.level`/`logging.format` — issue #172 WIRES those
-//! two instead of deleting them (they now do something — see
-//! `config::LoggingConfig`), which is why they never join this list at all.
-//! So: read an empty `scan` result as "no key has been through this
-//! deliberate delete-or-wire decision and come out decorative", never as
-//! "nothing is decorative" — that second reading is exactly the false claim
-//! the audit caught, and the fix each time is to run the same decision on
-//! the newly found key, not to add it to a running list here.
+//! **One key is reported today: `dirty_on_metadata_change`** (issue #347),
+//! when it is `true` in `[defaults]`, in an `[[archive_sets]]` table, or on
+//! an `archive_sets` row. `policy::resolve` resolves it and nothing reads
+//! the result: dirty detection (`unit::content_match`, shared by `collection
+//! sync/status`, `unit status --dirty`, `report dirty`, `audit` and
+//! `mark-tape-only`'s guard) compares each file's path, size and mtime
+//! only, so a metadata-only change never marks a unit dirty. `false` — the
+//! default — describes exactly that, so only `true` is reported; flagging
+//! the default would put a note on every fresh config.
 //!
-//! Every key this module was built for is GONE from `Config` altogether
+//! Be clear about what an empty result means: `scan` is a hand-maintained
+//! match, not a detector. It only ever reports a key someone has already
+//! noticed and added an arm for; it cannot discover an unwired key by
+//! inspecting `Config` itself. The 2026-09-13 post-redesign review
+//! (`docs/audits/`) found this the hard way — `scan`'s own doc comment
+//! claimed "every decorative-key occurrence in a loaded config" while SIX
+//! keys sat in `Config` with no reader and zero of them were listed here.
+//! Three (below) were spec W4's; issue #172 found the other three:
+//! `packing.strategy`, `packing.fill_threshold` and `defaults.hash` join
+//! the delete list below. The audit's count of six also included
+//! `logging.level`/`logging.format` — issue #172 WIRES those two instead of
+//! deleting them. Issue #347 found four more parsed-but-inert keys and ran
+//! the same delete-or-wire decision on each: `preserve_xattrs` and
+//! `preserve_fsa` were WIRED (`dar::create`: `false` now drops extended
+//! attributes / filesystem attributes), `preserve_acls` stays the ratified
+//! visible no-op (`policy::subsumed`), and `dirty_on_metadata_change` — whose
+//! wiring belongs to dirty detection, not config — is the one reported here
+//! until it is wired or deleted.
+//!
+//! Every key this module was originally built for is GONE from `Config`
+//! altogether
 //! (spec W4, operator decision 2026-09-13, extended by issue #172 —
 //! tapectl has never been used in production, so a knob that does nothing
 //! should be deleted rather than documented forever). They were deleted
@@ -59,41 +69,72 @@
 //! than an advisory note, and the reason deleting them is not a loss of
 //! operator-facing surface.
 
+use rusqlite::Connection;
+
 use crate::config::Config;
 
 /// One config key that is parsed but has no reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorativeHit {
-    /// Dotted key path, e.g. `"backends.lto[\"lto1\"].some_future_knob"`.
+    /// Dotted key path, e.g. `"defaults.dirty_on_metadata_change"` or
+    /// `"archive_sets[\"media\"].dirty_on_metadata_change"`.
     pub key: String,
 }
 
 /// Every decorative-key occurrence someone has already added an arm for —
-/// NOT, despite how an earlier version of this doc comment put it, every
-/// decorative-key occurrence in a loaded config. That stronger claim is
-/// exactly what the 2026-09-13 post-redesign audit caught false (see the
-/// module doc): this function cannot discover an unwired key by inspecting
-/// `Config`, only report one a human has already noticed and hand-coded a
-/// check for.
+/// NOT every decorative-key occurrence in a loaded config (see the module
+/// doc: this cannot discover an unwired key by inspecting `Config`).
 ///
-/// Empty today: every key this scan was built for has been deleted from
-/// `Config` (see the module doc). A future key with no reader is added here,
-/// per configured `[[backends.lto]]` entry if it is per-backend, once
-/// globally if it is not.
-pub fn scan(_config: &Config) -> Vec<DecorativeHit> {
-    Vec::new()
+/// Reads `[defaults]`, each `[[archive_sets]]` table, and the
+/// `archive_sets` rows — the rows are what `policy::resolve` actually
+/// reads, and `archive-set create/edit` can set the column without the
+/// TOML. An archive set named in both is reported once.
+pub fn scan(config: &Config, conn: &Connection) -> Vec<DecorativeHit> {
+    let mut out = Vec::new();
+    if config.defaults.dirty_on_metadata_change {
+        out.push(DecorativeHit {
+            key: "defaults.dirty_on_metadata_change".to_string(),
+        });
+    }
+
+    let mut sets: Vec<String> = config
+        .archive_sets
+        .iter()
+        .filter(|set| set.dirty_on_metadata_change == Some(true))
+        .map(|set| set.name.clone())
+        .collect();
+    // A missing table (fresh DB) is not an error for an advisory scan.
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT name FROM archive_sets WHERE dirty_on_metadata_change = 1 ORDER BY name")
+    {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            for name in rows.flatten() {
+                if !sets.contains(&name) {
+                    sets.push(name);
+                }
+            }
+        }
+    }
+    out.extend(sets.into_iter().map(|name| DecorativeHit {
+        key: format!("archive_sets[\"{name}\"].dirty_on_metadata_change"),
+    }));
+    out
 }
 
 /// The advisory line for one hit. Pure, so the wording is testable without
 /// a `Config` and so `config check`'s `--json` and text arms can never
 /// drift apart.
-///
-/// Only the generic form survives: the three keys that had bespoke wording
-/// no longer exist, and their reasons now live in the load-time rejection
-/// (`config::stale_lto_fields_message`) where an operator actually meets
-/// them. A future decorative key adds its own arm here.
 pub fn describe(hit: &DecorativeHit) -> String {
-    format!("note: {} is parsed but not consumed.", hit.key)
+    if hit.key.ends_with("dirty_on_metadata_change") {
+        format!(
+            "note: {} = true is parsed but not consumed — dirty detection compares each \
+             file's path, size and modification time only, so a change to permissions, \
+             ownership or extended attributes alone never marks a unit dirty.",
+            hit.key
+        )
+    } else {
+        format!("note: {} is parsed but not consumed.", hit.key)
+    }
 }
 
 #[cfg(test)]
@@ -113,24 +154,72 @@ mod tests {
         }
     }
 
-    /// The default config has no decorative keys — spec W4 deleted all
-    /// three of this module's original subjects from `Config` rather than
-    /// leaving them parsed-and-unread.
+    fn no_db() -> Connection {
+        Connection::open_in_memory().unwrap()
+    }
+
+    /// The default config has no decorative keys: `dirty_on_metadata_change`
+    /// defaults to `false`, which describes what dirty detection does.
     #[test]
     fn a_default_config_reports_nothing() {
         let config = Config::default();
-        assert!(scan(&config).is_empty());
+        assert!(scan(&config, &no_db()).is_empty());
     }
 
-    /// The two deleted per-backend keys were reported once per configured
-    /// drive, so a multi-backend config is the case that would still show
-    /// them if any survived.
+    /// Spec W4 deleted both per-backend subjects of this module; a
+    /// multi-backend config is the case that would still show them.
     #[test]
     fn backends_no_longer_contribute_any_hits() {
         let mut config = Config::default();
         config.backends.lto.push(backend("lto1"));
         config.backends.lto.push(backend("lto2"));
-        assert!(scan(&config).is_empty());
+        assert!(scan(&config, &no_db()).is_empty());
+    }
+
+    /// Issue #347: `dirty_on_metadata_change = true` is resolved and read
+    /// by nothing, so `config check` names it wherever it is set — once per
+    /// archive set even when the TOML and the table both carry it.
+    #[test]
+    fn dirty_on_metadata_change_true_is_named_at_every_layer() {
+        let mut config = Config::default();
+        config.defaults.dirty_on_metadata_change = true;
+        config.archive_sets.push(crate::config::ArchiveSetConfig {
+            name: "media".to_string(),
+            min_copies: None,
+            required_locations: None,
+            encrypt: None,
+            compression: None,
+            checksum_mode: None,
+            verify_interval_days: None,
+            slice_size: None,
+            preserve_xattrs: None,
+            preserve_acls: None,
+            preserve_fsa: None,
+            dirty_on_metadata_change: Some(true),
+        });
+        let conn = crate::db::open_memory().unwrap();
+        for (name, dirty) in [("media", 1), ("docs", 1), ("cold", 0)] {
+            conn.execute(
+                "INSERT INTO archive_sets (name, dirty_on_metadata_change) VALUES (?1, ?2)",
+                rusqlite::params![name, dirty],
+            )
+            .unwrap();
+        }
+
+        let keys: Vec<String> = scan(&config, &conn).into_iter().map(|h| h.key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "defaults.dirty_on_metadata_change".to_string(),
+                "archive_sets[\"media\"].dirty_on_metadata_change".to_string(),
+                "archive_sets[\"docs\"].dirty_on_metadata_change".to_string(),
+            ]
+        );
+        let line = describe(&DecorativeHit {
+            key: keys[0].clone(),
+        });
+        assert!(line.contains("not consumed"), "{line}");
+        assert!(line.contains("dirty detection"), "{line}");
     }
 
     /// The mechanism still works — this is what a future unwired key gets.

@@ -105,18 +105,22 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     // `report.problems`'s generic message does not carry.
     let unknown_key_hits = crate::policy::unknown_keys::scan(&toml_str);
 
-    // Advisory scan (issue #50/#92 precedent): `preserve_acls = false`
-    // cannot take effect (dar has no independent ACL switch; ACLs ride EAs).
+    // Advisory scan (issue #50/#92 precedent): a `preserve_acls` that
+    // disagrees with its layer's `preserve_xattrs` cannot take effect (dar
+    // has no independent ACL switch; ACLs ride EAs, issue #347).
     let subsumed_hits = match loaded {
         Some(cfg) if paths.db_file.exists() => crate::policy::subsumed::scan(cfg, conn),
         Some(cfg) => crate::policy::subsumed::scan(cfg, &rusqlite::Connection::open_in_memory()?),
         None => Vec::new(),
     };
 
-    // Decorative-key advisory (issue #62, #92/#50 precedent).
-    let decorative_hits = loaded
-        .map(crate::policy::decorative::scan)
-        .unwrap_or_default();
+    // Decorative-key advisory (issue #62, #92/#50 precedent; populated by
+    // issue #347). Reads the `archive_sets` table too, like `subsumed`.
+    let decorative_hits = match loaded {
+        Some(cfg) if paths.db_file.exists() => crate::policy::decorative::scan(cfg, conn),
+        Some(cfg) => crate::policy::decorative::scan(cfg, &rusqlite::Connection::open_in_memory()?),
+        None => Vec::new(),
+    };
 
     // Advisory scan (issue #97): a pre-existing archive_sets row whose
     // compression the local dar cannot perform.
@@ -230,6 +234,7 @@ fn print_json(
             serde_json::json!({
                 "source": h.source,
                 "field": "preserve_acls",
+                "value": h.preserve_acls,
                 "note": crate::policy::subsumed::describe(h),
             })
         })
