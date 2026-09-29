@@ -8,6 +8,8 @@ tapectl\-volume\-compact \- Interactive compaction: read + write + finish in one
 .SH DESCRIPTION
 Interactive compaction: read + write + finish in one flow
 .PP
+One drive (`\-\-device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `\-\-to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact\-read <SOURCE>`, swap cartridges, `volume compact\-write \-\-destination <DEST>`, then `volume compact\-finish <SOURCE>`.
+.PP
 Step 3 applies `compact\-finish`\*(Aqs ADR\-0008 Tier\-2 gate and may refuse non\-interactively without `\-\-force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact\-finish <SOURCE> \-\-force` completes the flow without re\-reading or re\-writing anything.
 .SH OPTIONS
 .TP
@@ -15,7 +17,7 @@ Step 3 applies `compact\-finish`\*(Aqs ADR\-0008 Tier\-2 gate and may refuse non
 Output in JSON format
 .TP
 \fB\-\-to\fR \fI<TO>\fR
-Destination volume label. Without it the flow PROMPTS for one, which needs a terminal — pass this to run compaction non\-interactively (issue #146, ADR\-0008\*(Aqs non\-hanging rule)
+Destination volume label (already initialised). With it, the pause after step 1 only asks you to swap cartridges and press Enter; without it, that pause also asks for the label. It never skips the swap: the destination is written through the same drive the source was read from
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
@@ -30,7 +32,7 @@ See `volume write \-\-allow\-missing\-escrow`
 Enable verbose output
 .TP
 \fB\-\-force\fR
-See `volume compact\-finish \-\-force` — step 3\*(Aqs ADR\-0008 Tier\-2 gate. With `\-\-to` and this (or the global `\-\-yes`), the whole three\-step flow runs non\-interactively
+See `volume compact\-finish \-\-force` — step 3\*(Aqs ADR\-0008 Tier\-2 gate. With this (or the global `\-\-yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)

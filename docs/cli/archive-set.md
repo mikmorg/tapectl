@@ -13,10 +13,10 @@ tapectl archive-set [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`create`](#tapectl-archive-set-create) — Create a new archive set policy
-- [`edit`](#tapectl-archive-set-edit) — Edit an existing archive set
+- [`edit`](#tapectl-archive-set-edit) — Edit an existing archive set (flags left out are left unchanged)
 - [`list`](#tapectl-archive-set-list) — List archive sets
 - [`info`](#tapectl-archive-set-info) — Show archive set details
-- [`sync`](#tapectl-archive-set-sync) — Sync archive sets from config.toml
+- [`sync`](#tapectl-archive-set-sync) — Sync archive sets from config.toml (writes only the keys each [[archive_sets]] table names)
 
 ### tapectl archive-set create
 
@@ -33,18 +33,22 @@ tapectl archive-set create [OPTIONS] <NAME>
 **Options**
 
 - `--min-copies <MIN_COPIES>` — Minimum copy count
-- `--required-locations <REQUIRED_LOCATIONS>` — Required locations (comma-separated)
+- `--required-locations <REQUIRED_LOCATIONS>` — Required locations (comma-separated); each must be a registered location (`tapectl location add`)
 - `--encrypt <ENCRYPT>` *(one of `true`, `false`)* — Encryption enabled
 - `--compression <COMPRESSION>` — Compression mode
 - `--checksum-mode <CHECKSUM_MODE>` — Checksum mode
-- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "2400G")
+- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "10G", the default)
 - `--verify-interval-days <VERIFY_INTERVAL_DAYS>` — Verify interval in days
-- `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Omitted leaves the field NULL, which means "defer to the system default"
+- `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Never set means "defer to the system default"
+- `--preserve-xattrs <PRESERVE_XATTRS>` *(one of `true`, `false`)* — Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
+- `--preserve-acls <PRESERVE_ACLS>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false). No effect of its own: ACLs follow --preserve-xattrs
+- `--preserve-fsa <PRESERVE_FSA>` *(one of `true`, `false`)* — Keep filesystem-specific attributes such as chattr flags (true/false)
+- `--dirty-on-metadata-change <DIRTY_ON_METADATA_CHANGE>` *(one of `true`, `false`)* — Treat a metadata-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
 - `-d, --description <DESCRIPTION>` — Description
 
 ### tapectl archive-set edit
 
-Edit an existing archive set
+Edit an existing archive set (flags left out are left unchanged)
 
 ```text
 tapectl archive-set edit [OPTIONS] <NAME>
@@ -57,13 +61,17 @@ tapectl archive-set edit [OPTIONS] <NAME>
 **Options**
 
 - `--min-copies <MIN_COPIES>` — Minimum copy count
-- `--required-locations <REQUIRED_LOCATIONS>` — Required locations (comma-separated)
+- `--required-locations <REQUIRED_LOCATIONS>` — Required locations (comma-separated); each must be a registered location (`tapectl location add`)
 - `--encrypt <ENCRYPT>` *(one of `true`, `false`)* — Encryption enabled
 - `--compression <COMPRESSION>` — Compression mode
 - `--checksum-mode <CHECKSUM_MODE>` — Checksum mode
-- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "2400G")
+- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "10G", the default)
 - `--verify-interval-days <VERIFY_INTERVAL_DAYS>` — Verify interval in days
-- `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Omitted leaves the field NULL, which means "defer to the system default"
+- `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Never set means "defer to the system default"
+- `--preserve-xattrs <PRESERVE_XATTRS>` *(one of `true`, `false`)* — Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
+- `--preserve-acls <PRESERVE_ACLS>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false). No effect of its own: ACLs follow --preserve-xattrs
+- `--preserve-fsa <PRESERVE_FSA>` *(one of `true`, `false`)* — Keep filesystem-specific attributes such as chattr flags (true/false)
+- `--dirty-on-metadata-change <DIRTY_ON_METADATA_CHANGE>` *(one of `true`, `false`)* — Treat a metadata-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
 - `-d, --description <DESCRIPTION>` — Description
 
 ### tapectl archive-set list
@@ -88,7 +96,7 @@ tapectl archive-set info [OPTIONS] <NAME>
 
 ### tapectl archive-set sync
 
-Sync archive sets from config.toml
+Sync archive sets from config.toml (writes only the keys each [[archive_sets]] table names)
 
 ```text
 tapectl archive-set sync [OPTIONS]

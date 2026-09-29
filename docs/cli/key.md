@@ -31,7 +31,7 @@ tapectl key generate [OPTIONS]
 
 - `--tenant <TENANT>` — Tenant name (required unless --escrow)
 - `--alias <ALIAS>` — Key alias (e.g., "primary", "backup", "2026") (required unless --escrow)
-- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type
+- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type. Not with --escrow, which has none to set
 - `--description <DESCRIPTION>` — Description
 - `--escrow` — Generate the permanent escrow recipient identity instead of a per-tenant key (ADR-0005). Prints the secret exactly once, for paper transcription — tapectl never stores it. Refuses if an escrow identity is already registered; there is only ever one, for the life of the archive
 
@@ -86,9 +86,10 @@ tapectl key import [OPTIONS] <PATH>
 **Options**
 
 - `--tenant <TENANT>` — Tenant name (required unless --escrow)
-- `--alias <ALIAS>` — Key alias (required unless --escrow)
-- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type
+- `--alias <ALIAS>` — Key alias (required unless --escrow or --reactivate)
+- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type. Not with --escrow or --reactivate, which have none to set: a reactivated key keeps the type it was registered with
 - `--escrow` — Adopt this public key as the permanent escrow recipient (ADR-0005). Refuses if one is already registered
+- `--reactivate` — Make this public key a recipient of new writes again when the catalog already has it for this tenant, deactivated (as `key rotate` leaves every key it replaces). The key keeps the alias it was registered under. Refuses for a key that is active, unknown, another tenant's, or the escrow identity
 
 ### tapectl key escrow-kit
 

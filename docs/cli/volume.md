@@ -113,7 +113,9 @@ tapectl volume abort [OPTIONS] <LABEL>
 
 ### tapectl volume verify
 
-Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing)
+Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing).
+
+Exit status: 0 = every checked file matched. 2 = the verify PROVED THE MEDIUM BAD: the volume is quarantined and no longer counts as a copy — write its content to another cartridge. 3 = inconclusive: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched — check the drive and verify again.
 
 ```text
 tapectl volume verify [OPTIONS] <LABEL>
@@ -247,6 +249,8 @@ tapectl volume compact-finish [OPTIONS] <LABEL>
 
 Interactive compaction: read + write + finish in one flow
 
+One drive (`--device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `--to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact-read <SOURCE>`, swap cartridges, `volume compact-write --destination <DEST>`, then `volume compact-finish <SOURCE>`.
+
 Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may refuse non-interactively without `--force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact-finish <SOURCE> --force` completes the flow without re-reading or re-writing anything.
 
 ```text
@@ -259,10 +263,10 @@ tapectl volume compact [OPTIONS] <LABEL>
 
 **Options**
 
-- `--to <TO>` — Destination volume label. Without it the flow PROMPTS for one, which needs a terminal — pass this to run compaction non-interactively (issue #146, ADR-0008's non-hanging rule)
+- `--to <TO>` — Destination volume label (already initialised). With it, the pause after step 1 only asks you to swap cartridges and press Enter; without it, that pause also asks for the label. It never skips the swap: the destination is written through the same drive the source was read from
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`
-- `--force` — See `volume compact-finish --force` — step 3's ADR-0008 Tier-2 gate. With `--to` and this (or the global `--yes`), the whole three-step flow runs non-interactively
+- `--force` — See `volume compact-finish --force` — step 3's ADR-0008 Tier-2 gate. With this (or the global `--yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
 
 ### tapectl volume deposit
 

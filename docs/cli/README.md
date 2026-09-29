@@ -101,10 +101,10 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`cartridge journal`](cartridge.md#tapectl-cartridge-journal) | Show the MAM journal: every MAM read taken of a cartridge, verbatim |
 | [`archive-set`](archive-set.md) | Manage archive set policies |
 | &nbsp;&nbsp;[`archive-set create`](archive-set.md#tapectl-archive-set-create) | Create a new archive set policy |
-| &nbsp;&nbsp;[`archive-set edit`](archive-set.md#tapectl-archive-set-edit) | Edit an existing archive set |
+| &nbsp;&nbsp;[`archive-set edit`](archive-set.md#tapectl-archive-set-edit) | Edit an existing archive set (flags left out are left unchanged) |
 | &nbsp;&nbsp;[`archive-set list`](archive-set.md#tapectl-archive-set-list) | List archive sets |
 | &nbsp;&nbsp;[`archive-set info`](archive-set.md#tapectl-archive-set-info) | Show archive set details |
-| &nbsp;&nbsp;[`archive-set sync`](archive-set.md#tapectl-archive-set-sync) | Sync archive sets from config.toml |
+| &nbsp;&nbsp;[`archive-set sync`](archive-set.md#tapectl-archive-set-sync) | Sync archive sets from config.toml (writes only the keys each [[archive_sets]] table names) |
 | [`audit`](audit.md) | Policy compliance audit |
 | [`catalog`](catalog.md) | Browse and search file catalog |
 | &nbsp;&nbsp;[`catalog ls`](catalog.md#tapectl-catalog-ls) | List files in a unit's latest snapshot |

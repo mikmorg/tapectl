@@ -6,7 +6,9 @@ tapectl\-volume\-verify \- Verify volume contents via the keyless chain walk (se
 .SH SYNOPSIS
 \fBtapectl volume verify\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-full\fR] [\fB\-\-quick\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
-Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
+Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing).
+.PP
+Exit status: 0 = every checked file matched. 2 = the verify PROVED THE MEDIUM BAD: the volume is quarantined and no longer counts as a copy — write its content to another cartridge. 3 = inconclusive: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched — check the drive and verify again.
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
