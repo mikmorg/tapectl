@@ -274,6 +274,14 @@ pub enum VolumeCommands {
 
     /// Interactive compaction: read + write + finish in one flow
     ///
+    /// One drive (`--device`) serves both the read and the write, so the
+    /// flow PAUSES after step 1 for you to unload the source and load the
+    /// destination — always, with or without `--to`. It therefore needs a
+    /// terminal, and without one it refuses before reading anything. To
+    /// compact unattended, run the steps separately: `volume compact-read
+    /// <SOURCE>`, swap cartridges, `volume compact-write --destination
+    /// <DEST>`, then `volume compact-finish <SOURCE>`.
+    ///
     /// Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may
     /// refuse non-interactively without `--force`. When it does, the
     /// destination tape is already written and sealed and nothing is lost:
@@ -282,9 +290,11 @@ pub enum VolumeCommands {
     Compact {
         /// Source volume label
         label: String,
-        /// Destination volume label. Without it the flow PROMPTS for one,
-        /// which needs a terminal — pass this to run compaction
-        /// non-interactively (issue #146, ADR-0008's non-hanging rule).
+        /// Destination volume label (already initialised). With it, the
+        /// pause after step 1 only asks you to swap cartridges and press
+        /// Enter; without it, that pause also asks for the label. It never
+        /// skips the swap: the destination is written through the same
+        /// drive the source was read from.
         #[arg(long)]
         to: Option<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
@@ -295,8 +305,8 @@ pub enum VolumeCommands {
         #[arg(long)]
         allow_missing_escrow: bool,
         /// See `volume compact-finish --force` — step 3's ADR-0008 Tier-2
-        /// gate. With `--to` and this (or the global `--yes`), the whole
-        /// three-step flow runs non-interactively.
+        /// gate. With this (or the global `--yes`) step 3 asks nothing; the
+        /// cartridge swap after step 1 still waits for you.
         #[arg(long)]
         force: bool,
     },
@@ -1339,6 +1349,14 @@ pub fn run(
             // step 2 writes, so this needs a real backend even though step 1
             // only reads.
             let device = write_device(config, device.as_deref())?;
+            // Issue #358: ONE drive serves both steps, so someone must swap
+            // cartridges between them. With no terminal nobody can, and the
+            // refusal comes now — before step 1's read, not after it.
+            let to = refuse_unattended_compact(
+                crate::cli::consent::stdin_is_terminal(),
+                label,
+                to.as_deref(),
+            )?;
             // Issue #166: step 1 only reads, so it gets the same fact check
             // as every other read path, before its store is opened.
             let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeCompact);
@@ -1376,7 +1394,10 @@ pub fn run(
                 crate::util::format_bytes_binary(report.bytes_read),
             );
 
-            let dest_label = resolve_compact_destination(to.as_deref())?;
+            // Issue #358: the swap. Step 1's store has closed; the source is
+            // still in the drive. `--to` names the destination — it never
+            // skips this pause.
+            let dest_label = swap_to_destination(to.as_deref(), label, &device)?;
             let dest_label = dest_label.as_str();
 
             println!("=== Step 2: Writing compaction slices to \"{dest_label}\" ===");
@@ -1736,73 +1757,140 @@ fn run_deposit(
     Ok(())
 }
 
+/// `volume compact`'s unattended refusal, taken BEFORE step 1 (issue #358),
+/// and the `--to` check that belongs with it. Returns `--to`, trimmed.
+///
+/// `volume compact` has ONE `--device`: step 1 reads the source through it
+/// and step 2 writes the destination through the same drive, so a person has
+/// to unload one cartridge and load the other in between. With no terminal
+/// there is nobody to do that or to say it is done, and ADR-0008's
+/// non-hanging rule forbids waiting for them. Until #358 `--to` made the
+/// command run straight through anyway — issue #146 had added it so
+/// compaction could run from a script — and on its one drive step 2 then
+/// wrote to the SOURCE tape still loaded, where File 0 refused it, after a
+/// read that can take hours. Refusing here costs nothing: no drive has been
+/// touched. The three separate steps are the unattended recipe, and the
+/// refusal names them — `compact-read`, the swap, `compact-write`,
+/// `compact-finish` — with the destination filled in when `--to` gave one.
+///
+/// An empty `--to` is refused here too, before step 1 rather than after it.
+fn refuse_unattended_compact(
+    is_tty: bool,
+    source: &str,
+    to: Option<&str>,
+) -> Result<Option<String>> {
+    let to = match to.map(str::trim) {
+        Some("") => {
+            return Err(TapectlError::Other(
+                "--to was given an empty destination label".into(),
+            ))
+        }
+        other => other.map(str::to_string),
+    };
+    if is_tty {
+        return Ok(to);
+    }
+    let dest = to.as_deref().unwrap_or("<DEST>");
+    Err(TapectlError::Other(format!(
+        "volume compact refused: it reads \"{source}\" and writes the destination through \
+         ONE drive, so someone has to swap cartridges between the two steps, and stdin is \
+         not a terminal — there is nobody to do it or to say it is done. Nothing was read. \
+         Run the three steps separately, which works unattended:\n    \
+         tapectl volume compact-read {source}\n    \
+         (unload \"{source}\", load the destination)\n    \
+         tapectl volume compact-write --destination {dest}\n    \
+         tapectl volume compact-finish {source}"
+    )))
+}
+
+/// The pause between `volume compact`'s step 1 and step 2: the operator
+/// swaps cartridges, and the destination label is settled (issue #358).
+///
+/// **Always a pause, `--to` or not.** One `--device` serves both steps, so
+/// the source is still in the drive when step 1 ends. With `--to` the
+/// operator only confirms the swap (Enter); without it the one prompt is
+/// both the swap and the label, as it always was (issue #146). An end of
+/// input (Ctrl-D) is not a confirmed swap: nothing is written, and the
+/// message says how to finish from the slices step 1 staged.
+///
+/// Never reads a non-terminal (ADR-0008's non-hanging rule; issue #146's
+/// crux). `run` refuses that case before step 1 via
+/// [`refuse_unattended_compact`], so this arm is the belt to its braces.
+fn swap_to_destination(to: Option<&str>, source: &str, device: &str) -> Result<String> {
+    swap_to_destination_with(
+        to,
+        source,
+        device,
+        crate::cli::consent::stdin_is_terminal(),
+        || {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            Ok(input)
+        },
+    )
+}
+
+/// [`swap_to_destination`] with the TTY answer and the read injected, so the
+/// pause is provably taken and the non-interactive branch provably never
+/// reads — the same testing discipline as `cli::consent::confirm_with`.
+fn swap_to_destination_with(
+    to: Option<&str>,
+    source: &str,
+    device: &str,
+    is_tty: bool,
+    read_answer: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    let finish_later = |dest: &str| {
+        format!(
+            "the live slices of \"{source}\" are staged; to finish, load the destination and \
+             run `tapectl volume compact-write --destination {dest}`, then \
+             `tapectl volume compact-finish {source}`"
+        )
+    };
+    if !is_tty {
+        return Err(TapectlError::Other(format!(
+            "volume compact stopped before step 2: stdin is not a terminal, so nobody can swap \
+             cartridges — {}",
+            finish_later(to.unwrap_or("<DEST>"))
+        )));
+    }
+    match to {
+        Some(dest) => {
+            println!(
+                "\nUnload \"{source}\" from {device} and load the destination \"{dest}\", then \
+                 press Enter to write it (Ctrl-D stops here):"
+            );
+            let answer = read_answer()?;
+            if answer.is_empty() {
+                return Err(TapectlError::Other(format!(
+                    "volume compact stopped before step 2: no answer at the swap prompt — {}",
+                    finish_later(dest)
+                )));
+            }
+            Ok(dest.to_string())
+        }
+        None => {
+            println!(
+                "\nUnload \"{source}\" from {device}, load the destination tape, and enter its \
+                 volume label:"
+            );
+            let input = read_answer()?;
+            let label = input.trim();
+            if label.is_empty() {
+                return Err(TapectlError::Other(format!(
+                    "no destination label provided — {}",
+                    finish_later("<DEST>")
+                )));
+            }
+            Ok(label.to_string())
+        }
+    }
+}
+
 /// ADR-0004 Tier 1: print the remaining-coverage evidence for every unit
 /// `compact_finish` retired coverage for. Display-only, matching
 /// `cli::operations::print_retire_impact`'s evidence lines -- compaction
 /// retires the source volume exactly like `volume retire` does.
-/// The compaction destination label, resolved WITHOUT ever blocking on a
-/// prompt nobody can answer (issue #146).
-///
-/// `volume compact`'s step-2 destination used to be a bare
-/// `stdin().read_line()` with no terminal check, and the global `--yes` did
-/// not skip it — so a cron job, the mhvtl verify gate, or any redirected
-/// run hung here forever. That is precisely the failure shape ADR-0008
-/// names ("blocking forever on a handle that will never produce input",
-/// the issue #33 class), and its rule is absolute: refuse with a non-zero
-/// exit rather than wait.
-///
-/// This is NOT routed through `cli::consent::confirm`. That is the Tier-2
-/// y/N gate; this is a VALUE the operator has to supply, and there is no
-/// safe default to assume — `--yes` cannot invent a label. So the terminal
-/// check is the same (`consent::stdin_is_terminal`, false in a test build) and the
-/// override is `--to`.
-fn resolve_compact_destination(to: Option<&str>) -> Result<String> {
-    resolve_compact_destination_with(to, crate::cli::consent::stdin_is_terminal(), || {
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        Ok(input)
-    })
-}
-
-/// [`resolve_compact_destination`] with the TTY answer and the read
-/// injected, so the non-interactive branch can be proven never to attempt
-/// the read that would hang — the same testing discipline as
-/// `cli::consent::confirm_with`.
-fn resolve_compact_destination_with(
-    to: Option<&str>,
-    is_tty: bool,
-    read_answer: impl FnOnce() -> Result<String>,
-) -> Result<String> {
-    if let Some(label) = to {
-        let label = label.trim();
-        if label.is_empty() {
-            return Err(crate::error::TapectlError::Other(
-                "--to was given an empty destination label".into(),
-            ));
-        }
-        return Ok(label.to_string());
-    }
-
-    if !is_tty {
-        return Err(crate::error::TapectlError::Other(
-            "volume compact refused: a destination label is required and stdin is not a \
-             terminal, so there is nobody to prompt — re-run with `--to <LABEL>` (the \
-             destination tape must already be initialised)"
-                .into(),
-        ));
-    }
-
-    println!("\nInsert destination tape and enter volume label:");
-    let input = read_answer()?;
-    let label = input.trim();
-    if label.is_empty() {
-        return Err(crate::error::TapectlError::Other(
-            "no destination label provided".into(),
-        ));
-    }
-    Ok(label.to_string())
-}
-
 fn print_compact_finish_evidence(report: &[write::CompactFinishReport]) {
     let now = chrono::Utc::now().naive_utc();
     for unit in report {
@@ -2545,61 +2633,111 @@ mod tests {
     /// Issue #146: `volume compact`'s destination-label prompt had no
     /// terminal check, so a non-interactive run blocked forever on a handle
     /// nobody would ever write to — the issue #33 failure shape ADR-0008
-    /// names by name. Every test here drives `resolve_compact_destination_with`
-    /// so both the TTY answer and the read are injected; the real
-    /// `resolve_compact_destination` is never called, exactly as
+    /// names by name. Issue #358: `--to` then skipped the prompt — and with
+    /// it the only pause in the flow — so on its one drive step 2 wrote to
+    /// the source tape still loaded. Every test here injects both the TTY
+    /// answer and the read; the real stdin is never touched, exactly as
     /// `cli::consent`'s own tests avoid the ambient terminal.
     mod compact_destination {
         use super::*;
+        use std::cell::Cell;
 
-        /// The crux: the refusal path must not merely return an error, it
-        /// must never ATTEMPT the read that would hang.
+        const SRC: &str = "L6-SRC";
+        const DEV: &str = "/nonexistent/tapectl-compact-nst";
+
+        /// Issue #358, the crux: `--to` names the destination, it does not
+        /// skip the swap. One `--device` serves both steps, so the flow must
+        /// stop for the operator to unload the source and load the
+        /// destination — with `--to` exactly as without it.
         #[test]
-        fn non_tty_without_to_refuses_and_never_reads_stdin() {
-            let err = resolve_compact_destination_with(None, false, || {
-                panic!("must never attempt to read stdin when non-TTY and --to was not given")
+        fn to_still_pauses_for_the_cartridge_swap() {
+            let read = Cell::new(false);
+            let label = swap_to_destination_with(Some("L6-DST"), SRC, DEV, true, || {
+                read.set(true);
+                Ok("\n".to_string())
             })
-            .expect_err("a non-interactive compaction with no --to must refuse");
-            let msg = err.to_string();
-            assert!(msg.contains("refused"), "got: {msg}");
+            .unwrap();
+            assert_eq!(label, "L6-DST");
             assert!(
-                msg.contains("--to"),
-                "the refusal must name the override; got: {msg}"
+                read.get(),
+                "the flow must wait for the operator to swap cartridges, --to or not"
             );
         }
 
-        /// `--to` short-circuits before any stdin interaction, on a TTY or
-        /// not — that is what makes compaction scriptable.
+        /// Ctrl-D at the swap prompt is not "I swapped": nothing is written,
+        /// and the refusal says how to finish later from the staged slices.
         #[test]
-        fn to_short_circuits_before_any_read() {
-            for is_tty in [true, false] {
-                let label = resolve_compact_destination_with(Some("L6-DST"), is_tty, || {
-                    panic!("--to must short-circuit before any stdin read")
-                })
-                .unwrap();
-                assert_eq!(label, "L6-DST");
+        fn end_of_input_at_the_swap_prompt_stops_before_writing() {
+            let err =
+                swap_to_destination_with(Some("L6-DST"), SRC, DEV, true, || Ok(String::new()))
+                    .expect_err("no answer is not a confirmed swap");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("volume compact-write --destination L6-DST"),
+                "{msg}"
+            );
+        }
+
+        /// Never reached through `run` (the up-front refusal comes first),
+        /// but the rule is absolute: a non-terminal is never read.
+        #[test]
+        fn non_tty_never_reads_stdin_at_the_swap() {
+            for to in [None, Some("L6-DST")] {
+                let err = swap_to_destination_with(to, SRC, DEV, false, || {
+                    panic!("must never attempt to read stdin when non-TTY")
+                });
+                assert!(err.is_err(), "{to:?}");
+            }
+        }
+
+        /// Issue #358: with no terminal nobody can swap cartridges, so the
+        /// whole command is refused BEFORE step 1 — not after a multi-hour
+        /// read — naming the three separate steps that do work unattended.
+        #[test]
+        fn non_tty_refuses_before_step_1_naming_the_three_step_recipe() {
+            for (to, dest) in [(Some("L6-DST"), "L6-DST"), (None, "<DEST>")] {
+                let err = refuse_unattended_compact(false, SRC, to)
+                    .expect_err("no terminal, nobody to swap cartridges");
+                let msg = err.to_string();
+                assert!(msg.contains("refused"), "{msg}");
+                assert!(msg.contains("terminal"), "{msg}");
+                for step in [
+                    format!("tapectl volume compact-read {SRC}"),
+                    format!("tapectl volume compact-write --destination {dest}"),
+                    format!("tapectl volume compact-finish {SRC}"),
+                ] {
+                    assert!(msg.contains(&step), "missing `{step}`: {msg}");
+                }
             }
         }
 
         #[test]
-        fn to_is_trimmed_and_an_empty_one_is_rejected() {
+        fn a_tty_is_not_refused_up_front() {
             assert_eq!(
-                resolve_compact_destination_with(Some("  L6-DST\n"), false, || unreachable!())
-                    .unwrap(),
-                "L6-DST"
+                refuse_unattended_compact(true, SRC, Some(" L6-DST\n")).unwrap(),
+                Some("L6-DST".to_string()),
+                "--to is trimmed"
             );
-            assert!(
-                resolve_compact_destination_with(Some("   "), false, || unreachable!()).is_err(),
-                "an empty --to is a mistake, not a request to prompt"
-            );
+            assert_eq!(refuse_unattended_compact(true, SRC, None).unwrap(), None);
         }
 
-        /// The interactive path still works — the fix is a terminal check,
-        /// not the removal of the prompt.
+        /// An empty `--to` is a mistake, not a request to prompt — and it is
+        /// caught before step 1 now, not after the read.
         #[test]
-        fn a_tty_still_prompts_and_trims_the_answer() {
+        fn an_empty_to_is_rejected_before_step_1() {
+            for is_tty in [true, false] {
+                let err = refuse_unattended_compact(is_tty, SRC, Some("   "))
+                    .expect_err("an empty --to is a mistake");
+                assert!(err.to_string().contains("--to"), "{err}");
+            }
+        }
+
+        /// Without `--to` the one prompt is still both the swap and the
+        /// label, and it names the source to unload.
+        #[test]
+        fn a_tty_without_to_prompts_and_trims_the_answer() {
             let label =
-                resolve_compact_destination_with(None, true, || Ok("  L6-DST \n".to_string()))
+                swap_to_destination_with(None, SRC, DEV, true, || Ok("  L6-DST \n".to_string()))
                     .unwrap();
             assert_eq!(label, "L6-DST");
         }
@@ -2608,7 +2746,55 @@ mod tests {
         /// the read; it still is.
         #[test]
         fn an_empty_answer_on_a_tty_is_refused() {
-            assert!(resolve_compact_destination_with(None, true, || Ok("\n".to_string())).is_err());
+            assert!(
+                swap_to_destination_with(None, SRC, DEV, true, || Ok("\n".to_string())).is_err()
+            );
+        }
+
+        /// Through the real command arm: `volume compact --to` with no
+        /// terminal (every test build — `stdin_is_terminal` is false under
+        /// `cfg(test)`) refuses before step 1 touches the drive: no MAM
+        /// read is journalled and no contact is recorded. Until #358 this
+        /// read the whole source volume and then failed at File 0 of the
+        /// source tape still loaded.
+        #[test]
+        fn volume_compact_to_without_a_terminal_refuses_before_touching_the_drive() {
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut config = Config::default();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto0".into(),
+                device_tape: DEV.into(),
+                device_sg: "/nonexistent/tapectl-compact-sg".into(),
+                generation: "LTO-6".into(),
+                capacity_override: None,
+                usable_capacity_factor: 1.0,
+                enospc_buffer: "0".into(),
+            });
+            let cmd = VolumeCommands::Compact {
+                label: SRC.into(),
+                to: Some("L6-DST".into()),
+                device: Some(DEV.into()),
+                allow_missing_escrow: false,
+                force: true,
+            };
+            let err = run(&conn, &paths, &config, &cmd, false, true, false)
+                .expect_err("no terminal: nobody can swap the cartridges");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("tapectl volume compact-read L6-SRC"),
+                "the refusal names the unattended recipe: {msg}"
+            );
+            let touched: i64 = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM mam_journal)
+                          + (SELECT COUNT(*) FROM cartridge_contacts)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(touched, 0, "refused before step 1 read anything");
         }
     }
 
