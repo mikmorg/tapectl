@@ -896,6 +896,22 @@ mod tests {
         assert!(msg.contains("\"lto6\""), "{msg}");
         assert!(msg.contains("/dev/tape/by-id/scsi-EXAMPLE-nst"), "{msg}");
         assert!(msg.contains("config check"), "{msg}");
+
+        // Issue #357: the ruling is cited by its ADR, which tells an operator
+        // why; the tracker number (`#143`) told them nothing.
+        assert!(msg.contains("by decision: ADR-0012)"), "{msg}");
+        assert!(!msg.contains('#'), "no issue numbers in a runtime message: {msg}");
+    }
+
+    /// The read-side twin carries the same config half, so the same #357
+    /// rule: the ADR stays, the issue number does not.
+    #[test]
+    fn cannot_read_message_cites_the_adr_not_an_issue_number() {
+        let backend = test_backend("lto5", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-5");
+        let msg = cannot_read_message(Generation::Lto5, Generation::Lto7, &backend);
+        assert!(msg.contains("cannot read LTO-7 media"), "{msg}");
+        assert!(msg.contains("by decision: ADR-0012)"), "{msg}");
+        assert!(!msg.contains('#'), "no issue numbers in a runtime message: {msg}");
     }
 
     #[test]
