@@ -15,7 +15,7 @@ It answers one question: **which remaining work needs a person, and which does n
 
 > **2026-09-29 — the pre-production pass landed** (master `21212a1`; ADR-0012's
 > 2026-09-29 amendment). The documentation pass's 18 issues (#345–#362) are fixed and
-> closed except #360 (a CTO question), with the File 0 `tr` fix (#349's neighbour) and
+> closed except #360 (ruled 2026-09-29; built after the first write), with the File 0 `tr` fix (#349's neighbour) and
 > the `tar` check in RESTORE.sh. Verified together: 2214 tests, the mhvtl gate GREEN
 > **40/40** (new: `empty_drive_refused`), `lifecycle-suite --all` GREEN (399 passed,
 > 13 structural skips), `first-run.sh` end to end on mhvtl, migration 026 on a real

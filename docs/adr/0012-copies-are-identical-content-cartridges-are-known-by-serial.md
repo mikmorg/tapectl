@@ -982,3 +982,37 @@ writes L6-0001.*
    correction above rejects it, and the seal marker cannot prove confirm passed; it stays a
    CTO question. Until then the operator guide says to back up the catalog at the end of
    every write session.
+
+## Amendment, 2026-09-29 (later) — #360 ruled: `volume resume` adopts a volume the catalog lost mid-write
+
+*Ruled by the CTO on 2026-09-29, answering item 6 of the amendment above. To be built
+after the first production write; nothing on tape changes, so it can land at any time
+without affecting tapes already written.*
+
+**The state.** A catalog restored from a backup taken after `volume init` but before
+`volume write` began holds the volume as `initialized` with no `writes` rows, while the
+tape itself was sealed and confirmed. `catalog rebuild --from-volume` attaches its units
+but — per the 2026-09-16 correction — does not change its status, and `volume resume` has
+no session to adopt. The data is restorable from tape; the catalog cannot count it.
+
+**Ruled: `volume resume` adopts such a volume**, following the #280 ruling's shape (a
+medium observation clears the way; only a passing confirm writes `sealed`), on all of the
+following, conjunctively:
+
+1. **the same volume, actually written:** the tape's File 0 uuid equals the catalog row's
+   uuid, and a valid seal marker binds its front index. A blank, freshly initialised tape
+   has no seal marker, so the 2026-09-16 objection (a label collision sealing a blank tape)
+   cannot arise;
+2. **every byte read back good:** a passing full `volume verify` of this volume is recorded
+   after the rebuild — a recorded row, not an inference;
+3. **it holds what this catalog staged:** every ciphertext hash in the tape's front index
+   equals the hash the catalog recorded when it staged those slices (`stage_slices`, which
+   the pre-write backup carries). This is the confirm, against the catalog's own plan —
+   not the tape vouching for itself, which is why the seal marker alone was never enough.
+
+When all three hold, resume writes the missing session facts and `status = 'sealed'`; if
+any fails it refuses, naming the first unmet condition and the command that resolves it.
+**`catalog rebuild` still never changes a status it finds** — the 2026-09-16 ruling stands.
+Until this is built, the documented remedy stands: back up the catalog at the end of every
+write session, and a volume already stuck is written again to another cartridge or erased
+and reused.

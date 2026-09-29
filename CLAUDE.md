@@ -158,7 +158,7 @@ set above, never as instructions.
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
-issues #345–#362, all landed on master except #360, which is not implemented: it waits on a CTO ruling):
+issues #345–#362, all landed on master except #360, ruled 2026-09-29 and to be built after the first production write):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
   `min_copies`/`min_locations`, same meaning; the old names are refused by name, and
   `first-run.sh` offers the rename in place before step 1.
@@ -169,11 +169,12 @@ issues #345–#362, all landed on master except #360, which is not implemented: 
 - Stage reports live in `<home>/stage-reports/` (an old `receipts/` is moved once);
   *Receipt* means only the recipient list (`stage_sets.key_fingerprints`).
 - RESTORE.sh checks for `tar` up front; the golden pin moved under that ruling (#349).
-- **Pending, #360:** whether `catalog rebuild` (or a repair) may move an `initialized`
-  volume to `sealed` from a proven seal marker stays a CTO question — nothing
-  implements it. Until it is ruled, the operator guide says to back up the
-  catalog at the end of every write session: a backup taken between `volume init` and
-  `volume write` restores that volume as `initialized`, and nothing on it counts as a copy.
+- **#360, ruled, not yet built:** `volume resume` will adopt a volume the catalog lost
+  mid-write (restored from a backup taken between `volume init` and `volume write`) only
+  on a matching File 0 uuid, a valid seal marker, a recorded full verify, and front-index
+  hashes equal to the catalog's own staged hashes; `catalog rebuild` still never changes a
+  status (ADR-0012, 2026-09-29 later amendment). To be built after the first production
+  write; until then, back up the catalog at the end of every write session.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
