@@ -396,7 +396,9 @@ impl PolicyWrite {
     /// #48 item 5). With `only_changes`, a column that already holds the
     /// new value is skipped and not logged: `sync` re-applies the same
     /// config on every run, and an event per unchanged key per run would
-    /// bury the real ones. Returns how many columns were written.
+    /// bury the real ones. Returns how many columns were written. The
+    /// `format!`ed column names come only from [`Self::columns`]'s fixed
+    /// literals, never from input.
     fn apply(
         &self,
         conn: &Connection,
