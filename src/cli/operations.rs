@@ -3005,6 +3005,7 @@ pub fn snapshot_mark_reclaimable(
     unit_name: &str,
     version: i64,
     force: bool,
+    assume_yes: bool,
     json_output: bool,
 ) -> Result<()> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
@@ -3033,18 +3034,42 @@ pub fn snapshot_mark_reclaimable(
     // Issue #348: a failed precondition is ADR-0008 Tier 2 — degraded
     // coverage the operator may knowingly accept — so it goes through the
     // one consent gate (`cli::consent::confirm`: a terminal asks, `--force`
-    // confirms in advance, a non-interactive run without it refuses with
-    // the fact), as `unit mark-tape-only`'s does. `Blocked.reason` is that
-    // fact. The policy is resolved even under `--force`: a gate that
-    // greenlights deletion must not guess at a policy it cannot read.
-    if let crate::policy::reclaimable::ReclaimVerdict::Blocked { reason, .. } =
-        crate::policy::reclaimable::assess(conn, config, &unit, version)?
+    // or the global `--yes` confirms in advance, a non-interactive run
+    // without either refuses with the fact), as `unit mark-tape-only`'s
+    // does. `Blocked.reason` is that fact. The policy is resolved even
+    // under `--force`: a gate that greenlights deletion must not guess at a
+    // policy it cannot read.
+    //
+    // One blocker is NOT a coverage shortfall: no current version supersedes
+    // this one, so marking it reclaimable would release the unit's only
+    // current version. Before #348 nothing but an explicit `--force` passed
+    // it, and the #348 reroute must not widen that — so it stays a refusal
+    // that neither a terminal's "y" nor the global `--yes` can answer
+    // (review of 2026-09-29).
+    if let crate::policy::reclaimable::ReclaimVerdict::Blocked {
+        reason,
+        superseding_version,
+        ..
+    } = crate::policy::reclaimable::assess(conn, config, &unit, version)?
     {
-        crate::cli::consent::confirm(
-            &format!("mark snapshot \"{unit_name}\" v{version} reclaimable"),
-            &[reason, "(`--force` confirms this in advance)".to_string()],
-            force,
-        )?;
+        match superseding_version {
+            None if !force => {
+                return Err(TapectlError::Other(format!(
+                    "{reason} — marking it reclaimable would release \"{unit_name}\"'s only \
+                     current version. That is not a shortfall a prompt or --yes can accept; \
+                     only an explicit --force overrides it."
+                )));
+            }
+            None => {}
+            Some(_) => crate::cli::consent::confirm(
+                &format!("mark snapshot \"{unit_name}\" v{version} reclaimable"),
+                &[
+                    reason,
+                    "(`--force` or `--yes` confirms this in advance)".to_string(),
+                ],
+                force || assume_yes,
+            )?,
+        }
     }
 
     conn.execute(
@@ -5915,6 +5940,63 @@ mod tests {
             (conn, unit_id)
         }
 
+        /// A version no current version supersedes is the unit's only current
+        /// version: marking it reclaimable is not a coverage shortfall the
+        /// #348 consent gate may accept. `--yes` (and so a terminal's "y",
+        /// which the same gate would take) must not pass it; only an
+        /// explicit `--force` does, as before #348 (review of 2026-09-29).
+        #[test]
+        fn mark_reclaimable_without_a_superseder_is_force_only_not_yes() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('uuid-only', 'only-version', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let config = Config::default();
+
+            let err =
+                snapshot_mark_reclaimable(&conn, &config, "only-version", 1, false, true, false)
+                    .expect_err("--yes must not release the only current version");
+            assert!(
+                err.to_string().contains("only an explicit --force"),
+                "{err}"
+            );
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM snapshots WHERE unit_id = ?1 AND version = 1",
+                    params![unit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "current", "a refused mark must change nothing");
+
+            snapshot_mark_reclaimable(&conn, &config, "only-version", 1, true, false, false)
+                .expect("an explicit --force still overrides it");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM snapshots WHERE unit_id = ?1 AND version = 1",
+                    params![unit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "reclaimable");
+        }
+
         fn mark_reclaimable_refuses_for_status(status: &str) {
             let name = format!("rec-{status}");
             // `Config::default()`'s `resolved.required_locations` stays
@@ -5923,7 +6005,7 @@ mod tests {
             // precondition under test can refuse.
             let config = Config::default();
             let (conn, _unit_id) = setup_reclaimable_fixture(&name, status);
-            let err = snapshot_mark_reclaimable(&conn, &config, &name, 1, false, false).expect_err(
+            let err = snapshot_mark_reclaimable(&conn, &config, &name, 1, false, false, false).expect_err(
                 &format!(
                     "a {status} second volume must not count toward the superseding snapshot's coverage"
                 ),
@@ -5959,7 +6041,7 @@ mod tests {
         fn mark_reclaimable_counts_two_sealed_volumes_as_two() {
             let (conn, _unit_id) = setup_reclaimable_fixture("rec-both-sealed", "sealed");
             let config = Config::default();
-            snapshot_mark_reclaimable(&conn, &config, "rec-both-sealed", 1, false, false)
+            snapshot_mark_reclaimable(&conn, &config, "rec-both-sealed", 1, false, false, false)
                 .expect("two sealed volumes on the superseding snapshot must satisfy min_copies=2");
         }
 
@@ -5975,7 +6057,7 @@ mod tests {
             let name = "rec-forced";
             let (conn, unit_id) = setup_reclaimable_fixture(name, "retired");
             let config = Config::default();
-            snapshot_mark_reclaimable(&conn, &config, name, 1, true, false)
+            snapshot_mark_reclaimable(&conn, &config, name, 1, true, false, false)
                 .expect("--force confirms a Tier-2 shortfall in advance");
             let status: String = conn
                 .query_row(
@@ -6000,7 +6082,7 @@ mod tests {
             let (conn, unit_id) = setup_reclaimable_fixture(name, "retired");
             let mut config = Config::default();
             config.defaults.slice_size = "not-a-size".to_string();
-            let err = snapshot_mark_reclaimable(&conn, &config, name, 1, true, false)
+            let err = snapshot_mark_reclaimable(&conn, &config, name, 1, true, false, false)
                 .expect_err("an unresolvable policy is not waived by --force");
             assert!(
                 matches!(err, TapectlError::PolicyUnresolvable { .. }),
@@ -6014,6 +6096,56 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(status, "superseded", "nothing was marked");
+        }
+
+        /// Issue #348: the consent gate's non-interactive refusal says
+        /// "re-run with --yes to proceed", which is true only if the global
+        /// `--yes` reaches the handler — so this goes through
+        /// `cli::snapshot::run`, the dispatch `main` calls with `cli.yes`,
+        /// not the handler. (`cfg(test)` makes stdin a non-terminal.)
+        #[test]
+        fn mark_reclaimable_through_dispatch_takes_the_global_yes() {
+            use crate::cli::snapshot::{run, SnapshotCommands};
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().to_path_buf());
+            let config = Config::default();
+            let mark = |name: &str| SnapshotCommands::MarkReclaimable {
+                name: name.to_string(),
+                version: 1,
+                force: false,
+            };
+
+            let (conn, _) = setup_reclaimable_fixture("rec-no-yes", "retired");
+            let err = run(
+                &conn,
+                &paths,
+                &config,
+                &mark("rec-no-yes"),
+                false,
+                false,
+                false,
+            )
+            .expect_err("neither --force nor --yes: a non-interactive run refuses");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("refused: non-interactive session")
+                    && msg.contains("re-run with --yes")
+                    && msg.contains("has 1 copies, needs 2")
+                    && msg.contains("(`--force` or `--yes` confirms this in advance)"),
+                "the refusal names the shortfall and both ways to confirm: {msg}"
+            );
+
+            let (conn, unit_id) = setup_reclaimable_fixture("rec-yes", "retired");
+            run(&conn, &paths, &config, &mark("rec-yes"), false, false, true)
+                .expect("the global --yes confirms the shortfall in advance");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM snapshots WHERE unit_id = ?1 AND version = 1",
+                    params![unit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "reclaimable");
         }
 
         /// The property this whole change exists to establish: the gate
@@ -6215,8 +6347,9 @@ mod tests {
                 other => panic!("expected Blocked, got {other:?}"),
             };
 
-            let err = snapshot_mark_reclaimable(&conn, &config, "agree-blocked", 1, false, false)
-                .expect_err("assess said Blocked, so the gate must refuse");
+            let err =
+                snapshot_mark_reclaimable(&conn, &config, "agree-blocked", 1, false, false, false)
+                    .expect_err("assess said Blocked, so the gate must refuse");
             let msg = err.to_string();
             assert!(
                 msg.contains(&format!("\n{reason}\n")),
@@ -6239,7 +6372,7 @@ mod tests {
                 ),
                 "fixture must be releasable"
             );
-            snapshot_mark_reclaimable(&conn, &config, "agree-ok", 1, false, false)
+            snapshot_mark_reclaimable(&conn, &config, "agree-ok", 1, false, false, false)
                 .expect("assess said Releasable, so the gate must accept");
         }
     }

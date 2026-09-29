@@ -405,7 +405,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             exit_if_nonzero(exit_code);
         }
         Commands::Snapshot { ref command } => {
-            cli::snapshot::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
+            cli::snapshot::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
         }
         Commands::Stage { ref command } => {
             cli::stage::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;

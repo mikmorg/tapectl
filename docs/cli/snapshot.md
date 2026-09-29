@@ -103,5 +103,5 @@ tapectl snapshot mark-reclaimable [OPTIONS] --version <VERSION> <NAME>
 
 **Options**
 
-- `--force` — Override preconditions
+- `--force` — Confirm in advance, as the global --yes does: mark the version even though the version superseding it is short of its policy's min_copies or required_locations (for a tape-only unit, the multiplied floors). Without either flag a terminal asks, and a non-interactive run refuses, naming the shortfall. Only --force (not --yes, not a prompt) marks a version no current version supersedes — that releases the unit's only current version
 

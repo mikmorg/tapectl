@@ -66,7 +66,13 @@ pub enum SnapshotCommands {
         /// Snapshot version
         #[arg(long)]
         version: i64,
-        /// Override preconditions
+        /// Confirm in advance, as the global --yes does: mark the version
+        /// even though the version superseding it is short of its policy's
+        /// min_copies or required_locations (for a tape-only unit, the
+        /// multiplied floors). Without either flag a terminal asks, and a
+        /// non-interactive run refuses, naming the shortfall. Only --force
+        /// (not --yes, not a prompt) marks a version no current version
+        /// supersedes — that releases the unit's only current version
         #[arg(long)]
         force: bool,
     },
@@ -144,6 +150,7 @@ pub fn run(
     command: &SnapshotCommands,
     json_output: bool,
     dry_run: bool,
+    assume_yes: bool,
 ) -> Result<()> {
     match command {
         SnapshotCommands::Create { name } => {
@@ -318,12 +325,17 @@ pub fn run(
                      exactly or risk being wrong.",
                 ));
             }
+            // Issue #348: the global `--yes` is the same advance Tier-2
+            // consent `--force` is here — `consent::confirm`'s
+            // non-interactive refusal tells the operator to re-run with
+            // `--yes`, which is only true if it arrives.
             crate::cli::operations::snapshot_mark_reclaimable(
                 conn,
                 config,
                 name,
                 *version,
                 *force,
+                assume_yes,
                 json_output,
             )?;
         }
