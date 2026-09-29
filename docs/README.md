@@ -1,7 +1,8 @@
 # tapectl documentation
 
 Start with the [project README](../README.md) for what tapectl is. This page lists
-every document, grouped by what you are trying to do.
+every document in `docs/`, and the vocabulary and original design kept at the top of
+the repository, grouped by what you are trying to do.
 
 ## Using tapectl
 
@@ -23,9 +24,12 @@ every document, grouped by what you are trying to do.
 |---|---|
 | [On-tape format v2](design/volume-format-v2.md) | The byte layout of a tape — normative. Includes what "self-describing" does and does not promise. |
 | [Write session](design/layout-session.md) | The state machine of a tape write: build → validate → plan → execute → seal → confirm. |
+| [v2 open questions](design/v2-open-questions.md) | The format v2 design questions and how each was resolved (§§1–11) — normative after the two above. |
+| [v2 implementation plan](design/v2-implementation-plan.md) | The T0–T11 build playbook the v2 write path was built from — last in the same order of authority. |
 | [Architecture decisions](adr/) | ADR-0001 … ADR-0013: the rules and why (escrow, consent tiers, cartridge identity, generations, …). |
 | [Vocabulary](../CONTEXT.md) | The project's defined terms. |
-| [Design errata](design-errata.md) | Where the original design document (`tapectl-design-v4_0.md`) is superseded. |
+| [Original design document](../tapectl-design-v4_0.md) | Design v4.0 — still the reference for whatever the documents above do not cover; read it with the errata. |
+| [Design errata](design-errata.md) | Where the original design document is superseded. |
 
 ## Testing and hardware validation
 
@@ -39,15 +43,19 @@ every document, grouped by what you are trying to do.
 ## Records
 
 Dated records are kept as history, not instructions: hardware session journals
-(`lto6-session-journal-*.md`), run reports ([runs/](runs/)), review audits
-([audits/](audits/)), research notes ([research/](research/)), and the maintainer
-handoff ([handoff.md](handoff.md)).
+(`lto6-session-journal-*.md`), raw drive captures from the virtual library
+(`mhvtl-baseline-recordings.txt`), run reports ([runs/](runs/)), review audits
+([audits/](audits/)), research notes ([research/](research/)), the questions
+unattended runs deferred to the maintainer, all since answered
+([decisions-pending.md](decisions-pending.md)), and the maintainer handoff
+([handoff.md](handoff.md)).
 
 ## Keeping the docs honest
 
 Every `tapectl …` line in a shell code block of the user-facing documents is checked
-against the binary by `scripts/check-docs.py` (subcommands and flags must exist;
-full `config.toml` examples must pass `config check`), and `docs/cli/` is regenerated
+against the binary by `scripts/check-docs.py` (subcommands and long `--flags` must
+exist — short flags, arguments and required options are not checked; full
+`config.toml` examples must pass `config check`), and `docs/cli/` is regenerated
 from the command definitions (`cargo run --example gen_cli_md`) with a test that fails
 while it is stale. If you find an example that does not work, that is a bug — please
 open an issue.

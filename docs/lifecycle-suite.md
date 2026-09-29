@@ -18,9 +18,12 @@ that class.
 ## Invocation
 
 ```bash
-# mhvtl virtual library (device discovery, generation-matched media, same as the gate)
-scripts/lifecycle-suite.sh --scenario first-year
-scripts/lifecycle-suite.sh --all --seed 3
+# mhvtl virtual library (device discovery, generation-matched media, same as the gate).
+# There is no default device: name the drive with --device (or TAPECTL_GATE_TAPE)
+# every time. `ls -l /dev/tape/by-id/` lists mhvtl's drives as scsi-XYZZY_A<n>-nst;
+# scsi-HUJ808A5L4-nst is the real drive, which takes the real-drive flags below.
+scripts/lifecycle-suite.sh --scenario first-year --device /dev/tape/by-id/scsi-XYZZY_A3-nst
+TAPECTL_GATE_TAPE=/dev/tape/by-id/scsi-XYZZY_A3-nst scripts/lifecycle-suite.sh --all --seed 3
 
 # a real single-cartridge LTO-6 drive — every flag below is required
 scripts/lifecycle-suite.sh --scenario retire-and-reuse \
@@ -41,7 +44,8 @@ before anything destructive runs (the same anchored-match consent shape as
 and takes HOURS on real LTO — never pass it on real hardware.
 
 Every scenario gets its own `$HOME_DIR`/source tree/tape-slot tracking
-(`--all` runs all 13 without leaking state between them), and workspace
+(`--all` runs all 16, in the order `--list` prints them, without leaking
+state between them), and workspace
 output goes to `--out DIR` (default `/scratch/tapectl-lifecycle`) as
 `run-<timestamp>/`, with `REPORT.md`, one `log-<check>.txt` per check,
 `SKIPPED.txt`, and `commands.log` (every `tapectl`/device command, in order —
@@ -55,8 +59,8 @@ the journal of everything done).
 | `evolving-source` | Mutate every unit, dirty/diff/supersedable, v2 on a 2nd volume, both versions restorable |
 | `key-rotation` | Rotate mid-archive; old (inactive), new, and escrow keys all still restore, on both volumes |
 | `tenant-reassign` | Move units between tenants; DB ownership change doesn't affect who can decrypt what |
-| `tape-only-and-reclaim` | mark-tape-only preconditions (copies/locations), reclaim a superseded snapshot |
-| `compaction` | mhvtl-only. compact-finish's copy-elsewhere refusal, then success once satisfied |
+| `tape-only-and-reclaim` | mark-tape-only preconditions (copies/locations), reclaim and purge a superseded snapshot |
+| `compaction` | mhvtl-only: needs four cartridges, so it SKIPs, visibly, under `--single-cartridge` (which a real drive requires). compact-finish's copy-elsewhere refusal, then success once satisfied |
 | `retire-and-reuse` | Retire (refused sole-copy, then safe), cartridge reuse, ADR-0003 sealed-tape refusal |
 | `db-loss` | db backup/import, DB-less raw-volume + `import`, the pure heir path, `catalog rebuild` from tape |
 | `escrow-ordering` | issue #115 regression: stage-before-escrow refusal, then a working escrow restore |
@@ -64,6 +68,9 @@ the journal of everything done).
 | `quick-archive` | The one-shot create+stage+write flow |
 | `collection` | Folder-per-unit sync/status/plan/run, rename resolved by dotfile uuid |
 | `permute` | Seeded random walk over the whole command surface (`--seed`/`--steps`) |
+| `stale-catalog-sealed-tape` | issue #208: a catalog restored from a backup taken before the write still calls the volume `initialized`; `volume write` must be refused by the tape-side seal check (the refusal cites ADR-0003), not by the catalog |
+| `cartridge-displacement` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issue #226: erase a cartridge bound to a sealed volume in place and re-init it without `--force` (ADR-0010). The displaced volume becomes `erased`, and the warning must tell the unit left with zero copies apart from the one with a copy elsewhere; a restore matrix off that other copy proves it is real |
+| `collection-second-copy` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issues #226/#229: `collection run` refuses a second `--label` before staging anything; one run writes copy 1 and keeps staging, a plain `volume write` makes copy 2 from the same staged bytes, a restore matrix runs off copy 2, then staging is released |
 
 ## The restore matrix
 
@@ -72,7 +79,7 @@ SRC_DIR TAG [OTHER_TENANT]`, producing 10 checks named `TAG.<method>`:
 `unit` and `file` (via `tapectl restore`), `restore_sh_dd` (dd the script off
 tape, `--info`/`--verify`), `restore_sh_primary`/`restore_sh_backup` (both of
 the tenant's keys), `operator_envelope` (a normal restore path — see
-`src/volume/layout.rs:516`), `escrow` (the printed-once escrow secret),
+`envelope_positions()` in `src/volume/layout.rs`), `escrow` (the printed-once escrow secret),
 `raw_volume` (DB-less dump, every file verified), `isolation` (a different
 tenant's key must not decrypt this one's slice — SKIPs, visibly, if no other
 tenant exists on the archive), and `verify` (full + quick chain walk).
@@ -146,7 +153,7 @@ and therefore the failure, is identical.
   and `audit` names `escrow_identity_mismatch` exactly once with the
   `key import --escrow` command. (`init --escrow-public-key`, #139, is the
   one-command form; the arm keeps the two-step on purpose.)
-- Three former expected failures are now fixed:
+- Two other former expected failures are fixed too:
   `restore-file-and-catalog`'s symlink case (`restore file` dereferenced via
   `fs::copy` while `restore unit` preserved the link — the two commands
   disagreed about the same archive entry) and `escrow-ordering`'s

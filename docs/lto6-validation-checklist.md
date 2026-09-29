@@ -46,8 +46,15 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
 - [ ] Compression as found: `sg_logs`/mode page 0x0f `DCE`. tapectl disables it per
       write; the record shows `DCE 1→0` verified.
 - [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
-- [ ] The mhvtl gate is GREEN on this binary (`TAPECTL_GATE_TAPE=/dev/nst1
-      TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 39 checks as of #301).
+- [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE=/dev/nst1
+      TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 40 checks since #355 added
+      `empty_drive_refused`). The gate always runs `cargo build` and tests the
+      checkout's own debug binary; it has no `TAPECTL_BIN`, so a green gate says
+      nothing about an installed release binary. The rehearsal's `TAPECTL_BIN=` run
+      below is what tests that one. The gate is the one exception to by-id addressing: it
+      wants an mhvtl drive's `/dev/nstN` spelling, so read the number off
+      `ls -l /dev/tape/by-id/` (a `scsi-XYZZY_A*-nst` link) first; `nst1` is only an
+      example.
 - [ ] Nothing else will touch the drive: every harness takes `/tmp/tapectl-tape.lock`.
 - [ ] **The host is quiet** for the duration: CI runners and their timers paused, no
       heavy builds on the staging disk (`docs/operator-guide.md`, "A quiet host while
@@ -86,8 +93,12 @@ TAPECTL_BIN=/usr/local/bin/tapectl scripts/lifecycle-suite.sh --scenario first-y
       contact says "no LTO backend is configured on this host" (record: 2026-09-23).
 - [ ] `tapectl --home <tmp> restore unit --unit <name> --from <label> --to <dir> --device <by-id>`
       then `diff -r --no-dereference <source> <dir>` — identical (record: 2026-09-23).
-- [ ] The heir script alone (no tapectl): `mt rewind; mt fsf 2; dd bs=512k | tr -d '\0' > RESTORE.sh`,
-      then `./RESTORE.sh --info`, `--find-envelope --key <key>`, `--restore --key <key> --to <dir>`.
+- [ ] The heir script alone (no tapectl), extracted as File 1 tells an heir to, with the
+      device named on every command:
+      `mt -f <by-id> rewind && mt -f <by-id> fsf 2 && dd if=<by-id> bs=512k | tr -d '\0' > RESTORE.sh && chmod +x RESTORE.sh`.
+      RESTORE.sh reads `/dev/nst0` unless `TAPE_DEVICE` names another drive, so run it as
+      `TAPE_DEVICE=<by-id> ./RESTORE.sh --info`, then `--find-envelope --key <key>` and
+      `--restore --key <key> --to <dir>` the same way.
       Every key the tenant holds must open its own leg (#288). This is the lifecycle
       suite's `restore_sh_*` checks, green on hardware.
 

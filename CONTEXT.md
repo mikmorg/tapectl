@@ -15,8 +15,10 @@ beliefs awaiting corroboration.
 _Avoid_: record (ambiguous), fact
 
 **Evidence**:
-Recorded proof that a claim was checked against the tape it describes — a write
-receipt or a verification session. Evidence has an age; claims with stale
+Recorded proof that a claim was checked against the medium it describes. For a
+tape that is a verification session: a write's confirm readback records one, and
+so does every later `volume verify`. For a warehouse copy it is the provider's
+deposit receipt (see **Warehouse**). Evidence has an age; claims with stale
 evidence are weaker.
 _Avoid_: verification (use for the act, not the artifact)
 
@@ -50,8 +52,10 @@ the claim is stale and the disk has moved on. Divergence's sibling at the
 other boundary, and deliberately not the same word — the disk is
 authoritative always, not only at contact, so the response is a fresh
 snapshot rather than quarantine. A dirty unit is routine, not an incident.
-It is why marking a unit tape-only is refused: the tape no longer holds what
-the disk now says.
+It is why marking a unit tape-only asks first: the tape no longer holds what
+the disk now says. That is an ADR-0008 Tier-2 fact, not a refusal: a prompt
+on a terminal, a refusal only when nobody can answer one, and `--yes` or
+`--force` confirms in advance.
 _Avoid_: divergence (reserved for tape↔catalog at contact), stale,
 out-of-date
 
@@ -112,8 +116,9 @@ counts as live, not just the newest, and a derivation that reports otherwise
 would promise reclaimable space that compaction will not actually reclaim.
 The cost is that superseded versions accumulate silently until someone marks
 them — an operator-action gap, not an arithmetic one.
-_Avoid_: superseded (nothing writes that status; it is vestigial and must not be
-read as a lifecycle stage), latest (says nothing about whether it is sealed),
+_Avoid_: superseded (not a snapshot status: nothing ever wrote it and migration
+026 removed it from the schema, so there is no supersession stage to name),
+latest (says nothing about whether it is sealed),
 stale (an old current snapshot is not stale — it is coverage nobody has released)
 
 ### Restoring
@@ -151,7 +156,10 @@ _Avoid_: fingerprint list (the column name, not the concept), key list
 **Receipt** has this one meaning (ADR-0012, 2026-09-29 amendment). Two things
 that used to share the word were renamed: the per-stage-set text file `stage
 create` writes is a **Stage report** (below), and the per-write rows `volume
-info` lists are **Writes**.
+info` lists are **Writes**. A warehouse provider's **deposit receipt** (`volume
+deposit add --receipt`) is a different thing and keeps its name: it is the
+provider's word about a deposit, not tapectl's about its own encryption. Write
+it in full, never as a bare Receipt.
 
 **Stage report**:
 The human-readable file `stage create` leaves in `<home>/stage-reports/`, one per

@@ -79,11 +79,11 @@ $ tapectl snapshot create family/letters
 snapshot created: family/letters v1 (2 files, 224 B)
 
 $ tapectl stage create family/letters
-staged: family/letters (1 slices, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: family/letters (1 slices, 1.1 KiB dar, 1.8 KiB encrypted)
 
 $ tapectl volume write L8-0001 --device /dev/tape/by-id/scsi-XYZZY_A1-nst --yes
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.7 KiB
+  family/letters v1: 1 slices, 1.8 KiB
   family/photos/2019-italy v1: 1 slices, 1.1 MiB
   family/photos/2020-garden v1: 1 slices, 588.1 KiB
   work/invoices-2024 v1: 1 slices, 1.7 KiB
@@ -114,7 +114,7 @@ because tape punishes surprises.
   volume write plan (2 copy/copies):
     family/photos/2019-italy v1: 1 slices, 1.1 MiB
     family/photos/2020-garden v1: 1 slices, 588.1 KiB
-    family/letters v1: 1 slices, 1.7 KiB
+    family/letters v1: 1 slices, 1.8 KiB
     work/invoices-2024 v1: 1 slices, 1.7 KiB
 
   total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
@@ -151,7 +151,7 @@ itself, not by the catalog.
 primary and a backup key:
 
 ```text
-$ tapectl tenant add family -d family photos and letters
+$ tapectl tenant add family -d "family photos and letters"
 tenant "family" created (id=2) with primary and backup keys
 ```
 
@@ -167,11 +167,11 @@ $ tapectl tenant list
 +--------+--------+----------+---------------------+---------------------------+
 | Name   | Status | Operator | Created             | Description               |
 +--------+--------+----------+---------------------+---------------------------+
-| family | active |          | 2026-09-28 21:43:58 | family photos and letters |
+| family | active |          | 2026-09-29 08:19:49 | family photos and letters |
 +--------+--------+----------+---------------------+---------------------------+
-| mike   | active | yes      | 2026-09-28 21:43:58 | System operator           |
+| mike   | active | yes      | 2026-09-29 08:19:49 | System operator           |
 +--------+--------+----------+---------------------+---------------------------+
-| work   | active |          | 2026-09-28 21:43:58 | business records          |
+| work   | active |          | 2026-09-29 08:19:50 | business records          |
 +--------+--------+----------+---------------------+---------------------------+
 ```
 
@@ -248,7 +248,7 @@ A collection's units are named `<collection name>/<relative path>`, for example
 `films/alien-1979`. They are not named with the path rule above.
 [`collection sync`](cli/collection.md#tapectl-collection-sync) registers new
 folders, reconnects moved or renamed ones by their dotfile uuid, and marks
-vanished ones `missing`. It never deletes or retires anything. On a scratch
+vanished ones `missing`. It never deletes anything. On a scratch
 home, after renaming the folder `alien-1979` to `alien`:
 
 ```text
@@ -296,6 +296,17 @@ v1 keeps counting (and being carried forward by compaction) until you
 explicitly mark it reclaimable with
 [`snapshot mark-reclaimable`](cli/snapshot.md#tapectl-snapshot-mark-reclaimable).
 
+That release is gated on the version that replaces it. A newer current version
+must exist, and it must meet the unit's copy requirement and hold a copy at
+every location the unit's policy names (see
+[Requirements](#requirements-and-seeing-them)). If it falls short, the command
+lists the shortfall and asks on a terminal; `--force` or the global `--yes`
+confirms in advance, and a run with no terminal and neither flag refuses.
+A version with no newer current version above it is a different case. That
+includes the unit's newest current version, even while an older version is
+also current. Neither a prompt nor `--yes` accepts it; only an explicit
+`--force` releases it.
+
 ### Stage set and slices
 
 A **stage set** is one snapshot turned into encrypted, checksummed files in the
@@ -311,13 +322,28 @@ with no key at all.
 
 ### Receipt
 
-tapectl uses "receipt" in three places, and they mean different things:
+A **receipt** is the list of recipients a stage set was encrypted to. It is
+recorded at staging and, on tapes written since 2026-09-11, carried on the tape
+inside the operator envelope. It is how tapectl knows the escrow recipient can
+decrypt a copy. `audit` reports escrow coverage as covered, a gap, or unknown,
+and `catalog locate` shows it in its Escrow column. A catalog rebuilt from tape
+recovers the receipts the tape carried
+(`escrow receipts: 4 stage set(s) carried theirs on the tape`).
+
+Two nearby things are not receipts:
 
 | You see | What it is |
 |---|---|
-| **Receipt** (the concept, in `audit` and `catalog locate`'s Escrow column) | The list of recipients a stage set was encrypted to, recorded at staging and, on tapes written since 2026-09-11, carried on the tape inside the operator envelope. It is how tapectl knows the escrow recipient can decrypt a copy. `audit` reports escrow coverage as covered, a gap, or unknown. |
-| Staging receipt files in `~/.tapectl/receipts/` | A text file per stage set listing each slice's plaintext and encrypted sha256. It is for your records and is private to the machine (mode 0600). |
-| "Write receipts" in `volume info` | One line per stage set written to that volume, with its outcome (`completed`) and time. |
+| **Stage reports** in `~/.tapectl/stage-reports/` | A text file per stage set, headed `tapectl stage report`: the unit, tenant, snapshot, and each slice's plaintext and encrypted size and sha256. It is for your records and is private to the machine (mode 0600). |
+| **Writes** in `volume info` | One line per stage set written to that volume, with its outcome and time (see [Write sessions](#write-sessions)). |
+
+`volume deposit add --receipt` is unrelated: it records the warehouse provider's
+own receipt or object-version identifier for a deposit.
+
+A home created before 2026-09-29 kept its stage reports in `receipts/`. The
+first tapectl command run on that home moves the directory to `stage-reports/`.
+If both directories already exist, both are kept and new reports go to
+`stage-reports/`.
 
 ## Where it lives: volumes, cartridges, locations
 
@@ -363,11 +389,18 @@ initialize a new volume on the same cartridge.
   about an object that can no longer change, which is the simplest thing to hand
   to an heir. See [ADR-0003](adr/0003-sealed-volumes-immutable-no-append.md).
 
-- **Interrupted is not sealed.** If a write stops partway (power, a signal, the
-  real end of tape), the volume stays **unsealed**: it is not a copy and not
-  self-describing. [`volume resume`](cli/volume.md#tapectl-volume-resume)
-  continues the same session on the same cartridge.
-  [`volume abort`](cli/volume.md#tapectl-volume-abort) abandons it.
+- **Interrupted is not sealed.** A write that stops partway leaves the volume
+  **unsealed**: it is not a copy and not self-describing. What comes next
+  depends on how it stopped:
+  - **Stopped from outside** (a crash, a power loss, Ctrl-C): the session is
+    `interrupted`. [`volume resume`](cli/volume.md#tapectl-volume-resume)
+    continues it on the same cartridge, and
+    [`volume abort`](cli/volume.md#tapectl-volume-abort) abandons it.
+  - **Failed** (the real end of tape, a drive error, a staged file that no
+    longer matches its checksum): the session aborts itself. A session
+    aborted before its seal is never resumed. The volume stays `initialized`,
+    and `volume write` starts a new session on it from the beginning of the
+    tape.
 
 ### Location
 
@@ -376,12 +409,14 @@ a fire safe at a relative's house) or a **warehouse** (cold cloud storage that
 receives recorded deposits of sealed volumes rather than cartridges).
 
 ```text
-$ tapectl location add offsite -d a fire-safe box at a relative's house
+$ tapectl location add offsite -d "a fire-safe box at a relative's house"
 location "offsite" added (id=2, kind=shelf)
 ```
 
-A cartridge's place is a location, never a status. A new volume starts
-`(not placed)`. When you carry a tape somewhere, record it with
+A cartridge's place is a location, never a status. A new volume starts where
+its cartridge is: at the cartridge's location if it has one (a reused tape, or
+a spare you placed with `cartridge move`), and `(not placed)` otherwise. When
+you carry a tape somewhere, record it with
 [`volume move`](cli/volume.md#tapectl-volume-move) or
 [`cartridge move`](cli/cartridge.md#tapectl-cartridge-move). Both do the same
 thing from different ends: they move the cartridge and every volume on it
@@ -408,8 +443,8 @@ sealed, not quarantined, and not retired. Three consequences follow:
   changed. A unit is only as covered as its **least-covered live version**,
   where live means current (not yet marked reclaimable). If v1 is on three tapes
   and v2 on one, the unit has one copy.
-- **Only sealed volumes count.** An unsealed tape from an interrupted write
-  counts for nothing.
+- **Only sealed volumes count.** An unsealed tape from an interrupted or
+  failed write counts for nothing.
 - **Copies are distinct volumes.** Writing the same stage set to two volumes
   gives two copies. The number of locations is the number of distinct places
   those volumes are kept (a recorded warehouse deposit also counts as a copy and
@@ -422,8 +457,11 @@ can judge it yourself.
 ### Requirements, and seeing them
 
 A unit's **minimum copies** comes from its policy (default 2, see
-[Policy](#policy-archive-sets-and-audit)). After the first tape in the session,
-`audit` reported every unit one copy short:
+[Policy](#policy-archive-sets-and-audit)). Its archive set can also name
+**required locations**. Those are checked by name: every current version needs a
+copy at each named location, and copies spread over other places do not stand
+in for a missing one. After the first tape in the session, `audit` reported
+every unit one copy short:
 
 ```text
 $ tapectl audit
@@ -432,7 +470,9 @@ VIOLATIONS (4):
   [copy_count] family/photos/2019-italy: has 1 copies, needs 2
   [copy_count] family/photos/2020-garden: has 1 copies, needs 2
   [copy_count] work/invoices-2024: has 1 copies, needs 2
-...
+WARNINGS (1):
+  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
+audit: 4 violations, 1 warnings (exit 2)
 ```
 
 After writing `L8-0002` and moving it offsite:
@@ -447,8 +487,11 @@ $ tapectl report copies
 
 [`catalog locate`](cli/catalog.md#tapectl-catalog-locate) shows each copy of a
 unit with its volume, location, escrow coverage, and last verification.
-The `MIN COPIES` column in `volume list` answers a different question: "if I
-lose this tape, how thin does the thinnest unit on it get?"
+The `MIN COPIES` column in `volume list` looks from the tape's side. It shows
+the copy count of the least-covered unit on that tape, counted as of now, and
+that count includes this tape while it is still a copy. It is not what losing
+the tape would leave: a
+`MIN COPIES` of 1 can mean this tape holds a unit's only copy.
 
 ### Tape-only units
 
@@ -457,16 +500,26 @@ Marking a unit **tape-only**
 say "the tapes are now the only copy, and I may delete the disk copy". Because
 that is irreversible in practice, the command is gated:
 
-- A unit that was **never archived** is refused outright. No flag overrides
-  this, because there is no copy to fall back on.
-- A unit with fewer copies than `min_copies_for_tape_only` or fewer locations
-  than `min_locations_for_tape_only` (both default 2), or one that is **dirty**,
-  needs `--force` or an interactive yes. The prompt shows you the coverage
-  facts first.
+- A unit that was **never archived** (it has no snapshot at all) is refused
+  outright. No flag overrides this. The check reads the unit's directory, so
+  it works only while that directory is still at the unit's recorded path. If
+  the directory has moved or is gone, a never-archived unit falls through to
+  the four facts below, and its zero copies become a shortfall that `--force`
+  or `--yes` confirms. Check `snapshot list` before you confirm.
+- A unit whose policy cannot be resolved (for example, a malformed dotfile) is
+  refused. The gate does not guess at a policy.
+- Otherwise the command checks the unit against four facts: its copies against
+  its resolved `min_copies`, its number of locations against the
+  `[defaults] min_locations` floor (default 2), a copy at each of its named
+  required locations, and whether it is **dirty**. A unit that meets all four
+  is marked at once. Any shortfall is listed, and on a terminal the command
+  asks before marking. `--force` or the global `--yes` confirms in advance; a
+  run with no terminal and neither flag refuses, naming each shortfall.
 
-Tape-only units stay in every audit check. Releasing an old version of a
-tape-only unit with `snapshot mark-reclaimable` is held to a stricter bar: the
-copy and location requirements are multiplied by
+Tape-only units stay in every audit check except `dirty`, since their disk copy
+may be gone. Releasing an old version of a tape-only unit with
+`snapshot mark-reclaimable` is held to a stricter bar: the copy requirement and
+the number of required locations are both multiplied by
 `[compaction] tape_only_safety_multiplier` (default 2).
 
 ## Policy: archive sets and audit
@@ -474,10 +527,17 @@ copy and location requirements are multiplied by
 ### Archive sets and resolution order
 
 An **archive set** is a named policy: minimum copies, required locations,
-encryption, compression, checksum mode, slice size, verify interval, and
-warehouse copies. Define archive sets in `config.toml` and load them with
+encryption, compression, checksum mode, slice size, verify interval, warehouse
+copies, and which file attributes to keep (extended attributes, and with them
+the ACLs Linux stores as extended attributes; filesystem flags). Define archive
+sets in `config.toml` and load them with
 [`archive-set sync`](cli/archive-set.md#tapectl-archive-set-sync), or create
 them with [`archive-set create`](cli/archive-set.md#tapectl-archive-set-create).
+`sync` writes only the keys each table names, so a value you set with
+`archive-set edit` for a key the table leaves out survives the next sync.
+Warehouse copies relies on that: an `[[archive_sets]]` table cannot name it
+(`warehouse_copies` there is an unknown key, and the config does not load), so
+set it with `--warehouse-copies` on `archive-set create` or `archive-set edit`.
 A unit joins one with `unit init --archive-set`, or through its collection's
 `archive_set`.
 
@@ -488,8 +548,17 @@ min_copies = 3
 required_locations = ["home-rack", "offsite", "bank-box"]
 ```
 
-Every policy value resolves in three layers, and the first layer that sets a
-value wins:
+Each name in `required_locations` must be a location you have already
+registered with [`location add`](cli/location.md#tapectl-location-add). Here
+that means registering `bank-box` first: `archive-set sync`, `create` and
+`edit` refuse a name that is not a registered location.
+
+The `encrypt` key exists but is never honoured: every slice is encrypted to its
+tenant, the operator and the escrow recipient, and `stage create` warns when a
+policy says `encrypt = false`.
+
+A policy value resolves through up to three layers, and the first layer that
+sets it wins:
 
 ```mermaid
 flowchart LR
@@ -497,17 +566,27 @@ flowchart LR
     B -->|not set| C["3 · defaults<br/>[defaults] in config.toml"]
 ```
 
-In `[defaults]`, the general copy requirement is spelled
-`min_copies_for_tape_only`, despite the name. A misspelled key at any layer is
-an error, not a silent fallback to the next layer. See
-[configuration](configuration.md) for every key.
+Not every key exists at every layer. A dotfile's `[policy]` can set only
+`checksum_mode`, `compression`, `slice_size` and `warehouse_copies`. The copy
+requirement is the archive set's `min_copies`, or else `[defaults] min_copies`
+(default 2). Named required locations come only from an archive set.
+`[defaults] min_locations` (default 2) is a floor on the number of distinct
+locations. It has no per-set layer, and only `unit mark-tape-only` reads it. A
+misspelled key at any layer is an error, not a silent fallback to the next
+layer. See [configuration](configuration.md) for every key.
+
+> [!NOTE]
+> Configs written before 2026-09-29 spell these two keys
+> `min_copies_for_tape_only` and `min_locations_for_tape_only`. A config that
+> still uses either old name does not load, and the error names the new keys.
+> Rename the lines; the values carry over unchanged.
 
 ### Audit is advisory
 
 [`audit`](cli/audit.md) checks every unit against its resolved policy (copy
-count, required locations, verification age, escrow coverage, and more) and
-reports **violations** and **warnings**. It never blocks anything and never
-changes anything. Its exit code tells a script how bad things are:
+count, each named required location, verification age, escrow coverage, and
+more) and reports **violations** and **warnings**. It never blocks anything and
+never changes anything. Its exit code tells a script how bad things are:
 
 | Exit | Meaning |
 |---|---|
@@ -515,43 +594,85 @@ changes anything. Its exit code tells a script how bad things are:
 | 1 | Warnings only |
 | 2 | At least one violation |
 
-`audit --action-plan` adds a suggested fix under each finding:
+`audit --action-plan` adds a suggested fix under each finding. The audit after
+the first tape, with its plan:
+
+```text
+$ tapectl audit --action-plan
+VIOLATIONS (4):
+  [copy_count] family/letters: has 1 copies, needs 2
+    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
+  [copy_count] family/photos/2019-italy: has 1 copies, needs 2
+    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
+  [copy_count] family/photos/2020-garden: has 1 copies, needs 2
+    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
+  [copy_count] work/invoices-2024: has 1 copies, needs 2
+    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
+WARNINGS (1):
+  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
+    fix: tapectl key escrow-kit --out <dir>
+audit: 4 violations, 1 warnings (exit 2)
+```
+
+Once `L8-0002` was written and moved offsite, only the heir-kit warning was
+left, so `audit` exited 1:
 
 ```text
 $ tapectl audit
-WARNINGS (3):
-  [compaction_candidate] volume:L8-0001: utilization 49% < 50% threshold
-  [compaction_candidate] volume:L8-0002: utilization 49% < 50% threshold
+WARNINGS (1):
   [escrow_kit_missing] archive: 2 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 3 warnings (exit 1)
+audit: 0 violations, 1 warnings (exit 1)
 ```
 
-The commands that do give things up (`volume retire`, `unit mark-tape-only`,
-`snapshot mark-reclaimable`, `cartridge mark-erased`, and others) enforce the
-same coverage facts themselves, in tiers. Staleness is shown but never gates.
-Degraded coverage (below minimum, but still at least one copy) asks for
-`--force` or `--yes`. Destroying the last eligible copy of a live version is
-refused outright, and no flag reaches it. See
+The commands that do give things up enforce the same coverage facts
+themselves, in tiers. Staleness is shown but never gates. A shortfall is
+listed as facts and asked about on a terminal. The global `--yes` (or the
+command's own `--force`, where it has one) confirms in advance, and a run with
+no terminal and neither flag refuses.
+
+The commands that take a copy out of service (`volume retire`,
+`volume compact-finish`, `cartridge retire` and `cartridge mark-erased`) also
+have a floor. Removing the last eligible copy of a live version is refused
+outright, and no flag reaches it. `unit mark-tape-only` and
+`snapshot mark-reclaimable` remove no copy, so they have no such floor. With
+consent, `unit mark-tape-only` marks a unit that has no copy on tape.
+`snapshot mark-reclaimable` releases a version even when the newer version
+that replaces it has no eligible copy. Their hard stops are different: a unit
+that was never archived is refused outright while its directory is still at
+its recorded path, and a version with no newer current version needs an
+explicit `--force`. See
+[Tape-only units](#tape-only-units),
+[Snapshot and Version](#snapshot-and-version) and
 [ADR-0008](adr/0008-destructive-consent-tiers.md).
 
 ## The states you see in listings
 
 The state names below are exactly the values the catalog stores and the
-listings print. Some values exist in the schema but no current command sets
-them. They are marked as such so that seeing one does not surprise you.
+listings print (and the values each `list --status` filter accepts).
 
 ### Volume status
 
 ```mermaid
 stateDiagram-v2
     [*] --> initialized : volume init
+    [*] --> sealed : catalog rebuild from the tape
     initialized --> sealed : volume write (confirm readback passes)
     initialized --> initialized : write interrupted, then volume resume or volume abort
+    initialized --> retired : volume retire, compact-finish, cartridge retire
     sealed --> retired : volume retire, compact-finish, cartridge retire
-    retired --> sealed : cartridge unretire (volumes retired with it)
+    retired --> initialized : cartridge unretire (back to the prior status)
+    retired --> sealed : cartridge unretire (back to the prior status)
+    initialized --> erased : cartridge mark-erased, or the cartridge is re-initialized
     sealed --> erased : cartridge mark-erased, or the cartridge is re-initialized
-    retired --> erased : cartridge mark-erased
+    retired --> erased : cartridge mark-erased, or the cartridge is re-initialized
 ```
+
+The retire and erase commands do not look at a volume's status.
+`cartridge retire` retires every volume on the cartridge, and
+`cartridge mark-erased`, or binding the cartridge to a new volume, erases every
+volume on it. So an `active` or `full` volume (below) leaves the same ways a
+`sealed` one does. `cartridge unretire` restores only the volumes that were
+retired with the cartridge, each to the status it had before.
 
 | Status | Meaning |
 |---|---|
@@ -560,8 +681,7 @@ stateDiagram-v2
 | `retired` | You took it out of service (`volume retire` shows the impact first; `compact-finish` and `cartridge retire` also retire volumes). Not a copy. `volume retire` accepts a volume in any status. |
 | `erased` | Its cartridge was bulk-erased (`cartridge mark-erased`) or re-initialized with a new volume. The bytes are gone. |
 | `active` | Set only by [`import`](cli/import.md), for a volume written outside this catalog. |
-| `full` | Legacy: a volume sealed before the current tape format. Treated like `sealed` for inventory. |
-| `blank`, `missing` | Allowed by the schema. No current command sets them. |
+| `full` | Legacy: a volume sealed before the current tape format. No current command sets it. Treated like `sealed` for inventory. |
 
 When you retire the last live volume on a cartridge, the cartridge moves to
 `pending_erase` (see below).
@@ -583,20 +703,28 @@ A volume is **quarantined** when a tape contradicts what the catalog says about
 it: the ID file names a different volume, the front index and seal marker
 disagree, or a readback or `volume verify` finds a hash mismatch. A quarantined
 volume is not a copy and not a write target. A full verify that reads every file
-back cleanly returns it to `ok`.
+back cleanly returns it to `ok`. A read that fails without proving anything
+about the medium (a drive or transport error, an empty drive) leaves the
+condition alone. `volume verify` tells the two apart in its exit status: 2 when
+it proved the medium bad, 3 when it was inconclusive.
 
 ### Cartridge status
 
 ```mermaid
 stateDiagram-v2
     [*] --> available : cartridge register
-    [*] --> in_use : auto-registered by volume init
-    available --> in_use : volume init binds a volume
+    [*] --> in_use : auto-registered by volume init or catalog rebuild
+    available --> in_use : a volume is bound to it (volume init, catalog rebuild)
     in_use --> pending_erase : its last live volume is retired
     pending_erase --> available : cartridge mark-erased (after a physical bulk erase)
+    in_use --> available : cartridge mark-erased, with consent
     pending_erase --> in_use : volume init reuses it
+    available --> retired_permanent : cartridge retire
     in_use --> retired_permanent : cartridge retire
-    retired_permanent --> available : cartridge unretire
+    pending_erase --> retired_permanent : cartridge retire
+    retired_permanent --> available : cartridge unretire (back to the prior status)
+    retired_permanent --> in_use : cartridge unretire (back to the prior status)
+    retired_permanent --> pending_erase : cartridge unretire (back to the prior status)
 ```
 
 | Status | Meaning |
@@ -616,12 +744,16 @@ version. There is no `offsite` status: where a cartridge is kept is its
 ```mermaid
 stateDiagram-v2
     [*] --> created : snapshot create (content changed)
+    [*] --> current : catalog rebuild from the tape
     created --> staged : stage create
     staged --> current : a volume holding it is sealed
     current --> reclaimable : snapshot mark-reclaimable
+    created --> reclaimable : snapshot mark-reclaimable
+    staged --> reclaimable : snapshot mark-reclaimable
     reclaimable --> purged : snapshot purge
+    purged --> reclaimable : snapshot mark-reclaimable (status only)
     created --> [*] : snapshot delete
-    staged --> [*] : snapshot delete
+    staged --> [*] : snapshot delete (needs --force while its slices are staged)
 ```
 
 | Status | Meaning |
@@ -631,18 +763,32 @@ stateDiagram-v2
 | `current` | On at least one sealed volume. Counts as live coverage. Several versions of one unit can be current. |
 | `reclaimable` | You released it. Compaction may drop its slices, and it no longer counts toward coverage. |
 | `purged` | Released and its per-file catalog rows deleted. The row remains as a record. |
-| `superseded`, `failed` | Allowed by the schema. No current command sets them. |
+
+A newer version never demotes an older one on its own: `reclaimable` is the only
+way out of `current`, and only you set it.
+[`snapshot mark-reclaimable`](cli/snapshot.md#tapectl-snapshot-mark-reclaimable)
+also takes a version that never reached a tape (`created` or `staged`), under
+the same gate as a current one (see [Snapshot and Version](#snapshot-and-version)).
+It refuses only a version that is already `reclaimable`. Given a `purged`
+version, it sets the status back to `reclaimable`, but the per-file rows stay
+deleted.
 
 [`snapshot delete`](cli/snapshot.md#tapectl-snapshot-delete) removes a snapshot
-that was never written to a sealed volume. It refuses one that was.
+that has no completed write to any volume, and refuses one that has. It goes by
+writes, not status, so a version you released before it ever reached a tape
+can be deleted too. While the
+snapshot's stage set is still `staged` (its slices are in the staging
+directory), the delete also needs `--force`, and it removes those slice files
+too.
 
 ### Stage set status
 
 ```mermaid
 stateDiagram-v2
     [*] --> staging : stage create starts
+    [*] --> cleaned : catalog rebuild from the tape
     staging --> staged : dar, encryption and checksums complete
-    staging --> failed : stage create crashed
+    staging --> failed : stage create stopped partway
     staged --> cleaned : staging clean
     failed --> cleaned : staging clean
     cleaned --> staged : volume read-slices or compact-read brings the slices back
@@ -652,15 +798,26 @@ stateDiagram-v2
 |---|---|
 | `staging` | `stage create` is running. |
 | `staged` | Slices are on disk and eligible for the next `volume write`. It stays `staged` after being written, so you can write more copies. |
-| `failed` | `stage create` died partway. The next tapectl command that opens the catalog marks it `failed`; `staging clean` removes the leftovers. |
+| `failed` | `stage create` stopped partway: it crashed, or refused after it had begun (for example, the source changed since the snapshot, or the staging directory proved too small once the unit had been read). The next tapectl command that opens the catalog marks it `failed`; `staging clean` removes the leftovers. |
 | `cleaned` | Slice files deleted from staging. The record and its checksums remain. A stage set rebuilt from tape by `catalog rebuild` also starts here. |
 
 ### Write sessions
 
-Behind each `volume write` is one row per stage set in the session, with its
-own status: `planned` → `in_progress` → `completed`, or `interrupted` (resumable
-with `volume resume`), `aborted` (`volume abort`), or `failed`. `volume info`
-lists them as "Write receipts".
+Behind each `volume write` is one row per stage set in the session (a
+**write**), with its own status: `planned` → `in_progress` → `completed`, or
+`interrupted` (resumable with `volume resume`) or `aborted` (by `volume abort`,
+or by the session itself when a write fails or its readback finds a mismatch).
+`volume info` lists a volume's writes under `Writes:`:
+
+```text
+$ tapectl volume info L8-0001
+...
+Writes:
+    work/invoices-2024 v1: completed (2026-09-29 08:20:01)
+    family/photos/2020-garden v1: completed (2026-09-29 08:20:01)
+    family/photos/2019-italy v1: completed (2026-09-29 08:20:01)
+    family/letters v1: completed (2026-09-29 08:20:01)
+```
 
 ## What is on a tape
 
@@ -671,11 +828,11 @@ and four slices.
 | File | Zone | On tape | What it holds |
 |---|---|---|---|
 | 0 | ID thunk | plaintext | Label, uuid, format version, where the front index and seal marker are, and a `[media]` block describing the cartridge. What `volume identify` prints. |
-| 1 | System guide | plaintext | The heir's manual: how to recover with `mt`, `dd`, `age`, `dar`, `sha256sum`. |
+| 1 | System guide | plaintext | The heir's manual: how to recover with `mt`, `dd`, `age`, `dar`, `tar`, `sha256sum`. |
 | 2 | `RESTORE.sh` | plaintext | A standalone recovery script that reads the front index and restores with the same standard tools. |
 | 3 | Front index | plaintext | The map: for every file, its position, type, byte size, and sha256 of its on-tape bytes. No names. |
-| 4 … | Tenant envelopes | encrypted to tenant + operator + escrow | One per tenant on the tape: `MANIFEST.toml` (file names, plaintext hashes, `dar` command, slice positions), `RECOVERY.md`, `dar` catalogs. |
-| next 2 | Operator envelope + backup | encrypted to operator + escrow | The manifests for every tenant on the tape, the write plan (`PLAN.toml`), and a `catalog.db` covering this write (used by `catalog rebuild`). The backup is a second copy. |
+| 4 … | Tenant envelopes | encrypted to tenant + operator + escrow | One per tenant on the tape: `MANIFEST.toml` (each unit's name, uuid and version, the `dar` version and command, and each slice's position, sizes and plaintext and encrypted sha256), `RECOVERY.md`, and the `dar` catalogs, which are where the archived file names are. |
+| next 2 | Operator envelope + backup | encrypted to operator + escrow | One `MANIFEST.toml` covering every tenant's units, `RECOVERY.md`, every unit's `dar` catalog, the write plan (`PLAN.toml`), and a `catalog.db` covering this write (used by `catalog rebuild`). The backup is a second copy. |
 | … M−1 | Data slices | encrypted to tenant + operator + escrow | The archived data itself, one `dar` slice per file, each unit's slices together. |
 | M | Seal marker | plaintext | "Everything before me is here": file count, seal time, the front index's hash, and a full copy of the front index. |
 
@@ -717,7 +874,7 @@ seal marker is visibly unsealed.
 A sealed volume promises two things and withholds a third:
 
 1. **Data.** Every unit on it can be restored by its tenant, with that tenant's
-   key and standard tools (`mt`, `dd`, `age`, `dar`, `sha256sum`), with no
+   key and standard tools (`mt`, `dd`, `age`, `dar`, `tar`, `sha256sum`), with no
    tapectl and no database. This is the heir path.
 2. **Catalog.** With the operator or escrow key,
    [`catalog rebuild --from-volume`](cli/catalog.md#tapectl-catalog-rebuild)
@@ -783,14 +940,16 @@ kit, and disaster recovery are covered in
 | Sealed | A volume whose write confirmed; immutable, never appended. | [Volume and cartridge](#volume-and-cartridge) |
 | Slice | One encrypted piece of a `dar` archive; one file on tape. | [Stage set and slices](#stage-set-and-slices) |
 | Snapshot | A recorded file list of a unit at one version. | [Snapshot and Version](#snapshot-and-version) |
+| Stage report | The text file per stage set in `stage-reports/`: slice sizes and hashes. Not a receipt. | [Receipt](#receipt) |
 | Stage set | A snapshot turned into encrypted slices on disk, ready to write. | [Stage set and slices](#stage-set-and-slices) |
 | Tag | A free-form label on a unit, for filtering. | [Tags](#tags) |
-| Tape-only | A unit whose disk copy you may delete; gated on coverage. | [Tape-only units](#tape-only-units) |
+| Tape-only | A unit whose disk copy you may delete; gated on its resolved policy. | [Tape-only units](#tape-only-units) |
 | Tenant | A key domain; one tenant's keys cannot read another's data. | [Tenant](#tenant) |
 | Unit | A directory archived as one entity, identified by its dotfile uuid. | [Unit](#unit) |
 | Unsealed | A volume whose write was interrupted; not a copy. | [Volume and cartridge](#volume-and-cartridge) |
 | Version | A snapshot's number within its unit, minted only when content changed. | [Snapshot and Version](#snapshot-and-version) |
 | Volume | The logical tape image written onto a cartridge, with your label. | [Volume and cartridge](#volume-and-cartridge) |
+| Write | One stage set's row in a write session; `volume info` lists them under `Writes:`. | [Write sessions](#write-sessions) |
 
 ## Related pages
 

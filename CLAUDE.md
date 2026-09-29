@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `rage` crate for age encryption, and SQLite for catalog/inventory/policy/audit.
+tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `age` crate (from the rage project) for age encryption, and SQLite for catalog/inventory/policy/audit.
 
 **The on-tape format is Layout Version 2** (ADR-0007). For anything touching tape
 bytes or the write path, the normative set is, in authority order:
@@ -21,13 +21,14 @@ vocabulary.
 
 ## Current State
 
-Milestones 0 through 5 are complete.
+Milestones 0 through 7 are complete (Milestone 7's last piece, real LTO-6 validation,
+was done on 2026-09-10 — see below).
 
 **Milestone 0:** Full round-trip validated — dar → age encrypt → mhvtl tape → read → decrypt → extract. All criteria passed. Validation programs in `validation/`.
 
 **Milestone 1:** Working commands: `init`, `tenant` (add/list/info/delete), `key` (generate/list/export/import), `unit` (init/init-bulk/list/status/tag/rename/discover). Full SQLite schema deployed.
 
-**Milestone 2:** Working commands: `snapshot create/list`, `stage create`, `staging status/clean`. Full pipeline: directory walk → manifest → sha256 validation → dar archive → age multi-recipient encryption → checksums → receipt. dar wrapper with version check, XML catalog parsing, catalog isolation.
+**Milestone 2:** Working commands: `snapshot create/list`, `stage create`, `staging status/clean`. Full pipeline: directory walk → manifest → sha256 validation → dar archive → age multi-recipient encryption → checksums → stage report. dar wrapper with version check, XML catalog parsing, catalog isolation.
 
 **Milestone 3:** Working commands: `volume init/write/verify/identify`. Full 10-file volume layout written to tape via mhvtl: ID thunk, system guide, RESTORE.sh, planning header, encrypted data slices, mini-index, tenant envelopes, dual operator envelopes. Tape ioctl module with fixed block I/O. Verify reads back and validates sha256.
 
@@ -39,7 +40,7 @@ Milestones 0 through 5 are complete.
 
 **Post-M6 completions:** All unassigned CLI commands from design doc implemented: `key rotate`, `tenant reassign`, `snapshot purge`, `unit check-integrity`, `quick-archive`, `db export/import/stats`, `config show/check`. Zero compiler warnings, 17 tests (5 unit + 12 integration), zero clippy errors. No StubCommands remain.
 
-**Milestone 7 (software-side complete):** Phases 1–9 landed. Lib target (Phase 1), module unit tests (Phase 2), sg_logs health collection (Phase 3), full audit trail wiring (Phase 4), mhvtl-gated E2E round-trip (Phase 5), library failure-mode tests (Phase 6), multi-tenant isolation tests (Phase 7 — crypto cross-decrypt rejection, plaintext-leak scan on raw tape bytes, both-tenants self-restore, tape-device lock for parallel mhvtl tests), performance harness (Phase 8 — `tests/performance.rs` gated on `TAPECTL_PERF_TESTS=1`, baselines in `docs/perf-baselines.md`), docs + man pages (Phase 9 — README Testing/Documentation sections, `examples/gen_man.rs` + `docs/man/*.1` via clap_mangen, `docs/lto6-validation-checklist.md`, written as a procedure stub in Phase 9 but **no longer one** — it was fleshed out and dry-run annotated against mhvtl on 2026-07-20 (#8) and records the ENOSPC fidelity gap; read it as usable procedure).
+**Milestone 7 (complete — its real-LTO-6 validation is below):** Phases 1–9 landed. Lib target (Phase 1), module unit tests (Phase 2), sg_logs health collection (Phase 3), full audit trail wiring (Phase 4), mhvtl-gated E2E round-trip (Phase 5), library failure-mode tests (Phase 6), multi-tenant isolation tests (Phase 7 — crypto cross-decrypt rejection, plaintext-leak scan on raw tape bytes, both-tenants self-restore, tape-device lock for parallel mhvtl tests), performance harness (Phase 8 — `tests/performance.rs` gated on `TAPECTL_PERF_TESTS=1`, baselines in `docs/perf-baselines.md`), docs + man pages (Phase 9 — README Testing/Documentation sections, `examples/gen_man.rs` + `docs/man/*.1` via clap_mangen, `docs/lto6-validation-checklist.md`, written as a procedure stub in Phase 9 but **no longer one** — it was fleshed out and dry-run annotated against mhvtl on 2026-07-20 (#8) and records the ENOSPC fidelity gap; read it as usable procedure).
 
 **2026-09-11 — disaster recovery and the architecture review (complete).** Three
 review rounds on `catalog rebuild --from-volume` (#136) and what building it
@@ -53,12 +54,14 @@ exposed, then seven deepenings, all landed and real-drive-validated (four
   through one predicate and one query (`policy::escrow`); a rebuilt row is
   `unknown` (`stage_sets.origin`), attestable by `catalog rebuild --key <escrow>`
   decrypting one slice header. `audit` names an escrow-identity mismatch once.
-- **The DR recipe is one command:** `init --escrow-public-key <original>` (#139).
+- **The DR recipe is one command:** `init --operator <name> --escrow-public-key <original>`
+  (#139). `--operator` is required under a system account such as the `tapectl`
+  service user (uid below `UID_MIN`), where `init` refuses without it (#357).
   No command replaces a registered escrow identity (ADR-0005).
 - **`audit` scopes per check** (`cli::audit::CHECKS`); tape-only units were
   invisible to every check from Milestone 6 until #138.
 - **Byte pins:** `tests/on_tape_golden.rs` pins MANIFEST.toml and RESTORE.sh.
-  If one fails, the on-tape format changed — a CTO decision, never a re-pin.
+  If one fails, the on-tape format changed — a CTO decision, never an agent's re-pin.
   `MANIFEST.toml` is one type both directions (`volume::manifest`); RESTORE.sh
   is assembled from named awk fragments (`volume::restore_script`).
 - The full account: `docs/runs/2026-09-11-unattended.md`,
@@ -111,8 +114,10 @@ govern the result:
   promises no code keeps) and issues #142-#152.
 
 **Handoff:** `docs/handoff.md` is the current division of remaining work into
-what an agent finishes and what needs the operator's hands (the Heir Kit
-ceremony, the LTO-6 session, the first production write).
+what an agent finishes and what needs the operator's hands (the go-ahead for the
+first production write, on hold by the CTO's word; the Heir Kit ceremony; cartridges
+and locations). The real-drive rehearsal is done (2026-09-23,
+`docs/runs/2026-09-23-real-drive-rehearsal.md`).
 
 **Post-M7 hardening (complete):** Design gap audit identified 3 active bugs + 6 unacknowledged gaps. All 8 items fixed: clone-slices restructured to staging-only read-slices (self-describing invariant preserved), restore trial-decrypts with all tenant+operator keys (key rotation no longer breaks restore), compact-finish refuses retirement if live slices lack copies elsewhere, volume_verify records verification_sessions (audit feedback loop closed), staging cleanup reports actual bytes freed, compact-read errors on checksum mismatch, critical DB operations wrapped in transactions, export writes MANIFEST.toml + RECOVERY.md. RESTORE.sh fleshed out from stub to full emergency recovery script (--info, --find-envelope, --restore modes with sha256 verification and block-padding trimming). 106 tests (60 unit + 46 integration/lib/isolation/failure-mode), zero clippy warnings.
 
@@ -144,20 +149,38 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
   corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
   EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 39 checks as of #301).
+  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29).
 
-**Next:** issues #22–#28 describe the *pre-v2* design and must be read against the
-normative set above, not implemented literally.
+Issues #22–#28 (closed) describe the *pre-v2* design; read them against the normative
+set above, never as instructions.
 
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install.
+
+**2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
+issues #345–#362, integrated on `preprod` — all but #360, which is not implemented: it waits on a CTO ruling):
+- `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
+  `min_copies`/`min_locations`, same meaning; the old names are refused by name, and
+  `first-run.sh` offers the rename in place before step 1.
+- Migration 026 dropped the states nothing set (unit `retired`, snapshot
+  `superseded`/`failed`, volume `blank`/`missing`); a row still carrying one fails the
+  migration loudly, and `volumes.status` has no default.
+- `volume verify` exits 0 passed / 2 medium proven bad (quarantined) / 3 inconclusive.
+- Stage reports live in `<home>/stage-reports/` (an old `receipts/` is moved once);
+  *Receipt* means only the recipient list (`stage_sets.key_fingerprints`).
+- RESTORE.sh checks for `tar` up front; the golden pin moved under that ruling (#349).
+- **Pending, #360:** whether `catalog rebuild` (or a repair) may move an `initialized`
+  volume to `sealed` from a proven seal marker stays a CTO question — nothing on
+  `preprod` implements it. Until it is ruled, the operator guide says to back up the
+  catalog at the end of every write session: a backup taken between `volume init` and
+  `volume write` restores that volume as `initialized`, and nothing on it counts as a copy.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
 open hardware questions are answered there — block size 512 K vs 1 M is a wash, MAM
-over-report is +2 MiB. `scripts/lifecycle-suite.sh` (13 scenarios x a 10-method
-restore matrix) is the permutation suite built from it.
+over-report is +2 MiB. `scripts/lifecycle-suite.sh` (16 scenarios, `--list` names
+them, x a 10-method restore matrix) is the permutation suite built from it.
 
 ## Build Commands
 
@@ -171,7 +194,10 @@ cargo clippy --all-targets    # must stay warning-clean
 cargo fmt --check
 ```
 
-There is no CI; run `clippy`, `fmt --check`, and `cargo test` locally before committing.
+CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, `cargo test`
+(with dar installed), a `docs/man` drift check and a non-blocking `cargo audit` — but only
+on pushes and PRs to `master`. Run `clippy`, `fmt --check`, and `cargo test` locally
+before committing; nothing checks a `preprod` or other branch push.
 
 The crate is a **dual lib + bin target**: `src/main.rs` is a thin wrapper and all logic
 lives in the `tapectl` library crate (`src/lib.rs`). Integration tests import `tapectl::`
@@ -194,13 +220,20 @@ control). Run it with clippy/fmt before committing a docs or CLI change.
 Default `cargo test` runs unit + integration + tenant-isolation + failure-mode tests;
 none need tape hardware or mhvtl.
 
-**`dar` must be on `PATH` (issue #43).** The ungated suite is *not* hermetic: 13
-tests shell out to a real dar — the staging-pipeline regression guards plus the
-restore-collision test. `tests/test_dependencies.rs` asserts this once, by name,
-so a missing dar fails with instructions instead of a dozen cryptic `dar -c
-failed` panics. It is a hard *runtime* dependency anyway, so testing needs
-nothing extra. Fixtures resolve it as plain `"dar"` via `PATH` — never hardcode
-`/usr/bin/dar`, which is wrong on any distro installing to `/usr/local/bin`.
+**`dar` must be on `PATH` (issue #43).** The ungated suite is *not* hermetic: 49
+tests need a working dar (counted 2026-09-29 by stubbing dar out) — the staging
+pipeline, `stage create`/`quick-archive`/collection batches, the dar wrapper,
+`config check`'s dar probe, the restore record, and three `cli_smoke` tests.
+Without dar, plain `cargo test` runs the whole lib test binary first — dozens of
+dar-dependent tests fail with cryptic panics — and then stops (cargo's fail-fast is
+per test binary), never reaching the named check in `tests/test_dependencies.rs`; run
+`cargo test --test test_dependencies` for its instructions. Its by-name list
+(`DAR_DEPENDENT_TESTS`) names only 13 of the 49, so do not read it as complete. dar is
+a hard *runtime* dependency anyway, so testing needs nothing extra. The ungated tests
+that run dar resolve it as plain `"dar"` via `PATH` — never hardcode `/usr/bin/dar`,
+which is wrong on any distro installing to `/usr/local/bin`. The two
+`binary = "/usr/bin/dar"` fixtures in `tests/integration.rs` are inert only because
+no test using them reaches dar; do not copy them.
 
 ```bash
 cargo test                              # everything ungated
@@ -240,13 +273,13 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 - **CLI layer** (`src/cli/`): clap derive-based subcommands (tenant, unit, snapshot, stage, volume, catalog, restore, audit, etc.)
 - **Database** (`src/db/`): SQLite with WAL mode, forward-only numbered migrations, full audit trail; `ontape_catalog.rs` is the operator envelope's `catalog.db` — schema, generation probe, read and write in one place
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
-- **dar integration** (`src/dar/`): subprocess wrapper; minimum dar 2.6.x; XML catalog parsing via quick-xml
+- **dar integration** (`src/dar/`): subprocess wrapper for create, restore and the version check; minimum dar 2.6.x
 - **Staging** (`src/staging/`): sha256 validation before archiving, age multi-recipient encryption, ephemeral slices
 - **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), RESTORE.sh from named awk fragments (`restore_script.rs`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
 - **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit; `coverage.rs` owns the copy/location SQL and every `volumes.status` predicate, `escrow.rs` owns escrow coverage (verdict AND query) — never inline either again
-- **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` are the remaining peers (#72/#73)
+- **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` stay ADR-0006 peers but are unbuilt and untracked: #72 (closed) rescoped warehouse copies to a documented rclone/aws-cli procedure over sealed volumes (`docs/design-errata.md`), #73 (closed) is the warehouse-location model, and no issue tracks an `ExportStore` — `export` does not go through the trait
 - **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical first-fit batch selector, stage-once/write-N-copies/release
 
 **Design principles:**
@@ -259,18 +292,21 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 ## External Dependencies
 
 - `dar` ≥2.6 (recommended 2.7.20+) — archive creation/extraction
-- `sg3-utils` — drive health diagnostics
+- `sg3-utils` — drive health pages (`sg_logs`), the cartridge's MAM (`sg_read_attr`), drive identity (`sg_inq`)
 - `mhvtl` — virtual tape library for development/testing
-- `lsscsi`, `mt-st` — optional device discovery and debugging
+- `lsscsi`, `mt-st` — the binary never calls them (device discovery and debugging), but
+  `scripts/first-run.sh` step 2 requires both, along with `acl` (`setfacl`) and `python3`
+- the `age` and `tar` CLIs — not used by the binary (it uses the `age` and `tar`
+  crates), but the on-tape RESTORE.sh (the heir path) refuses to run without them or `mt`
 
 ## Key Rust Dependencies
 
 - `clap` 4.6 (derive), `rusqlite` 0.39 (bundled), `age`/`rage` 0.11 (pinned: pre-1.0 API unstable)
-- `quick-xml` 0.39, `nix` 0.29 (ioctl/fs), `sha2` 0.10, `uuid` 1 (v4/v7)
+- `nix` 0.29 (ioctl/fs), `sha2` 0.10, `uuid` 1 (v4/v7)
 - `thiserror` 2, `anyhow` 1, `chrono` 0.4, `walkdir` 2, `serde` 1
 
 ## Configuration
 
-- System config: `~/.tapectl/config.toml` (dar path, backends, locations, defaults, exclusions, policy)
+- System config: `~/.tapectl/config.toml` (dar path, backends, defaults incl. exclusions and copy policy, archive sets, staging, collections, host check); locations are catalog rows from `location add`, not config — a `[locations]` table is refused
 - Database: `~/.tapectl/tapectl.db`
 - Per-unit config: `.tapectl-unit.toml` in each archival directory

@@ -44,6 +44,7 @@ documentation is [docs/README.md](README.md).
   - [Search the catalog](#search-the-catalog)
 - [Safety Operations](#safety-operations)
 - [Policy and Compliance](#policy-and-compliance)
+  - [Scripting against tapectl](#scripting-against-tapectl)
 - [Warehouse Copies (Cold Cloud)](#warehouse-copies-cold-cloud)
 - [Cadence](#cadence)
 - [Compaction](#compaction)
@@ -105,11 +106,14 @@ tapectl init --operator mike
 ```
 
 `--operator` names the **operator tenant**, a label in the catalog, not a Unix
-account (it defaults to the name of the user running `init`). `init` creates
+account. It defaults to your login name, except under a system account — the
+`tapectl` service user, or root — where `init` refuses without it rather than
+name the operator after the account. `init` creates
 that tenant with a primary and a backup key, so do not `tenant add` it
 afterwards — that fails because the name is taken. It also creates the
 database, the config file, the `keys/` directory, and the permanent **escrow
-recipient**, whose secret it prints exactly once:
+recipient**, whose secret it prints exactly once. The secret line below is a
+placeholder; your terminal shows the whole secret there:
 
 ```text
 ================================================================================
@@ -118,18 +122,19 @@ recipient**, whose secret it prints exactly once:
   ...
   SECRET -- transcribe this line:
 
-    AGE-SECRET-KEY-1…(redacted)
+    AGE-SECRET-KEY-1<58 more characters: your secret>
 
   Public key (already saved to disk and the database -- safe to keep there):
 
-    age1zczqp0emrmylxcetrrz5k8xu5j097dlptp4eysje0vgu496mgc5qaq0nmp
+    age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+
 ================================================================================
 
 tapectl initialized at ~/.tapectl
   operator: mike
   database: ~/.tapectl/tapectl.db
   config:   ~/.tapectl/config.toml
-  escrow:   age1zczqp0emrmylxcetrrz5k8xu5j097dlptp4eysje0vgu496mgc5qaq0nmp
+  escrow:   age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
             (the SECRET was printed above — transcribe it now onto paper; ADR-0005)
   dar:      dar (found at /usr/bin/dar)
 ```
@@ -178,18 +183,25 @@ generation = "LTO-6"        # what the DRIVE is, not what you feed it
 # capacity_override = "2400M"   # virtual drives and test harnesses only
 
 [staging]
-directory = "/mnt/staging"  # Needs space for dar + encrypted slices
+directory = "/mnt/staging"  # Peak need: one unit's dar archive + one encrypted slice
 
 [defaults]
 slice_size = "10G"
-min_copies_for_tape_only = 2
-min_locations_for_tape_only = 2
+min_copies = 2              # copies every unit needs (an archive set may ask for more)
+min_locations = 2           # distinct locations those copies must be in
 
 [discovery]
 watch_roots = ["/media/tv", "/media/movies"]
 ```
 
-Unknown keys are errors, everywhere. Validate with:
+Unknown keys are errors, everywhere. That includes the two `[defaults]` keys
+that were renamed on 2026-09-29: a config written earlier carries
+`min_copies_for_tape_only` and `min_locations_for_tape_only`, and it will not
+load until you rename them to `min_copies` and `min_locations` — the meaning
+and the values are unchanged, and the refusal says exactly that. (On an install
+made with `first-run.sh`, re-running it offers the rename at step 0.)
+
+Validate with:
 
 ```bash
 tapectl config check
@@ -218,8 +230,8 @@ TAPECTL_HOME=/mnt/usb/archive tapectl audit
 ```
 
 `--config` points at a config *file*. On its own it **also** relocates the
-whole home to that file's parent directory — database, keys, catalogs,
-receipts — which is surprising, and it warns when you do it. It still works,
+whole home to that file's parent directory — database, keys, catalogs, stage
+reports — which is surprising, and it warns when you do it. It still works,
 because scripts and test harnesses have long relied on it for isolation, and
 silently repointing them at the real archive would be worse than the
 surprise. Use `--home` to choose the archive and `--config` only to name a
@@ -263,11 +275,12 @@ tapectl volume write L8-0002 --device "$TAPE"
 tapectl volume verify L8-0002 --device "$TAPE"
 tapectl volume move L8-0002 --to offsite
 
-# 5. Check, release staging, refresh the Heir Kit
+# 5. Check, release staging, refresh the Heir Kit, back up the catalog
 tapectl audit
 tapectl report copies
 tapectl staging clean
 tapectl key escrow-kit --out ~/heir-kit
+tapectl db backup --to /mnt/backup/tapectl.db   # a timer install: sudo systemctl start tapectl-backup.service
 ```
 
 What success looks like at each step:
@@ -277,13 +290,13 @@ $ tapectl snapshot create family/letters
 snapshot created: family/letters v1 (2 files, 224 B)
 
 $ tapectl stage create family/letters
-staged: family/letters (1 slices, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: family/letters (1 slices, 1.1 KiB dar, 1.8 KiB encrypted)
 
 $ tapectl volume plan --copies 2
 volume write plan (2 copy/copies):
   family/photos/2019-italy v1: 1 slices, 1.1 MiB
   family/photos/2020-garden v1: 1 slices, 588.1 KiB
-  family/letters v1: 1 slices, 1.7 KiB
+  family/letters v1: 1 slices, 1.8 KiB
   work/invoices-2024 v1: 1 slices, 1.7 KiB
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
@@ -295,7 +308,7 @@ volume "L8-0001" initialized (id=1)
 
 $ tapectl volume write L8-0001 --device "$TAPE"
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.7 KiB
+  family/letters v1: 1 slices, 1.8 KiB
   family/photos/2019-italy v1: 1 slices, 1.1 MiB
   family/photos/2020-garden v1: 1 slices, 588.1 KiB
   work/invoices-2024 v1: 1 slices, 1.7 KiB
@@ -324,21 +337,18 @@ VIOLATIONS (4):
   [copy_count] family/photos/2019-italy: has 1 copies, needs 2
   [copy_count] family/photos/2020-garden: has 1 copies, needs 2
   [copy_count] work/invoices-2024: has 1 copies, needs 2
-WARNINGS (2):
-  [compaction_candidate] volume:L8-0001: utilization 49% < 50% threshold
+WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 4 violations, 2 warnings (exit 2)
+audit: 4 violations, 1 warnings (exit 2)
 ```
 
 And after the second copy is written and moved offsite:
 
 ```text
 $ tapectl audit
-WARNINGS (3):
-  [compaction_candidate] volume:L8-0001: utilization 49% < 50% threshold
-  [compaction_candidate] volume:L8-0002: utilization 49% < 50% threshold
+WARNINGS (1):
   [escrow_kit_missing] archive: 2 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 3 warnings (exit 1)
+audit: 0 violations, 1 warnings (exit 1)
 
 $ tapectl report copies
   family/letters: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
@@ -354,12 +364,21 @@ $ tapectl key escrow-kit --out ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 668082 bytes, covering 2 sealed volume(s)
-  ...
+  catalog.db.age   encrypted catalog, 672130 bytes, covering 2 sealed volume(s)
+
+still to do, and only you can do it:
+  1. print COVER.txt (or the HTML page)
+  2. copy the escrow SECRET (AGE-SECRET-KEY-1..., shown once by `tapectl init`)
+     by hand into the box marked WRITE IT HERE -- the kit prints only the
+     public half, and without the secret the sheet opens nothing
+  3. seal it in a tamper-evident envelope
+  4. store copies in at least TWO independent failure domains
 ```
 
-(The compaction warnings are expected for tiny test data; a full cartridge
-does not trip them.)
+(The remaining warning, `escrow_kit_missing`, is what step 5's
+`key escrow-kit` clears. Take the catalog backup last, once the session is
+over; [Database Operations](#database-operations) says why a mid-session one
+is not enough.)
 
 If you archive whole folders of similar things — one unit per subfolder of a
 media root — a [Collection](cli/collection.md) (`collection sync`,
@@ -397,6 +416,18 @@ does not invent new units; it finds directories that already carry a dotfile,
 registering any the catalog does not know and updating the path of any that
 moved (for example after the catalog was lost, or on a new host).
 
+**Leaving files out.** Exclude patterns come from `[defaults] global_excludes`
+in config.toml (`init` writes `*.nfo`, `Thumbs.db`, `.DS_Store` and `*.tmp`)
+plus the `[excludes] patterns` list in a unit's dotfile. Matching ignores case.
+A plain pattern such as `*.iso` matches a file's name, anywhere in the unit. A
+pattern ending in `/`, such as `.cache/` or `node_modules/`, drops everything
+inside every directory of that name, at any depth below the unit, from the
+snapshot and from the dar archive, so none of it reaches tape (the directory
+itself is kept, empty). A collection's own `exclude` list, which decides which
+folders become units, ignores case too: a plain pattern there matches a
+candidate folder's name, and a `name/` pattern skips every candidate below a
+folder of that name. Every key is in [configuration.md](configuration.md).
+
 ### Archive to tape
 
 `tapectl init` creates the permanent escrow recipient (ADR-0005) for you and
@@ -425,6 +456,33 @@ tapectl volume write L6-0001 --device "$TAPE"
 # Step 4: Verify
 tapectl volume verify L6-0001 --device "$TAPE"
 ```
+
+**Staging space.** At its peak, `stage create` holds one unit's dar archive
+plus one encrypted slice written beside it: about the unit's size plus one
+`slice_size`, not a multiple of the unit. It checks for that room before dar
+runs:
+
+- With `compression = "none"` (the default) it first reads the whole unit (the
+  sha256 validation pass), because only the content says what dar will store.
+  If free space is below that floor, the unit's non-zero bytes plus one slice,
+  it refuses with the figures (`not enough space in staging directory …`), and
+  no flag overrides that. If free space is between the floor and the unit's
+  full size (hard-linked and zero-filled files make them differ), the unit may
+  or may not fit, so it asks.
+- With compression on, what dar writes cannot be known in advance. If free
+  space is below the uncompressed figure, it asks before reading anything.
+
+The question is an ADR-0008 Tier-2 one: a terminal gets
+`stage unit "…" — proceed? [y/N]`, `--yes` proceeds (the figures are still
+printed), and a run with no terminal and no `--yes` refuses. That includes
+`collection run`, `quick-archive` and anything you script. If a stage that
+went ahead does run out of room, dar fails partway and the partial slices are
+removed.
+
+Each stage set also leaves a short stage report (unit, tenant, snapshot, and
+every slice's size and hash) in `<home>/stage-reports/`. A home initialised
+before 2026-09-29 kept these in `receipts/`; the first command run on it moves
+the directory.
 
 **`volume write` writes everything still staged, not just what you staged in
 this sitting** — and it says so before it touches the drive:
@@ -490,10 +548,10 @@ tripped, and runs on a machine not yet `init`ed:
 
 ```text
 $ tapectl host check
-load average       3.78 over 16 CPUs = 0.24/CPU             max 1.00/CPU
-available memory   7709 MiB                                 min 2048 MiB
-memory pressure    0.01% full avg60                         max 10.00%
-I/O pressure       0.23% full avg60                         max 10.00%
+load average       2.69 over 16 CPUs = 0.17/CPU             max 1.00/CPU
+available memory   8071 MiB                                 min 2048 MiB
+memory pressure    0.00% full avg60                         max 10.00%
+I/O pressure       0.60% full avg60                         max 10.00%
 processes          cargo, rustc, docker, Runner.Worker      contender_processes
 units              (none listed)                            contender_units
 host check: quiet — nothing listed above is running or over its limit
@@ -549,6 +607,18 @@ tapectl volume plan --copies 2
 tapectl report pending
 ```
 
+`stage list --status staged` is everything the next `volume write` would
+carry. `report pending` is narrower: the stage sets whose version still owes a
+copy, fewer copies than its unit's resolved `min_copies`, each with how many it
+has of how many it needs. A stage set that already has all its copies is only
+counted on a last line, as held in staging until `staging clean` releases it:
+
+```text
+$ tapectl report pending
+no stage set owes a copy
+4 more stage set(s) have every copy their own version needs and are only held in staging (`tapectl staging clean` decides which can be released)
+```
+
 `volume plan` estimates against the drive's own generation; pass
 `--generation LTO-5` to count cartridges of another generation that drive can
 write.
@@ -576,7 +646,7 @@ $ tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/un
 would restore "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
 
 $ tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE"
-2026-09-28T21:44:10.997985Z  WARN tapectl::dar::restore: restoring as a non-root user: restored files will be owned by the invoking user, not their archived owners
+2026-09-29T08:20:06.455931Z  WARN tapectl::dar::restore: restoring as a non-root user: restored files will be owned by the invoking user, not their archived owners
 restored "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
 
 $ diff -r /media/family/letters /tmp/restore/unit && echo identical
@@ -606,14 +676,13 @@ $ tapectl catalog locate family/letters
 +---------+--------+-----------+-----------+----------+--------+---------------------+-------------+-----------+--------+----------+
 | Volume  | Status | Condition | Location  | Snapshot | Slices | Written             | Serviceable | Warehouse | Escrow | Verified |
 +---------+--------+-----------+-----------+----------+--------+---------------------+-------------+-----------+--------+----------+
-| L8-0001 | sealed | ok        | home-rack | 1        | 1      | 2026-09-28 21:44:05 | yes         | -         | yes    | 0d ago   |
+| L8-0001 | sealed | ok        | home-rack | 1        | 1      | 2026-09-29 08:20:01 | yes         | -         | yes    | 0d ago   |
 +---------+--------+-----------+-----------+----------+--------+---------------------+-------------+-----------+--------+----------+
-| L8-0002 | sealed | ok        | offsite   | 1        | 1      | 2026-09-28 21:44:09 | yes         | -         | yes    | 0d ago   |
+| L8-0002 | sealed | ok        | offsite   | 1        | 1      | 2026-09-29 08:20:05 | yes         | -         | yes    | 0d ago   |
 +---------+--------+-----------+-----------+----------+--------+---------------------+-------------+-----------+--------+----------+
-```
 
-"Verified" is the catalog's record of the last *passed* `volume verify` of that
-copy, not a check made just now.
+note: "Verified" is this catalog's last-known record of each copy's most recent PASSED `volume verify` — not a check of the tape performed just now. "never" means no passed verification is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
+```
 
 ## Safety Operations
 
@@ -665,13 +734,45 @@ When local disk copies are no longer needed:
 # Check the local files still match what was staged
 tapectl unit check-integrity tv/breaking-bad/s01
 
-# Then mark it tape-only (enforces min_copies_for_tape_only and min_locations_for_tape_only)
+# Then mark it tape-only (checks its copies and locations against its policy)
 tapectl unit mark-tape-only tv/breaking-bad/s01
 ```
 
-`mark-tape-only` refuses while the unit has fewer copies or locations than the
-tape-only minimums (2 and 2 by default); `--force` overrides that, and should
-not be needed.
+`check-integrity` exits 0 whether or not the files match, so read what it
+prints: a `BITROT`, `MISSING` or `SIZE_MISMATCH` line means they do not.
+
+```text
+$ tapectl unit check-integrity family/letters
+integrity check for "family/letters":
+  OK:            1
+  SIZE_MISMATCH: 1
+    a.txt — SIZE_MISMATCH
+```
+
+`mark-tape-only` checks the unit against its own resolved policy (dotfile >
+archive set > `[defaults]`): at least `min_copies` copies (2 by default);
+copies in at least `[defaults] min_locations` distinct locations (2 by
+default); a copy at every one of its `required_locations`, by name; and
+nothing changed on disk since its last snapshot. A unit that meets all of it is marked with no
+question asked.
+
+A shortfall is a risk you may knowingly accept (ADR-0008 Tier 2), so it is
+asked about rather than refused: a terminal shows each shortfall and asks
+`mark unit "…" tape-only — proceed? [y/N]`, `--force` or the global `--yes`
+confirms in advance, and a session with no terminal and neither flag refuses,
+naming each one:
+
+```text
+$ tapectl unit mark-tape-only tv/show/s01 < /dev/null
+error: mark unit "tv/show/s01" tape-only refused: non-interactive session with no confirmation given — refusing rather than assuming consent (re-run with --yes to proceed)
+insufficient copies: 0 < 2 required by unit "tv/show/s01"'s policy
+insufficient locations: 0 < 2 required ([defaults] location floor)
+(`--force` or `--yes` confirms this in advance)
+```
+
+Two things no flag passes: a unit that was never archived (no snapshot, so no
+tape holds it; ADR-0008 Tier 3), and a unit whose policy cannot be resolved,
+such as one with a malformed dotfile. The gate will not guess at a policy.
 
 ### Retire a Volume
 
@@ -690,7 +791,10 @@ shows.
 An archive set is a named policy (minimum copies, required locations, verify
 interval, …) that units can be assigned to (`unit init --archive-set`). Policy
 resolves in three layers: the unit's dotfile, then its archive set, then
-`[defaults]` in config.toml.
+`[defaults]` in config.toml. Not every key exists in every layer. A dotfile's
+`[policy]` table takes only `checksum_mode`, `compression`, `slice_size` and
+`warehouse_copies`. `required_locations` and `verify_interval_days` exist only
+on an archive set, so a unit outside one has neither.
 
 ```bash
 # Create a policy template
@@ -699,8 +803,31 @@ tapectl archive-set create critical-media \
   --required-locations "home-rack,parents-house" \
   --verify-interval-days 180
 
-# Import the archive sets defined in config.toml
+# Apply the [[archive_sets]] tables in config.toml
 tapectl archive-set sync
+```
+
+`--required-locations` takes the names of registered locations (see
+[Locations and Movement](#locations-and-movement)), and they are checked by
+name everywhere: `audit`, `unit mark-tape-only` and `snapshot mark-reclaimable`
+all want a copy *at each named place*, not merely copies in that many places.
+A name that is not registered is refused, dry run or not:
+
+```text
+$ tapectl archive-set create critical-media --min-copies 3 --required-locations "home-rack,parents-house" --verify-interval-days 180
+error: --required-locations names "parents-house", which is not a registered location (registered locations: home-rack). Register a location first with `tapectl location add <name>`, or fix the spelling.
+```
+
+`archive-set sync` writes only the keys each `[[archive_sets]]` table in
+config.toml names. For those keys config.toml wins, so an `archive-set edit`
+of one is undone by the next sync; change the file instead. A key the table
+leaves out keeps whatever `create` or `edit` set. A table whose
+`required_locations` names an unregistered location stops the sync before any
+set is written.
+
+```text
+$ tapectl archive-set sync
+sync: 1 created, 0 updated, 1 unchanged from config.toml
 ```
 
 ### Audit
@@ -726,13 +853,17 @@ VIOLATIONS (4):
   [copy_count] family/letters: has 1 copies, needs 2
     fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
   ...
-WARNINGS (2):
-  [compaction_candidate] volume:L8-0001: utilization 49% < 50% threshold
-    fix: tapectl volume compact-read L8-0001
+WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
     fix: tapectl key escrow-kit --out <dir>
-audit: 4 violations, 2 warnings (exit 2)
+audit: 4 violations, 1 warnings (exit 2)
 ```
+
+`location_presence` compares a unit's `required_locations`, by name, with
+where its copies actually are: a missing place reads
+`no copy at required location(s) offsite (policy requires home-rack, offsite; copies are in 1 location(s))`,
+and its fix ends in `tapectl volume move <OTHER-LABEL> --to offsite`. A name
+that is not a registered location counts as missing.
 
 ### Reports
 
@@ -749,16 +880,76 @@ tapectl report events --days 30
 ```text
 $ tapectl report summary
 tapectl summary
-  Tenants:    3
+  Tenants:    2 (the operator not counted)
   Units:      4 active
   Snapshots:  4
-  Volumes:    2 active
+  Volumes:    2 holding data (retired, erased and quarantined not counted)
   Writes:     8 completed
   Total data: 7.0 MiB on tape
-  Pending:    4 stage set(s) awaiting write
+  Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl staging clean` decides which can be released)
 ```
 
+The `Staging` line appears only while something is staged. When a stage set's
+version still has fewer copies than its unit needs, it reads
+`N stage set(s) held, M still owe a copy`, and `report pending` lists them.
+
 The full list of reports is in the [command reference](cli/report.md).
+
+### Scripting against tapectl
+
+The global `--json` flag makes a command print machine-readable output on
+stdout; log lines always go to stderr. Only the commands in the first six
+rows put a finding in their exit status:
+
+| command | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| `audit` | clean | warnings only | violations, or an error | — |
+| `volume verify` | every checked file matched | — | the medium is proven bad: the volume is quarantined and no longer counts as a copy | inconclusive: a drive or transport failure, or any error, including a command line that does not parse |
+| `db fsck` | clean | findings that are not corruption (orphaned rows, repaired or not) | the integrity check failed, or an error | — |
+| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), and the rest ran | an error | — |
+| `host check` | quiet | something tripped | an error | — |
+| `config check` | the config loads | — | it does not, or an error | — |
+| every other command | it ran, whatever it found | — | an error, including a usage error | — |
+
+Every other command reports what it finds in its output only, and exits 0
+whatever that is. `unit check-integrity` exits 0 when files no longer match,
+and `report fire-risk` exits 0 with units at risk. A script reads those from
+`--json`: `unit check-integrity` gives the counts `bitrot`, `missing` and
+`size_mismatch` (all 0 when every file matches), and `report fire-risk` gives
+`at_risk`.
+
+```text
+$ tapectl --json unit check-integrity family/letters; echo "exit=$?"
+{"bitrot":0,"details":[{"actual":12,"expected":6,"path":"a.txt","status":"SIZE_MISMATCH"}],"missing":0,"ok":1,"size_mismatch":1,"unit":"family/letters"}
+exit=0
+```
+
+`--help` exits 0 everywhere. Older builds exited 2 from `volume verify` for a
+bad medium and for every error alike. A script that retried a verify on 2 must
+now retry on 3, and replace the cartridge on 2.
+
+With no terminal on stdin, a command that would ask for confirmation (an
+ADR-0008 Tier-2 question, such as `unit mark-tape-only` below policy, or
+`stage create` when the staging directory may be too small) refuses and
+exits 2 rather than assume consent. Pass the global `--yes`, or the command's
+`--force` where it has one, to confirm in advance.
+
+These `--json` fields changed incompatibly from older builds:
+
+| command | before | now |
+|---|---|---|
+| `report summary` | `staged_pending` | removed; `stage_sets_held` (every stage set in staging) and `stage_sets_owing_a_copy` (those whose version is still short of copies) replace it |
+| `report summary` | `tenants` counted the operator | `tenants` excludes the operator |
+| `report pending` | a row per staged stage set | a row only per stage set that still owes a copy, with new `copies` and `min_copies` (`null` when the unit's policy cannot be resolved) |
+| `report compaction-candidates` | `total_bytes` | `data_bytes`: live plus reclaimable archive data, without the fixed per-volume metadata; `utilization` is `live_bytes / data_bytes`, and `flagged` also needs `reclaimable_bytes > 0` |
+| `key list` | the escrow row's `key_type` was `"primary"` | `"escrow"` (`is_escrow` is unchanged) |
+| `config show` | `defaults.min_copies_for_tape_only`, `defaults.min_locations_for_tape_only` | `defaults.min_copies`, `defaults.min_locations`; it mirrors config.toml, and a fresh one no longer has empty `collections` and `archive_sets` |
+
+Additions a parser can ignore: `db backup` gains `keys_dir` (`null` when no
+keys were copied), `archive-set sync` gains `unchanged`, `archive-set info`
+gains `warehouse_copies`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`
+and `dirty_on_metadata_change`, and `key import --reactivate` prints
+`alias`, `fingerprint` and `reactivated`.
 
 ## Warehouse Copies (Cold Cloud)
 
@@ -866,10 +1057,14 @@ tapectl volume deposit list
 tapectl volume deposit list --volume L6-0003
 ```
 
-`deposit add` refuses two things and nothing else: a location that is not a
-warehouse, and a volume that is not `sealed` (unsealed bytes are not final, so
-there is nothing durable to have deposited). There is deliberately **no
-checksum field** — tapectl did not perform the copy, so a checksum you typed
+`deposit add` checks the request, not the copy. It refuses a location that is
+not a warehouse, and a volume that is not an eligible copy: one that is not
+`sealed` (unsealed bytes are not final, so there is nothing durable to have
+deposited), or one that is `sealed` but that a failed verify quarantined (its
+`observed_condition` is not `ok`). No flag passes the quarantine refusal,
+because it is a fact the catalog recorded, not a risk to accept. A volume holds
+one deposit per warehouse: to record a new receipt, `deposit remove` the old
+one first. There is deliberately **no checksum field** — tapectl did not perform the copy, so a checksum you typed
 in would be a claim about a claim. What gets recorded is what is actually
 attestable: which volume, which warehouse, when, and the provider's receipt.
 
@@ -1058,14 +1253,24 @@ tapectl report verify-status
 ### Weekly — cheap, no tape
 
 Run `tapectl audit`. It runs eleven compliance checks, including copy count,
-location presence, and **verification age against each unit's resolved
-`verify_interval_days`**. That last check is what produces your "what is
-overdue" list — you do not track it yourself. Per ADR-0004 it is advisory: it
-warns, it never blocks, and a stale volume still counts as a copy.
+location presence, and **verification age**. The verification-age check
+covers only a unit whose archive set sets `verify_interval_days`. That key
+exists on archive sets and nowhere else. A `[defaults]` key stops config.toml
+loading, and a dotfile `[policy]` key makes the unit's policy unresolvable. For
+the units it covers, `audit` produces your "what is overdue" list, and you do
+not track it yourself. Any other unit gets no verification-age finding at all.
+On an install that has never set an interval, that is every unit, and
+`tapectl report verify-status` is the list you read by eye (see
+[Monthly](#monthly--verify-a-rotating-slice-of-the-library)). To have `audit`
+track it, set the interval on the archive set your units belong to
+(`tapectl archive-set edit <name> --verify-interval-days 365`). A unit joins
+an archive set when it is registered (`unit init --archive-set <name>`). Per
+ADR-0004 the check is advisory: it warns, it never blocks, and a stale volume
+still counts as a copy.
 
 `tapectl report dirty` and `tapectl report pending` are the companion glance —
-what has drifted since its last snapshot, and what is staged but not yet on
-tape.
+what has drifted since its last snapshot, and which stage sets still owe a
+copy.
 
 ### Scheduling the advisory half
 
@@ -1102,13 +1307,18 @@ verify-status`, and its exit status is `audit`'s:
 | 2 | violations | failure |
 
 Warnings are not a failure on purpose. `audit` warns for ordinary drift — an
-overdue verification, a unit one copy short — and ADR-0004 is explicit that the
-audit advises and never blocks. A timer that alerts on exit 1 would turn the
-advisory audit into a blocking one by the back door.
+overdue verification (for a unit whose archive set sets an interval; see
+[Weekly](#weekly--cheap-no-tape)), a source changed since its last snapshot, a Heir Kit
+older than the newest tape — and ADR-0004 is explicit that the audit advises
+and never blocks. A timer that alerts on exit 1 would turn the advisory audit
+into a blocking one by the back door. A unit short of its copies or of a
+required location is a violation, not a warning, so it exits 2 and the timer
+unit fails: that is the finding you want to hear about.
 
 `report verify-status` always exits 0; it runs for the journal record, not as a
-check. The verification-age *check* with real exit codes is one of `audit`'s
-checks, so nothing is lost.
+check. The verification-age *check*, with a real exit code, is `audit`'s, and
+it covers only units whose archive set sets `verify_interval_days`. For every
+other unit, the verify-status listing in the journal is the only record.
 
 Set `TAPECTL_HEALTHCHECK_URL` in the service to ping a healthchecks.io-style
 endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2). It is off unless
@@ -1138,11 +1348,23 @@ tapectl report verify-status                     # verification recency, oldest 
 tapectl volume verify L6-0003 --device "$TAPE"   # --full is the default
 ```
 
-Pick the N oldest-evidence volumes such that **every volume gets one full pass
-within its `verify_interval_days`** — if you hold 24 volumes on a 12-month
-interval, that is roughly 2 per month. `verify_interval_days` resolves through
-the usual three layers (dotfile > archive set > defaults) and is set with
-`tapectl archive-set edit <name> --verify-interval-days N`.
+The report lists every verification session, not one line per volume.
+`never verified` lines come first, then sessions oldest first, so a volume
+verified twice appears twice. Judge each volume by its newest line:
+
+```text
+$ tapectl report verify-status
+  L8-0001: full passed at 2026-09-28 23:14:34 (13/13/0 checked/passed/failed)
+  L8-0001: full passed at 2026-09-28 23:14:35 (13/13/0 checked/passed/failed)
+  L8-0002: full passed at 2026-09-28 23:14:39 (13/13/0 checked/passed/failed)
+```
+
+Pick the N volumes whose newest pass is oldest, such that **every volume gets
+one full pass within your verification interval**. If you hold 24 volumes on a
+12-month interval, that is roughly 2 per month. The interval `audit` checks is
+`verify_interval_days`, which only an archive set carries
+(`tapectl archive-set edit <name> --verify-interval-days N`). For a unit
+outside such a set, the interval is yours to keep, and nothing checks it.
 
 Two tiers, and the distinction matters:
 
@@ -1155,6 +1377,18 @@ Two tiers, and the distinction matters:
 want to rule out fast. It is not a substitute for a full pass, and a `--quick`
 run should not reset your sense of when that volume was really verified.
 
+The exit status says which of three things happened, so a script needs no
+`--json` to tell them apart:
+
+| exit | meaning | what to do |
+|---|---|---|
+| 0 | every checked file matched | nothing |
+| 2 | the verify **proved the medium bad**: the volume is quarantined and no longer counts as a copy | write its content to another cartridge |
+| 3 | **inconclusive**: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched | check the drive, then verify again |
+
+An empty drive is refused at once with `no cartridge loaded in <device>`, by
+`volume verify` and by every other command that reads or writes a tape.
+
 ### Annually — the heir-path restore drill
 
 The drill that matters is not "can tapectl restore this" — it is **can someone
@@ -1166,16 +1400,18 @@ The procedure already exists in
 *Raw-recovery drill* section. Follow it there rather than a second copy here;
 two drifting checklists are a failure waiting to happen. The drill's
 essentials: load a real tape, pull `RESTORE.sh` off the plaintext front zone
-with `mt` + `dd`, and run it using **only** `mt`, `dd`, `age`, `dar`, and
-`sha256sum` — no `tapectl` — against nothing but the printed key material.
+with `mt` + `dd`, and run it using **only** the tools the tape's own guide
+lists — `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate` and `tar` —
+plus the shell tools any Linux system has, and no `tapectl`, against nothing
+but the printed key material.
 
 Nothing automated performs a drill; schedule it yourself, on real hardware.
 
 While you are there, confirm your off-tape recovery inputs are current:
 
 ```bash
-tapectl db backup --to /path/to/backup        # add --include-keys only if the
-                                              # destination is treated as secret
+tapectl db backup --to /path/to/backup/tapectl.db   # add --include-keys only if the
+                                                    # destination is treated as secret
 tapectl key list --tenant <name>              # find the aliases, then
 tapectl key export <alias>                    # public half, for the record
 ```
@@ -1212,12 +1448,17 @@ nothing until you do it:**
    shelves in one building;
 5. paper in a UL-350 safe; Class-125 if stored together with tape.
 
-**Re-run it after every write session.** A kit made before newer tapes were
-written still opens the older ones and silently misses the new — which is the
-failure mode ADR-0005 names explicitly. You are not expected to remember:
-`audit` warns (`escrow_kit_stale`, or `escrow_kit_missing` if you have sealed
-tapes and no kit at all) whenever volumes were sealed after the last
-generation. It is advisory and never blocks — exit 1, never 2.
+**Re-run it after every write session.** The escrow secret opens every tape
+ever written, old and new, because the escrow recipient is on all of them.
+What goes stale is `catalog.db.age`: it lists only the volumes that existed
+when the kit was made, so an heir holding an old kit can decrypt a newer tape
+but finds nothing in the catalog about what it holds or where it is kept.
+They can still rebuild the catalog from that tape
+(`catalog rebuild --from-volume`); a fresh kit spares them that. You are not
+expected to remember: `audit` warns (`escrow_kit_stale`, or
+`escrow_kit_missing` if you have sealed tapes and no kit at all) whenever
+volumes were sealed after the last generation. It is advisory and never
+blocks — exit 1, never 2.
 
 The bundle deliberately contains the **whole** `tapectl.db`, not the filtered
 subset that rides on tape: without `locations` and `cartridges` an heir would
@@ -1266,7 +1507,7 @@ destination must be a volume already initialised with `volume init`.
 # Check candidates
 tapectl report compaction-candidates
 
-# Mark old snapshots as reclaimable (enforced preconditions)
+# Mark old snapshots as reclaimable (checks the version that supersedes each)
 tapectl snapshot mark-reclaimable tv/breaking-bad/s01 --version 1
 
 # Three-step compaction, on one drive
@@ -1276,18 +1517,84 @@ tapectl volume init L6-0010 --device "$TAPE"
 tapectl volume compact-write --destination L6-0010 --device "$TAPE"
 tapectl volume compact-finish L6-0001                         # retires the source
 
-# Or all three in one flow
-tapectl volume compact L6-0001 --device "$TAPE"
+# Or all three in one flow, at a terminal: initialise the destination first
+tapectl volume init L6-0010 --device "$TAPE"                  # destination loaded
+# (swap in the source)
+tapectl volume compact L6-0001 --to L6-0010 --device "$TAPE"
 ```
 
-`volume compact` reads the source, then prompts "Insert destination tape and
-enter volume label" — load the already-initialised destination there and type
-its label. `--to <label>` skips the prompt (for a non-interactive run), which
-also means there is no pause to swap cartridges: use it only when the
-destination is already the tape the drive will write. Step 3 (retiring the
-source) asks for consent; `--force` or `--yes` answers it, and if it declines,
-the destination is already written and sealed —
-`volume compact-finish <source> --force` completes the job.
+A volume is a candidate when its live data falls below
+`[compaction] utilization_threshold` (50% by default) of the archive data on
+it: live data plus the data of reclaimable and purged snapshots, with the
+fixed per-volume metadata left out. A volume with nothing reclaimable is never
+a candidate however little it holds, so a freshly written tape never is. The
+report prints a line for every sealed volume holding data (a quarantined one
+is left out), marks a
+candidate `*** CANDIDATE ***`, and ends with `no compaction candidates` when
+none qualifies:
+
+```text
+$ tapectl report compaction-candidates
+  L8-0001: live data is 100% of the archive data on this volume (1.7 MiB live, 0 B in reclaimable/purged snapshots)
+  L8-0002: live data is 100% of the archive data on this volume (1.7 MiB live, 0 B in reclaimable/purged snapshots)
+no compaction candidates (threshold: live data below 50% of the archive data on a volume)
+```
+
+`snapshot mark-reclaimable` releases an older version once a newer current
+version supersedes it, and first checks that the superseding version is
+covered on its own: `min_copies` copies, and a copy at each of its
+`required_locations` by name (for a tape-only unit, both floors multiplied by
+`[compaction] tape_only_safety_multiplier`). A shortfall goes through the same
+Tier-2 consent as `mark-tape-only`: a terminal asks, `--force` or `--yes`
+confirms in advance, and a session with no terminal and neither flag refuses,
+naming it (for example
+`superseding v2 has no copy at required location(s) offsite (policy requires home-rack, offsite)`).
+
+`--force` accepts a shortfall; it does not skip the check. When a superseding
+version exists, the unit's policy is resolved before any coverage is checked,
+even under `--force`. A policy that cannot be resolved, such as a dotfile with an invalid
+`[policy]` value or a unit whose archive set the catalog no longer has, is an
+error rather than a shortfall. Fix what it names, then run the command again:
+
+```text
+$ tapectl snapshot mark-reclaimable tv/show/s01 --version 1 --force
+error: unit "tv/show/s01" has an invalid [policy] compression in /media/tv/show/s01/.tapectl-unit.toml (invalid compression "bogus": accepted values are none, gzip, bzip2, lzo, xz, lzma, zstd, lz4)
+```
+
+A version that no current version supersedes is different. Marking it would
+release the unit's only current version, which is not a shortfall to accept at
+a prompt, so neither a terminal's `y` nor `--yes` passes it; only an explicit
+`--force` does:
+
+```text
+$ tapectl snapshot mark-reclaimable tv/show/s01 --version 1
+error: no superseding current snapshot exists for v1 — marking it reclaimable would release "tv/show/s01"'s only current version. That is not a shortfall a prompt or --yes can accept; only an explicit --force overrides it.
+```
+
+`volume compact` reads and writes through one drive, so it **always pauses
+after step 1** for you to unload the source and load the destination, with or
+without `--to`. With `--to` the pause asks only for the swap:
+
+```text
+Unload "L6-0001" from /dev/tape/by-id/scsi-<SERIAL>-nst and load the destination "L6-0010", then press Enter to write it (Ctrl-D stops here):
+```
+
+Without `--to` the same pause also asks for the destination's label. Because
+someone has to make the swap, `volume compact` needs a terminal: without one
+it refuses before reading anything and prints the three separate steps above,
+which are the way to compact unattended. Ctrl-D at the pause stops before
+step 2 with the source's live slices staged; the message names the
+`compact-write` and `compact-finish` that finish the job.
+
+Step 3 retires the source without asking in an ordinary compaction, because
+the destination now carries every live slice the source did. It asks only
+when retiring the source would leave some unit below its policy. `--force` or
+`--yes` answers that question in advance (the swap still waits for you). If
+you decline, the destination is already written and sealed, and
+`volume compact-finish <source> --force` completes the job. Step 3 refuses
+outright, and no flag passes it, when a live slice on the source has no copy
+on any other volume, or when the source holds the last eligible copy of a live
+version.
 
 ## Cartridge Tracking
 
@@ -1392,7 +1699,7 @@ $ tapectl cartridge list
 +---------------------+-------+--------+-----------+-------+---------+
 | Barcode             | Type  | Status | Location  | Loads | Volume  |
 +---------------------+-------+--------+-----------+-------+---------+
-| E01001L8_1775794348 | LTO-8 | in_use | home-rack | 541   | L8-0001 |
+| E01001L8_1775794348 | LTO-8 | in_use | home-rack | 564   | L8-0001 |
 +---------------------+-------+--------+-----------+-------+---------+
 ```
 
@@ -1482,15 +1789,31 @@ $ tapectl key list --tenant family
 +----------------+---------+--------+--------+-----------------------------+---------------------+
 | Alias          | Type    | Active | Escrow | Fingerprint                 | Created             |
 +----------------+---------+--------+--------+-----------------------------+---------------------+
-| family-backup  | backup  | yes    |        | age1p39zlwg4wf57xv2kk7dj... | 2026-09-28 21:43:58 |
+| family-backup  | backup  | yes    |        | age1k83yzew0lqgc2ghf7ktc... | 2026-09-29 08:19:49 |
 +----------------+---------+--------+--------+-----------------------------+---------------------+
-| family-primary | primary | yes    |        | age1guqq2ueeq3x6mddm4qwm... | 2026-09-28 21:43:58 |
+| family-primary | primary | yes    |        | age194da4h246gzse65r0a3k... | 2026-09-29 08:19:49 |
 +----------------+---------+--------+--------+-----------------------------+---------------------+
 ```
 
-Old keys are never deleted — only deactivated. Restore tries all known keys.
-`key rotate` refuses until an escrow recipient is registered, and never touches
-the escrow key itself.
+The operator's own list (`key list --tenant mike`) also shows the escrow
+recipient, as type `escrow`, flagged `ESCROW (ADR-0005)`.
+
+Old keys are never deleted — only deactivated. Restore tries every key file of
+the unit's tenant, deactivated ones included, and the operator's; which files
+are a tenant's comes from the catalog's key rows. A key file with no row goes
+to every tenant whose name, followed by `-`, begins the file name. A catalog
+built by `catalog rebuild` alone has no key rows, so there this applies to
+every file: until `key import` registers the key again,
+`family-old-laptop.age.key` is tried for both `family` and `family-old`.
+
+`key rotate` refuses until an escrow recipient is registered, and never
+touches the escrow key itself. To
+make a deactivated key a recipient of new writes again, import its public key
+file with `--reactivate`; it keeps the alias it was registered under:
+
+```bash
+tapectl key import --tenant family --reactivate ~/.tapectl/keys/family-primary.age.pub
+```
 
 ## Database Operations
 
@@ -1506,9 +1829,20 @@ $ tapectl db backup --to /tmp/tour/backup/tapectl.db
 database backed up to /tmp/tour/backup/tapectl.db (private keys not included — pass --include-keys to copy them)
 ```
 
+`--to` names the backup *file*, and its directory must already exist:
+`db backup` creates no directories, and refuses a `--to` that is itself a
+directory. `--include-keys` also copies the private key directory beside the
+file, named for it with the extension replaced by `.keys`
+(`--to /backup/tapectl.db` puts the keys in `/backup/tapectl.keys/`); treat that
+directory as secret wherever it ends up.
+
 A `first-run.sh` install already backs the catalog up daily to a second disk
-([install.md §7](install.md#7-the-timers-and-the-operator-wrapper)); run the
-backup service by hand after a write session too.
+([install.md §7](install.md#7-the-timers-and-the-operator-wrapper)). Run the
+backup service by hand at the end of every write session too
+(`sudo systemctl start tapectl-backup.service`). A backup taken mid-session,
+after `volume init` and before `volume write`, restores that volume as
+`initialized`, and rebuilding the catalog from the sealed tape attaches its
+units to the row but does not seal it, so nothing on it counts as a copy.
 
 `db fsck` runs SQLite's `integrity_check` and `foreign_key_check` and reports
 every violation it finds. `--repair` deletes rows whose foreign-key parent is
@@ -1536,8 +1870,12 @@ case, restoring a catalog from a `db backup` copy.
 
 ### If you hold a tenant key: restore directly, no catalog needed
 
-This is the heir path. It needs `mt`, `dd`, `age`, `dar` and `sha256sum` — and
-notably not `tapectl`.
+This is the heir path. It needs `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`,
+`truncate` and `tar` — the list the tape's own guide gives, and the tools
+RESTORE.sh checks for before it reads anything — plus the ordinary shell tools
+any Linux system already has (`bash`, `awk`, `sed`, `tr`, `cut`, `grep`, `wc`,
+`mktemp`), which RESTORE.sh uses without checking for them. Notably, it does
+not need `tapectl`.
 
 1. Read the ID thunk (tape file 0), which says what the tape is and how to
    read the rest. With tapectl installed, `tapectl volume identify --device "$TAPE"`
@@ -1584,27 +1922,32 @@ public key and does step 1 for you.)
 **1. Register the original escrow identity.**
 
 ```bash
-tapectl init --escrow-public-key age1…        # the ORIGINAL, from the kit's cover sheet
+tapectl init --operator mike --escrow-public-key age1…   # the ORIGINAL, from the kit's cover sheet
 ```
 
+`--operator` is required when you run this as the `tapectl` service user or as
+root; the recorded session below gives the same name the original home used.
+
 ```text
-$ tapectl --home ~/.tapectl-rebuilt init --operator mike --escrow-public-key age1zczqp0emrmylxcetrrz5k8xu5j097dlptp4eysje0vgu496mgc5qaq0nmp
+$ tapectl --home ~/.tapectl-rebuilt init --operator mike --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
 tapectl initialized at ~/.tapectl-rebuilt
   operator: mike
   ...
-  escrow:   adopted age1zczqp0emrmylxcetrrz5k8xu5j097dlptp4eysje0vgu496mgc5qaq0nmp (imported — its secret lives on the heir kit, not here)
+  escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
 ```
 
 Every escrow check compares against the escrow recipient this catalog has
 *registered*. A plain `init` registers a brand-new one, and every tape was
-encrypted to the old one — so until the original is registered, everything
-reads `NO: encrypted without the current escrow recipient`, `volume write`
-refuses to re-copy, and nothing can be attested. `audit` reports this
-(`escrow_identity_mismatch`, naming the key). The equivalent two-step form
-still works, if you prefer it:
+encrypted to the old one. So until the original is registered, every stage set
+is an escrow gap: `catalog locate` shows `NO` in its Escrow column, `audit`'s
+`escrow_coverage` check reports each one as
+`encrypted without the current escrow recipient — the current escrow key cannot recover it`,
+`volume write` refuses to re-copy, and nothing can be attested. `audit` also
+explains the cause once (`escrow_identity_mismatch`, naming the key). The
+equivalent two-step form still works, if you prefer it:
 
 ```bash
-tapectl init --no-escrow                      # do NOT let init mint a new escrow identity
+tapectl init --operator mike --no-escrow      # do NOT let init mint a new escrow identity
 tapectl key import --escrow age1…             # the ORIGINAL escrow public key, from the cover sheet
 ```
 
@@ -1645,18 +1988,28 @@ live database** with the file you name. That is what you want here and exactly
 why this step precedes the rebuild. It prints `database imported from
 catalog.db`.
 
-**4. Rebuild every tape sealed since the kit was made.** `audit`'s
-`escrow_kit_stale` check names exactly that set.
+**4. Rebuild every tape sealed since the kit was made.** Those are the tapes
+the imported catalog does not list. `tapectl volume list` shows every volume
+the kit's catalog knows, so each cartridge on your shelf whose label is
+missing from it needs a rebuild. `audit` cannot find them for you: the
+imported catalog has never heard of those tapes. If you are unsure about a
+tape, rebuild it anyway: a tape the catalog already knows adds nothing (what a
+rebuild does to rows it finds is below the example).
 
 ```bash
 tapectl catalog rebuild --from-volume \
     --device "$TAPE" \
-    --key ~/.tapectl/keys/operator-primary.age.key \
-    --label VOL0001            # optional wrong-tape guard
+    --key escrow.age.key \
+    --label L8-0002            # optional wrong-tape guard
 ```
 
+`--key` takes the escrow secret file from step 3, or an operator key file
+from the old home's `keys/` directory. Operator key files are named after
+the operator tenant, for example `~/.tapectl/keys/mike-primary.age.key`.
+Rebuilding one tape into an empty catalog with the escrow key printed:
+
 ```text
-rebuilt from volume "L8-0002" (uuid a5379113-e90f-4e97-86c5-66368cb6c406), 3 envelope(s) opened
+rebuilt from volume "L8-0002" (uuid 6ff3d909-0486-4310-a31e-68a0fd0d1ec5), 3 envelope(s) opened
   inserted: 2 tenant(s), 4 unit(s), 4 snapshot(s), 4 stage set(s),
             4 slice(s), 4 write(s), 4 position(s), 11 file row(s), 1 volume
   cartridge "E01003L8_1775794348" registered from this tape's own identity and bound
@@ -1664,9 +2017,28 @@ rebuilt from volume "L8-0002" (uuid a5379113-e90f-4e97-86c5-66368cb6c406), 3 env
   escrow receipts: 4 stage set(s) carried theirs on the tape
 ```
 
-Run it once per cartridge, in any order. It only ever **inserts what is
-missing** and never edits a row it finds, so running it twice — or over a
-catalog that is damaged rather than absent — is safe.
+Run it once per cartridge, in any order. Running it twice, or over a catalog
+that is damaged rather than absent, is safe, because of what it does to rows
+it finds:
+
+- **It inserts what is missing.** A second run over the same cartridge inserts
+  nothing; when it changes nothing at all, it prints
+  `no changes — the catalog already knew this volume`.
+- **It fills only what was empty.** Run with the registered escrow key, it
+  records an escrow receipt on a rebuilt stage set that has none, once it has
+  proved it (*Attest*, below). A cartridge row with no chip serial gets the one
+  this drive read (`medium serial learned onto cartridge "…"`).
+- **It reports a volume row it disagrees with, and leaves it alone.** If the
+  catalog already has this volume as something other than `sealed`, or with
+  an `observed_condition` other than `ok` (a quarantine a failed verify left),
+  the report prints a `warning:` naming it. The tape's units are attached to
+  that row, and its status and condition stay as they were.
+- **It displaces the old volume on a reused cartridge.** When the chip serial
+  proves this tape is a cartridge the catalog binds to a *different* volume,
+  that volume's bytes are gone from the medium. The rebuild marks it `erased`,
+  as `volume init` would, and prints each unit that loses a copy, flagging
+  one left with `ZERO copies`. A barcode alone never displaces a live volume
+  (see the cartridge identity paragraph below).
 
 **How to tell it worked.** A row reconstructed from tape rather than recorded
 at staging is marked `stage_sets.origin = 'rebuilt'` (the default is
@@ -1757,11 +2129,11 @@ $ tapectl tenant list
 +--------+--------+----------+---------------------+---------------------------+
 | Name   | Status | Operator | Created             | Description               |
 +--------+--------+----------+---------------------+---------------------------+
-| family | active |          | 2026-09-28 21:43:58 | family photos and letters |
+| family | active |          | 2026-09-29 08:19:49 | family photos and letters |
 +--------+--------+----------+---------------------+---------------------------+
-| mike   | active | yes      | 2026-09-28 21:43:58 | System operator           |
+| mike   | active | yes      | 2026-09-29 08:19:49 | System operator           |
 +--------+--------+----------+---------------------+---------------------------+
-| work   | active |          | 2026-09-28 21:43:58 | business records          |
+| work   | active |          | 2026-09-29 08:19:50 | business records          |
 +--------+--------+----------+---------------------+---------------------------+
 ```
 
