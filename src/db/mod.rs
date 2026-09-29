@@ -315,6 +315,17 @@ fn migrations() -> Migrations<'static> {
         // 022/023. Append-only, never pruned. Plain CREATE, touching no other
         // table, so no `.foreign_key_check()`. See the migration header.
         M::up(include_str!("migrations/025_st_stats_journal.sql")),
+        // 026 rebuilds `units`, `snapshots` and `volumes` (create/copy/drop/
+        // rename, all three in one migration) to drop the five status values
+        // no code has ever written -- units 'retired', snapshots 'superseded'
+        // and 'failed', volumes 'blank' and 'missing' -- and `volumes.status`
+        // loses its DEFAULT ('blank' was it) so every insert must name a
+        // status (issue #362). No remapping: a row in a dropped state was set
+        // by hand, and 026 refuses by name rather than guess (see `migrate()`
+        // for how that refusal reaches the operator). `.foreign_key_check()`
+        // for the same reason as 003/012/017: seventeen foreign keys point
+        // into these three tables. See the migration header.
+        M::up(include_str!("migrations/026_drop_unwritten_states.sql")).foreign_key_check(),
     ])
 }
 
@@ -347,6 +358,20 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         let msg = e.to_string();
         match e {
             MigrationError::ForeignKeyCheck(_) => TapectlError::DatabaseNeedsRepair(msg),
+            // Issue #362: a migration that refuses on purpose does it with
+            // `RAISE(ABORT, <message>)` (026's dropped-state guard), which
+            // SQLite reports as SQLITE_CONSTRAINT_TRIGGER. That message is
+            // written for the operator, so it is shown as it is --
+            // `rusqlite_migration`'s Display would put the whole migration
+            // script in front of it. Typed on the extended code, never on
+            // the text; a CHECK failure (SQLITE_CONSTRAINT_CHECK) and
+            // everything else keep the full `msg` below.
+            MigrationError::RusqliteError {
+                err: rusqlite::Error::SqliteFailure(failure, Some(raised)),
+                ..
+            } if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER => {
+                TapectlError::Migration(raised)
+            }
             _ => TapectlError::Migration(msg),
         }
     });
@@ -3010,6 +3035,444 @@ mod tests {
             "the rebuild must preserve the row's original id, not let SQLite \
              assign a fresh one"
         );
+    }
+
+    // --- Migration 026 (issue #362): drop the schema states nothing sets ---
+
+    /// The three tables 026 rebuilds.
+    const REBUILT_BY_026: [&str; 3] = ["units", "snapshots", "volumes"];
+
+    /// One cell rendered with its storage class, so `1` and `'1'` differ.
+    fn render_cell(v: rusqlite::types::ValueRef<'_>) -> String {
+        use rusqlite::types::ValueRef;
+        match v {
+            ValueRef::Null => "NULL".into(),
+            ValueRef::Integer(i) => format!("i:{i}"),
+            ValueRef::Real(f) => format!("r:{f}"),
+            ValueRef::Text(t) => format!("t:{}", String::from_utf8_lossy(t)),
+            ValueRef::Blob(b) => format!("b:{b:02x?}"),
+        }
+    }
+
+    /// Every row of every table (the FTS shadow tables included), sorted,
+    /// keyed by table name. The "nothing else moved" discriminator: a
+    /// rebuild that renumbered, dropped, truncated or re-typed a single
+    /// cell anywhere shows up as a difference here. `SELECT *`, not
+    /// `rowid, *`: `files_fts_config` is WITHOUT ROWID, and every table
+    /// whose rowid anything points at declares it as `id`.
+    fn every_row(
+        conn: &Connection,
+    ) -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for table in tables {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let n = stmt.column_count();
+            let mut rows: Vec<Vec<String>> = stmt
+                .query_map([], |r| {
+                    (0..n)
+                        .map(|i| r.get_ref(i).map(render_cell))
+                        .collect::<rusqlite::Result<Vec<String>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.sort();
+            out.insert(table, rows);
+        }
+        out
+    }
+
+    /// (type, name, tbl_name, sql) for every schema object, sorted.
+    fn schema_objects(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        conn.prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master \
+             ORDER BY type, name",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Seed a schema-25 database with rows in `units`, `snapshots` and
+    /// `volumes` in EVERY status 026 keeps, every column set to a
+    /// non-default value where it has one, out-of-sequence ids (the 017
+    /// `500` trick: a copy that dropped `id` would renumber from 1), and a
+    /// row in every table holding one of the 17 foreign keys into them.
+    fn seed_schema_25(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (3, 'op', 1, 'active');
+             INSERT INTO archive_sets (id, name, min_copies) VALUES (4, 'as', 2);
+             INSERT INTO locations (id, name, kind) VALUES (5, 'shelf-a', 'shelf');
+             INSERT INTO locations (id, name, kind) VALUES (6, 'vault', 'warehouse');
+             INSERT INTO tags (id, name) VALUES (7, 'tag');
+             INSERT INTO cartridges (id, barcode, media_type, nominal_capacity, status)
+                  VALUES (8, 'BC0008', 'LTO-6', 2500000000000, 'in_use');
+             INSERT INTO drives (id, serial) VALUES (9, 'DRV0009');
+
+             INSERT INTO units (id, uuid, name, tenant_id, archive_set_id, current_path,
+                                checksum_mode, encrypt, status, created_at, last_scanned, notes)
+                  VALUES (500, 'uuid-500', 'u-active', 3, 4, '/src/a', 'sha256', 0, 'active',
+                          '2026-01-01 00:00:00', '2026-01-02 00:00:00', 'note-500');
+             INSERT INTO units (id, uuid, name, tenant_id, status, created_at)
+                  VALUES (501, 'uuid-501', 'u-tape-only', 3, 'tape_only', '2026-01-01 00:00:01');
+             INSERT INTO units (id, uuid, name, tenant_id, status, created_at)
+                  VALUES (502, 'uuid-502', 'u-missing', 3, 'missing', '2026-01-01 00:00:02');
+
+             INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path,
+                                    total_size, file_count, created_at, superseded_at, notes)
+                  VALUES (600, 500, 1, 'full', 'current', '/src/a', 10, 1,
+                          '2026-01-03 00:00:00', '2026-01-04 00:00:00', 'note-600');
+             INSERT INTO snapshots (id, unit_id, version, snapshot_type, base_snapshot_id,
+                                    status, source_path, created_at)
+                  VALUES (601, 500, 2, 'differential', 600, 'reclaimable', '/src/a',
+                          '2026-01-03 00:00:01');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, created_at)
+                  VALUES (602, 500, 3, 'created', '/src/a', '2026-01-03 00:00:02');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, created_at)
+                  VALUES (603, 501, 1, 'staged', '/src/b', '2026-01-03 00:00:03');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, created_at)
+                  VALUES (604, 502, 1, 'purged', '/src/c', '2026-01-03 00:00:04');
+
+             INSERT INTO volumes (id, label, backend_type, backend_name, media_type,
+                                  capacity_bytes, mam_capacity_bytes, mam_remaining_at_start,
+                                  bytes_written, num_data_files, has_manifest, location_id,
+                                  status, observed_condition, first_write, last_write, notes,
+                                  created_at, uuid, sealed_at)
+                  VALUES (700, 'V-SEALED', 'lto', 'lto0', 'LTO-6', 2500000000000,
+                          2500002097152, 2400000000000, 123, 4, 1, 5, 'sealed', 'quarantined',
+                          '2026-01-05 00:00:00', '2026-01-05 01:00:00', 'note-700',
+                          '2026-01-05 00:00:00', 'vol-uuid-700', '2026-01-05 01:00:00');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  created_at)
+                  VALUES (701, 'V-INIT', 'lto', 'lto0', 1000, 'initialized', '2026-01-05 00:00:01');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  created_at)
+                  VALUES (702, 'V-ACTIVE', 'lto', 'lto0', 1000, 'active', '2026-01-05 00:00:02');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  created_at)
+                  VALUES (703, 'V-FULL', 'lto', 'lto0', 1000, 'full', '2026-01-05 00:00:03');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  created_at)
+                  VALUES (704, 'V-RETIRED', 'lto', 'lto0', 1000, 'retired', '2026-01-05 00:00:04');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  created_at)
+                  VALUES (705, 'V-ERASED', 'lto', 'lto0', 1000, 'erased', '2026-01-05 00:00:05');
+
+             INSERT INTO unit_tags (unit_id, tag_id) VALUES (500, 7);
+             INSERT INTO unit_path_history (id, unit_id, path, observed_at)
+                  VALUES (800, 500, '/src/a', '2026-01-06 00:00:00');
+             INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, is_directory)
+                  VALUES (801, 600, 'dir/needle.txt', 10, 'ab', 0);
+             INSERT INTO manifests (id, snapshot_id, created_at)
+                  VALUES (802, 600, '2026-01-06 00:00:01');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size, num_slices, created_at)
+                  VALUES (803, 600, 'staged', 1024, 1, '2026-01-06 00:00:02');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, created_at)
+                  VALUES (804, 803, 600, 700, 'completed', '2026-01-06 00:00:03');
+             INSERT INTO cartridge_volumes (id, cartridge_id, volume_id, mounted_at)
+                  VALUES (805, 8, 700, '2026-01-06 00:00:04');
+             INSERT INTO cartridge_contacts (id, cartridge_id, volume_id, drive_id, operation,
+                                             device, opened_at)
+                  VALUES (806, 8, 700, 9, 'volume verify', '/dev/null', '2026-01-06 00:00:05');
+             INSERT INTO verification_sessions (id, volume_id, started_at, outcome)
+                  VALUES (807, 700, '2026-01-06 00:00:06', 'passed');
+             INSERT INTO health_logs (id, volume_id, contact_id, session_id, logged_at, operation)
+                  VALUES (808, 700, 806, 807, '2026-01-06 00:00:07', 'verify');
+             INSERT INTO volume_deposits (id, volume_id, location_id, deposited_at)
+                  VALUES (809, 700, 6, '2026-01-06 00:00:08');
+             INSERT INTO volume_movements (id, volume_id, from_location, to_location, moved_at)
+                  VALUES (810, 700, 5, 6, '2026-01-06 00:00:09');
+             INSERT INTO restores (id, contact_id, volume_id, volume_label, unit_id, unit_name,
+                                   version, kind, destination, started_at, finished_at,
+                                   outcome, tapectl_version)
+                  VALUES (811, 806, 700, 'V-SEALED', 500, 'u-active', 1, 'unit', '/restore',
+                          '2026-01-06 00:00:10', '2026-01-06 00:00:11', 'ok', 'v');",
+        )
+        .unwrap();
+    }
+
+    /// THE test for migration 026 (issue #362): a populated schema-25
+    /// database comes through with every row and every cell intact, every
+    /// schema object outside the three rebuilt tables byte-identical, every
+    /// index and foreign key restated, and a clean `foreign_key_check` --
+    /// and afterwards the five dropped states are refused while every kept
+    /// state is still accepted.
+    #[test]
+    fn test_migrate_025_populated_db_to_026_preserves_every_row_and_drops_five_states() {
+        let mut conn = open_memory_at_version(25);
+        assert_eq!(user_version(&conn), 25, "precondition: at schema 25");
+        seed_schema_25(&conn);
+
+        let rows_before = every_row(&conn);
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let cols_before: Vec<_> = REBUILT_BY_026
+            .iter()
+            .map(|t| table_info(&conn, t))
+            .collect();
+
+        migrate(&mut conn).expect("026 must migrate a database carrying only kept states");
+        assert_eq!(
+            user_version(&conn),
+            26,
+            "this is the latest-migration pin: move it (and re-target this test with \
+             open_memory_at_version) when 027 is registered"
+        );
+
+        // Every row, every cell, every table -- including the three rebuilt
+        // ones, whose ids the copy must carry verbatim.
+        let rows_after = every_row(&conn);
+        assert_eq!(
+            rows_before, rows_after,
+            "026 must not add, drop, renumber or alter a single row anywhere"
+        );
+        assert!(
+            rows_after["units"].len() == 3
+                && rows_after["snapshots"].len() == 5
+                && rows_after["volumes"].len() == 6,
+            "positive control: the seed really populated the rebuilt tables"
+        );
+
+        // Every schema object outside the three rebuilt tables is
+        // byte-identical (012's rename trap would rewrite other tables'
+        // REFERENCES clauses), and the rebuilt tables' indexes come back
+        // with identical SQL.
+        let objects_after = schema_objects(&conn);
+        let outside = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && REBUILT_BY_026.contains(&o.1.as_str())))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            outside(&objects_before),
+            outside(&objects_after),
+            "026 changed a schema object other than the three tables it rebuilds, or \
+             failed to recreate one of their indexes exactly"
+        );
+        for table in REBUILT_BY_026 {
+            assert!(
+                !index_names(&conn, table).is_empty(),
+                "positive control: {table} has indexes to compare"
+            );
+        }
+
+        // Every foreign key of every table, in and out of the rebuilt ones
+        // (all 17 inbound edges live on the referencing tables).
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "026 must restate every foreign key");
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "PRAGMA foreign_key_check after 026");
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(report.integrity_ok, "integrity_check after 026");
+        assert!(
+            report.issues.is_empty(),
+            "db fsck must be clean after 026: {:?}",
+            report.issues
+        );
+
+        // Columns: only `volumes.status` changes, and only by losing its
+        // DEFAULT ('blank' was it). NOT NULL with no default: every insert
+        // must state a status.
+        for (table, before) in REBUILT_BY_026.iter().zip(cols_before) {
+            let after = table_info(&conn, table);
+            let expected: Vec<_> = before
+                .into_iter()
+                .map(|c| {
+                    if *table == "volumes" && c.0 == "status" {
+                        assert_eq!(c.3.as_deref(), Some("'blank'"), "precondition");
+                        (c.0, c.1, c.2, None, c.4)
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert_eq!(after, expected, "026 changed a column of {table}");
+        }
+        let no_status = conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
+             VALUES ('V-NOSTATUS', 'lto', 'lto0', 1000)",
+            [],
+        );
+        assert!(
+            no_status.is_err(),
+            "volumes.status has no DEFAULT after 026: an insert must state one"
+        );
+
+        // FK enforcement is back on and bites on a rebuilt parent.
+        assert!(
+            conn.execute("DELETE FROM units WHERE id = 500", []).is_err(),
+            "units 500 is referenced; FK enforcement must refuse the delete"
+        );
+        assert!(
+            conn.execute("DELETE FROM volumes WHERE id = 700", []).is_err(),
+            "volumes 700 is referenced; FK enforcement must refuse the delete"
+        );
+        // And the FTS triggers on `files` still index.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'needle'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "files_fts must still find the seeded file");
+
+        // The five dropped states are refused; every kept state is still
+        // accepted (the positive control for each table).
+        let set = |table: &str, id: i64, status: &str| {
+            conn.execute(
+                &format!("UPDATE {table} SET status = ?1 WHERE id = ?2"),
+                rusqlite::params![status, id],
+            )
+        };
+        for (table, id, dropped) in [
+            ("units", 502, "retired"),
+            ("snapshots", 602, "superseded"),
+            ("snapshots", 602, "failed"),
+            ("volumes", 701, "blank"),
+            ("volumes", 701, "missing"),
+        ] {
+            let err = set(table, id, dropped)
+                .expect_err(&format!("{table}.status = '{dropped}' must be refused after 026"));
+            assert!(
+                err.to_string().contains("CHECK constraint failed"),
+                "{table}.status = '{dropped}' must fail the CHECK, got: {err}"
+            );
+        }
+        for status in ["active", "tape_only", "missing"] {
+            set("units", 502, status)
+                .unwrap_or_else(|e| panic!("units.status '{status}' must stay legal: {e}"));
+        }
+        for status in ["created", "staged", "current", "reclaimable", "purged"] {
+            set("snapshots", 602, status)
+                .unwrap_or_else(|e| panic!("snapshots.status '{status}' must stay legal: {e}"));
+        }
+        for status in [
+            "initialized",
+            "active",
+            "full",
+            "retired",
+            "erased",
+            "sealed",
+        ] {
+            set("volumes", 701, status)
+                .unwrap_or_else(|e| panic!("volumes.status '{status}' must stay legal: {e}"));
+        }
+    }
+
+    /// Issue #362, P2: no code has ever written any of the five dropped
+    /// states, so a row carrying one was put there by hand -- and 026 must
+    /// not guess what it should have been. It refuses, loudly, naming the
+    /// table and the state, and changes nothing. The message must be the
+    /// migration's own words, not SQLite's bare "CHECK constraint failed"
+    /// and not `rusqlite_migration`'s dump of the whole 026 script.
+    #[test]
+    fn test_migration_026_refuses_a_row_in_a_dropped_state_by_name() {
+        for (table, id, state) in [
+            ("units", 502, "retired"),
+            ("snapshots", 602, "superseded"),
+            ("snapshots", 602, "failed"),
+            ("volumes", 701, "blank"),
+            ("volumes", 701, "missing"),
+        ] {
+            let mut conn = open_memory_at_version(25);
+            seed_schema_25(&conn);
+            conn.execute(
+                &format!("UPDATE {table} SET status = ?1 WHERE id = ?2"),
+                rusqlite::params![state, id],
+            )
+            .unwrap_or_else(|e| panic!("precondition: schema 25 admits '{state}': {e}"));
+
+            let err = migrate(&mut conn)
+                .expect_err(&format!("026 must refuse a {table} row in '{state}'"));
+            let msg = match &err {
+                TapectlError::Migration(m) => m.clone(),
+                other => panic!(
+                    "a dropped-state row is not an FK problem `db fsck --repair` can fix; \
+                     it must be the generic Migration variant, got {other:?}"
+                ),
+            };
+            assert!(
+                msg.contains(&format!("{table}.status = '{state}'")),
+                "the refusal must name the table and the state: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("id {id}")),
+                "the refusal must name the row: {msg}"
+            );
+            assert!(
+                !msg.contains("CREATE TABLE") && !msg.contains("CHECK constraint failed"),
+                "the refusal must be 026's own words, not the SQL dump or a bare \
+                 constraint failure: {msg}"
+            );
+
+            // Nothing moved: still schema 25, the row still says what it said.
+            assert_eq!(user_version(&conn), 25, "a refused 026 must roll back");
+            let still: String = conn
+                .query_row(
+                    &format!("SELECT status FROM {table} WHERE id = ?1"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(still, state, "a refused 026 must not rewrite the row");
+        }
+    }
+
+    /// Every offender, in every table, is named in the ONE refusal -- an
+    /// operator fixing rows by hand should not have to discover them one
+    /// failed open at a time. Positive control: the same seed with no
+    /// offender migrates (the populated test above).
+    #[test]
+    fn test_migration_026_refusal_names_every_offending_table_and_state() {
+        let mut conn = open_memory_at_version(25);
+        seed_schema_25(&conn);
+        conn.execute_batch(
+            "UPDATE units SET status = 'retired' WHERE id IN (501, 502);
+             UPDATE snapshots SET status = 'superseded' WHERE id = 602;
+             UPDATE snapshots SET status = 'failed' WHERE id = 603;
+             UPDATE volumes SET status = 'blank' WHERE id = 701;
+             UPDATE volumes SET status = 'missing' WHERE id = 702;",
+        )
+        .unwrap();
+        let err = migrate(&mut conn).expect_err("026 must refuse");
+        let msg = err.to_string();
+        for needle in [
+            "units.status = 'retired'",
+            "snapshots.status = 'superseded'",
+            "snapshots.status = 'failed'",
+            "volumes.status = 'blank'",
+            "volumes.status = 'missing'",
+            "2 row(s)",
+        ] {
+            assert!(msg.contains(needle), "refusal must name {needle:?}: {msg}");
+        }
+        assert_eq!(user_version(&conn), 25);
     }
 
     // --- Issue #233: an orphan blocks ordinary open; repair must still run ---
