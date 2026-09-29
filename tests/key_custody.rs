@@ -99,3 +99,182 @@ fn key_list_labels_the_escrow_key_as_escrow_in_the_table_and_in_json() {
         .unwrap_or_else(|| panic!("no {OP}-primary row in --json: {json}"));
     assert_eq!(ordinary["key_type"], "primary", "{ordinary}");
 }
+
+// ── #350(b): `key import` of a key the catalog already has ──
+
+/// `init` plus a tenant `family` with its two auto-generated keys.
+fn init_home_with_family() -> TempDir {
+    let home = init_home();
+    ok(home.path(), &["tenant", "add", "family"]);
+    home
+}
+
+fn pub_file(home: &Path, alias: &str) -> String {
+    home.join(".tapectl")
+        .join("keys")
+        .join(format!("{alias}.age.pub"))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A public key the catalog has never seen, in a file of its own.
+fn fresh_pub_file(dir: &Path, name: &str) -> String {
+    let kp = tapectl::crypto::keys::generate_keypair();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("{}\n", kp.public_key)).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+fn refused(home: &Path, args: &[&str]) -> String {
+    let o = run(home, args);
+    assert!(
+        !o.status.success(),
+        "`tapectl {}` should have been refused\nstdout: {}",
+        args.join(" "),
+        stdout(&o)
+    );
+    let err = stderr(&o);
+    assert!(
+        !err.contains("UNIQUE constraint"),
+        "`tapectl {}` leaked a raw SQLite error: {err}",
+        args.join(" ")
+    );
+    err
+}
+
+fn key_row(home: &Path, tenant: &str, alias: &str) -> serde_json::Value {
+    let json: serde_json::Value = serde_json::from_str(&stdout(&ok(
+        home,
+        &["--json", "key", "list", "--tenant", tenant],
+    )))
+    .unwrap();
+    json.as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["alias"] == alias)
+        .unwrap_or_else(|| panic!("no key {alias} in {json}"))
+        .clone()
+}
+
+/// Re-importing a key that is already registered and active used to fail
+/// with `UNIQUE constraint failed: encryption_keys.fingerprint`. Now it says
+/// which key it already is, dry run included; and an alias that is taken by
+/// a DIFFERENT key says so too, instead of the other raw UNIQUE error.
+#[test]
+fn importing_an_already_registered_key_says_so_plainly() {
+    let home = init_home_with_family();
+    let h = home.path();
+    let family_pub = pub_file(h, "family-primary");
+
+    for dry in [false, true] {
+        let mut args = vec![];
+        if dry {
+            args.push("--dry-run");
+        }
+        args.extend([
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--alias",
+            "again",
+            &family_pub,
+        ]);
+        let err = refused(h, &args);
+        assert!(
+            err.contains("already in the catalog as \"family-primary\"") && err.contains("active"),
+            "dry_run={dry}: the refusal must name the key and its state: {err}"
+        );
+    }
+
+    // Positive control: a key the catalog does not have imports fine.
+    let new_pub = fresh_pub_file(h, "new.pub");
+    ok(
+        h,
+        &[
+            "key", "import", "--tenant", "family", "--alias", "laptop", &new_pub,
+        ],
+    );
+    assert_eq!(key_row(h, "family", "family-laptop")["is_active"], true);
+
+    // A different key under a taken alias.
+    let other_pub = fresh_pub_file(h, "other.pub");
+    let err = refused(
+        h,
+        &[
+            "key", "import", "--tenant", "family", "--alias", "laptop", &other_pub,
+        ],
+    );
+    assert!(err.contains("family-laptop"), "{err}");
+}
+
+/// `key rotate` deactivates every ordinary key of the tenant — including a
+/// recipient someone else holds the secret for. Re-importing that recipient
+/// used to be a raw UNIQUE error. Now the refusal says it is deactivated.
+#[test]
+fn a_deactivated_key_is_named_as_deactivated() {
+    let home = init_home_with_family();
+    let h = home.path();
+    let family_pub = pub_file(h, "family-primary");
+    ok(h, &["key", "rotate", "--tenant", "family"]);
+    assert_eq!(key_row(h, "family", "family-primary")["is_active"], false);
+
+    let err = refused(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--alias",
+            "readd",
+            &family_pub,
+        ],
+    );
+    assert!(
+        err.contains("already in the catalog as \"family-primary\"") && err.contains("deactivated"),
+        "the refusal must say the key is deactivated: {err}"
+    );
+}
+
+/// The escrow identity (a recipient of every write already, ADR-0005) and
+/// another tenant's key (one key belongs to one tenant) are refused by name.
+#[test]
+fn import_refuses_the_escrow_key_and_another_tenants_key() {
+    let home = init_home_with_family();
+    let h = home.path();
+    let escrow_pub = pub_file(h, &format!("{OP}-escrow"));
+    let family_pub = pub_file(h, "family-primary");
+
+    let err = refused(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--alias",
+            "esc",
+            &escrow_pub,
+        ],
+    );
+    assert!(err.contains("escrow identity"), "{err}");
+
+    let err = refused(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            OP,
+            "--alias",
+            "fam",
+            &family_pub,
+        ],
+    );
+    assert!(
+        err.contains("tenant \"family\""),
+        "must name the tenant that owns the key: {err}"
+    );
+}

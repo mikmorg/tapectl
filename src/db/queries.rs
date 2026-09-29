@@ -218,6 +218,38 @@ pub fn get_key_by_alias(conn: &Connection, alias: &str) -> Result<Option<Encrypt
     .map_err(Into::into)
 }
 
+/// The key row carrying `fingerprint`, whatever its state — active or
+/// deactivated, ordinary or escrow (issue #350). `encryption_keys.fingerprint`
+/// is UNIQUE, so `key import` asks this BEFORE inserting and can say which key
+/// a public key already is, instead of surfacing SQLite's constraint error.
+pub fn get_key_by_fingerprint(
+    conn: &Connection,
+    fingerprint: &str,
+) -> Result<Option<EncryptionKey>> {
+    conn.query_row(
+        "SELECT id, tenant_id, alias, fingerprint, public_key, key_type,
+                is_active, created_at, description, is_escrow
+         FROM encryption_keys WHERE fingerprint = ?1",
+        params![fingerprint],
+        |row| {
+            Ok(EncryptionKey {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                alias: row.get(2)?,
+                fingerprint: row.get(3)?,
+                public_key: row.get(4)?,
+                key_type: row.get(5)?,
+                is_active: row.get(6)?,
+                created_at: row.get(7)?,
+                description: row.get(8)?,
+                is_escrow: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 // ── Escrow recipient (ADR-0005) ──
 
 /// Insert the escrow key row: public key only, `is_escrow=1`, `is_active=1`.

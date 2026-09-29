@@ -351,13 +351,11 @@ pub fn run(
                 let full_alias = format!("{tenant}-{alias}");
 
                 // Issue #241: importing only reads a public key already
-                // given to us, so a faithful preview costs nothing extra
-                // — the read above already happened, and this just checks
-                // the alias is free before skipping the insert/file write.
+                // given to us, so a faithful preview costs nothing extra —
+                // `check_import` makes every check a real run makes, then
+                // the dry run stops short of the insert and file write.
+                check_import(conn, &t, &full_alias, &fingerprint)?;
                 if dry_run {
-                    if queries::get_key_by_alias(conn, &full_alias)?.is_some() {
-                        return Err(TapectlError::KeyAlreadyExists(full_alias));
-                    }
                     if json_output {
                         println!(
                             "{}",
@@ -634,6 +632,67 @@ fn import_escrow_key(
         println!("  public: {pub_key}");
     }
     Ok(())
+}
+
+/// Refuse, in words, a `key import` the catalog cannot take (issue #350).
+///
+/// `encryption_keys.fingerprint` and `.alias` are both UNIQUE, and a public
+/// key the catalog already has used to reach the INSERT and come back as
+/// `UNIQUE constraint failed: encryption_keys.fingerprint`. The common way
+/// to get there is re-adding a recipient `key rotate` deactivated — rotation
+/// deactivates every ordinary key of the tenant, including one whose secret
+/// only someone else holds. Every case now says which key the public key
+/// already is and in what state, before anything is written.
+fn check_import(
+    conn: &Connection,
+    tenant: &crate::db::models::Tenant,
+    full_alias: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let Some(existing) = queries::get_key_by_fingerprint(conn, fingerprint)? else {
+        if queries::get_key_by_alias(conn, full_alias)?.is_some() {
+            return Err(TapectlError::KeyAlreadyExists(full_alias.to_string()));
+        }
+        return Ok(());
+    };
+
+    let alias = &existing.alias;
+    if existing.is_escrow {
+        return Err(TapectlError::Other(format!(
+            "key import refuses: this public key is the escrow identity \"{alias}\" \
+             (ADR-0005) — it is already a recipient of every write, and it is never \
+             imported as a tenant key"
+        )));
+    }
+    let state = if existing.is_active {
+        "active"
+    } else {
+        "deactivated"
+    };
+    if existing.tenant_id != tenant.id {
+        let owner = queries::get_tenant_by_id(conn, existing.tenant_id)?
+            .map(|t| t.name)
+            .unwrap_or_else(|| format!("#{}", existing.tenant_id));
+        return Err(TapectlError::Other(format!(
+            "key import refuses: this public key is already in the catalog as \"{alias}\", a \
+             key of tenant \"{owner}\" ({state}) — a key belongs to one tenant, so it cannot \
+             also be imported for \"{}\"",
+            tenant.name
+        )));
+    }
+    if existing.is_active {
+        return Err(TapectlError::Other(format!(
+            "key import refuses: this public key is already in the catalog as \"{alias}\" \
+             (tenant \"{}\", active) — nothing to import",
+            tenant.name
+        )));
+    }
+    Err(TapectlError::Other(format!(
+        "key import refuses: this public key is already in the catalog as \"{alias}\" \
+         (tenant \"{}\", deactivated — `key rotate` deactivates the keys it replaces). \
+         tapectl has no command that makes a deactivated key a recipient again.",
+        tenant.name
+    )))
 }
 
 /// Resolve `--tenant`/`--alias` for a non-escrow `Generate`/`Import`, with a
