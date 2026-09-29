@@ -87,7 +87,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`volume compact`](volume.md#tapectl-volume-compact) | Interactive compaction: read + write + finish in one flow |
 | &nbsp;&nbsp;[`volume deposit`](volume.md#tapectl-volume-deposit) | Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006) |
 | &nbsp;&nbsp;[`volume list`](volume.md#tapectl-volume-list) | List every volume, most recently written first |
-| &nbsp;&nbsp;[`volume info`](volume.md#tapectl-volume-info) | The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits |
+| &nbsp;&nbsp;[`volume info`](volume.md#tapectl-volume-info) | The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits |
 | [`cartridge`](cartridge.md) | Manage physical cartridges |
 | &nbsp;&nbsp;[`cartridge register`](cartridge.md#tapectl-cartridge-register) | Register a physical cartridge |
 | &nbsp;&nbsp;[`cartridge list`](cartridge.md#tapectl-cartridge-list) | List cartridges |

@@ -570,6 +570,45 @@ fn logs_are_uncoloured_when_stderr_is_not_a_terminal() {
     );
 }
 
+/// Issue #361: one meaning per word. "Receipt" is the recipient list a
+/// stage set was encrypted to (CONTEXT.md); `volume info`'s list of this
+/// volume's `writes` rows is headed "Writes:", not "Write receipts:". The
+/// JSON key was already `writes`.
+#[test]
+fn volume_info_heads_its_write_history_writes_not_receipts() {
+    let home = TempDir::new().expect("tempdir");
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let import = run_tapectl(
+        home.path(),
+        &["import", "--label", "INFO-1", "--generation", "LTO-6"],
+    );
+    assert!(
+        import.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    let out = run_tapectl(home.path(), &["volume", "info", "INFO-1"]);
+    assert!(
+        out.status.success(),
+        "volume info: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|l| l == "Writes: none"),
+        "the write history is headed \"Writes:\": {stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("receipt"),
+        "\"receipt\" means the recipient list, not a write: {stdout}"
+    );
+
+    let json = run_tapectl(home.path(), &["--json", "volume", "info", "INFO-1"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).expect("volume info --json");
+    assert!(v["writes"].is_array(), "the JSON key stays `writes`: {v}");
+}
+
 /// End-to-end process smoke: init -> audit --json -> config check --json
 /// -> db fsck, entirely inside a throwaway HOME.
 ///

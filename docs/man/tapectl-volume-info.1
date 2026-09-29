@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH tapectl-volume-info 1  "tapectl-volume-info " 
 .SH NAME
-tapectl\-volume\-info \- The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits
+tapectl\-volume\-info \- The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits
 .SH SYNOPSIS
 \fBtapectl volume info\fR [\fB\-\-json\fR] [\fB\-\-units\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
-The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits.
+The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits.
 .PP
 Catalog\-only: never opens a drive. Summarises units carried by default — the design probes ~280 units per cartridge (docs/design/v2\-open\-questions.md:434) — pass `\-\-units` to list every one instead of the largest few.
 .SH OPTIONS

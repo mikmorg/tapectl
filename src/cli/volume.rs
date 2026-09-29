@@ -341,7 +341,7 @@ pub enum VolumeCommands {
     },
 
     /// The dossier for one volume: capacity, media generation, cartridge
-    /// binding, location, units carried, write receipts, verification
+    /// binding, location, units carried, writes, verification
     /// history, warehouse deposits.
     ///
     /// Catalog-only: never opens a drive. Summarises units carried by
@@ -2170,11 +2170,12 @@ struct UnitOnVolume {
     bytes: i64,
 }
 
-/// One `writes` row: a receipt that a specific stage set was written to
+/// One `writes` row: a record that a specific stage set was written to
 /// this volume, regardless of outcome — `volume info` shows the write
-/// history, not just the successes.
+/// history, not just the successes. Not a "receipt": that word means the
+/// recipient list a stage set was encrypted to (CONTEXT.md, issue #361).
 #[derive(Debug, Clone, Serialize)]
-struct WriteReceipt {
+struct WriteRow {
     unit: String,
     version: i64,
     status: String,
@@ -2249,7 +2250,7 @@ struct VolumeInfo {
     largest_units: Vec<UnitOnVolume>,
     /// Every unit carried, only when `--units` was passed.
     units: Option<Vec<UnitOnVolume>>,
-    writes: Vec<WriteReceipt>,
+    writes: Vec<WriteRow>,
     verifications: Vec<VerificationRow>,
     deposits: Vec<DepositRow>,
 }
@@ -2397,7 +2398,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         .collect();
     let units = if include_units { Some(all_units) } else { None };
 
-    // Write receipts: every write of this volume, whatever its outcome —
+    // Writes: every write of this volume, whatever its outcome —
     // this is the history, not the coverage derivation.
     let mut writes_stmt = conn.prepare(
         "SELECT u.name, s.version, w.status, w.started_at, w.completed_at,
@@ -2409,9 +2410,9 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
          WHERE w.volume_id = ?1
          ORDER BY w.completed_at DESC, w.id DESC",
     )?;
-    let writes: Vec<WriteReceipt> = writes_stmt
+    let writes: Vec<WriteRow> = writes_stmt
         .query_map(rusqlite::params![vol_id], |row| {
-            Ok(WriteReceipt {
+            Ok(WriteRow {
                 unit: row.get(0)?,
                 version: row.get(1)?,
                 status: row.get(2)?,
@@ -2582,9 +2583,9 @@ fn print_volume_info(info: &VolumeInfo) {
 
     println!();
     if info.writes.is_empty() {
-        println!("Write receipts: none");
+        println!("Writes: none");
     } else {
-        println!("Write receipts:");
+        println!("Writes:");
         for w in &info.writes {
             println!(
                 "    {} v{}: {} ({})",

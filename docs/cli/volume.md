@@ -28,7 +28,7 @@ tapectl volume [OPTIONS] <COMMAND>
 - [`compact`](#tapectl-volume-compact) — Interactive compaction: read + write + finish in one flow
 - [`deposit`](#tapectl-volume-deposit) — Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006)
 - [`list`](#tapectl-volume-list) — List every volume, most recently written first
-- [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits
+- [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits
 
 ### tapectl volume init
 
@@ -349,7 +349,7 @@ tapectl volume list [OPTIONS]
 
 ### tapectl volume info
 
-The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits.
+The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits.
 
 Catalog-only: never opens a drive. Summarises units carried by default — the design probes ~280 units per cartridge (docs/design/v2-open-questions.md:434) — pass `--units` to list every one instead of the largest few.
 
