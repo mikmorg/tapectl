@@ -14,7 +14,11 @@ pub struct DarCreateParams<'a> {
     pub compression: &'a str,
     pub exclude_patterns: &'a [String],
     pub exclude_paths: &'a [String],
+    /// Archive extended attributes (and the POSIX ACLs that are carried as
+    /// extended attributes). `false` passes dar `-u "*"`.
     pub preserve_xattrs: bool,
+    /// Archive filesystem-specific attributes (Linux chattr flags).
+    /// `false` passes dar `--fsa-scope none`.
     pub preserve_fsa: bool,
 }
 
@@ -52,18 +56,30 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
                    // archive before/after encryption, are the real integrity mechanism.
     cmd.arg("-Q"); // quiet (no tty prompt)
 
-    if params.preserve_xattrs {
-        cmd.arg("-am");
+    // Extended attributes (issue #347). dar archives every EA by default
+    // (EA support is compiled into the system dar), so keeping them needs no
+    // flag and dropping them needs the exclusion mask `-u "*"`, which matches
+    // every `namespace.name`. On Linux POSIX ACLs ARE extended attributes
+    // (`system.posix_acl_*`), so this switch carries them too — which is why
+    // `preserve_acls` cannot act on its own (issue #50, `policy::subsumed`).
+    //
+    // This used to pass `-am` when true and nothing when false. `-am` is
+    // `--alter=mask`: it only changes how several -I/-X (and -P/-g, -U/-u)
+    // masks combine — ordered, last match wins — and tapectl passes only
+    // exclusions, for which both orderings select the same files. It never
+    // touched EAs, so both values archived them (issues #50/#51 recorded
+    // the fact; #347 made the key honest).
+    if !params.preserve_xattrs {
+        cmd.arg("-u").arg("*");
     }
-    // ACLs: on Linux, dar carries POSIX ACLs as Extended Attributes whenever
-    // EA support is compiled in (it is in the system dar), and this code
-    // passes no -u/-U EA-exclusion mask on create or restore, so ACL data is
-    // preserved via ordinary EA carriage. `-am` is `--alter=mask`, a mask
-    // *ordering* toggle unrelated to EAs/ACLs — it does not itself preserve
-    // anything (issues #50/#51).
-    if params.preserve_fsa {
-        cmd.arg("--fsa-scope").arg("extX");
-    }
+    // Filesystem-specific attributes (issue #347). dar's default scope is
+    // EVERY FSA family, so passing nothing for false — as this used to —
+    // still archived them. `none` is dar's documented "ignore all FSA
+    // families". True keeps naming extX (Linux chattr flags), the only
+    // family a Linux source carries, so a default archive is byte-for-byte
+    // what it was even on a dar built with HFS+ support.
+    cmd.arg("--fsa-scope")
+        .arg(if params.preserve_fsa { "extX" } else { "none" });
 
     for pattern in params.exclude_patterns {
         cmd.arg("-X").arg(pattern);
@@ -400,5 +416,113 @@ mod tests {
         let err = list_slices(&tmp.path().join("base")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("base"), "error must name the stem: {msg}");
+    }
+
+    /// `dar -l -alist-ea` for the archive at `base`: one line per entry,
+    /// each followed by its Extended Attribute names; the fourth bracketed
+    /// column is the FSA status (`[-L-]` = Linux extX attributes saved,
+    /// `[---]` = none).
+    fn dar_listing(base: &Path) -> String {
+        let out = Command::new("dar")
+            .arg("-l")
+            .arg(base)
+            .args(["-Q", "-alist-ea"])
+            .output()
+            .expect("dar must be on PATH (tests/test_dependencies.rs)");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Archive `src` with the two policy switches, returning the listing.
+    fn archive_with(src: &Path, out: &Path, preserve_xattrs: bool, preserve_fsa: bool) -> String {
+        std::fs::create_dir_all(out).unwrap();
+        let base = out.join("arch");
+        create_archive(&DarCreateParams {
+            dar_binary: "dar",
+            source_path: src,
+            archive_base: &base,
+            slice_size: "10G",
+            compression: "none",
+            exclude_patterns: &[],
+            exclude_paths: &[],
+            preserve_xattrs,
+            preserve_fsa,
+        })
+        .unwrap();
+        dar_listing(&base)
+    }
+
+    /// Issue #347: `preserve_xattrs = true` used to add dar's `-am` — mask
+    /// ORDERING, unrelated to extended attributes — and `false` left it off,
+    /// so extended attributes were archived either way and the key did
+    /// nothing. `false` must now drop them; `true` (the positive control)
+    /// must keep them.
+    #[test]
+    fn preserve_xattrs_false_drops_extended_attributes_and_true_keeps_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("a.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let set = Command::new("setfattr")
+            .args(["-n", "user.tapectl_probe", "-v", "1"])
+            .arg(&file)
+            .status();
+        if !matches!(set, Ok(s) if s.success()) {
+            eprintln!(
+                "SKIP preserve_xattrs behaviour test: setfattr is missing or the temp \
+                 filesystem refuses user xattrs ({set:?})"
+            );
+            return;
+        }
+
+        let kept = archive_with(&src, &tmp.path().join("keep"), true, true);
+        assert!(
+            kept.contains("user.tapectl_probe"),
+            "preserve_xattrs = true must archive the attribute:\n{kept}"
+        );
+        let dropped = archive_with(&src, &tmp.path().join("drop"), false, true);
+        assert!(
+            !dropped.contains("user.tapectl_probe"),
+            "preserve_xattrs = false must not archive the attribute:\n{dropped}"
+        );
+    }
+
+    /// Issue #347: `preserve_fsa = true` passed `--fsa-scope extX` and
+    /// `false` passed nothing — but dar's default scope is every FSA family,
+    /// so filesystem-specific attributes were archived either way. `false`
+    /// must now pass `--fsa-scope none`; `true` (the positive control) keeps
+    /// the extX family.
+    #[test]
+    fn preserve_fsa_false_drops_filesystem_attributes_and_true_keeps_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+
+        let line = |listing: &str| {
+            listing
+                .lines()
+                .find(|l| l.trim_end().ends_with("a.txt"))
+                .unwrap_or_else(|| panic!("a.txt missing from:\n{listing}"))
+                .to_string()
+        };
+        let kept = archive_with(&src, &tmp.path().join("keep"), true, true);
+        if !line(&kept).contains("[-L-]") {
+            eprintln!(
+                "SKIP preserve_fsa behaviour test: this dar or filesystem records no \
+                 extX attributes even when asked:\n{kept}"
+            );
+            return;
+        }
+        let dropped = archive_with(&src, &tmp.path().join("drop"), true, false);
+        assert!(
+            line(&dropped).contains("[---]"),
+            "preserve_fsa = false must archive no filesystem-specific attributes:\n{dropped}"
+        );
     }
 }
