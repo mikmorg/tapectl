@@ -632,6 +632,87 @@ pub fn deposit_count_expr(q: &CoverageQuery) -> String {
     format!("(SELECT COUNT(*) FROM ({}))", scoped_deposits(q, "cd.id"))
 }
 
+// ── Named required locations (issue #348) ──
+
+/// The names in `required` that unit `unit_id`'s CURRENT coverage is NOT
+/// at, in `required`'s order (duplicates collapsed). Empty means every
+/// named location holds a copy.
+///
+/// **The** named-location predicate: `audit`'s `location_presence` check
+/// and `unit mark-tape-only`'s location gate both call this, so they can
+/// never disagree about whether `required_locations` is met. It replaces a
+/// count-only comparison (distinct locations vs `required.len()`) under
+/// which copies at `home-rack` and `garage` satisfied
+/// `["home-rack","offsite"]`.
+///
+/// A location "holds a copy" on the same terms [`location_count_expr`]
+/// counts it: an [`eligible`] volume with a completed write, shelved there,
+/// or a recorded warehouse deposit there of such a volume (ADR-0006) — the
+/// two sides are unioned, never one without the other.
+///
+/// **Per-version rule (issue #153, ADR-0012)**, the same as
+/// [`location_count_expr`]'s MIN: a unit is as covered as its
+/// least-covered live version, so a named location is present only if
+/// EVERY current snapshot has a copy there. v1 at `home-rack` and v2 at
+/// `offsite` satisfies neither name. A unit with no current snapshot is at
+/// no location, so every name is missing.
+///
+/// A name matching no `locations` row (a typo, or a location since renamed)
+/// is simply missing: nothing can be at a place the catalog does not know.
+pub fn missing_required_locations(
+    conn: &Connection,
+    unit_id: i64,
+    required: &[String],
+) -> crate::error::Result<Vec<String>> {
+    let mut wanted: Vec<&String> = Vec::new();
+    for name in required {
+        if !wanted.contains(&name) {
+            wanted.push(name);
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let current: Vec<i64> = conn
+        .prepare("SELECT id FROM snapshots WHERE unit_id = ?1 AND status = 'current'")?
+        .query_map(params![unit_id], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if current.is_empty() {
+        return Ok(wanted.into_iter().cloned().collect());
+    }
+
+    let per_snapshot = CoverageQuery {
+        scope: CoverageScope::Snapshot { id_expr: "?1" },
+        exclude_volume: None,
+    };
+    let sql = format!(
+        "SELECT l.name FROM locations l WHERE l.id IN ({} UNION {})",
+        eligible_writes(&per_snapshot, "cv.location_id"),
+        scoped_deposits(&per_snapshot, "cd.location_id"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    // Intersection over the current snapshots: a name survives only while
+    // every version examined so far has a copy there.
+    let mut present: Option<std::collections::HashSet<String>> = None;
+    for snapshot_id in current {
+        let names: std::collections::HashSet<String> = stmt
+            .query_map(params![snapshot_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        present = Some(match present {
+            None => names,
+            Some(so_far) => so_far.intersection(&names).cloned().collect(),
+        });
+    }
+    let present = present.unwrap_or_default();
+    Ok(wanted
+        .into_iter()
+        .filter(|name| !present.contains(name.as_str()))
+        .cloned()
+        .collect())
+}
+
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
 
 /// One CURRENT version of a unit whose coverage a retirement is about to
@@ -864,6 +945,74 @@ pub(crate) mod tests {
     fn scalar(conn: &Connection, expr: &str, unit_id: i64) -> i64 {
         conn.query_row(&format!("SELECT {expr}"), params![unit_id], |r| r.get(0))
             .unwrap()
+    }
+
+    // ── missing_required_locations (issue #348) ──
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Tape at `home`, warehouse deposit at `glacier`: both names are met —
+    /// the deposit side counts exactly as it does for the location count —
+    /// and a name with no copy (`offsite`) is reported by name.
+    #[test]
+    fn required_locations_are_checked_by_name_including_deposits() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        assert!(
+            missing_required_locations(&conn, unit_id, &names(&["home", "glacier"]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            missing_required_locations(&conn, unit_id, &names(&["home", "offsite", "offsite"]))
+                .unwrap(),
+            names(&["offsite"]),
+            "two locations hold copies, but not the two the policy names"
+        );
+    }
+
+    /// ADR-0004: an ineligible volume is not a copy, so it places the unit
+    /// nowhere — and its deposit goes with it.
+    #[test]
+    fn a_retired_volume_places_the_unit_at_no_location() {
+        let (conn, unit_id, vol) = setup_unit_with_deposit("active");
+        conn.execute(
+            "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+            params![vol],
+        )
+        .unwrap();
+        assert_eq!(
+            missing_required_locations(&conn, unit_id, &names(&["home", "glacier"])).unwrap(),
+            names(&["home", "glacier"])
+        );
+    }
+
+    /// Issue #153's per-version rule: v1 at `home-rack`, v2 at `garage`. A
+    /// unit is as covered as its least-covered live version, so neither
+    /// name is met by the unit as a whole.
+    #[test]
+    fn a_required_location_must_hold_every_current_version() {
+        let (conn, unit_id) =
+            setup_unit_with_two_current_snapshots("mv-named", Some("home-rack"), Some("garage"));
+        assert_eq!(
+            missing_required_locations(&conn, unit_id, &names(&["home-rack", "garage"])).unwrap(),
+            names(&["home-rack", "garage"])
+        );
+    }
+
+    #[test]
+    fn no_current_snapshot_means_every_required_location_is_missing() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        conn.execute("UPDATE snapshots SET status = 'created'", [])
+            .unwrap();
+        assert_eq!(
+            missing_required_locations(&conn, unit_id, &names(&["home"])).unwrap(),
+            names(&["home"])
+        );
+        assert!(missing_required_locations(&conn, unit_id, &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -537,7 +537,7 @@ fn in_service_copy_of_version(
 /// not in question, so a live stage set can be written as-is and a
 /// released one can be pulled back byte-for-byte with `read-slices`.
 /// `extra` is appended verbatim to the final write command (e.g.
-/// `location_presence`'s "(at missing location)" reminder).
+/// `location_presence`'s `volume move ... --to <missing location>` step).
 fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result<String> {
     let versions = current_versions_live(conn, unit.id)?;
     if versions.is_empty() {
@@ -545,11 +545,13 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
         // (which may also be firing alongside this one), but a defensive
         // fallback still needs a command that works. Nothing to
         // distinguish from "the first copy" here, hence `<LABEL>` rather
-        // than `<OTHER-LABEL>`.
+        // than `<OTHER-LABEL>` — in `extra` too (`location_presence`'s
+        // `volume move` step names the volume this recipe writes).
         return Ok(format!(
             "tapectl snapshot create {0} && tapectl stage create {0} && \
-             tapectl volume init <LABEL> && tapectl volume write <LABEL>{extra}",
-            unit.name
+             tapectl volume init <LABEL> && tapectl volume write <LABEL>{1}",
+            unit.name,
+            extra.replace("<OTHER-LABEL>", "<LABEL>")
         ));
     }
 
@@ -761,7 +763,10 @@ fn check_warehouse_copies(
     Ok(f)
 }
 
-// Check location presence.
+// Check location presence BY NAME (issue #348). Copies at two places that
+// are not the two the policy names do not satisfy it — the check used to
+// compare only the count. The predicate is `policy::coverage`'s, shared with
+// `unit mark-tape-only`'s location gate, so the two cannot disagree.
 fn check_location_presence(
     ctx: &Ctx<'_>,
     unit: &Unit,
@@ -769,21 +774,38 @@ fn check_location_presence(
 ) -> Result<Findings> {
     let resolved = policy.expect("location_presence is a needs_policy check");
     let mut f = Findings::default();
-    let location_count = location_count_for_unit(ctx.conn, unit.id)?;
+    if resolved.required_locations.is_empty() {
+        return Ok(f);
+    }
 
-    if !resolved.required_locations.is_empty() {
-        let needed = resolved.required_locations.len() as i64;
-        if location_count < needed {
-            f.violations.push(AuditFinding {
-                unit: unit.name.clone(),
-                check: "location_presence".into(),
-                message: format!(
-                    "in {location_count} locations, needs {needed} ({:?})",
-                    resolved.required_locations
-                ),
-                action: additional_copy_action(ctx.conn, unit, " (at missing location)")?,
-            });
+    let missing = policy::coverage::missing_required_locations(
+        ctx.conn,
+        unit.id,
+        &resolved.required_locations,
+    )?;
+    if !missing.is_empty() {
+        let location_count = location_count_for_unit(ctx.conn, unit.id)?;
+        // The remedy's last step says where the new copy goes. One copy can
+        // only be shelved at one place, so with several names missing the
+        // recipe is repeated per location, which the note says.
+        let mut extra = format!(" && tapectl volume move <OTHER-LABEL> --to {}", missing[0]);
+        if missing.len() > 1 {
+            extra.push_str(&format!(
+                " (then the same again, one new copy each, for: {})",
+                missing[1..].join(", ")
+            ));
         }
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "location_presence".into(),
+            message: format!(
+                "no copy at required location(s) {} (policy requires {}; copies are in \
+                 {location_count} location(s))",
+                missing.join(", "),
+                resolved.required_locations.join(", "),
+            ),
+            action: additional_copy_action(ctx.conn, unit, &extra)?,
+        });
     }
     Ok(f)
 }
@@ -3452,6 +3474,121 @@ mod tests {
         fn no_registered_escrow_is_silent() {
             let conn = setup("age1new", &[r#"["age1old"]"#], &[]);
             assert!(escrow_identity_findings(&conn, None).unwrap().is_empty());
+        }
+    }
+
+    /// Issue #348: `location_presence` compared only the NUMBER of distinct
+    /// locations with `required_locations.len()`, so copies at `home-rack`
+    /// and `garage` satisfied `["home-rack","offsite"]`. It now checks the
+    /// names, through the same `policy::coverage` predicate `unit
+    /// mark-tape-only` gates on.
+    mod required_locations_by_name {
+        use super::*;
+
+        /// Unit `named` in archive set `twosite` (required_locations
+        /// `["home-rack","offsite"]`), one current snapshot completed-written
+        /// to one sealed volume per name in `copies_at`. All three locations
+        /// exist; only the named ones hold a copy.
+        fn setup(copies_at: &[&str]) -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO archive_sets (name, required_locations)
+                 VALUES ('twosite', '[\"home-rack\",\"offsite\"]')",
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status, archive_set_id)
+                 VALUES ('u-named', 'named', ?1, 'mtime_size', 1, 'active', ?2)",
+                params![tid, set_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            for loc in ["home-rack", "garage", "offsite"] {
+                conn.execute(
+                    "INSERT INTO locations (name, kind) VALUES (?1, 'shelf')",
+                    params![loc],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            for loc in copies_at {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status, location_id)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                             (SELECT id FROM locations WHERE name = ?2))",
+                    params![format!("V-{loc}"), loc],
+                )
+                .unwrap();
+                let vol_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss_id, snap_id, vol_id],
+                )
+                .unwrap();
+            }
+            conn
+        }
+
+        fn location_findings(conn: &Connection) -> Vec<AuditFinding> {
+            let (violations, _warnings) =
+                collect_findings(conn, &Config::default(), Some("named")).unwrap();
+            violations
+                .into_iter()
+                .filter(|f| f.check == "location_presence")
+                .collect()
+        }
+
+        #[test]
+        fn two_copies_at_the_wrong_two_places_violate_the_named_policy() {
+            let conn = setup(&["home-rack", "garage"]);
+            let findings = location_findings(&conn);
+            assert_eq!(
+                findings.len(),
+                1,
+                "home-rack + garage does not satisfy [home-rack, offsite]: {findings:?}"
+            );
+            assert_eq!(
+                findings[0].message,
+                "no copy at required location(s) offsite (policy requires home-rack, offsite; \
+                 copies are in 2 location(s))"
+            );
+            assert!(
+                findings[0]
+                    .action
+                    .ends_with("tapectl volume move <OTHER-LABEL> --to offsite"),
+                "the remedy must say where the new copy goes: {}",
+                findings[0].action
+            );
+        }
+
+        /// Positive control: the same fixture with the copies where the
+        /// policy names them is clean.
+        #[test]
+        fn copies_at_every_named_location_satisfy_it() {
+            let conn = setup(&["home-rack", "offsite"]);
+            assert!(location_findings(&conn).is_empty());
         }
     }
 
