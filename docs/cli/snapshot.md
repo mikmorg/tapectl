@@ -42,7 +42,7 @@ tapectl snapshot list [OPTIONS]
 **Options**
 
 - `--unit <UNIT>` — Filter by unit name
-- `--status <STATUS>` — Filter by status (created, staged, current, superseded, reclaimable, purged, failed)
+- `--status <STATUS>` — Filter by status (created, staged, current, reclaimable, purged)
 
 ### tapectl snapshot diff
 

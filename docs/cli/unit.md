@@ -69,7 +69,7 @@ tapectl unit list [OPTIONS]
 **Options**
 
 - `--tenant <TENANT>` — Filter by tenant name
-- `--status <STATUS>` — Filter by status (active, tape_only, missing, retired)
+- `--status <STATUS>` — Filter by status (active, tape_only, missing)
 - `-t, --tag <TAG>` — Filter by tag
 
 ### tapectl unit status
