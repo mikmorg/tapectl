@@ -346,6 +346,71 @@ fn import_refuses_the_escrow_key_another_tenants_key_and_reactivating_an_unknown
     assert!(err.contains("not in the catalog"), "{err}");
 }
 
+/// `--reactivate` keeps the key exactly as it was registered, and `--escrow`
+/// registers the escrow identity — neither has a key type to set, so both
+/// used to accept `--key-type` and silently drop it. An input the command
+/// would ignore is refused by name, and nothing changes.
+#[test]
+fn key_type_is_refused_where_the_command_would_ignore_it() {
+    let home = init_home_with_family();
+    let h = home.path();
+    let family_pub = pub_file(h, "family-primary");
+    ok(h, &["key", "rotate", "--tenant", "family"]);
+
+    let err = refused(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--reactivate",
+            "--key-type",
+            "backup",
+            &family_pub,
+        ],
+    );
+    assert!(
+        err.contains("--key-type") && err.contains("--reactivate"),
+        "the refusal must name the ignored flag: {err}"
+    );
+    assert_eq!(key_row(h, "family", "family-primary")["is_active"], false);
+
+    let fresh = fresh_pub_file(h, "escrow-candidate.pub");
+    let err = refused(
+        h,
+        &["key", "import", "--escrow", "--key-type", "backup", &fresh],
+    );
+    assert!(
+        err.contains("--key-type") && err.contains("--escrow"),
+        "the refusal must name the ignored flag: {err}"
+    );
+    // `key generate --escrow` has the same shape.
+    let err = refused(h, &["key", "generate", "--escrow", "--key-type", "backup"]);
+    assert!(
+        err.contains("--key-type") && err.contains("--escrow"),
+        "the refusal must name the ignored flag: {err}"
+    );
+
+    // Positive control: --key-type is still honoured by a plain import.
+    let new_pub = fresh_pub_file(h, "laptop.pub");
+    ok(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--alias",
+            "laptop",
+            "--key-type",
+            "backup",
+            &new_pub,
+        ],
+    );
+    assert_eq!(key_row(h, "family", "family-laptop")["key_type"], "backup");
+}
+
 // ── #350(a): `db backup --to … [--include-keys]` ──
 
 /// A `--to` whose directory does not exist used to reach SQLite and come

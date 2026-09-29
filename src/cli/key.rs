@@ -22,8 +22,8 @@ pub enum KeyCommands {
         /// Key alias (e.g., "primary", "backup", "2026") (required unless --escrow)
         #[arg(long, required_unless_present = "escrow", conflicts_with = "escrow")]
         alias: Option<String>,
-        /// Key type
-        #[arg(long, default_value = "primary")]
+        /// Key type. Not with --escrow, which has none to set.
+        #[arg(long, default_value = "primary", conflicts_with = "escrow")]
         key_type: String,
         /// Description
         #[arg(long)]
@@ -75,8 +75,9 @@ pub enum KeyCommands {
         /// Path to public key file — or, with --escrow, either a path or
         /// the literal age1... public key
         path: String,
-        /// Key type
-        #[arg(long, default_value = "primary")]
+        /// Key type. Not with --escrow or --reactivate, which have none to
+        /// set: a reactivated key keeps the type it was registered with.
+        #[arg(long, default_value = "primary", conflicts_with_all = ["escrow", "reactivate"])]
         key_type: String,
         /// Adopt this public key as the permanent escrow recipient
         /// (ADR-0005). Refuses if one is already registered.
