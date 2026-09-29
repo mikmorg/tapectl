@@ -3879,7 +3879,11 @@ PY2
         || { cat "$sd/sct.extra-stage.txt"; return 1; }
 
     local out rc
-    out="$(NEWHOME_TCTL "$newhome" volume write VOL-S --device "$TAPE_DEV" 2>&1)"; rc=$?
+    # --yes answers only the quiet-host pre-flight (a Tier-2 question). Without
+    # it a busy host refused here first — 2026-09-29, while builds ran — and
+    # the scenario never reached the ADR-0003 refusal it exists to prove.
+    # --yes cannot waive that refusal: it is a fact, not a risk to accept.
+    out="$(NEWHOME_TCTL "$newhome" volume write VOL-S --device "$TAPE_DEV" --yes 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || {
         echo "volume write VOL-S SUCCEEDED against an already-sealed tape — ADR-0003 violation (issue #208): $out"
         return 1
