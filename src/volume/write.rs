@@ -8290,7 +8290,10 @@ mod tests {
         every_other.retain(|s| s != "initialized");
         let mut ours: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
         ours.sort();
-        assert_eq!(ours, every_other, "the non-write-target statuses the schema permits");
+        assert_eq!(
+            ours, every_other,
+            "the non-write-target statuses the schema permits"
+        );
         for status in statuses {
             let conn = crate::db::open_memory().unwrap();
             conn.execute(

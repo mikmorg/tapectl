@@ -1611,7 +1611,14 @@ pub(crate) mod tests {
     /// migrated schema itself means the next migration cannot strand it.
     #[test]
     fn is_write_target_admits_exactly_initialized() {
-        let statuses = ["initialized", "active", "full", "retired", "erased", "sealed"];
+        let statuses = [
+            "initialized",
+            "active",
+            "full",
+            "retired",
+            "erased",
+            "sealed",
+        ];
 
         // The live `CHECK(status IN (...))` set, pinned against `statuses`
         // by SET EQUALITY, not mere containment -- a one-directional "does

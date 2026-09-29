@@ -3095,9 +3095,7 @@ mod tests {
     /// cell anywhere shows up as a difference here. `SELECT *`, not
     /// `rowid, *`: `files_fts_config` is WITHOUT ROWID, and every table
     /// whose rowid anything points at declares it as `id`.
-    fn every_row(
-        conn: &Connection,
-    ) -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
+    fn every_row(conn: &Connection) -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
         let tables: Vec<String> = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
@@ -3110,9 +3108,7 @@ mod tests {
             .unwrap();
         let mut out = std::collections::BTreeMap::new();
         for table in tables {
-            let mut stmt = conn
-                .prepare(&format!("SELECT * FROM \"{table}\""))
-                .unwrap();
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
             let n = stmt.column_count();
             let mut rows: Vec<Vec<String>> = stmt
                 .query_map([], |r| {
@@ -3360,11 +3356,13 @@ mod tests {
 
         // FK enforcement is back on and bites on a rebuilt parent.
         assert!(
-            conn.execute("DELETE FROM units WHERE id = 500", []).is_err(),
+            conn.execute("DELETE FROM units WHERE id = 500", [])
+                .is_err(),
             "units 500 is referenced; FK enforcement must refuse the delete"
         );
         assert!(
-            conn.execute("DELETE FROM volumes WHERE id = 700", []).is_err(),
+            conn.execute("DELETE FROM volumes WHERE id = 700", [])
+                .is_err(),
             "volumes 700 is referenced; FK enforcement must refuse the delete"
         );
         // And the FTS triggers on `files` still index.
@@ -3392,8 +3390,9 @@ mod tests {
             ("volumes", 701, "blank"),
             ("volumes", 701, "missing"),
         ] {
-            let err = set(table, id, dropped)
-                .expect_err(&format!("{table}.status = '{dropped}' must be refused after 026"));
+            let err = set(table, id, dropped).expect_err(&format!(
+                "{table}.status = '{dropped}' must be refused after 026"
+            ));
             assert!(
                 err.to_string().contains("CHECK constraint failed"),
                 "{table}.status = '{dropped}' must fail the CHECK, got: {err}"
