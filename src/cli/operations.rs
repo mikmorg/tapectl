@@ -3895,8 +3895,10 @@ pub fn quick_archive(
         ));
     }
 
-    // Step 1: init unit
-    let unit_id = crate::unit::init_unit(conn, paths, path, tenant, None, tag, None)?;
+    // Step 1: init unit — under the operator's config, so `[defaults]
+    // checksum_mode` applies as it does for `unit init` (issue #347).
+    // `init_unit` resolves against built-in defaults instead.
+    let unit_id = crate::unit::init_unit_with_config(conn, config, path, tenant, None, tag, None)?;
     let unit_name: String = conn.query_row(
         "SELECT name FROM units WHERE id = ?1",
         rusqlite::params![unit_id],
@@ -3959,6 +3961,92 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+
+    /// Issue #347 (via #359's unit worker): quick-archive's unit is created
+    /// under the operator's `[defaults] checksum_mode`, like `unit init`'s.
+    /// It called `unit::init_unit`, which resolves against built-in
+    /// defaults, so the unit came out `mtime_size` whatever the config said.
+    ///
+    /// The volume is `sealed`, so `volume write` refuses it as not a write
+    /// target before it resolves anything on a drive (ADR-0012) — the unit,
+    /// snapshot and stage set all exist by then, and no device is touched.
+    #[test]
+    fn quick_archive_creates_its_unit_under_the_configured_checksum_mode() {
+        let tmp = tempfile::Builder::new().prefix("qa").tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let holder = conn.last_insert_rowid();
+        let kp = crate::crypto::keys::generate_keypair();
+        queries::insert_escrow_key(
+            &conn,
+            holder,
+            "test-escrow",
+            &kp.fingerprint,
+            &kp.public_key,
+            None,
+        )
+        .unwrap();
+
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let device = tmp.path().join("no-such-tape").to_string_lossy().into_owned();
+        let mut config = Config::default();
+        config.dar.binary = "dar".to_string();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.checksum_mode = "sha256".to_string();
+        config.backends.lto = vec![crate::config::LtoBackendConfig {
+            name: "lto0".to_string(),
+            device_tape: device.clone(),
+            device_sg: "/dev/null".to_string(),
+            generation: "LTO-6".to_string(),
+            capacity_override: None,
+            usable_capacity_factor: 0.92,
+            enospc_buffer: "50M".to_string(),
+        }];
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('VOL-Q', 'lto', 'lto0', 'LTO-6', 1, 'sealed')",
+            [],
+        )
+        .unwrap();
+
+        let src = tmp.path().join("photos");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"quick archive content").unwrap();
+
+        let err = quick_archive(
+            &conn,
+            &paths,
+            &config,
+            src.to_str().unwrap(),
+            "alice",
+            "VOL-Q",
+            &[],
+            Some(&device),
+            false,
+            false,
+            true,
+        )
+        .expect_err("a sealed volume is not a write target");
+        assert!(
+            matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "stopped at the write-target refusal, after the unit was made: {err}"
+        );
+        let mode: String = conn
+            .query_row("SELECT checksum_mode FROM units", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "sha256", "[defaults] checksum_mode must apply");
     }
 
     /// #132: quick-archive's `--volume` must already exist, and the failure
