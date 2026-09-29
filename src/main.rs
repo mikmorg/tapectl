@@ -552,12 +552,18 @@ fn cmd_init(
         .transpose()
         .context("invalid --escrow-public-key")?;
 
-    // Pure — reads only the CLI arg / $USER env var, no side effect — so it
-    // is safe to compute ahead of the dry-run branch below even though the
-    // real path does not need it until the tenant is created, later.
-    let op_name = operator_name
-        .map(String::from)
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "operator".to_string()));
+    // No side effect — reads only the CLI arg, $USER, the effective uid and
+    // /etc/login.defs — so it is safe to compute ahead of the dry-run branch
+    // below even though the real path does not need it until the tenant is
+    // created, later. Issue #357: under a system account (a service user)
+    // it refuses rather than naming the operator tenant after the account,
+    // and a dry run refuses identically.
+    let op_name = tenant::operator_name_for_init(
+        operator_name,
+        std::env::var("USER").ok().as_deref(),
+        nix::unistd::geteuid().as_raw(),
+        tenant::system_uid_min(),
+    )?;
 
     // Issue #247: `init` writes config, keys and the database — a dry run
     // must report all three and create NONE of them (never a half-created

@@ -13,7 +13,7 @@ Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow 
 Output in JSON format
 .TP
 \fB\-\-operator\fR \fI<OPERATOR>\fR
-Operator name (defaults to system username)
+Name of the operator tenant. Defaults to the login name ($USER) — except under a system account (a uid below UID_MIN in /etc/login.defs, such as a `tapectl` service user), where it is required: `init` refuses rather than name the operator after the account
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it

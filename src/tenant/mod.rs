@@ -112,6 +112,62 @@ pub fn delete_tenant(conn: &Connection, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The operator tenant's name for `tapectl init` (issue #357).
+///
+/// `--operator` when given. Without it, the login name (`$USER`) — but NOT
+/// under a system account: run as a service user, `init` used to name the
+/// operator tenant after the account (`tapectl`) silently. A uid below
+/// `uid_min` (the system's `UID_MIN`, see [`uid_min_from_login_defs`]) is a
+/// system account, and `init` refuses there until `--operator` names the
+/// person.
+///
+/// Pure: `main()` passes the real flag, `$USER`, effective uid and
+/// `UID_MIN`, so the decision is testable with any uid.
+pub fn operator_name_for_init(
+    operator_flag: Option<&str>,
+    user_env: Option<&str>,
+    uid: u32,
+    uid_min: u32,
+) -> Result<String> {
+    if let Some(name) = operator_flag {
+        return Ok(name.to_string());
+    }
+    let user = user_env.filter(|u| !u.is_empty());
+    if uid < uid_min {
+        let account = user.map(|u| format!("\"{u}\", ")).unwrap_or_default();
+        return Err(TapectlError::Other(format!(
+            "init: --operator is required when run as a system account ({account}uid {uid}, \
+             below UID_MIN {uid_min}). Without it the operator tenant would be named after \
+             the account rather than the person who operates this archive. Re-run with \
+             --operator <name>, e.g. `tapectl init --operator alice`."
+        )));
+    }
+    Ok(user.unwrap_or("operator").to_string())
+}
+
+/// `UID_MIN` from the text of `/etc/login.defs`, or 1000 (the shadow-utils
+/// default) when the file is absent or does not set it. Only an
+/// uncommented `UID_MIN` line counts — not `SYS_UID_MIN`, `SUB_UID_MIN` or
+/// a commented example.
+pub fn uid_min_from_login_defs(text: Option<&str>) -> u32 {
+    const DEFAULT_UID_MIN: u32 = 1000;
+    text.and_then(|text| {
+        text.lines().find_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("UID_MIN"), Some(value)) => value.parse().ok(),
+                _ => None,
+            }
+        })
+    })
+    .unwrap_or(DEFAULT_UID_MIN)
+}
+
+/// [`uid_min_from_login_defs`] over the real `/etc/login.defs`.
+pub fn system_uid_min() -> u32 {
+    uid_min_from_login_defs(std::fs::read_to_string("/etc/login.defs").ok().as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     //! Wiring tests for issue #103. `naming.rs` proves the *rule*; these
@@ -171,5 +227,56 @@ mod tests {
         let (pub_path, key_path) =
             crate::crypto::keys::key_paths(&paths.keys_dir, "alice", "primary");
         assert!(pub_path.exists() && key_path.exists());
+    }
+
+    // --- operator_name_for_init (issue #357) -------------------------------
+
+    #[test]
+    fn init_operator_flag_wins_even_under_a_system_account() {
+        let name = operator_name_for_init(Some("alice"), Some("tapectl"), 998, 1000).unwrap();
+        assert_eq!(name, "alice");
+    }
+
+    #[test]
+    fn init_operator_defaults_to_user_for_a_login_account() {
+        let name = operator_name_for_init(None, Some("mike"), 1000, 1000).unwrap();
+        assert_eq!(name, "mike");
+        let name = operator_name_for_init(None, None, 1001, 1000).unwrap();
+        assert_eq!(name, "operator", "no $USER: the old fallback stands");
+    }
+
+    #[test]
+    fn init_without_operator_refuses_under_a_system_account() {
+        for uid in [0, 998, 999] {
+            let err = operator_name_for_init(None, Some("tapectl"), uid, 1000)
+                .expect_err("a system account must not silently name the operator");
+            let msg = err.to_string();
+            assert!(msg.contains("--operator"), "must name the flag: {msg}");
+            assert!(msg.contains(&uid.to_string()), "must name the uid: {msg}");
+        }
+        // The boundary follows the system's UID_MIN, not a constant.
+        assert!(operator_name_for_init(None, Some("svc"), 499, 500).is_err());
+        assert!(operator_name_for_init(None, Some("svc"), 500, 500).is_ok());
+    }
+
+    #[test]
+    fn uid_min_is_read_from_login_defs_and_defaults_to_1000() {
+        let debian = "#\n# Min/max values for automatic uid selection in useradd\n#\n\
+                      UID_MIN\t\t\t 1000\nUID_MAX\t\t\t60000\n\
+                      #SYS_UID_MIN\t\t  100\nSUB_UID_MIN\t\t   100000\n";
+        assert_eq!(uid_min_from_login_defs(Some(debian)), 1000);
+        assert_eq!(uid_min_from_login_defs(Some("UID_MIN 500\n")), 500);
+        assert_eq!(
+            uid_min_from_login_defs(Some("SYS_UID_MIN 201\nSUB_UID_MIN 100000\n")),
+            1000,
+            "only UID_MIN itself counts"
+        );
+        assert_eq!(
+            uid_min_from_login_defs(Some("# UID_MIN 500\n")),
+            1000,
+            "a commented line does not count"
+        );
+        assert_eq!(uid_min_from_login_defs(Some("UID_MIN nonsense\n")), 1000);
+        assert_eq!(uid_min_from_login_defs(None), 1000);
     }
 }

@@ -80,7 +80,11 @@ pub enum Commands {
     /// --escrow-public-key to adopt an existing one instead of minting a new
     /// identity)
     Init {
-        /// Operator name (defaults to system username)
+        /// Name of the operator tenant. Defaults to the login name
+        /// ($USER) — except under a system account (a uid below UID_MIN in
+        /// /etc/login.defs, such as a `tapectl` service user), where it is
+        /// required: `init` refuses rather than name the operator after the
+        /// account.
         #[arg(long)]
         operator: Option<String>,
         /// Do NOT create the permanent escrow recipient (ADR-0005) at init.

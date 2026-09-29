@@ -12,7 +12,7 @@ tapectl init [OPTIONS]
 
 **Options**
 
-- `--operator <OPERATOR>` — Operator name (defaults to system username)
+- `--operator <OPERATOR>` — Name of the operator tenant. Defaults to the login name ($USER) — except under a system account (a uid below UID_MIN in /etc/login.defs, such as a `tapectl` service user), where it is required: `init` refuses rather than name the operator after the account
 - `--no-escrow` — Do NOT create the permanent escrow recipient (ADR-0005) at init. By default `init` generates it and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import --escrow` instead, or in tests/tooling that register escrow separately
 - `--escrow-public-key <KEY_OR_FILE>` — Register THIS existing escrow public key (an age1… literal, or a path to a .pub file) instead of minting a new identity — the disaster-recovery form: a rebuilt machine adopts the original recipient from the heir kit's cover sheet so every tape's receipts keep matching
 
