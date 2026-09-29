@@ -321,7 +321,8 @@ pub fn describe_staging_space(check: &StagingSpaceCheck) -> Option<String> {
             generation,
         } => Some(format!(
             "warning: staging '{path}' has {} free; one {generation} cartridge is up to {} — \
-             stage create will fail partway if you fill a tape in one session",
+             a tape filled in one session will not fit: stage create stops before dar \
+             and asks (or refuses) when a unit will not fit",
             decimal_bytes(*free_bytes),
             decimal_bytes(*tape_bytes),
         )),
@@ -690,7 +691,8 @@ mod tests {
         let line = describe_staging_space(&check).unwrap();
         assert!(line.starts_with("warning:"), "{line}");
         assert!(line.contains("LTO-6"), "{line}");
-        assert!(line.contains("fail partway"), "{line}");
+        assert!(line.contains("will not fit"), "{line}");
+        assert!(!line.contains("fail partway"), "{line}");
     }
 
     /// A one-byte "cartridge": any filesystem clears it, so this is the
