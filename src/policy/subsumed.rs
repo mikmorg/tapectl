@@ -88,6 +88,14 @@ pub fn scan(config: &Config, conn: &Connection) -> Vec<SubsumedAcls> {
         }
     }
     for table in &config.archive_sets {
+        // A table naming neither key changes nothing the next sync writes
+        // (it writes only the keys present, issue #346), so it is judged on
+        // its row if that names one, and otherwise inherits both from
+        // `[defaults]` — whose own line above already covers it. Judging it
+        // here would repeat the defaults note once per set (issue #347).
+        if table.preserve_xattrs.is_none() && table.preserve_acls.is_none() {
+            continue;
+        }
         let pair = sets.entry(table.name.clone()).or_insert((None, None));
         if table.preserve_xattrs.is_some() {
             pair.0 = table.preserve_xattrs;
@@ -307,6 +315,65 @@ mod tests {
                 preserve_acls: false,
             }],
             "a table naming neither key leaves the row's disagreement standing"
+        );
+    }
+
+    /// Issue #347: a set that names NEITHER key inherits both from
+    /// `[defaults]`, so its disagreement is `[defaults]`' own and the
+    /// `defaults` line already says it. Giving each such set its own note
+    /// repeated one fact once per set (and `--json` emitted N duplicate
+    /// hits), each advising an edit to a set that sets nothing. Judged the
+    /// same through a synced row (both columns NULL) and an unsynced table.
+    #[test]
+    fn a_set_naming_neither_key_is_covered_by_the_defaults_line() {
+        let mut config = Config::default();
+        config.defaults.preserve_xattrs = false;
+        config.defaults.preserve_acls = true;
+        for name in ["media", "docs"] {
+            config.archive_sets.push(crate::config::ArchiveSetConfig {
+                name: name.to_string(),
+                min_copies: Some(2),
+                required_locations: None,
+                encrypt: None,
+                compression: None,
+                checksum_mode: None,
+                verify_interval_days: None,
+                slice_size: None,
+                preserve_xattrs: None,
+                preserve_acls: None,
+                preserve_fsa: None,
+                dirty_on_metadata_change: None,
+            });
+        }
+        let only_defaults = vec![SubsumedAcls {
+            source: "defaults".to_string(),
+            preserve_acls: true,
+        }];
+        assert_eq!(scan(&config, &conn_without_archive_sets()), only_defaults);
+
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO archive_sets (name, min_copies) VALUES ('media', 2), ('docs', 2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(scan(&config, &conn), only_defaults, "synced rows too");
+
+        // Positive control: a set that NAMES a key is still judged on its
+        // own, beside the defaults line.
+        config.archive_sets[1].preserve_acls = Some(true);
+        assert_eq!(
+            scan(&config, &conn),
+            vec![
+                SubsumedAcls {
+                    source: "defaults".to_string(),
+                    preserve_acls: true,
+                },
+                SubsumedAcls {
+                    source: "archive set \"docs\"".to_string(),
+                    preserve_acls: true,
+                },
+            ]
         );
     }
 
