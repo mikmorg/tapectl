@@ -26,6 +26,15 @@
 //! This paragraph is the record, not a precedent. The next failure of this
 //! test is a CTO decision again.
 //!
+//! **RE-PINNED A SECOND TIME, 2026-09-29, under the CTO's ruling on issue
+//! #349**, made the day before the first production write, for the same
+//! reason the first re-pin gave: this is the cheapest moment the change will
+//! ever be available. RESTORE.sh runs `tar xf -` to unpack an envelope but did
+//! not check for `tar` up front, so an heir on a minimal system met a late,
+//! confusing failure. The ruling covers exactly one line — `tar` appended to
+//! the prerequisite loop — and the test below proves nothing else moved:
+//! undoing that one word reproduces the previous pin.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -42,7 +51,11 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "bb29026cdf82975b8fb89e894f70f1dbb335a3ffbcde9e98ac3747d240a97f9a";
+const RESTORE_SH_SHA256: &str = "299a34c018c131fc04da2ca69a6973a0293a4092ea917596b0a7f10697ca5b3b";
+/// The pin before issue #349 — kept so the test can prove the re-pin moved
+/// only the ruled line.
+const RESTORE_SH_SHA256_PRE_349: &str =
+    "bb29026cdf82975b8fb89e894f70f1dbb335a3ffbcde9e98ac3747d240a97f9a";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -55,6 +68,22 @@ fn restore_sh_bytes_are_pinned() {
         actual, RESTORE_SH_SHA256,
         "RESTORE.sh bytes changed. That is an on-tape format change and a CTO decision; \
          do not re-pin without one."
+    );
+    // Issue #349 moved exactly one line: undo it and the old bytes return.
+    let ruled = "for tool in mt dd age sha256sum dar head truncate tar; do\n";
+    assert_eq!(
+        script.matches(ruled).count(),
+        1,
+        "the ruled prerequisite line"
+    );
+    let pre_349 = script.replace(
+        ruled,
+        "for tool in mt dd age sha256sum dar head truncate; do\n",
+    );
+    assert_eq!(
+        sha256_hex(&pre_349),
+        RESTORE_SH_SHA256_PRE_349,
+        "something besides the #349 prerequisite line moved in RESTORE.sh"
     );
     // The two placeholders must both have been substituted.
     assert!(!script.contains("__LABEL__") && !script.contains("__TOTAL_FILES__"));
