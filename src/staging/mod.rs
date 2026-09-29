@@ -282,6 +282,25 @@ pub fn stage_create(
     config: &Config,
     snapshot_id: i64,
 ) -> Result<i64> {
+    stage_create_reporting(conn, paths, config, snapshot_id, &mut std::io::stderr())
+}
+
+/// [`stage_create`] with its operator notices written to `notices` rather
+/// than straight to stderr — the seam the tests read them through.
+///
+/// A notice is something the operator must see whatever `[logging] level`
+/// says (issue #347: `encrypt = false` used to be reported only through
+/// `tracing::warn!`, which `logging.level = "error"` silences). So notices
+/// never go through `tracing`; `stage_create` hands this stderr, the way
+/// `cli::key::print_escrow_secret_warning` bypasses the log level, and
+/// stdout stays clean for `--json`.
+pub(crate) fn stage_create_reporting(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    snapshot_id: i64,
+    notices: &mut dyn Write,
+) -> Result<i64> {
     let stage_set_id_holder: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
     // Holds the stage set's flock guard for the entire lifetime of this
     // function call, success or error (issue #98) — `lock::StageLock`
@@ -297,6 +316,7 @@ pub fn stage_create(
         snapshot_id,
         &stage_set_id_holder,
         &lock_holder,
+        notices,
     ) {
         Ok(id) => Ok(id),
         Err(e) => {
@@ -315,6 +335,7 @@ fn stage_create_inner(
     snapshot_id: i64,
     stage_set_id_holder: &std::cell::Cell<Option<i64>>,
     lock_holder: &std::cell::Cell<Option<lock::StageLock>>,
+    notices: &mut dyn Write,
 ) -> Result<i64> {
     // ADR-0005 / issue #115. First thing, before the `stage_sets` INSERT and
     // long before dar: without a registered escrow recipient,
@@ -412,13 +433,20 @@ fn stage_create_inner(
     // the sacred no-plaintext-tenant-identity-on-tape invariant. Coordinator
     // decision (issues #47/#48, 2026-07-29): never refuse the stage and
     // never silently ignore a `policy.encrypt = false`, but never honor it
-    // either — warn loudly (now that #45 wires `tracing` to stderr, this
-    // reaches the operator) and encrypt regardless.
+    // either — warn loudly and encrypt regardless.
+    //
+    // Issue #347: "loudly" means a notice, not `tracing::warn!` — the log
+    // level (`[logging] level`, default "warn") could silence it, and an
+    // operator who set `encrypt = false` must never be left believing it
+    // took effect.
     if !resolved.encrypt {
-        tracing::warn!(
-            unit = %unit.name,
-            "policy resolved encrypt=false, but encryption cannot be disabled \
-             (ADR-0005 escrow requirement) — encrypting anyway"
+        let _ = writeln!(
+            notices,
+            "warning: unit \"{}\": policy sets encrypt = false, which tapectl never \
+             honours — its slices are encrypted anyway, to the tenant, operator and escrow \
+             recipients (ADR-0005). Remove `encrypt = false` from the unit's archive set \
+             or from [defaults].",
+            unit.name
         );
     }
 
@@ -2885,8 +2913,22 @@ mod tests {
         )
         .unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let stage_set_id = stage_create(&conn, &paths, &config, snap_id)
+        let mut notices = Vec::new();
+        let stage_set_id = stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices)
             .expect("encrypt=false must warn, not refuse (ADR-0005 makes it un-honorable)");
+
+        // Issue #347: the warning is a notice — written to what
+        // `stage_create` makes stderr — not a `tracing::warn!` that
+        // `logging.level = "error"` silences.
+        let notices = String::from_utf8(notices).unwrap();
+        assert!(
+            notices.contains("encrypt = false") && notices.contains("\"unit1\""),
+            "encrypt = false must produce a notice naming the unit: {notices:?}"
+        );
+        assert!(
+            notices.contains("encrypted anyway") && notices.contains("ADR-0005"),
+            "the notice must say what actually happens, and why: {notices:?}"
+        );
 
         let (encrypted, fingerprints): (i64, String) = conn
             .query_row(
@@ -2920,6 +2962,27 @@ mod tests {
         assert!(
             head.starts_with(b"age-encryption.org/v1"),
             "slice must carry a real age header despite policy.encrypt = false"
+        );
+    }
+
+    /// The negative half of the notice above, with its positive control in
+    /// that test: an ordinary stage — `encrypt` left at its default, and a
+    /// staging directory with plenty of room — writes no notice at all, so
+    /// the one that does appear is never noise an operator learns to skip.
+    #[test]
+    fn an_ordinary_stage_writes_no_notices() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        assert!(config.defaults.encrypt, "fixture: the default policy");
+        fs::write(src.join("f.txt"), b"ordinary content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let mut notices = Vec::new();
+        stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices).unwrap();
+        assert_eq!(
+            String::from_utf8(notices).unwrap(),
+            "",
+            "an ordinary stage must be quiet"
         );
     }
 
