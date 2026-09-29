@@ -661,6 +661,16 @@ mod tests {
         assert!(notice.contains("home=/mnt/archive"), "{notice}");
     }
 
+    /// Issue #361: what the relocated home holds is listed with the words
+    /// the rest of tapectl uses — stage reports, not "receipts", which now
+    /// means only the recipient list a stage set was encrypted to.
+    #[test]
+    fn the_notice_lists_stage_reports_not_receipts() {
+        let notice = ambiguous_config_notice(Path::new("/mnt/archive"));
+        assert!(notice.contains("stage reports"), "{notice}");
+        assert!(!notice.to_lowercase().contains("receipt"), "{notice}");
+    }
+
     /// **Issue #258.** This test used to call [`resolve_from`] twice with
     /// the identical literal arguments and assert the two results equal
     /// each other -- `f(x) == f(x)` on a function with no interior

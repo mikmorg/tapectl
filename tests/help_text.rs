@@ -95,3 +95,59 @@ fn help_examples_never_name_a_numbered_tape_device() {
         offenders.join("\n")
     );
 }
+
+/// Issue #361: one meaning per word. "Receipt" is the recipient list a
+/// stage set was encrypted to (CONTEXT.md), and a warehouse provider's own
+/// receipt for a deposit; the per-stage-set text files are stage reports,
+/// in `<home>/stage-reports/`. The two help strings that list the home's
+/// contents said "receipts" until then.
+#[test]
+fn receipt_in_help_means_only_the_recipients_or_a_deposit() {
+    // `(path, why the word is right there)`.
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "tapectl init --escrow_public_key",
+            "the escrow receipt: every tape's recipient list names this key",
+        ),
+        (
+            "tapectl volume deposit add --receipt",
+            "the warehouse provider's own receipt for a deposit",
+        ),
+    ];
+    let texts = all_help_texts();
+    let mentions = |text: &str| text.to_lowercase().contains("receipt");
+
+    // Positive control: each allowance is still used, so the search reads
+    // the texts it claims to and the list does not outlive its reasons.
+    for (path, why) in ALLOWED {
+        assert!(
+            texts.iter().any(|(p, t)| p == path && mentions(t)),
+            "{path} no longer says \"receipt\" ({why}) — drop it from ALLOWED"
+        );
+    }
+    let offenders: Vec<String> = texts
+        .iter()
+        .filter(|(p, t)| mentions(t) && !ALLOWED.iter().any(|(a, _)| a == p))
+        .map(|(p, t)| format!("{p}: {t}"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "\"receipt\" means the recipient list (CONTEXT.md) or a deposit's receipt; the \
+         per-stage-set files are stage reports:\n{}",
+        offenders.join("\n")
+    );
+
+    // The two home listings name the directory by its current name.
+    for flag in ["tapectl --home", "tapectl --config"] {
+        let said: Vec<String> = texts
+            .iter()
+            .filter(|(p, _)| p == flag)
+            .map(|(_, t)| t.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert!(
+            said.iter()
+                .any(|t| t.contains("stage-reports") || t.contains("stage reports")),
+            "{flag}'s help lists the home's contents, stage reports among them: {said:?}"
+        );
+    }
+}
