@@ -272,6 +272,12 @@ pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
 
 /// Full stage pipeline: validate → dar → encrypt → checksums.
 ///
+/// Everything that can refuse without touching the source runs first,
+/// before the `stage_sets` INSERT (issue #354): the escrow recipient, the
+/// tenant's and operator's keys, the staging directory (created, then
+/// proved writable) and its free space. What remains to fail after dar is
+/// the work itself.
+///
 /// Thin wrapper around `stage_create_inner` mirroring
 /// `encrypt_file_streaming`'s "wrapper does cleanup on `Err`" pattern
 /// (issue #54): on failure, best-effort cleanup runs before the original
