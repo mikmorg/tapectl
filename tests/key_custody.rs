@@ -211,9 +211,10 @@ fn importing_an_already_registered_key_says_so_plainly() {
 
 /// `key rotate` deactivates every ordinary key of the tenant — including a
 /// recipient someone else holds the secret for. Re-importing that recipient
-/// used to be a raw UNIQUE error. Now the refusal says it is deactivated.
+/// used to be a raw UNIQUE error with no way back. Now the refusal says it
+/// is deactivated and names `--reactivate`, which is the explicit way back.
 #[test]
-fn a_deactivated_key_is_named_as_deactivated() {
+fn a_deactivated_key_is_named_and_reactivated_only_with_the_flag() {
     let home = init_home_with_family();
     let h = home.path();
     let family_pub = pub_file(h, "family-primary");
@@ -233,20 +234,13 @@ fn a_deactivated_key_is_named_as_deactivated() {
         ],
     );
     assert!(
-        err.contains("already in the catalog as \"family-primary\"") && err.contains("deactivated"),
-        "the refusal must say the key is deactivated: {err}"
+        err.contains("already in the catalog as \"family-primary\"")
+            && err.contains("deactivated")
+            && err.contains("--reactivate"),
+        "the refusal must say the key is deactivated and how to bring it back: {err}"
     );
-}
 
-/// The escrow identity (a recipient of every write already, ADR-0005) and
-/// another tenant's key (one key belongs to one tenant) are refused by name.
-#[test]
-fn import_refuses_the_escrow_key_and_another_tenants_key() {
-    let home = init_home_with_family();
-    let h = home.path();
-    let escrow_pub = pub_file(h, &format!("{OP}-escrow"));
-    let family_pub = pub_file(h, "family-primary");
-
+    // --alias naming a different key than the one this public key is.
     let err = refused(
         h,
         &[
@@ -255,26 +249,99 @@ fn import_refuses_the_escrow_key_and_another_tenants_key() {
             "--tenant",
             "family",
             "--alias",
-            "esc",
-            &escrow_pub,
+            "readd",
+            "--reactivate",
+            &family_pub,
         ],
     );
-    assert!(err.contains("escrow identity"), "{err}");
+    assert!(err.contains("family-primary"), "{err}");
 
+    // Dry run previews and changes nothing.
+    let out = stdout(&ok(
+        h,
+        &[
+            "--dry-run",
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--reactivate",
+            &family_pub,
+        ],
+    ));
+    assert!(out.contains("would reactivate"), "{out}");
+    assert_eq!(key_row(h, "family", "family-primary")["is_active"], false);
+
+    let out = stdout(&ok(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--reactivate",
+            &family_pub,
+        ],
+    ));
+    assert!(
+        out.contains("family-primary") && out.contains("reactivated"),
+        "{out}"
+    );
+    assert_eq!(key_row(h, "family", "family-primary")["is_active"], true);
+
+    // Once active, there is nothing left to reactivate.
     let err = refused(
         h,
         &[
             "key",
             "import",
             "--tenant",
-            OP,
-            "--alias",
-            "fam",
+            "family",
+            "--reactivate",
             &family_pub,
         ],
     );
-    assert!(
-        err.contains("tenant \"family\""),
-        "must name the tenant that owns the key: {err}"
+    assert!(err.contains("active"), "{err}");
+}
+
+/// The keys `--reactivate` must never touch: the escrow identity (a
+/// recipient of every write already, ADR-0005), another tenant's key (one key
+/// belongs to one tenant), and a key the catalog has never seen.
+#[test]
+fn import_refuses_the_escrow_key_another_tenants_key_and_reactivating_an_unknown_key() {
+    let home = init_home_with_family();
+    let h = home.path();
+    let escrow_pub = pub_file(h, &format!("{OP}-escrow"));
+    let family_pub = pub_file(h, "family-primary");
+
+    for extra in [None, Some("--reactivate")] {
+        let mut args = vec!["key", "import", "--tenant", "family", "--alias", "esc"];
+        args.extend(extra);
+        args.push(&escrow_pub);
+        let err = refused(h, &args);
+        assert!(err.contains("escrow"), "{extra:?}: {err}");
+
+        let mut args = vec!["key", "import", "--tenant", OP, "--alias", "fam"];
+        args.extend(extra);
+        args.push(&family_pub);
+        let err = refused(h, &args);
+        assert!(
+            err.contains("tenant \"family\""),
+            "{extra:?}: must name the tenant that owns the key: {err}"
+        );
+    }
+
+    let new_pub = fresh_pub_file(h, "unknown.pub");
+    let err = refused(
+        h,
+        &[
+            "key",
+            "import",
+            "--tenant",
+            "family",
+            "--reactivate",
+            &new_pub,
+        ],
     );
+    assert!(err.contains("not in the catalog"), "{err}");
 }

@@ -250,6 +250,18 @@ pub fn get_key_by_fingerprint(
     .map_err(Into::into)
 }
 
+/// Make a deactivated ordinary key a recipient again (`key import
+/// --reactivate`, issue #350). Guarded in SQL as well as by the caller: only
+/// a row that is currently inactive and is not the escrow row changes.
+/// Returns the number of rows changed (0 or 1).
+pub fn reactivate_key(conn: &Connection, key_id: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE encryption_keys SET is_active = 1
+         WHERE id = ?1 AND is_active = 0 AND is_escrow = 0",
+        params![key_id],
+    )?)
+}
+
 // ── Escrow recipient (ADR-0005) ──
 
 /// Insert the escrow key row: public key only, `is_escrow=1`, `is_active=1`.

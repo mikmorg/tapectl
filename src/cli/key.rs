@@ -65,8 +65,12 @@ pub enum KeyCommands {
         /// Tenant name (required unless --escrow)
         #[arg(long, required_unless_present = "escrow", conflicts_with = "escrow")]
         tenant: Option<String>,
-        /// Key alias (required unless --escrow)
-        #[arg(long, required_unless_present = "escrow", conflicts_with = "escrow")]
+        /// Key alias (required unless --escrow or --reactivate)
+        #[arg(
+            long,
+            required_unless_present_any = ["escrow", "reactivate"],
+            conflicts_with = "escrow"
+        )]
         alias: Option<String>,
         /// Path to public key file — or, with --escrow, either a path or
         /// the literal age1... public key
@@ -78,6 +82,13 @@ pub enum KeyCommands {
         /// (ADR-0005). Refuses if one is already registered.
         #[arg(long)]
         escrow: bool,
+        /// Make this public key a recipient of new writes again when the
+        /// catalog already has it for this tenant, deactivated (as `key
+        /// rotate` leaves every key it replaces). The key keeps the alias it
+        /// was registered under. Refuses for a key that is active, unknown,
+        /// another tenant's, or the escrow identity.
+        #[arg(long, conflicts_with = "escrow")]
+        reactivate: bool,
     },
 
     /// Generate the printed Heir Kit and the encrypted catalog bundle
@@ -328,6 +339,7 @@ pub fn run(
             path,
             key_type,
             escrow,
+            reactivate,
         } => {
             if *escrow {
                 // Issue #241: same reasoning as `key generate --escrow` —
@@ -342,19 +354,47 @@ pub fn run(
                 }
                 import_escrow_key(conn, paths, path, json_output)?;
             } else {
-                let (tenant, alias) = require_tenant_and_alias(tenant, alias)?;
+                // `--reactivate` finds the key by its public key and keeps
+                // the alias it already has, so `--alias` is optional there.
+                let (tenant, alias) = if *reactivate {
+                    let tenant = tenant.as_deref().ok_or_else(|| {
+                        TapectlError::Other("--tenant is required (or pass --escrow)".into())
+                    })?;
+                    (tenant, alias.as_deref())
+                } else {
+                    let (tenant, alias) = require_tenant_and_alias(tenant, alias)?;
+                    (tenant, Some(alias))
+                };
 
                 let t = crate::tenant::require_tenant(conn, tenant)?;
                 let pub_key = keys::read_public_key(Path::new(path))?;
                 let fingerprint = pub_key.clone();
-
-                let full_alias = format!("{tenant}-{alias}");
+                let full_alias = alias.map(|a| format!("{tenant}-{a}"));
 
                 // Issue #241: importing only reads a public key already
                 // given to us, so a faithful preview costs nothing extra —
-                // `check_import` makes every check a real run makes, then
-                // the dry run stops short of the insert and file write.
-                check_import(conn, &t, &full_alias, &fingerprint)?;
+                // `plan_import` makes every check a real run makes, then
+                // the dry run stops short of the insert/update and file write.
+                let full_alias = match plan_import(
+                    conn,
+                    &t,
+                    full_alias.as_deref(),
+                    &fingerprint,
+                    *reactivate,
+                )? {
+                    ImportPlan::Insert(full_alias) => full_alias,
+                    ImportPlan::Reactivate(existing) => {
+                        return reactivate_imported_key(
+                            conn,
+                            paths,
+                            &t,
+                            &existing,
+                            &pub_key,
+                            dry_run,
+                            json_output,
+                        );
+                    }
+                };
                 if dry_run {
                     if json_output {
                         println!(
@@ -634,26 +674,47 @@ fn import_escrow_key(
     Ok(())
 }
 
-/// Refuse, in words, a `key import` the catalog cannot take (issue #350).
+/// What `key import` will do with a public key, decided from the catalog
+/// before anything is written (issue #350).
+enum ImportPlan {
+    /// A key the catalog does not have: insert it under this full alias.
+    Insert(String),
+    /// A deactivated key of this tenant, and `--reactivate` was given.
+    Reactivate(crate::db::models::EncryptionKey),
+}
+
+/// Decide `key import`'s action, or refuse in words (issue #350).
 ///
 /// `encryption_keys.fingerprint` and `.alias` are both UNIQUE, and a public
 /// key the catalog already has used to reach the INSERT and come back as
 /// `UNIQUE constraint failed: encryption_keys.fingerprint`. The common way
 /// to get there is re-adding a recipient `key rotate` deactivated — rotation
 /// deactivates every ordinary key of the tenant, including one whose secret
-/// only someone else holds. Every case now says which key the public key
-/// already is and in what state, before anything is written.
-fn check_import(
+/// only someone else holds — and there was no way back. Every case now says
+/// which key the public key already is and in what state; the way back is
+/// `--reactivate`, explicit, for this tenant's own deactivated key only.
+fn plan_import(
     conn: &Connection,
     tenant: &crate::db::models::Tenant,
-    full_alias: &str,
+    full_alias: Option<&str>,
     fingerprint: &str,
-) -> Result<()> {
+    reactivate: bool,
+) -> Result<ImportPlan> {
     let Some(existing) = queries::get_key_by_fingerprint(conn, fingerprint)? else {
+        if reactivate {
+            return Err(TapectlError::Other(
+                "key import --reactivate refuses: this public key is not in the catalog, so \
+                 there is nothing to reactivate — drop --reactivate (and give --alias) to \
+                 import it as a new key"
+                    .into(),
+            ));
+        }
+        let full_alias = full_alias
+            .ok_or_else(|| TapectlError::Other("--alias is required (or pass --escrow)".into()))?;
         if queries::get_key_by_alias(conn, full_alias)?.is_some() {
             return Err(TapectlError::KeyAlreadyExists(full_alias.to_string()));
         }
-        return Ok(());
+        return Ok(ImportPlan::Insert(full_alias.to_string()));
     };
 
     let alias = &existing.alias;
@@ -661,7 +722,7 @@ fn check_import(
         return Err(TapectlError::Other(format!(
             "key import refuses: this public key is the escrow identity \"{alias}\" \
              (ADR-0005) — it is already a recipient of every write, and it is never \
-             imported as a tenant key"
+             imported, deactivated or reactivated as a tenant key"
         )));
     }
     let state = if existing.is_active {
@@ -681,18 +742,102 @@ fn check_import(
         )));
     }
     if existing.is_active {
+        let nothing = if reactivate {
+            "nothing to reactivate"
+        } else {
+            "nothing to import"
+        };
         return Err(TapectlError::Other(format!(
             "key import refuses: this public key is already in the catalog as \"{alias}\" \
-             (tenant \"{}\", active) — nothing to import",
+             (tenant \"{}\", active) — {nothing}",
             tenant.name
         )));
     }
-    Err(TapectlError::Other(format!(
-        "key import refuses: this public key is already in the catalog as \"{alias}\" \
-         (tenant \"{}\", deactivated — `key rotate` deactivates the keys it replaces). \
-         tapectl has no command that makes a deactivated key a recipient again.",
-        tenant.name
-    )))
+    if !reactivate {
+        return Err(TapectlError::Other(format!(
+            "key import refuses: this public key is already in the catalog as \"{alias}\" \
+             (tenant \"{}\", deactivated — `key rotate` deactivates the keys it replaces). \
+             To make it a recipient of new writes again, re-run with --reactivate.",
+            tenant.name
+        )));
+    }
+    if let Some(given) = full_alias {
+        if given != alias {
+            return Err(TapectlError::Other(format!(
+                "key import --reactivate refuses: this public key is registered as \"{alias}\", \
+                 not \"{given}\" — reactivation keeps the alias a key was registered under; \
+                 drop --alias, or pass the one it has"
+            )));
+        }
+    }
+    Ok(ImportPlan::Reactivate(existing))
+}
+
+/// Carry out `key import --reactivate` on a key [`plan_import`] cleared:
+/// flip it active and record the change on the audit trail, atomically, then
+/// report it — or, under `--dry-run`, only report what would happen. The
+/// public-key file is rewritten only if it has gone missing: it is public,
+/// and nothing else about the key changes.
+fn reactivate_imported_key(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    tenant: &crate::db::models::Tenant,
+    existing: &crate::db::models::EncryptionKey,
+    pub_key: &str,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    let alias = &existing.alias;
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({"alias": alias, "fingerprint": existing.fingerprint,
+                                   "reactivated": true, "dry_run": true})
+            );
+        } else {
+            println!("would reactivate key \"{alias}\" (DRY RUN — no changes made)");
+        }
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    if queries::reactivate_key(&tx, existing.id)? != 1 {
+        return Err(TapectlError::Other(format!(
+            "key \"{alias}\" changed while being reactivated — run `key list` and try again"
+        )));
+    }
+    events::log_field_change(
+        &tx,
+        "encryption_key",
+        existing.id,
+        alias,
+        "reactivated",
+        "is_active",
+        Some("0"),
+        "1",
+        Some(existing.tenant_id),
+    )?;
+    tx.commit()?;
+
+    let pub_path = paths.keys_dir.join(format!("{alias}.age.pub"));
+    if !pub_path.exists() {
+        keys::save_public_key(&pub_path, pub_key)?;
+    }
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"alias": alias, "fingerprint": existing.fingerprint,
+                               "reactivated": true})
+        );
+    } else {
+        println!(
+            "key \"{alias}\" reactivated: a recipient of new writes for tenant \"{}\" again",
+            tenant.name
+        );
+    }
+    Ok(())
 }
 
 /// Resolve `--tenant`/`--alias` for a non-escrow `Generate`/`Import`, with a

@@ -1161,6 +1161,7 @@ fn second_escrow_registration_refuses() {
         path: fresh_pub,
         key_type: "primary".to_string(),
         escrow: true,
+        reactivate: false,
     };
     let err2 = tapectl::cli::key::run(&conn, &paths, &import, false, false).unwrap_err();
     assert!(
