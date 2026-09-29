@@ -155,8 +155,18 @@ fn init_tracing(verbose: bool, logging: &config::LoggingConfig) {
         configured
     };
 
+    // Issue #357: no ANSI colour unless stderr is a terminal (and never
+    // under NO_COLOR) — a captured log must not carry raw escape codes.
+    let ansi = {
+        use std::io::IsTerminal;
+        startup::log_ansi(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        )
+    };
     let builder = tracing_subscriber::fmt()
         .with_max_level(level)
+        .with_ansi(ansi)
         .with_writer(std::io::stderr);
 
     // Each `tracing_subscriber::fmt` formatter method returns a distinct

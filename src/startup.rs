@@ -250,6 +250,23 @@ pub fn ambiguous_config_notice(home: &Path) -> String {
     )
 }
 
+/// Whether log output on stderr carries ANSI colour codes (issue #357).
+///
+/// Only when stderr is a terminal: a log captured to a file, a pipe, a
+/// systemd journal or a transcript otherwise fills with raw escape
+/// sequences. And never when `NO_COLOR` is set to a non-empty value
+/// (<https://no-color.org>) — tracing-subscriber honours that variable by
+/// default, but only until `with_ansi` is called, which overrides it; so
+/// this decision has to honour it itself. An empty `NO_COLOR` is "unset",
+/// as the convention specifies.
+///
+/// Pure, like [`resolve_from`]: `main()` passes the real
+/// `stderr().is_terminal()` and `var_os("NO_COLOR")`.
+pub fn log_ansi(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    let no_color_requested = no_color.is_some_and(|value| !value.is_empty());
+    stderr_is_terminal && !no_color_requested
+}
+
 /// Best-effort peek at `[logging]` before a subscriber exists (issue #172).
 ///
 /// Reads just the `logging` table, not the full `Config` — deserializing
@@ -822,5 +839,28 @@ mod tests {
             peek_logging_config(&paths).level,
             LoggingConfig::default().level
         );
+    }
+
+    /// Issue #357: colour only on a terminal, and never under a non-empty
+    /// `NO_COLOR`. The whole table, since each input is a parameter.
+    #[test]
+    fn log_colour_follows_the_terminal_and_no_color() {
+        let set = OsStr::new("1");
+        let empty = OsStr::new("");
+        let rows: [(bool, Option<&OsStr>, bool); 6] = [
+            (true, None, true),
+            (true, Some(empty), true),
+            (true, Some(set), false),
+            (false, None, false),
+            (false, Some(empty), false),
+            (false, Some(set), false),
+        ];
+        for (tty, no_color, want) in rows {
+            assert_eq!(
+                log_ansi(tty, no_color),
+                want,
+                "stderr_is_terminal={tty}, NO_COLOR={no_color:?}"
+            );
+        }
     }
 }

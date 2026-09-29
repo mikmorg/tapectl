@@ -539,6 +539,37 @@ fn logging_level_debug_surfaces_the_wiring_debug_line() {
     );
 }
 
+/// Issue #357: log output captured to a file, a pipe or a transcript must
+/// not carry raw ANSI colour codes. `Command::output` pipes stderr, so it is
+/// not a terminal here — the subscriber has to notice that on its own.
+/// `NO_COLOR` is removed so the test proves the terminal check, not the
+/// variable (tracing-subscriber already honours `NO_COLOR` by itself).
+#[test]
+fn logs_are_uncoloured_when_stderr_is_not_a_terminal() {
+    let home = TempDir::new().expect("tempdir");
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--verbose", "config", "show"])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("failed to spawn tapectl binary");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Positive control: a log line was actually written, so "no escape
+    // byte" cannot pass by there being no log output at all.
+    assert!(
+        stderr.contains("loaded config"),
+        "--verbose should surface the debug line: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "stderr is a pipe, so the log must carry no ANSI escapes: {stderr:?}"
+    );
+}
+
 /// End-to-end process smoke: init -> audit --json -> config check --json
 /// -> db fsck, entirely inside a throwaway HOME.
 ///
