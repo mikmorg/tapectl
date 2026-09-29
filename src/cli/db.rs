@@ -33,15 +33,33 @@ pub fn run(
             // either `Connection::open` call — so on the dry path it has
             // already printed its own preview and returned, and the success
             // lines below must not print a second, contradictory message.
-            crate::cli::operations::db_backup(paths, to, *include_keys, dry_run, json_output)?;
+            //
+            // Issue #350: the success line names WHERE the private keys went
+            // (`<dest minus extension>.keys/`, e.g. `tapectl.db` →
+            // `tapectl.keys/`) — "database and keys backed up to <dest>"
+            // left the operator to guess where the secret half of the
+            // backup was, and it was not at <dest>.
+            let keys_dir =
+                crate::cli::operations::db_backup(paths, to, *include_keys, dry_run, json_output)?;
             if !dry_run {
                 if json_output {
                     println!(
                         "{}",
-                        serde_json::json!({"backup": to, "keys_included": include_keys})
+                        serde_json::json!({"backup": to, "keys_included": include_keys,
+                                           "keys_dir": keys_dir})
+                    );
+                } else if let Some(keys_dir) = keys_dir {
+                    println!(
+                        "database backed up to {to}; private keys copied to {}/ — treat that \
+                         directory as secret",
+                        keys_dir.display()
                     );
                 } else if *include_keys {
-                    println!("database and keys backed up to {to}");
+                    println!(
+                        "database backed up to {to} (--include-keys: there is no key directory \
+                         at {} to copy)",
+                        paths.keys_dir.display()
+                    );
                 } else {
                     println!(
                         "database backed up to {to} (private keys not included — pass --include-keys to copy them)"

@@ -3111,37 +3111,115 @@ fn get_file_map(
     Ok(map)
 }
 
+/// Where `db backup --include-keys` copies the private-key directory for a
+/// backup written to `dest`: `dest` with its extension replaced by `keys`
+/// (`/mnt/usb/tapectl.db` → `/mnt/usb/tapectl.keys/`; `backup` →
+/// `backup.keys/`). Every backup made so far has this layout, so it is kept
+/// as the rule (issue #350) — the help text used to say `<dest>.keys`, which
+/// is only right for a `--to` with no extension.
+pub fn keys_backup_path(dest: &Path) -> std::path::PathBuf {
+    dest.with_extension("keys")
+}
+
+/// Refuse, by name, a `--to` that cannot be written (issue #350), before
+/// anything is opened. SQLite's own answer to each of these was a bare
+/// `unable to open database file`.
+///
+/// A missing directory is refused rather than created: `--to` usually
+/// points at removable or network media, and a mistyped or unmounted path
+/// would otherwise quietly grow a directory tree on the local disk and put
+/// the backup — with `--include-keys`, the private keys — where nobody will
+/// look for it.
+fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
+    if dest.is_dir() {
+        return Err(TapectlError::Other(format!(
+            "db backup refuses: --to {} is a directory; --to names the backup FILE, e.g. {}",
+            dest.display(),
+            dest.join("tapectl.db").display()
+        )));
+    }
+    let dir = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if !dir.exists() {
+        return Err(TapectlError::Other(format!(
+            "db backup refuses: the destination directory {} does not exist — create it, \
+             or mount the medium it lives on, and run again (db backup does not create \
+             directories)",
+            dir.display()
+        )));
+    }
+    if !dir.is_dir() {
+        return Err(TapectlError::Other(format!(
+            "db backup refuses: {} is not a directory, so --to {} cannot be written",
+            dir.display(),
+            dest.display()
+        )));
+    }
+    if include_keys && keys_backup_path(dest) == dest {
+        return Err(TapectlError::Other(format!(
+            "db backup refuses: --to {} ends in .keys, which is exactly where --include-keys \
+             puts the private-key directory — the database file and the key directory would \
+             be the same path; give --to another extension, e.g. .db",
+            dest.display()
+        )));
+    }
+    Ok(())
+}
+
 /// DB backup using SQLite backup API.
 ///
 /// `dry_run` (issue #247) is checked before EITHER `Connection::open` call
 /// below: `rusqlite`/SQLite creates its target file the instant `open` is
 /// called, before a single page is copied, so even opening `dest` would
 /// already be the side effect a dry run promises not to have — a half-built
-/// or zero-byte backup file is worse than none.
+/// or zero-byte backup file is worse than none. The destination checks run
+/// first, dry run included, so a preview refuses exactly what a real run
+/// would.
+///
+/// Returns the directory the private keys were copied to — `None` without
+/// `--include-keys`, or when there was no key directory to copy — so the
+/// caller can name it (issue #350). A dry run returns `None`.
 pub fn db_backup(
     paths: &TapectlPaths,
     dest: &str,
     include_keys: bool,
     dry_run: bool,
     json_output: bool,
-) -> Result<()> {
+) -> Result<Option<std::path::PathBuf>> {
+    check_backup_destination(Path::new(dest), include_keys)?;
+    let keys_backup = keys_backup_path(Path::new(dest));
+
     if dry_run {
+        let keys_dir = (include_keys && paths.keys_dir.exists()).then_some(&keys_backup);
         if json_output {
             println!(
                 "{}",
                 serde_json::json!({
-                    "backup": dest, "keys_included": include_keys, "dry_run": true,
+                    "backup": dest, "keys_included": include_keys,
+                    "keys_dir": keys_dir, "dry_run": true,
                 })
             );
+        } else if let Some(keys_dir) = keys_dir {
+            println!(
+                "would back up database to {dest} and private keys to {}/ (DRY RUN — no \
+                 changes made)",
+                keys_dir.display()
+            );
         } else if include_keys {
-            println!("would back up database and keys to {dest} (DRY RUN — no changes made)");
+            println!(
+                "would back up database to {dest} (DRY RUN — no changes made; there is no \
+                 key directory at {} to copy)",
+                paths.keys_dir.display()
+            );
         } else {
             println!(
                 "would back up database to {dest} (DRY RUN — no changes made; private keys \
                  not included — pass --include-keys to copy them)"
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let src_conn = rusqlite::Connection::open(&paths.db_file)?;
@@ -3160,21 +3238,22 @@ pub fn db_backup(
     // because ADR-0005's Heir Kit (#69) is deferred and unbuilt: gating +
     // warning is the right call today, not deprecating the only key-export
     // path there is.
+    let mut keys_copied_to = None;
     if include_keys {
         if paths.keys_dir.exists() {
-            let keys_backup = Path::new(dest).with_extension("keys");
             copy_dir_all(&paths.keys_dir, &keys_backup)?;
             warn!(
                 destination = %keys_backup.display(),
                 "private key material copied to backup destination — treat this location as secret"
             );
+            keys_copied_to = Some(keys_backup);
         }
     } else {
         info!("--include-keys not set; private keys were not copied to this backup");
     }
 
     info!(dest = dest, "database backup complete");
-    Ok(())
+    Ok(keys_copied_to)
 }
 
 /// DB import: restore a backup file over the live database.
@@ -7385,9 +7464,13 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            db_backup(&paths, dest.to_str().unwrap(), false, false, false).unwrap();
+            let keys = db_backup(&paths, dest.to_str().unwrap(), false, false, false).unwrap();
 
             assert!(dest.exists(), "the database copy itself must still happen");
+            assert_eq!(
+                keys, None,
+                "no keys directory to report without --include-keys"
+            );
             let keys_backup = dest.with_extension("keys");
             assert!(
                 !keys_backup.exists(),
@@ -7401,10 +7484,15 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            db_backup(&paths, dest.to_str().unwrap(), true, false, false).unwrap();
+            let reported = db_backup(&paths, dest.to_str().unwrap(), true, false, false).unwrap();
 
             let keys_backup = dest.with_extension("keys");
             assert!(keys_backup.is_dir(), ".keys directory should be created");
+            assert_eq!(
+                reported.as_deref(),
+                Some(keys_backup.as_path()),
+                "db_backup must report the directory it copied the keys to (issue #350)"
+            );
             assert_eq!(
                 mode_of(&keys_backup),
                 0o700,
@@ -7443,10 +7531,14 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            db_backup(&paths, dest.to_str().unwrap(), true, false, false)
+            let reported = db_backup(&paths, dest.to_str().unwrap(), true, false, false)
                 .expect("a missing keys_dir must not turn --include-keys into an error");
 
             assert!(dest.exists());
+            assert_eq!(
+                reported, None,
+                "nothing was copied, so no directory to name"
+            );
             assert!(!dest.with_extension("keys").exists());
         }
     }
