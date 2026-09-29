@@ -73,7 +73,7 @@ A few commands finish their work and then report a verdict through the exit code
 | [`host check`](cli/host.md#tapectl-host-check) | host is quiet | something tripped | an error |
 | [`config check`](cli/config.md#tapectl-config-check) | config valid | never used | config invalid (or an error) |
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
-| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit's dotfile was refused while the rest ran | an error |
+| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; the rest ran, and each failure is an `error:` line | an error |
 
 Apart from `volume verify`, every other command exits 0 on success and 2 on
 error.
@@ -368,7 +368,9 @@ Add a [[backends.lto]] section to your tapectl config (by default ~/.tapectl/con
 ```
 
 Every write path (`volume init`, `volume write`, `volume resume`,
-`collection run`) needs a `[[backends.lto]]` entry. Uncomment the example
+`collection run`) needs a `[[backends.lto]]` entry, and so do the planners,
+`volume plan` and `collection plan`, even with `--generation` (`volume plan`
+prints its plan first and then fails). Uncomment the example
 `init` left in config.toml, or add one with
 [`tapectl backend add`](cli/backend.md#tapectl-backend-add).
 

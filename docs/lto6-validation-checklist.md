@@ -8,8 +8,11 @@ version of this file (v1's "layered EOT recovery" and `/dev/nst0` addressing) is
 superseded: Layout v2 has no end-of-tape salvage (ADR-0007), and no device is ever
 addressed by number.
 
-**The drive on this VM:** the HP Ultrium 6-SCSI, serial HUJ808A5L4, passed through from
-`home2` (`docs/lto6-drive-passthrough.md`), is `/dev/tape/by-id/scsi-HUJ808A5L4-nst`.
+**The validation drive:** the HP Ultrium 6-SCSI, serial HUJ808A5L4, at
+`/dev/tape/by-id/scsi-HUJ808A5L4-nst` on whichever machine holds it. Since 2026-09-28 it
+belongs to production on `home2` and is detached from the development VM (ADR-0012); to
+run this checklist on the VM, lend it back first (`docs/lto6-drive-passthrough.md`) and
+detach it again before any production contact.
 mhvtl's drives are `scsi-XYZZY_A*-nst`. `/dev/nstN` numbering moves across reboots and
 after module reloads; every command below takes the by-id path. The expendable test
 cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a production tape.
@@ -46,15 +49,15 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
 - [ ] Compression as found: `sg_logs`/mode page 0x0f `DCE`. tapectl disables it per
       write; the record shows `DCE 1→0` verified.
 - [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
-- [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE=/dev/nst1
+- [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE=/dev/nst3
       TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 40 checks since #355 added
       `empty_drive_refused`). The gate always runs `cargo build` and tests the
       checkout's own debug binary; it has no `TAPECTL_BIN`, so a green gate says
       nothing about an installed release binary. The rehearsal's `TAPECTL_BIN=` run
       below is what tests that one. The gate is the one exception to by-id addressing: it
-      wants an mhvtl drive's `/dev/nstN` spelling, so read the number off
-      `ls -l /dev/tape/by-id/` (a `scsi-XYZZY_A*-nst` link) first; `nst1` is only an
-      example.
+      wants the `/dev/nstN` spelling of an **LTO-8** emulated drive (`lsscsi` shows
+      `ULT3580-TD8`; its LTO-8 backend refuses a TD6 drive's LTO-6 media), so read the
+      number off `ls -l /dev/tape/by-id/` and `lsscsi` first; `nst3` is only an example.
 - [ ] Nothing else will touch the drive: every harness takes `/tmp/tapectl-tape.lock`.
 - [ ] **The host is quiet** for the duration: CI runners and their timers paused, no
       heavy builds on the staging disk (`docs/operator-guide.md`, "A quiet host while

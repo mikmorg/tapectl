@@ -187,6 +187,7 @@ directory = "/mnt/staging"  # Peak need: one unit's dar archive + one encrypted 
 
 [defaults]
 slice_size = "10G"
+global_excludes = ["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]   # keep: a [defaults] table without it excludes nothing
 min_copies = 2              # copies every unit needs (an archive set may ask for more)
 min_locations = 2           # distinct locations those copies must be in
 
@@ -394,10 +395,10 @@ becomes `tv/breaking-bad/s01`); `--name` overrides it.
 
 ```bash
 # Single directory
-tapectl unit init /media/tv/breaking-bad/s01 --tenant mike --tag tv
+tapectl unit init /media/tv/breaking-bad/s01 --tenant family --tag tv
 
 # Every immediate subdirectory becomes its own unit (s01, s02, …)
-tapectl unit init-bulk /media/tv/breaking-bad --tenant mike --tag tv
+tapectl unit init-bulk /media/tv/breaking-bad --tenant family --tag tv
 
 # Re-register units whose .tapectl-unit.toml dotfiles already exist under watch_roots
 tapectl unit discover
@@ -906,7 +907,7 @@ rows put a finding in their exit status:
 | `audit` | clean | warnings only | violations, or an error | — |
 | `volume verify` | every checked file matched | — | the medium is proven bad: the volume is quarantined and no longer counts as a copy | inconclusive: a drive or transport failure, or any error, including a command line that does not parse |
 | `db fsck` | clean | findings that are not corruption (orphaned rows, repaired or not) | the integrity check failed, or an error | — |
-| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), and the rest ran | an error | — |
+| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set); the rest ran | an error | — |
 | `host check` | quiet | something tripped | an error | — |
 | `config check` | the config loads | — | it does not, or an error | — |
 | every other command | it ran, whatever it found | — | an error, including a usage error | — |
@@ -1397,7 +1398,8 @@ back**. Run it from real media once a year.
 
 The procedure already exists in
 [`docs/lto6-validation-checklist.md`](lto6-validation-checklist.md) — see its
-*Raw-recovery drill* section. Follow it there rather than a second copy here;
+*Disaster recovery from the real tape* section (the "heir script alone (no
+tapectl)" item). Follow it there rather than a second copy here;
 two drifting checklists are a failure waiting to happen. The drill's
 essentials: load a real tape, pull `RESTORE.sh` off the plaintext front zone
 with `mt` + `dd`, and run it using **only** the tools the tape's own guide
@@ -1684,14 +1686,15 @@ this is something tapectl cannot know, not a risk for you to accept.
 
 ```bash
 tapectl cartridge list                      # barcode, generation, status, location, volume
+tapectl location add offsite-vault -d "the bank's safe deposit box"   # a place must exist before anything moves there
 tapectl cartridge list --location offsite-vault
 tapectl cartridge info L6-0001
 tapectl cartridge edit L6-0001 --generation LTO-5  # the registration was wrong about the medium
-tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
 tapectl cartridge unretire L6-0001          # you were wrong about the medium; undo the retire
 tapectl cartridge mark-erased L6-0001       # after a physical erase
+tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not (later commands use the new barcode)
 ```
 
 ```text
@@ -1915,7 +1918,7 @@ There are two sources — the heir kit's catalog bundle, and the tapes themselve
 `db import` replaces the *entire* live database, so importing the bundle after
 rebuilding tapes would silently discard everything you just rebuilt.
 
-Run these four steps in sequence on the rebuilt machine. (On a fresh
+Run these five steps in sequence on the rebuilt machine. (On a fresh
 production host, `scripts/first-run.sh` step 7 asks for the original escrow
 public key and does step 1 for you.)
 
@@ -2104,6 +2107,15 @@ A tape written before the on-tape catalog existed carries no `catalog.db`. The
 restore path still comes back whole; what you lose is `catalog ls`/`catalog
 search` and each snapshot's original source path, and the command says so when
 it happens.
+
+**5. Rotate before staging anything new.** Any tenant, the operator included,
+with an active key whose `.age.key` is not in `keys/` must be rotated
+(`tapectl key rotate --tenant <name>`) — and nothing warns you: `stage create`
+would encrypt new data to keys whose private halves are gone. If you skipped
+step 3 (no kit), rotate the operator even though its key files came back: `init`
+gave it fresh rows, and step 2 put different private files under those names.
+Rebuilt tenants have no key rows until you rotate or `key import` them. The full
+check is [Keys and recovery](keys-and-recovery.md), runbook C, step 9.
 
 ## Multi-Tenant Setup
 

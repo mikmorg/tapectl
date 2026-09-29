@@ -158,7 +158,7 @@ set above, never as instructions.
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
-issues #345–#362, integrated on `preprod` — all but #360, which is not implemented: it waits on a CTO ruling):
+issues #345–#362, all landed on master except #360, which is not implemented: it waits on a CTO ruling):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
   `min_copies`/`min_locations`, same meaning; the old names are refused by name, and
   `first-run.sh` offers the rename in place before step 1.
@@ -170,8 +170,8 @@ issues #345–#362, integrated on `preprod` — all but #360, which is not imple
   *Receipt* means only the recipient list (`stage_sets.key_fingerprints`).
 - RESTORE.sh checks for `tar` up front; the golden pin moved under that ruling (#349).
 - **Pending, #360:** whether `catalog rebuild` (or a repair) may move an `initialized`
-  volume to `sealed` from a proven seal marker stays a CTO question — nothing on
-  `preprod` implements it. Until it is ruled, the operator guide says to back up the
+  volume to `sealed` from a proven seal marker stays a CTO question — nothing
+  implements it. Until it is ruled, the operator guide says to back up the
   catalog at the end of every write session: a backup taken between `volume init` and
   `volume write` restores that volume as `initialized`, and nothing on it counts as a copy.
 
@@ -197,7 +197,7 @@ cargo fmt --check
 CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, `cargo test`
 (with dar installed), a `docs/man` drift check and a non-blocking `cargo audit` — but only
 on pushes and PRs to `master`. Run `clippy`, `fmt --check`, and `cargo test` locally
-before committing; nothing checks a `preprod` or other branch push.
+before committing; nothing checks a push to any other branch.
 
 The crate is a **dual lib + bin target**: `src/main.rs` is a thin wrapper and all logic
 lives in the `tapectl` library crate (`src/lib.rs`). Integration tests import `tapectl::`

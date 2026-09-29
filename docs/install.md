@@ -7,9 +7,10 @@ how to re-run it over a home that already exists, how to get the catalog back,
 how to move to another host, and how to take it all off again.
 
 It does not repeat the operator's manual: `docs/operator-guide.md` is what to
-do *with* an installed tapectl, and its "Disaster Recovery" section is the
-authority on catalog and data recovery — this document points at it rather
-than restating it. `CONTEXT.md` is the vocabulary.
+do *with* an installed tapectl, and [Keys and recovery](keys-and-recovery.md) is
+the authority on catalog and data recovery (the operator guide's "Disaster
+Recovery" section is its short form) — this document points at them rather than
+restating them. `CONTEXT.md` is the vocabulary.
 
 Every `tapectl` flag below was checked against the binary's own `--help` on
 2026-09-29. Every path below is the default; `first-run.sh --home`, `--user`
@@ -173,6 +174,7 @@ archive"). For the service user that is **`/var/lib/tapectl/.tapectl`**, mode
 ├── stage-reports/       stage reports: one text file per stage set (slice sizes and hashes)
 ├── staging/             created 0700 by init as the default [staging] directory; stays empty once step 7 points staging elsewhere
 ├── logs/                created by ensure_dirs; may stay empty
+├── locks/               stage-<id>.lock: one lockfile per stage set, held while its stage create runs (`staging clean` reclaims them)
 ├── config.toml.pre-rename-<stamp>   only after the pre-step-1 check renamed old [defaults] keys (§6)
 └── config.toml.superseded-<stamp>   only after step 7 regenerated a config this version could not load
 ```
@@ -431,9 +433,9 @@ a plain `ls` as you is refused).
 ## 8. Getting the catalog back
 
 Three sources, from cheapest to last resort. Which one you take depends on
-what you hold, not on how bad the loss is. `docs/operator-guide.md`,
-"Disaster Recovery", is the authority; this is the short form with the
-ordering trap spelled out.
+what you hold, not on how bad the loss is. [Keys and recovery](keys-and-recovery.md)
+(runbooks C and D) is the authority; this is the short form with the ordering
+trap spelled out.
 
 **Rule for all three: the home first, then the keys, then the rows.** `db
 import` replaces the *entire* live database, so anything you rebuilt or
@@ -497,8 +499,11 @@ hand-written secret) and the kit's `catalog.db.age`. In this order:
    shelf is the list. The simplest route is `catalog rebuild --from-volume
    --device <by-id> --key <operator or escrow secret key> [--label <L>]` on
    **every** cartridge you hold, once each, any order: it inserts what is
-   missing and never edits a row it finds, so running it on a cartridge the
-   catalog already has is safe. The narrower route: `volume list` shows every
+   missing, and changes a row it finds only to bind the cartridge (recording a
+   chip serial the row lacked), to mark a volume displaced by a re-initialised
+   cartridge `erased`, or, with the escrow key, to attest escrow coverage —
+   printing a line for each ([Keys and recovery](keys-and-recovery.md), runbook C,
+   step 7). Running it on a cartridge the catalog already has is safe. The narrower route: `volume list` shows every
    volume the kit's catalog knew (the cover sheet's "Sealed cartridges known
    at generation time" counts the sealed ones), `volume identify --device
    <by-id>` prints the label of the cartridge that is loaded, and only the
@@ -526,8 +531,10 @@ the catalog has registered, so register it first:
 - you hold only the operator key and do not know the escrow public key:
   `init --operator <name> --no-escrow` now, and `key import --escrow age1…`
   the day you find it (it refuses only while one is already registered). Until then escrow
-  coverage cannot be confirmed for anything, and `audit` says so — a rebuilt
-  catalog must not be quiet about it.
+  coverage cannot be confirmed for anything, and `audit` does **not** say so:
+  with no escrow identity registered it skips its escrow checks, so a clean
+  `audit` says nothing about escrow, and `catalog locate` shows `-` in its Escrow
+  column ([Keys and recovery](keys-and-recovery.md), runbook C, step 3).
 
 Then `catalog rebuild --from-volume --device <by-id> --key <key>` per
 cartridge. A tenant with only their tenant key needs no catalog at all:
