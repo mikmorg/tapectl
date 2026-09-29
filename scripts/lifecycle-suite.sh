@@ -4152,7 +4152,7 @@ csc_skip_single_cartridge() {
 # to exist.
 csc_multi_label_refused() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: tapectl collection run --collection media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED citing issue #229) then tapectl stage list --json (assert still empty -- refused BEFORE staging)"
+        echo "PLAN: tapectl collection run --collection media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED: more than one destination label, with the swap-and-volume-write remedy) then tapectl stage list --json (assert still empty -- refused BEFORE staging)"
         return 0
     fi
     local out rc
@@ -4160,12 +4160,15 @@ csc_multi_label_refused() {
               --label VOL-CS1 --label VOL-CS2 --device "$TAPE_DEV" 2>&1)"; rc=$?
     printf '%s\n' "$out" >"$RUN/log-csc.multi-label.txt"
     [ "$rc" -ne 0 ] || { echo "collection run accepted two --label values; #229 ruled it refuses: $out"; return 1; }
-    printf '%s\n' "$out" | grep -q "more than one destination label" || {
+    grep -q "more than one destination label" <<<"$out" || {
         echo "refused, but not by #229's rule -- the message does not name the label count, so this proves nothing about the ruling: $out"
         return 1
     }
-    printf '%s\n' "$out" | grep -q "issue #229" || {
-        echo "the refusal does not cite issue #229: $out"; return 1; }
+    # The refusal must say what to do instead. It used to be checked by the
+    # issue number it cited; #357 took issue numbers out of operator
+    # messages, so the check is on the remedy an operator actually reads.
+    grep -q "swap in the next cartridge" <<<"$out" || {
+        echo "the refusal does not tell the operator how to write the further copies: $out"; return 1; }
     local f="$RUN/log-csc.staged-after-refusal.json"
     TCTL stage list --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d == [], d' "$f" || {
