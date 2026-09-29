@@ -1378,7 +1378,8 @@ fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
 
 /// The `[defaults]` half of [`stale_lto_fields_message`].
 ///
-/// Issue #348 (CTO ruling 2026-09-28; ADR-0012, 2026-09-28 amendment):
+/// Issue #348 (CTO ruling 2026-09-28; no ADR records it — ADR-0012's
+/// 2026-09-28 amendment is the home2 move only):
 /// `min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
 /// `min_copies` / `min_locations`. The old names said "tape-only", but the
 /// copy requirement is the bottom layer of every unit's policy
