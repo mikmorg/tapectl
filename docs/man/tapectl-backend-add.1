@@ -21,7 +21,7 @@ Name for this drive, used to select it later. Letters, digits, dot, underscore a
 Tape device node, e.g. /dev/tape/by\-id/scsi\-XXXX\-nst
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-device\-sg\fR \fI<DEVICE_SG>\fR
 SCSI generic node used for health/MAM queries, e.g. /dev/sg1
@@ -33,7 +33,7 @@ Enable verbose output
 Generation this drive natively writes, e.g. LTO\-6 (ADR\-0010: a drive declares only what it can write; the medium\*(Aqs actual generation is detected at `volume init`, not declared here)
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-capacity\-override\fR \fI<CAPACITY_OVERRIDE>\fR
 Capacity override — for virtual drives (mhvtl) and test harnesses only. A real drive\*(Aqs capacity follows the loaded cartridge\*(Aqs detected generation (ADR\-0010); leave this unset. Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `enospc_buffer` uses
@@ -41,7 +41,7 @@ Capacity override — for virtual drives (mhvtl) and test harnesses only. A real
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-enospc\-buffer\fR \fI<ENOSPC_BUFFER>\fR
 Headroom reserved before end\-of\-tape, e.g. 50M
@@ -49,7 +49,7 @@ Headroom reserved before end\-of\-tape, e.g. 50M
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

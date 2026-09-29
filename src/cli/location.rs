@@ -14,7 +14,7 @@ pub enum LocationCommands {
         name: String,
         /// Description. For a warehouse this is where the endpoint or
         /// prefix goes (e.g. "s3://bucket/prefix") -- there is
-        /// deliberately no separate URI column (issue #73).
+        /// deliberately no separate URI column.
         #[arg(long, short)]
         description: Option<String>,
         /// Kind of location (ADR-0006). A `shelf` holds physical

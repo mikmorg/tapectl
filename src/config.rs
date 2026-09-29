@@ -1353,7 +1353,7 @@ fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
     }
     if packing.contains_key("strategy") || packing.contains_key("fill_threshold") {
         return Some(
-            "the [packing] section was removed (issue #172, ADR-0012) — `strategy` and \
+            "the [packing] section was removed (ADR-0012) — `strategy` and \
              `fill_threshold` were parsed but never read: the real batch selector is \
              alphabetical first-fit (src/collection/), not a configurable best-fit \
              strategy, and no code ever consulted a fill threshold. Delete the \
@@ -1372,7 +1372,7 @@ fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
     let labels = value.get("labels")?.as_table()?;
     if labels.contains_key("format") {
         return Some(
-            "the [labels] section was removed (issue #172, ADR-0012) — `format` was \
+            "the [labels] section was removed (ADR-0012) — `format` was \
              parsed but never read: volume labels are always operator-supplied \
              (`--label`), not generated from a template. Delete the [labels] table."
                 .to_string(),
@@ -1410,7 +1410,7 @@ fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
         .collect();
     if !renamed.is_empty() {
         return Some(format!(
-            "defaults.{} renamed (issue #348): the keys are now defaults.min_copies and \
+            "defaults.{} renamed: the keys are now defaults.min_copies and \
              defaults.min_locations, with the same meaning — the copy and location \
              requirement every unit starts from (an [[archive_sets]] entry's min_copies \
              overrides it). Rename {}; the values carry over unchanged.",
@@ -1427,7 +1427,7 @@ fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
     }
     if defaults.contains_key("hash") {
         return Some(
-            "defaults.hash was removed (issue #172, ADR-0012) — nothing ever read it: \
+            "defaults.hash was removed (ADR-0012) — nothing ever read it: \
              every checksum tapectl computes is sha256, hardcoded; `defaults.checksum_mode` \
              is the real knob (it governs WHEN a checksum is taken, not which algorithm). \
              Delete the line."

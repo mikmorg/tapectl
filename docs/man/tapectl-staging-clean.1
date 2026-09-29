@@ -10,35 +10,35 @@ Clean staged files from disk
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Clean all staged sets, not just those with completed writes; also releases a unit\*(Aqs staged data that a bare `staging clean` would otherwise retain for being below its policy\*(Aqs resolved min_copies (issue #244, #262)
+Clean all staged sets, not just those with completed writes; also releases a unit\*(Aqs staged data that a bare `staging clean` would otherwise retain for being below its policy\*(Aqs resolved min_copies
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-unit\fR \fI<UNIT>\fR
-Narrow which staged sets are considered for release to this unit (repeatable) \-\- issue #274. Without `\-\-force`, the same min_copies split still applies within the named unit(s): one below its own resolved min_copies keeps its staged bytes retained (pass `\-\-force` to release it too, exactly as for the whole\-archive form). A `\*(Aqfailed\*(Aq` stage_set is always swept regardless of this scope \-\- see `CleanScope::Units`\*(Aqs own contract in `src/staging/clean.rs`. An unknown unit name is an error, not a silent no\-op
+Narrow which staged sets are considered for release to this unit (repeatable). Without `\-\-force`, the same min_copies split still applies within the named unit(s): one below its own resolved min_copies keeps its staged bytes retained (pass `\-\-force` to release it too, exactly as for the whole\-archive form). A `\*(Aqfailed\*(Aq` stage_set is always swept regardless of this scope \-\- see `CleanScope::Units`\*(Aqs own contract in `src/staging/clean.rs`. An unknown unit name is an error, not a silent no\-op
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
 \fB\-\-version\fR \fI<VERSION>\fR
-Narrow release further, to just this snapshot version within the single unit named by `\-\-unit` \-\- issue #278. Requires exactly one `\-\-unit`; zero or more than one is a usage error naming the constraint, never a silent widening back to unit\-level scope. Exists so a `\-\-force` release meant for one under\-written version of a unit can never also release a DIFFERENT, still\-unwritten version of that same unit \-\- see `CleanScope::UnitVersion`\*(Aqs contract in `src/staging/clean.rs`
+Narrow release further, to just this snapshot version within the single unit named by `\-\-unit`. Requires exactly one `\-\-unit`; zero or more than one is a usage error naming the constraint, never a silent widening back to unit\-level scope. Exists so a `\-\-force` release meant for one under\-written version of a unit can never also release a DIFFERENT, still\-unwritten version of that same unit \-\- see `CleanScope::UnitVersion`\*(Aqs contract in `src/staging/clean.rs`
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

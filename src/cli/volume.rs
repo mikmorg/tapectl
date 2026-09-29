@@ -25,7 +25,7 @@ pub enum VolumeCommands {
         /// Overwrite a cartridge whose File 0 already identifies a
         /// DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY
         /// (a filemark at the beginning of the tape). Refused by
-        /// default (issue #27) — loading the wrong cartridge would
+        /// default — loading the wrong cartridge would
         /// otherwise silently overwrite it. Never overrides a cartridge
         /// that is already SEALED (ADR-0003): bulk-erase the physical tape
         /// and run `cartridge mark-erased` first for that case. It also
@@ -79,15 +79,15 @@ pub enum VolumeCommands {
         allow_missing_escrow: bool,
     },
 
-    /// Resume an interrupted write session (issue #25). Reload the SAME
+    /// Resume an interrupted write session. Reload the SAME
     /// cartridge first: the session continues from its frozen staging files
     /// rather than rebuilding them.
     ///
     /// An already-sealed tape is RE-CONFIRMED, not refused, when the tape
     /// itself proves it is this session's own: File 0's identity matches
     /// this volume, File 0's OWN recorded seal-marker pointer equals this
-    /// session's layout, and a real seal marker parses at that position
-    /// (issue #208). `seal()` is never called a second time. This is the
+    /// session's layout, and a real seal marker parses at that position.
+    /// The seal is never written a second time. This is the
     /// path `volume write` sends you down when it says "run `tapectl
     /// volume resume <label>` to retry the confirm readback".
     ///
@@ -119,7 +119,7 @@ pub enum VolumeCommands {
         device: Option<String>,
     },
 
-    /// Deliberately abandon a volume's unfinished write session (issue #94):
+    /// Deliberately abandon a volume's unfinished write session:
     /// `docs/design/layout-session.md`'s Aborted row, first clause. Use this
     /// when a `volume resume` reports a revalidation failure you know to be
     /// permanent (the staged data is really gone), or to clear a `planned`
@@ -265,7 +265,7 @@ pub enum VolumeCommands {
         label: String,
         /// Waive the ADR-0008 Tier-2 prompt: proceed when the retirement
         /// leaves a live version below its policy but above zero. It
-        /// defeats NEITHER Tier-3 refusal (issue #147) — a live slice with
+        /// defeats NEITHER Tier-3 refusal — a live slice with
         /// no copy on another volume, and the last eligible copy of a live
         /// version, each stop the retirement outright and no flag reaches
         /// them. See cli::consent.
@@ -314,16 +314,16 @@ pub enum VolumeCommands {
 
     /// Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006).
     ///
-    /// tapectl does NOT move the bytes. Issue #72 was rescoped by CTO
-    /// decision: an operator copies a sealed volume's bytes to cold cloud
-    /// storage by the documented external procedure (rclone / aws-cli) and
+    /// tapectl does NOT move the bytes: an operator copies a sealed
+    /// volume's bytes to cold cloud storage by the documented external
+    /// procedure (rclone / aws-cli) and
     /// then RECORDS that copy here, so the catalog can reason about it.
     Deposit {
         #[command(subcommand)]
         command: DepositCommands,
     },
 
-    /// List every volume, most recently written first (issue #195).
+    /// List every volume, most recently written first.
     ///
     /// Catalog-only: never opens a drive. Every status is shown by default —
     /// ADR-0011: retired means unfit to WRITE, not unreadable ("a retired
@@ -342,7 +342,7 @@ pub enum VolumeCommands {
 
     /// The dossier for one volume: capacity, media generation, cartridge
     /// binding, location, units carried, write receipts, verification
-    /// history, warehouse deposits (issue #195).
+    /// history, warehouse deposits.
     ///
     /// Catalog-only: never opens a drive. Summarises units carried by
     /// default — the design probes ~280 units per cartridge
@@ -370,7 +370,7 @@ pub enum DepositCommands {
         /// The provider's receipt / object-version identifier, if it gave
         /// one. There is deliberately no checksum field: tapectl did not
         /// perform the copy, so a typed-in checksum would be a claim about
-        /// a claim (issue #73).
+        /// a claim.
         #[arg(long)]
         receipt: Option<String>,
         /// Storage class the bytes were placed in (e.g. DEEP_ARCHIVE)

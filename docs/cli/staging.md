@@ -33,6 +33,6 @@ tapectl staging clean [OPTIONS]
 
 **Options**
 
-- `--force` — Clean all staged sets, not just those with completed writes; also releases a unit's staged data that a bare `staging clean` would otherwise retain for being below its policy's resolved min_copies (issue #244, #262)
-- `--unit <UNIT>` — Narrow which staged sets are considered for release to this unit (repeatable) -- issue #274. Without `--force`, the same min_copies split still applies within the named unit(s): one below its own resolved min_copies keeps its staged bytes retained (pass `--force` to release it too, exactly as for the whole-archive form). A `'failed'` stage_set is always swept regardless of this scope -- see `CleanScope::Units`'s own contract in `src/staging/clean.rs`. An unknown unit name is an error, not a silent no-op
+- `--force` — Clean all staged sets, not just those with completed writes; also releases a unit's staged data that a bare `staging clean` would otherwise retain for being below its policy's resolved min_copies
+- `--unit <UNIT>` — Narrow which staged sets are considered for release to this unit (repeatable). Without `--force`, the same min_copies split still applies within the named unit(s): one below its own resolved min_copies keeps its staged bytes retained (pass `--force` to release it too, exactly as for the whole-archive form). A `'failed'` stage_set is always swept regardless of this scope -- see `CleanScope::Units`'s own contract in `src/staging/clean.rs`. An unknown unit name is an error, not a silent no-op
 

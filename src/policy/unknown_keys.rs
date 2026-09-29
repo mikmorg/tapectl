@@ -102,7 +102,7 @@ pub fn describe(hit: &UnknownKeyHit) -> String {
         .find(|(old, _)| *old == key)
     {
         format!(
-            "[defaults].{old} was renamed to [defaults].{new} (#348) — the config will not \
+            "[defaults].{old} was renamed to [defaults].{new} — the config will not \
              load while the old name is present. Rename the key; its meaning and value \
              are unchanged."
         )

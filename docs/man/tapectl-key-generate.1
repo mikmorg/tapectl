@@ -19,7 +19,7 @@ Tenant name (required unless \-\-escrow)
 Key alias (e.g., "primary", "backup", "2026") (required unless \-\-escrow)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-key\-type\fR \fI<KEY_TYPE>\fR [default: primary]
 Key type. Not with \-\-escrow, which has none to set
@@ -31,12 +31,12 @@ Enable verbose output
 Description
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-escrow\fR
 Generate the permanent escrow recipient identity instead of a per\-tenant key (ADR\-0005). Prints the secret exactly once, for paper transcription — tapectl never stores it. Refuses if an escrow identity is already registered; there is only ever one, for the life of the archive
@@ -44,7 +44,7 @@ Generate the permanent escrow recipient identity instead of a per\-tenant key (A
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

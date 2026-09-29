@@ -68,7 +68,7 @@ pub enum CollectionCommands {
     /// Execute one batch: stage every unit in it once, write one session to
     /// the destination label, then release staging IF that copy already
     /// satisfies every unit's resolved `min_copies` — otherwise staging is
-    /// retained for the further copies still needed (issue #229). Targets a
+    /// retained for the further copies still needed. Targets a
     /// single collection (unlike `sync`/`status`/`plan`, which sweep every
     /// configured collection) since a batch write is a real, one-shot tape
     /// action.
@@ -78,7 +78,7 @@ pub enum CollectionCommands {
         collection: String,
         /// Which batch to execute (0 = first). Numbered against THIS run's
         /// own budget — the destination `--label` volumes' recorded
-        /// capacity (issue #175), not the drive's generation. This matches
+        /// capacity, not the drive's generation. This matches
         /// `collection plan`'s ordering only when `plan` was run
         /// (`--generation <GEN>`) for the generation those volumes were
         /// actually initialised as; otherwise the batch reviewed in `plan`
@@ -89,7 +89,7 @@ pub enum CollectionCommands {
         /// cartridge. Exactly one: tapectl drives no changer, so it cannot
         /// write a second copy without a human swapping cartridges, and a
         /// batch run has no point where that swap could happen. More than
-        /// one is refused (issue #229). For a second and further copy,
+        /// one is refused. For a second and further copy,
         /// swap in the next cartridge after this run finishes and use
         /// `tapectl volume write <label>` directly against the same
         /// staged data.

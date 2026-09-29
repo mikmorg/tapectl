@@ -13,21 +13,21 @@ definitions it parses. For what to *do* with them, start at the
 Accepted by every command, before or after the subcommand.
 
 - `--json` — Output in JSON format
-- `--dry-run` — Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+- `--dry-run` — Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 - `-v, --verbose` — Enable verbose output
-- `-y, --yes` — Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a Tier-3 refusal — those are facts, not risks to accept (issue #147)
+- `-y, --yes` — Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a Tier-3 refusal — those are facts, not risks to accept
 - `--config <CONFIG>` — Path to config file.
   
-    NOTE: on its own this ALSO relocates the whole tapectl home to the config file's parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use --home when you mean "operate on a different archive", and --config only to point at a config file inside that home (issue #109).
+    NOTE: on its own this ALSO relocates the whole tapectl home to the config file's parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use --home when you mean "operate on a different archive", and --config only to point at a config file inside that home.
 - `--home <HOME>` — tapectl home directory: database, keys, catalogs, receipts, logs.
   
-    Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless --config overrides it. Also settable as TAPECTL_HOME (issue #109).
+    Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless --config overrides it. Also settable as TAPECTL_HOME.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| [`init`](init.md) | Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or --escrow-public-key to adopt an existing one instead of minting a new identity, #139) |
+| [`init`](init.md) | Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or --escrow-public-key to adopt an existing one instead of minting a new identity) |
 | [`tenant`](tenant.md) | Manage tenants |
 | &nbsp;&nbsp;[`tenant add`](tenant.md#tapectl-tenant-add) | Add a new tenant (generates keypair automatically) |
 | &nbsp;&nbsp;[`tenant list`](tenant.md#tapectl-tenant-list) | List all tenants |
@@ -40,7 +40,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`key export`](key.md#tapectl-key-export) | Export a public key to stdout |
 | &nbsp;&nbsp;[`key rotate`](key.md#tapectl-key-rotate) | Rotate keys for a tenant (deactivate old, generate new). Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself |
 | &nbsp;&nbsp;[`key import`](key.md#tapectl-key-import) | Import a public key from a file, or adopt an existing one as the permanent escrow recipient with --escrow (ADR-0005) |
-| &nbsp;&nbsp;[`key escrow-kit`](key.md#tapectl-key-escrow-kit) | Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009, issue #69) |
+| &nbsp;&nbsp;[`key escrow-kit`](key.md#tapectl-key-escrow-kit) | Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009) |
 | [`unit`](unit.md) | Manage archival units |
 | &nbsp;&nbsp;[`unit init`](unit.md#tapectl-unit-init) | Initialize a directory as an archival unit |
 | &nbsp;&nbsp;[`unit init-bulk`](unit.md#tapectl-unit-init-bulk) | Bulk-initialize subdirectories as units |
@@ -55,7 +55,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`collection sync`](collection.md#tapectl-collection-sync) | Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts) |
 | &nbsp;&nbsp;[`collection status`](collection.md#tapectl-collection-status) | Show pending/dirty/missing/under-copied counts for every configured collection |
 | &nbsp;&nbsp;[`collection plan`](collection.md#tapectl-collection-plan) | Show the batch plan (alphabetical first-fit, §7) for every configured collection's pending units |
-| &nbsp;&nbsp;[`collection run`](collection.md#tapectl-collection-run) | Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit's resolved `min_copies` — otherwise staging is retained for the further copies still needed (issue #229). Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action |
+| &nbsp;&nbsp;[`collection run`](collection.md#tapectl-collection-run) | Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit's resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action |
 | [`snapshot`](snapshot.md) | Manage snapshots |
 | &nbsp;&nbsp;[`snapshot create`](snapshot.md#tapectl-snapshot-create) | Create a snapshot (fast directory walk + manifest) |
 | &nbsp;&nbsp;[`snapshot list`](snapshot.md#tapectl-snapshot-list) | List snapshots |
@@ -73,8 +73,8 @@ Accepted by every command, before or after the subcommand.
 | [`volume`](volume.md) | Manage volumes and tape operations |
 | &nbsp;&nbsp;[`volume init`](volume.md#tapectl-volume-init) | Initialize a new volume (write ID thunk to tape) |
 | &nbsp;&nbsp;[`volume write`](volume.md#tapectl-volume-write) | Write staged data to volume |
-| &nbsp;&nbsp;[`volume resume`](volume.md#tapectl-volume-resume) | Resume an interrupted write session (issue #25). Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them |
-| &nbsp;&nbsp;[`volume abort`](volume.md#tapectl-volume-abort) | Deliberately abandon a volume's unfinished write session (issue #94): `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own |
+| &nbsp;&nbsp;[`volume resume`](volume.md#tapectl-volume-resume) | Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them |
+| &nbsp;&nbsp;[`volume abort`](volume.md#tapectl-volume-abort) | Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own |
 | &nbsp;&nbsp;[`volume verify`](volume.md#tapectl-volume-verify) | Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing) |
 | &nbsp;&nbsp;[`volume identify`](volume.md#tapectl-volume-identify) | Identify a tape (read ID thunk) |
 | &nbsp;&nbsp;[`volume move`](volume.md#tapectl-volume-move) | Move a volume to a location |
@@ -86,8 +86,8 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`volume compact-finish`](volume.md#tapectl-volume-compact-finish) | Retire source volume after compaction (compaction step 3) |
 | &nbsp;&nbsp;[`volume compact`](volume.md#tapectl-volume-compact) | Interactive compaction: read + write + finish in one flow |
 | &nbsp;&nbsp;[`volume deposit`](volume.md#tapectl-volume-deposit) | Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006) |
-| &nbsp;&nbsp;[`volume list`](volume.md#tapectl-volume-list) | List every volume, most recently written first (issue #195) |
-| &nbsp;&nbsp;[`volume info`](volume.md#tapectl-volume-info) | The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits (issue #195) |
+| &nbsp;&nbsp;[`volume list`](volume.md#tapectl-volume-list) | List every volume, most recently written first |
+| &nbsp;&nbsp;[`volume info`](volume.md#tapectl-volume-info) | The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits |
 | [`cartridge`](cartridge.md) | Manage physical cartridges |
 | &nbsp;&nbsp;[`cartridge register`](cartridge.md#tapectl-cartridge-register) | Register a physical cartridge |
 | &nbsp;&nbsp;[`cartridge list`](cartridge.md#tapectl-cartridge-list) | List cartridges |

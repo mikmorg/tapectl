@@ -27,7 +27,7 @@ pub enum CartridgeCommands {
         /// The medium serial you BELIEVE this cartridge carries, for
         /// pre-registering one that has not been loaded yet.
         ///
-        /// ADR-0012 amendment (2026-09-16, issue #197): this is an
+        /// ADR-0012 amendment (2026-09-16): this is an
         /// unconfirmed CLAIM, stored in `operator_serial` — never the chip's
         /// own report. `volume init` writes the confirmed identity
         /// (`serial_number`) itself, from a real MAM read, the first time
@@ -46,8 +46,7 @@ pub enum CartridgeCommands {
         /// cartridge's place is a location now; use --location.
         #[arg(long)]
         status: Option<String>,
-        /// Filter by physical location name (issue #157) -- the sibling
-        /// of `--status`, same bound-parameter discipline (issue #110).
+        /// Filter by physical location name -- the sibling of `--status`.
         #[arg(long)]
         location: Option<String>,
     },
@@ -87,7 +86,7 @@ pub enum CartridgeCommands {
     /// that consent.
     ///
     /// This said consent was "required when a unit is left below its policy"
-    /// until 2026-09-17 (issue #219), which read as "not required otherwise"
+    /// until 2026-09-17, which read as "not required otherwise"
     /// — so a script retiring a fully-covered cartridge without `--yes` was
     /// refused by a non-interactive session for a reason the help denied.
     Retire {
@@ -98,7 +97,7 @@ pub enum CartridgeCommands {
         reason: Option<String>,
         /// Supply the ADR-0008 Tier-2 consent this command asks on every
         /// run, including when no unit is left below its policy. It does
-        /// NOT defeat the Tier-3 refusal (issue #147) — a cartridge holding
+        /// NOT defeat the Tier-3 refusal — a cartridge holding
         /// the last eligible copy of a live version is refused outright and
         /// no flag reaches it. See cli::consent.
         #[arg(long)]
@@ -107,7 +106,7 @@ pub enum CartridgeCommands {
     /// Mark a cartridge as erased (available for reuse)
     ///
     /// Refused outright on a `retired_permanent` cartridge — no `--force`, no
-    /// `--yes`, no exception (ADR-0011, corrected 2026-09-14; issue #207):
+    /// `--yes`, no exception (ADR-0011, corrected 2026-09-14):
     /// this command's own mutation is the cartridge returning to `available`,
     /// and no amount of consent makes a medium declared permanently unfit fit
     /// again. `cartridge unretire` is the way back.
@@ -116,8 +115,8 @@ pub enum CartridgeCommands {
         barcode: String,
         /// Override the pending_erase lifecycle precondition (ADR-0008
         /// Tier 2 — see cli::consent). Does NOT reach a `retired_permanent`
-        /// cartridge (issue #207) — `cartridge unretire` is the way back.
-        /// Does NOT reach the Tier-3 zero-copy floor either (issue #289):
+        /// cartridge — `cartridge unretire` is the way back.
+        /// Does NOT reach the Tier-3 zero-copy floor either:
         /// if a mounted volume holds a unit's last eligible copy, marking
         /// the cartridge erased is refused, and no flag waives that.
         #[arg(long)]
@@ -135,7 +134,7 @@ pub enum CartridgeCommands {
     /// 3 — capacity is decided once at init and stored on the volume).
     ///
     /// `--serial` is a SEPARATE, independently gated correction (ADR-0012
-    /// amendment, 2026-09-16; issue #197): gating is per-flag, not
+    /// amendment, 2026-09-16): gating is per-flag, not
     /// per-command, because `--generation` is a fact correction (Tier 1)
     /// while `--serial` is a claim about IDENTITY (Tier 2 — see
     /// `cli::consent`). It writes only `operator_serial`, never
@@ -191,7 +190,7 @@ pub enum CartridgeCommands {
     },
     /// Show the MAM journal: every MAM read taken of a cartridge, verbatim
     ///
-    /// ADR-0013 / issue #297: every `sg_read_attr` a command runs is kept
+    /// ADR-0013: every `sg_read_attr` a command runs is kept
     /// whole — including the attributes tapectl does not parse, such as the
     /// medium's own ring of the last four drives that loaded it — because
     /// loading the cartridge overwrites them. Lists the rows, oldest first;

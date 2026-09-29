@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or --escrow-public-key to adopt an existing one instead of minting a new identity, #139)
+Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or --escrow-public-key to adopt an existing one instead of minting a new identity)
 
 ```text
 tapectl init [OPTIONS]
@@ -14,5 +14,5 @@ tapectl init [OPTIONS]
 
 - `--operator <OPERATOR>` — Operator name (defaults to system username)
 - `--no-escrow` — Do NOT create the permanent escrow recipient (ADR-0005) at init. By default `init` generates it and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import --escrow` instead, or in tests/tooling that register escrow separately
-- `--escrow-public-key <KEY_OR_FILE>` — Register THIS existing escrow public key (an age1… literal, or a path to a .pub file) instead of minting a new identity — the disaster-recovery form: a rebuilt machine adopts the original recipient from the heir kit's cover sheet so every tape's receipts keep matching (#139)
+- `--escrow-public-key <KEY_OR_FILE>` — Register THIS existing escrow public key (an age1… literal, or a path to a .pub file) instead of minting a new identity — the disaster-recovery form: a rebuilt machine adopts the original recipient from the heir kit's cover sheet so every tape's receipts keep matching
 

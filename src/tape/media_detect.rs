@@ -463,7 +463,7 @@ fn cannot_write_message(
          If this drive is not really an {drive_gen}, `generation` in the \
          [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
          (`tapectl config show` prints it; there is no `backend edit`, by decision: \
-         ADR-0012, #143) and run `tapectl config check`.",
+         ADR-0012) and run `tapectl config check`.",
         backend.name, backend.device_tape,
     )
 }
@@ -489,7 +489,7 @@ fn cannot_read_message(
          If this drive is not really an {drive_gen}, `generation` in the \
          [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
          (`tapectl config show` prints it; there is no `backend edit`, by decision: \
-         ADR-0012, #143) and run `tapectl config check`.",
+         ADR-0012) and run `tapectl config check`.",
         backend.name, backend.device_tape,
     )
 }

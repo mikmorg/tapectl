@@ -28,7 +28,7 @@ pub enum RestoreCommands {
         /// Snapshot version to restore. Defaults to the newest version of
         /// the unit on this volume (the same rule RESTORE.sh applies); a
         /// version the volume does not carry is refused, naming the ones it
-        /// does (issue #315)
+        /// does
         #[arg(long)]
         version: Option<i64>,
         /// Show what would be restored without restoring
@@ -57,7 +57,7 @@ pub enum RestoreCommands {
         /// Snapshot version to restore. Defaults to the newest version of
         /// the unit on this volume (the same rule RESTORE.sh applies); a
         /// version the volume does not carry is refused, naming the ones it
-        /// does (issue #315)
+        /// does
         #[arg(long)]
         version: Option<i64>,
     },

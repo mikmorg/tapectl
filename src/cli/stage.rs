@@ -17,15 +17,14 @@ pub enum StageCommands {
         /// Re-stage a specific snapshot version instead of the latest
         /// unstaged one — for when `tapectl staging clean --unit <name>
         /// --version <N>` already released that stage set's slices and
-        /// another copy is wanted (issue #53). Refuses if a stage set for
+        /// another copy is wanted. Refuses if a stage set for
         /// that version already has live slices; use `volume write` to
         /// consume them, or `staging clean --unit <name> --version <N>`
         /// to release them first. A plain clean releases it only when it
         /// already has a completed write AND the unit is not currently
         /// below its policy's min_copies; add `--force` otherwise —
         /// including for a stage set that was never written anywhere,
-        /// which a plain clean leaves untouched regardless of min_copies
-        /// (issue #279).
+        /// which a plain clean leaves untouched regardless of min_copies.
         #[arg(long)]
         version: Option<i64>,
     },

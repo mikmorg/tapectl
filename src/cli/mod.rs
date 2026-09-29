@@ -37,7 +37,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Show what would be done without making changes. Commands that
-    /// cannot preview refuse the flag rather than ignore it (issue #241).
+    /// cannot preview refuse the flag rather than ignore it.
     #[arg(long, global = true)]
     pub dry_run: bool,
 
@@ -46,7 +46,7 @@ pub struct Cli {
     pub verbose: bool,
 
     /// Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a
-    /// Tier-3 refusal — those are facts, not risks to accept (issue #147)
+    /// Tier-3 refusal — those are facts, not risks to accept
     #[arg(long, short, global = true)]
     pub yes: bool,
 
@@ -57,7 +57,7 @@ pub struct Cli {
     /// That is how every test harness gets an isolated home, so it still
     /// works, but it is surprising enough that it now warns. Use --home
     /// when you mean "operate on a different archive", and --config only
-    /// to point at a config file inside that home (issue #109).
+    /// to point at a config file inside that home.
     #[arg(long, global = true)]
     pub config: Option<String>,
 
@@ -65,7 +65,7 @@ pub struct Cli {
     ///
     /// Defaults to ~/.tapectl. The config file is taken from
     /// <home>/config.toml unless --config overrides it. Also settable as
-    /// TAPECTL_HOME (issue #109).
+    /// TAPECTL_HOME.
     #[arg(long, global = true)]
     pub home: Option<String>,
 
@@ -78,7 +78,7 @@ pub enum Commands {
     /// Initialize tapectl (DB, config, operator tenant, keys, and the
     /// permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or
     /// --escrow-public-key to adopt an existing one instead of minting a new
-    /// identity, #139)
+    /// identity)
     Init {
         /// Operator name (defaults to system username)
         #[arg(long)]
@@ -94,7 +94,7 @@ pub enum Commands {
         /// path to a .pub file) instead of minting a new identity — the
         /// disaster-recovery form: a rebuilt machine adopts the original
         /// recipient from the heir kit's cover sheet so every tape's
-        /// receipts keep matching (#139).
+        /// receipts keep matching.
         #[arg(long, value_name = "KEY_OR_FILE", conflicts_with = "no_escrow")]
         escrow_public_key: Option<String>,
     },
@@ -227,7 +227,7 @@ pub enum Commands {
         /// configured — with one drive, or none, the behaviour is unchanged.
         /// Resolved leniently: this command only writes a catalog row and
         /// never touches the device, so a path no backend claims is not an
-        /// error (issue #151).
+        /// error.
         #[arg(long)]
         device: Option<String>,
         /// Notes
@@ -343,7 +343,7 @@ pub enum DbCommands {
         /// `/mnt/usb/tapectl.keys/`). Off by default — the database alone
         /// is the common backup case. Private key material copied this way
         /// must be treated as secret wherever the destination ends up (USB
-        /// stick, network share, cloud-synced folder, ...) — issue #40.
+        /// stick, network share, cloud-synced folder, ...).
         #[arg(long)]
         include_keys: bool,
     },

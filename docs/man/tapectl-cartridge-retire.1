@@ -12,7 +12,7 @@ ADR\-0011: for wear, read errors, or any judgement that the medium is no longer 
 .PP
 ADR\-0008 Tier 2: the coverage impact is displayed first, and consent is asked EVERY time — retiring a medium permanently is a declaration worth confirming even when no unit loses coverage by it, which is what `cartridge_retire` does deliberately. `\-\-force`/`\-\-yes` supplies that consent.
 .PP
-This said consent was "required when a unit is left below its policy" until 2026\-09\-17 (issue #219), which read as "not required otherwise" — so a script retiring a fully\-covered cartridge without `\-\-yes` was refused by a non\-interactive session for a reason the help denied.
+This said consent was "required when a unit is left below its policy" until 2026\-09\-17, which read as "not required otherwise" — so a script retiring a fully\-covered cartridge without `\-\-yes` was refused by a non\-interactive session for a reason the help denied.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -22,26 +22,26 @@ Output in JSON format
 Why (appended to the cartridge\*(Aqs notes, never overwriting them)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-force\fR
-Supply the ADR\-0008 Tier\-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier\-3 refusal (issue #147) — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it. See cli::consent
+Supply the ADR\-0008 Tier\-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier\-3 refusal — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it. See cli::consent
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

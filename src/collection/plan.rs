@@ -384,7 +384,7 @@ pub fn plan_for_run(
              that swap could happen. Run `collection run` with exactly one --label for \
              the first copy; for each further copy your policy requires, swap in the \
              next cartridge and run `tapectl volume write <label>` directly against the \
-             same staged data (issue #229).",
+             same staged data.",
             labels.len(),
             labels.join(", "),
         )));

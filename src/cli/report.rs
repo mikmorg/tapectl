@@ -1379,7 +1379,7 @@ fn report_verify_status(
                 // --json` prints the full evidence.
                 println!(
                     "    no per-slice detail recorded — the failure was at a metadata \
-                     position, or predates issue #142. Re-run `volume verify --json` for \
+                     position, or was recorded by an older tapectl. Re-run `volume verify --json` for \
                      the full chain-walk evidence."
                 );
             }
@@ -1980,7 +1980,7 @@ pub(crate) fn tape_alert_block(sightings: &[TapeAlertSighting]) -> Vec<String> {
     }
     let mut lines: Vec<String> = sightings.iter().map(tape_alert_line).collect();
     lines.push(format!(
-        "   read-to-clear (issue #340): compare that contact's page 0x2E bytes with the NEXT \
+        "   read-to-clear: compare that contact's page 0x2E bytes with the NEXT \
          contact's on the same drive — SELECT j.contact_id, j.captured_at, hex(j.raw) FROM \
          log_page_journal j JOIN cartridge_contacts cc ON cc.id = j.contact_id WHERE \
          j.page_code = {} AND cc.drive_id = <drive> ORDER BY j.captured_at, j.id; an all-zero \

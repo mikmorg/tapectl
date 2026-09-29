@@ -17,12 +17,12 @@ pub enum StagingCommands {
         /// Clean all staged sets, not just those with completed writes;
         /// also releases a unit's staged data that a bare `staging clean`
         /// would otherwise retain for being below its policy's resolved
-        /// min_copies (issue #244, #262)
+        /// min_copies
         #[arg(long)]
         force: bool,
 
         /// Narrow which staged sets are considered for release to this
-        /// unit (repeatable) -- issue #274. Without `--force`, the same
+        /// unit (repeatable). Without `--force`, the same
         /// min_copies split still applies within the named unit(s): one
         /// below its own resolved min_copies keeps its staged bytes
         /// retained (pass `--force` to release it too, exactly as for the
@@ -34,7 +34,7 @@ pub enum StagingCommands {
         unit: Vec<String>,
 
         /// Narrow release further, to just this snapshot version within
-        /// the single unit named by `--unit` -- issue #278. Requires
+        /// the single unit named by `--unit`. Requires
         /// exactly one `--unit`; zero or more than one is a usage error
         /// naming the constraint, never a silent widening back to
         /// unit-level scope. Exists so a `--force` release meant for one
@@ -188,7 +188,7 @@ fn retention_notice(under_copied: &[UnderCopiedUnit]) -> String {
     let mut msg = format!(
         "retained {} unit(s) below their policy's min_copies -- not cleaned; \
          releasing them now would discard the only cheap route to the copy \
-         their own policy requires (issue #244). Pass --force to release \
+         their own policy requires. Pass --force to release \
          them too:\n",
         under_copied.len()
     );
@@ -309,7 +309,7 @@ pub fn run(
             if dry_run {
                 return Err(crate::cli::refuse_dry_run(
                     "staging clean",
-                    "it enforces the #244 min_copies release gate, which a preview would \
+                    "it enforces the min_copies release gate, which a preview would \
                      have to reproduce exactly or risk being wrong.",
                 ));
             }

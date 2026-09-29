@@ -19,7 +19,7 @@ Tenant name (required unless \-\-escrow)
 Key alias (required unless \-\-escrow or \-\-reactivate)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-key\-type\fR \fI<KEY_TYPE>\fR [default: primary]
 Key type. Not with \-\-escrow or \-\-reactivate, which have none to set: a reactivated key keeps the type it was registered with
@@ -31,12 +31,12 @@ Enable verbose output
 Adopt this public key as the permanent escrow recipient (ADR\-0005). Refuses if one is already registered
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-reactivate\fR
 Make this public key a recipient of new writes again when the catalog already has it for this tenant, deactivated (as `key rotate` leaves every key it replaces). The key keeps the alias it was registered under. Refuses for a key that is active, unknown, another tenant\*(Aqs, or the escrow identity
@@ -44,7 +44,7 @@ Make this public key a recipient of new writes again when the catalog already ha
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

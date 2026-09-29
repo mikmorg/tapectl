@@ -158,7 +158,7 @@ impl FeedRatio {
             "warning: volume \"{label}\": the drive used {native} bytes of native tape \
              ({mb} MB, page 0x0c BOP to EOD) for {data} bytes of data sent -- {ratio:.3} \
              native bytes per data byte, above the {threshold:.2} threshold. The drive spent \
-             tape repositioning behind an irregular feed; see issue #323 and the operator \
+             tape repositioning behind an irregular feed; see the operator \
              guide's quiet-host rule. The volume is complete and correct; this is a warning \
              about the host, and the next tape will hold less than planned if it continues.",
             native = self.native_bytes(),
@@ -486,7 +486,7 @@ mod tests {
             "warning: volume \"V1\": the drive used 1480000000 bytes of native tape (1480 MB, \
              page 0x0c BOP to EOD) for 1000000000 bytes of data sent -- 1.480 native bytes \
              per data byte, above the 1.05 threshold. The drive spent tape repositioning \
-             behind an irregular feed; see issue #323 and the operator guide's quiet-host \
+             behind an irregular feed; see the operator guide's quiet-host \
              rule. The volume is complete and correct; this is a warning about the host, and \
              the next tape will hold less than planned if it continues."
         );

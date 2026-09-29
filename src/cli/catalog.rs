@@ -771,7 +771,7 @@ pub fn run(
                 }
                 if !report.had_catalog_db {
                     println!(
-                        "  note: this tape carries no catalog.db (written before issue #83) — \
+                        "  note: this tape carries no catalog.db (it was written by an older tapectl) — \
                          the restore path is complete, but there is no per-file index and \
                          each snapshot's original source path is unknown"
                     );

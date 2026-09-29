@@ -124,7 +124,7 @@ pub fn run(
                 if schema_pending {
                     println!(
                         "note: this repair ran against a database that has not finished \
-                         migrating (issue #233) — the next tapectl command will complete the \
+                         migrating — the next tapectl command will complete the \
                          migration."
                     );
                 }

@@ -16,10 +16,10 @@ Tape device (by\-id path). Defaults to the only configured drive; required when 
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-force\fR
-Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default (issue #27) — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR\-0003): bulk\-erase the physical tape and run `cartridge mark\-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010)
+Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR\-0003): bulk\-erase the physical tape and run `cartridge mark\-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010)
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Declare the loaded medium\*(Aqs generation (e.g. LTO\-6, LTO\-7\-M8).
@@ -35,17 +35,17 @@ Bind this volume to an already\-registered cartridge by barcode.
 Normally unnecessary: `volume init` matches the loaded medium\*(Aqs MAM serial to `cartridges.serial_number`, and auto\-registers a cartridge (barcode = that serial) when nothing matches. Use this to attach the volume to a cartridge YOU labelled — the barcode on the physical sticker — instead. A serial match wins over this flag, since the serial was read off the medium.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

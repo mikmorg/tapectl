@@ -8,7 +8,7 @@ tapectl\-cartridge\-journal \- Show the MAM journal: every MAM read taken of a c
 .SH DESCRIPTION
 Show the MAM journal: every MAM read taken of a cartridge, verbatim
 .PP
-ADR\-0013 / issue #297: every `sg_read_attr` a command runs is kept whole — including the attributes tapectl does not parse, such as the medium\*(Aqs own ring of the last four drives that loaded it — because loading the cartridge overwrites them. Lists the rows, oldest first; `\-\-raw <ID>` prints one row\*(Aqs tool output exactly as captured.
+ADR\-0013: every `sg_read_attr` a command runs is kept whole — including the attributes tapectl does not parse, such as the medium\*(Aqs own ring of the last four drives that loaded it — because loading the cartridge overwrites them. Lists the rows, oldest first; `\-\-raw <ID>` prints one row\*(Aqs tool output exactly as captured.
 .PP
 A cartridge\*(Aqs rows are found two ways: reads taken in a contact attributed to it, and reads whose chip serial is its confirmed serial — so a read taken before it was registered is found too. With neither a barcode nor `\-\-serial`, every row is listed, including reads no cartridge could be named for. Read\-only.
 .SH OPTIONS
@@ -20,7 +20,7 @@ Output in JSON format
 Select by the medium serial the chip reported instead (for a cartridge that is not registered)
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-raw\fR \fI<ID>\fR
 Print this journal row\*(Aqs raw `sg_read_attr` output, byte for byte
@@ -29,17 +29,17 @@ Print this journal row\*(Aqs raw `sg_read_attr` output, byte for byte
 Enable verbose output
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

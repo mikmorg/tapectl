@@ -415,7 +415,7 @@ fn print_human(
     }
     if !unreadable_dotfiles.is_empty() {
         println!(
-            "  hint: an unrecognised key under [policy] is refused by name (issue #211); \
+            "  hint: an unrecognised key under [policy] is refused by name; \
              an ABSENT key is always fine and defers to the archive set or defaults"
         );
     }

@@ -715,7 +715,7 @@ fn resolve_or_register_cartridge(
                          (That writes the OPERATOR's claim, which this lookup then \
                          finds and the chip's own reading confirms. Unlike \
                          `--cartridge`, it works from `volume write` too, which has \
-                         no such flag — issue #214.)\n\
+                         no such flag.)\n\
                          \n\
                          If it is a DIFFERENT cartridge, give the registered one a \
                          barcode of its own and retry:\n    \

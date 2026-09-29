@@ -18,6 +18,6 @@ tapectl import [OPTIONS] --label <LABEL> --generation <GENERATION>
 - `--capacity <CAPACITY>` — Capacity (e.g., "2500G"). Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `slice_size`/`enospc_buffer` use.
   
     Defaults to the generation table's native capacity for `--generation` when omitted (ADR-0010, decision 3).
-- `--device <DEVICE>` — Which configured drive this volume belongs to, by its device path (ADR-0010). Only needed when more than one `[[backends.lto]]` is configured — with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no backend claims is not an error (issue #151)
+- `--device <DEVICE>` — Which configured drive this volume belongs to, by its device path (ADR-0010). Only needed when more than one `[[backends.lto]]` is configured — with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no backend claims is not an error
 - `--notes <NOTES>` — Notes
 

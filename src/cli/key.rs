@@ -93,7 +93,7 @@ pub enum KeyCommands {
     },
 
     /// Generate the printed Heir Kit and the encrypted catalog bundle
-    /// (ADR-0005 / ADR-0009, issue #69).
+    /// (ADR-0005 / ADR-0009).
     ///
     /// Writes three files: COVER.txt (the plain-text cover sheet — the
     /// artifact with the decades-scale claim), escrow-kit.html (the same

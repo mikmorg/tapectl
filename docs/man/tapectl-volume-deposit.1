@@ -8,30 +8,30 @@ tapectl\-volume\-deposit \- Record and inspect WAREHOUSE DEPOSITS of sealed volu
 .SH DESCRIPTION
 Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR\-0006).
 .PP
-tapectl does NOT move the bytes. Issue #72 was rescoped by CTO decision: an operator copies a sealed volume\*(Aqs bytes to cold cloud storage by the documented external procedure (rclone / aws\-cli) and then RECORDS that copy here, so the catalog can reason about it.
+tapectl does NOT move the bytes: an operator copies a sealed volume\*(Aqs bytes to cold cloud storage by the documented external procedure (rclone / aws\-cli) and then RECORDS that copy here, so the catalog can reason about it.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

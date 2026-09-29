@@ -29,7 +29,7 @@ tapectl db backup [OPTIONS] --to <TO>
 **Options**
 
 - `--to <TO>` *(required)* — The backup file to write. Its directory must already exist
-- `--include-keys` — Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`--to /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...) — issue #40
+- `--include-keys` — Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`--to /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...)
 
 ### tapectl db fsck
 

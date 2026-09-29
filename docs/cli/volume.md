@@ -14,8 +14,8 @@ tapectl volume [OPTIONS] <COMMAND>
 
 - [`init`](#tapectl-volume-init) — Initialize a new volume (write ID thunk to tape)
 - [`write`](#tapectl-volume-write) — Write staged data to volume
-- [`resume`](#tapectl-volume-resume) — Resume an interrupted write session (issue #25). Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
-- [`abort`](#tapectl-volume-abort) — Deliberately abandon a volume's unfinished write session (issue #94): `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
+- [`resume`](#tapectl-volume-resume) — Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
+- [`abort`](#tapectl-volume-abort) — Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
 - [`verify`](#tapectl-volume-verify) — Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing)
 - [`identify`](#tapectl-volume-identify) — Identify a tape (read ID thunk)
 - [`move`](#tapectl-volume-move) — Move a volume to a location
@@ -27,8 +27,8 @@ tapectl volume [OPTIONS] <COMMAND>
 - [`compact-finish`](#tapectl-volume-compact-finish) — Retire source volume after compaction (compaction step 3)
 - [`compact`](#tapectl-volume-compact) — Interactive compaction: read + write + finish in one flow
 - [`deposit`](#tapectl-volume-deposit) — Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006)
-- [`list`](#tapectl-volume-list) — List every volume, most recently written first (issue #195)
-- [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits (issue #195)
+- [`list`](#tapectl-volume-list) — List every volume, most recently written first
+- [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits
 
 ### tapectl volume init
 
@@ -45,7 +45,7 @@ tapectl volume init [OPTIONS] <LABEL>
 **Options**
 
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--force` — Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default (issue #27) — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR-0003): bulk-erase the physical tape and run `cartridge mark-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR-0010)
+- `--force` — Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. Never overrides a cartridge that is already SEALED (ADR-0003): bulk-erase the physical tape and run `cartridge mark-erased` first for that case. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR-0010)
 - `--generation <GENERATION>` — Declare the loaded medium's generation (e.g. LTO-6, LTO-7-M8).
   
     Normally unnecessary and normally ignored: ADR-0010 DETECTS the generation from the drive (MAM medium density code, else MAM format density code, else the st driver's density register), and a detected code is a fact about the tape that this flag cannot override — a `--generation` contradicting one is an error, not a hint. It is consulted only when no source reports a recognised code.
@@ -75,9 +75,9 @@ tapectl volume write [OPTIONS] <LABEL>
 
 ### tapectl volume resume
 
-Resume an interrupted write session (issue #25). Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
+Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
 
-An already-sealed tape is RE-CONFIRMED, not refused, when the tape itself proves it is this session's own: File 0's identity matches this volume, File 0's OWN recorded seal-marker pointer equals this session's layout, and a real seal marker parses at that position (issue #208). `seal()` is never called a second time. This is the path `volume write` sends you down when it says "run `tapectl volume resume <label>` to retry the confirm readback".
+An already-sealed tape is RE-CONFIRMED, not refused, when the tape itself proves it is this session's own: File 0's identity matches this volume, File 0's OWN recorded seal-marker pointer equals this session's layout, and a real seal marker parses at that position. The seal is never written a second time. This is the path `volume write` sends you down when it says "run `tapectl volume resume <label>` to retry the confirm readback".
 
 Everything else quarantines the volume: a File 0 whose identity does not match, one that is unreadable or unparseable, no recorded pointer, a pointer disagreeing with this session, or a position that does not parse as a seal marker. There is no --force: `volume write --force` overrides a wrong-cartridge finding before anything is written, which has no meaning for a tape this session has already partly written.
 
@@ -99,7 +99,7 @@ tapectl volume resume [OPTIONS] <LABEL>
 
 ### tapectl volume abort
 
-Deliberately abandon a volume's unfinished write session (issue #94): `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
+Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
 
 The tape is never contacted (hence no --device): the cartridge is left exactly as the session left it, and the staged files stay pinned until `staging clean --force` runs. The session becomes ABORTED: `volume resume` will not pick it up again unless its seal is recorded AND a clean full verify is recorded after the abort (ADR-0012, 2026-09-23), and a session aborted before its seal is never resumable. When the seal is recorded, keep staging if you intend to verify and resume: that re-confirm revalidates against the staged files, so releasing them forfeits it.
 
@@ -243,7 +243,7 @@ tapectl volume compact-finish [OPTIONS] <LABEL>
 
 **Options**
 
-- `--force` — Waive the ADR-0008 Tier-2 prompt: proceed when the retirement leaves a live version below its policy but above zero. It defeats NEITHER Tier-3 refusal (issue #147) — a live slice with no copy on another volume, and the last eligible copy of a live version, each stop the retirement outright and no flag reaches them. See cli::consent
+- `--force` — Waive the ADR-0008 Tier-2 prompt: proceed when the retirement leaves a live version below its policy but above zero. It defeats NEITHER Tier-3 refusal — a live slice with no copy on another volume, and the last eligible copy of a live version, each stop the retirement outright and no flag reaches them. See cli::consent
 
 ### tapectl volume compact
 
@@ -272,7 +272,7 @@ tapectl volume compact [OPTIONS] <LABEL>
 
 Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006).
 
-tapectl does NOT move the bytes. Issue #72 was rescoped by CTO decision: an operator copies a sealed volume's bytes to cold cloud storage by the documented external procedure (rclone / aws-cli) and then RECORDS that copy here, so the catalog can reason about it.
+tapectl does NOT move the bytes: an operator copies a sealed volume's bytes to cold cloud storage by the documented external procedure (rclone / aws-cli) and then RECORDS that copy here, so the catalog can reason about it.
 
 ```text
 tapectl volume deposit [OPTIONS] <COMMAND>
@@ -299,7 +299,7 @@ tapectl volume deposit add [OPTIONS] --to <TO> <LABEL>
 **Options**
 
 - `--to <TO>` *(required)* — Warehouse location name (must be a location of kind `warehouse`)
-- `--receipt <RECEIPT>` — The provider's receipt / object-version identifier, if it gave one. There is deliberately no checksum field: tapectl did not perform the copy, so a typed-in checksum would be a claim about a claim (issue #73)
+- `--receipt <RECEIPT>` — The provider's receipt / object-version identifier, if it gave one. There is deliberately no checksum field: tapectl did not perform the copy, so a typed-in checksum would be a claim about a claim
 - `--storage-class <STORAGE_CLASS>` — Storage class the bytes were placed in (e.g. DEEP_ARCHIVE)
 - `--notes <NOTES>` — Free-text note
 
@@ -335,7 +335,7 @@ tapectl volume deposit remove [OPTIONS] --from <FROM> <LABEL>
 
 ### tapectl volume list
 
-List every volume, most recently written first (issue #195).
+List every volume, most recently written first.
 
 Catalog-only: never opens a drive. Every status is shown by default — ADR-0011: retired means unfit to WRITE, not unreadable ("a retired volume can still be restored from"), and the dangerous failure for an inventory is a tape you forgot you had. `--status` narrows; nothing is hidden without it.
 
@@ -349,7 +349,7 @@ tapectl volume list [OPTIONS]
 
 ### tapectl volume info
 
-The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits (issue #195).
+The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, write receipts, verification history, warehouse deposits.
 
 Catalog-only: never opens a drive. Summarises units carried by default — the design probes ~280 units per cartridge (docs/design/v2-open-questions.md:434) — pass `--units` to list every one instead of the largest few.
 

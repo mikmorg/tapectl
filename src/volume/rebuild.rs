@@ -691,8 +691,8 @@ fn attest_escrow(
             }
             Err(age::DecryptError::NoMatchingKeys) => {
                 tracing::warn!(unit = %unit.name, position = first.tape_position,
-                    "attest: the escrow key is not a recipient of this slice — the #115 shape; \
-                     coverage stays unknown");
+                    "attest: the escrow key is not a recipient of this slice, so it cannot \
+                     attest this stage set; coverage stays unknown");
                 report.escrow_attest_not_recipient += 1;
             }
             Err(e) => {
@@ -1464,7 +1464,7 @@ fn record_event(
         if report.had_catalog_db {
             "present"
         } else {
-            "absent (pre-#83 tape): no file index, no source paths"
+            "absent (a tape written before catalog.db rode on tape): no file index, no source paths"
         },
     );
     crate::db::events::log_event(
@@ -1542,7 +1542,7 @@ fn classify_media(media: Option<&format::IdThunkMedia>) -> RebuildIdentity {
         Some("operator") => RebuildIdentity::Operator(media.cartridge_serial.clone()),
         _ => RebuildIdentity::Unknown(format!(
             "this tape's File 0 records cartridge_serial \"{}\" but no \
-             cartridge_identity_source (written before issue #192) — it cannot be told \
+             cartridge_identity_source (written by an older tapectl) — it cannot be told \
              apart from an operator-typed barcode, so it is not assumed to be a \
              chip-verified serial",
             media.cartridge_serial
@@ -1808,7 +1808,7 @@ fn cartridge_capacity_bytes(meta: &format::IdThunkVolumeMeta) -> i64 {
                 "rebuild: File 0's media_type is not a recognised LTO generation, so the \
                  new cartridge row records this volume's resolved capacity instead of the \
                  generation-table figure. Correct it with \
-                 `tapectl cartridge edit <barcode> --generation <G>` (issue #167), which \
+                 `tapectl cartridge edit <barcode> --generation <G>`, which \
                  re-defaults the capacity when the stored figure was a table value"
             );
             meta.nominal_capacity_bytes

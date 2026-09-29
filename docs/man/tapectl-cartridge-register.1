@@ -16,7 +16,7 @@ Barcode label
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Media generation (e.g., LTO\-6, LTO\-7, LTO\-7\-M8, LTO\-8)
@@ -30,15 +30,15 @@ Enable verbose output
 \fB\-\-serial\fR \fI<SERIAL>\fR
 The medium serial you BELIEVE this cartridge carries, for pre\-registering one that has not been loaded yet.
 
-ADR\-0012 amendment (2026\-09\-16, issue #197): this is an unconfirmed CLAIM, stored in `operator_serial` — never the chip\*(Aqs own report. `volume init` writes the confirmed identity (`serial_number`) itself, from a real MAM read, the first time this cartridge is loaded; no operator command ever writes that column. Correct a wrong claim with `cartridge edit \-\-serial`.
+ADR\-0012 amendment (2026\-09\-16): this is an unconfirmed CLAIM, stored in `operator_serial` — never the chip\*(Aqs own report. `volume init` writes the confirmed identity (`serial_number`) itself, from a real MAM read, the first time this cartridge is loaded; no operator command ever writes that column. Correct a wrong claim with `cartridge edit \-\-serial`.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-notes\fR \fI<NOTES>\fR
 Notes
@@ -46,7 +46,7 @@ Notes
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

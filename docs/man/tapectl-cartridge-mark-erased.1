@@ -8,33 +8,33 @@ tapectl\-cartridge\-mark\-erased \- Mark a cartridge as erased (available for re
 .SH DESCRIPTION
 Mark a cartridge as erased (available for reuse)
 .PP
-Refused outright on a `retired_permanent` cartridge — no `\-\-force`, no `\-\-yes`, no exception (ADR\-0011, corrected 2026\-09\-14; issue #207): this command\*(Aqs own mutation is the cartridge returning to `available`, and no amount of consent makes a medium declared permanently unfit fit again. `cartridge unretire` is the way back.
+Refused outright on a `retired_permanent` cartridge — no `\-\-force`, no `\-\-yes`, no exception (ADR\-0011, corrected 2026\-09\-14): this command\*(Aqs own mutation is the cartridge returning to `available`, and no amount of consent makes a medium declared permanently unfit fit again. `cartridge unretire` is the way back.
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Override the pending_erase lifecycle precondition (ADR\-0008 Tier 2 — see cli::consent). Does NOT reach a `retired_permanent` cartridge (issue #207) — `cartridge unretire` is the way back. Does NOT reach the Tier\-3 zero\-copy floor either (issue #289): if a mounted volume holds a unit\*(Aqs last eligible copy, marking the cartridge erased is refused, and no flag waives that
+Override the pending_erase lifecycle precondition (ADR\-0008 Tier 2 — see cli::consent). Does NOT reach a `retired_permanent` cartridge — `cartridge unretire` is the way back. Does NOT reach the Tier\-3 zero\-copy floor either: if a mounted volume holds a unit\*(Aqs last eligible copy, marking the cartridge erased is refused, and no flag waives that
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it (issue #241)
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept (issue #147)
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
 Path to config file.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home (issue #109).
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, receipts. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, receipts, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME (issue #109).
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

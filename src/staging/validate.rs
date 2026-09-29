@@ -262,7 +262,9 @@ pub fn validate_source(
                 return Err(TapectlError::Other(format!(
                     "BITROT suspected: {rel_path} — sha256 differs at an unchanged \
                      size ({expected_size} bytes): baseline={baseline}, current={hex}. \
-                     Refusing to stage (see #32); investigate before re-staging."
+                     Refusing to stage; investigate before re-staging \
+                     (`tapectl unit check-integrity <unit>` checks every file against \
+                     its recorded baseline)."
                 )));
             }
         }
@@ -317,8 +319,9 @@ fn check_source_size(full_path: &Path, rel_path: &str, expected_size: i64) -> Re
     if metadata.len() as i64 != expected_size {
         return Err(TapectlError::Other(format!(
             "DIRTY: source file size changed: {rel_path} (expected {expected_size} bytes, \
-             found {} bytes) — a real edit (size and content both differ); tracked \
-             separately under issue #36",
+             found {} bytes) — a real edit (size and content both differ) since the \
+             snapshot was taken. Take a new snapshot (`tapectl snapshot create <unit>`) \
+             and stage that instead.",
             metadata.len()
         )));
     }
@@ -370,7 +373,7 @@ fn stream_source_file(
     if !meta.is_file() {
         return Err(TapectlError::Other(format!(
             "refusing to read non-regular file: {rel_path} — symlinks/FIFOs/sockets/devices \
-             are never content-validated (issue #33)"
+             are never content-validated"
         )));
     }
 
@@ -619,6 +622,11 @@ mod tests {
 
         assert!(msg.contains("BITROT"), "must name it BITROT, got: {msg}");
         assert!(msg.contains("a.txt"), "must name the file, got: {msg}");
+        // Issue #357: the next step, not an issue number.
+        assert!(
+            msg.contains("tapectl unit check-integrity") && !msg.contains('#'),
+            "must name the command that investigates, got: {msg}"
+        );
         assert!(
             msg.contains(stale_baseline.as_str()),
             "must show the baseline hash, got: {msg}"
@@ -667,6 +675,11 @@ mod tests {
             "dirty and bitrot must be mutually exclusive outcomes, got: {msg}"
         );
         assert!(msg.contains("a.txt"), "must name the file, got: {msg}");
+        // Issue #357: the remedy, not "tracked separately under issue #36".
+        assert!(
+            msg.contains("tapectl snapshot create") && !msg.contains('#'),
+            "must name the remedy, got: {msg}"
+        );
     }
 
     #[test]

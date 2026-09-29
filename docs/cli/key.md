@@ -17,7 +17,7 @@ tapectl key [OPTIONS] <COMMAND>
 - [`export`](#tapectl-key-export) — Export a public key to stdout
 - [`rotate`](#tapectl-key-rotate) — Rotate keys for a tenant (deactivate old, generate new). Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself
 - [`import`](#tapectl-key-import) — Import a public key from a file, or adopt an existing one as the permanent escrow recipient with --escrow (ADR-0005)
-- [`escrow-kit`](#tapectl-key-escrow-kit) — Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009, issue #69)
+- [`escrow-kit`](#tapectl-key-escrow-kit) — Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009)
 
 ### tapectl key generate
 
@@ -93,7 +93,7 @@ tapectl key import [OPTIONS] <PATH>
 
 ### tapectl key escrow-kit
 
-Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009, issue #69).
+Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009).
 
 Writes three files: COVER.txt (the plain-text cover sheet — the artifact with the decades-scale claim), escrow-kit.html (the same content with an inline QR, for printing), and catalog.db.age (the whole catalog encrypted to the escrow recipient).
 
