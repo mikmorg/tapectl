@@ -274,9 +274,12 @@ pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
 ///
 /// Everything that can refuse without touching the source runs first,
 /// before the `stage_sets` INSERT (issue #354): the escrow recipient, the
-/// tenant's and operator's keys, the staging directory (created, then
-/// proved writable) and its free space. What remains to fail after dar is
-/// the work itself.
+/// tenant's and operator's keys, and the staging directory (created, then
+/// proved writable). A staging directory too small for the unit is refused
+/// after the sha256 pass and before dar: that pass reads every byte, and
+/// nothing short of reading the content bounds what dar stores (see
+/// [`check_staging_space`]). What remains to fail after dar is the work
+/// itself.
 ///
 /// Thin wrapper around `stage_create_inner` mirroring
 /// `encrypt_file_streaming`'s "wrapper does cleanup on `Err`" pattern
@@ -426,21 +429,21 @@ fn stage_create_inner(
     let slice_size = resolve_slice_size_string(conn, config, &unit, resolved.slice_size);
     let compression = resolved.compression.clone();
 
-    // Issue #354: the staging directory is usable and big enough, or the
-    // stage is refused here — before the INSERT, the sha256 pass and dar.
+    // Issue #354: the staging directory is usable, or the stage is refused
+    // here — before the INSERT, the sha256 pass and dar. Whether it is big
+    // enough is known now only when it plainly is; otherwise the sha256
+    // pass below measures what dar must store, and the refusal comes then,
+    // still before dar.
     let staging_dir = Path::new(&config.staging.directory);
     prepare_staging_dir(staging_dir)?;
-    check_staging_space(
-        conn,
-        &StagingSpaceInputs {
-            staging_dir,
-            unit_name: &unit.name,
-            snapshot: &snapshot,
-            slice_size: resolved.slice_size,
-            compression: &compression,
-        },
-        notices,
-    )?;
+    let space = StagingSpaceInputs {
+        staging_dir,
+        unit_name: &unit.name,
+        snapshot: &snapshot,
+        slice_size: resolved.slice_size,
+        compression: &compression,
+    };
+    let space_upper = staging_space_before_reading(&space, notices);
 
     // ADR-0005's escrow recipient participates in every write, and
     // pre-write validation refuses without one — encryption cannot be made
@@ -494,7 +497,10 @@ fn stage_create_inner(
 
     // Step 1: SHA256 source validation
     info!("validating source checksums");
-    let checksums = validate::validate_source(
+    let validate::SourceValidation {
+        checksums,
+        nonzero_bytes,
+    } = validate::validate_source(
         conn,
         snapshot_id,
         &snapshot.source_path,
@@ -505,6 +511,13 @@ fn stage_create_inner(
         "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
         params![stage_set_id],
     )?;
+
+    // Issue #354: the read just made is what bounds dar's archive from
+    // below, so a staging directory too small for the unit is refused here,
+    // after the one full read and before dar.
+    if let Some(upper) = space_upper {
+        check_staging_space(&space, upper, nonzero_bytes, notices)?;
+    }
 
     // Step 2: Run dar
     //
@@ -1088,7 +1101,7 @@ fn prepare_staging_dir(staging_dir: &Path) -> Result<()> {
 /// because this only ever widens the "may not fit" band, never a refusal.
 const DAR_ENTRY_OVERHEAD_BYTES: i64 = 1024;
 
-/// What [`check_staging_space`] needs to know about the stage it guards.
+/// What the staging-space check needs to know about the stage it guards.
 struct StagingSpaceInputs<'a> {
     staging_dir: &'a Path,
     unit_name: &'a str,
@@ -1099,142 +1112,156 @@ struct StagingSpaceInputs<'a> {
     compression: &'a str,
 }
 
-/// Refuse a stage that cannot fit in the staging directory, before dar
-/// starts (issue #354) — and say so, with the numbers.
-///
-/// **What a stage actually needs.** dar writes every slice first; then the
-/// encryption loop writes ONE slice's `.age` beside its plaintext and
-/// deletes the plaintext before the next. So staging peaks at the dar
-/// archive plus one encrypted slice — about 1x the unit, not the 3x this
-/// check used to warn at (which would refuse a staging directory sized, as
-/// `first-run.sh` tells the operator to size it, for one tape's worth).
-///
-/// **How sure the figure is.** The snapshot's recorded size is the sum of
-/// its regular files' apparent sizes, which is an UPPER bound on what dar
-/// stores (plus [`DAR_ENTRY_OVERHEAD_BYTES`] a file): dar stores a
-/// hard-linked file once, turns zero runs into holes by default
-/// (`--sparse-file-min-size` 15), and compresses when asked. Refusing on
-/// the upper bound would block units that fit, with no way past it — so:
+impl StagingSpaceInputs<'_> {
+    /// Staging's peak for a dar archive of `archive` bytes. dar writes every
+    /// slice first; then the encryption loop writes ONE slice's `.age`
+    /// beside its plaintext and deletes the plaintext before the next. So
+    /// staging peaks at the archive plus one encrypted slice — about 1x the
+    /// unit, not the 3x this check used to warn at (which would refuse a
+    /// staging directory sized, as `first-run.sh` tells the operator to size
+    /// it, for one tape's worth).
+    fn peak(&self, archive: i64) -> i64 {
+        archive.saturating_add(self.slice_size.min(archive))
+    }
+
+    /// The most the stage is expected to need with `compression = none`,
+    /// as near as it can be told without reading the files: the snapshot's
+    /// recorded size — the sum of its regular files' apparent sizes — plus
+    /// [`DAR_ENTRY_OVERHEAD_BYTES`] a file, at its peak.
+    fn upper(&self) -> i64 {
+        let files = self.snapshot.file_count.unwrap_or(0);
+        self.peak(
+            self.snapshot
+                .total_size
+                .unwrap_or(0)
+                .saturating_add(files.saturating_mul(DAR_ENTRY_OVERHEAD_BYTES)),
+        )
+    }
+
+    fn free(&self, notices: &mut dyn Write) -> Option<i64> {
+        match staging_free_bytes(self.staging_dir) {
+            Ok(free) => Some(i64::try_from(free).unwrap_or(i64::MAX)),
+            Err(e) => {
+                let _ = writeln!(
+                    notices,
+                    "warning: could not read the free space of staging directory {} ({e}); \
+                     staging unit \"{}\" without a space check",
+                    self.staging_dir.display(),
+                    self.unit_name
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The half of the staging-space check that runs before the source is read
+/// (issue #354). Never refuses; returns the upper bound when the check must
+/// be finished by [`check_staging_space`] once the read has measured the
+/// unit, and `None` when there is nothing more to decide.
 ///
 /// - free space covers the upper bound: nothing to say;
-/// - `compression = none`: the files are stat'ed for a LOWER bound (each
-///   file's allocated size, a hard-linked inode once). Below it, refuse;
-///   between the two, a notice, and the stage goes ahead;
-/// - any other compression: dar's output has no useful lower bound, so it is
-///   a notice with the uncompressed figure, never a refusal.
-///
-/// Only a lower bound refuses, so this never blocks a stage that would have
-/// fit — at worst a doomed one proceeds and dar fails partway, which is
-/// where every stage was before this check.
-fn check_staging_space(
-    conn: &Connection,
+/// - any compression but `none`: dar's output has no lower bound (text can
+///   compress to a sliver), so a notice with the uncompressed figure, and
+///   the stage goes ahead;
+/// - `compression = none`: wait for the read.
+fn staging_space_before_reading(
     inputs: &StagingSpaceInputs,
+    notices: &mut dyn Write,
+) -> Option<i64> {
+    use crate::util::format_bytes_binary as fmt;
+
+    let free = inputs.free(notices)?;
+    let upper = inputs.upper();
+    if free >= upper {
+        return None;
+    }
+    if inputs.compression == "none" {
+        return Some(upper);
+    }
+    let _ = writeln!(
+        notices,
+        "warning: staging directory {} may be too small for unit \"{}\": {} free, and \
+         staging it needs up to {} if its data does not compress (compression = \"{}\") — \
+         the dar archive plus one encrypted slice beside it; {STAGING_RUNS_OUT}",
+        inputs.staging_dir.display(),
+        inputs.unit_name,
+        fmt(free),
+        fmt(upper),
+        inputs.compression,
+    );
+    None
+}
+
+/// What happens to a stage that proceeds and then runs out of staging.
+const STAGING_RUNS_OUT: &str =
+    "if it runs out, dar fails partway and the partial slices are removed";
+
+/// Refuse a stage that cannot fit in the staging directory, before dar
+/// starts (issue #354) — and say so, with the numbers. Runs after the
+/// sha256 pass, with `compression = none` and free space below `upper`
+/// ([`staging_space_before_reading`]).
+///
+/// **Why only after the read.** Only a true lower bound on what dar stores
+/// may refuse, since there is no way past a refusal. The snapshot's
+/// recorded size is an UPPER bound, and so is a file's allocation on disk:
+/// dar stores a hard-linked file once and turns runs of zeros into holes by
+/// default (`--sparse-file-min-size` 15), so a dense file of written zeros
+/// — a preallocated disk image, a fallocate'd database, a zero-padded ISO —
+/// is fully allocated yet costs dar a few hundred bytes (measured: 16 MiB of
+/// zeros, a 752-byte archive). What dar cannot shrink without compression
+/// is the non-zero bytes, and counting them means reading every byte: the
+/// sha256 pass does that anyway ([`validate::SourceValidation::nonzero_bytes`]).
+///
+/// - free space (read again: the pass can take hours) covers `upper`:
+///   nothing to say;
+/// - below the lower bound — the non-zero bytes, plus one slice of them —
+///   the stage cannot fit: refused;
+/// - between the two: a notice with both figures, and the stage goes ahead.
+///
+/// Every byte counted in the lower bound is one dar must write, so a refusal
+/// is never wrong about the archive dar would make with tapectl's flags. (A
+/// `~/.darrc` that adds compression to every `dar -c` is outside what this
+/// can see: tapectl does not pass dar `-N`.)
+fn check_staging_space(
+    inputs: &StagingSpaceInputs,
+    upper: i64,
+    nonzero_bytes: i64,
     notices: &mut dyn Write,
 ) -> Result<()> {
     use crate::util::format_bytes_binary as fmt;
 
     let dir = inputs.staging_dir.display();
     let unit = inputs.unit_name;
-    let free = match staging_free_bytes(inputs.staging_dir) {
-        Ok(free) => i64::try_from(free).unwrap_or(i64::MAX),
-        Err(e) => {
-            let _ = writeln!(
-                notices,
-                "warning: could not read the free space of staging directory {dir} ({e}); \
-                 staging unit \"{unit}\" without a space check"
-            );
-            return Ok(());
-        }
+    let Some(free) = inputs.free(notices) else {
+        return Ok(());
     };
-
-    let peak = |archive: i64| archive.saturating_add(inputs.slice_size.min(archive));
-    let files = inputs.snapshot.file_count.unwrap_or(0);
-    let archive_upper = inputs
-        .snapshot
-        .total_size
-        .unwrap_or(0)
-        .saturating_add(files.saturating_mul(DAR_ENTRY_OVERHEAD_BYTES));
-    let upper = peak(archive_upper);
     if free >= upper {
         return Ok(());
     }
-
-    let then = "if it runs out, dar fails partway and the partial slices are removed";
-    if inputs.compression != "none" {
-        let _ = writeln!(
-            notices,
-            "warning: staging directory {dir} may be too small for unit \"{unit}\": {} free, \
-             and staging it needs up to {} if its data does not compress (compression = \
-             \"{}\") — the dar archive plus one encrypted slice beside it; {then}",
-            fmt(free),
-            fmt(upper),
-            inputs.compression,
-        );
-        return Ok(());
-    }
-
-    let stored = stored_bytes_lower_bound(conn, inputs.snapshot)?;
-    let lower = peak(stored);
+    let lower = inputs.peak(nonzero_bytes);
     if free < lower {
         return Err(TapectlError::Other(format!(
             "not enough space in staging directory {dir} for unit \"{unit}\": staging it needs \
-             at least {} — its dar archive (at least {}, the unit's files as stored on disk) \
-             plus one encrypted slice ({}) written beside it — and {} is free. Free space \
-             there, or point [staging] directory at a larger filesystem.",
+             at least {} — its dar archive (at least {}, the unit's non-zero bytes, every one \
+             of which dar stores) plus one encrypted slice ({}) written beside it — and {} is \
+             free. Free space there, or point [staging] directory at a larger filesystem.",
             fmt(lower),
-            fmt(stored),
-            fmt(inputs.slice_size.min(stored)),
+            fmt(nonzero_bytes),
+            fmt(inputs.slice_size.min(nonzero_bytes)),
             fmt(free),
         )));
     }
     let _ = writeln!(
         notices,
         "warning: staging directory {dir} may be too small for unit \"{unit}\": {} free, and \
-         staging it needs between {} and {} (the low end counts hard-linked files once and \
-         sparse files by what they occupy, as dar stores them); {then}",
+         staging it needs between {} and {} (the low end counts only non-zero bytes: dar \
+         stores runs of zeros as holes and a hard-linked file once); {STAGING_RUNS_OUT}",
         fmt(free),
         fmt(lower),
         fmt(upper),
     );
     Ok(())
-}
-
-/// A lower bound on the bytes dar stores for `snapshot` with
-/// `compression = none`: every recorded regular file's allocated size
-/// (`st_blocks`, capped at its length — a sparse file's holes are not
-/// stored), with a hard-linked inode counted once.
-///
-/// Only ever errs LOW, which is the safe direction for a refusal: a file
-/// gone since the snapshot counts nothing (the sha256 pass reports it), and
-/// a filesystem that compresses (ZFS, btrfs) reports a smaller allocation
-/// than dar, which reads the file's full contents, will store.
-fn stored_bytes_lower_bound(conn: &Connection, snapshot: &models::Snapshot) -> Result<i64> {
-    use std::collections::HashSet;
-    use std::os::unix::fs::MetadataExt;
-
-    let base = Path::new(&snapshot.source_path);
-    let mut stmt =
-        conn.prepare("SELECT path FROM files WHERE snapshot_id = ?1 AND is_directory = 0")?;
-    let paths = stmt
-        .query_map(params![snapshot.id], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut linked = HashSet::new();
-    let mut total: i64 = 0;
-    for path in paths {
-        let Ok(meta) = fs::symlink_metadata(base.join(&path)) else {
-            continue;
-        };
-        if !meta.file_type().is_file() {
-            continue;
-        }
-        if meta.nlink() > 1 && !linked.insert((meta.dev(), meta.ino())) {
-            continue;
-        }
-        let stored = meta.len().min(meta.blocks().saturating_mul(512));
-        total = total.saturating_add(i64::try_from(stored).unwrap_or(i64::MAX));
-    }
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -3189,12 +3216,18 @@ mod tests {
         f.sync_all().unwrap();
     }
 
-    /// What `stored_bytes_lower_bound` counts for one file: its allocation,
-    /// capped at its length.
+    /// A file's allocation on disk, capped at its length — what a bound read
+    /// off `st_blocks` would count for it.
     fn allocated(path: &Path) -> i64 {
         use std::os::unix::fs::MetadataExt;
         let m = fs::metadata(path).unwrap();
         m.len().min(m.blocks() * 512) as i64
+    }
+
+    /// The file's non-zero bytes: what the staging-space lower bound counts
+    /// for it (`validate::SourceValidation::nonzero_bytes`).
+    fn nonzero(path: &Path) -> i64 {
+        fs::read(path).unwrap().iter().filter(|&&b| b != 0).count() as i64
     }
 
     /// Issue #354 (b): a unit that cannot fit is refused before dar starts,
@@ -3202,8 +3235,12 @@ mod tests {
     /// `tracing::warn!` at 3x the source, and the real failure came from dar,
     /// partway through the archive.
     ///
-    /// Same "when" evidence as the key and escrow refusals: dar's binary is a
-    /// path that cannot exist, and no `stage_sets` row is left behind.
+    /// The refusal comes after the sha256 pass, which is what measures the
+    /// lower bound (see `check_staging_space`), so unlike the key and escrow
+    /// refusals a `stage_sets` row exists — validated, never given to dar —
+    /// for the next `db::open()` sweep to mark failed, as a BITROT refusal
+    /// leaves one. "Before dar" is the dar binary being a path that cannot
+    /// exist, and no `dar_command` on the row.
     #[test]
     fn insufficient_staging_space_is_refused_before_dar_with_the_numbers() {
         use crate::util::format_bytes_binary as fmt;
@@ -3213,10 +3250,16 @@ mod tests {
         write_dense_file(&src.join("big.bin"), 256 * 1024);
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
-        // The unit's files as stored: big.bin plus the dotfile `unit init`
-        // wrote (a regular file dar archives like any other). One slice
-        // holds it all, so the peak is the archive plus its `.age`: 2x.
-        let stored = allocated(&src.join("big.bin")) + allocated(&src.join(".tapectl-unit.toml"));
+        // What dar must store: every non-zero byte of big.bin and of the
+        // dotfile `unit init` wrote (a regular file dar archives like any
+        // other). One slice holds it all, so the peak is the archive plus
+        // its `.age`: 2x.
+        let stored = nonzero(&src.join("big.bin")) + nonzero(&src.join(".tapectl-unit.toml"));
+        assert_eq!(
+            nonzero(&src.join("big.bin")),
+            256 * 1024,
+            "fixture: a dense file with no zero byte"
+        );
         let free: u64 = 100 * 1024;
         let _free = FreeSpaceOverride::set(free);
 
@@ -3237,10 +3280,18 @@ mod tests {
             fmt(free as i64)
         );
         assert!(!msg.contains("dar-must-never-run"), "before dar: {msg}");
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+        let (validated, dar_command): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source_validated_at, dar_command FROM stage_sets",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(rows, 0, "refused before the stage_sets INSERT");
+        assert!(validated.is_some(), "refused after the sha256 pass");
+        assert!(
+            dar_command.is_none(),
+            "refused before dar ran: {dar_command:?}"
+        );
         let left: Vec<_> = fs::read_dir(&config.staging.directory)
             .unwrap()
             .flatten()
@@ -3266,7 +3317,7 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let snapshot = get_snapshot(&conn, snap_id).unwrap();
 
-        let stored = allocated(&src.join("a.bin")) + allocated(&src.join(".tapectl-unit.toml"));
+        let stored = nonzero(&src.join("a.bin")) + nonzero(&src.join(".tapectl-unit.toml"));
         let lower = 2 * stored;
         let upper = 2
             * (snapshot.total_size.unwrap()
@@ -3292,6 +3343,63 @@ mod tests {
         );
     }
 
+    /// The adversarial review's probe (issue #354): a DENSE file of zeros —
+    /// written, not seeked, so every block is allocated — costs dar almost
+    /// nothing, because dar stores zero runs as holes by default
+    /// (`--sparse-file-min-size` 15; measured: 16 MiB of zeros made a
+    /// 752-byte archive). A bound read off the file's allocation counted all
+    /// 8 MiB and refused a stage that needs a few KiB, with no way past it —
+    /// preallocated disk images, fallocate'd databases and zero-padded ISOs
+    /// all look like this. Only what dar cannot turn into a hole, its
+    /// non-zero bytes, may refuse; here that is the dotfile, so the stage
+    /// runs, with a notice carrying both figures.
+    #[test]
+    fn a_dense_file_of_zeros_that_fits_is_staged_not_refused() {
+        use crate::util::format_bytes_binary as fmt;
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let zeros = src.join("disk.img");
+        {
+            let mut f = fs::File::create(&zeros).unwrap();
+            f.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(
+            allocated(&zeros) >= 8 * 1024 * 1024,
+            "fixture: the zeros must be allocated on disk (dense, not sparse), \
+             or this test cannot tell an allocation bound from a content one"
+        );
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let free: u64 = 4 * 1024 * 1024;
+        let _free = FreeSpaceOverride::set(free);
+
+        let mut notices = Vec::new();
+        let stage_set_id = stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices)
+            .expect("8 MiB of zeros needs a few KiB of staging: it must be staged, not refused");
+
+        // It really did fit: dar's archive is a sliver of the 4 MiB "free".
+        let dar_size: i64 = conn
+            .query_row(
+                "SELECT total_dar_size FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            dar_size < 64 * 1024,
+            "dar stored the zeros as holes: {dar_size} bytes"
+        );
+
+        let dotfile = fs::metadata(src.join(".tapectl-unit.toml")).unwrap().len() as i64;
+        let notices = String::from_utf8(notices).unwrap();
+        assert!(
+            notices.contains("may be too small for unit \"unit1\"")
+                && notices.contains(&format!("between {}", fmt(2 * dotfile))),
+            "the notice must carry the content-proven low end ({}): {notices:?}",
+            fmt(2 * dotfile)
+        );
+    }
+
     /// With compression on, dar's archive has no useful lower bound (text
     /// can compress to a sliver), so a short staging directory is a notice
     /// with the uncompressed figure — never a refusal.
@@ -3312,31 +3420,6 @@ mod tests {
             notices.contains("if its data does not compress")
                 && notices.contains("compression = \"gzip\""),
             "the notice must say the figure assumes no compression: {notices:?}"
-        );
-    }
-
-    /// The lower bound counts a sparse file by what it occupies, not its
-    /// length: dar turns zero runs into holes by default, so an 8 MiB file
-    /// with one written block stores about one block.
-    #[test]
-    fn the_stored_lower_bound_counts_a_sparse_file_by_its_allocation() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, _paths, _config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        let f = fs::File::create(src.join("sparse.img")).unwrap();
-        f.set_len(8 * 1024 * 1024).unwrap();
-        (&f).write_all(&[1u8; 4096]).unwrap();
-        f.sync_all().unwrap();
-        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let snapshot = get_snapshot(&conn, snap_id).unwrap();
-
-        let stored = stored_bytes_lower_bound(&conn, &snapshot).unwrap();
-        assert!(
-            snapshot.total_size.unwrap() >= 8 * 1024 * 1024,
-            "fixture: the recorded size is the apparent length"
-        );
-        assert!(
-            stored < 1024 * 1024,
-            "a sparse file counts what it occupies ({stored} bytes), not its length"
         );
     }
 

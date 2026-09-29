@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
@@ -7,6 +8,24 @@ use tracing::info;
 
 use crate::error::{Result, TapectlError};
 use crate::util::HashingReader;
+
+/// What [`validate_source`]'s full read of the source establishes.
+#[derive(Debug)]
+pub struct SourceValidation {
+    /// `(relative_path, sha256_hex)` for every regular file in the snapshot.
+    pub checksums: Vec<(String, String)>,
+    /// The non-zero bytes of the regular files dar will archive — those the
+    /// current exclude patterns still admit — with a hard-linked inode
+    /// counted once (issue #354).
+    ///
+    /// A true LOWER bound on dar's archive with `compression = none`: dar
+    /// may store any run of zeros as a hole (`--sparse-file-min-size`,
+    /// default 15), and stores a hard-linked inode once, but it must store
+    /// every non-zero byte of every file it archives. A file's allocation
+    /// is no such bound — a dense file of written zeros is fully allocated
+    /// and costs dar almost nothing.
+    pub nonzero_bytes: i64,
+}
 
 /// Validate source files by computing SHA256 for all files in the snapshot.
 ///
@@ -33,11 +52,13 @@ use crate::util::HashingReader;
 /// from disk) already errored before this fix, via `check_source_size`'s
 /// `metadata()` call below — preserved verbatim.
 ///
-/// Returns `Vec<(relative_path, sha256_hex)>` for every file — the return
-/// contract is unchanged (callers depend on it): `stage_create` passes this
-/// straight to `backfill_checksums`, whose own `sha256 IS NULL` guard —
-/// not any filtering here — is what actually prevents overwriting an
-/// existing baseline.
+/// Returns every regular file's `(relative_path, sha256_hex)` in
+/// [`SourceValidation::checksums`]: `stage_create` passes these straight to
+/// `backfill_checksums`, whose own `sha256 IS NULL` guard — not any
+/// filtering here — is what actually prevents overwriting an existing
+/// baseline. Reading every byte also yields
+/// [`SourceValidation::nonzero_bytes`], the staging-space check's lower
+/// bound (issue #354).
 ///
 /// `global_excludes` is `config.defaults.global_excludes` (issue #49) —
 /// passed through to the internal `walk_directory` call the NEW-file check
@@ -48,7 +69,7 @@ pub fn validate_source(
     snapshot_id: i64,
     source_path: &str,
     global_excludes: &[String],
-) -> Result<Vec<(String, String)>> {
+) -> Result<SourceValidation> {
     let base = Path::new(source_path);
 
     // Get all non-directory entries from the manifest, including any
@@ -85,6 +106,15 @@ pub fn validate_source(
     // issue #49 already established between `walk_directory` and
     // `collection::fingerprint::walk_fingerprint`.
     let (_, _, disk_entries) = super::walk_directory(source_path, global_excludes)?;
+    // What dar will archive, by the same exclude patterns it is handed: a
+    // manifest file a dotfile pattern has excluded since `snapshot create`
+    // is still hashed below, but dar skips it, so it must not count toward
+    // the lower bound (issue #354).
+    let archived_paths: HashSet<&str> = disk_entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.path.as_str())
+        .collect();
     let manifest_paths: HashSet<&str> = all_entries.iter().map(|(p, ..)| p.as_str()).collect();
     let mut new_files: Vec<&str> = disk_entries
         .iter()
@@ -159,6 +189,8 @@ pub fn validate_source(
 
     let mut checksums = Vec::new();
     let mut validated = 0;
+    let mut nonzero_bytes: i64 = 0;
+    let mut linked_inodes: HashSet<(u64, u64)> = HashSet::new();
 
     for (rel_path, expected_size, baseline_sha) in &files {
         let full_path = base.join(rel_path);
@@ -183,7 +215,13 @@ pub fn validate_source(
         // is folders of 2-15 GB typically dominated by ONE file at ~90%, so
         // this ran 2-13 GB into RAM before #35's streaming loop was ever
         // reached.
-        let (hex, streamed) = hash_source_file(&full_path, rel_path)?;
+        //
+        // The same read counts the file's non-zero bytes (issue #354) —
+        // nothing short of reading the content can bound what dar stores.
+        let mut nonzero: i64 = 0;
+        let (hex, streamed, meta) = stream_source_file(&full_path, rel_path, &mut |chunk| {
+            nonzero += count_nonzero(chunk);
+        })?;
 
         // TOCTOU guard: `check_source_size` and the streaming read above are
         // two separate passes over the filesystem, so the file could change
@@ -231,6 +269,12 @@ pub fn validate_source(
 
         checksums.push((rel_path.clone(), hex));
 
+        if archived_paths.contains(rel_path.as_str())
+            && (meta.nlink() <= 1 || linked_inodes.insert((meta.dev(), meta.ino())))
+        {
+            nonzero_bytes = nonzero_bytes.saturating_add(nonzero);
+        }
+
         validated += 1;
         if validated % 100 == 0 {
             info!(
@@ -241,7 +285,10 @@ pub fn validate_source(
     }
 
     info!(files = validated, "source validation complete");
-    Ok(checksums)
+    Ok(SourceValidation {
+        checksums,
+        nonzero_bytes,
+    })
 }
 
 /// Stat `full_path` and confirm its current size matches `expected_size`
@@ -305,6 +352,19 @@ const VALIDATE_STREAM_BUFFER: usize = 128 * 1024;
 /// unconditionally — a FIFO with no writer blocks `File::open` forever
 /// with no timeout, so that call must never be reached for anything else.
 pub(crate) fn hash_source_file(full_path: &Path, rel_path: &str) -> Result<(String, i64)> {
+    let (hex, total, _) = stream_source_file(full_path, rel_path, &mut |_| {})?;
+    Ok((hex, total))
+}
+
+/// [`hash_source_file`]'s read loop, handing every chunk read to `chunk` as
+/// well, and returning the `symlink_metadata` it checked before opening —
+/// how `validate_source` counts non-zero bytes and recognises a hard-linked
+/// inode in the one read it already makes (issue #354).
+fn stream_source_file(
+    full_path: &Path,
+    rel_path: &str,
+    chunk: &mut dyn FnMut(&[u8]),
+) -> Result<(String, i64, std::fs::Metadata)> {
     let meta = std::fs::symlink_metadata(full_path)
         .map_err(|e| TapectlError::Other(format!("cannot stat source file: {rel_path} ({e})")))?;
     if !meta.is_file() {
@@ -324,9 +384,15 @@ pub(crate) fn hash_source_file(full_path: &Path, rel_path: &str) -> Result<(Stri
         if n == 0 {
             break;
         }
+        chunk(&buf[..n]);
         total += n as i64;
     }
-    Ok((reader.finalize_hex(), total))
+    Ok((reader.finalize_hex(), total, meta))
+}
+
+/// How many bytes of `buf` are not zero.
+fn count_nonzero(buf: &[u8]) -> i64 {
+    buf.iter().filter(|&&b| b != 0).count() as i64
 }
 
 #[cfg(test)]
@@ -408,7 +474,9 @@ mod tests {
         std::fs::write(tmp.path().join("b.bin"), b"world!!").unwrap();
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None), ("b.bin", 7, None)]);
-        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
+            .unwrap()
+            .checksums;
         assert_eq!(result.len(), 2);
         // Sha256 of "hello" is 2cf24d...
         let hello = result
@@ -480,7 +548,9 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
-        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
+            .unwrap()
+            .checksums;
         assert_eq!(checksums.len(), 1);
         let (path, hex) = &checksums[0];
         assert_eq!(path, "a.txt");
@@ -509,7 +579,9 @@ mod tests {
         let baseline = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(baseline))]);
-        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
+            .unwrap()
+            .checksums;
         assert_eq!(checksums[0].1, baseline);
 
         crate::staging::backfill_checksums(&conn, sid, &checksums).unwrap();
@@ -616,7 +688,7 @@ mod tests {
             out.is_ok(),
             "a NEW file must warn, not refuse staging: {out:?}"
         );
-        let checksums = out.unwrap();
+        let checksums = out.unwrap().checksums;
         assert!(
             checksums.iter().any(|(p, _)| p == "a.txt"),
             "the manifest's own file must still be hashed and returned: {checksums:?}"
@@ -689,6 +761,61 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("freshbaseline"));
     }
 
+    // --- issue #354: the staging-space lower bound the read yields ---
+
+    /// Zeros are not counted, however they sit on disk: dar may store any
+    /// run of them as a hole, but every non-zero byte it must store.
+    #[test]
+    fn nonzero_bytes_counts_what_dar_cannot_turn_into_holes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("mixed.bin"), b"\0\0a\0\0\0\0\0b\0c\0").unwrap();
+        std::fs::write(tmp.path().join("zeros.img"), vec![0u8; 256 * 1024]).unwrap();
+        let (conn, sid) =
+            setup_conn_with_snapshot(&[("mixed.bin", 12, None), ("zeros.img", 256 * 1024, None)]);
+
+        let v = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        assert_eq!(
+            v.nonzero_bytes, 3,
+            "three non-zero bytes in mixed.bin; a written file of zeros counts nothing"
+        );
+        assert_eq!(v.checksums.len(), 2, "both files are still hashed");
+    }
+
+    /// A hard-linked inode is one file to dar, stored once.
+    #[test]
+    fn nonzero_bytes_counts_a_hard_linked_inode_once() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        std::fs::hard_link(tmp.path().join("a.txt"), tmp.path().join("b.txt")).unwrap();
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None), ("b.txt", 5, None)]);
+
+        let v = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        assert_eq!(v.nonzero_bytes, 5, "the inode once, not once per link");
+        assert_eq!(v.checksums.len(), 2, "each link is still hashed");
+    }
+
+    /// A manifest file the exclude patterns now reject is still hashed, but
+    /// dar is handed the same patterns and skips it — so it cannot count
+    /// toward a bound on what dar stores.
+    #[test]
+    fn nonzero_bytes_leaves_out_a_file_dar_will_exclude() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), b"kept").unwrap();
+        std::fs::write(tmp.path().join("junk.tmp"), b"excluded since the snapshot").unwrap();
+        let (conn, sid) =
+            setup_conn_with_snapshot(&[("keep.txt", 4, None), ("junk.tmp", 27, None)]);
+
+        let v = validate_source(
+            &conn,
+            sid,
+            tmp.path().to_str().unwrap(),
+            &["*.tmp".to_string()],
+        )
+        .unwrap();
+        assert_eq!(v.nonzero_bytes, 4, "only keep.txt reaches dar");
+        assert_eq!(v.checksums.len(), 2, "the manifest's files are all hashed");
+    }
+
     #[test]
     fn validate_source_skips_directories() {
         let tmp = TempDir::new().unwrap();
@@ -732,7 +859,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
+            .unwrap()
+            .checksums;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "subdir/f.txt");
     }
@@ -963,7 +1092,7 @@ mod tests {
             result.is_ok(),
             "a mismatched-length symlink must not produce a false DIRTY: {result:?}"
         );
-        let checksums = result.unwrap();
+        let checksums = result.unwrap().checksums;
         assert!(
             checksums.iter().any(|(p, _)| p == "target.txt"),
             "the real regular file must still be validated: {checksums:?}"
@@ -995,7 +1124,7 @@ mod tests {
             result.is_ok(),
             "a broken symlink must not error at all — excluded from validation: {result:?}"
         );
-        let checksums = result.unwrap();
+        let checksums = result.unwrap().checksums;
         assert!(
             !checksums.iter().any(|(p, _)| p == "dangling"),
             "the broken symlink must be excluded from the validation set: {checksums:?}"
@@ -1023,7 +1152,9 @@ mod tests {
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
         insert_nonregular_file(&conn, sid, "a.fifo", 0, "special", None);
 
-        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        let checksums = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
+            .unwrap()
+            .checksums;
         assert_eq!(
             checksums.len(),
             1,
