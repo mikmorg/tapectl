@@ -2798,6 +2798,140 @@ mod tests {
                 .unwrap();
             assert_eq!(touched, 0, "refused before step 1 read anything");
         }
+
+        /// The code of `src` with comment lines dropped and every string
+        /// literal's contents blanked, so a word in a message or a doc is
+        /// neither a call nor a use of `to`.
+        fn code_only(src: &str) -> String {
+            let mut out = String::new();
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                let (mut in_str, mut escaped) = (false, false);
+                for c in line.chars() {
+                    if in_str {
+                        match (escaped, c) {
+                            (true, _) => escaped = false,
+                            (false, '\\') => escaped = true,
+                            (false, '"') => {
+                                in_str = false;
+                                out.push('"');
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        in_str = c == '"';
+                        out.push(c);
+                    }
+                }
+                out.push('\n');
+            }
+            out
+        }
+
+        /// Where `run`'s Compact arm takes the swap, or why it does not take
+        /// it unconditionally.
+        fn swap_is_unconditional(arm: &str) -> std::result::Result<(), String> {
+            let code = code_only(arm);
+            const SWAP: &str = "swap_to_destination(";
+            if code.matches(SWAP).count() != 1 {
+                return Err(format!(
+                    "{} swap calls, not one",
+                    code.matches(SWAP).count()
+                ));
+            }
+            // At the arm's own statement level (12 spaces), so it sits in no
+            // `if`, `match` arm or closure — and fed `--to` itself.
+            let stmt =
+                "            let dest_label = swap_to_destination(to.as_deref(), label, &device)?;";
+            if !code.lines().any(|l| l == stmt) {
+                return Err("the swap is not an unconditional statement of the arm".into());
+            }
+            let (read, swap, write) = (
+                code.find("write::compact_read(").ok_or("no step 1")?,
+                code.find(SWAP).unwrap(),
+                code.find("write::compact_write(").ok_or("no step 2")?,
+            );
+            if !(read < swap && swap < write) {
+                return Err("the swap is not between step 1's read and step 2's write".into());
+            }
+            // `to` is bound, checked once before step 1, and handed to the
+            // swap — any other use is a decision taken on it.
+            let uses = code
+                .match_indices("to")
+                .filter(|(i, _)| {
+                    let ident = |c: char| c.is_alphanumeric() || c == '_';
+                    !code[..*i].ends_with(ident) && !code[i + 2..].starts_with(ident)
+                })
+                .count();
+            if uses != 4 {
+                return Err(format!(
+                    "`to` appears {uses} times: the binding, `let to =`, the pre-step-1 \
+                     check and the swap make 4"
+                ));
+            }
+            Ok(())
+        }
+
+        /// Issue #358's review: the pause with `--to` is proved above only at
+        /// function level (`swap_to_destination_with`), and a test through
+        /// `run` cannot reach it — under `cfg(test)` stdin is never a
+        /// terminal, so `run` refuses before step 1. So nothing pinned that
+        /// `run` still routes `--to` THROUGH the swap: a short-circuit there
+        /// (`match to { Some(t) => t, None => swap_to_destination(..)? }`),
+        /// the exact regression #358 fixed, would have left every test green.
+        /// Pinned by source, with the checker's own negative controls.
+        #[test]
+        fn run_routes_to_through_the_swap_unconditionally() {
+            let src = include_str!("volume.rs");
+            let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+            let start = prod
+                .find("        VolumeCommands::Compact {")
+                .expect("run's Compact arm");
+            let end = start
+                + prod[start..]
+                    .find("\n        VolumeCommands::Deposit {")
+                    .expect("the arm after it");
+            let arm = &prod[start..end];
+            assert!(
+                arm.contains("refuse_unattended_compact("),
+                "positive control: the slice is the real arm"
+            );
+            assert_eq!(swap_is_unconditional(arm), Ok(()));
+
+            // The fixed arm, reduced to the lines the checker reads, and
+            // three ways back to the bug.
+            let good = "        VolumeCommands::Compact {\n            to,\n        } => {\n            \
+                        let to = refuse_unattended_compact(tty, label, to.as_deref())?;\n            \
+                        let report = write::compact_read(conn)?;\n            \
+                        let dest_label = swap_to_destination(to.as_deref(), label, &device)?;\n            \
+                        write::compact_write(conn, &dest_label)?;\n        }\n";
+            assert_eq!(swap_is_unconditional(good), Ok(()), "calibration");
+            for (shape, bad) in [
+                (
+                    "a match that skips the swap for --to",
+                    good.replace(
+                        "            let dest_label = swap_to_destination(to.as_deref(), label, &device)?;",
+                        "            let dest_label = match to {\n                Some(t) => t,\n                \
+                         None => swap_to_destination(to.as_deref(), label, &device)?,\n            };",
+                    ),
+                ),
+                (
+                    "an early return when --to is given",
+                    good.replace(
+                        "            let report",
+                        "            if to.is_some() {\n                return Ok(());\n            }\n            let report",
+                    ),
+                ),
+                (
+                    "the swap after the write",
+                    good.replace(
+                        "            let dest_label = swap_to_destination(to.as_deref(), label, &device)?;\n",
+                        "",
+                    ) + "            let dest_label = swap_to_destination(to.as_deref(), label, &device)?;\n",
+                ),
+            ] {
+                assert!(swap_is_unconditional(&bad).is_err(), "not rejected: {shape}");
+            }
+        }
     }
 
     /// `volume deposit` validation (issue #73 / ADR-0006). These are the
