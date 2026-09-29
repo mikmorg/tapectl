@@ -10,7 +10,7 @@ use rusqlite::{params, Connection};
 use tracing::warn;
 use walkdir::WalkDir;
 
-use crate::config::{CollectionConfig, TapectlPaths};
+use crate::config::{CollectionConfig, Config, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::unit::dotfile;
@@ -42,6 +42,24 @@ pub struct SyncReport {
     pub refused: Vec<super::fingerprint::RefusedUnit>,
 }
 
+/// Sync one collection with BUILT-IN defaults (`Config::default()`) plus the
+/// given `global_excludes` -- see `sync_collection_with_config`, which this
+/// wraps. Kept for callers that hold no operator config (tests); a command
+/// that has the operator's `Config` must call `sync_collection_with_config`,
+/// or `[defaults] checksum_mode` is silently ignored for every unit this
+/// registers (issue #347).
+pub fn sync_collection(
+    conn: &Connection,
+    _paths: &TapectlPaths,
+    lib: &CollectionConfig,
+    dry_run: bool,
+    global_excludes: &[String],
+) -> Result<(SyncReport, Vec<String>)> {
+    let mut config = Config::default();
+    config.defaults.global_excludes = global_excludes.to_vec();
+    sync_collection_with_config(conn, &config, lib, dry_run)
+}
+
 /// Sync one collection. `dry_run` computes and reports every count above
 /// without mutating anything (no DB writes, no dotfile writes, no `unit
 /// init` calls) — the same detection logic runs either way; only the
@@ -51,18 +69,21 @@ pub struct SyncReport {
 /// tenant) are collected rather than aborting the whole sync, same spirit
 /// as `unit::discovery::discover`.
 ///
-/// `global_excludes` is `config.defaults.global_excludes` (issue #49) —
-/// threaded through to step 3's `pending_units_for_collection` call so this
-/// sync's pending/dirty counts agree with `unit status --dirty`/`report
-/// dirty`/`collection status`. Passed as a slice rather than the whole
-/// `Config` since that is the only field this function's own scan needs.
-pub fn sync_collection(
+/// `config` supplies two things. `config.defaults.global_excludes` (issue
+/// #49) reaches step 3's `pending_units_for_collection` call so this sync's
+/// pending/dirty counts agree with `unit status --dirty`/`report
+/// dirty`/`collection status`. And every unit this registers -- a fresh
+/// folder, a path-keyed one, or an adopted dotfile -- takes its checksum mode
+/// from the resolved policy under `config` (issue #347,
+/// `unit::creation_checksum_mode`); a unit already registered keeps the mode
+/// it has.
+pub fn sync_collection_with_config(
     conn: &Connection,
-    paths: &TapectlPaths,
+    config: &Config,
     lib: &CollectionConfig,
     dry_run: bool,
-    global_excludes: &[String],
 ) -> Result<(SyncReport, Vec<String>)> {
+    let global_excludes = &config.defaults.global_excludes;
     let mut report = SyncReport::default();
     let mut errors = Vec::new();
 
@@ -81,7 +102,7 @@ pub fn sync_collection(
     // here, so step 2 (which re-reads `current_path` fresh from the DB)
     // sees the new, existing path and never flags it as vanished.
     for dir in candidate_unit_dirs(&root_path, lib) {
-        if let Err(e) = sync_one_directory(conn, paths, lib, &root, &dir, dry_run, &mut report) {
+        if let Err(e) = sync_one_directory(conn, config, lib, &root, &dir, dry_run, &mut report) {
             errors.push(format!("{}: {e}", dir.display()));
         }
     }
@@ -168,7 +189,7 @@ fn collection_unit_name(lib: &CollectionConfig, root: &str, abs_str: &str) -> St
 
 fn sync_one_directory(
     conn: &Connection,
-    paths: &TapectlPaths,
+    config: &Config,
     lib: &CollectionConfig,
     root: &str,
     dir: &Path,
@@ -189,7 +210,7 @@ fn sync_one_directory(
                     // verbatim (mirrors `unit::discovery`'s own "not found"
                     // branch) rather than minting a second uuid.
                     if !dry_run {
-                        adopt_dotfile(conn, &df, &abs_str)?;
+                        adopt_dotfile(conn, config, &df, &abs_str)?;
                     }
                     report.created += 1;
                     Ok(())
@@ -201,9 +222,9 @@ fn sync_one_directory(
             // directory.
             if !dry_run {
                 let name = collection_unit_name(lib, root, &abs_str);
-                crate::unit::init_unit(
+                crate::unit::init_unit_with_config(
                     conn,
-                    paths,
+                    config,
                     &abs_str,
                     &lib.tenant,
                     Some(&name),
@@ -221,7 +242,7 @@ fn sync_one_directory(
             Some(existing) => resolve_existing(conn, &existing, &abs_str, dry_run, report),
             None => {
                 if !dry_run {
-                    insert_path_keyed_unit(conn, lib, root, &abs_str)?;
+                    insert_path_keyed_unit(conn, config, lib, root, &abs_str)?;
                 }
                 report.created += 1;
                 Ok(())
@@ -284,7 +305,12 @@ fn resolve_existing(
 /// Register a unit whose dotfile already existed on disk but wasn't in the
 /// DB yet — mirrors `unit::discovery::sync_discovered_unit`'s "not found"
 /// branch: trust the dotfile's own recorded identity verbatim.
-fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -> Result<()> {
+fn adopt_dotfile(
+    conn: &Connection,
+    config: &Config,
+    df: &dotfile::UnitDotfile,
+    dir_path: &str,
+) -> Result<()> {
     let tenant = queries::get_tenant_by_name(conn, &df.tenant)?
         .ok_or_else(|| TapectlError::TenantNotFound(df.tenant.clone()))?;
     // Resolve `df.archive_set` exactly as `unit::discovery::sync_discovered_unit`
@@ -295,6 +321,10 @@ fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -
     // A dotfile naming a deleted or hand-edited archive set surfaces as `Err`
     // here, which the caller treats as a per-unit failure, not a fatal scan.
     let archive_set_id = queries::resolve_archive_set(conn, df.archive_set.as_deref())?;
+    // Issue #347: the resolved policy's mode, exactly as `unit discover`'s
+    // adoption resolves it -- the dotfile's own when it sets one.
+    let checksum_mode =
+        crate::unit::creation_checksum_mode(conn, config, &df.name, archive_set_id, dir_path)?;
 
     let unit_id = queries::insert_unit(
         conn,
@@ -303,9 +333,7 @@ fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -
         tenant.id,
         archive_set_id,
         dir_path,
-        df.checksum_mode
-            .as_deref()
-            .unwrap_or(crate::unit::dotfile::DEFAULT_CHECKSUM_MODE),
+        &checksum_mode,
         true,
     )?;
     events::log_created(conn, "unit", unit_id, &df.name, Some(tenant.id))?;
@@ -321,6 +349,7 @@ fn adopt_dotfile(conn: &Connection, df: &dotfile::UnitDotfile, dir_path: &str) -
 /// skip-and-report.
 fn insert_path_keyed_unit(
     conn: &Connection,
+    config: &Config,
     lib: &CollectionConfig,
     root: &str,
     abs_str: &str,
@@ -338,6 +367,10 @@ fn insert_path_keyed_unit(
     // `collection sync` agreeing about the collection's own configured
     // policy, rather than silently depending on `dotfiles = true/false`.
     let archive_set_id = queries::resolve_archive_set(conn, lib.archive_set.as_deref())?;
+    // Issue #347: the same resolved mode `init_unit_with_config` gives the
+    // dotfile-backed branch.
+    let checksum_mode =
+        crate::unit::creation_checksum_mode(conn, config, &name, archive_set_id, abs_str)?;
 
     let unit_id = queries::insert_unit(
         conn,
@@ -346,7 +379,7 @@ fn insert_path_keyed_unit(
         tenant.id,
         archive_set_id,
         abs_str,
-        "mtime_size",
+        &checksum_mode,
         true,
     )?;
     events::log_created(conn, "unit", unit_id, &name, Some(tenant.id))?;
@@ -639,6 +672,52 @@ mod tests {
             .is_some());
     }
 
+    /// Issue #347: adoption resolves the unit's policy to find its checksum
+    /// mode, so a dotfile whose `[policy]` cannot be resolved is refused --
+    /// named, per directory, and the rest of the collection still syncs --
+    /// instead of being registered and failing later at `stage create`.
+    #[test]
+    fn adopting_a_dotfile_with_an_invalid_policy_value_is_refused_by_name() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        let bad = root.path().join("beta");
+        std::fs::create_dir_all(&bad).unwrap();
+        dotfile::write_dotfile(
+            &bad.join(".tapectl-unit.toml"),
+            &dotfile::UnitDotfile {
+                uuid: uuid::Uuid::new_v4().to_string(),
+                name: "testlib/beta".to_string(),
+                created: "2026-01-01T00:00:00Z".to_string(),
+                tags: vec![],
+                tenant: "media".to_string(),
+                archive_set: None,
+                checksum_mode: None,
+                compression: Some("zstd-ish".to_string()),
+                slice_size: None,
+                warehouse_copies: None,
+                exclude_patterns: vec![],
+            },
+        )
+        .unwrap();
+
+        let lib = test_lib(root.path(), "media");
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert_eq!(report.created, 1, "alpha still registers");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains(".tapectl-unit.toml") && errors[0].contains("compression"),
+            "the refusal must name the dotfile and the bad key: {}",
+            errors[0]
+        );
+        assert!(queries::get_unit_by_name(&conn, "testlib/beta")
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn dotfiles_false_uses_path_keyed_identity_with_no_dotfile_written() {
         let conn = db::open_memory().unwrap();
@@ -734,7 +813,7 @@ mod tests {
             exclude_patterns: Vec::new(),
         };
 
-        adopt_dotfile(&conn, &df, dir.to_str().unwrap()).unwrap();
+        adopt_dotfile(&conn, &Config::default(), &df, dir.to_str().unwrap()).unwrap();
 
         let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
             .unwrap()

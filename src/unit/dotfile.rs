@@ -35,11 +35,6 @@ pub struct UnitDotfile {
     pub exclude_patterns: Vec<String>,
 }
 
-/// Fallback checksum mode used at DB insert sites when a dotfile omits
-/// `[policy] checksum_mode` (absent means defer to archive_set/defaults for
-/// resolving policy, but the `units.checksum_mode` DB column is non-null).
-pub const DEFAULT_CHECKSUM_MODE: &str = "mtime_size";
-
 // ── TOML structure matching design Section 2.2 ──
 //
 // [unit]

@@ -140,7 +140,7 @@ pub fn run(
         // detail: rename either field and the two spellings would silently
         // diverge. Neither can turn a dry run back into a real one.
         CollectionCommands::Sync { dry_run } => {
-            cmd_sync(conn, paths, config, *dry_run || global_dry_run, json_output)
+            cmd_sync(conn, config, *dry_run || global_dry_run, json_output)
         }
         CollectionCommands::Status => cmd_status(conn, config, json_output),
         CollectionCommands::Plan {
@@ -229,13 +229,7 @@ fn print_refused_plain(refused: &[RefusedUnit]) {
     }
 }
 
-fn cmd_sync(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    config: &Config,
-    dry_run: bool,
-    json_output: bool,
-) -> Result<i32> {
+fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool) -> Result<i32> {
     if config.collections.is_empty() {
         no_libraries_configured(json_output);
         return Ok(crate::error::EXIT_SUCCESS);
@@ -244,13 +238,8 @@ fn cmd_sync(
     let mut rows = Vec::new();
     let mut any_refused = false;
     for lib in &config.collections {
-        let (report, errors) = collection::sync::sync_collection(
-            conn,
-            paths,
-            lib,
-            dry_run,
-            &config.defaults.global_excludes,
-        )?;
+        let (report, errors) =
+            collection::sync::sync_collection_with_config(conn, config, lib, dry_run)?;
         // Issue #337: a directory step 1 could not register -- an
         // UNREGISTERED unit whose dotfile does not parse, or any other
         // registration failure -- is a unit that will never be archived,
@@ -819,5 +808,155 @@ pattern = ["*.tmp"]
         )
         .unwrap();
         assert_eq!(code, 0, "no unit was refused, so the command must exit 0");
+    }
+}
+
+#[cfg(test)]
+mod checksum_mode_tests {
+    //! Issue #347: `collection sync` registers a unit with the resolved
+    //! policy's checksum mode (dotfile `[policy]` > archive set >
+    //! `[defaults]`) -- a fresh folder, a path-keyed one, and an adopted
+    //! dotfile alike -- and never rewrites an existing unit's stored mode.
+    use super::*;
+    use crate::config::{CollectionConfig, TapectlPaths};
+    use crate::db;
+
+    struct Fixture {
+        conn: Connection,
+        root: tempfile::TempDir,
+        home: tempfile::TempDir,
+    }
+
+    fn fixture() -> Fixture {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        Fixture {
+            conn,
+            root: tempfile::tempdir().unwrap(),
+            home: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn lib(root: &std::path::Path, dotfiles: bool) -> CollectionConfig {
+        CollectionConfig {
+            name: "lib".into(),
+            root: root.canonicalize().unwrap().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles,
+        }
+    }
+
+    fn sync(f: &Fixture, config: &Config) {
+        let paths = TapectlPaths::new(f.home.path().to_path_buf());
+        let code = run(
+            &f.conn,
+            &paths,
+            config,
+            &CollectionCommands::Sync { dry_run: false },
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+    }
+
+    fn stored_mode(conn: &Connection, name: &str) -> String {
+        crate::db::queries::get_unit_by_name(conn, name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("unit {name} must exist"))
+            .checksum_mode
+    }
+
+    fn sha256_defaults(lib: CollectionConfig) -> Config {
+        let mut config = Config::default();
+        config.defaults.checksum_mode = "sha256".into();
+        config.collections.push(lib);
+        config
+    }
+
+    #[test]
+    fn a_fresh_folder_is_registered_with_the_defaults_checksum_mode() {
+        let f = fixture();
+        std::fs::create_dir_all(f.root.path().join("alpha")).unwrap();
+        sync(&f, &sha256_defaults(lib(f.root.path(), true)));
+        assert_eq!(stored_mode(&f.conn, "lib/alpha"), "sha256");
+    }
+
+    #[test]
+    fn a_path_keyed_folder_is_registered_with_the_defaults_checksum_mode() {
+        let f = fixture();
+        std::fs::create_dir_all(f.root.path().join("alpha")).unwrap();
+        sync(&f, &sha256_defaults(lib(f.root.path(), false)));
+        assert_eq!(stored_mode(&f.conn, "lib/alpha"), "sha256");
+    }
+
+    #[test]
+    fn a_fresh_folder_takes_the_collections_archive_set_checksum_mode() {
+        let f = fixture();
+        f.conn
+            .execute(
+                "INSERT INTO archive_sets (name, checksum_mode) VALUES ('cold', 'sha256_on_archive')",
+                [],
+            )
+            .unwrap();
+        std::fs::create_dir_all(f.root.path().join("alpha")).unwrap();
+        let mut l = lib(f.root.path(), true);
+        l.archive_set = Some("cold".into());
+        sync(&f, &sha256_defaults(l));
+        assert_eq!(stored_mode(&f.conn, "lib/alpha"), "sha256_on_archive");
+    }
+
+    #[test]
+    fn an_adopted_dotfile_without_a_checksum_mode_takes_the_defaults() {
+        let f = fixture();
+        let dir = f.root.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &dir.join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: uuid::Uuid::new_v4().to_string(),
+                name: "lib/alpha".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "media".into(),
+                archive_set: None,
+                checksum_mode: None,
+                compression: None,
+                slice_size: None,
+                warehouse_copies: None,
+                exclude_patterns: vec![],
+            },
+        )
+        .unwrap();
+        sync(&f, &sha256_defaults(lib(f.root.path(), true)));
+        assert_eq!(stored_mode(&f.conn, "lib/alpha"), "sha256");
+    }
+
+    /// A production home already has units: changing `[defaults]` later must
+    /// not rewrite the mode an existing unit was registered with.
+    #[test]
+    fn an_existing_unit_keeps_its_stored_checksum_mode() {
+        let f = fixture();
+        std::fs::create_dir_all(f.root.path().join("alpha")).unwrap();
+        let l = lib(f.root.path(), true);
+        let mut before = Config::default();
+        before.collections.push(l.clone());
+        sync(&f, &before);
+        assert_eq!(stored_mode(&f.conn, "lib/alpha"), "mtime_size");
+
+        sync(&f, &sha256_defaults(l));
+        assert_eq!(
+            stored_mode(&f.conn, "lib/alpha"),
+            "mtime_size",
+            "a later [defaults] change must not be applied retroactively"
+        );
     }
 }

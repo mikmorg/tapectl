@@ -4,17 +4,20 @@ use rusqlite::Connection;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
+use crate::config::Config;
 use crate::db::{events, queries};
 use crate::error::Result;
 
 use super::dotfile;
 
-/// Scan watch_roots for .tapectl-unit.toml dotfiles and sync with DB.
+/// Scan `config.discovery.watch_roots` for .tapectl-unit.toml dotfiles and
+/// sync with DB. A unit registered here takes its checksum mode from the
+/// resolved policy under `config` (issue #347).
 /// Returns the number of units discovered/updated.
-pub fn discover(conn: &Connection, watch_roots: &[String]) -> Result<DiscoverReport> {
+pub fn discover(conn: &Connection, config: &Config) -> Result<DiscoverReport> {
     let mut report = DiscoverReport::default();
 
-    for root in watch_roots {
+    for root in &config.discovery.watch_roots {
         let root_path = Path::new(root);
         if !root_path.is_dir() {
             warn!(root = %root, "watch root does not exist, skipping");
@@ -40,7 +43,7 @@ pub fn discover(conn: &Connection, watch_roots: &[String]) -> Result<DiscoverRep
             match dotfile::read_dotfile(dotfile_path) {
                 Ok(df) => {
                     let dir_str = unit_dir.to_string_lossy().to_string();
-                    match sync_discovered_unit(conn, &df, &dir_str) {
+                    match sync_discovered_unit(conn, config, &df, &dir_str) {
                         Ok(SyncAction::Created) => {
                             info!(uuid = %df.uuid, name = %df.name, "discovered new unit");
                             report.created += 1;
@@ -91,6 +94,7 @@ enum SyncAction {
 /// Sync a discovered dotfile with the database. DB wins on conflict per design.
 fn sync_discovered_unit(
     conn: &Connection,
+    config: &Config,
     df: &dotfile::UnitDotfile,
     dir_path: &str,
 ) -> crate::error::Result<SyncAction> {
@@ -133,6 +137,12 @@ fn sync_discovered_unit(
     // logged and skipped, not fatal to the whole scan.
     let archive_set_id = queries::resolve_archive_set(conn, df.archive_set.as_deref())?;
 
+    // Issue #347: the resolved policy's mode -- the dotfile's own `[policy]
+    // checksum_mode` when it sets one (as before), else the archive set's,
+    // else `[defaults]` (was: a hardcoded `mtime_size`).
+    let checksum_mode =
+        super::creation_checksum_mode(conn, config, &df.name, archive_set_id, dir_path)?;
+
     let unit_id = queries::insert_unit(
         conn,
         &df.uuid,
@@ -140,9 +150,7 @@ fn sync_discovered_unit(
         tenant.id,
         archive_set_id,
         dir_path,
-        df.checksum_mode
-            .as_deref()
-            .unwrap_or(dotfile::DEFAULT_CHECKSUM_MODE),
+        &checksum_mode,
         true,
     )?;
     events::log_created(conn, "unit", unit_id, &df.name, Some(tenant.id))?;
@@ -162,6 +170,12 @@ mod tests {
 
     fn fresh_conn() -> Connection {
         crate::db::open_memory().unwrap()
+    }
+
+    fn watching(root: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.discovery.watch_roots = vec![root.to_string_lossy().to_string()];
+        config
     }
 
     fn write_test_dotfile(
@@ -208,7 +222,7 @@ mod tests {
         std::fs::create_dir_all(&unit_dir).unwrap();
         let df = write_test_dotfile(&unit_dir, Some("cold"));
 
-        let report = discover(&conn, &[tmp.path().to_string_lossy().to_string()]).unwrap();
+        let report = discover(&conn, &watching(tmp.path())).unwrap();
         assert_eq!(report.created, 1, "errors: {:?}", report.errors);
 
         let unit = queries::get_unit_by_uuid(&conn, &df.uuid).unwrap().unwrap();
@@ -245,7 +259,7 @@ mod tests {
         std::fs::create_dir_all(&unit_dir).unwrap();
         let df = write_test_dotfile(&unit_dir, Some("does-not-exist"));
 
-        let report = discover(&conn, &[tmp.path().to_string_lossy().to_string()]).unwrap();
+        let report = discover(&conn, &watching(tmp.path())).unwrap();
         assert_eq!(report.created, 0);
         assert_eq!(report.errors.len(), 1, "errors: {:?}", report.errors);
         assert!(report.errors[0].contains("does-not-exist"));

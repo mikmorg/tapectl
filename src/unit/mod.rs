@@ -9,14 +9,83 @@ use rusqlite::Connection;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::config::TapectlPaths;
+use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 
-/// Initialize a single unit at the given directory path.
+/// The checksum mode a unit being REGISTERED starts with (issue #347): the
+/// resolved policy's, by the one resolver (`policy::resolve` -- dotfile
+/// `[policy]` > archive set > `[defaults]`), rather than a hardcoded
+/// `mtime_size`. Resolved before the row exists, against an in-memory stand-in
+/// carrying the only three fields the resolver reads (`name`,
+/// `archive_set_id`, `current_path`); the stand-in's other fields are never
+/// consulted.
+///
+/// Called at creation ONLY. `units.checksum_mode` is a stored fact about a
+/// registered unit, and dirty detection and version minting read it; a later
+/// `[defaults]` or archive-set change is deliberately not applied to units
+/// that already exist.
+///
+/// Refuses (a `PolicyUnresolvable` naming the file) when a dotfile already at
+/// `dir_path` has an invalid `[policy]` -- a unit whose policy cannot be
+/// resolved is not registered.
+pub(crate) fn creation_checksum_mode(
+    conn: &Connection,
+    config: &Config,
+    name: &str,
+    archive_set_id: Option<i64>,
+    dir_path: &str,
+) -> Result<String> {
+    let stand_in = crate::db::models::Unit {
+        id: 0,
+        uuid: String::new(),
+        name: name.to_string(),
+        tenant_id: 0,
+        archive_set_id,
+        current_path: Some(dir_path.to_string()),
+        checksum_mode: String::new(),
+        encrypt: true,
+        status: "active".to_string(),
+        created_at: String::new(),
+        last_scanned: None,
+        notes: None,
+    };
+    Ok(crate::policy::resolve(conn, config, &stand_in)?.checksum_mode)
+}
+
+/// Initialize a single unit at the given directory path, resolving its
+/// checksum mode against BUILT-IN defaults (`Config::default()`).
+///
+/// Kept for callers that hold no operator config (tests, and
+/// `quick-archive` until it moves over). A command that has the operator's
+/// `Config` must call `init_unit_with_config`, or `[defaults] checksum_mode`
+/// is silently ignored for the unit it creates (issue #347).
 pub fn init_unit(
     conn: &Connection,
     _paths: &TapectlPaths,
+    dir_path: &str,
+    tenant_name: &str,
+    name_override: Option<&str>,
+    tags: &[String],
+    archive_set: Option<&str>,
+) -> Result<i64> {
+    init_unit_with_config(
+        conn,
+        &Config::default(),
+        dir_path,
+        tenant_name,
+        name_override,
+        tags,
+        archive_set,
+    )
+}
+
+/// Initialize a single unit at the given directory path. Its
+/// `units.checksum_mode` is the resolved policy's under `config`
+/// (`creation_checksum_mode`, issue #347).
+pub fn init_unit_with_config(
+    conn: &Connection,
+    config: &Config,
     dir_path: &str,
     tenant_name: &str,
     name_override: Option<&str>,
@@ -70,6 +139,11 @@ pub fn init_unit(
         return Err(TapectlError::UnitAlreadyExists(unit_name));
     }
 
+    // Issue #347. The dotfile is written below, with no `[policy]`, so the
+    // resolver's dotfile layer is absent now and stays absent: archive set
+    // > [defaults].
+    let checksum_mode = creation_checksum_mode(conn, config, &unit_name, archive_set_id, &abs_str)?;
+
     let uuid = Uuid::new_v4().to_string();
 
     // Insert into DB
@@ -80,7 +154,7 @@ pub fn init_unit(
         tenant.id,
         archive_set_id,
         &abs_str,
-        "mtime_size",
+        &checksum_mode,
         true,
     )?;
     events::log_created(conn, "unit", unit_id, &unit_name, Some(tenant.id))?;
@@ -112,10 +186,11 @@ pub fn init_unit(
     Ok(unit_id)
 }
 
-/// Bulk-initialize units from a list of directories under a parent.
+/// Bulk-initialize units from a list of directories under a parent, each
+/// as `init_unit_with_config` would under `config`.
 pub fn init_bulk(
     conn: &Connection,
-    paths: &TapectlPaths,
+    config: &Config,
     parent_dir: &str,
     tenant_name: &str,
     tags: &[String],
@@ -139,7 +214,7 @@ pub fn init_bulk(
         }
 
         let path_str = path.to_string_lossy().to_string();
-        let result = init_unit(conn, paths, &path_str, tenant_name, None, tags, None);
+        let result = init_unit_with_config(conn, config, &path_str, tenant_name, None, tags, None);
         results.push((path_str, result));
     }
 

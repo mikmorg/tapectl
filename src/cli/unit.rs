@@ -137,7 +137,7 @@ fn validate_unit_status(value: &str) -> Result<()> {
 
 pub fn run(
     conn: &Connection,
-    paths: &TapectlPaths,
+    _paths: &TapectlPaths,
     config: &Config,
     command: &UnitCommands,
     json_output: bool,
@@ -163,9 +163,9 @@ pub fn run(
                      name collisions as it goes; a faithful preview would duplicate that logic.",
                 ));
             }
-            let unit_id = crate::unit::init_unit(
+            let unit_id = crate::unit::init_unit_with_config(
                 conn,
-                paths,
+                config,
                 path,
                 tenant,
                 name.as_deref(),
@@ -192,7 +192,7 @@ pub fn run(
                      faithful preview would duplicate `unit init`'s own logic.",
                 ));
             }
-            let results = crate::unit::init_bulk(conn, paths, path, tenant, tag)?;
+            let results = crate::unit::init_bulk(conn, config, path, tenant, tag)?;
             let mut success = 0;
             let mut failed = 0;
             for (dir, result) in &results {
@@ -407,7 +407,7 @@ pub fn run(
                      faithful preview would duplicate that reconciliation logic.",
                 ));
             }
-            let report = crate::unit::discovery::discover(conn, &config.discovery.watch_roots)?;
+            let report = crate::unit::discovery::discover(conn, config)?;
             if json_output {
                 println!(
                     "{}",
@@ -838,5 +838,215 @@ mod tag_tests {
             queries::get_tags_for_unit(&conn, unit.id).unwrap(),
             vec!["family".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod checksum_mode_tests {
+    //! Issue #347: a new unit's `units.checksum_mode` comes from the resolved
+    //! policy (dotfile `[policy]` > archive set > `[defaults]`), not a
+    //! hardcoded `mtime_size`. Driven through `cli::unit::run`, so these
+    //! prove the operator's own config reaches the command.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn harness() -> (Connection, TempDir, TapectlPaths) {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        (conn, tmp, paths)
+    }
+
+    fn stored_mode(conn: &Connection, name: &str) -> String {
+        queries::get_unit_by_name(conn, name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("unit {name} must exist"))
+            .checksum_mode
+    }
+
+    fn init(
+        conn: &Connection,
+        paths: &TapectlPaths,
+        config: &Config,
+        dir: &std::path::Path,
+        name: &str,
+        archive_set: Option<&str>,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        run(
+            conn,
+            paths,
+            config,
+            &UnitCommands::Init {
+                path: dir.to_string_lossy().to_string(),
+                tenant: "alice".into(),
+                name: Some(name.into()),
+                tag: vec![],
+                archive_set: archive_set.map(str::to_string),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unit_init_takes_checksum_mode_from_defaults() {
+        let (conn, tmp, paths) = harness();
+        let mut config = Config::default();
+        config.defaults.checksum_mode = "sha256".into();
+        init(&conn, &paths, &config, &tmp.path().join("a"), "a", None);
+        assert_eq!(stored_mode(&conn, "a"), "sha256");
+    }
+
+    #[test]
+    fn unit_init_takes_checksum_mode_from_the_archive_set_over_defaults() {
+        let (conn, tmp, paths) = harness();
+        conn.execute(
+            "INSERT INTO archive_sets (name, checksum_mode) VALUES ('cold', 'sha256_on_archive')",
+            [],
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.defaults.checksum_mode = "sha256".into();
+        init(
+            &conn,
+            &paths,
+            &config,
+            &tmp.path().join("a"),
+            "a",
+            Some("cold"),
+        );
+        assert_eq!(stored_mode(&conn, "a"), "sha256_on_archive");
+    }
+
+    /// The control: nothing configured anywhere still means `mtime_size`.
+    #[test]
+    fn unit_init_with_nothing_configured_stays_mtime_size() {
+        let (conn, tmp, paths) = harness();
+        init(
+            &conn,
+            &paths,
+            &Config::default(),
+            &tmp.path().join("a"),
+            "a",
+            None,
+        );
+        assert_eq!(stored_mode(&conn, "a"), "mtime_size");
+    }
+
+    #[test]
+    fn unit_init_bulk_takes_checksum_mode_from_defaults() {
+        let (conn, _tmp, paths) = harness();
+        // init-bulk derives each unit's name from its path, and a unit name
+        // may not have a dot-led segment -- so not under TempDir's `.tmpXXX`.
+        let tmp = tempfile::Builder::new().prefix("bulk").tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        for d in ["x", "y"] {
+            std::fs::create_dir_all(parent.join(d)).unwrap();
+        }
+        let mut config = Config::default();
+        config.defaults.checksum_mode = "sha256".into();
+        run(
+            &conn,
+            &paths,
+            &config,
+            &UnitCommands::InitBulk {
+                path: parent.to_string_lossy().to_string(),
+                tenant: "alice".into(),
+                tag: vec![],
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        let units = queries::list_units(&conn, None, None).unwrap();
+        assert_eq!(units.len(), 2);
+        for u in units {
+            assert_eq!(u.checksum_mode, "sha256", "unit {}", u.name);
+        }
+    }
+
+    /// Adoption by `unit discover`: a dotfile with no `[policy]
+    /// checksum_mode` defers to the archive set, then `[defaults]`.
+    #[test]
+    fn unit_discover_adopts_with_the_resolved_checksum_mode() {
+        let (conn, tmp, paths) = harness();
+        let roots = tmp.path().join("roots");
+        let dir = roots.join("found");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &dir.join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: uuid::Uuid::new_v4().to_string(),
+                name: "found".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "alice".into(),
+                archive_set: None,
+                checksum_mode: None,
+                compression: None,
+                slice_size: None,
+                warehouse_copies: None,
+                exclude_patterns: vec![],
+            },
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.defaults.checksum_mode = "sha256".into();
+        config.discovery.watch_roots = vec![roots.to_string_lossy().to_string()];
+        run(
+            &conn,
+            &paths,
+            &config,
+            &UnitCommands::Discover,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(stored_mode(&conn, "found"), "sha256");
+    }
+
+    /// A dotfile's own `[policy] checksum_mode` still wins at adoption.
+    #[test]
+    fn unit_discover_keeps_the_dotfiles_own_checksum_mode() {
+        let (conn, tmp, paths) = harness();
+        let roots = tmp.path().join("roots");
+        let dir = roots.join("found");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::unit::dotfile::write_dotfile(
+            &dir.join(".tapectl-unit.toml"),
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: uuid::Uuid::new_v4().to_string(),
+                name: "found".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "alice".into(),
+                archive_set: None,
+                checksum_mode: Some("mtime_size".into()),
+                compression: None,
+                slice_size: None,
+                warehouse_copies: None,
+                exclude_patterns: vec![],
+            },
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.defaults.checksum_mode = "sha256".into();
+        config.discovery.watch_roots = vec![roots.to_string_lossy().to_string()];
+        run(
+            &conn,
+            &paths,
+            &config,
+            &UnitCommands::Discover,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(stored_mode(&conn, "found"), "mtime_size");
     }
 }
