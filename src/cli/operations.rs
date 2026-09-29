@@ -5963,6 +5963,59 @@ mod tests {
                 .expect("two sealed volumes on the superseding snapshot must satisfy min_copies=2");
         }
 
+        /// Issue #348: a failed precondition is ADR-0008 Tier 2, asked
+        /// through `cli::consent::confirm`, and `--force` is the advance
+        /// consent — the one path through the gate a non-interactive run
+        /// has besides `--yes`. Superseding v2 has 1 copy against
+        /// `min_copies` 2 (its other volume is retired): refused without
+        /// `--force` (`mark_reclaimable_refuses_when_second_volume_is_retired`),
+        /// marked with it.
+        #[test]
+        fn mark_reclaimable_with_force_proceeds_past_a_failed_precondition() {
+            let name = "rec-forced";
+            let (conn, unit_id) = setup_reclaimable_fixture(name, "retired");
+            let config = Config::default();
+            snapshot_mark_reclaimable(&conn, &config, name, 1, true, false)
+                .expect("--force confirms a Tier-2 shortfall in advance");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM snapshots WHERE unit_id = ?1 AND version = 1",
+                    params![unit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "reclaimable");
+        }
+
+        /// Issue #348: `--force` waives a shortfall it has been told about,
+        /// not a policy nobody can read. The preconditions are assessed
+        /// under `--force` too (before #348 `--force` skipped them
+        /// entirely), so a policy that cannot be resolved refuses, naming
+        /// the layer that broke — as `unit mark-tape-only`, which also
+        /// resolves before its gate, does. Deliberate: this gate greenlights
+        /// deleting a version's data.
+        #[test]
+        fn mark_reclaimable_with_force_still_refuses_a_policy_it_cannot_resolve() {
+            let name = "rec-unresolvable";
+            let (conn, unit_id) = setup_reclaimable_fixture(name, "retired");
+            let mut config = Config::default();
+            config.defaults.slice_size = "not-a-size".to_string();
+            let err = snapshot_mark_reclaimable(&conn, &config, name, 1, true, false)
+                .expect_err("an unresolvable policy is not waived by --force");
+            assert!(
+                matches!(err, TapectlError::PolicyUnresolvable { .. }),
+                "refused on the policy, not the shortfall: {err}"
+            );
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM snapshots WHERE unit_id = ?1 AND version = 1",
+                    params![unit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "superseded", "nothing was marked");
+        }
+
         /// The property this whole change exists to establish: the gate
         /// (`unit_mark_tape_only`), `report copies`
         /// (`cli::report::copies_rows`), and `audit`
