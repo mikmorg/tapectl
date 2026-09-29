@@ -2497,6 +2497,27 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
     })
 }
 
+/// `volume info`'s write-history section, one line per `writes` row under
+/// a "Writes:" heading — "Write receipts:" until issue #361 ("receipt"
+/// means the recipient list a stage set was encrypted to). Rendered to a
+/// string so both the empty and the populated heading are testable.
+fn render_write_history(writes: &[WriteRow]) -> String {
+    if writes.is_empty() {
+        return "Writes: none\n".to_string();
+    }
+    let mut out = String::from("Writes:\n");
+    for w in writes {
+        out.push_str(&format!(
+            "    {} v{}: {} ({})\n",
+            w.unit,
+            w.version,
+            w.status,
+            w.completed_at.as_deref().unwrap_or("not completed"),
+        ));
+    }
+    out
+}
+
 fn print_volume_info(info: &VolumeInfo) {
     println!("Volume: {}", info.label);
     println!("  Status:      {}", info.status);
@@ -2582,20 +2603,7 @@ fn print_volume_info(info: &VolumeInfo) {
     }
 
     println!();
-    if info.writes.is_empty() {
-        println!("Writes: none");
-    } else {
-        println!("Writes:");
-        for w in &info.writes {
-            println!(
-                "    {} v{}: {} ({})",
-                w.unit,
-                w.version,
-                w.status,
-                w.completed_at.as_deref().unwrap_or("not completed"),
-            );
-        }
-    }
+    print!("{}", render_write_history(&info.writes));
 
     println!();
     if info.verifications.is_empty() {
@@ -3917,5 +3925,31 @@ mod tests {
             assert!(!returned_to_service_json(false, true));
             assert!(!returned_to_service_json(false, false));
         }
+    }
+
+    /// Issue #361: the populated write history is headed "Writes:" too —
+    /// tests/cli_smoke.rs reaches only the empty case, since a volume with
+    /// `writes` rows needs a tape. "Receipt" means the recipient list.
+    #[test]
+    fn write_history_is_headed_writes_when_there_are_writes() {
+        let row = |unit: &str, completed_at: Option<&str>| WriteRow {
+            unit: unit.to_string(),
+            version: 3,
+            status: "some-status".to_string(),
+            started_at: None,
+            completed_at: completed_at.map(str::to_string),
+            num_slices: None,
+            bytes: None,
+        };
+        let text = render_write_history(&[
+            row("photos", Some("2026-09-01 10:00:00")),
+            row("docs", None),
+        ]);
+        assert_eq!(
+            text,
+            "Writes:\n    photos v3: some-status (2026-09-01 10:00:00)\n    \
+             docs v3: some-status (not completed)\n"
+        );
+        assert_eq!(render_write_history(&[]), "Writes: none\n");
     }
 }
