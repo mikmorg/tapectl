@@ -148,6 +148,18 @@ ways from it: **covered** (the current Escrow Recipient is on the list),
 a tape that carried no receipt — not covered, every gate still refuses, but
 the remedy is attestation, not re-staging).
 _Avoid_: fingerprint list (the column name, not the concept), key list
+**Receipt** has this one meaning (ADR-0012, 2026-09-29 amendment). Two things
+that used to share the word were renamed: the per-stage-set text file `stage
+create` writes is a **Stage report** (below), and the per-write rows `volume
+info` lists are **Writes**.
+
+**Stage report**:
+The human-readable file `stage create` leaves in `<home>/stage-reports/`, one per
+stage set: unit, tenant, snapshot, and each slice's size and hash. A record for the
+operator, not evidence about encryption — the recipient list is the Receipt. Homes
+initialised before 2026-09-29 had these in `receipts/`; the directory is moved once,
+on first use.
+_Avoid_: receipt, staging receipt
 
 **Attestation**:
 Escrow coverage proved rather than recorded: the Escrow Recipient's own key
