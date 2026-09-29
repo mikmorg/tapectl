@@ -1443,4 +1443,49 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// Issue #354 (b): a staging directory that may be too small is ASKED
+    /// about through `cli::consent::confirm`, whose non-interactive refusal
+    /// says "re-run with --yes to proceed". That is true only if the global
+    /// `--yes` reaches `stage_create`, so this goes through `cli::stage::run`
+    /// — the dispatch `main` calls with `cli.yes` — not `stage_create`
+    /// itself. With compression on, the question comes before the source is
+    /// read, so the refused run leaves no stage set behind. (`cfg(test)`
+    /// makes stdin a non-terminal, so the refusal never prompts.)
+    #[test]
+    fn create_carries_the_global_yes_to_the_staging_space_question() {
+        let (conn, paths, mut config, _tmp) = setup();
+        config.defaults.compression = "gzip".to_string();
+        let snap_id = crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let _free = crate::staging::FreeSpaceOverride::set(1024);
+        let create = StageCommands::Create {
+            name: "unit1".to_string(),
+            version: None,
+        };
+
+        let err = run(&conn, &paths, &config, &create, false, false, false)
+            .expect_err("no terminal and no --yes: a stage that may not fit is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stage unit \"unit1\" refused: non-interactive session")
+                && msg.contains("re-run with --yes")
+                && msg.contains("may be too small for unit \"unit1\""),
+            "the staging-space consent refusal: {msg}"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "refused before anything was staged");
+
+        run(&conn, &paths, &config, &create, false, false, true)
+            .expect("the global --yes must reach the staging-space question and answer it");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "staged");
+    }
 }

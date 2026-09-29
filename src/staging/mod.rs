@@ -1331,6 +1331,28 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Test-only: pretend the staging filesystem has `bytes` free, on this
+/// test's thread, until dropped. Crate-visible so that a caller's own tests
+/// (`cli::stage`, `collection::batch`, `cli::operations`'s quick-archive)
+/// can drive the staging-space consent gate through that caller, proving the
+/// global `--yes` reaches it (issue #354) — `stage_create` runs on the
+/// calling thread, so the override is seen.
+#[cfg(test)]
+pub(crate) struct FreeSpaceOverride;
+#[cfg(test)]
+impl FreeSpaceOverride {
+    pub(crate) fn set(bytes: u64) -> Self {
+        STAGING_FREE_OVERRIDE.with(|c| c.set(Some(bytes)));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for FreeSpaceOverride {
+    fn drop(&mut self) {
+        STAGING_FREE_OVERRIDE.with(|c| c.set(None));
+    }
+}
+
 /// Bytes an unprivileged process can still write under `dir`:
 /// `f_bavail` (not `f_bfree`, which counts root's reserve) in units of
 /// `f_frsize` (POSIX; `f_bsize` is only the preferred I/O size) — the same
@@ -3370,21 +3392,6 @@ mod tests {
     }
 
     // ── issue #354 (b): staging space, refused before dar ──
-
-    /// Pretend the staging filesystem has `bytes` free, on this test's
-    /// thread, until dropped.
-    struct FreeSpaceOverride;
-    impl FreeSpaceOverride {
-        fn set(bytes: u64) -> Self {
-            STAGING_FREE_OVERRIDE.with(|c| c.set(Some(bytes)));
-            Self
-        }
-    }
-    impl Drop for FreeSpaceOverride {
-        fn drop(&mut self) {
-            STAGING_FREE_OVERRIDE.with(|c| c.set(None));
-        }
-    }
 
     /// `len` bytes with no zero byte anywhere — nothing dar could store as a
     /// hole — written and synced, so its allocation is on record.

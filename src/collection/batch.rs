@@ -795,4 +795,164 @@ mod tests {
              scoping (issue #248/#284)"
         );
     }
+
+    // ── issue #354 (b): the global --yes reaches the staging-space question ──
+
+    /// A real, stageable unit `unit1` (source on disk, tenant, escrow
+    /// recipient) with compression on, staging reported as 1 KiB free —
+    /// so `stage_create` asks about staging space before it reads the
+    /// source — and one `sealed` destination, which `volume_write` refuses
+    /// as not a write target before it resolves a backend or touches a
+    /// device (ADR-0012). Returns the tempdir guard and a device path inside
+    /// it that does not exist.
+    fn stageable_batch_fixture() -> (Connection, TapectlPaths, Config, tempfile::TempDir, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = TapectlPaths::new(home);
+        paths.ensure_dirs().unwrap();
+        let conn = db::open(&paths.db_file).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let holder = conn.last_insert_rowid();
+        let kp = crate::crypto::keys::generate_keypair();
+        crate::db::queries::insert_escrow_key(
+            &conn,
+            holder,
+            "test-escrow",
+            &kp.fingerprint,
+            &kp.public_key,
+            None,
+        )
+        .unwrap();
+
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut config = config_with_staging_dir(&staging, 1);
+        config.dar.binary = "dar".to_string();
+        config.defaults.compression = "gzip".to_string();
+
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), b"collection batch content").unwrap();
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('VOL-B', 'lto', 'lto0', 10485760, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let device = tmp
+            .path()
+            .join("no-such-tape")
+            .to_string_lossy()
+            .into_owned();
+        (conn, paths, config, tmp, device)
+    }
+
+    fn stage_set_statuses(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT status FROM stage_sets ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Issue #354 (b): `execute_batch` carries the global `--yes` to
+    /// `stage_create` for a freshly minted version (the `(true, _)` arm).
+    /// It gets past the staging question — the unit is staged — and stops
+    /// at the sealed destination, before any device.
+    #[test]
+    fn execute_batch_carries_yes_to_the_staging_space_question_for_a_new_version() {
+        let (conn, paths, config, _tmp, device) = stageable_batch_fixture();
+        let _free = crate::staging::FreeSpaceOverride::set(1024);
+
+        let err = execute_batch(
+            &conn,
+            &paths,
+            &config,
+            &one_unit_batch("unit1"),
+            &["VOL-B".to_string()],
+            &device,
+            512 * 1024,
+            true,
+        )
+        .expect_err("the sealed destination is not a write target");
+        assert!(
+            matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "--yes answered the staging question, so the batch reached the write: {err}"
+        );
+        assert_eq!(stage_set_statuses(&conn), vec!["staged".to_string()]);
+    }
+
+    /// Issue #354 (b), the `(false, "created")` arm: without `--yes` a
+    /// non-interactive batch is refused at the staging question, leaving
+    /// its version `created` and unstaged; re-run with `--yes`, the same
+    /// version is staged. (`cfg(test)` makes stdin a non-terminal.)
+    #[test]
+    fn execute_batch_carries_yes_to_the_staging_space_question_for_an_unstaged_version() {
+        let (conn, paths, config, _tmp, device) = stageable_batch_fixture();
+        let _free = crate::staging::FreeSpaceOverride::set(1024);
+        let batch = one_unit_batch("unit1");
+        let labels = ["VOL-B".to_string()];
+
+        let err = execute_batch(
+            &conn,
+            &paths,
+            &config,
+            &batch,
+            &labels,
+            &device,
+            512 * 1024,
+            false,
+        )
+        .expect_err("no terminal and no --yes: a stage that may not fit is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stage unit \"unit1\" refused: non-interactive session")
+                && msg.contains("re-run with --yes"),
+            "the staging-space consent refusal: {msg}"
+        );
+        assert!(stage_set_statuses(&conn).is_empty(), "nothing staged");
+        let status: String = conn
+            .query_row("SELECT status FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status, "created",
+            "fixture: the second run takes the unstaged arm"
+        );
+
+        let err = execute_batch(
+            &conn,
+            &paths,
+            &config,
+            &batch,
+            &labels,
+            &device,
+            512 * 1024,
+            true,
+        )
+        .expect_err("the sealed destination is not a write target");
+        assert!(
+            matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "--yes answered the staging question, so the batch reached the write: {err}"
+        );
+        assert_eq!(stage_set_statuses(&conn), vec!["staged".to_string()]);
+    }
 }

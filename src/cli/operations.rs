@@ -3972,16 +3972,22 @@ mod tests {
             .collect()
     }
 
-    /// Issue #347 (via #359's unit worker): quick-archive's unit is created
-    /// under the operator's `[defaults] checksum_mode`, like `unit init`'s.
-    /// It called `unit::init_unit`, which resolves against built-in
-    /// defaults, so the unit came out `mtime_size` whatever the config said.
-    ///
-    /// The volume is `sealed`, so `volume write` refuses it as not a write
-    /// target before it resolves anything on a drive (ADR-0012) — the unit,
-    /// snapshot and stage set all exist by then, and no device is touched.
-    #[test]
-    fn quick_archive_creates_its_unit_under_the_configured_checksum_mode() {
+    /// quick-archive's world: tenants `op` and `alice`, an escrow
+    /// recipient, a staging directory, an LTO backend whose device path does
+    /// not exist, a `sealed` volume `VOL-Q`, and a source directory
+    /// `photos` with one file. The volume is `sealed`, so `volume write`
+    /// refuses it as not a write target before it resolves anything on a
+    /// drive (ADR-0012) — the unit, snapshot and stage set all exist by
+    /// then, and no device is touched. Returns (tempdir guard, paths, conn,
+    /// config, source path, device).
+    fn quick_archive_fixture() -> (
+        tempfile::TempDir,
+        TapectlPaths,
+        Connection,
+        Config,
+        std::path::PathBuf,
+        String,
+    ) {
         let tmp = tempfile::Builder::new().prefix("qa").tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -4017,7 +4023,6 @@ mod tests {
         let mut config = Config::default();
         config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();
-        config.defaults.checksum_mode = "sha256".to_string();
         config.backends.lto = vec![crate::config::LtoBackendConfig {
             name: "lto0".to_string(),
             device_tape: device.clone(),
@@ -4037,6 +4042,17 @@ mod tests {
         let src = tmp.path().join("photos");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.txt"), b"quick archive content").unwrap();
+        (tmp, paths, conn, config, src, device)
+    }
+
+    /// Issue #347 (via #359's unit worker): quick-archive's unit is created
+    /// under the operator's `[defaults] checksum_mode`, like `unit init`'s.
+    /// It called `unit::init_unit`, which resolves against built-in
+    /// defaults, so the unit came out `mtime_size` whatever the config said.
+    #[test]
+    fn quick_archive_creates_its_unit_under_the_configured_checksum_mode() {
+        let (_tmp, paths, conn, mut config, src, device) = quick_archive_fixture();
+        config.defaults.checksum_mode = "sha256".to_string();
 
         let err = quick_archive(
             &conn,
@@ -4060,6 +4076,59 @@ mod tests {
             .query_row("SELECT checksum_mode FROM units", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "sha256", "[defaults] checksum_mode must apply");
+    }
+
+    /// Issue #354 (b): quick-archive carries the global `--yes` to
+    /// `stage_create`'s question about a staging directory that may be too
+    /// small. With compression on and 1 KiB "free", the question comes
+    /// before the source is read: without `--yes` a non-interactive run is
+    /// refused there (`cfg(test)` makes stdin a non-terminal); with it the
+    /// unit is staged and the run stops only at the sealed volume.
+    #[test]
+    fn quick_archive_carries_yes_to_the_staging_space_question() {
+        for assume_yes in [false, true] {
+            let (_tmp, paths, conn, mut config, src, device) = quick_archive_fixture();
+            config.defaults.compression = "gzip".to_string();
+            let _free = crate::staging::FreeSpaceOverride::set(1024);
+
+            let err = quick_archive(
+                &conn,
+                &paths,
+                &config,
+                src.to_str().unwrap(),
+                "alice",
+                "VOL-Q",
+                &[],
+                Some(&device),
+                false,
+                false,
+                assume_yes,
+            )
+            .expect_err("either refused at staging or at the sealed volume");
+            let staged: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if assume_yes {
+                assert!(
+                    matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+                    "--yes answered the staging question, so the run reached the write: {err}"
+                );
+                assert_eq!(staged, 1, "the unit was staged");
+            } else {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("refused: non-interactive session")
+                        && msg.contains("re-run with --yes")
+                        && msg.contains("may be too small for unit"),
+                    "the staging-space consent refusal: {msg}"
+                );
+                assert_eq!(staged, 0, "nothing staged");
+            }
+        }
     }
 
     /// #132: quick-archive's `--volume` must already exist, and the failure
