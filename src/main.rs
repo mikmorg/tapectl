@@ -408,7 +408,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::snapshot::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Stage { ref command } => {
-            cli::stage::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
+            cli::stage::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
         }
         Commands::Staging { ref command } => {
             cli::staging::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;

@@ -3918,7 +3918,7 @@ pub fn quick_archive(
     let snap_id = crate::staging::snapshot_create(conn, &unit_name, config)?;
     println!("snapshot created (id={snap_id})");
     // Step 3: stage
-    let ss_id = crate::staging::stage_create(conn, paths, config, snap_id)?;
+    let ss_id = crate::staging::stage_create(conn, paths, config, snap_id, assume_yes)?;
     println!("staged (stage_set={ss_id})");
     // Step 4: write
     // force=false: quick-archive writes to a caller-provided volume
@@ -4009,7 +4009,11 @@ mod tests {
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
-        let device = tmp.path().join("no-such-tape").to_string_lossy().into_owned();
+        let device = tmp
+            .path()
+            .join("no-such-tape")
+            .to_string_lossy()
+            .into_owned();
         let mut config = Config::default();
         config.dar.binary = "dar".to_string();
         config.staging.directory = staging.to_string_lossy().into_owned();

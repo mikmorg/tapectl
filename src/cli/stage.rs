@@ -111,6 +111,7 @@ pub fn run(
     command: &StageCommands,
     json_output: bool,
     dry_run: bool,
+    assume_yes: bool,
 ) -> Result<()> {
     match command {
         StageCommands::List { status } => {
@@ -474,7 +475,7 @@ pub fn run(
                 }
             };
 
-            let stage_set_id = staging::stage_create(conn, paths, config, snapshot_id)?;
+            let stage_set_id = staging::stage_create(conn, paths, config, snapshot_id, assume_yes)?;
 
             // Fetch results for display
             let (num_slices, total_dar, total_enc): (Option<i64>, Option<i64>, Option<i64>) = conn
@@ -651,6 +652,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -669,6 +671,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: None,
             },
+            false,
             false,
             false,
         )
@@ -699,6 +702,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -721,6 +725,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -734,6 +739,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
             false,
         )
@@ -781,6 +787,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: None,
             },
+            false,
             false,
             false,
         )
@@ -837,6 +844,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
             false,
         )
@@ -1015,6 +1023,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1042,6 +1051,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
             false,
         )
@@ -1084,6 +1094,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1121,6 +1132,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
             false,
         )
@@ -1161,6 +1173,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: None,
             },
+            false,
             false,
             false,
         )
@@ -1223,6 +1236,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1249,6 +1263,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: None,
             },
+            false,
             false,
             false,
         )
@@ -1279,6 +1294,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
             false,
         )
@@ -1316,6 +1332,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1344,6 +1361,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
         run(
@@ -1355,6 +1373,7 @@ mod tests {
                 version: 1,
             },
             true,
+            false,
             false,
         )
         .unwrap();
@@ -1374,6 +1393,7 @@ mod tests {
                 name: "unit1".to_string(),
                 version: Some(1),
             },
+            false,
             false,
             false,
         )
@@ -1406,6 +1426,7 @@ mod tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
         run(
@@ -1417,6 +1438,7 @@ mod tests {
                 version: 1,
             },
             true,
+            false,
             false,
         )
         .unwrap();

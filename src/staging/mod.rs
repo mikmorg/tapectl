@@ -278,7 +278,10 @@ pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
 /// proved writable). A staging directory too small for the unit is refused
 /// after the sha256 pass and before dar: that pass reads every byte, and
 /// nothing short of reading the content bounds what dar stores (see
-/// [`check_staging_space`]). What remains to fail after dar is the work
+/// [`check_staging_space`]). One that MAY be too small — the need cannot be
+/// pinned down — is asked about (ADR-0008 Tier 2): `assume_yes` (the global
+/// `--yes`) is that consent given in advance, and without it a
+/// non-interactive run refuses. What remains to fail after dar is the work
 /// itself.
 ///
 /// Thin wrapper around `stage_create_inner` mirroring
@@ -290,8 +293,16 @@ pub fn stage_create(
     paths: &TapectlPaths,
     config: &Config,
     snapshot_id: i64,
+    assume_yes: bool,
 ) -> Result<i64> {
-    stage_create_reporting(conn, paths, config, snapshot_id, &mut std::io::stderr())
+    stage_create_reporting(
+        conn,
+        paths,
+        config,
+        snapshot_id,
+        assume_yes,
+        &mut std::io::stderr(),
+    )
 }
 
 /// [`stage_create`] with its operator notices written to `notices` rather
@@ -308,6 +319,7 @@ pub(crate) fn stage_create_reporting(
     paths: &TapectlPaths,
     config: &Config,
     snapshot_id: i64,
+    assume_yes: bool,
     notices: &mut dyn Write,
 ) -> Result<i64> {
     let stage_set_id_holder: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
@@ -323,6 +335,7 @@ pub(crate) fn stage_create_reporting(
         paths,
         config,
         snapshot_id,
+        assume_yes,
         &stage_set_id_holder,
         &lock_holder,
         notices,
@@ -337,11 +350,13 @@ pub(crate) fn stage_create_reporting(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_create_inner(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
     snapshot_id: i64,
+    assume_yes: bool,
     stage_set_id_holder: &std::cell::Cell<Option<i64>>,
     lock_holder: &std::cell::Cell<Option<lock::StageLock>>,
     notices: &mut dyn Write,
@@ -442,8 +457,9 @@ fn stage_create_inner(
         snapshot: &snapshot,
         slice_size: resolved.slice_size,
         compression: &compression,
+        assume_yes,
     };
-    let space_upper = staging_space_before_reading(&space, notices);
+    let space_upper = staging_space_before_reading(&space, notices)?;
 
     // ADR-0005's escrow recipient participates in every write, and
     // pre-write validation refuses without one — encryption cannot be made
@@ -1116,6 +1132,9 @@ struct StagingSpaceInputs<'a> {
     slice_size: i64,
     /// The resolved dar compression (`"none"` or an algorithm).
     compression: &'a str,
+    /// Tier-2 consent given in advance (the global `--yes`) for a stage
+    /// that may not fit (issue #354).
+    assume_yes: bool,
 }
 
 impl StagingSpaceInputs<'_> {
@@ -1162,41 +1181,70 @@ impl StagingSpaceInputs<'_> {
 }
 
 /// The half of the staging-space check that runs before the source is read
-/// (issue #354). Never refuses; returns the upper bound when the check must
-/// be finished by [`check_staging_space`] once the read has measured the
-/// unit, and `None` when there is nothing more to decide.
+/// (issue #354). Returns the upper bound when the check must be finished by
+/// [`check_staging_space`] once the read has measured the unit, and `None`
+/// when there is nothing more to decide.
 ///
 /// - free space covers the upper bound: nothing to say;
 /// - any compression but `none`: dar's output has no lower bound (text can
-///   compress to a sliver), so a notice with the uncompressed figure, and
-///   the stage goes ahead;
+///   compress to a sliver), so whether it fits cannot be known — the
+///   operator is ASKED, with the uncompressed figure ([`ask_to_stage_anyway`]:
+///   ADR-0008 Tier 2; `--yes` proceeds, a non-interactive run without it
+///   refuses). Never a hard refusal: the need may well fit;
 /// - `compression = none`: wait for the read.
 fn staging_space_before_reading(
     inputs: &StagingSpaceInputs,
     notices: &mut dyn Write,
-) -> Option<i64> {
+) -> Result<Option<i64>> {
     use crate::util::format_bytes_binary as fmt;
 
-    let free = inputs.free(notices)?;
+    let Some(free) = inputs.free(notices) else {
+        return Ok(None);
+    };
     let upper = inputs.upper();
     if free >= upper {
-        return None;
+        return Ok(None);
     }
     if inputs.compression == "none" {
-        return Some(upper);
+        return Ok(Some(upper));
     }
-    let _ = writeln!(
+    ask_to_stage_anyway(
+        inputs,
+        format!(
+            "staging directory {} may be too small for unit \"{}\": {} free, and staging it \
+             needs up to {} if its data does not compress (compression = \"{}\") — the dar \
+             archive plus one encrypted slice beside it; {STAGING_RUNS_OUT}",
+            inputs.staging_dir.display(),
+            inputs.unit_name,
+            fmt(free),
+            fmt(upper),
+            inputs.compression,
+        ),
         notices,
-        "warning: staging directory {} may be too small for unit \"{}\": {} free, and \
-         staging it needs up to {} if its data does not compress (compression = \"{}\") — \
-         the dar archive plus one encrypted slice beside it; {STAGING_RUNS_OUT}",
-        inputs.staging_dir.display(),
-        inputs.unit_name,
-        fmt(free),
-        fmt(upper),
-        inputs.compression,
-    );
-    None
+    )?;
+    Ok(None)
+}
+
+/// Ask whether to stage a unit that may not fit (issue #354, criterion
+/// (b): "refused, or asked about"). It is ADR-0008 Tier 2 — the need is
+/// uncertain, not proven short, so the operator may knowingly go ahead —
+/// and goes through the one consent gate, `cli::consent::confirm`: a
+/// terminal is shown `fact` and asked; `--yes` proceeds; a non-interactive
+/// run without `--yes` refuses, carrying `fact`. `--yes` does not hide the
+/// figures: they are written to `notices` before the stage goes on.
+fn ask_to_stage_anyway(
+    inputs: &StagingSpaceInputs,
+    fact: String,
+    notices: &mut dyn Write,
+) -> Result<()> {
+    if inputs.assume_yes {
+        let _ = writeln!(notices, "warning: {fact} — staging anyway (--yes given)");
+    }
+    crate::cli::consent::confirm(
+        &format!("stage unit \"{}\"", inputs.unit_name),
+        &[fact],
+        inputs.assume_yes,
+    )
 }
 
 /// What happens to a stage that proceeds and then runs out of staging.
@@ -1222,8 +1270,10 @@ const STAGING_RUNS_OUT: &str =
 /// - free space (read again: the pass can take hours) covers `upper`:
 ///   nothing to say;
 /// - below the lower bound — the non-zero bytes, plus one slice of them —
-///   the stage cannot fit: refused;
-/// - between the two: a notice with both figures, and the stage goes ahead.
+///   the stage cannot fit: refused, whatever the flags (a fact, not a
+///   risk);
+/// - between the two: it may or may not fit, so the operator is asked, with
+///   both figures ([`ask_to_stage_anyway`]).
 ///
 /// Every byte counted in the lower bound is one dar must write, so a refusal
 /// is never wrong about the archive dar would make with tapectl's flags. (A
@@ -1258,16 +1308,18 @@ fn check_staging_space(
             fmt(free),
         )));
     }
-    let _ = writeln!(
+    ask_to_stage_anyway(
+        inputs,
+        format!(
+            "staging directory {dir} may be too small for unit \"{unit}\": {} free, and \
+             staging it needs between {} and {} (the low end counts only non-zero bytes: dar \
+             stores runs of zeros as holes and a hard-linked file once); {STAGING_RUNS_OUT}",
+            fmt(free),
+            fmt(lower),
+            fmt(upper),
+        ),
         notices,
-        "warning: staging directory {dir} may be too small for unit \"{unit}\": {} free, and \
-         staging it needs between {} and {} (the low end counts only non-zero bytes: dar \
-         stores runs of zeros as holes and a hard-linked file once); {STAGING_RUNS_OUT}",
-        fmt(free),
-        fmt(lower),
-        fmt(upper),
-    );
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -1735,7 +1787,9 @@ fn walk_directory(
     let walker = WalkDir::new(base)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !(e.file_type().is_dir() && exclude_compiled.excludes_dir_entry(e.path())));
+        .filter_entry(|e| {
+            !(e.file_type().is_dir() && exclude_compiled.excludes_dir_entry(e.path()))
+        });
     for entry in walker {
         let entry = entry.map_err(|e| TapectlError::Other(e.to_string()))?;
         let rel_path = entry
@@ -2400,7 +2454,7 @@ mod tests {
         // test; the one thing that must NOT happen is the whole pipeline
         // reaching a successful stage_set with secret.env silently included.
         let result = snapshot_create(&conn, "unit1", &Config::default())
-            .and_then(|snap_id| stage_create(&conn, &paths, &config, snap_id));
+            .and_then(|snap_id| stage_create(&conn, &paths, &config, snap_id, false));
 
         assert!(
             result.is_err(),
@@ -2489,7 +2543,7 @@ mod tests {
         .unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
         let slice_size: i64 = conn
             .query_row(
@@ -2571,8 +2625,8 @@ mod tests {
         // reachable via `stage create --version`. Calling `stage_create`
         // directly here (bypassing the CLI gate) is deliberate: this test
         // is about `archive_base` collision, not about the gate.
-        let stage_set_1 = stage_create(&conn, &paths, &config, snap_id).unwrap();
-        let stage_set_2 = stage_create(&conn, &paths, &config, snap_id).unwrap();
+        let stage_set_1 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let stage_set_2 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
         assert_ne!(stage_set_1, stage_set_2);
 
         let paths_for = |stage_set_id: i64| -> Vec<String> {
@@ -2661,7 +2715,7 @@ mod tests {
         .unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let result = stage_create(&conn, &paths, &config, snap_id);
+        let result = stage_create(&conn, &paths, &config, snap_id, false);
 
         assert!(
             result.is_err(),
@@ -2894,7 +2948,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
 
-        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let err = stage_create(&conn, &paths, &config, snap_id, false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no escrow recipient is registered"),
@@ -2958,7 +3012,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
 
-        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let err = stage_create(&conn, &paths, &config, snap_id, false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("has no active keys"),
@@ -3023,7 +3077,7 @@ mod tests {
         fs::write(src.join("f.txt"), b"content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
-        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let err = stage_create(&conn, &paths, &config, snap_id, false).unwrap_err();
         let msg = as_operator_sees_it(err);
         assert!(
             msg.contains(&*staging.to_string_lossy()),
@@ -3067,7 +3121,7 @@ mod tests {
         fs::write(src.join("f.txt"), b"content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
-        let result = stage_create(&conn, &paths, &config, snap_id);
+        let result = stage_create(&conn, &paths, &config, snap_id, false);
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
         let msg = as_operator_sees_it(result.unwrap_err());
         assert!(
@@ -3242,8 +3296,9 @@ mod tests {
         .unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let mut notices = Vec::new();
-        let stage_set_id = stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices)
-            .expect("encrypt=false must warn, not refuse (ADR-0005 makes it un-honorable)");
+        let stage_set_id =
+            stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut notices)
+                .expect("encrypt=false must warn, not refuse (ADR-0005 makes it un-honorable)");
 
         // Issue #347: the warning is a notice — written to what
         // `stage_create` makes stderr — not a `tracing::warn!` that
@@ -3306,7 +3361,7 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         let mut notices = Vec::new();
-        stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices).unwrap();
+        stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut notices).unwrap();
         assert_eq!(
             String::from_utf8(notices).unwrap(),
             "",
@@ -3389,7 +3444,7 @@ mod tests {
         let free: u64 = 100 * 1024;
         let _free = FreeSpaceOverride::set(free);
 
-        let err = stage_create(&conn, &paths, &config, snap_id).unwrap_err();
+        let err = stage_create(&conn, &paths, &config, snap_id, false).unwrap_err();
         let msg = as_operator_sees_it(err);
         assert!(
             msg.contains("not enough space in staging directory")
@@ -3426,15 +3481,17 @@ mod tests {
         assert!(left.is_empty(), "nothing left in staging: {left:?}");
     }
 
-    /// The refusal must not block a unit that fits. A hard-linked file is
-    /// one inode, which dar stores once, while the snapshot's recorded size
-    /// counts every link — so refusing on the recorded size would turn away
-    /// a unit whose real need is well inside the free space, with no way
-    /// past it. Here free space sits between the lower bound (the link
-    /// counted once) and the recorded-size figure: the stage goes ahead,
-    /// with a notice carrying both numbers.
+    /// The hard refusal must not block a unit that fits. A hard-linked file
+    /// is one inode, which dar stores once, while the snapshot's recorded
+    /// size counts every link — so refusing on the recorded size would turn
+    /// away a unit whose real need is well inside the free space, with no
+    /// way past it. Here free space sits between the lower bound (the link
+    /// counted once) and the recorded-size figure: it is asked about, not
+    /// refused, and with `--yes` the stage goes ahead with a notice carrying
+    /// both numbers (the refusal without consent is
+    /// `free_space_between_the_bounds_is_refused_without_consent`).
     #[test]
-    fn a_hard_linked_unit_that_fits_is_staged_with_a_notice_not_refused() {
+    fn a_hard_linked_unit_that_fits_is_staged_with_yes_not_refused() {
         use crate::util::format_bytes_binary as fmt;
         let tmp = TempDir::new().unwrap();
         let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
@@ -3457,12 +3514,13 @@ mod tests {
         let _free = FreeSpaceOverride::set(free as u64);
 
         let mut notices = Vec::new();
-        stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices)
-            .expect("a unit whose lower bound fits must be staged, not refused");
+        stage_create_reporting(&conn, &paths, &config, snap_id, true, &mut notices)
+            .expect("a unit whose lower bound fits must be staged with --yes, not refused");
         let notices = String::from_utf8(notices).unwrap();
         assert!(
             notices.contains("may be too small for unit \"unit1\"")
-                && notices.contains(&format!("between {} and {}", fmt(lower), fmt(upper))),
+                && notices.contains(&format!("between {} and {}", fmt(lower), fmt(upper)))
+                && notices.contains("staging anyway (--yes given)"),
             "the notice must carry both bounds ({} and {}): {notices:?}",
             fmt(lower),
             fmt(upper)
@@ -3478,7 +3536,8 @@ mod tests {
     /// preallocated disk images, fallocate'd databases and zero-padded ISOs
     /// all look like this. Only what dar cannot turn into a hole, its
     /// non-zero bytes, may refuse; here that is the dotfile, so the stage
-    /// runs, with a notice carrying both figures.
+    /// is asked about rather than refused, and with `--yes` it runs, with a
+    /// notice carrying both figures.
     #[test]
     fn a_dense_file_of_zeros_that_fits_is_staged_not_refused() {
         use crate::util::format_bytes_binary as fmt;
@@ -3500,8 +3559,10 @@ mod tests {
         let _free = FreeSpaceOverride::set(free);
 
         let mut notices = Vec::new();
-        let stage_set_id = stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices)
-            .expect("8 MiB of zeros needs a few KiB of staging: it must be staged, not refused");
+        let stage_set_id =
+            stage_create_reporting(&conn, &paths, &config, snap_id, true, &mut notices).expect(
+                "8 MiB of zeros needs a few KiB of staging: it must be staged, not refused",
+            );
 
         // It really did fit: dar's archive is a sliver of the 4 MiB "free".
         let dar_size: i64 = conn
@@ -3527,10 +3588,13 @@ mod tests {
     }
 
     /// With compression on, dar's archive has no useful lower bound (text
-    /// can compress to a sliver), so a short staging directory is a notice
-    /// with the uncompressed figure — never a refusal.
+    /// can compress to a sliver), so a short staging directory is never a
+    /// hard refusal: it is asked about, and with `--yes` the stage goes
+    /// ahead with a notice carrying the uncompressed figure (the refusal
+    /// without consent is
+    /// `with_compression_short_space_is_asked_about_and_refused_without_consent`).
     #[test]
-    fn with_compression_short_space_is_a_notice_never_a_refusal() {
+    fn with_compression_short_space_is_staged_with_yes_never_hard_refused() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         config.defaults.compression = "gzip".to_string();
@@ -3539,14 +3603,107 @@ mod tests {
         let _free = FreeSpaceOverride::set(1024);
 
         let mut notices = Vec::new();
-        stage_create_reporting(&conn, &paths, &config, snap_id, &mut notices)
-            .expect("compression makes the need unknowable: warn, never refuse");
+        stage_create_reporting(&conn, &paths, &config, snap_id, true, &mut notices)
+            .expect("compression makes the need unknowable: --yes proceeds");
         let notices = String::from_utf8(notices).unwrap();
         assert!(
             notices.contains("if its data does not compress")
-                && notices.contains("compression = \"gzip\""),
+                && notices.contains("compression = \"gzip\"")
+                && notices.contains("staging anyway (--yes given)"),
             "the notice must say the figure assumes no compression: {notices:?}"
         );
+    }
+
+    /// Issue #354 (b), the compressed case: whether the unit fits cannot be
+    /// known before dar runs, so a short staging directory is ASKED about
+    /// (ADR-0008 Tier 2) — and a non-interactive run without `--yes`
+    /// refuses, with the figures, rather than printing a notice and
+    /// carrying on. Asked before the source is read: no `stage_sets` row,
+    /// nothing in staging.
+    #[test]
+    fn with_compression_short_space_is_asked_about_and_refused_without_consent() {
+        use crate::util::format_bytes_binary as fmt;
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.defaults.compression = "gzip".to_string();
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        write_dense_file(&src.join("big.bin"), 64 * 1024);
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let _free = FreeSpaceOverride::set(1024);
+
+        let mut notices = Vec::new();
+        let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut notices)
+            .expect_err("no terminal and no --yes: a stage that may not fit is refused");
+        let msg = as_operator_sees_it(err);
+        assert!(
+            msg.contains("stage unit \"unit1\" refused: non-interactive session")
+                && msg.contains("re-run with --yes"),
+            "through the consent gate: {msg}"
+        );
+        assert!(
+            msg.contains("may be too small for unit \"unit1\"")
+                && msg.contains(&format!("{} free", fmt(1024)))
+                && msg.contains("if its data does not compress")
+                && msg.contains("compression = \"gzip\""),
+            "the refusal carries the figures it would have asked about: {msg}"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "asked before the stage_sets INSERT");
+    }
+
+    /// Issue #354 (b), `compression = none`: free space between the
+    /// content-proven low end and the apparent-size figure may or may not
+    /// be enough — asked about, and refused without consent in a
+    /// non-interactive run. Asked after the sha256 pass (which measures the
+    /// low end), before dar: the row is validated, dar never ran, staging
+    /// is left empty.
+    #[test]
+    fn free_space_between_the_bounds_is_refused_without_consent() {
+        use crate::util::format_bytes_binary as fmt;
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        write_dense_file(&src.join("a.bin"), 64 * 1024);
+        fs::hard_link(src.join("a.bin"), src.join("b.bin")).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let snapshot = get_snapshot(&conn, snap_id).unwrap();
+        let stored = nonzero(&src.join("a.bin")) + nonzero(&src.join(".tapectl-unit.toml"));
+        let lower = 2 * stored;
+        let upper = 2
+            * (snapshot.total_size.unwrap()
+                + snapshot.file_count.unwrap() * DAR_ENTRY_OVERHEAD_BYTES);
+        let _free = FreeSpaceOverride::set(((lower + upper) / 2) as u64);
+
+        let mut notices = Vec::new();
+        let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut notices)
+            .expect_err("no terminal and no --yes: refused");
+        let msg = as_operator_sees_it(err);
+        assert!(
+            msg.contains("stage unit \"unit1\" refused: non-interactive session"),
+            "through the consent gate: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("between {} and {}", fmt(lower), fmt(upper))),
+            "the refusal carries both bounds: {msg}"
+        );
+        assert!(!msg.contains("dar-must-never-run"), "before dar: {msg}");
+        let (validated, dar_command): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source_validated_at, dar_command FROM stage_sets",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(validated.is_some(), "asked after the sha256 pass");
+        assert!(dar_command.is_none(), "asked before dar: {dar_command:?}");
+        let left: Vec<_> = fs::read_dir(&config.staging.directory)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "nothing left in staging: {left:?}");
     }
 
     /// Issue #52 change 2 — the self-match trap. `snapshot_create` for an
@@ -3738,7 +3895,7 @@ mod tests {
         fs::write(src.join("junk.tmp"), b"AAAA").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
+        stage_create(&conn, &paths, &config, snap_id, false).expect("first stage must succeed");
 
         // The excluded junk file's content drifts at an UNCHANGED size —
         // exactly the false-BITROT scenario the issue describes
@@ -3748,7 +3905,7 @@ mod tests {
         // Re-staging the SAME snapshot (a real "stage create" retry) must
         // succeed cleanly — never raise BITROT over content dar was never
         // going to archive.
-        let result = stage_create(&conn, &paths, &config, snap_id);
+        let result = stage_create(&conn, &paths, &config, snap_id, false);
         assert!(
             result.is_ok(),
             "re-staging must succeed — an excluded file's content drift must \
@@ -3813,7 +3970,7 @@ mod tests {
         fs::write(src.join("junk.tmp"), b"excluded junk").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        stage_create(&conn, &paths, &config, snap_id).unwrap();
+        stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
         let junk_row_exists: i64 = conn
             .query_row(
@@ -3853,7 +4010,7 @@ mod tests {
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
         let dar_command: String = conn
             .query_row(
@@ -3901,7 +4058,7 @@ mod tests {
         fs::write(src.join("sub/kept-nested.txt"), b"kept too").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let stage_set_id = stage_create(&conn, &paths, &config, snap_id).unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
         let catalog: String = conn
             .query_row(
@@ -3995,7 +4152,7 @@ mod tests {
              is filtered from the walk — matches pre-#49 behavior exactly"
         );
 
-        stage_create(&conn, &paths, &config, snap_id)
+        stage_create(&conn, &paths, &config, snap_id, false)
             .expect("staging a unit with no excludes at all must succeed exactly as before");
     }
 
@@ -4025,13 +4182,13 @@ mod tests {
         fs::write(src.join("Thumbs.db"), b"AAAA").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
-        stage_create(&conn, &paths, &config, snap_id).expect("first stage must succeed");
+        stage_create(&conn, &paths, &config, snap_id, false).expect("first stage must succeed");
 
         // Thumbs.db regenerates at an UNCHANGED size — exactly the
         // false-BITROT scenario the issue describes.
         fs::write(src.join("Thumbs.db"), b"BBBB").unwrap();
 
-        let result = stage_create(&conn, &paths, &config, snap_id);
+        let result = stage_create(&conn, &paths, &config, snap_id, false);
         assert!(
             result.is_ok(),
             "re-staging must succeed — a globally-excluded file's content drift \
@@ -4095,7 +4252,7 @@ mod tests {
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
-        stage_create(&conn, &paths, &config, snap_id).unwrap();
+        stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
         let junk_row_exists: i64 = conn
             .query_row(

@@ -302,7 +302,7 @@ fn add_unit(
     .unwrap();
     h.source_dirs.push(src);
     let sid = staging::snapshot_create(&h.conn, unit_name, &Config::default()).unwrap();
-    staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
+    staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
 }
 
 /// Like `add_unit`, but also drops one distinctively-named file into the
@@ -341,7 +341,7 @@ fn add_unit_with_sentinel_file(
     .unwrap();
     h.source_dirs.push(src);
     let sid = staging::snapshot_create(&h.conn, unit_name, &Config::default()).unwrap();
-    staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
+    staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
 }
 
 /// Build a harness and write a freshly-initialized volume with the given units.

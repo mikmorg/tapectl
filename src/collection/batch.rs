@@ -115,8 +115,10 @@ pub struct BatchExecutionReport {
 /// made, callable directly by a test; `execute_batch_still_delegates_
 /// release_to_the_scoped_helper` pins that this function still calls it.
 ///
-/// `assume_yes` answers `volume_write`'s quiet-host pre-flight for every
-/// copy (ADR-0012, 2026-09-24 amendment, item 7) — the global `--yes`.
+/// `assume_yes` is the global `--yes`: it answers `volume_write`'s
+/// quiet-host pre-flight for every copy (ADR-0012, 2026-09-24 amendment,
+/// item 7) and `stage_create`'s question about a staging directory that may
+/// be too small (issue #354) for every unit staged.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_batch(
     conn: &Connection,
@@ -164,13 +166,13 @@ pub fn execute_batch(
         match (outcome.minted, outcome.status.as_str()) {
             // A fresh version was minted — always needs staging.
             (true, _) => {
-                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id, assume_yes)?;
                 units_staged += 1;
             }
             // Existing but never-staged content (ADR-0012 reuse, Change 3)
             // — the row already exists, but its slices don't yet.
             (false, "created") => {
-                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id, assume_yes)?;
                 units_staged += 1;
             }
             // Already staged: a stage_set with live slices exists for this
@@ -200,7 +202,7 @@ pub fn execute_batch(
                     status = other,
                     "unminted snapshot with an unexpected status — staging anyway"
                 );
-                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id)?;
+                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id, assume_yes)?;
                 units_staged += 1;
             }
         }

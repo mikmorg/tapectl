@@ -178,7 +178,7 @@ fn perf_many_files_single_unit() {
     report("many_files", "init_unit + snapshot_create", t.elapsed());
 
     let t = Instant::now();
-    staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
+    staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
     let stage_elapsed = t.elapsed();
     report("many_files", "stage_create (dar + age)", stage_elapsed);
 
@@ -335,7 +335,7 @@ fn perf_large_single_file() {
     report("large_file", "init_unit + snapshot_create", t.elapsed());
 
     let t = Instant::now();
-    staging::stage_create(&h.conn, &h.paths, &h.config, sid).unwrap();
+    staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
     let stage_elapsed = t.elapsed();
     let mib_per_sec = (size_mb as f64) / stage_elapsed.as_secs_f64();
     report(
