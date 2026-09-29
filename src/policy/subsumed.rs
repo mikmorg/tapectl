@@ -101,7 +101,8 @@ pub fn describe(hit: &SubsumedAcls) -> String {
         format!(
             "note: {} has preserve_acls = true, which cannot take effect — preserve_xattrs = \
              false drops every extended attribute, and on Linux ACLs are extended attributes \
-             (dar has no separate ACL switch). Set preserve_xattrs = true to keep them.",
+             (dar has no separate ACL switch). Set preserve_xattrs = true to keep them, or \
+             set preserve_acls = false to say they go (that also silences this note).",
             hit.source
         )
     } else {
@@ -188,6 +189,14 @@ mod tests {
         let line = describe(&hits[0]);
         assert!(line.contains("preserve_acls = true"), "{line}");
         assert!(line.contains("preserve_xattrs = false"), "{line}");
+        // `init` writes `preserve_acls = true`, so an operator who turns
+        // only xattrs off meant to drop them and gets this note on every
+        // `config check`: it must also name the edit that says so and
+        // silences it, not only the one that undoes their choice.
+        assert!(
+            line.contains("set preserve_acls = false"),
+            "must offer the other way to make the two agree: {line}"
+        );
     }
 
     /// Both off agree — ACLs are dropped, as asked — so nothing to say.
