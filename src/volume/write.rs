@@ -12333,6 +12333,206 @@ mod tests {
             );
         }
 
+        /// One drive-touching step of a command, as the source-order scan
+        /// below sees it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum DriveStep {
+            /// `reads.check_read_contact(` — the no-medium probe is its first
+            /// act (issue #355; pinned in `tape::media_detect`).
+            Check,
+            /// `::loaded_medium(` — the pre-store MAM read, which opens the
+            /// st node.
+            Medium,
+            /// `TapeStore::open_read(` — a read path's store.
+            OpenRead,
+            /// `TapeStore::open(` — a write path's store, and `volume
+            /// verify`'s.
+            Open,
+            /// `::rebuild_from_volume(` — the catalog rebuild, whose callee
+            /// takes its own `Medium` and `OpenRead`.
+            Rebuild,
+        }
+
+        /// The drive steps of `prod` (a production half), in source order.
+        /// Comment lines are dropped, so a doc naming `TapeStore::open_read`
+        /// is not a call.
+        fn drive_steps(prod: &str) -> Vec<DriveStep> {
+            const PATTERNS: [(&str, DriveStep); 5] = [
+                ("reads.check_read_contact(", DriveStep::Check),
+                ("::loaded_medium(", DriveStep::Medium),
+                ("TapeStore::open_read(", DriveStep::OpenRead),
+                ("TapeStore::open(", DriveStep::Open),
+                ("::rebuild_from_volume(", DriveStep::Rebuild),
+            ];
+            let code: String = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(|l| [l, "\n"])
+                .collect();
+            let mut found: Vec<(usize, DriveStep)> = PATTERNS
+                .iter()
+                .flat_map(|(p, step)| code.match_indices(p).map(|(i, _)| (i, *step)))
+                .collect();
+            found.sort_by_key(|(i, _)| *i);
+            found.into_iter().map(|(_, step)| step).collect()
+        }
+
+        /// Parse `steps` into paths: a READ path is its check, then its MAM
+        /// read, then its store (or its check, then the rebuild that holds
+        /// the other two); a lone `TapeStore::open(` is a WRITE path's store,
+        /// whose probe runs in `volume_*_contacted` before `detect` (pinned
+        /// by `every_write_path_probes_for_an_empty_drive_before_detect`).
+        /// Anything else — a store or a MAM read with no
+        /// check in front of it — is the shape that stalls on an empty drive.
+        /// Returns `(read paths, write-path stores)`.
+        fn drive_paths(steps: &[DriveStep]) -> std::result::Result<(usize, usize), String> {
+            use DriveStep::*;
+            let (mut reads, mut writes, mut i) = (0, 0, 0);
+            while i < steps.len() {
+                match &steps[i..] {
+                    [Check, Medium, OpenRead | Open, ..] => {
+                        reads += 1;
+                        i += 3;
+                    }
+                    [Check, Rebuild, ..] => {
+                        reads += 1;
+                        i += 2;
+                    }
+                    [Open, ..] => {
+                        writes += 1;
+                        i += 1;
+                    }
+                    rest => {
+                        return Err(format!(
+                            "after {reads} read path(s) in order: {:?} — a drive touch with \
+                             no no-medium check in front of it",
+                            &rest[..rest.len().min(3)]
+                        ))
+                    }
+                }
+            }
+            Ok((reads, writes))
+        }
+
+        /// Issue #355's gap, found by its review: the no-medium probe is the
+        /// first act of `check_read_contact`, so it spares a read path the
+        /// blocking open only if the check comes BEFORE the path's first
+        /// touch of the drive — its pre-store MAM read (`loaded_medium`) and
+        /// its store open. `every_read_path_holds_both_reads_for_its_contact`
+        /// counts the checks but not where they sit; a check moved below its
+        /// `TapeStore::open_read` would stall on an empty drive again with
+        /// every other test green.
+        ///
+        /// Walks the production half of every file under `src/`, so a NEW
+        /// read path that opens the drive without a check fails here too,
+        /// not only a reordered old one. `volume/rebuild.rs` is the one
+        /// callee: `catalog rebuild` checks in `cli/catalog.rs` and then
+        /// calls `rebuild_from_volume`, which takes the MAM read and opens
+        /// the store — so there the pair must come alone and in order.
+        #[test]
+        fn every_read_path_checks_for_a_cartridge_before_it_touches_the_drive() {
+            use DriveStep::*;
+
+            // Negative controls first: the parser rejects each shape that
+            // stalls, so the green below is not a parser that accepts all.
+            const CHECK: &str = "reads.check_read_contact(c, d)?;\n";
+            const MEDIUM: &str = "let m = binding::loaded_medium(c, d, &reads);\n";
+            const OPEN_READ: &str = "let s = TapeStore::open_read(d, b)?;\n";
+            const OPEN: &str = "let s = TapeStore::open(d, b, u)?;\n";
+            const REBUILD: &str = "let r = rebuild::rebuild_from_volume(c, d);\n";
+            for (shape, bad) in [
+                (
+                    "store opened before the check",
+                    [OPEN_READ, CHECK, MEDIUM].concat(),
+                ),
+                (
+                    "MAM read before the check",
+                    [MEDIUM, CHECK, OPEN_READ].concat(),
+                ),
+                (
+                    "check between MAM read and store",
+                    [MEDIUM, CHECK, OPEN].concat(),
+                ),
+                ("rebuild with no check", REBUILD.to_string()),
+                ("a check with no store", CHECK.to_string()),
+            ] {
+                assert!(
+                    drive_paths(&drive_steps(&bad)).is_err(),
+                    "negative control not rejected: {shape}"
+                );
+            }
+            // The same parser accepts the shapes the production paths take.
+            assert_eq!(
+                drive_paths(&drive_steps(
+                    &[CHECK, MEDIUM, OPEN_READ, OPEN, CHECK, REBUILD, CHECK, MEDIUM, OPEN].concat()
+                )),
+                Ok((3, 1))
+            );
+            // ...and a commented-out call is not a call.
+            assert_eq!(
+                drive_steps("// TapeStore::open_read(d, b)\n    /// `x::loaded_medium(`\n"),
+                vec![]
+            );
+
+            let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let rebuild = src.join("volume").join("rebuild.rs");
+            let production = |text: &str| -> String {
+                match text.find("#[cfg(test)]\nmod tests") {
+                    Some(i) => text[..i].to_string(),
+                    None => text.to_string(),
+                }
+            };
+            let (mut reads, mut writes) = (0, 0);
+            let mut files = Vec::new();
+            for entry in walkdir::WalkDir::new(&src)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path == rebuild || path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(path).unwrap();
+                let steps = drive_steps(&production(&text));
+                if steps.is_empty() {
+                    continue;
+                }
+                let (r, w) =
+                    drive_paths(&steps).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                reads += r;
+                writes += w;
+                files.push(path.strip_prefix(&src).unwrap().display().to_string());
+            }
+            files.sort();
+
+            // Positive control on the walk: it found every read path the
+            // count test names, in the files they live in.
+            assert_eq!(
+                reads, 8,
+                "verify, restore unit, catalog rebuild, restore raw-volume, identify, \
+                 read-slices, compact-read, compact — found in {files:?}"
+            );
+            assert_eq!(writes, 3, "init, write, resume — found in {files:?}");
+            assert_eq!(
+                files,
+                [
+                    "cli/catalog.rs",
+                    "cli/restore.rs",
+                    "cli/volume.rs",
+                    "volume/restore.rs",
+                    "volume/write.rs"
+                ]
+            );
+
+            let callee = drive_steps(&production(&std::fs::read_to_string(&rebuild).unwrap()));
+            assert_eq!(
+                callee,
+                vec![Medium, OpenRead],
+                "rebuild_from_volume takes its MAM read, then opens its store — its caller's \
+                 check covers both"
+            );
+        }
+
         /// `volume resume` is the one write path no ungated test can drive
         /// past its own MAM read: `InterruptedSession::rehydrate` runs
         /// BEFORE `detect()` and needs a real session directory with the
