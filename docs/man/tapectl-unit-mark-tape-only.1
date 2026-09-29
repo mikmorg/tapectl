@@ -10,7 +10,7 @@ Mark unit as tape\-only (local data can be deleted)
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Override copy/location requirements
+Confirm in advance, as the global \-\-yes does: mark the unit even though it is short of its policy\*(Aqs min_copies, the [defaults] min_locations floor or its required_locations, or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non\-interactive run refuses, naming each shortfall. A unit that was never archived is refused whatever the flags (ADR\-0008 Tier 3)
 .TP
 \fB\-\-json\fR
 Output in JSON format

@@ -391,7 +391,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cli::key::run(&conn, &paths, command, cli.json, cli.dry_run)?;
         }
         Commands::Unit { ref command } => {
-            cli::unit::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
+            cli::unit::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
         }
         Commands::Collection { ref command } => {
             // Issue #285: `collection::run` now returns a process exit code

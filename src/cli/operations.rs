@@ -2454,10 +2454,9 @@ pub fn unit_mark_tape_only(
         if let Some(line) = &evidence_summary {
             facts.push(line.clone());
         }
-        // Names only `--force`, the flag this handler receives. Whether
-        // the global `--yes` also reaches it is the caller's wiring
-        // (`cli::unit::run`), not this function's to promise.
-        facts.push("(`--force` confirms this in advance)".to_string());
+        // `force` is the caller's OR of `--force` and the global `--yes`
+        // (`cli::unit::run`, issue #348), so the line names both.
+        facts.push("(`--force` or `--yes` confirms this in advance)".to_string());
         crate::cli::consent::confirm(
             &format!("mark unit \"{unit_name}\" tape-only"),
             &facts,
@@ -4349,8 +4348,8 @@ mod tests {
                  without a terminal: {msg}"
             );
             assert!(
-                msg.contains("\n(`--force` confirms this in advance)"),
-                "the refusal names the flag this command's handler itself honours: {msg}"
+                msg.contains("\n(`--force` or `--yes` confirms this in advance)"),
+                "the refusal names both flags that reach this handler: {msg}"
             );
             assert_eq!(photos_status(&conn), "active");
 

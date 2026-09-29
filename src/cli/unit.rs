@@ -96,7 +96,13 @@ pub enum UnitCommands {
     MarkTapeOnly {
         /// Unit name
         name: String,
-        /// Override copy/location requirements
+        /// Confirm in advance, as the global --yes does: mark the unit even
+        /// though it is short of its policy's min_copies, the [defaults]
+        /// min_locations floor or its required_locations, or is dirty
+        /// (changed since its last snapshot). Without either flag a
+        /// terminal asks, and a non-interactive run refuses, naming each
+        /// shortfall. A unit that was never archived is refused whatever
+        /// the flags (ADR-0008 Tier 3)
         #[arg(long)]
         force: bool,
     },
@@ -142,6 +148,7 @@ pub fn run(
     command: &UnitCommands,
     json_output: bool,
     dry_run: bool,
+    assume_yes: bool,
 ) -> Result<()> {
     match command {
         UnitCommands::Init {
@@ -449,7 +456,17 @@ pub fn run(
                      preview would have to reproduce exactly or risk being wrong.",
                 ));
             }
-            crate::cli::operations::unit_mark_tape_only(conn, config, name, *force, json_output)?;
+            // Issue #348: the global `--yes` is the same advance Tier-2
+            // consent `--force` is here — `consent::confirm`'s
+            // non-interactive refusal tells the operator to re-run with
+            // `--yes`, which is only true if it arrives.
+            crate::cli::operations::unit_mark_tape_only(
+                conn,
+                config,
+                name,
+                *force || assume_yes,
+                json_output,
+            )?;
         }
     }
     Ok(())
@@ -719,7 +736,7 @@ mod tag_tests {
     }
 
     fn run_cmd(conn: &Connection, paths: &TapectlPaths, cmd: UnitCommands) {
-        run(conn, paths, &Config::default(), &cmd, false, false).unwrap();
+        run(conn, paths, &Config::default(), &cmd, false, false, false).unwrap();
     }
 
     #[test]
@@ -799,6 +816,7 @@ mod tag_tests {
             },
             false,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&dotfile_path).unwrap(), before);
@@ -890,6 +908,7 @@ mod checksum_mode_tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
     }
@@ -962,6 +981,7 @@ mod checksum_mode_tests {
             },
             false,
             false,
+            false,
         )
         .unwrap();
         let units = queries::list_units(&conn, None, None).unwrap();
@@ -1006,6 +1026,7 @@ mod checksum_mode_tests {
             &UnitCommands::Discover,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(stored_mode(&conn, "found"), "sha256");
@@ -1045,8 +1066,94 @@ mod checksum_mode_tests {
             &UnitCommands::Discover,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(stored_mode(&conn, "found"), "mtime_size");
+    }
+}
+
+#[cfg(test)]
+mod mark_tape_only_consent_tests {
+    //! Issue #348: `unit mark-tape-only` asks for ADR-0008 Tier-2 consent
+    //! through `cli::consent::confirm`, whose non-interactive refusal says
+    //! "re-run with --yes to proceed". That is true only if the global
+    //! `--yes` reaches the handler, so these go through `cli::unit::run` —
+    //! the dispatch `main` calls with `cli.yes` — not the handler directly.
+    //! (`cfg(test)` makes stdin a non-terminal, so a refusal never prompts.)
+    use super::*;
+    use tempfile::TempDir;
+
+    /// `photos`: 2 copies in 2 locations (`coverage::tests`' fixture),
+    /// against a `[defaults] min_copies` of 3 — below policy, not dirty and
+    /// not never-archived, so only the Tier-2 copy shortfall can stop it.
+    fn below_policy() -> (Connection, TempDir, TapectlPaths, Config) {
+        let (conn, _unit, _vol) =
+            crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let mut config = Config::default();
+        config.defaults.min_copies = 3;
+        (conn, tmp, paths, config)
+    }
+
+    fn mark(
+        conn: &Connection,
+        paths: &TapectlPaths,
+        config: &Config,
+        force: bool,
+        assume_yes: bool,
+    ) -> Result<()> {
+        run(
+            conn,
+            paths,
+            config,
+            &UnitCommands::MarkTapeOnly {
+                name: "photos".into(),
+                force,
+            },
+            false,
+            false,
+            assume_yes,
+        )
+    }
+
+    fn status(conn: &Connection) -> String {
+        queries::get_unit_by_name(conn, "photos")
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn the_global_yes_confirms_a_below_policy_unit_in_advance() {
+        let (conn, _tmp, paths, config) = below_policy();
+        mark(&conn, &paths, &config, false, true)
+            .expect("--yes is Tier-2 consent given in advance (ADR-0008)");
+        assert_eq!(status(&conn), "tape_only");
+    }
+
+    /// The negative control: neither flag, no terminal — refused, with the
+    /// facts and the flags that would confirm, and nothing changed.
+    #[test]
+    fn without_yes_or_force_a_non_interactive_run_refuses() {
+        let (conn, _tmp, paths, config) = below_policy();
+        let msg = mark(&conn, &paths, &config, false, false)
+            .expect_err("no consent, no terminal: refuse")
+            .to_string();
+        assert!(msg.contains("insufficient copies: 2 < 3"), "{msg}");
+        assert!(msg.contains("re-run with --yes to proceed"), "{msg}");
+        assert!(
+            msg.contains("`--force` or `--yes` confirms this in advance"),
+            "the refusal names both flags that now reach the handler: {msg}"
+        );
+        assert_eq!(status(&conn), "active");
+    }
+
+    #[test]
+    fn force_still_confirms_a_below_policy_unit_in_advance() {
+        let (conn, _tmp, paths, config) = below_policy();
+        mark(&conn, &paths, &config, true, false).expect("--force confirms, as before");
+        assert_eq!(status(&conn), "tape_only");
     }
 }
