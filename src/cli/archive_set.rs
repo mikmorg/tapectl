@@ -66,6 +66,22 @@ fn parse_required_locations(conn: &Connection, value: &str) -> Result<Vec<String
              give a comma-separated list such as \"home-rack,offsite\""
         )));
     }
+    check_registered_locations(conn, "--required-locations", &names)?;
+    Ok(names)
+}
+
+/// The registration check behind [`parse_required_locations`], shared with
+/// `sync` (issue #348): an `[[archive_sets]]` table's `required_locations`
+/// reaches the same column through config.toml, so it is refused on the
+/// same terms. `field` is how the caller's operator spelled it — the CLI
+/// flag or the TOML key — so the message points at the thing to fix.
+fn check_registered_locations(conn: &Connection, field: &str, names: &[String]) -> Result<()> {
+    if names.iter().any(|n| n.trim().is_empty()) {
+        return Err(TapectlError::Other(format!(
+            "{field} contains an empty location name — name a registered location \
+             (`tapectl location list`)"
+        )));
+    }
     let registered: Vec<String> = conn
         .prepare("SELECT name FROM locations ORDER BY name")?
         .query_map([], |row| row.get(0))?
@@ -87,12 +103,12 @@ fn parse_required_locations(conn: &Connection, value: &str) -> Result<Vec<String
             "which are not registered locations"
         };
         return Err(TapectlError::Other(format!(
-            "--required-locations names {}, {what} ({known}). Register a location \
+            "{field} names {}, {what} ({known}). Register a location \
              first with `tapectl location add <name>`, or fix the spelling.",
             unknown.join(", "),
         )));
     }
-    Ok(names)
+    Ok(())
 }
 
 /// The policy columns `archive-set create` and `edit` take as flags — one
@@ -816,6 +832,12 @@ pub fn run(
                     crate::config::validate_checksum_mode(m)
                         .map_err(|e| named(TapectlError::Other(e)))?;
                 }
+                // Issue #348: the same registration check `create`/`edit`
+                // apply to `--required-locations`, so a location name the
+                // policy can never meet cannot arrive through config.toml.
+                if let Some(locs) = &as_cfg.required_locations {
+                    check_registered_locations(conn, "required_locations", locs).map_err(named)?;
+                }
                 // Issue #59: a malformed slice_size must not silently become
                 // 0 or the wrong magnitude in the DB (parsed in `from_config`).
                 writes.push((as_cfg, PolicyWrite::from_config(as_cfg).map_err(named)?));
@@ -1294,6 +1316,66 @@ fi
         assert_eq!(
             stored_locations(&conn, "cold").as_deref(),
             Some(r#"["home-rack","bank"]"#)
+        );
+    }
+
+    /// Issue #348, the config-driven path: `sync` copied an
+    /// `[[archive_sets]]` table's `required_locations` straight into the
+    /// row, so a name no `location add` ever registered landed in the DB
+    /// and the policy could never be met — the defect `create`/`edit`
+    /// refuse, reached through config.toml instead of a flag. `sync`
+    /// refuses it the same way, naming the set and the TOML key, before
+    /// any row is written (sync is all-or-nothing, so the valid set listed
+    /// first is not written either).
+    #[test]
+    fn sync_refuses_a_required_location_that_is_not_registered() {
+        let conn = fresh_conn();
+        add_location(&conn, "home-rack");
+        let mut config = Config::default();
+        let mut first = set_config("aaa");
+        first.min_copies = Some(2);
+        let mut cold = set_config("cold");
+        cold.required_locations = Some(vec!["home-rack".to_string(), "nowhere".to_string()]);
+        config.archive_sets.push(first);
+        config.archive_sets.push(cold);
+
+        let err = run(&conn, &config, &ArchiveSetCommands::Sync, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"nowhere\""),
+            "must name the unknown one: {err}"
+        );
+        assert!(
+            err.contains("archive set \"cold\""),
+            "must name the set: {err}"
+        );
+        assert!(
+            err.contains("required_locations") && !err.contains("--required-locations"),
+            "must name the TOML key, not the CLI flag: {err}"
+        );
+        assert!(
+            err.contains("location add"),
+            "must say how to fix it: {err}"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_sets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a refused sync must write nothing");
+
+        // An empty name can only be a typo; it is refused too.
+        config.archive_sets[1].required_locations = Some(vec![String::new()]);
+        let err = run(&conn, &config, &ArchiveSetCommands::Sync, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty location name"), "{err}");
+
+        // Positive control: registered names sync and are stored.
+        config.archive_sets[1].required_locations = Some(vec!["home-rack".to_string()]);
+        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
+        assert_eq!(
+            stored_locations(&conn, "cold").as_deref(),
+            Some(r#"["home-rack"]"#)
         );
     }
 
