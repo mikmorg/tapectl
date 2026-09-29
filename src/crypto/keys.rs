@@ -147,34 +147,40 @@ pub fn load_all_identities(
     Ok(identities)
 }
 
-/// Which tenant each key file under `keys/` belongs to (issue #350).
+/// Which key files under `keys/` belong to which tenant (issue #350).
 ///
 /// A key file is `{alias}.age.key`, and an alias is `{tenant}-{short}` — but
 /// tenant names may themselves contain `-`, so a file name alone cannot say
 /// whether `family-old-primary` is tenant `family`'s key `old-primary` or
-/// tenant `family-old`'s key `primary`. Two sources settle it, in order:
+/// tenant `family-old`'s key `primary`. The rules, in order:
 ///
-/// 1. **The key's own row.** `encryption_keys.alias` is exactly the file
-///    stem, and its `tenant_id` is the answer. Deactivated rows count: a key
-///    a rotation retired still decrypts everything written before it.
-/// 2. **The longest tenant name that prefixes the stem** (followed by `-`).
-///    This is what survives `catalog rebuild`, which recreates tenant rows
-///    but deliberately no key rows (no tape records a recipient list, #137)
-///    — so restore after a rebuild still finds every tenant's files on disk,
-///    and still does not hand `family` the files of `family-old`. Tenants of
-///    every status count: a deleted `family-old`'s keys are still not
-///    `family`'s.
+/// 1. **The key's own row settles it.** `encryption_keys.alias` is exactly
+///    the file stem (unique across tenants), and its `tenant_id` is the
+///    answer. Deactivated rows count: a key a rotation retired still
+///    decrypts everything written before it. This is the ordinary case —
+///    every key `tenant add`, `key generate` and `key rotate` write has a row
+///    — and it is where `family` stops loading `family-old`'s keys.
+/// 2. **With no row, the plain `{tenant}-` prefix decides**, exactly as the
+///    old scan did, so an ambiguous file goes to EVERY tenant whose name
+///    prefixes it. This is the `catalog rebuild` case: a rebuild recreates
+///    tenant rows but deliberately no key rows (no tape records a recipient
+///    list, #137), and then nothing on this machine can say whose
+///    `family-old-laptop.age.key` is. Guessing — the longest matching tenant
+///    name, say — would hand `family`'s own `old-laptop` key to `family-old`
+///    and leave a restore of `family` unable to open what was written only
+///    to it. An extra identity costs one failed trial decryption; a missing
+///    one costs the data. So after a rebuild, ownership is exact again only
+///    once each key is back in the catalog (`key import`).
 ///
-/// Both rules only ever take a file AWAY from the plain `{tenant}-` prefix
-/// scan [`load_all_identities`] did, never add one: the tenant asked about
-/// is always a candidate, so its own files match at minimum.
+/// Rule 1 only ever takes a file AWAY from the prefix scan, and only when a
+/// row names another tenant; rule 2 is the prefix scan. So a tenant's own
+/// key file is never withheld from it.
 pub struct KeyOwners {
     by_alias: HashMap<String, String>,
-    tenants: Vec<String>,
 }
 
 impl KeyOwners {
-    /// Read every key alias and every tenant name the catalog knows.
+    /// Read every key alias the catalog knows, with its tenant.
     pub fn from_catalog(conn: &Connection) -> Result<Self> {
         let mut by_alias = HashMap::new();
         let mut stmt = conn.prepare(
@@ -185,32 +191,23 @@ impl KeyOwners {
             let (alias, tenant) = row?;
             by_alias.insert(alias, tenant);
         }
-        let mut stmt = conn.prepare("SELECT name FROM tenants")?;
-        let tenants = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(Self { by_alias, tenants })
+        Ok(Self { by_alias })
     }
 
-    /// The tenant that owns key file stem `stem`, or `None` when no known
-    /// tenant (nor `also_consider`, the tenant being asked about) prefixes it.
-    fn owner_of<'a>(&'a self, stem: &str, also_consider: &'a str) -> Option<&'a str> {
-        if let Some(t) = self.by_alias.get(stem) {
-            return Some(t.as_str());
+    /// Whether key file stem `stem` is `tenant`'s, by the rules above.
+    fn is_owned_by(&self, stem: &str, tenant: &str) -> bool {
+        match self.by_alias.get(stem) {
+            Some(owner) => owner == tenant,
+            None => stem
+                .strip_prefix(tenant)
+                .is_some_and(|rest| rest.starts_with('-')),
         }
-        self.tenants
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once(also_consider))
-            .filter(|t| {
-                stem.len() > t.len() + 1 && stem.starts_with(t) && stem.as_bytes()[t.len()] == b'-'
-            })
-            .max_by_key(|t| t.len())
     }
 }
 
 /// Load every secret key file under `keys_dir` that belongs to
-/// `tenant_name` — exactly its own, by [`KeyOwners`]' rules — as age
+/// `tenant_name`, by [`KeyOwners`]' rules — exactly its own while the
+/// catalog has key rows, every file it might own when it has none — as age
 /// identities, for trial decryption. Deactivated keys are included (they
 /// still open what was written before a rotation). Files are read from disk,
 /// never from the database: the catalog only says whose a file is.
@@ -244,7 +241,7 @@ fn load_identities_owned_by(
             p.file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".age.key"))
-                .is_some_and(|stem| owners.owner_of(stem, tenant_name) == Some(tenant_name))
+                .is_some_and(|stem| owners.is_owned_by(stem, tenant_name))
         })
         .collect();
     paths.sort();
@@ -501,9 +498,14 @@ mod tests {
 
     /// After `catalog rebuild` the catalog has tenant rows but NO key rows
     /// (no tape records a recipient list, #137), and restore must still find
-    /// each tenant's files on disk — and still only its own.
+    /// each tenant's files on disk. A file whose name only one tenant
+    /// prefixes is that tenant's alone (`family-old` does not get `family`'s
+    /// keys). `family-old-primary.age.key` is prefixed by BOTH names, and
+    /// with no row nothing can say which it is, so `family` gets it too —
+    /// the old prefix scan's answer, and the only one that cannot withhold a
+    /// tenant's own key (see the rowless-ambiguous test below).
     #[test]
-    fn a_rebuilt_catalog_with_no_key_rows_still_loads_each_tenants_own_keys() {
+    fn a_rebuilt_catalog_with_no_key_rows_loads_every_file_a_tenant_might_own() {
         let tmp = TempDir::new().unwrap();
         let family = generate_and_save(tmp.path(), "family", "primary").unwrap();
         let family_b = generate_and_save(tmp.path(), "family", "backup").unwrap();
@@ -512,7 +514,11 @@ mod tests {
 
         assert_eq!(
             publics(&load_tenant_identities(&conn, tmp.path(), "family").unwrap()),
-            sorted(vec![family.public_key, family_b.public_key]),
+            sorted(vec![
+                family.public_key,
+                family_b.public_key,
+                old.public_key.clone()
+            ]),
         );
         assert_eq!(
             publics(&load_tenant_identities(&conn, tmp.path(), "family-old").unwrap()),
@@ -546,6 +552,34 @@ mod tests {
             publics(&load_tenant_identities(&conn, tmp.path(), "family-old").unwrap()),
             vec![old_backup.public_key],
         );
+    }
+
+    /// The DR case the reviewer of #350 found: tenant `family` has a key
+    /// `old-laptop` (`key generate` accepts dashes), so its file is
+    /// `family-old-laptop.age.key` — and tenant `family-old` also exists.
+    /// After `catalog rebuild` there is no key row to say whose that file
+    /// is, and nothing else can: a longest-prefix guess hands `family`'s own
+    /// key to `family-old`, and a restore of `family` then cannot open what
+    /// was written only to it. With no row, both tenants get the file — an
+    /// extra identity costs a trial decryption; a missing one costs the data.
+    #[test]
+    fn a_rowless_ambiguous_file_is_not_taken_from_the_shorter_tenant_name() {
+        let tmp = TempDir::new().unwrap();
+        let laptop = generate_and_save(tmp.path(), "family", "old-laptop").unwrap();
+        let family = generate_and_save(tmp.path(), "family", "primary").unwrap();
+        let old = generate_and_save(tmp.path(), "family-old", "primary").unwrap();
+        let conn = catalog(&["op", "family", "family-old"], &[]);
+
+        let fam = publics(&load_tenant_identities(&conn, tmp.path(), "family").unwrap());
+        assert!(
+            fam.contains(&laptop.public_key),
+            "family lost its own key family-old-laptop after a rebuild: {fam:?}"
+        );
+        assert!(fam.contains(&family.public_key), "{fam:?}");
+        // Still no key of a tenant that does not prefix the file.
+        let fam_old = publics(&load_tenant_identities(&conn, tmp.path(), "family-old").unwrap());
+        assert!(fam_old.contains(&old.public_key), "{fam_old:?}");
+        assert!(!fam_old.contains(&family.public_key), "{fam_old:?}");
     }
 
     /// Positive control, ported from the old loader: every rotation's key
