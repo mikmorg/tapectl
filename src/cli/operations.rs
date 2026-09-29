@@ -2277,6 +2277,12 @@ fn thinnest_current_version(
 }
 
 /// Mark a unit as tape-only with enforcement.
+///
+/// `force` is ADR-0008's Tier-2 confirmation for this command: it answers
+/// the consent prompt in advance, as the global `--yes` does for every
+/// Tier-2 prompt — a caller holding `--yes` passes `force || yes`, the
+/// shape `volume compact-finish` uses. It never reaches the Tier-3
+/// never-archived refusal.
 pub fn unit_mark_tape_only(
     conn: &Connection,
     config: &Config,
@@ -2287,8 +2293,18 @@ pub fn unit_mark_tape_only(
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
-    let min_copies = config.defaults.min_copies;
-    let min_locations = config.defaults.min_locations;
+    // Issue #348: the unit's RESOLVED policy (dotfile > archive set >
+    // defaults), the same `policy::resolve` `audit` checks against — not
+    // `[defaults]` read directly, which let a unit in an archive set asking
+    // for 3 copies be marked tape-only with 2. A policy that cannot be
+    // resolved refuses here (the error names the layer that broke): a
+    // delete-greenlighting gate must not guess at a policy.
+    let policy = crate::policy::resolve(conn, config, &unit)?;
+    let min_copies = policy.min_copies;
+    // The location-count floor has no per-unit or per-archive-set layer:
+    // it exists only in `[defaults]`, so it is read from there. The named
+    // `required_locations` below is the per-set location policy.
+    let min_locations = i64::from(config.defaults.min_locations);
 
     // Count copies and locations. ADR-0004: a write's own `status =
     // 'completed'` only proves the volume was sealed AT WRITE TIME —
@@ -2312,6 +2328,14 @@ pub fn unit_mark_tape_only(
     let (copy_count, location_count): (i64, i64) =
         conn.query_row(&sql, params![unit.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
+    // Issue #348: `required_locations` checked BY NAME, through the one
+    // predicate `audit`'s `location_presence` also uses.
+    let missing_locations = crate::policy::coverage::missing_required_locations(
+        conn,
+        unit.id,
+        &policy.required_locations,
+    )?;
+
     // Issue #153 / ADR-0012: `copy_count` above is already the MINIMUM
     // across the unit's current versions -- this names WHICH version that
     // minimum belongs to, so the operator isn't left staring at a single
@@ -2325,8 +2349,8 @@ pub fn unit_mark_tape_only(
     let pending =
         crate::collection::fingerprint::classify(conn, &unit, &config.defaults.global_excludes)?;
 
-    // TIER 3 (ADR-0008): zero coverage is ABSOLUTE. Checked BEFORE `force`
-    // is consulted, and deliberately outside the `if !force` block below.
+    // TIER 3 (ADR-0008): zero coverage is ABSOLUTE. Checked BEFORE the
+    // consent gate, and deliberately outside it.
     //
     // A never-archived unit has no snapshot, so no tape holds it and there
     // is no claim to be stale. Marking it tape-only is not a riskier
@@ -2339,7 +2363,7 @@ pub fn unit_mark_tape_only(
     //
     // The copy-count check below cannot stand in for this. It catches a
     // never-archived unit only INCIDENTALLY (zero completed writes fails
-    // `copy_count < min_copies`), and `min_copies_for_tape_only` is
+    // `copy_count < min_copies`), and the resolved `min_copies` is
     // operator-configurable — at 0 that comparison passes vacuously.
     if matches!(
         pending.as_ref().map(|p| &p.reason),
@@ -2353,7 +2377,21 @@ pub fn unit_mark_tape_only(
         ));
     }
 
-    // TIER 2 (ADR-0008): degraded but non-zero coverage — `--force` overrides.
+    // ADR-0004 Tier 1: evidence age for the coverage this unit is about to
+    // rely on. Display-only: never gates, never changes the tier logic,
+    // never affects the exit code. Computed before the consent gate so it
+    // is among the facts shown at the moment consent is asked — marking
+    // tape-only is exactly when local data may be deleted.
+    let evidence = crate::policy::evidence::remaining_coverage_evidence(conn, unit.id, None)?;
+    let now = chrono::Utc::now().naive_utc();
+    let evidence_summary = crate::policy::evidence::describe(unit_name, &evidence, now);
+
+    // TIER 2 (ADR-0008): degraded but non-zero coverage — each shortfall is
+    // a fact, and any fact at all sends this through the one consent gate
+    // (`cli::consent::confirm`: prompt on a terminal; `--force`/`--yes`
+    // confirm in advance; a non-interactive run without either refuses with
+    // the facts). A compliant unit has no facts and never reaches the gate,
+    // so a scripted run of a policy-meeting unit is not blocked.
     //
     // Issue #89 / ADR-0004 interaction, decided by the coordinator and
     // recorded here so it is not re-litigated: `copy_count` above already
@@ -2367,36 +2405,62 @@ pub fn unit_mark_tape_only(
     // DEGRADED, not incoherent — the cartridge still physically exists,
     // and quarantine means "claims unreliable until reconciled at
     // contact," not "gone." So this stays Tier 2 and remains
-    // `--force`-overridable, same as any other below-threshold copy
-    // count. Do not move this case into the Tier-3 guard above.
-    if !force {
-        if copy_count < min_copies as i64 {
-            return Err(TapectlError::Other(format!(
-                "insufficient copies: {copy_count} < {min_copies} required (use --force to override)"
-            )));
+    // confirmable, same as any other below-threshold copy count. Do not
+    // move this case into the Tier-3 guard above.
+    let mut facts: Vec<String> = Vec::new();
+    if copy_count < min_copies {
+        facts.push(format!(
+            "insufficient copies: {copy_count} < {min_copies} required by unit \
+             \"{unit_name}\"'s policy"
+        ));
+        // Which version the shortfall is on — only worth a line when the
+        // unit carries more than one current version.
+        if let Some(t) = thinnest_version
+            .as_ref()
+            .filter(|t| t.total_current_versions > 1)
+        {
+            facts.push(format!("  {}", t.describe()));
         }
-        if location_count < min_locations as i64 {
-            return Err(TapectlError::Other(format!(
-                "insufficient locations: {location_count} < {min_locations} required (use --force to override)"
-            )));
+    }
+    if location_count < min_locations {
+        facts.push(format!(
+            "insufficient locations: {location_count} < {min_locations} required \
+             ([defaults] location floor)"
+        ));
+    }
+    if !missing_locations.is_empty() {
+        facts.push(format!(
+            "insufficient locations: no copy at required location(s) {} (policy requires {})",
+            missing_locations.join(", "),
+            policy.required_locations.join(", ")
+        ));
+    }
+    // Dirty is Tier 2, not Tier 3: the tape copy is stale relative to
+    // disk, but it exists. An operator may legitimately know the delta
+    // is junk. `tape_only` is the signal that local data may be deleted,
+    // so a stale copy still warrants asking by default.
+    if let Some(p) = &pending {
+        if matches!(
+            p.reason,
+            crate::collection::fingerprint::PendingReason::Dirty
+        ) {
+            facts.push(format!(
+                "unit is dirty: on-disk contents changed since the last snapshot — {}",
+                p.changes.describe()
+            ));
         }
-
-        // Dirty is Tier 2, not Tier 3: the tape copy is stale relative to
-        // disk, but it exists. An operator may legitimately know the delta
-        // is junk. `tape_only` is the signal that local data may be deleted,
-        // so a stale copy still warrants refusing by default.
-        if let Some(p) = &pending {
-            if matches!(
-                p.reason,
-                crate::collection::fingerprint::PendingReason::Dirty
-            ) {
-                return Err(TapectlError::Other(format!(
-                    "unit is dirty: on-disk contents changed since the last snapshot — {} \
-                     (use --force to override)",
-                    p.changes.describe()
-                )));
-            }
+    }
+    if !facts.is_empty() {
+        if let Some(line) = &evidence_summary {
+            facts.push(line.clone());
         }
+        facts
+            .push("(`--force` on this command gives the same confirmation as `--yes`)".to_string());
+        crate::cli::consent::confirm(
+            &format!("mark unit \"{unit_name}\" tape-only"),
+            &facts,
+            force,
+        )?;
     }
 
     conn.execute(
@@ -2414,15 +2478,6 @@ pub fn unit_mark_tape_only(
         "tape_only",
         Some(unit.tenant_id),
     )?;
-
-    // ADR-0004 Tier 1: display evidence age for the coverage this unit is
-    // now relying on -- marking tape-only is exactly the point at which
-    // local data may be deleted, so the operator should see how strong
-    // that remaining coverage is. Display-only: never gates, never changes
-    // the tier logic above, never affects the exit code.
-    let evidence = crate::policy::evidence::remaining_coverage_evidence(conn, unit.id, None)?;
-    let now = chrono::Utc::now().naive_utc();
-    let evidence_summary = crate::policy::evidence::describe(unit_name, &evidence, now);
 
     if json_output {
         let evidence_json: Vec<serde_json::Value> = evidence.iter().map(evidence_json).collect();
@@ -4232,6 +4287,102 @@ mod tests {
             "active",
             "a refused mark-tape-only must not have changed unit status"
         );
+    }
+
+    /// Issue #348: `unit mark-tape-only` read `[defaults]` directly instead
+    /// of the unit's resolved policy, checked `required_locations` by count
+    /// only (not at all, in fact — only the defaults' count floor), and
+    /// refused with "(use --force to override)" instead of going through
+    /// the ADR-0008 Tier-2 consent gate.
+    ///
+    /// Fixture: `coverage::tests::setup_unit_with_deposit` — unit `photos`,
+    /// one sealed tape at `home` plus a warehouse deposit at `glacier`: 2
+    /// copies in 2 locations, which the DEFAULTS (2/2) accept. The unit has
+    /// no `current_path`, so neither the dirty nor the never-archived guard
+    /// can fire; only the policy under test can refuse.
+    mod issue348_resolved_policy_and_consent {
+        use super::*;
+
+        fn photos_in_archive_set(columns: &str, values: &str) -> Connection {
+            let (conn, unit_id, _vol) =
+                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+            conn.execute(
+                &format!("INSERT INTO archive_sets (name, {columns}) VALUES ('strict', {values})"),
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE id = ?2",
+                params![set_id, unit_id],
+            )
+            .unwrap();
+            conn
+        }
+
+        fn photos_status(conn: &Connection) -> String {
+            conn.query_row("SELECT status FROM units WHERE name = 'photos'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        }
+
+        /// The archive set asks for 3 copies; the default is 2 and the unit
+        /// has 2. The resolved policy decides.
+        #[test]
+        fn gates_on_the_archive_sets_min_copies_not_the_default() {
+            let conn = photos_in_archive_set("min_copies", "3");
+            let config = Config::default();
+
+            let err = unit_mark_tape_only(&conn, &config, "photos", false, false)
+                .expect_err("2 copies against an archive set's min_copies of 3 must not pass");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("insufficient copies: 2 < 3 required"),
+                "the refusal must name the resolved shortfall: {msg}"
+            );
+            assert!(
+                msg.contains("mark unit \"photos\" tape-only refused: non-interactive session"),
+                "a Tier-2 shortfall goes through the consent gate, which refuses \
+                 without a terminal: {msg}"
+            );
+            assert_eq!(photos_status(&conn), "active");
+
+            unit_mark_tape_only(&conn, &config, "photos", true, false)
+                .expect("Tier 2: --force confirms, as ADR-0008 says");
+            assert_eq!(photos_status(&conn), "tape_only");
+        }
+
+        /// Two locations hold copies, but not the two the policy names —
+        /// the same predicate `audit`'s `location_presence` uses.
+        #[test]
+        fn gates_on_the_named_required_locations() {
+            let conn = photos_in_archive_set("required_locations", "'[\"home\",\"offsite\"]'");
+            let config = Config::default();
+
+            let err = unit_mark_tape_only(&conn, &config, "photos", false, false)
+                .expect_err("home + glacier does not satisfy [home, offsite]");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(
+                    "insufficient locations: no copy at required location(s) offsite \
+                     (policy requires home, offsite)"
+                ),
+                "{msg}"
+            );
+            assert_eq!(photos_status(&conn), "active");
+        }
+
+        /// Positive control for the one above: the names met, nothing to
+        /// confirm, no prompt — a compliant unit must never reach the gate
+        /// (a non-interactive run would otherwise refuse it).
+        #[test]
+        fn a_unit_meeting_its_named_locations_is_marked_without_a_prompt() {
+            let conn = photos_in_archive_set("required_locations", "'[\"home\",\"glacier\"]'");
+            unit_mark_tape_only(&conn, &Config::default(), "photos", false, false)
+                .expect("every named location holds a copy");
+            assert_eq!(photos_status(&conn), "tape_only");
+        }
     }
 
     /// Issue #38/H12: `volume_retire`'s ADR-0008 Tier-2 consent gate.
