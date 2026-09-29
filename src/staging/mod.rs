@@ -1428,15 +1428,27 @@ fn encrypt_file_streaming_inner(
     pubkey_strings: &[String],
 ) -> Result<EncryptedSliceInfo> {
     let encryptor = build_encryptor(pubkey_strings)?;
-
     let input = fs::File::open(input_path)?;
-    let mut reader = HashingReader::new(input);
-
     let output = fs::File::create(output_path)?;
+    encrypt_stream(encryptor, input, output)
+}
+
+/// The body of [`encrypt_file_streaming`] over any reader and writer — the
+/// seam a test drives a writer that fails partway through.
+fn encrypt_stream(
+    encryptor: age::Encryptor,
+    input: impl Read,
+    output: impl Write,
+) -> Result<EncryptedSliceInfo> {
+    let mut reader = HashingReader::new(input);
     let hashing_output = HashingWriter::new(output);
-    let mut writer = encryptor
-        .wrap_output(hashing_output)
-        .map_err(|e| TapectlError::Encryption(format!("wrap_output failed: {e}")))?;
+    // Issue #354: both `wrap_output` (which writes the age header) and
+    // `finish` (which writes the last chunk) fail only by failing to write,
+    // so their errors stay io errors — `encrypt_file_streaming` then names
+    // the slice and its `.age`. As `Encryption` strings they used to pass
+    // through it pathless: an ENOSPC in staging read "encryption error:
+    // finish failed: No space left on device (os error 28)".
+    let mut writer = encryptor.wrap_output(hashing_output)?;
 
     let plain_size = stream_copy(&mut reader, &mut writer)?;
     let sha256_plain = reader.finalize_hex();
@@ -1448,9 +1460,7 @@ fn encrypt_file_streaming_inner(
     // `stream_copy` has streamed the *entire* plaintext without error — an
     // error above returns via `?` and never reaches this line, so a
     // partial stream is never finished into a falsely-valid file.
-    let hashing_output = writer
-        .finish()
-        .map_err(|e| TapectlError::Encryption(format!("finish failed: {e}")))?;
+    let hashing_output = writer.finish()?;
     let sha256_encrypted = hashing_output.finalize_hex();
     let encrypted_size = hashing_output.bytes_written() as i64;
 
@@ -3082,6 +3092,107 @@ mod tests {
         );
         assert!(msg.contains("cannot encrypt"), "names the operation: {msg}");
         assert_eq!(os_error_mentions(&msg), 1, "printed once: {msg}");
+    }
+
+    /// Issue #354 (a): the staging filesystem filling up WHILE the `.age` is
+    /// written — not at `File::create` — must name the paths too. The age
+    /// header is written by `wrap_output`, and the last (for a slice under
+    /// 64 KiB, the only) chunk by `finish`; both used to surface as
+    /// `Encryption` strings naming neither file — `encryption error:
+    /// wrap_output failed: failed to write header: ...` and `encryption
+    /// error: finish failed: No space left on device (os error 28)`.
+    ///
+    /// The output is a symlink to `/dev/full`, where every write is ENOSPC.
+    /// Never the device itself: on failure `encrypt_file_streaming` removes
+    /// its output path, which would unlink `/dev/full` under root.
+    #[test]
+    fn a_full_staging_filesystem_while_encrypting_names_the_paths_once() {
+        if !Path::new("/dev/full").exists() {
+            eprintln!("skipping: no /dev/full");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("slice.1.dar");
+        fs::write(&input, b"plaintext slice").unwrap();
+        let output = tmp.path().join("slice.1.dar.age");
+        std::os::unix::fs::symlink("/dev/full", &output).unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+
+        let Err(err) = encrypt_file_streaming(&input, &output, &[kp.public_key]) else {
+            panic!("every write to /dev/full fails");
+        };
+        let msg = as_operator_sees_it(err);
+        assert!(
+            msg.contains(&*output.to_string_lossy()) && msg.contains(&*input.to_string_lossy()),
+            "the error must name the slice and its .age: {msg}"
+        );
+        assert!(
+            msg.contains("cannot encrypt") && !msg.contains("wrap_output failed"),
+            "names the operation, in the operator's terms: {msg}"
+        );
+        // age writes the header itself and flattens the io error into its
+        // own text ("failed to write header: IoError(Os { .. })"), so the
+        // cause is there in age's words, not as "(os error 28)" — once.
+        assert_eq!(
+            msg.matches("No space left on device").count(),
+            1,
+            "the cause, printed once: {msg}"
+        );
+        assert!(
+            Path::new("/dev/full").exists(),
+            "the device itself is untouched"
+        );
+    }
+
+    /// A writer that accepts `budget` bytes in all, then fails with ENOSPC —
+    /// a staging filesystem filling up partway through one `.age`.
+    struct FillsUpAfter {
+        budget: usize,
+        accepted: usize,
+    }
+    impl Write for FillsUpAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.accepted + buf.len() > self.budget {
+                return Err(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::ENOSPC as i32,
+                ));
+            }
+            self.accepted += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The `finish` half of the test above: the header fits, then the final
+    /// chunk does not. The failure must come out as an io error, which
+    /// `encrypt_file_streaming` rewrites to name both paths — not as an
+    /// `Encryption` string it passes through without them.
+    #[test]
+    fn running_out_of_space_at_the_final_chunk_is_an_io_error() {
+        let kp = crate::crypto::keys::generate_keypair();
+        let plaintext = vec![7u8; 8 * 1024]; // under one 64 KiB STREAM chunk
+        let mut out = FillsUpAfter {
+            budget: 4096,
+            accepted: 0,
+        };
+
+        let err = encrypt_stream(
+            build_encryptor(&[kp.public_key]).unwrap(),
+            &plaintext[..],
+            &mut out,
+        )
+        .err()
+        .expect("8 KiB of ciphertext cannot fit a 4 KiB budget");
+        assert!(
+            out.accepted > 0,
+            "fixture: the header must have been written, so the failure is finish's"
+        );
+        assert!(
+            matches!(err, TapectlError::Io(_)),
+            "an ENOSPC in finish must reach the path-naming wrapper as io: {err:?}"
+        );
     }
 
     /// The complement of the refusal above, and the ordering story issue
