@@ -51,6 +51,14 @@
 -- `rusqlite_migration`'s dump of this whole script in front of it. The
 -- CHECK constraints below remain the backstop.
 --
+-- `RAISE(ABORT, NEW.message)` takes an EXPRESSION as its message, which
+-- older SQLite parsers reject (the system sqlite3 3.45.1 on the dev VM does;
+-- the 3.51.3 rusqlite bundles accepts it, and tapectl always runs on the
+-- bundled engine). Apply this migration only through tapectl: `migrate()`
+-- runs it inside one transaction, so any failure rolls everything back. A
+-- hand application with an older `sqlite3` CLI would skip the guard with a
+-- parse error and, without `.bail on`, carry on into the DROPs.
+--
 -- NO DEFAULT ON volumes.status (the coordinator's P1 ruling)
 -- ----------------------------------------------------------
 -- 'blank' was the DEFAULT. 'initialized' would be the wrong replacement: it
