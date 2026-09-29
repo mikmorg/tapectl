@@ -26,6 +26,8 @@
 //! Like [`crate::policy::shadowing`], this advises and never rewrites,
 //! and it must never affect `config check`'s exit code.
 
+use std::collections::BTreeMap;
+
 use rusqlite::Connection;
 
 use crate::config::Config;
@@ -44,12 +46,16 @@ pub struct SubsumedAcls {
 /// Every layer whose effective `preserve_acls` disagrees with its effective
 /// `preserve_xattrs`.
 ///
-/// Reads `config.defaults` and the `archive_sets` table; an archive set's
-/// NULL column inherits `[defaults]`, exactly as `policy::resolve` does, so
-/// a set that turns only `preserve_xattrs` off is judged on the
-/// `preserve_acls` it inherits. A set that sets neither column is covered by
-/// the `defaults` line. Dotfiles are not scanned: a dotfile's `[policy]`
-/// table accepts neither key (`unit::dotfile::PolicySection`).
+/// Reads `config.defaults`, the `archive_sets` rows and each
+/// `[[archive_sets]]` table. A set is judged on the pair the next
+/// `archive-set sync` would leave it with: a key its table names wins (sync
+/// writes exactly the keys present, issue #346), then the row's column, and
+/// a NULL column inherits `[defaults]`, exactly as `policy::resolve` does —
+/// so a set that turns only `preserve_xattrs` off is judged on the
+/// `preserve_acls` it inherits, and a table not yet synced is judged too
+/// (as `policy::decorative` reads both). A set that sets neither key is
+/// covered by the `defaults` line. Dotfiles are not scanned: a dotfile's
+/// `[policy]` table accepts neither key (`unit::dotfile::PolicySection`).
 pub fn scan(config: &Config, conn: &Connection) -> Vec<SubsumedAcls> {
     let mut out = Vec::new();
     let defaults = &config.defaults;
@@ -61,32 +67,44 @@ pub fn scan(config: &Config, conn: &Connection) -> Vec<SubsumedAcls> {
         });
     }
 
+    // name -> (preserve_xattrs, preserve_acls), `None` = inherit [defaults].
+    let mut sets: BTreeMap<String, (Option<bool>, Option<bool>)> = BTreeMap::new();
     // A missing table (fresh DB) is not an error for an advisory scan.
-    let mut stmt = match conn.prepare(
+    if let Ok(mut stmt) = conn.prepare(
         "SELECT name, preserve_xattrs, preserve_acls FROM archive_sets
-         WHERE preserve_xattrs IS NOT NULL OR preserve_acls IS NOT NULL
-         ORDER BY name",
+         WHERE preserve_xattrs IS NOT NULL OR preserve_acls IS NOT NULL",
     ) {
-        Ok(s) => s,
-        Err(_) => return out,
-    };
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    });
-    if let Ok(rows) = rows {
-        for (name, xattrs, acls) in rows.flatten() {
-            let xattrs = xattrs.map_or(defaults.preserve_xattrs, |v| v != 0);
-            let acls = acls.map_or(defaults.preserve_acls, |v| v != 0);
-            if acls != xattrs {
-                out.push(SubsumedAcls {
-                    source: format!("archive set \"{name}\""),
-                    preserve_acls: acls,
-                });
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        });
+        if let Ok(rows) = rows {
+            for (name, xattrs, acls) in rows.flatten() {
+                sets.insert(name, (xattrs.map(|v| v != 0), acls.map(|v| v != 0)));
             }
+        }
+    }
+    for table in &config.archive_sets {
+        let pair = sets.entry(table.name.clone()).or_insert((None, None));
+        if table.preserve_xattrs.is_some() {
+            pair.0 = table.preserve_xattrs;
+        }
+        if table.preserve_acls.is_some() {
+            pair.1 = table.preserve_acls;
+        }
+    }
+
+    for (name, (xattrs, acls)) in sets {
+        let xattrs = xattrs.unwrap_or(defaults.preserve_xattrs);
+        let acls = acls.unwrap_or(defaults.preserve_acls);
+        if acls != xattrs {
+            out.push(SubsumedAcls {
+                source: format!("archive set \"{name}\""),
+                preserve_acls: acls,
+            });
         }
     }
 
@@ -232,6 +250,63 @@ mod tests {
                 source: "archive set \"bare\"".to_string(),
                 preserve_acls: true,
             }]
+        );
+    }
+
+    /// A `[[archive_sets]]` table is judged too, not only the row: an
+    /// operator who writes `preserve_xattrs = false` into config.toml and
+    /// runs `config check` before `archive-set sync` must see the note the
+    /// sync will make true (`policy::decorative` reads both the same way).
+    #[test]
+    fn an_unsynced_archive_sets_table_is_judged_too() {
+        let mut config = Config::default();
+        let mut media = crate::config::ArchiveSetConfig {
+            name: "media".to_string(),
+            min_copies: None,
+            required_locations: None,
+            encrypt: None,
+            compression: None,
+            checksum_mode: None,
+            verify_interval_days: None,
+            slice_size: None,
+            preserve_xattrs: Some(false),
+            preserve_acls: None,
+            preserve_fsa: None,
+            dirty_on_metadata_change: None,
+        };
+        config.archive_sets.push(media.clone());
+        let expected = vec![SubsumedAcls {
+            source: "archive set \"media\"".to_string(),
+            preserve_acls: true,
+        }];
+        assert_eq!(scan(&config, &conn_without_archive_sets()), expected);
+        let conn = crate::db::open_memory().unwrap();
+        assert_eq!(scan(&config, &conn), expected);
+
+        // A key the table names wins over the row, as the next sync will
+        // make it (issue #346); a key it omits keeps the row's value.
+        conn.execute(
+            "INSERT INTO archive_sets (name, preserve_xattrs, preserve_acls) \
+             VALUES ('media', 1, 0)",
+            [],
+        )
+        .unwrap();
+        media.preserve_xattrs = Some(false);
+        config.archive_sets[0] = media.clone();
+        assert!(
+            scan(&config, &conn).is_empty(),
+            "table xattrs=false + row acls=false agree, once reported: {:?}",
+            scan(&config, &conn)
+        );
+        media.preserve_xattrs = None;
+        config.archive_sets[0] = media;
+        assert_eq!(
+            scan(&config, &conn),
+            vec![SubsumedAcls {
+                source: "archive set \"media\"".to_string(),
+                preserve_acls: false,
+            }],
+            "a table naming neither key leaves the row's disagreement standing"
         );
     }
 
