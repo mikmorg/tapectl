@@ -418,6 +418,29 @@ check volume_init     step_vol_init
 check volume_write    step_vol_write
 check sealed_at_recorded step_sealed_at
 check volume_verify   step_vol_verify
+
+# ---------- #355: an empty drive is refused at once ----------
+# Before #355 only `volume init` probed for a cartridge; `volume verify` (and
+# write, identify, restore) on an empty drive sat ~2 minutes in the kernel's
+# open and then failed with a bare I/O error. The probe must refuse at once,
+# naming the device, and verify's exit must be 3 (inconclusive: nothing about
+# any medium was learned). The timeout turns the old stall into a failure.
+step_empty_drive_refused() {
+    local slot out rc
+    slot="$(mtx -f "$CHG_SG" status | sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
+    [ -n "$slot" ] || { echo "no cartridge in DTE $DTE to take out"; return 1; }
+    mtx -f "$CHG_SG" unload "$slot" "$DTE" || { echo "unload of DTE $DTE to slot $slot failed"; return 1; }
+    out="$(timeout 60 "$BIN" --home "$HOME_DIR" --config "$CFG" volume verify "$LABEL" --device "$TAPE_DEV" 2>&1)"
+    rc=$?
+    # Put the cartridge back BEFORE judging, so a failure here cannot strand
+    # every later check on an empty drive; rewind blocks until it is ready.
+    mtx -f "$CHG_SG" load "$slot" "$DTE" || { echo "reload of slot $slot into DTE $DTE failed"; return 1; }
+    mt -f "$TAPE_DEV" rewind >/dev/null 2>&1 || true
+    printf '%s\n' "$out"
+    [ "$rc" = 3 ] || { echo "exit $rc, want 3 (124 = the open stalled: the probe did not run first)"; return 1; }
+    grep -q "no cartridge loaded in" <<<"$out" || { echo "the refusal does not say 'no cartridge loaded in'"; return 1; }
+}
+check empty_drive_refused step_empty_drive_refused
 check evidence_row    step_evidence
 check restore_diff    step_restore_A
 check restore_multislice_unit step_restore_B
