@@ -5018,8 +5018,10 @@ mod tests {
         )
         .to_string();
         assert!(
-            msg.contains("name 2 different session directories \
-                 (/scratch/session-a, /scratch/session-b)"),
+            msg.contains(
+                "name 2 different session directories \
+                 (/scratch/session-a, /scratch/session-b)"
+            ),
             "{msg}"
         );
         assert!(

@@ -900,7 +900,10 @@ mod tests {
         // Issue #357: the ruling is cited by its ADR, which tells an operator
         // why; the tracker number (`#143`) told them nothing.
         assert!(msg.contains("by decision: ADR-0012)"), "{msg}");
-        assert!(!msg.contains('#'), "no issue numbers in a runtime message: {msg}");
+        assert!(
+            !msg.contains('#'),
+            "no issue numbers in a runtime message: {msg}"
+        );
     }
 
     /// The read-side twin carries the same config half, so the same #357
@@ -911,7 +914,10 @@ mod tests {
         let msg = cannot_read_message(Generation::Lto5, Generation::Lto7, &backend);
         assert!(msg.contains("cannot read LTO-7 media"), "{msg}");
         assert!(msg.contains("by decision: ADR-0012)"), "{msg}");
-        assert!(!msg.contains('#'), "no issue numbers in a runtime message: {msg}");
+        assert!(
+            !msg.contains('#'),
+            "no issue numbers in a runtime message: {msg}"
+        );
     }
 
     #[test]

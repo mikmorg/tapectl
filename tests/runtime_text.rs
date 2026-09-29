@@ -384,7 +384,12 @@ fn g<'a>(x: &'a str) -> &'a str { "after the tests #17" }
         .iter()
         .filter_map(|(_, t)| issue_reference(t))
         .collect();
-    assert_eq!(refs, vec!["#13", "#14", "#15", "#17"], "{:?}", lexed.literals);
+    assert_eq!(
+        refs,
+        vec!["#13", "#14", "#15", "#17"],
+        "{:?}",
+        lexed.literals
+    );
     let line_of = |needle: &str| {
         lexed
             .literals
@@ -393,8 +398,16 @@ fn g<'a>(x: &'a str) -> &'a str { "after the tests #17" }
             .map(|(l, _)| *l)
     };
     assert_eq!(line_of("#13"), Some(8));
-    assert_eq!(line_of("#14"), Some(9), "a literal is reported on its first line");
-    assert_eq!(line_of("two #15"), Some(11), "continuation joins without the newline");
+    assert_eq!(
+        line_of("#14"),
+        Some(9),
+        "a literal is reported on its first line"
+    );
+    assert_eq!(
+        line_of("two #15"),
+        Some(11),
+        "continuation joins without the newline"
+    );
     assert!(!lexed.code.contains("mod tests"), "{}", lexed.code);
     assert!(!lexed.code.contains("only_for_tests"), "{}", lexed.code);
     assert!(lexed.code.contains("fn g<'a>"), "{}", lexed.code);
@@ -459,7 +472,10 @@ fn operator_level_log_fields_carry_no_debug_rendering() {
             }
         }
     }
-    assert!(calls > 50, "the scan found only {calls} info!/warn!/error! calls");
+    assert!(
+        calls > 50,
+        "the scan found only {calls} info!/warn!/error! calls"
+    );
     assert!(
         offenders.is_empty(),
         "a log field an operator reads renders Rust's {{:?}} — use %value or a method \
