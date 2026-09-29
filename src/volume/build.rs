@@ -654,7 +654,11 @@ impl BuiltLayout {
                 if !violations.is_empty() {
                     errs.push(LayoutError::GeneratedZoneInconsistent {
                         position,
-                        message: format!("{violations:?}"),
+                        message: violations
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; "),
                     });
                 }
             }

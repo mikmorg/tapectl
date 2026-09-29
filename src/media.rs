@@ -253,6 +253,18 @@ pub enum CapacitySource {
     GenerationTable,
 }
 
+impl CapacitySource {
+    /// Where the figure came from, in words (issue #357: the `volume init`
+    /// log line carried this as Rust's `{:?}`).
+    pub fn describe(self) -> &'static str {
+        match self {
+            CapacitySource::DriveOverride => "the drive's capacity_override",
+            CapacitySource::CartridgeRow => "the cartridge's registered capacity",
+            CapacitySource::GenerationTable => "the generation's native capacity",
+        }
+    }
+}
+
 /// A volume's capacity in bytes, decided ONCE at `volume init` and then
 /// stored on `volumes.capacity_bytes` (ADR-0010, decision 3).
 ///
@@ -686,6 +698,20 @@ mod tests {
         );
         assert_eq!(bytes, 2_400 * 1024 * 1024);
         assert_eq!(src, CapacitySource::DriveOverride);
+    }
+
+    /// Issue #357: the source is logged in words, never as `DriveOverride`.
+    #[test]
+    fn capacity_source_describes_itself_in_words() {
+        for (src, debug) in [
+            (CapacitySource::DriveOverride, "DriveOverride"),
+            (CapacitySource::CartridgeRow, "CartridgeRow"),
+            (CapacitySource::GenerationTable, "GenerationTable"),
+        ] {
+            assert_eq!(format!("{src:?}"), debug);
+            assert!(!src.describe().contains(debug), "{}", src.describe());
+            assert!(src.describe().contains(' '), "{}", src.describe());
+        }
     }
 
     /// The whole point of issue #141: an LTO-5 cartridge in an LTO-6 drive

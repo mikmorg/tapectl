@@ -989,9 +989,10 @@ impl InterruptedSession {
         if dirs.len() > 1 {
             return Err(TapectlError::Other(format!(
                 "volume {volume_id}: its {status} `writes` rows name {} different session \
-                 directories ({dirs:?}) — these are not one write session, and resuming would \
+                 directories ({}) — these are not one write session, and resuming would \
                  mix frozen files from different builds. Resolve by hand before retrying.",
-                dirs.len()
+                dirs.len(),
+                dirs.join(", ")
             )));
         }
         let session_dir = Path::new(dirs[0]).to_path_buf();
@@ -1794,8 +1795,9 @@ fn run_entries(
                 entry.position
             )),
             Ok(actual_hash) if expected_hash != Some(actual_hash.as_str()) => Some(format!(
-                "hash mismatch at position {}: expected {expected_hash:?}, got {actual_hash}",
-                entry.position
+                "hash mismatch at position {}: expected {}, got {actual_hash}",
+                entry.position,
+                expected_hash.unwrap_or("no recorded hash")
             )),
             Ok(_) => None,
         };

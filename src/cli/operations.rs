@@ -845,12 +845,12 @@ pub(crate) fn below_policy_facts(
             }
             if needed_locations > 0 && version.locations_after < needed_locations {
                 facts.push(format!(
-                    "unit \"{}\" v{} would be left in {} location(s), below its policy of {} ({:?})",
+                    "unit \"{}\" v{} would be left in {} location(s), below its policy of {} ({})",
                     impact.unit_name,
                     version.version,
                     version.locations_after,
                     needed_locations,
-                    policy.required_locations
+                    policy.required_locations.join(", ")
                 ));
             }
         }

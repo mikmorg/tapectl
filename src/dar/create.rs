@@ -190,9 +190,14 @@ pub fn list_slices(archive_base: &Path) -> Result<Vec<PathBuf>> {
                 "dar slice numbering for archive \"{stem}\" is not a clean \
                  1..={total} run: expected slice {expected} at position \
                  {position} (1-based), found slice {n} instead — all parsed \
-                 slice numbers: {found:?}. Refusing to guess an order: a \
+                 slice numbers: {}. Refusing to guess an order: a \
                  gap, duplicate, or out-of-range slice number means dar did \
                  not produce what tapectl expected.",
+                found
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 total = numbered.len(),
                 position = i + 1,
             )));

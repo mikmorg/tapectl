@@ -468,7 +468,7 @@ fn volume_init_in_contact<'c>(
         label,
         %generation,
         nominal_capacity,
-        capacity_source = ?capacity_source,
+        capacity_source = capacity_source.describe(),
         "volume media resolved"
     );
 
@@ -3410,22 +3410,40 @@ fn record_write_bookkeeping(
 pub(crate) fn describe_quarantine(reason: &QuarantineReason) -> String {
     match reason {
         QuarantineReason::ConfirmFailed(evidence) => format!(
-            "confirm chain-walk found {} mismatch(es) at tier {:?}: {:?}",
+            "confirm chain-walk ({}) found {} mismatch(es): {}",
+            evidence.tier.describe(),
             evidence.mismatches.len(),
-            evidence.tier,
-            evidence.mismatches
+            evidence
+                .mismatches
+                .iter()
+                .map(crate::store::Mismatch::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
         QuarantineReason::IdentityMismatch {
             expected_label,
             expected_uuid,
             found,
         } => format!(
-            "identity mismatch: expected label={expected_label:?} uuid={expected_uuid:?}, found {found:?}"
+            "identity mismatch: expected label={expected_label:?}, uuid={expected_uuid:?}; \
+             found {}",
+            describe_file0_identity(found.as_ref())
         ),
         QuarantineReason::AlreadySealed { seal_position } => format!(
             "tape already carries a seal marker at position {seal_position} \
              (ADR-0003: sealed volumes are immutable)"
         ),
+    }
+}
+
+/// What File 0 said, for a message that reports an identity mismatch: the
+/// label and uuid it carries, or that it did not parse at all. One wording
+/// for the fresh-write refusal and the resume quarantine (issue #357: the
+/// latter printed `Some(IdThunkIdentity { .. })`).
+fn describe_file0_identity(found: Option<&super::format::IdThunkIdentity>) -> String {
+    match found {
+        Some(id) => format!("label={:?}, uuid={:?}", id.label, id.uuid),
+        None => "a present but unparseable/corrupt File 0".to_string(),
     }
 }
 
@@ -3501,10 +3519,7 @@ fn decide_fresh_write_contact(
              physical tape, then run `tapectl cartridge mark-erased` before writing to it again."
         ))),
         ContactOutcome::IdentityMismatch { found } => {
-            let found_desc = match found {
-                Some(id) => format!("label={:?}, uuid={:?}", id.label, id.uuid),
-                None => "a present but unparseable/corrupt File 0".to_string(),
-            };
+            let found_desc = describe_file0_identity(found.as_ref());
             if allow_overwrite {
                 warn!(
                     label,
@@ -9754,21 +9769,81 @@ mod tests {
         assert_eq!(status, "sealed");
     }
 
+    /// Issue #357: an operator reads this line (it is the quarantine error
+    /// and the `write_quarantined` event), so the tier and every mismatch
+    /// are rendered in words — never Rust's `{:?}` of `Tier`/`Mismatch`.
     #[test]
-    fn describe_quarantine_confirm_failed_mentions_mismatch_count_and_tier() {
+    fn describe_quarantine_confirm_failed_renders_tier_and_mismatches_in_words() {
         let evidence = Evidence {
             tier: Tier::Integrity,
             files_checked: 5,
-            mismatches: vec![Mismatch {
-                position: 4,
-                kind: MismatchKind::ContentHashMismatch,
-                expected: "aa".into(),
-                actual: "bb".into(),
-            }],
+            mismatches: vec![
+                Mismatch {
+                    position: 4,
+                    kind: MismatchKind::ContentHashMismatch,
+                    expected: "aa".into(),
+                    actual: "bb".into(),
+                },
+                Mismatch {
+                    position: 6,
+                    kind: MismatchKind::NavigationDisagreement,
+                    expected: "front index lists position 6".into(),
+                    actual: "missing from front index".into(),
+                },
+            ],
         };
         let msg = describe_quarantine(&QuarantineReason::ConfirmFailed(evidence));
-        assert!(msg.contains('1'), "expected the mismatch count in: {msg}");
-        assert!(msg.contains("Integrity"), "expected the tier in: {msg}");
+        assert!(msg.contains("2 mismatch"), "the mismatch count: {msg}");
+        assert!(msg.contains("full read-back"), "the tier, in words: {msg}");
+        assert!(
+            msg.contains("position 4: content_hash_mismatch — expected aa, found bb"),
+            "the first mismatch, in `volume verify`'s own shape: {msg}"
+        );
+        assert!(
+            msg.contains("position 6: navigation_disagreement"),
+            "every mismatch is named: {msg}"
+        );
+        for debug in [
+            "Integrity",
+            "Mismatch {",
+            "MismatchKind",
+            "ContentHashMismatch",
+            "[",
+            "{",
+        ] {
+            assert!(
+                !msg.contains(debug),
+                "Debug output {debug:?} leaked into: {msg}"
+            );
+        }
+
+        let quick = describe_quarantine(&QuarantineReason::ConfirmFailed(Evidence {
+            tier: Tier::Navigable,
+            files_checked: 1,
+            mismatches: vec![Mismatch {
+                position: 3,
+                kind: MismatchKind::FrontIndexUnreadable,
+                expected: "readable".into(),
+                actual: "short read".into(),
+            }],
+        }));
+        assert!(quick.contains("1 mismatch"), "{quick}");
+        assert!(quick.contains("quick navigation check"), "{quick}");
+        assert!(!quick.contains("Navigable"), "{quick}");
+    }
+
+    /// Issue #357: the resume-side identity mismatch names what File 0 said
+    /// in words, not as `Some(IdThunkIdentity { .. })`.
+    #[test]
+    fn describe_quarantine_identity_mismatch_renders_found_in_words() {
+        let msg = describe_quarantine(&QuarantineReason::IdentityMismatch {
+            expected_label: "VOL-A".into(),
+            expected_uuid: "u-1".into(),
+            found: None,
+        });
+        assert!(msg.contains("unparseable"), "{msg}");
+        assert!(!msg.contains("None"), "Debug output leaked into: {msg}");
+        assert!(!msg.contains("Some("), "Debug output leaked into: {msg}");
     }
 
     #[test]

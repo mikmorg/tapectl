@@ -35,6 +35,19 @@ pub enum Tier {
     Integrity,
 }
 
+impl Tier {
+    /// The tier in words, for text an operator reads (issue #357: the
+    /// quarantine message printed `Integrity`, Rust's `{:?}`). "full" and
+    /// "quick" are the names `volume verify` and `verification_sessions`
+    /// already give the two tiers.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Tier::Integrity => "full read-back",
+            Tier::Navigable => "quick navigation check",
+        }
+    }
+}
+
 impl Default for Tier {
     /// Integrity is the ratified seal-time default (`--quick` opts down to
     /// Navigable) — `docs/design/v2-open-questions.md` §1.2: at seal time
@@ -224,6 +237,22 @@ pub struct Mismatch {
     pub expected: String,
     /// What was actually found.
     pub actual: String,
+}
+
+impl Mismatch {
+    /// One mismatch as a line of text, in the shape `volume verify` prints
+    /// its own: `position N: <kind> — expected X, found Y`. The kind is
+    /// [`MismatchKind::label`], the stable name `--json` also carries, so an
+    /// operator can match the two (issue #357: this used to be `{:?}`).
+    pub fn describe(&self) -> String {
+        format!(
+            "position {}: {} — expected {}, found {}",
+            self.position,
+            self.kind.label(),
+            self.expected,
+            self.actual
+        )
+    }
 }
 
 /// What `confirm` found.
@@ -561,7 +590,7 @@ where
                 position: fi_pos,
                 kind: MismatchKind::FrontIndexInconsistent,
                 expected: "front index entries are self-consistent (§2.5)".to_string(),
-                actual: format!("{violation:?}"),
+                actual: violation.to_string(),
             });
         }
 

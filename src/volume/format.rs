@@ -390,6 +390,50 @@ pub enum ConsistencyViolation {
     MissingHash { position: i32 },
 }
 
+/// A violation in words: it reaches an operator as a `volume verify`
+/// mismatch's "found" text and as a layout-validation error, where Rust's
+/// `{:?}` (`PositionOutOfSequence { index: 2, .. }`) used to stand (issue
+/// #357).
+impl std::fmt::Display for ConsistencyViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsistencyViolation::PositionOutOfSequence {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "entry {index} claims position {actual}, expected {expected} \
+                 (positions must run 0, 1, 2, … with no gaps)"
+            ),
+            ConsistencyViolation::FrontIndexCount { found } => {
+                write!(f, "{found} front_index entries (exactly one is required)")
+            }
+            ConsistencyViolation::FrontIndexNotAtThree { position } => write!(
+                f,
+                "the front_index entry is at position {position}, not position 3"
+            ),
+            ConsistencyViolation::SealMarkerCount { found } => {
+                write!(f, "{found} seal_marker entries (exactly one is required)")
+            }
+            ConsistencyViolation::SealMarkerNotLast {
+                position,
+                last_index,
+            } => write!(
+                f,
+                "the seal_marker entry is at position {position}, not the last \
+                 position ({last_index})"
+            ),
+            ConsistencyViolation::MissingSize { position } => {
+                write!(f, "position {position} carries no size_bytes")
+            }
+            ConsistencyViolation::MissingHash { position } => {
+                write!(f, "position {position} carries no sha256_encrypted")
+            }
+        }
+    }
+}
+
 /// Run the §2.5 self-consistency checks over a parsed `[[files]]` list
 /// (either the front index or the seal marker's embedded copy — same
 /// shape). Returns every violation found; an empty vec means the list is
@@ -918,6 +962,39 @@ cartridge_serial = \"SERIAL1\"
             v,
             ConsistencyViolation::FrontIndexNotAtThree { position: 0 }
         )));
+    }
+
+    /// Issue #357: every violation renders in words — no variant or field
+    /// name, no `{ .. }` — because it reaches the operator as text.
+    #[test]
+    fn consistency_violations_render_in_words() {
+        let all = [
+            ConsistencyViolation::PositionOutOfSequence {
+                index: 2,
+                expected: 2,
+                actual: 5,
+            },
+            ConsistencyViolation::FrontIndexCount { found: 0 },
+            ConsistencyViolation::FrontIndexNotAtThree { position: 1 },
+            ConsistencyViolation::SealMarkerCount { found: 2 },
+            ConsistencyViolation::SealMarkerNotLast {
+                position: 4,
+                last_index: 6,
+            },
+            ConsistencyViolation::MissingSize { position: 7 },
+            ConsistencyViolation::MissingHash { position: 8 },
+        ];
+        for v in &all {
+            let text = v.to_string();
+            let debug = format!("{v:?}");
+            let variant = debug.split([' ', '{']).next().unwrap();
+            assert!(!text.contains(variant), "{text:?} names the variant");
+            assert!(!text.contains('{') && !text.contains('}'), "{text:?}");
+        }
+        assert_eq!(
+            all[0].to_string(),
+            "entry 2 claims position 5, expected 2 (positions must run 0, 1, 2, … with no gaps)"
+        );
     }
 
     #[test]
