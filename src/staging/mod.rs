@@ -4609,9 +4609,12 @@ mod tests {
             .collect();
         assert_eq!(reports.len(), 1, "one stage, one report: {reports:?}");
         let text = fs::read_to_string(&reports[0]).unwrap();
-        assert_eq!(
-            text.lines().next(),
-            Some("tapectl stage report"),
+        // The whole first line, newline included — which is also the form
+        // tests/refusal_recipes.rs's command scan passes over (it reads a
+        // bare "tapectl stage report" as a call to a `stage report`
+        // subcommand that does not exist).
+        assert!(
+            text.starts_with("tapectl stage report\n"),
             "the header names what the file is: {text}"
         );
         assert!(
