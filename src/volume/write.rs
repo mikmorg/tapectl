@@ -4909,8 +4909,12 @@ pub struct VerifyReport {
     ///
     /// `None` on a clean verify AND on a failed one whose every mismatch is
     /// a read or transport failure. The second case is a failure — `failed`
-    /// is non-zero and the exit code is still `EXIT_ERROR` — that left the
-    /// volume exactly as it was.
+    /// is non-zero — that left the volume exactly as it was.
+    ///
+    /// It is also what `volume verify`'s exit code is keyed on (issue #356):
+    /// `Some` exits `EXIT_VERIFY_MEDIUM_BAD` (2), a failure with `None`
+    /// exits `EXIT_VERIFY_INCONCLUSIVE` (3) — see `cli::volume`'s
+    /// `verify_exit_code`.
     pub quarantine: Option<QuarantineEffect>,
     /// What a clean FULL verify did to `volumes.observed_condition` — the
     /// inverse of [`VerifyReport::quarantine`] (ADR-0012's 2026-09-18

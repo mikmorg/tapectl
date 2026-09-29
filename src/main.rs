@@ -49,8 +49,22 @@ fn main() {
 
     signal::install_handler();
 
+    // Decided before `run` consumes `cli` (issue #356): `volume verify`'s
+    // exit contract reserves 2 for "the medium is proven bad", so every
+    // error that invocation returns — its own, or the database's or the
+    // config's before it ever ran — exits 3, "inconclusive", instead.
+    let error_code = error_exit_code(&cli.command);
     if let Err(err) = run(cli) {
-        error::exit_with_error(&err);
+        error::exit_with_error_code(&err, error_code);
+    }
+}
+
+/// The exit code for an error from `command` — [`error::EXIT_ERROR`] for
+/// everything except `volume verify` (see `cli::volume::error_exit_code`).
+fn error_exit_code(command: &Commands) -> i32 {
+    match command {
+        Commands::Volume { command } => cli::volume::error_exit_code(command),
+        _ => error::EXIT_ERROR,
     }
 }
 
@@ -346,8 +360,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Volume { ref command } => {
             // issue #45/H10: `volume::run` now returns a process exit code
-            // (0=clean, 1=warning, 2=violation) for `Verify`; every other
+            // for `Verify` (issue #356: 0 = passed, 2 = the medium proven
+            // bad and quarantined, 3 = inconclusive); every other
             // subcommand returns EXIT_SUCCESS. Mirrors the Audit arm below.
+            // A verify's ERRORS exit 3 too — see `error_exit_code` above.
             let exit_code =
                 cli::volume::run(&conn, &paths, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
             exit_if_nonzero(exit_code);

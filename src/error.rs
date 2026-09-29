@@ -5,12 +5,34 @@ use thiserror::Error;
 /// Exit codes per design: 0=success, 1=warnings, 2=errors/violations.
 ///
 /// Mirrors the convention `audit` already established (`src/cli/audit.rs`):
-/// 0=clean, 1=warning, 2=violation. `volume verify` (src/cli/volume.rs) and
-/// `db fsck` (src/main.rs) both compute their exit code against these same
-/// constants — see `verify_exit_code`/`fsck_exit_code` (issue #45/H10).
+/// 0=clean, 1=warning, 2=violation. `db fsck` (src/main.rs) computes its exit
+/// code against these same constants — see `fsck_exit_code` (issue #45/H10).
+/// `volume verify` has its own three, below (issue #356).
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_WARNING: i32 = 1;
 pub const EXIT_ERROR: i32 = 2;
+
+/// `volume verify`: the verify FAILED and PROVED THE MEDIUM BAD — at least
+/// one mismatch is medium evidence, so the volume's condition is (or already
+/// was) `quarantined` and it no longer counts as a copy (ADR-0012, the
+/// 2026-09-17 amendment). The remedy is another cartridge.
+///
+/// CTO ruling, 2026-09-28 (issue #356): exit codes are an interface, and a
+/// failed verify has two outcomes with opposite remedies. Until then both
+/// exited 2, and a script — the systemd timers' health ping, `first-run.sh`
+/// step 13 — could tell them apart only by parsing `--json`. Now 2 is
+/// reachable from `volume verify` ONLY through a quarantine; every other
+/// failure is [`EXIT_VERIFY_INCONCLUSIVE`].
+pub const EXIT_VERIFY_MEDIUM_BAD: i32 = 2;
+
+/// `volume verify`: INCONCLUSIVE — the verify reached no verdict about the
+/// medium and the volume is untouched. A drive or transport failure (a read
+/// error, a short read, an unreadable front index), a refusal before the
+/// tape was read (no cartridge loaded, the wrong tape, a drive that cannot
+/// read this generation, an unknown label, `--dry-run`), or any other error
+/// the command stopped on. The remedy is the drive, the cartridge in it, or
+/// the command line — then verify again. Issue #356.
+pub const EXIT_VERIFY_INCONCLUSIVE: i32 = 3;
 
 #[derive(Error, Debug)]
 #[allow(dead_code)]
@@ -256,6 +278,14 @@ pub type Result<T> = std::result::Result<T, TapectlError>;
 
 /// Exit the process with the appropriate code for the given error.
 pub fn exit_with_error(err: &anyhow::Error) -> ! {
+    exit_with_error_code(err, EXIT_ERROR)
+}
+
+/// [`exit_with_error`] with the code chosen by the caller — `volume verify`
+/// exits [`EXIT_VERIFY_INCONCLUSIVE`] on every error, because under its exit
+/// contract 2 means "the medium is proven bad" (issue #356). The message is
+/// printed exactly as [`exit_with_error`] prints it.
+pub fn exit_with_error_code(err: &anyhow::Error, code: i32) -> ! {
     eprintln!("error: {err:#}");
-    process::exit(EXIT_ERROR);
+    process::exit(code);
 }

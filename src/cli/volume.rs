@@ -152,6 +152,13 @@ pub enum VolumeCommands {
     /// -> content). Default tier is `--full` (integrity: hashes every
     /// content file); `--quick` opts down to navigable (seal binding + front
     /// index self-consistency only, no per-file content hashing).
+    ///
+    /// Exit status: 0 = every checked file matched. 2 = the verify PROVED
+    /// THE MEDIUM BAD: the volume is quarantined and no longer counts as a
+    /// copy — write its content to another cartridge. 3 = inconclusive: a
+    /// drive or transport failure, or an error before any verdict (no
+    /// cartridge loaded, the wrong tape, an unknown label); the volume is
+    /// untouched — check the drive and verify again.
     Verify {
         /// Volume label
         label: String,
@@ -1836,25 +1843,59 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
         .collect()
 }
 
-/// Decide the process exit code for `volume verify` from its report
-/// (issue #45/H10). No warning tier of its own: a chain walk either
-/// confirms every checked slice or it finds real corruption, so the
-/// result is binary — clean or violation — unlike `fsck`, which can also
-/// report a repaired-but-notable finding.
+/// The exit code for an ERROR from `volume <command>` — anything `run`
+/// returns as `Err` (issue #356, CTO ruling 2026-09-28).
 ///
-/// **Issue #234 deliberately does NOT change this.** A verify now has two
-/// distinguishable failure outcomes — one that quarantined the volume and
-/// one that did not — and neither changes the answer to the question this
-/// function asks. A read or transport failure is still a failure, so
-/// dropping it to `EXIT_SUCCESS` would resurrect issue #45/H10 exactly (a
-/// cron-scheduled integrity check that finds nothing readable and reports
-/// success); and giving a quarantine a third code would invent a CLI
-/// contract nobody asked for, when the distinction is already carried where
-/// the amendment requires it — in the printed summary and in `--json`'s
-/// `quarantined` / `quarantine` fields.
+/// `volume verify`'s exit status is a three-way contract (see
+/// [`verify_exit_code`]) in which 2 means "the medium is proven bad and the
+/// volume is quarantined". An error is never that: every one a verify stops
+/// on — an unknown label, an empty drive, the wrong tape, a drive that
+/// cannot read this generation, a front index that will not read, a store
+/// error, `--dry-run` — happened before a verdict or instead of one, and
+/// none of them touches the volume's condition. So a verify's errors exit
+/// [`crate::error::EXIT_VERIFY_INCONCLUSIVE`], and 2 stays reachable only
+/// through a quarantine. Every other volume subcommand keeps the ordinary
+/// error code.
+///
+/// Decided from the parsed command, before it runs, so that `main` maps
+/// every error the invocation can return — including the ones raised
+/// before this module is reached (the database, the config) — and not only
+/// those from the verify itself.
+pub fn error_exit_code(command: &VolumeCommands) -> i32 {
+    match command {
+        VolumeCommands::Verify { .. } => crate::error::EXIT_VERIFY_INCONCLUSIVE,
+        _ => crate::error::EXIT_ERROR,
+    }
+}
+
+/// Decide the process exit code for `volume verify` from its report —
+/// issue #45/H10 made a failing verify non-zero; issue #356 (CTO ruling,
+/// 2026-09-28) split the failure in two, because its two outcomes have
+/// opposite remedies (ADR-0012, the 2026-09-17 amendment):
+///
+/// - [`crate::error::EXIT_SUCCESS`] (0): every checked file matched.
+/// - [`crate::error::EXIT_VERIFY_MEDIUM_BAD`] (2): at least one mismatch
+///   PROVES THE MEDIUM BAD, so the volume's condition is — or, re-verified,
+///   still is — `quarantined` and it no longer counts as a copy. Remedy:
+///   another cartridge.
+/// - [`crate::error::EXIT_VERIFY_INCONCLUSIVE`] (3): mismatches, none of
+///   them medium evidence — a read or transport failure, "we could not read
+///   it today", which is not "the bytes are gone". The volume is untouched.
+///   Remedy: the drive, then verify again. Every ERROR a verify returns
+///   exits 3 as well ([`error_exit_code`]).
+///
+/// Keyed on `report.quarantine`, the same field that drives the printed
+/// summary and `--json`'s `quarantined`, so the exit code, the message and
+/// the JSON can never disagree about which outcome this was. Until #356
+/// both failures exited 2 and only `--json` told them apart; issue #234 had
+/// declined a third code as "a CLI contract nobody asked for", and the
+/// systemd timers' health ping and `first-run.sh` step 13 turned out to be
+/// the ones asking.
 fn verify_exit_code(report: &write::VerifyReport) -> i32 {
-    if report.failed > 0 {
-        crate::error::EXIT_ERROR
+    if report.quarantine.is_some() {
+        crate::error::EXIT_VERIFY_MEDIUM_BAD
+    } else if report.failed > 0 {
+        crate::error::EXIT_VERIFY_INCONCLUSIVE
     } else {
         crate::error::EXIT_SUCCESS
     }
@@ -2749,26 +2790,91 @@ mod tests {
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
     }
 
+    /// Issue #356 (CTO ruling 2026-09-28): a failure that proved nothing
+    /// about the medium — a read error, a short read, a transport fault —
+    /// left the volume untouched, and exits 3, never the 2 that now means
+    /// "the medium is bad". Still non-zero: issue #45/H10 (a scheduled
+    /// verify that could read nothing must not report success) stands.
     #[test]
-    fn verify_exit_code_any_failure_is_violation() {
+    fn verify_exit_code_a_failure_that_proved_nothing_is_inconclusive() {
         let report = write::VerifyReport {
             checked: 10,
             passed: 9,
             failed: 1,
             ..Default::default()
         };
-        assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
+        assert_eq!(
+            verify_exit_code(&report),
+            crate::error::EXIT_VERIFY_INCONCLUSIVE
+        );
+        assert_eq!(crate::error::EXIT_VERIFY_INCONCLUSIVE, 3, "the ruled value");
     }
 
     #[test]
-    fn verify_exit_code_all_failed_is_violation() {
+    fn verify_exit_code_all_failed_without_medium_evidence_is_inconclusive() {
         let report = write::VerifyReport {
             checked: 3,
             passed: 0,
             failed: 3,
             ..Default::default()
         };
-        assert_eq!(verify_exit_code(&report), crate::error::EXIT_ERROR);
+        assert_eq!(
+            verify_exit_code(&report),
+            crate::error::EXIT_VERIFY_INCONCLUSIVE
+        );
+    }
+
+    fn a_proving_mismatch() -> crate::store::Mismatch {
+        crate::store::Mismatch {
+            position: 4,
+            kind: crate::store::MismatchKind::ContentHashMismatch,
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+    }
+
+    /// Issue #356: 2 is the quarantine, and only the quarantine — the one
+    /// verify outcome whose remedy is another cartridge.
+    #[test]
+    fn verify_exit_code_a_quarantine_is_medium_bad() {
+        let report = write::VerifyReport {
+            checked: 10,
+            passed: 9,
+            failed: 1,
+            mismatches: vec![a_proving_mismatch()],
+            quarantine: Some(write::QuarantineEffect {
+                previous_condition: "ok".into(),
+                proof: vec![a_proving_mismatch()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            verify_exit_code(&report),
+            crate::error::EXIT_VERIFY_MEDIUM_BAD
+        );
+        assert_eq!(crate::error::EXIT_VERIFY_MEDIUM_BAD, 2, "the ruled value");
+    }
+
+    /// Re-verifying a volume already quarantined, and finding the medium
+    /// still bad, is the same finding: 2, although the condition did not
+    /// change this time.
+    #[test]
+    fn verify_exit_code_a_reconfirmed_quarantine_is_still_medium_bad() {
+        let report = write::VerifyReport {
+            checked: 10,
+            passed: 9,
+            failed: 1,
+            mismatches: vec![a_proving_mismatch()],
+            quarantine: Some(write::QuarantineEffect {
+                previous_condition: "quarantined".into(),
+                proof: vec![a_proving_mismatch()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            verify_exit_code(&report),
+            crate::error::EXIT_VERIFY_MEDIUM_BAD
+        );
     }
 
     #[test]
@@ -2777,6 +2883,39 @@ mod tests {
         // failure) must not be reported as a violation.
         let report = write::VerifyReport::default();
         assert_eq!(verify_exit_code(&report), crate::error::EXIT_SUCCESS);
+    }
+
+    /// Issue #356: every ERROR a `volume verify` invocation stops on — an
+    /// unknown label, the wrong tape, an empty drive, a front index that
+    /// will not read — reached no verdict about the medium and changed
+    /// nothing, so it exits 3. Only a quarantine exits 2. Every other volume
+    /// subcommand keeps the ordinary error code.
+    #[test]
+    fn a_verify_that_errors_exits_inconclusive_and_nothing_else_changes() {
+        let verify = VolumeCommands::Verify {
+            label: "L".into(),
+            device: None,
+            full: false,
+            quick: false,
+        };
+        assert_eq!(
+            error_exit_code(&verify),
+            crate::error::EXIT_VERIFY_INCONCLUSIVE
+        );
+        for other in [
+            VolumeCommands::Identify { device: None },
+            VolumeCommands::Retire { label: "L".into() },
+            VolumeCommands::Resume {
+                label: "L".into(),
+                device: None,
+            },
+        ] {
+            assert_eq!(
+                error_exit_code(&other),
+                crate::error::EXIT_ERROR,
+                "{other:?}"
+            );
+        }
     }
 
     /// `volume list` / `volume info` (issue #195).
