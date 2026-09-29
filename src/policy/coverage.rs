@@ -644,11 +644,12 @@ pub fn deposit_count_expr(q: &CoverageQuery) -> String {
 /// named location holds a copy.
 ///
 /// **The** named-location predicate: `audit`'s `location_presence` check
-/// and `unit mark-tape-only`'s location gate both call this, so they can
-/// never disagree about whether `required_locations` is met. It replaces a
-/// count-only comparison (distinct locations vs `required.len()`) under
-/// which copies at `home-rack` and `garage` satisfied
-/// `["home-rack","offsite"]`.
+/// and `unit mark-tape-only`'s location gate both call this, and `snapshot
+/// mark-reclaimable` calls its one-version form,
+/// [`missing_required_locations_for_snapshot`], so they can never disagree
+/// about whether `required_locations` is met. It replaces a count-only
+/// comparison (distinct locations vs `required.len()`) under which copies
+/// at `home-rack` and `garage` satisfied `["home-rack","offsite"]`.
 ///
 /// A location "holds a copy" on the same terms [`location_count_expr`]
 /// counts it: an [`eligible`] volume with a completed write, shelved there,
@@ -669,12 +670,7 @@ pub fn missing_required_locations(
     unit_id: i64,
     required: &[String],
 ) -> crate::error::Result<Vec<String>> {
-    let mut wanted: Vec<&String> = Vec::new();
-    for name in required {
-        if !wanted.contains(&name) {
-            wanted.push(name);
-        }
-    }
+    let wanted = distinct_names(required);
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
@@ -683,10 +679,62 @@ pub fn missing_required_locations(
         .prepare("SELECT id FROM snapshots WHERE unit_id = ?1 AND status = 'current'")?
         .query_map(params![unit_id], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if current.is_empty() {
-        return Ok(wanted.into_iter().cloned().collect());
-    }
+    let present = names_holding_every(conn, &current)?;
+    Ok(absent_from(wanted, &present))
+}
 
+/// [`missing_required_locations`] for ONE version: the names in `required`
+/// that snapshot `snapshot_id` has no copy at, on the same terms, in
+/// `required`'s order (duplicates collapsed).
+///
+/// `snapshot mark-reclaimable` asks this of the SUPERSEDING version — the
+/// one that must carry the policy once the released version is gone. The
+/// unit form would be the wrong question there: it intersects over every
+/// current version, the one being released included, so a v1 at `home`
+/// alone would hold back releasing v1 even with v2 at every named place.
+pub fn missing_required_locations_for_snapshot(
+    conn: &Connection,
+    snapshot_id: i64,
+    required: &[String],
+) -> crate::error::Result<Vec<String>> {
+    let wanted = distinct_names(required);
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let present = names_holding_every(conn, &[snapshot_id])?;
+    Ok(absent_from(wanted, &present))
+}
+
+/// `required`, first occurrence of each name kept, in order.
+fn distinct_names(required: &[String]) -> Vec<&String> {
+    let mut wanted: Vec<&String> = Vec::new();
+    for name in required {
+        if !wanted.contains(&name) {
+            wanted.push(name);
+        }
+    }
+    wanted
+}
+
+/// The names in `wanted` not in `present`, in `wanted`'s order.
+fn absent_from(
+    wanted: Vec<&String>,
+    present: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    wanted
+        .into_iter()
+        .filter(|name| !present.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The location names at which EVERY snapshot in `snapshot_ids` has a
+/// copy — the intersection of each one's locations. No snapshots, no
+/// locations.
+fn names_holding_every(
+    conn: &Connection,
+    snapshot_ids: &[i64],
+) -> crate::error::Result<std::collections::HashSet<String>> {
     let per_snapshot = CoverageQuery {
         scope: CoverageScope::Snapshot { id_expr: "?1" },
         exclude_volume: None,
@@ -698,10 +746,10 @@ pub fn missing_required_locations(
     );
     let mut stmt = conn.prepare(&sql)?;
 
-    // Intersection over the current snapshots: a name survives only while
-    // every version examined so far has a copy there.
+    // Intersection: a name survives only while every snapshot examined so
+    // far has a copy there.
     let mut present: Option<std::collections::HashSet<String>> = None;
-    for snapshot_id in current {
+    for snapshot_id in snapshot_ids {
         let names: std::collections::HashSet<String> = stmt
             .query_map(params![snapshot_id], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -710,12 +758,7 @@ pub fn missing_required_locations(
             Some(so_far) => so_far.intersection(&names).cloned().collect(),
         });
     }
-    let present = present.unwrap_or_default();
-    Ok(wanted
-        .into_iter()
-        .filter(|name| !present.contains(name.as_str()))
-        .cloned()
-        .collect())
+    Ok(present.unwrap_or_default())
 }
 
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
@@ -1004,6 +1047,36 @@ pub(crate) mod tests {
             missing_required_locations(&conn, unit_id, &names(&["home-rack", "garage"])).unwrap(),
             names(&["home-rack", "garage"])
         );
+    }
+
+    /// The one-version form answers for that version alone: v2 (at
+    /// `garage`) is missing `home-rack` though v1 is there, and v1 is
+    /// missing `garage`. The unit form above misses both; this is what
+    /// `snapshot mark-reclaimable` asks of the version it keeps.
+    #[test]
+    fn the_one_version_form_judges_that_version_alone() {
+        let (conn, unit_id) =
+            setup_unit_with_two_current_snapshots("mv-one", Some("home-rack"), Some("garage"));
+        let snap = |v: i64| -> i64 {
+            conn.query_row(
+                "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+                params![unit_id, v],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let wanted = names(&["home-rack", "garage", "garage"]);
+        assert_eq!(
+            missing_required_locations_for_snapshot(&conn, snap(2), &wanted).unwrap(),
+            names(&["home-rack"])
+        );
+        assert_eq!(
+            missing_required_locations_for_snapshot(&conn, snap(1), &wanted).unwrap(),
+            names(&["garage"])
+        );
+        assert!(missing_required_locations_for_snapshot(&conn, snap(1), &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

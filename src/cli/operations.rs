@@ -3028,14 +3028,23 @@ pub fn snapshot_mark_reclaimable(
 
     // Issue #90: the preconditions live in `policy::reclaimable::assess`,
     // not here, so that `report supersedable` measures releasability with
-    // this exact code rather than a second copy of it. `Blocked.reason`
-    // IS this function's historical error text.
-    if !force {
-        if let crate::policy::reclaimable::ReclaimVerdict::Blocked { reason, .. } =
-            crate::policy::reclaimable::assess(conn, config, &unit, version)?
-        {
-            return Err(TapectlError::Other(reason));
-        }
+    // this exact code rather than a second copy of it.
+    //
+    // Issue #348: a failed precondition is ADR-0008 Tier 2 — degraded
+    // coverage the operator may knowingly accept — so it goes through the
+    // one consent gate (`cli::consent::confirm`: a terminal asks, `--force`
+    // confirms in advance, a non-interactive run without it refuses with
+    // the fact), as `unit mark-tape-only`'s does. `Blocked.reason` is that
+    // fact. The policy is resolved even under `--force`: a gate that
+    // greenlights deletion must not guess at a policy it cannot read.
+    if let crate::policy::reclaimable::ReclaimVerdict::Blocked { reason, .. } =
+        crate::policy::reclaimable::assess(conn, config, &unit, version)?
+    {
+        crate::cli::consent::confirm(
+            &format!("mark snapshot \"{unit_name}\" v{version} reclaimable"),
+            &[reason, "(`--force` confirms this in advance)".to_string()],
+            force,
+        )?;
     }
 
     conn.execute(
@@ -6082,10 +6091,14 @@ mod tests {
 
             let err = snapshot_mark_reclaimable(&conn, &config, "agree-blocked", 1, false, false)
                 .expect_err("assess said Blocked, so the gate must refuse");
-            assert_eq!(
-                err.to_string(),
-                reason,
-                "the report's reason text IS the gate's error text"
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("\n{reason}\n")),
+                "the report's reason text IS the fact the gate refuses with: {msg}"
+            );
+            assert!(
+                msg.contains("refused: non-interactive session"),
+                "a failed precondition goes through the consent gate (issue #348): {msg}"
             );
         }
 

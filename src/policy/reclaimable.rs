@@ -22,10 +22,11 @@ use crate::config::Config;
 use crate::db::models::Unit;
 use crate::error::Result;
 
-/// The outcome of the non-`--force` precondition set for one snapshot.
+/// The outcome of the precondition set for one snapshot.
 ///
-/// `--force` is deliberately not modelled: the report must describe the
-/// ordinary path, or it would list force-only cases as releasable.
+/// Consent is deliberately not modelled: the report must describe the
+/// ordinary path, or it would list cases that need `--force` (advance
+/// ADR-0008 Tier-2 consent) as releasable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReclaimVerdict {
     /// Every precondition passes; `snapshot mark-reclaimable` will accept.
@@ -33,8 +34,10 @@ pub enum ReclaimVerdict {
         superseding_version: i64,
         freeable_bytes: i64,
     },
-    /// A precondition fails. `reason` is the exact error text the gate
-    /// produces, "(use --force to override)" suffix included.
+    /// A precondition fails. `reason` is the fact the gate puts to the
+    /// operator at its consent prompt (issue #348: `snapshot
+    /// mark-reclaimable` asks through `cli::consent::confirm`, which says
+    /// how to confirm — the reason itself is only the shortfall).
     ///
     /// `freeable_bytes` is carried here too, and is the same number the
     /// `Releasable` arm would report. A blocked candidate is the one an
@@ -58,12 +61,12 @@ pub struct Candidate {
 }
 
 /// Assess whether `version` of `unit` may be marked reclaimable without
-/// `--force`.
+/// consent.
 ///
 /// The message text of every [`ReclaimVerdict::Blocked`] is the gate's
-/// own error text, verbatim: `snapshot_mark_reclaimable` returns it
-/// unchanged, and the report prints it as the blocker. One string, one
-/// meaning, in both places.
+/// own fact, verbatim: `snapshot_mark_reclaimable` puts it to the operator
+/// at the consent gate, and the report prints it as the blocker. One
+/// string, one meaning, in both places.
 ///
 /// `policy::resolve` is called here rather than passed in — it reads the
 /// unit's dotfile from disk, so a caller resolving separately could
@@ -110,9 +113,7 @@ pub fn assess(
             return Ok(ReclaimVerdict::Blocked {
                 superseding_version: None,
                 freeable_bytes: freeable,
-                reason: format!(
-                "no superseding current snapshot exists for v{version} (use --force to override)"
-            ),
+                reason: format!("no superseding current snapshot exists for v{version}"),
             })
         }
     };
@@ -120,7 +121,16 @@ pub fn assess(
     // Precondition 2: Superseding snapshot meets policy
     let resolved = super::resolve(conn, config, unit)?;
     let mut required_copies = resolved.min_copies;
-    let mut required_locations = resolved.required_locations.len() as i64;
+    // The count floor the named locations imply: one distinct place per
+    // distinct name (a name listed twice is one place). The names
+    // themselves are checked below; this count is what the tape-only
+    // multiplier scales.
+    let mut required_locations = {
+        let mut distinct: Vec<&String> = resolved.required_locations.iter().collect();
+        distinct.sort();
+        distinct.dedup();
+        distinct.len() as i64
+    };
 
     // Precondition 3: tape-only units get multiplied requirements.
     //
@@ -160,7 +170,7 @@ pub fn assess(
             superseding_version: Some(superseding.1),
             freeable_bytes: freeable,
             reason: format!(
-                "superseding v{} has {copy_count} copies, needs {required_copies}{} (use --force to override)",
+                "superseding v{} has {copy_count} copies, needs {required_copies}{}",
                 superseding.1,
                 match tape_only_multiplier {
                     Some(m) => format!(" (tape-only {m}x)"),
@@ -170,6 +180,34 @@ pub fn assess(
         });
     }
 
+    // Issue #348: `required_locations` is a list of NAMES, and each must
+    // hold a copy of the superseding version — checked through the one
+    // named-location predicate `audit` and `unit mark-tape-only` share, in
+    // its one-version form (the version being released must not count).
+    // Checked by count alone, copies at `home` and `garage` met
+    // `["home","offsite"]` and the older version was released with nothing
+    // offsite.
+    let missing = super::coverage::missing_required_locations_for_snapshot(
+        conn,
+        superseding.0,
+        &resolved.required_locations,
+    )?;
+    if !missing.is_empty() {
+        return Ok(ReclaimVerdict::Blocked {
+            superseding_version: Some(superseding.1),
+            freeable_bytes: freeable,
+            reason: format!(
+                "superseding v{} has no copy at required location(s) {} (policy requires {})",
+                superseding.1,
+                missing.join(", "),
+                resolved.required_locations.join(", "),
+            ),
+        });
+    }
+
+    // With every name met, the distinct-location count is at least the
+    // number of names, so this binds only for a tape-only unit, whose
+    // floor the multiplier raises above it.
     let sql = format!("SELECT {}", super::coverage::location_count_expr(&scoped));
     let location_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
 
@@ -178,8 +216,12 @@ pub fn assess(
             superseding_version: Some(superseding.1),
             freeable_bytes: freeable,
             reason: format!(
-                "superseding v{} in {location_count} locations, needs {required_locations} (use --force to override)",
+                "superseding v{} in {location_count} locations, needs {required_locations}{}",
                 superseding.1,
+                match tape_only_multiplier {
+                    Some(m) => format!(" (tape-only {m}x)"),
+                    None => String::new(),
+                }
             ),
         });
     }
@@ -415,7 +457,10 @@ pub(crate) mod tests {
                     reason.contains("superseding v2 has 1 copies, needs 2"),
                     "status {status}: {reason}"
                 );
-                assert!(reason.contains("(use --force to override)"), "{reason}");
+                assert!(
+                    !reason.contains("--force"),
+                    "the reason is the fact; the consent gate says how to confirm: {reason}"
+                );
             }
             other => panic!("status {status}: expected Blocked, got {other:?}"),
         }
@@ -492,8 +537,7 @@ pub(crate) mod tests {
             ReclaimVerdict::Blocked {
                 superseding_version: None,
                 freeable_bytes: 1000,
-                reason: "no superseding current snapshot exists for v2 (use --force to override)"
-                    .to_string(),
+                reason: "no superseding current snapshot exists for v2".to_string(),
             }
         );
     }
@@ -614,6 +658,98 @@ pub(crate) mod tests {
                 freeable_bytes: 1000,
             },
             "glacier is a second distinct location"
+        );
+    }
+
+    /// Shelve `{name}-SEALED` at `sealed_at` and `{name}-OTHER` at
+    /// `other_at`, and bind the unit to an archive set requiring
+    /// `required` (a JSON array). Returns the re-read unit.
+    fn place_and_require(
+        conn: &Connection,
+        name: &str,
+        sealed_at: &str,
+        other_at: &str,
+        required: &str,
+    ) -> Unit {
+        for (suffix, loc) in [("SEALED", sealed_at), ("OTHER", other_at)] {
+            conn.execute(
+                "INSERT OR IGNORE INTO locations (name, kind) VALUES (?1, 'shelf')",
+                params![loc],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = ?1)
+                 WHERE label = ?2",
+                params![loc, format!("{name}-{suffix}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO archive_sets (name, required_locations) VALUES ('named', ?1)",
+            params![required],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE units SET archive_set_id = (SELECT id FROM archive_sets WHERE name = 'named')
+             WHERE name = ?1",
+            params![name],
+        )
+        .unwrap();
+        crate::db::queries::get_unit_by_name(conn, name)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Issue #348's defect class on the delete path: `required_locations`
+    /// was checked by COUNT only, so the superseding version's copies at
+    /// `home` and `garage` — two places — satisfied `["home","offsite"]`,
+    /// and the older version was released with no copy offsite at all.
+    /// Now each NAME must hold a copy of the superseding version, through
+    /// the predicate `audit` and `unit mark-tape-only` use.
+    #[test]
+    fn required_locations_are_checked_by_name_not_by_count() {
+        let (conn, _unit) = setup("sup-named", 2, "sealed", "active");
+        let unit = place_and_require(&conn, "sup-named", "home", "garage", r#"["home","offsite"]"#);
+        match assess(&conn, &Config::default(), &unit, 1).unwrap() {
+            ReclaimVerdict::Blocked {
+                superseding_version,
+                reason,
+                ..
+            } => {
+                assert_eq!(superseding_version, Some(2));
+                assert!(
+                    reason.contains(
+                        "superseding v2 has no copy at required location(s) offsite \
+                         (policy requires home, offsite)"
+                    ),
+                    "{reason}"
+                );
+            }
+            other => panic!("home + garage must not satisfy [home, offsite]: {other:?}"),
+        }
+    }
+
+    /// The question is asked of the SUPERSEDING version alone: v1 (the one
+    /// being released) sits only at `home`, and v2 at `home` and `offsite`.
+    /// The unit-wide form intersects over every current version, v1
+    /// included, and would report `offsite` missing — holding back exactly
+    /// the release the policy allows.
+    #[test]
+    fn the_version_being_released_does_not_hold_its_own_release_back() {
+        let (conn, _unit) = setup("sup-named-ok", 2, "sealed", "active");
+        let unit = place_and_require(
+            &conn,
+            "sup-named-ok",
+            "home",
+            "offsite",
+            r#"["home","offsite"]"#,
+        );
+        assert_eq!(
+            assess(&conn, &Config::default(), &unit, 1).unwrap(),
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            }
         );
     }
 }
