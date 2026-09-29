@@ -2454,8 +2454,10 @@ pub fn unit_mark_tape_only(
         if let Some(line) = &evidence_summary {
             facts.push(line.clone());
         }
-        facts
-            .push("(`--force` on this command gives the same confirmation as `--yes`)".to_string());
+        // Names only `--force`, the flag this handler receives. Whether
+        // the global `--yes` also reaches it is the caller's wiring
+        // (`cli::unit::run`), not this function's to promise.
+        facts.push("(`--force` confirms this in advance)".to_string());
         crate::cli::consent::confirm(
             &format!("mark unit \"{unit_name}\" tape-only"),
             &facts,
@@ -4345,6 +4347,10 @@ mod tests {
                 msg.contains("mark unit \"photos\" tape-only refused: non-interactive session"),
                 "a Tier-2 shortfall goes through the consent gate, which refuses \
                  without a terminal: {msg}"
+            );
+            assert!(
+                msg.contains("\n(`--force` confirms this in advance)"),
+                "the refusal names the flag this command's handler itself honours: {msg}"
             );
             assert_eq!(photos_status(&conn), "active");
 
