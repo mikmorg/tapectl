@@ -565,7 +565,7 @@ fn rebuild_contacted(
     // `unchecked_transaction` matches the codebase's convention (session,
     // write, key, operations): the CLI holds a shared `Connection`, and
     // requiring `&mut` here would ripple through every caller for nothing.
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::busy::immediate_tx(conn)?;
     let volume_id = insert_all(
         &tx,
         &ident.label,

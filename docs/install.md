@@ -405,13 +405,15 @@ ancestors the service user cannot enter needs `sudo setfacl -m u:tapectl:x
 <ancestor>` before the `chown`. Under `--no-service-user` it is plain `tapectl
 key escrow-kit --out ~/heir-kit`.
 
-**Caveat, shared with the audit timer.** Opening the database runs the
-startup sweep, which marks an `in_progress` write session `interrupted` (fully
-resumable, revalidated on resume). A backup landing in the middle of an
-overnight `volume write` costs one spurious "recovered orphaned write sessions"
-event and nothing else; keep 03:00 outside your write window or move
-`OnCalendar=` (in `contrib/systemd/tapectl-backup.timer`, then re-run the
-installer).
+**During a write session.** A backup may land in the middle of an overnight
+`volume write`. Opening the database runs the startup sweep, which leaves
+a live session alone: it tells a crashed session from a running one by the
+volume's lock, which the kernel releases when a process dies. The backup
+itself is a single-step online copy that never blocks the writer. If another
+command holds the catalog's write lock longer than the backup will wait,
+`tapectl` exits 75 ("catalog busy") and the wrapper logs "catalog busy, no
+backup this run" instead of a failure. To move the time, edit `OnCalendar=`
+in `contrib/systemd/tapectl-backup.timer` and re-run the installer.
 
 **The wrapper.** `/usr/local/bin/tapectl-op` is
 

@@ -70,7 +70,16 @@ fn main() {
     // `parse_error_exit_code`.)
     let error_code = error_exit_code(&cli.command);
     if let Err(err) = run(cli) {
-        error::exit_with_error_code(&err, error_code);
+        // Issue #377: a busy catalog is "retry later", not a failure of what
+        // the command checks, so it exits 75 — except where a command's own
+        // contract already has a code for "no verdict, try again" (`volume
+        // verify`'s 3), which it keeps.
+        let code = if error_code == error::EXIT_ERROR && db::busy::is_catalog_busy(&err) {
+            error::EXIT_CATALOG_BUSY
+        } else {
+            error_code
+        };
+        error::exit_with_error_code(&err, code);
     }
 }
 

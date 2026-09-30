@@ -529,6 +529,11 @@ fn volume_init_in_contact<'c>(
     )?;
     events::log_created(&tx, "volume", volume_id, label, None)?;
     tx.commit()?;
+    // Issue #376: the volume's session lock, from the moment its row exists
+    // until File 0 is on tape and this function returns. Nothing else can
+    // hold it yet (the id was minted a line ago); holding it is what makes
+    // this session visible as live to every other process.
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
 
     // AFTER the commit, and ONLY when the CHIP named the cartridge.
     // `cartridge_contacts` has no `identity_source` column, so a
@@ -1032,6 +1037,12 @@ fn volume_write_contacted<'c>(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Issue #376: the volume's session lock, held from here through plan,
+    // execute, seal and confirm (`finish_session` runs inside this
+    // function) and released by the kernel however this process ends.
+    // Refused, before anything else, while another process holds it.
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
 
     // ADR-0012 (issue #161): the catalog's own statement that this volume is
     // finished, gone, or untrusted is a fact, not a risk judgement -- refuse
@@ -1693,6 +1704,11 @@ fn volume_resume_contacted<'c>(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
+    // Issue #376: same session lock as `volume_write`, held through the
+    // resumed session's confirm. A live writer on this volume is refused
+    // here, as a fact, before any contact, MAM read or health sweep.
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
+
     // ADR-0012 (issue #161): same fact refusal as `volume_write`, and for
     // the same reason it must come before anything else -- a `quarantined`
     // volume must be named by its status, not answered with
@@ -1986,11 +2002,10 @@ fn volume_resume_in_contact(
 /// against them (issue #324). Returns whether the seal is recorded, so the
 /// caller's closing message can say the same.
 ///
-/// It refuses outright if any row is still `in_progress`. Per `rehydrate`'s
-/// own reasoning, `db::open` sweeps `in_progress` to `interrupted` before any
-/// command holds a `Connection`, so a surviving `in_progress` row means
-/// another process is writing this tape right now, and aborting it would
-/// corrupt a live session.
+/// It refuses outright while another process holds the volume's session
+/// lock (issue #376): a live writer, resume, confirm or verify. That is an
+/// ADR-0008 Tier-3 fact, so `--yes` does not reach it. The abort then holds
+/// the lock itself, so no session can start on the volume under it.
 pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<AbortSeal> {
     let volume_id: i64 = conn
         .query_row(
@@ -1999,6 +2014,7 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
             |row| row.get(0),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
 
     let rows: Vec<(i64, String)> = conn
         .prepare(
@@ -2017,12 +2033,7 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
     }
 
     if rows.iter().any(|(_, s)| s == "in_progress") {
-        return Err(TapectlError::Other(format!(
-            "volume \"{label}\" has an `in_progress` write session. `tapectl` sweeps crashed \
-             sessions to 'interrupted' when it opens the database, so a row still 'in_progress' \
-             means ANOTHER PROCESS IS WRITING THIS TAPE RIGHT NOW. Refusing to abort — cutting \
-             a live writer's session out from under it would destroy the cartridge."
-        )));
+        return Err(in_progress_after_lock(label, "abort"));
     }
 
     let write_ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
@@ -2060,7 +2071,7 @@ pub fn volume_abort(conn: &Connection, label: &str, assume_yes: bool) -> Result<
         assume_yes,
     )?;
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::busy::immediate_tx(conn)?;
     apply_abort(&tx, volume_id, label, &write_ids)?;
     tx.commit()?;
 
@@ -2228,6 +2239,20 @@ pub(crate) fn abort_consent_facts(
     ]
 }
 
+/// An `in_progress` row seen by a command that HOLDS the volume's session
+/// lock (issue #376). A live session would have made the lock unavailable,
+/// so this row's process has ended — after this command's `db::open`
+/// swept, or the row would be `interrupted` already. Not acted on here: the
+/// next open sweeps it, and the command is simply run again.
+fn in_progress_after_lock(label: &str, verb: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "volume \"{label}\" has a write session still recorded `in_progress`, but no process \
+         holds its lock: the session ended after this command opened the catalog. Refusing to \
+         {verb} on this read; run the same command again — opening the catalog marks the \
+         session `interrupted`."
+    ))
+}
+
 /// Explain a `rehydrate` that found nothing, naming the `writes` statuses
 /// that actually exist for this volume rather than asserting there are none.
 ///
@@ -2269,13 +2294,7 @@ fn nothing_to_resume(conn: &Connection, volume_id: i64, label: &str) -> TapectlE
         ));
     }
     if statuses.iter().any(|s| s == "in_progress") {
-        return TapectlError::Other(format!(
-            "volume \"{label}\" has an `in_progress` write session. `tapectl` sweeps crashed \
-             sessions to 'interrupted' when it opens the database, so a row still 'in_progress' \
-             means ANOTHER PROCESS IS WRITING THIS TAPE RIGHT NOW. Refusing to resume — two \
-             writers on one cartridge would destroy it. (Existing statuses: {}.)",
-            statuses.join(", ")
-        ));
+        return in_progress_after_lock(label, "resume");
     }
     TapectlError::Other(format!(
         "volume \"{label}\" has no interrupted write session to resume — its write sessions are \
@@ -2557,11 +2576,15 @@ fn finish_session(
             // `ReadyToSeal::seal` (`ReadyToSeal::seal` itself takes no
             // `Connection`), serving both a fresh write and a resumed one,
             // so recording it here covers both.
-            conn.execute(
-                "UPDATE volumes SET sealed_at = COALESCE(sealed_at, datetime('now')) \
-                 WHERE id = ?1",
-                params![volume_id],
-            )?;
+            // Retried on a busy catalog (issue #377): the seal marker is
+            // already on tape, and this is the one record of it.
+            crate::db::busy::retry(crate::db::busy::BusyPolicy::DEFAULT, "the seal", || {
+                Ok(conn.execute(
+                    "UPDATE volumes SET sealed_at = COALESCE(sealed_at, datetime('now')) \
+                     WHERE id = ?1",
+                    params![volume_id],
+                )?)
+            })?;
 
             // Issue #276: sibling to `session`'s `TAPECTL_TEST_PAUSE_AFTER_PLAN`
             // hook, for a state that one cannot reach -- it parks BEFORE any
@@ -3727,6 +3750,11 @@ pub fn volume_verify(
             |row| row.get(0),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Issue #376: the verify is a session on this volume too — held for the
+    // whole readback, so no abort, resume or second verify acts on the
+    // volume under it, and refused while a write or confirm holds it.
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
 
     // Capacity comes from the volume's own row (ADR-0010 decision 3) — the
     // figure decided at init from the medium actually loaded. Only the
@@ -7839,7 +7867,14 @@ mod tests {
     /// Returns `(conn, tenant_id, stage_set_id)`.
     fn escrow_check_fixture() -> (Connection, i64, i64) {
         let conn = crate::db::open_memory().unwrap();
+        let (tenant_id, stage_set_id) = seed_escrow_check_fixture(&conn);
+        (conn, tenant_id, stage_set_id)
+    }
 
+    /// [`escrow_check_fixture`]'s rows, on any connection — a file-backed
+    /// `db::open` for the issue #376 tests, whose locks live beside the
+    /// database file. Returns `(tenant_id, stage_set_id)`.
+    fn seed_escrow_check_fixture(conn: &Connection) -> (i64, i64) {
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
             [],
@@ -7889,7 +7924,7 @@ mod tests {
         .unwrap();
         let stage_set_id = conn.last_insert_rowid();
 
-        (conn, tenant_id, stage_set_id)
+        (tenant_id, stage_set_id)
     }
 
     /// Register the permanent escrow recipient (ADR-0005) on its own holder
@@ -9094,12 +9129,11 @@ mod tests {
         );
     }
 
-    /// An `in_progress` row means a live writer in another process
-    /// (`db::open`'s startup sweep is what would otherwise convert it to
-    /// `interrupted`; this test uses `open_memory`, which does not sweep,
-    /// so the row stays `in_progress` on purpose). It must still reach
-    /// `nothing_to_resume`'s own refusal for that state, not be caught by
-    /// the write-target guard.
+    /// An `in_progress` row seen while resume holds the volume's lock is a
+    /// session that ended after the open (issue #376: a live one would hold
+    /// the lock; `open_memory` does not sweep, so the row stays
+    /// `in_progress` on purpose). It must still reach `nothing_to_resume`'s
+    /// own refusal for that state, not be caught by the write-target guard.
     #[test]
     fn volume_resume_still_targets_a_volume_with_an_in_progress_write() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
@@ -9146,9 +9180,145 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("ANOTHER PROCESS IS WRITING THIS TAPE RIGHT NOW"),
+            msg.contains("no process holds its lock"),
             "must reach nothing_to_resume's in_progress-specific message, proving it \
              passed the write-target guard: {msg}"
+        );
+    }
+
+    /// Issue #376, the positive control for every volume-lock refusal: a
+    /// file-backed catalog, a volume with an `in_progress` write, and the
+    /// volume's lock held through another open file description (the kernel
+    /// treats it exactly as another process's). Returns the pieces; the
+    /// caller decides when the holder drops.
+    fn live_session_fixture(
+        tmp: &tempfile::TempDir,
+    ) -> (Connection, i64, crate::staging::lock::VolumeLock) {
+        let db_file = tmp.path().join("tapectl.db");
+        let conn = crate::db::open(&db_file).unwrap();
+        let (_tenant_id, stage_set_id) = seed_escrow_check_fixture(&conn);
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-LIVE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'in_progress')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+        let holder_conn = Connection::open(&db_file).unwrap();
+        let holder =
+            crate::staging::lock::acquire_volume(&holder_conn, volume_id, "L6-LIVE").unwrap();
+        (conn, volume_id, holder)
+    }
+
+    fn write_status(conn: &Connection, volume_id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM writes WHERE volume_id = ?1",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #376 (a): `volume abort` against a live session is refused as
+    /// a fact — `--yes` does not reach it — and the rows are untouched.
+    /// Released, the same abort gets past the lock (and, with the row now
+    /// swept to `interrupted` by a fresh open, proceeds to abort it).
+    #[test]
+    fn volume_abort_refuses_a_live_session_and_proceeds_once_released() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, volume_id, holder) = live_session_fixture(&tmp);
+
+        let err = volume_abort(&conn, "L6-LIVE", true).unwrap_err();
+        assert!(
+            matches!(err, TapectlError::VolumeSessionLive { .. }),
+            "a held lock must refuse the abort: {err}"
+        );
+        assert_eq!(write_status(&conn, volume_id), "in_progress");
+
+        drop(holder);
+        drop(conn);
+        let conn = crate::db::open(&tmp.path().join("tapectl.db")).unwrap();
+        assert_eq!(
+            write_status(&conn, volume_id),
+            "interrupted",
+            "released, the open sweeps the crashed session"
+        );
+        volume_abort(&conn, "L6-LIVE", true).expect("released, the abort proceeds");
+        assert_eq!(write_status(&conn, volume_id), "aborted");
+    }
+
+    /// Issue #376 (d): `volume resume` against a live session is refused by
+    /// tapectl's own rule, before any device is touched (the device path
+    /// here does not exist, so reaching it would be a different error).
+    #[test]
+    fn volume_resume_refuses_a_live_session_and_passes_the_lock_once_released() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, volume_id, holder) = live_session_fixture(&tmp);
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let config = Config::default();
+        let resume = |conn: &Connection| {
+            volume_resume(
+                conn,
+                &paths,
+                &config,
+                "L6-LIVE",
+                "/nonexistent/tapectl-resume-live-test-nst",
+                512 * 1024,
+            )
+            .unwrap_err()
+        };
+
+        let err = resume(&conn);
+        assert!(
+            matches!(err, TapectlError::VolumeSessionLive { .. }),
+            "a held lock must refuse the resume: {err}"
+        );
+        assert_eq!(write_status(&conn, volume_id), "in_progress");
+
+        drop(holder);
+        let err = resume(&conn);
+        assert!(
+            !matches!(err, TapectlError::VolumeSessionLive { .. }),
+            "released, resume must get past the lock: {err}"
+        );
+    }
+
+    /// Issue #376: `volume write` holds the lock for its session, so a
+    /// second one — or any other session command — is refused while it runs.
+    #[test]
+    fn volume_write_refuses_a_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, _volume_id, _holder) = live_session_fixture(&tmp);
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let err = volume_write(
+            &conn,
+            &paths,
+            &Config::default(),
+            "L6-LIVE",
+            "/nonexistent/tapectl-write-live-test-nst",
+            512 * 1024,
+            true,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TapectlError::VolumeSessionLive { .. }),
+            "a held lock must refuse the write, even with --force: {err}"
         );
     }
 

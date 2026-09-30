@@ -34,7 +34,9 @@
 # basic. Anything else in the directory is left alone.
 #
 # Exit status: nonzero if the backup failed its header check, or fsck
-# reported problems. Pruning failures are logged, never fatal.
+# reported problems. 75 (with no /fail ping) if the catalog was busy — another
+# tapectl command held its write lock past tapectl's wait (issue #377); that
+# is "retry later", not a failure. Pruning failures are logged, never fatal.
 #
 # Optional healthchecks.io-style pinging: TAPECTL_HEALTHCHECK_URL, fail-open,
 # same rule as the audit wrapper (monitoring must never break the thing it
@@ -86,6 +88,14 @@ else
 	"$TAPECTL" db backup --to "$OUT"
 fi
 rc=$?
+if [ "$rc" -eq 75 ]; then
+	# Issue #377: another tapectl command held the catalog past tapectl's
+	# wait. Not a broken catalog, so not /fail; no backup this run, and the
+	# next timer run (or a manual `systemctl start`) tries again.
+	rm -f "$OUT"
+	echo "backup: catalog busy — another tapectl command holds the catalog; no backup this run, retry later" >&2
+	exit 75
+fi
 [ "$rc" -eq 0 ] || fail "tapectl db backup exited $rc"
 
 # A backup that is not a SQLite database is not a backup. The header is the
@@ -122,6 +132,11 @@ while IFS= read -r f; do
 done < <(find "$DIR" -maxdepth 1 -type f -name 'tapectl-[0-9]*T[0-9]*Z.db' -print | sort -r)
 echo "retention: $((n - pruned)) kept, $pruned pruned"
 
+if [ "$fsck_rc" -eq 75 ]; then
+	echo "backup: ok; db fsck skipped — catalog busy (another tapectl command holds it), retry later" >&2
+	ping_hc ""
+	exit 0
+fi
 if [ "$fsck_rc" -ne 0 ]; then
 	echo "backup: written, but db fsck reported problems (exit $fsck_rc) — the LIVE catalog needs attention" >&2
 	ping_hc /fail

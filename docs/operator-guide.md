@@ -1322,20 +1322,31 @@ it covers only units whose archive set sets `verify_interval_days`. For every
 other unit, the verify-status listing in the journal is the only record.
 
 Set `TAPECTL_HEALTHCHECK_URL` in the service to ping a healthchecks.io-style
-endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2). It is off unless
-set, and a missing `curl` or a failed ping never changes the run's own result.
+endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2, no second ping
+on 75, catalog busy). It is off unless set, and a missing `curl` or a failed
+ping never changes the run's own result.
 
 Two things the timers do **not** change:
 
 - **They never write.** No tape command is scheduled, ever. The services set
   `PrivateDevices=true` so they cannot reach `/dev/nst*` even by mistake.
-- **They are safe to fire during other work, with one cosmetic caveat.**
-  Opening the database runs the startup sweep, which marks an `in_progress`
-  write session `interrupted` — so an audit or backup landing in the middle of
-  a `volume write` produces a spurious "recovered orphaned write sessions"
-  event. The session stays fully resumable and revalidates on resume, so
-  nothing is lost, but prefer a schedule outside your usual write window to
-  keep the event log honest.
+- **They are safe to fire during other work.** Opening the database runs
+  the startup sweep, which marks a crashed write session `interrupted` and a
+  crashed verification `aborted`. It tells a crashed session from a live
+  one by the volume's lock (`locks/volume-<id>.lock`, held by `volume init`,
+  `write`, `resume` through confirm, and `verify`; the kernel releases it
+  when the process dies), so a timer that fires during a `volume write`
+  leaves the live session alone. The sweep reads first and writes only
+  when it has something to recover, so the audit and the backup read the
+  catalog even while another command holds its write lock. If that lock is
+  held longer than a command will wait, the command exits **75** ("catalog
+  busy", [Exit codes](troubleshooting.md#exit-codes)). The wrappers report
+  that as "busy, not run" and do not ping `/fail`.
+
+The same lock guards the destructive commands. `volume abort`, `volume
+resume` and `staging clean` (with or without `--force`) refuse a volume or
+stage set whose session is live, and `--force` does not override that: the
+running command is a fact, not a risk judgement.
 
 ### Monthly — verify a rotating slice of the library
 

@@ -71,7 +71,7 @@ volume + started_at, driven as a unit; `write_positions` rows are the cursor):
 |---|---|---|
 | Planned | `planned` | Layout validated, rows inserted, nothing on tape. |
 | Executing | `in_progress` | Store is executing entries; `write_positions` advances `pending → writing → written`. |
-| Interrupted | `interrupted` | SIGINT (clean mark) **or** startup sweep found orphaned `in_progress` (crash). Resumable while the Layout revalidates. |
+| Interrupted | `interrupted` | SIGINT (clean mark) **or** startup sweep found an orphaned `in_progress` row whose volume lock is free (crash, #376). Resumable while the Layout revalidates. |
 | Sealed | `completed` | Confirm readback passed. Terminal. |
 | Aborted | `aborted` | Operator explicitly abandoned an interrupted session; resume revalidation failed unrecoverably; **or** a real EOT was hit mid-write (MAM over-reported capacity — clean abort, no salvage). Terminal; the tape is not a copy. |
 | Failed | `failed` | Store error other than EOT/interrupt (device gone, I/O error) with no transition available. Terminal unless operator retries → new validation → resume semantics. |
@@ -209,9 +209,16 @@ Rules that hold in every path:
   itself to `session_dir/layout.json` (a staging-side sidecar; never a
   `LayoutEntry`, never on tape). `InterruptedSession::rehydrate` reads both,
   reconstructs the cursor map from `write_positions`, and adopts only
-  `interrupted` rows — never `in_progress`, since `db::open` sweeps those
-  before any command holds a `Connection`, so one still `in_progress` means a
-  live writer in another process. Revalidation is unchanged and still runs.
+  `interrupted` rows — never `in_progress`. Liveness is the volume's lock,
+  not the row (#376): `volume init`/`write`/`resume` hold
+  `locks/volume-<id>.lock` from plan through confirm (and `volume verify` for
+  its readback), and the kernel releases it however the process dies.
+  `db::open`'s sweep moves an `in_progress` row to `interrupted` only when
+  that lock is free, and `volume resume` takes the lock before it rehydrates,
+  so a live writer in another process is refused on the lock itself. An
+  `in_progress` row that resume sees while holding the lock belongs to a
+  process that died after this command's open; the next open sweeps it.
+  Revalidation is unchanged and still runs.
 - **Confirm** (#23): a single forward pass from BOP (the index is at the front,
   not the tail — no seek-back). Read the seal marker and verify it binds File 3;
   diff the front index against the Layout (navigable tier); hash each file

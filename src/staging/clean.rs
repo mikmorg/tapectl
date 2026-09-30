@@ -377,6 +377,40 @@ pub fn clean_staging(
         rows
     };
 
+    // Issue #376: a stage set that a live session is writing (or resuming,
+    // or confirming) to some volume is never released, `force` or not — its
+    // staged slices are what that session reads next. The session's volume
+    // lock is the fact (ADR-0008 Tier 3), not a policy judgement, so this
+    // stays within the policy-free rule above. Held sets are skipped and
+    // named in the report; every other candidate is still cleaned.
+    let mut candidates_free = Vec::with_capacity(candidates.len());
+    for (stage_set_id, status) in candidates {
+        let live: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT v.id, v.label FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![stage_set_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .filter(|(volume_id, _)| {
+                    crate::staging::lock::volume_session_live(conn, *volume_id)
+                })
+                .map(|(_, label)| label)
+                .collect()
+        };
+        if live.is_empty() {
+            candidates_free.push((stage_set_id, status));
+        } else {
+            report.held_by_live_session.push((stage_set_id, live));
+        }
+    }
+    let candidates = candidates_free;
+
     if candidates.is_empty() {
         return Ok(report);
     }
@@ -595,6 +629,10 @@ pub struct CleanReport {
     /// `locks/stage-<id>.lock` files removed because their stage_set
     /// reached a terminal state (`staged`, `failed`, `cleaned`).
     pub lockfiles_reclaimed: usize,
+    /// Stage sets NOT released because a live session holds the lock of a
+    /// volume they are planned onto (issue #376), with those volumes'
+    /// labels. `--force` does not release them; they wait for the session.
+    pub held_by_live_session: Vec<(i64, Vec<String>)>,
 }
 
 /// Reclaim `{staging.directory}/sessions/*` directories and terminal
@@ -807,6 +845,16 @@ mod tests {
         status: &str,
     ) -> (Connection, i64, std::path::PathBuf, tempfile::TempDir) {
         let conn = db::open_memory().unwrap();
+        let (stage_set_id, path, dir) = seed_stage_set_rows(&conn, status);
+        (conn, stage_set_id, path, dir)
+    }
+
+    /// [`seed_stage_set_with_status`]'s rows and slice file on any
+    /// connection — a file-backed one for the issue #376 lock tests.
+    fn seed_stage_set_rows(
+        conn: &Connection,
+        status: &str,
+    ) -> (i64, std::path::PathBuf, tempfile::TempDir) {
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
             [],
@@ -848,7 +896,45 @@ mod tests {
         )
         .unwrap();
 
-        (conn, stage_set_id, path, dir)
+        (stage_set_id, path, dir)
+    }
+
+    /// Issue #376 (b): `staging clean --force` used to release a stage set
+    /// whatever its writes' status, so a live writer's next slice open
+    /// failed and the tape was left unsealed. With the volume's lock held
+    /// (another open file description), `--force` keeps the set and names
+    /// it; released — the positive control — the same call releases it.
+    #[test]
+    fn force_clean_keeps_a_stage_set_a_live_session_is_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let conn = db::open(&db_file).unwrap();
+        let (stage_set_id, path, dir) = seed_stage_set_rows(&conn, "staged");
+        seed_write(&conn, stage_set_id, "V-LIVE", "in_progress");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'V-LIVE'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let holder_conn = Connection::open(&db_file).unwrap();
+        let holder =
+            crate::staging::lock::acquire_volume(&holder_conn, volume_id, "V-LIVE").unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), true, CleanScope::Whole).unwrap();
+        assert_eq!(report.sets_cleaned, 0, "a live session's set must be kept");
+        assert_eq!(
+            report.held_by_live_session,
+            vec![(stage_set_id, vec!["V-LIVE".to_string()])]
+        );
+        assert!(path.exists(), "the live writer's slice must still be there");
+
+        drop(holder);
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), true, CleanScope::Whole).unwrap();
+        assert_eq!(report.sets_cleaned, 1, "released, --force releases it");
+        assert!(report.held_by_live_session.is_empty());
+        assert!(!path.exists());
     }
 
     /// A `'failed'` stage_set with NO `stage_slices` rows (the common shape

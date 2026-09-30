@@ -47,8 +47,9 @@ A few conventions:
 ## Exit codes
 
 Any command that fails prints `error: <message>` on stderr and exits **2**.
-The one exception is `volume verify`, which exits **3** on every error
-([below](#volume-verify-0-2-or-3)). When one failure caused another, the
+There are two exceptions. `volume verify` exits **3** on every error
+([below](#volume-verify-0-2-or-3)). A **busy catalog** exits **75**
+([below](#75-catalog-busy)). When one failure caused another, the
 message is the whole chain, joined by `: `. For example, a bad config file
 prints:
 
@@ -75,8 +76,30 @@ A few commands finish their work and then report a verdict through the exit code
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
 | [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; the rest ran, and each failure is an `error:` line | an error |
 
-Apart from `volume verify`, every other command exits 0 on success and 2 on
-error.
+Apart from `volume verify` and a busy catalog, every other command exits 0 on
+success and 2 on error.
+
+### 75: catalog busy
+
+SQLite lets one process write the catalog at a time. A command that needs
+the write lock waits 5 seconds for it. Commands that record finished work
+wait up to 10 minutes: a stage set's slices and its finalization, a tape
+session's positions, its seal and its confirm. If the lock is still held
+after that wait, the command exits **75**, sysexits' `EX_TEMPFAIL`, with
+`error: ... catalog busy ...` or `database is locked` in the message.
+
+Exit 75 is not a verdict. The catalog is not damaged, and an `audit` that
+exits 75 found neither violations nor warnings: it did not run. Run the
+command again once the other one has finished (`ps -C tapectl` shows it). A
+`stage create` that stops this way keeps its encrypted slices. The next
+command marks the set `failed`, and `staging clean` reclaims it; stage the
+unit again. Opening the catalog takes the write lock only to recover a
+crashed session, so read-only commands such as `report`, `catalog` and `db
+backup` run while another command writes.
+
+`volume verify` keeps its own contract: a busy catalog is one more way to
+reach no verdict, so it exits 3. The `contrib/` timer wrappers log 75 as
+"catalog busy" and do not ping `/fail`.
 
 ### `volume verify`: 0, 2 or 3
 

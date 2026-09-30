@@ -436,6 +436,12 @@ pub fn run(
                         // Issue #108: nothing will ever rediscover these,
                         // so a scripted consumer needs the paths, not a count.
                         "stranded": report.stranded,
+                        // Issue #376: stage sets a live session is using,
+                        // never released, `--force` or not.
+                        "held_by_live_session": report.held_by_live_session.iter().map(|(id, labels)| serde_json::json!({
+                            "stage_set_id": id,
+                            "volumes": labels,
+                        })).collect::<Vec<_>>(),
                         // Issue #262: units whose staged bytes were
                         // retained because they have not met their
                         // resolved min_copies. Always present (empty when
@@ -464,6 +470,15 @@ pub fn run(
                 );
                 if report.errors > 0 {
                     println!("  {} errors", report.errors);
+                }
+                // Issue #376: a live session's slices are never released —
+                // a fact, not a judgement, so `--force` does not reach it.
+                for (id, labels) in &report.held_by_live_session {
+                    println!(
+                        "  stage set {id} kept: a live session is using it on volume(s) {} \
+                         (`--force` does not apply; run this again once it has finished)",
+                        labels.join(", ")
+                    );
                 }
                 // Issue #108: `staging clean` nulls `staging_path` before it
                 // unlinks, so a file whose unlink failed can never be found

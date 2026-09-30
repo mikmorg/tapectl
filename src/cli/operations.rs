@@ -3313,10 +3313,7 @@ pub fn db_backup(
     let src_conn = rusqlite::Connection::open(&paths.db_file)?;
     let mut dst_conn = rusqlite::Connection::open(dest)?;
 
-    let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
-    backup
-        .run_to_completion(100, std::time::Duration::from_millis(10), None)
-        .map_err(TapectlError::Database)?;
+    copy_database_in_one_step(&src_conn, &mut dst_conn)?;
 
     // Issue #40: unconditionally copying every private key to an arbitrary
     // operator-chosen destination (USB stick, network share, cloud-synced
@@ -3402,10 +3399,7 @@ pub fn db_import(
 
     let src_conn = rusqlite::Connection::open(import_path)?;
     let mut dst_conn = rusqlite::Connection::open(&paths.db_file)?;
-    let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
-    backup
-        .run_to_completion(100, std::time::Duration::from_millis(10), None)
-        .map_err(TapectlError::Database)?;
+    copy_database_in_one_step(&src_conn, &mut dst_conn)?;
 
     if json_output {
         println!(
@@ -3416,6 +3410,28 @@ pub fn db_import(
         println!("database imported from {import_path}");
     }
     Ok(())
+}
+
+/// SQLite's online backup of `src` into `dst` in ONE step (issue #377).
+/// `step(-1)` copies every page under a single read transaction on `src`,
+/// which in WAL mode never blocks a writer and cannot be restarted by one.
+/// The 100-pages-per-step loop it replaces restarted the copy on every
+/// commit another process made (about 220 steps today, 2,560 at 1 GB), so a
+/// backup during a busy session could chase the catalog indefinitely.
+/// rusqlite's `run_to_completion` refuses a non-positive page count, hence
+/// the loop here; it retries only a busy or locked step.
+fn copy_database_in_one_step(
+    src: &rusqlite::Connection,
+    dst: &mut rusqlite::Connection,
+) -> Result<()> {
+    use rusqlite::backup::{Backup, StepResult};
+    let backup = Backup::new(src, dst)?;
+    loop {
+        match backup.step(-1).map_err(TapectlError::Database)? {
+            StepResult::Done => return Ok(()),
+            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
 }
 
 /// DB fsck: integrity check with optional repair.

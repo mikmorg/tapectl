@@ -748,7 +748,7 @@ pub fn run(
             // transaction: a failure partway through must not leave some
             // fields changed and others not (issue #48 item 5). Each event
             // records the real old value, read just before its own UPDATE.
-            let tx = conn.unchecked_transaction()?;
+            let tx = crate::db::busy::immediate_tx(conn)?;
             write.apply(&tx, id, name, "edited", false)?;
             tx.commit()?;
 
@@ -852,7 +852,7 @@ pub fn run(
             // `synced` field event; a set with nothing to change is
             // `unchanged` and logs nothing.
             let (mut created, mut updated, mut unchanged) = (0, 0, 0);
-            let tx = conn.unchecked_transaction()?;
+            let tx = crate::db::busy::immediate_tx(conn)?;
             for (as_cfg, write) in &writes {
                 let existing: Option<i64> = tx
                     .query_row(

@@ -68,6 +68,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
+use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
 use crate::store::{Evidence, Store, Tier};
 use crate::util::HashingReader;
@@ -1461,6 +1462,24 @@ impl SealedPending {
         )?;
         let vs_id = conn.last_insert_rowid();
 
+        // Issue #376 (c): the status each `writes` row entered confirm in —
+        // `in_progress` after a fresh seal, `interrupted` on a re-confirm,
+        // `aborted` for a session `adopt_aborted` picked up (#280). The seal
+        // transaction below completes a row only if it still reads the same,
+        // so an abort that landed during the readback is reported, never
+        // overwritten.
+        let entry_statuses: Vec<String> = self
+            .write_ids
+            .iter()
+            .map(|(write_id, _)| {
+                conn.query_row(
+                    "SELECT status FROM writes WHERE id = ?1",
+                    params![write_id],
+                    |r| r.get(0),
+                )
+            })
+            .collect::<rusqlite::Result<_>>()?;
+
         let evidence = store.confirm(&self.built.layout, tier)?;
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
@@ -1470,26 +1489,34 @@ impl SealedPending {
         // condemn a physically sound tape.
         let proves_medium_bad = evidence.proves_medium_bad();
 
-        conn.execute(
-            "UPDATE verification_sessions
-             SET completed_at = datetime('now'), outcome = ?1,
-                 slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
-             WHERE id = ?5",
-            params![
-                if passed { "passed" } else { "failed" },
-                evidence.files_checked as i64,
-                if passed {
-                    evidence.files_checked as i64
-                } else {
-                    0
-                },
-                if passed {
-                    0
-                } else {
-                    evidence.mismatches.len() as i64
-                },
-                vs_id,
-            ],
+        // Issue #377: recorded after an hours-long readback, so a busy
+        // catalog is waited out rather than failing the confirm.
+        busy::retry(
+            BusyPolicy::DEFAULT,
+            "the confirm's verification session",
+            || {
+                Ok(conn.execute(
+                    "UPDATE verification_sessions
+                 SET completed_at = datetime('now'), outcome = ?1,
+                     slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
+                 WHERE id = ?5",
+                    params![
+                        if passed { "passed" } else { "failed" },
+                        evidence.files_checked as i64,
+                        if passed {
+                            evidence.files_checked as i64
+                        } else {
+                            0
+                        },
+                        if passed {
+                            0
+                        } else {
+                            evidence.mismatches.len() as i64
+                        },
+                        vs_id,
+                    ],
+                )?)
+            },
         )?;
         // Issue #142: the same per-mismatch detail `volume verify` records,
         // through the same writer — write-time confirm is the OTHER producer
@@ -1498,47 +1525,76 @@ impl SealedPending {
         super::write::record_verification_results(conn, vs_id, self.volume_id, &evidence)?;
 
         if passed {
-            let tx = conn.unchecked_transaction()?;
-            for (write_id, _) in &self.write_ids {
-                tx.execute(
-                    "UPDATE writes SET status = 'completed', completed_at = datetime('now')
-                     WHERE id = ?1",
-                    params![write_id],
-                )?;
-            }
-            // Snapshot promotions, plus what each one needs for its audit row
-            // (issue #58). The pre-flip status is read BEFORE the update so the
-            // event records a real old->new transition rather than guessing,
-            // and so nothing is logged when the guard matches no row.
-            let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
-            for (_, snapshot_id) in &self.write_ids {
-                let before: Option<(String, String, i64)> = tx
-                    .query_row(
-                        "SELECT s.status, u.name, u.tenant_id
-                         FROM snapshots s JOIN units u ON u.id = s.unit_id
-                         WHERE s.id = ?1",
-                        params![snapshot_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .ok();
-
-                let changed = tx.execute(
-                    "UPDATE snapshots SET status = 'current'
-                     WHERE id = ?1 AND status IN ('created', 'staged')",
-                    params![snapshot_id],
-                )?;
-
-                if changed > 0 {
-                    if let Some((old_status, unit_name, tenant_id)) = before {
-                        promoted.push((*snapshot_id, old_status, unit_name, tenant_id));
+            // IMMEDIATE (issue #377: it reads snapshot statuses, then
+            // writes) and retried as a whole on a busy catalog — a dropped
+            // transaction rolls back, so each attempt starts clean.
+            let promoted = busy::retry(BusyPolicy::DEFAULT, "the seal", || {
+                let tx = busy::immediate_tx(conn)?;
+                for ((write_id, _), entered) in self.write_ids.iter().zip(&entry_statuses) {
+                    let completed = tx.execute(
+                        "UPDATE writes SET status = 'completed', completed_at = datetime('now')
+                         WHERE id = ?1 AND status = ?2",
+                        params![write_id, entered],
+                    )?;
+                    if completed == 0 {
+                        // Issue #376 (c): the row moved while confirm read the
+                        // tape — an operator's abort got there first. Dropping
+                        // `tx` rolls back; nothing is sealed over it.
+                        let now: Option<String> = tx
+                            .query_row(
+                                "SELECT status FROM writes WHERE id = ?1",
+                                params![write_id],
+                                |r| r.get(0),
+                            )
+                            .ok();
+                        return Err(TapectlError::Other(format!(
+                            "volume \"{}\": the confirm readback passed, but write session \
+                             {write_id} changed while it ran (entered confirm `{entered}`, now \
+                             `{}`) — most likely `tapectl volume abort`. The catalog was NOT \
+                             updated to sealed over it: the volume stays `initialized` and \
+                             does not count as a copy. The tape itself is sealed; see `tapectl \
+                             volume resume` for re-confirming an aborted session.",
+                            self.built.layout.label,
+                            now.as_deref().unwrap_or("gone"),
+                        )));
                     }
                 }
-            }
-            tx.execute(
-                "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
-                params![self.volume_id],
-            )?;
-            tx.commit()?;
+                // Snapshot promotions, plus what each one needs for its audit
+                // row (issue #58). The pre-flip status is read BEFORE the
+                // update so the event records a real old->new transition
+                // rather than guessing, and so nothing is logged when the
+                // guard matches no row.
+                let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
+                for (_, snapshot_id) in &self.write_ids {
+                    let before: Option<(String, String, i64)> = tx
+                        .query_row(
+                            "SELECT s.status, u.name, u.tenant_id
+                             FROM snapshots s JOIN units u ON u.id = s.unit_id
+                             WHERE s.id = ?1",
+                            params![snapshot_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok();
+
+                    let changed = tx.execute(
+                        "UPDATE snapshots SET status = 'current'
+                         WHERE id = ?1 AND status IN ('created', 'staged')",
+                        params![snapshot_id],
+                    )?;
+
+                    if changed > 0 {
+                        if let Some((old_status, unit_name, tenant_id)) = before {
+                            promoted.push((*snapshot_id, old_status, unit_name, tenant_id));
+                        }
+                    }
+                }
+                tx.execute(
+                    "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+                    params![self.volume_id],
+                )?;
+                tx.commit()?;
+                Ok(promoted)
+            })?;
 
             // Audit rows are emitted AFTER the commit, deliberately, and a
             // failure here is warned about rather than propagated (issue #58).
@@ -1813,34 +1869,40 @@ fn run_entries(
             let write_id = *slice_write_id
                 .get(&stage_slice_id)
                 .expect("plan() populated slice_write_id for every slice entry");
-            match (&stream_result, &abort_reason) {
-                (Ok(actual_hash), None) => {
-                    conn.execute(
-                        "UPDATE write_positions
-                         SET status = 'written', written_at = datetime('now'),
-                             sha256_on_volume = ?1
-                         WHERE write_id = ?2 AND stage_slice_id = ?3",
-                        params![actual_hash, write_id, stage_slice_id],
-                    )?;
+            // Issue #377: the cursor row for a slice already on tape. A busy
+            // catalog is waited out (minutes), never allowed to stop the
+            // drive mid-tape; each UPDATE is idempotent, so a retry is safe.
+            busy::retry(BusyPolicy::DEFAULT, "a slice's write position", || {
+                match (&stream_result, &abort_reason) {
+                    (Ok(actual_hash), None) => {
+                        conn.execute(
+                            "UPDATE write_positions
+                             SET status = 'written', written_at = datetime('now'),
+                                 sha256_on_volume = ?1
+                             WHERE write_id = ?2 AND stage_slice_id = ?3",
+                            params![actual_hash, write_id, stage_slice_id],
+                        )?;
+                    }
+                    (Ok(actual_hash), Some(_)) => {
+                        // Streamed, but the hash didn't match.
+                        conn.execute(
+                            "UPDATE write_positions SET status = 'failed', sha256_on_volume = ?1
+                             WHERE write_id = ?2 AND stage_slice_id = ?3",
+                            params![actual_hash, write_id, stage_slice_id],
+                        )?;
+                    }
+                    (Err(_), _) => {
+                        // Never streamed at all (open failed or store.execute
+                        // errored) — no sha256_on_volume to record.
+                        conn.execute(
+                            "UPDATE write_positions SET status = 'failed'
+                             WHERE write_id = ?1 AND stage_slice_id = ?2",
+                            params![write_id, stage_slice_id],
+                        )?;
+                    }
                 }
-                (Ok(actual_hash), Some(_)) => {
-                    // Streamed, but the hash didn't match.
-                    conn.execute(
-                        "UPDATE write_positions SET status = 'failed', sha256_on_volume = ?1
-                         WHERE write_id = ?2 AND stage_slice_id = ?3",
-                        params![actual_hash, write_id, stage_slice_id],
-                    )?;
-                }
-                (Err(_), _) => {
-                    // Never streamed at all (open failed or store.execute
-                    // errored) — no sha256_on_volume to record.
-                    conn.execute(
-                        "UPDATE write_positions SET status = 'failed'
-                         WHERE write_id = ?1 AND stage_slice_id = ?2",
-                        params![write_id, stage_slice_id],
-                    )?;
-                }
-            }
+                Ok(())
+            })?;
         }
 
         if let Some(reason) = abort_reason {
@@ -1887,14 +1949,19 @@ fn record_quarantine(
     write_ids: &[(i64, i64)],
     reason: QuarantineReason,
 ) -> Result<QuarantinedSession> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
-        params![volume_id],
-    )?;
-    mark_writes(&tx, write_ids, "aborted")?;
-    super::write::log_quarantine(&tx, volume_id, label, &reason)?;
-    tx.commit()?;
+    // IMMEDIATE, so no statement inside can meet a busy catalog, and the
+    // whole act retried as one on a busy BEGIN (issue #377).
+    busy::retry(BusyPolicy::DEFAULT, "a quarantine", || {
+        let tx = busy::immediate_tx(conn)?;
+        tx.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+            params![volume_id],
+        )?;
+        mark_writes(&tx, write_ids, "aborted")?;
+        super::write::log_quarantine(&tx, volume_id, label, &reason)?;
+        tx.commit()?;
+        Ok(())
+    })?;
     Ok(QuarantinedSession {
         volume_id,
         label: label.to_string(),
@@ -1902,12 +1969,18 @@ fn record_quarantine(
     })
 }
 
+/// Move a session's `writes` rows to `status`. Retried on a busy catalog
+/// (issue #377): this records where a tape session stopped, and losing it to
+/// a 5-second lock wait would leave the rows claiming a state the tape is
+/// not in. Idempotent, so safe to retry.
 fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
     for (write_id, _) in write_ids {
-        conn.execute(
-            "UPDATE writes SET status = ?1 WHERE id = ?2",
-            params![status, write_id],
-        )?;
+        busy::retry(BusyPolicy::DEFAULT, "a write session's status", || {
+            Ok(conn.execute(
+                "UPDATE writes SET status = ?1 WHERE id = ?2",
+                params![status, write_id],
+            )?)
+        })?;
     }
     Ok(())
 }
@@ -1968,8 +2041,12 @@ mod tests {
     }
 
     fn make_fixture() -> Fixture {
-        let conn = db::open_memory().unwrap();
+        make_fixture_on(db::open_memory().unwrap())
+    }
 
+    /// [`make_fixture`] on a given connection — a file-backed `db::open`
+    /// when a test needs a second connection to contend with (issue #377).
+    fn make_fixture_on(conn: Connection) -> Fixture {
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
             [],
@@ -2153,6 +2230,163 @@ mod tests {
             sha256_encrypted: sha_enc,
             staging_path: path,
         }
+    }
+
+    /// A `MemStore` whose readback lets an operator's `volume abort` land in
+    /// the middle of confirm — the race issue #376 (c) names.
+    struct AbortsDuringConfirm<'c> {
+        inner: MemStore,
+        conn: &'c Connection,
+        volume_id: i64,
+    }
+
+    impl Store for AbortsDuringConfirm<'_> {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            self.inner.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+        fn confirm(
+            &mut self,
+            layout: &crate::volume::layout_model::Layout,
+            tier: Tier,
+        ) -> Result<Evidence> {
+            self.conn
+                .execute(
+                    "UPDATE writes SET status = 'aborted' WHERE volume_id = ?1",
+                    params![self.volume_id],
+                )
+                .unwrap();
+            self.inner.confirm(layout, tier)
+        }
+    }
+
+    /// Issue #376 (c): confirm's completion no longer overwrites an abort
+    /// that landed during the readback. The readback passes, but the seal
+    /// transaction finds the rows moved, rolls back and says so: `writes`
+    /// stay `aborted`, the volume is not `sealed`, no snapshot is promoted.
+    #[test]
+    fn confirm_does_not_complete_a_session_aborted_during_its_readback() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).unwrap();
+        let mut racing = AbortsDuringConfirm {
+            inner: store,
+            conn: &f.conn,
+            volume_id: f.volume_id,
+        };
+        let err = match sealed_pending.confirm(&f.conn, &mut racing, Tier::Integrity) {
+            Err(e) => e,
+            Ok(_) => panic!("confirm must not complete a session aborted under it"),
+        };
+        assert!(
+            err.to_string().contains("changed while it ran"),
+            "must name the abort that got there first: {err}"
+        );
+        let statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(statuses.iter().all(|s| s == "aborted"), "{statuses:?}");
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(volume_status, "sealed", "nothing sealed over the abort");
+    }
+
+    /// A `MemStore` that, on the first entry it is asked to write, has
+    /// another connection take the catalog's write lock and hold it for
+    /// `hold` — a second tapectl process's long finalization landing
+    /// mid-tape (issue #377 item 2).
+    struct CatalogLockedMidWrite {
+        inner: MemStore,
+        db_path: std::path::PathBuf,
+        hold: std::time::Duration,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Store for CatalogLockedMidWrite {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            if self.holder.is_none() {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (path, hold) = (self.db_path.clone(), self.hold);
+                self.holder = Some(std::thread::spawn(move || {
+                    let c = Connection::open(&path).unwrap();
+                    c.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    std::thread::sleep(hold);
+                    c.execute_batch("COMMIT").unwrap();
+                }));
+                ready_rx.recv().unwrap();
+            }
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            self.inner.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    /// Issue #377 item 2: another connection holds the write lock for ten
+    /// times this connection's busy_timeout while the tape is being
+    /// written. Before, the first slice's `write_positions` UPDATE failed
+    /// and stopped the drive; now it waits the lock out and the session
+    /// reaches Ready with every slice recorded `written`.
+    #[test]
+    fn a_catalog_lock_mid_write_is_waited_out_not_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+        let f = make_fixture_on(db::open(&db_path).unwrap());
+        f.conn.pragma_update(None, "busy_timeout", 50).unwrap();
+        let mut store = CatalogLockedMidWrite {
+            inner: MemStore::new(BS as usize),
+            db_path,
+            hold: std::time::Duration::from_millis(500),
+            holder: None,
+        };
+        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let outcome = planned
+            .execute(&f.conn, &mut store)
+            .expect("a busy catalog mid-write must be waited out");
+        assert!(matches!(outcome, ExecuteOutcome::Ready(_)));
+        store.holder.take().unwrap().join().unwrap();
+        let unwritten: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions WHERE status != 'written'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unwritten, 0, "every slice's cursor row must be recorded");
     }
 
     // --- behavior 1: happy path over MemStore ends Sealed ----------------

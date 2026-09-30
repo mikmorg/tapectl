@@ -1,3 +1,4 @@
+pub mod busy;
 pub mod catalog_snapshot;
 pub mod events;
 pub mod export;
@@ -477,24 +478,36 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
 /// action, and re-matching it on every `db::open()` would log a spurious
 /// "recovered N sessions" event each time an unresolved interrupted session
 /// simply sits there.
-/// Issue #98 asymmetry, deliberate: the `writes` sweep just above stays
-/// exactly as it was — NOT made lock-aware. `docs/design/layout-session.md`
-/// (~line 157) makes "still `in_progress` at open ⇒ a live writer in
-/// another process" load-bearing for `InterruptedSession::rehydrate`, and
-/// changing that inference to a flock check would invalidate a documented
-/// contract this function does not own. It also degrades safely as-is:
-/// `interrupted` is resumable and revalidation still runs on resume, so a
-/// live writer wrongly marked `interrupted` by this sweep loses nothing.
-/// The `stage_sets` sweep below has no such safety net — marking a live
-/// `staging` row `failed` while something else could later target `failed`
-/// rows for deletion would be actively destructive — which is exactly why
-/// it, and only it, gets the flock treatment.
+///
+/// **Lock-aware, all three tables (issues #98, #376).** A row's status alone
+/// cannot tell a crashed session from one running right now in another
+/// process, and this sweep runs on every `db::open()`, including every
+/// read-only command and timer. Until #376 the `writes` and
+/// `verification_sessions` arms rewrote every `in_progress` row regardless,
+/// so the rule "a row still `in_progress` at open means a live writer"
+/// (`docs/design/layout-session.md`'s rehydrate contract, and the `volume
+/// abort`/`volume resume` refusals built on it) could never be observed by
+/// the command asking. Now each candidate is probed through its lock: a
+/// write or verify session through its volume's lock
+/// (`staging::lock::volume_session_live`), a stage set through its own
+/// (`staging::lock::is_crashed`). Held ⇒ a live process owns it ⇒ left
+/// untouched. Free ⇒ crashed ⇒ swept.
+///
+/// **Reads first, writes only on candidates (issue #377).** Every arm
+/// SELECTs, and UPDATEs only when a crashed row exists, so an open with
+/// nothing to recover never needs SQLite's write lock — a read-only command
+/// opens and runs while another command holds it.
 fn recover_orphaned_sessions(conn: &Connection, db_path: &Path) -> Result<()> {
-    let updated = conn.execute(
-        "UPDATE writes SET status = 'interrupted'
-         WHERE status = 'in_progress'",
-        [],
-    )?;
+    let mut updated = 0usize;
+    for volume_id in in_progress_volumes(conn, "writes", "status")? {
+        if !crate::staging::lock::volume_session_live(conn, volume_id) {
+            updated += conn.execute(
+                "UPDATE writes SET status = 'interrupted'
+                 WHERE volume_id = ?1 AND status = 'in_progress'",
+                [volume_id],
+            )?;
+        }
+    }
     if updated > 0 {
         warn!(
             count = updated,
@@ -567,11 +580,16 @@ fn recover_orphaned_sessions(conn: &Connection, db_path: &Path) -> Result<()> {
         )?;
     }
 
-    let updated = conn.execute(
-        "UPDATE verification_sessions SET outcome = 'aborted'
-         WHERE outcome = 'in_progress'",
-        [],
-    )?;
+    let mut updated = 0usize;
+    for volume_id in in_progress_volumes(conn, "verification_sessions", "outcome")? {
+        if !crate::staging::lock::volume_session_live(conn, volume_id) {
+            updated += conn.execute(
+                "UPDATE verification_sessions SET outcome = 'aborted'
+                 WHERE volume_id = ?1 AND outcome = 'in_progress'",
+                [volume_id],
+            )?;
+        }
+    }
     if updated > 0 {
         warn!(
             count = updated,
@@ -593,9 +611,129 @@ fn recover_orphaned_sessions(conn: &Connection, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The volumes with at least one `in_progress` row in `table` (`writes` by
+/// `status`, `verification_sessions` by `outcome`) — the sweep's candidates.
+/// A plain SELECT, so finding none needs no write lock (issue #377).
+fn in_progress_volumes(conn: &Connection, table: &str, column: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT volume_id FROM {table} WHERE {column} = 'in_progress'"
+    ))?;
+    let ids = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file-backed catalog holding one volume with one `in_progress`
+    /// write session and one `in_progress` verification session — the
+    /// shape a live `volume write` is in during its confirm (issue #376).
+    /// Returns `(db_path, volume_id)`; the connection is closed.
+    fn live_session_catalog(tmp: &tempfile::TempDir) -> (std::path::PathBuf, i64) {
+        let db_path = tmp.path().join("tapectl.db");
+        let conn = open(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (name) VALUES ('alpha');
+             INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-1', 'photos', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 'staged', '/tmp/photos', 1, 10);
+             INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (1, 'staged', 524288);
+             INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (1, 1, 1, 'in_progress')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (1, 'full', 'in_progress')",
+            [],
+        )
+        .unwrap();
+        (db_path, 1)
+    }
+
+    fn session_states(conn: &Connection) -> (String, String) {
+        (
+            conn.query_row("SELECT status FROM writes", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row("SELECT outcome FROM verification_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Issue #376: with the volume's lock held (another open file
+    /// description — the kernel treats it exactly as another process's),
+    /// opening the catalog leaves the live session's rows alone. Released —
+    /// the positive control — the same open sweeps both.
+    #[test]
+    fn open_sweeps_a_session_only_once_its_volume_lock_is_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db_path, volume_id) = live_session_catalog(&tmp);
+
+        let holder_conn = Connection::open(&db_path).unwrap();
+        let holder =
+            crate::staging::lock::acquire_volume(&holder_conn, volume_id, "L6-0001").unwrap();
+        let conn = open(&db_path).unwrap();
+        assert_eq!(
+            session_states(&conn),
+            ("in_progress".to_string(), "in_progress".to_string()),
+            "a live session must survive another command's open"
+        );
+        drop(conn);
+
+        drop(holder);
+        let conn = open(&db_path).unwrap();
+        assert_eq!(
+            session_states(&conn),
+            ("interrupted".to_string(), "aborted".to_string()),
+            "once the lock is free, the open sweeps the crashed session"
+        );
+    }
+
+    /// Issue #377: opening the catalog needs no write lock when there is
+    /// nothing to recover, so a read-only command opens and reads while
+    /// another connection holds a write transaction. The holder's lock is
+    /// real (the negative control: a write from the second connection
+    /// fails busy), and the open finishes well inside its 5-second wait.
+    #[test]
+    fn open_succeeds_while_another_connection_holds_the_write_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+        drop(open(&db_path).unwrap());
+
+        let holder = Connection::open(&db_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        let conn = open(&db_path).expect("a read-only open must not need the write lock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "open waited {:?} — something at open wanted the write lock",
+            started.elapsed()
+        );
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
+            .unwrap();
+
+        conn.pragma_update(None, "busy_timeout", 50).unwrap();
+        let write = conn.execute("INSERT INTO tenants (name) VALUES ('x')", []);
+        assert!(
+            matches!(&write, Err(e) if busy::is_busy(e)),
+            "negative control: the holder must really hold the write lock: {write:?}"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+    }
 
     /// Issue #41: `db::open` used to `Connection::open(path)` with no mode
     /// of its own, leaving `tapectl.db` — which holds every filename, path,

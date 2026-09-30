@@ -12,6 +12,7 @@
 #   tapectl audit  0 = clean       -> success
 #                  1 = warnings    -> success, logged
 #                  2 = violations  -> failure
+#                 75 = catalog busy -> no verdict, logged, no ping (issue #377)
 #
 # Warnings are deliberately NOT a failure. `audit` warns for ordinary drift
 # (an overdue verification, a unit one copy short of its target) and paging on
@@ -61,6 +62,12 @@ case "$rc" in
 1)
 	echo "audit: warnings only (advisory — not a failure)"
 	ping_hc ""
+	;;
+75)
+	# Issue #377: another tapectl command held the catalog's write lock past
+	# tapectl's wait. Not a verdict, so neither a success ping nor /fail: the
+	# audit simply did not run. The next timer run tries again.
+	echo "audit: catalog busy — another tapectl command holds the catalog; no verdict this run, retry later" >&2
 	;;
 *)
 	echo "audit: VIOLATIONS (exit $rc)" >&2

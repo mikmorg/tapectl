@@ -10,11 +10,12 @@ Documentation=file:/usr/share/doc/tapectl/install.md
 # timer cannot know when you are done, and the ruling asks for "after every
 # session" (ADR-0012, 2026-09-24 amendment, item 5).
 #
-# Opening the database runs the startup sweep, which marks an `in_progress`
-# write session `interrupted` (fully resumable, revalidated on resume) — the
-# same cosmetic caveat as the audit timer. Keep this outside your usual write
-# window; an overnight write that is still running at 03:00 gets one spurious
-# "recovered orphaned write sessions" event and nothing else.
+# Safe during an overnight write: opening the database sweeps only sessions
+# whose volume lock is free (a crashed process's; the kernel releases a dead
+# holder's lock), so a write still running at 03:00 is left alone, and the
+# backup is a single-step online copy that does not block it. If the catalog
+# stays write-locked past tapectl's wait, the wrapper logs "catalog busy"
+# (exit 75) rather than a failure (issues #376, #377).
 OnCalendar=*-*-* 03:00:00
 
 # A machine that was off at 03:00 still needs its backup — catch up on the

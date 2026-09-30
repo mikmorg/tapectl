@@ -628,7 +628,7 @@ fn move_together(
     // One transaction: a cartridge recorded in a new place while its volumes
     // still claim the old one is precisely the disagreement ADR-0011 exists to
     // make impossible, and a half-applied move would create it.
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::busy::immediate_tx(conn)?;
 
     if let Some((cart_id, barcode)) = &cartridge {
         let old_loc: Option<i64> = tx.query_row(

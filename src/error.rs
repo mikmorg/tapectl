@@ -37,6 +37,15 @@ pub const EXIT_VERIFY_MEDIUM_BAD: i32 = 2;
 /// it, or the command line — then verify again. Issue #356.
 pub const EXIT_VERIFY_INCONCLUSIVE: i32 = 3;
 
+/// The catalog was busy: another tapectl process held SQLite's write lock
+/// for longer than this command would wait (issue #377). Not a verdict and
+/// not a failure of the thing the command checks — the remedy is to run it
+/// again later. 75 is sysexits' `EX_TEMPFAIL`, the conventional "temporary
+/// failure, retry", chosen so it can never collide with a verdict code.
+/// `volume verify` keeps its own contract instead (every error is
+/// [`EXIT_VERIFY_INCONCLUSIVE`], which already means "try again").
+pub const EXIT_CATALOG_BUSY: i32 = 75;
+
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum TapectlError {
@@ -46,6 +55,17 @@ pub enum TapectlError {
 
     #[error("migration error: {0}")]
     Migration(String),
+
+    /// Issue #377: another tapectl process held the catalog's write lock for
+    /// longer than a long writer's retry budget (`db::busy`). Exits
+    /// [`EXIT_CATALOG_BUSY`]. The text names what was being recorded, so
+    /// the operator knows what did and did not land.
+    #[error(
+        "catalog busy: {0} — another tapectl command held the database's write lock for too \
+         long. Nothing is wrong with the catalog; run the command again once the other one \
+         has finished."
+    )]
+    CatalogBusy(String),
 
     /// Issue #233: `db::migrate` catches specifically
     /// `rusqlite_migration::Error::ForeignKeyCheck` — never any other
@@ -192,6 +212,20 @@ pub enum TapectlError {
          point (ADR-0010)."
     )]
     VolumeQuarantined { label: String },
+
+    /// Issue #376: another process holds this volume's session lock
+    /// (`staging::lock::acquire_volume`) — a `volume init`, `write`,
+    /// `resume` (through its confirm) or `verify` is running on it right
+    /// now. A fact the kernel reports, not a risk judgement: ADR-0008 Tier
+    /// 3, and neither `--force` nor `--yes` crosses it.
+    #[error(
+        "volume \"{label}\" has a live session: another tapectl process is running `volume \
+         init`, `write`, `resume` or `verify` on it right now (it holds the volume's lock). \
+         Refusing — acting on a live session would cut it out from under its writer. \
+         `--force` does not apply. Wait for that command to finish; if it was killed, the \
+         kernel has already released its lock and this refusal will not recur."
+    )]
+    VolumeSessionLive { label: String },
 
     #[error("tape I/O error: {0}")]
     TapeIo(String),

@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::config::{Config, TapectlPaths};
 use crate::dar;
+use crate::db::busy::{self, BusyPolicy};
 use crate::db::{events, models, queries};
 use crate::error::{Result, TapectlError};
 use crate::util::{HashingReader, HashingWriter};
@@ -343,10 +344,41 @@ pub(crate) fn stage_create_reporting(
         Ok(id) => Ok(id),
         Err(e) => {
             if let Some(stage_set_id) = stage_set_id_holder.get() {
-                cleanup_failed_stage_set(conn, config, stage_set_id);
+                after_failed_stage(conn, config, stage_set_id, &e);
             }
             Err(e)
         }
+    }
+}
+
+/// What a failed `stage_create` does with its stage set's files: removes
+/// them (`cleanup_failed_stage_set`, issue #54), with two exceptions where
+/// they are kept.
+///
+/// - A busy catalog (issue #377) is not a failed stage. Every slice written
+///   so far is either recorded or still in plaintext
+///   (`record_encrypted_slice`), so keeping the files loses nothing, and
+///   this command does not delete finished work over a lock wait. The next
+///   open marks the set `failed` (its lock is free once `stage_create`
+///   returns), and `staging clean` reclaims it.
+/// - A set that reached `staged` before the error is complete: its slices
+///   are the stage, never garbage.
+fn after_failed_stage(conn: &Connection, config: &Config, stage_set_id: i64, e: &TapectlError) {
+    let staged = conn
+        .query_row(
+            "SELECT status = 'staged' FROM stage_sets WHERE id = ?1",
+            params![stage_set_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if busy::is_busy_error(e) || staged {
+        tracing::warn!(
+            stage_set_id,
+            error = %e,
+            "stage_create stopped; its staging files were left in place"
+        );
+    } else {
+        cleanup_failed_stage_set(conn, config, stage_set_id);
     }
 }
 
@@ -644,23 +676,14 @@ fn stage_create_inner(
         let encrypted_path = PathBuf::from(format!("{}.age", slice_path.display()));
         let info = encrypt_file_streaming(slice_path, &encrypted_path, &all_pubkeys)?;
 
-        // Remove unencrypted slice
-        fs::remove_file(slice_path)
-            .map_err(|e| staging_io_error("cannot remove plaintext slice", slice_path, e))?;
-
-        conn.execute(
-            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                       sha256_plain, sha256_encrypted, staging_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                stage_set_id,
-                slice_num,
-                info.plain_size,
-                info.encrypted_size,
-                info.sha256_plain,
-                info.sha256_encrypted,
-                encrypted_path.to_string_lossy().to_string(),
-            ],
+        record_encrypted_slice(
+            conn,
+            BusyPolicy::DEFAULT,
+            stage_set_id,
+            slice_num,
+            slice_path,
+            &encrypted_path,
+            &info,
         )?;
 
         total_dar_size += info.plain_size;
@@ -717,68 +740,129 @@ fn stage_create_inner(
     // `catalog_path` UPDATEs, and the per-slice `stage_slices` INSERTs)
     // stay outside any transaction; only the finalization below — which
     // only ever runs once the pipeline has fully succeeded — is atomic.
-    let tx = conn.unchecked_transaction()?;
+    //
+    // Issue #377: IMMEDIATE (the snapshot guard reads before it writes),
+    // and retried as a whole for minutes on a busy catalog — every slice is
+    // already encrypted, and a 5-second lock wait must not throw them away.
+    // A dropped transaction rolls back, and every statement here is guarded
+    // or idempotent, so each attempt starts clean.
+    busy::retry(BusyPolicy::DEFAULT, "the stage set's finalization", || {
+        let tx = busy::immediate_tx(conn)?;
 
-    // Update stage_set
-    tx.execute(
-        "UPDATE stage_sets SET status = 'staged', num_slices = ?1, total_dar_size = ?2,
-         total_encrypted_size = ?3, key_fingerprints = ?4, staged_at = datetime('now')
-         WHERE id = ?5",
-        params![
-            dar_result.num_slices as i64,
-            total_dar_size,
-            total_encrypted_size,
-            serde_json::to_string(&key_fingerprints).unwrap(),
-            stage_set_id,
-        ],
-    )?;
-
-    // Update snapshot status
-    let updated = tx.execute(
-        "UPDATE snapshots SET status = 'staged' WHERE id = ?1 AND status = 'created'",
-        params![snapshot_id],
-    )?;
-    if updated > 0 {
-        events::log_field_change(
-            &tx,
-            "snapshot",
-            snapshot_id,
-            &format!("{} v{}", unit.name, snapshot.version),
-            "status_change",
-            "status",
-            Some("created"),
-            "staged",
-            Some(unit.tenant_id),
+        // Update stage_set
+        tx.execute(
+            "UPDATE stage_sets SET status = 'staged', num_slices = ?1, total_dar_size = ?2,
+             total_encrypted_size = ?3, key_fingerprints = ?4, staged_at = datetime('now')
+             WHERE id = ?5",
+            params![
+                dar_result.num_slices as i64,
+                total_dar_size,
+                total_encrypted_size,
+                serde_json::to_string(&key_fingerprints).unwrap(),
+                stage_set_id,
+            ],
         )?;
-    }
 
-    // Backfill sha256 into files and manifest_entries — establishes the
-    // baseline ONLY where one doesn't already exist (issue #32/H6).
-    // `validate_source` now refuses to stage (BITROT) before we ever get
-    // here if a hash disagrees with an existing baseline, but the thing
-    // that actually makes "(first stage only)" true is
-    // `backfill_checksums`'s own `sha256 IS NULL` guard on both UPDATEs —
-    // not this `is_empty()` check, which only skips a no-op call.
-    if !checksums.is_empty() {
-        backfill_checksums(&tx, snapshot_id, &checksums)?;
-    }
+        // Update snapshot status
+        let updated = tx.execute(
+            "UPDATE snapshots SET status = 'staged' WHERE id = ?1 AND status = 'created'",
+            params![snapshot_id],
+        )?;
+        if updated > 0 {
+            events::log_field_change(
+                &tx,
+                "snapshot",
+                snapshot_id,
+                &format!("{} v{}", unit.name, snapshot.version),
+                "status_change",
+                "status",
+                Some("created"),
+                "staged",
+                Some(unit.tenant_id),
+            )?;
+        }
 
-    tx.commit()?;
+        // Backfill sha256 into files and manifest_entries — establishes
+        // the baseline ONLY where one doesn't already exist (issue #32/H6).
+        // `validate_source` now refuses to stage (BITROT) before we ever
+        // get here if a hash disagrees with an existing baseline, but the
+        // thing that actually makes "(first stage only)" true is
+        // `backfill_checksums`'s own `sha256 IS NULL` guard on both
+        // UPDATEs — not this `is_empty()` check, which only skips a no-op
+        // call.
+        if !checksums.is_empty() {
+            backfill_checksums(&tx, snapshot_id, &checksums)?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    })?;
 
     // The stage report is filesystem work and must not sit inside a DB
     // transaction — done here, after commit, along with the creation event.
     let report = generate_stage_report(conn, stage_set_id, &unit, &snapshot, &tenant)?;
     let _report_path = write_stage_report(paths, stage_set_id, &report)?;
 
-    events::log_created(
-        conn,
-        "stage_set",
-        stage_set_id,
-        &format!("{} v{}", unit.name, snapshot.version),
-        Some(unit.tenant_id),
+    busy::retry(
+        BusyPolicy::DEFAULT,
+        "the stage set's creation event",
+        || {
+            events::log_created(
+                conn,
+                "stage_set",
+                stage_set_id,
+                &format!("{} v{}", unit.name, snapshot.version),
+                Some(unit.tenant_id),
+            )
+        },
     )?;
 
     Ok(stage_set_id)
+}
+
+/// Record one encrypted slice, then delete its plaintext — in that order
+/// (issue #377). `cleanup_failed_stage_set` finds `.age` files only through
+/// their `stage_slices` rows and plaintext `.dar` files by prefix, so at
+/// every instant each file on disk is findable: before the row lands, the
+/// plaintext is still there and the `.age` is removed again if the row
+/// cannot be written; after it lands, the row names the `.age`. The INSERT
+/// is retried on a busy catalog for `policy`'s budget — the encryption it
+/// records may have taken an hour.
+fn record_encrypted_slice(
+    conn: &Connection,
+    policy: BusyPolicy,
+    stage_set_id: i64,
+    slice_num: i64,
+    slice_path: &Path,
+    encrypted_path: &Path,
+    info: &EncryptedSliceInfo,
+) -> Result<()> {
+    let recorded = busy::retry(policy, "a staged slice", || {
+        Ok(conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                stage_set_id,
+                slice_num,
+                info.plain_size,
+                info.encrypted_size,
+                info.sha256_plain,
+                info.sha256_encrypted,
+                encrypted_path.to_string_lossy().to_string(),
+            ],
+        )?)
+    });
+    if let Err(e) = recorded {
+        // No row names this `.age`, so nothing could ever find it again;
+        // its plaintext is still on disk for the prefix-keyed cleanup.
+        let _ = fs::remove_file(encrypted_path);
+        return Err(e);
+    }
+
+    // Remove unencrypted slice
+    fs::remove_file(slice_path)
+        .map_err(|e| staging_io_error("cannot remove plaintext slice", slice_path, e))
 }
 
 /// The `archive_base` file-name stem for one stage set: `{uuid12}_v{version}_s{stage_set_id}`.
@@ -813,8 +897,10 @@ pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i
 ///
 /// - **Plaintext `.dar`/`.sha512` are found by filesystem prefix, NOT by DB
 ///   rows.** `dar -c` creates every slice up front; the encryption loop
-///   only deletes a `.dar` (and inserts its `stage_slices` row) *after*
-///   writing its `.age`. So a failure partway through the encryption loop
+///   only inserts a slice's `stage_slices` row and then deletes its `.dar`
+///   *after* writing its `.age` (`record_encrypted_slice`, issue #377: row
+///   first, so no `.age` ever exists without a row once its plaintext is
+///   gone). So a failure partway through the encryption loop
 ///   — or any failure before it even starts, e.g. the zero-active-keys
 ///   refusal — leaves plaintext `.dar` files with no `stage_slices` row at
 ///   all. Iterating `stage_slices` would find exactly the files that are
@@ -2884,6 +2970,117 @@ mod tests {
             sibling_hash.exists(),
             "the sibling's hash file must survive this cleanup for the same reason"
         );
+    }
+
+    /// Issue #377: a file-backed catalog with one `staging` stage set, a
+    /// plaintext slice and its freshly written `.age` — the state
+    /// `record_encrypted_slice` is called in. Returns
+    /// `(tmp, db_path, conn, config, stage_set_id, dar, age)`.
+    #[allow(clippy::type_complexity)]
+    fn slice_being_recorded() -> (TempDir, PathBuf, Connection, Config, i64, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+        let conn = crate::db::open(&db_path).unwrap();
+        let staging_dir = tmp.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let mut config = Config::default();
+        config.staging.directory = staging_dir.to_string_lossy().into_owned();
+        let uuid = "aaaaaaaabbbbccccddddeeeeeeeeeeee";
+        conn.execute_batch(&format!(
+            "INSERT INTO tenants (name) VALUES ('alice');
+             INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('{uuid}', 'u', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (unit_id, version, source_path, status)
+                 VALUES (1, 1, '/src', 'created');
+             INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
+                 VALUES (1, 1024, 'none', 1);"
+        ))
+        .unwrap();
+        let dar = staging_dir.join(format!("{}.1.dar", archive_base_name(uuid, 1, 1)));
+        let age = PathBuf::from(format!("{}.age", dar.display()));
+        fs::write(&dar, b"plaintext").unwrap();
+        fs::write(&age, b"ciphertext").unwrap();
+        (tmp, db_path, conn, config, 1, dar, age)
+    }
+
+    fn slice_info() -> EncryptedSliceInfo {
+        EncryptedSliceInfo {
+            plain_size: 9,
+            sha256_plain: "p".into(),
+            encrypted_size: 10,
+            sha256_encrypted: "e".into(),
+        }
+    }
+
+    fn slice_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM stage_slices", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    const QUICK: BusyPolicy = BusyPolicy {
+        budget: std::time::Duration::from_millis(200),
+        first_pause: std::time::Duration::from_millis(10),
+        max_pause: std::time::Duration::from_millis(50),
+    };
+
+    /// Issue #377 item 1: the row is recorded BEFORE the plaintext goes, so
+    /// a busy INSERT can never leave an `.age` that no row names. With the
+    /// write lock held past the retry budget, the `.age` is removed and the
+    /// plaintext kept (the prefix-keyed cleanup finds it); released — the
+    /// positive control — the same call records the row and only then
+    /// deletes the plaintext.
+    #[test]
+    fn a_busy_slice_insert_leaves_no_age_file_without_a_row() {
+        let (_tmp, db_path, conn, _config, stage_set_id, dar, age) = slice_being_recorded();
+        conn.pragma_update(None, "busy_timeout", 20).unwrap();
+        let holder = Connection::open(&db_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let err = record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info())
+            .unwrap_err();
+        assert!(matches!(err, TapectlError::CatalogBusy(_)), "{err:?}");
+        assert_eq!(slice_rows(&conn), 0);
+        assert!(
+            !age.exists(),
+            "an .age no row names must not be left behind"
+        );
+        assert!(
+            dar.exists(),
+            "the plaintext stays for the prefix-keyed cleanup"
+        );
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        fs::write(&age, b"ciphertext").unwrap();
+        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info()).unwrap();
+        assert_eq!(slice_rows(&conn), 1);
+        assert!(age.exists() && !dar.exists());
+    }
+
+    /// Issue #377 item 2: a lock error after slices are encrypted never
+    /// reaches `cleanup_failed_stage_set` — the recorded `.age` and its row
+    /// stay. The same call with any other error (the positive control)
+    /// does clean them up.
+    #[test]
+    fn a_busy_error_keeps_the_stage_sets_files_and_any_other_error_cleans_them() {
+        let (_tmp, _db_path, conn, config, stage_set_id, dar, age) = slice_being_recorded();
+        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info()).unwrap();
+
+        let busy_err = TapectlError::CatalogBusy("the stage set's finalization".into());
+        after_failed_stage(&conn, &config, stage_set_id, &busy_err);
+        assert!(
+            age.exists(),
+            "a busy catalog must not discard encrypted slices"
+        );
+        assert_eq!(slice_rows(&conn), 1);
+
+        after_failed_stage(
+            &conn,
+            &config,
+            stage_set_id,
+            &TapectlError::Other("dar failed".into()),
+        );
+        assert!(!age.exists(), "any other failure still cleans up");
+        assert_eq!(slice_rows(&conn), 0);
     }
 
     // ── issue #49: exclusions end-to-end (dotfile+global -> dar, walk, validation) ──
