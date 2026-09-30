@@ -13473,6 +13473,65 @@ mod tests {
             );
         }
 
+        /// ADR-0012's 2026-09-30 (later) amendment, through the whole
+        /// `volume_write` orchestration: a staged slice rotted in place (same
+        /// size). With `--prewrite-hash` the pre-flight validate refuses it
+        /// before the store sees a byte; without it the write reaches the
+        /// store and L2 aborts it with the hash-mismatch reason, unsealed.
+        #[test]
+        fn prewrite_hash_flag_is_threaded_through_volume_write() {
+            for prewrite_hash in [true, false] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (conn, mut config, volume_id) = swept_write_fixture("SW-ROT", tmp.path());
+                config.backends.lto[0].capacity_override = Some("2400G".into());
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let slice_path = tmp.path().join("slices").join("slice_1.age");
+                let mut bytes = fs::read(&slice_path).unwrap();
+                bytes[0] ^= 0xFF;
+                fs::write(&slice_path, bytes).unwrap();
+                let mut slot = ContactSlot::empty();
+                let mut store = MemStore::new(512 * 1024);
+
+                let r = volume_write_contacted(
+                    &conn,
+                    &paths,
+                    &config,
+                    "SW-ROT",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    prewrite_hash,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(&mut store),
+                );
+                let err = slot.finish_result(r).unwrap_err().to_string();
+                if prewrite_hash {
+                    assert!(
+                        err.contains("failed pre-write validation")
+                            && err.contains("checksum mismatch"),
+                        "--prewrite-hash refuses before the tape: {err}"
+                    );
+                    assert!(store.files.is_empty(), "nothing reached the store");
+                } else {
+                    assert!(
+                        err.contains("hash mismatch at position"),
+                        "the default reaches the store and L2 aborts: {err}"
+                    );
+                    assert!(!store.files.is_empty(), "the write did reach the store");
+                }
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM volumes WHERE id = ?1",
+                        params![volume_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(status, "initialized", "never sealed ({prewrite_hash})");
+            }
+        }
+
         /// The structural statement of "once per contact" for all three
         /// write paths (issue #342), including `volume resume`, which no
         /// ungated test can drive past its MAM read: each `_contacted`
