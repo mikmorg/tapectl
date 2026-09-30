@@ -46,13 +46,13 @@ pub struct SnapshotOutcome {
 /// The comparison reuses `unit::content_match::matches_snapshot` — the
 /// exact predicate `unit status --dirty`/`report dirty`/`audit` already use
 /// to decide *Dirty* (`collection::fingerprint::classify`) — against the
-/// walk this function has *already* performed (`manifest_entries`, below).
+/// walk this function has *already* performed (`walked`, below).
 /// It is never re-walked: a second `walk_directory`/`WalkDir` pass here
 /// would silently double every snapshot's wall-clock time, which is the
 /// exact regression issue #159 warns against.
 ///
 /// `config.defaults.global_excludes` (issue #49 item 5) is passed through
-/// to `walk_directory` so the recorded `files`/manifest rows never include
+/// to `walk_directory` so the recorded `files` rows never include
 /// a file dar itself was never going to archive (the unit's own dotfile
 /// excludes are read internally by `walk_directory`, keyed off
 /// `source_path`). `config` also supplies `defaults.large_file_warn_threshold`
@@ -84,8 +84,8 @@ pub fn snapshot_create_detailed(
 
     // Walk directory and build manifest — the ONLY walk this function
     // performs. Both the content-match short-circuit immediately below and
-    // the mint path that follows it reuse `manifest_entries` (issue #159).
-    let (total_size, file_count, manifest_entries) = walk_directory(source_path, global_excludes)?;
+    // the mint path that follows it reuse `walked` (issue #159).
+    let (total_size, file_count, walked) = walk_directory(source_path, global_excludes)?;
 
     // ADR-0012 / issue #159: does this walk already match the unit's most
     // recent snapshot? `content_match::latest_snapshot` is the exact same
@@ -95,7 +95,7 @@ pub fn snapshot_create_detailed(
     if let Some((latest_id, latest_version, latest_status)) =
         crate::unit::content_match::latest_snapshot(conn, unit.id)?
     {
-        let mut fresh_stamps: Vec<crate::unit::content_match::FileStamp> = manifest_entries
+        let mut fresh_stamps: Vec<crate::unit::content_match::FileStamp> = walked
             .iter()
             .filter(|e| !e.is_dir)
             .map(|e| crate::unit::content_match::FileStamp {
@@ -141,13 +141,6 @@ pub fn snapshot_create_detailed(
         }
     }
 
-    // Determine next version number
-    let next_version: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) + 1 FROM snapshots WHERE unit_id = ?1",
-        params![unit.id],
-        |row| row.get(0),
-    )?;
-
     // Empty units: warn but allow (design line 185). Gated on `file_count`,
     // not `total_size` — a unit full of zero-byte files is not empty.
     if file_count == 0 {
@@ -161,7 +154,7 @@ pub fn snapshot_create_detailed(
     // validated at config load, so in practice this only fails if that
     // guard is ever bypassed.
     let large_file_threshold = parse_size_to_bytes(&config.defaults.large_file_warn_threshold)?;
-    for entry in &manifest_entries {
+    for entry in &walked {
         if !entry.is_dir && entry.size > large_file_threshold {
             tracing::warn!(
                 path = %entry.path,
@@ -172,72 +165,64 @@ pub fn snapshot_create_detailed(
         }
     }
 
-    // Insert snapshot
-    conn.execute(
-        "INSERT INTO snapshots (unit_id, version, source_path, total_size, file_count)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![unit.id, next_version, source_path, total_size, file_count],
-    )?;
-    let snapshot_id = conn.last_insert_rowid();
+    // Issue #374: the snapshot row and every `files` row land in ONE
+    // IMMEDIATE transaction, or none of them does. Before, each INSERT was
+    // its own autocommit, so a Ctrl-C or a busy catalog partway through left
+    // a committed snapshot with a short file list that nothing detected.
+    // The walk and the content match above stay outside it: the lock is held
+    // only for the inserts (about 1-2 s per 50k files). The version number is
+    // read inside it, since IMMEDIATE is what makes read-then-write safe
+    // against a concurrent `snapshot create` of the same unit (`db::busy`,
+    // rule 2). A busy catalog is retried (rule 3); a transaction dropped on
+    // error rolls back, so each attempt starts clean.
+    let (snapshot_id, next_version) =
+        busy::retry(BusyPolicy::DEFAULT, "the snapshot's file list", || {
+            let tx = busy::immediate_tx(conn)?;
+            let next_version: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM snapshots WHERE unit_id = ?1",
+                params![unit.id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO snapshots (unit_id, version, source_path, total_size, file_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![unit.id, next_version, source_path, total_size, file_count],
+            )?;
+            let snapshot_id = tx.last_insert_rowid();
 
-    // Insert manifest
-    conn.execute(
-        "INSERT INTO manifests (snapshot_id) VALUES (?1)",
-        params![snapshot_id],
-    )?;
-    let manifest_id = conn.last_insert_rowid();
+            // `files` is the one per-file record (migration 027 dropped the
+            // write-only `manifests`/`manifest_entries` duplicate, issue
+            // #372). Mode/uid/gid live in dar's own catalogue, which is what
+            // a restore reads.
+            {
+                let mut file_insert = tx.prepare(
+                    "INSERT INTO files (snapshot_id, path, size_bytes, modified_at, is_directory,
+                                        file_type, link_target)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                for entry in &walked {
+                    file_insert.execute(params![
+                        snapshot_id,
+                        entry.path,
+                        entry.size,
+                        entry.mtime,
+                        entry.is_dir,
+                        entry.file_type,
+                        entry.link_target,
+                    ])?;
+                }
+            }
 
-    // Insert manifest entries and files
-    let mut file_insert = conn.prepare(
-        "INSERT INTO files (snapshot_id, path, size_bytes, modified_at, is_directory,
-                            file_type, link_target)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    let mut manifest_insert = conn.prepare(
-        // No has_xattrs/has_acls (issue #149, migration 013): both were bound
-        // as literal 0 here under a comment claiming they were "populated on
-        // stage", nothing ever fulfilled it, and nothing ever read them. dar
-        // owns xattr/ACL handling and records what it preserved in its own
-        // archive catalog; a second copy here could only drift from it.
-        "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime, is_directory,
-                                       mode, uid, gid, username, groupname,
-                                       file_type, link_target)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-    )?;
-
-    for entry in &manifest_entries {
-        file_insert.execute(params![
-            snapshot_id,
-            entry.path,
-            entry.size,
-            entry.mtime,
-            entry.is_dir,
-            entry.file_type,
-            entry.link_target,
-        ])?;
-        manifest_insert.execute(params![
-            manifest_id,
-            entry.path,
-            entry.size,
-            entry.mtime,
-            entry.is_dir,
-            entry.mode,
-            entry.uid,
-            entry.gid,
-            entry.username,
-            entry.groupname,
-            entry.file_type,
-            entry.link_target,
-        ])?;
-    }
-
-    events::log_created(
-        conn,
-        "snapshot",
-        snapshot_id,
-        &format!("{unit_name} v{next_version}"),
-        Some(unit.tenant_id),
-    )?;
+            events::log_created(
+                &tx,
+                "snapshot",
+                snapshot_id,
+                &format!("{unit_name} v{next_version}"),
+                Some(unit.tenant_id),
+            )?;
+            tx.commit()?;
+            Ok((snapshot_id, next_version))
+        })?;
 
     Ok(SnapshotOutcome {
         snapshot_id,
@@ -419,6 +404,7 @@ fn stage_create_inner(
 
     let snapshot = get_snapshot(conn, snapshot_id)?;
     let unit = get_unit_for_snapshot(conn, &snapshot)?;
+    check_file_list_complete(conn, &snapshot, &unit.name)?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
@@ -782,13 +768,13 @@ fn stage_create_inner(
             )?;
         }
 
-        // Backfill sha256 into files and manifest_entries — establishes
+        // Backfill sha256 into files — establishes
         // the baseline ONLY where one doesn't already exist (issue #32/H6).
         // `validate_source` now refuses to stage (BITROT) before we ever
         // get here if a hash disagrees with an existing baseline, but the
         // thing that actually makes "(first stage only)" true is
-        // `backfill_checksums`'s own `sha256 IS NULL` guard on both
-        // UPDATEs — not this `is_empty()` check, which only skips a no-op
+        // `backfill_checksums`'s own `sha256 IS NULL` guard on its
+        // UPDATE — not this `is_empty()` check, which only skips a no-op
         // call.
         if !checksums.is_empty() {
             backfill_checksums(&tx, snapshot_id, &checksums)?;
@@ -1133,6 +1119,43 @@ fn resolve_slice_size_string(
     // receives the config string verbatim, never round-tripped through
     // `parse_size_to_bytes`.
     config.defaults.slice_size.clone()
+}
+
+/// Refuse to stage a snapshot whose file list is short (issue #374).
+///
+/// `snapshots.file_count` is the walk's own count of non-directory entries,
+/// written in the same statement as the snapshot row; the `files` rows are
+/// what `catalog search`, `locate` and the tape's `catalog.db` are built
+/// from. Since #374 both land in one transaction, but a snapshot minted
+/// before that could have committed its row and then lost the rest of its
+/// file list to a Ctrl-C or a busy catalog, and nothing detected it: dar
+/// would archive the files anyway, and the tape's catalog would carry the
+/// gap. A NULL `file_count` (never written by `snapshot create`) is not a
+/// count to compare, so it passes.
+fn check_file_list_complete(
+    conn: &Connection,
+    snapshot: &models::Snapshot,
+    unit_name: &str,
+) -> Result<()> {
+    let Some(expected) = snapshot.file_count else {
+        return Ok(());
+    };
+    let recorded: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
+        params![snapshot.id],
+        |r| r.get(0),
+    )?;
+    if recorded != expected {
+        return Err(TapectlError::Other(format!(
+            "snapshot {unit_name} v{} is incomplete: it records {expected} file(s) but the \
+             catalog holds {recorded} file row(s) for it, so an earlier `snapshot create` \
+             was interrupted partway. Staging it would put a short file list on tape. \
+             Recover with `tapectl snapshot delete {unit_name} --version {}`, then \
+             `tapectl snapshot create {unit_name}`",
+            snapshot.version, snapshot.version
+        )));
+    }
+    Ok(())
 }
 
 fn get_snapshot(conn: &Connection, id: i64) -> Result<models::Snapshot> {
@@ -1658,9 +1681,9 @@ fn stream_copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64>
 }
 
 /// Establish the sha256 baseline for every `(path, hash)` pair — but ONLY
-/// where `files`/`manifest_entries` don't already have one (issue #32/H6).
+/// where `files` doesn't already have one (issue #32/H6).
 ///
-/// The `sha256 IS NULL` guard on both UPDATEs is the actual enforcement:
+/// The `sha256 IS NULL` guard on the UPDATE is the actual enforcement:
 /// it makes this function safe to call on every `stage_create` (including
 /// a re-stage of an already-baselined snapshot) regardless of what
 /// `checksums` contains, rather than relying on the caller to have
@@ -1670,23 +1693,26 @@ fn stream_copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64>
 /// establishes it) or already matches (a no-op rewrite of the identical
 /// value) — but the guard holds even if that invariant is ever violated by
 /// a future caller.
+///
+/// Issue #372: each UPDATE is keyed by `(snapshot_id, path)`, which the
+/// `UNIQUE(snapshot_id, path)` index serves, so finalization is linear in
+/// the file count. The second UPDATE this used to run, into
+/// `manifest_entries`, could only search by `manifest_id` and scanned the
+/// whole manifest per file; migration 027 dropped that table. The plan is
+/// pinned by `backfill_checksums_searches_the_unique_index`. The `files_au`
+/// FTS trigger fires only on a `path` change since 027, so a sha256-only
+/// UPDATE no longer rewrites the search index either.
+pub(crate) const BACKFILL_SQL: &str =
+    "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = ?3 AND sha256 IS NULL";
+
 fn backfill_checksums(
     conn: &Connection,
     snapshot_id: i64,
     checksums: &[(String, String)],
 ) -> Result<()> {
-    let mut file_update = conn.prepare(
-        "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = ?3 AND sha256 IS NULL",
-    )?;
-    let mut manifest_update = conn.prepare(
-        "UPDATE manifest_entries SET sha256 = ?1
-         WHERE manifest_id = (SELECT id FROM manifests WHERE snapshot_id = ?2 LIMIT 1)
-         AND path = ?3 AND sha256 IS NULL",
-    )?;
-
+    let mut file_update = conn.prepare(BACKFILL_SQL)?;
     for (path, hash) in checksums {
         file_update.execute(params![hash, snapshot_id, path])?;
-        manifest_update.execute(params![hash, snapshot_id, path])?;
     }
     Ok(())
 }
@@ -1997,11 +2023,6 @@ fn walk_directory(
             is_dir,
             file_type,
             link_target,
-            mode: Some(meta.mode() as i64),
-            uid: Some(meta.uid() as i64),
-            gid: Some(meta.gid() as i64),
-            username: None,
-            groupname: None,
         });
     }
 
@@ -2036,11 +2057,6 @@ struct ManifestEntry {
     is_dir: bool,
     file_type: &'static str,
     link_target: Option<String>,
-    mode: Option<i64>,
-    uid: Option<i64>,
-    gid: Option<i64>,
-    username: Option<String>,
-    groupname: Option<String>,
 }
 
 #[cfg(test)]
@@ -4130,7 +4146,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_files_do_not_appear_in_manifest_or_files_table() {
+    fn excluded_files_do_not_appear_in_files_table() {
         let tmp = TempDir::new().unwrap();
         let (conn, _paths, _config, src) =
             setup_unit_with_excludes(&tmp, vec!["*.tmp".to_string()]);
@@ -4148,20 +4164,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(files_count, 0, "excluded file must not appear in `files`");
-
-        let manifest_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM manifest_entries me
-                 JOIN manifests m ON m.id = me.manifest_id
-                 WHERE m.snapshot_id = ?1 AND me.path = 'junk.tmp'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            manifest_count, 0,
-            "excluded file must not appear in `manifest_entries`"
-        );
 
         let kept_count: i64 = conn
             .query_row(
@@ -4413,7 +4415,7 @@ mod tests {
     }
 
     #[test]
-    fn global_default_excluded_files_do_not_appear_in_manifest_or_files_table() {
+    fn global_default_excluded_files_do_not_appear_in_files_table() {
         let tmp = TempDir::new().unwrap();
         let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
 
@@ -4433,20 +4435,6 @@ mod tests {
             files_count, 0,
             "a globally-excluded file must not appear in `files`, even with no \
              dotfile override"
-        );
-
-        let manifest_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM manifest_entries me
-                 JOIN manifests m ON m.id = me.manifest_id
-                 WHERE m.snapshot_id = ?1 AND me.path = 'Thumbs.db'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            manifest_count, 0,
-            "a globally-excluded file must not appear in `manifest_entries` either"
         );
 
         let kept_count: i64 = conn
@@ -4920,5 +4908,244 @@ mod tests {
             // earlier and never gets here).
             secure_catalog_files(&ghost);
         }
+    }
+
+    // --- issue #372: the checksum backfill is linear ---
+
+    /// `EXPLAIN QUERY PLAN` detail lines for `sql`, with every parameter
+    /// bound to NULL.
+    fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let n = stmt.parameter_count();
+        let nulls: Vec<Option<i64>> = vec![None; n];
+        stmt.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// The pin: each backfill UPDATE finds its row through the
+    /// UNIQUE(snapshot_id, path) index. Before migration 027 the second
+    /// UPDATE, into `manifest_entries`, searched by `manifest_id` alone and
+    /// scanned the whole manifest per file.
+    #[test]
+    fn backfill_checksums_searches_the_unique_index() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = query_plan(&conn, BACKFILL_SQL);
+        assert_eq!(
+            plan,
+            vec!["SEARCH files USING INDEX sqlite_autoindex_files_1 (snapshot_id=? AND path=?)"],
+            "the backfill must be one indexed lookup per file"
+        );
+    }
+
+    /// Timing-independent linearity: the backfill never takes a full-scan
+    /// step, and the virtual-machine steps it spends per file do not grow
+    /// with the snapshot's size. A per-file scan (the pre-027 shape) makes
+    /// the per-file cost proportional to the file count.
+    #[test]
+    fn backfill_checksums_costs_the_same_per_file_at_any_snapshot_size() {
+        fn steps_per_file(files: i64) -> (f64, i32) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
+                 INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
+                 INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 1, '/s');
+                 INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (2, 1, 2, '/s');",
+            )
+            .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut checksums = Vec::new();
+            for sid in [1i64, 2] {
+                for f in 0..files {
+                    let path = format!("d{}/f{f:06}", f % 17);
+                    tx.execute(
+                        "INSERT INTO files (snapshot_id, path, size_bytes) VALUES (?1, ?2, 1)",
+                        params![sid, path],
+                    )
+                    .unwrap();
+                    if sid == 2 {
+                        checksums.push((path, format!("{f:064x}")));
+                    }
+                }
+            }
+            tx.commit().unwrap();
+
+            let mut stmt = conn.prepare(BACKFILL_SQL).unwrap();
+            for (path, hash) in &checksums {
+                stmt.execute(params![hash, 2i64, path]).unwrap();
+            }
+            let vm = stmt.get_status(rusqlite::StatementStatus::VmStep);
+            let fullscan = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+            let done: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE snapshot_id = 2 AND sha256 IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(done, files, "positive control: every file was baselined");
+            (vm as f64 / files as f64, fullscan)
+        }
+
+        let (small, small_scan) = steps_per_file(500);
+        let (large, large_scan) = steps_per_file(4_000);
+        assert_eq!((small_scan, large_scan), (0, 0), "no full-scan step, ever");
+        assert!(
+            large <= small * 1.25,
+            "per-file cost grew with the snapshot: {small:.1} steps/file at 500 files, \
+             {large:.1} at 4000"
+        );
+
+        // Positive control: the same measurement on the UPDATE this
+        // replaced (schema 26, `manifest_entries` searched by `manifest_id`
+        // alone) sees the per-file cost grow with the manifest.
+        fn old_steps_per_file(files: i64) -> f64 {
+            let conn = crate::db::open_memory_at_version(26);
+            conn.execute_batch(
+                "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
+                 INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
+                 INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 1, '/s');
+                 INSERT INTO manifests (id, snapshot_id) VALUES (1, 1);",
+            )
+            .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for f in 0..files {
+                tx.execute(
+                    "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime)
+                     VALUES (1, ?1, 1, 'm')",
+                    params![format!("f{f:06}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "UPDATE manifest_entries SET sha256 = ?1
+                     WHERE manifest_id = (SELECT id FROM manifests WHERE snapshot_id = ?2 LIMIT 1)
+                     AND path = ?3 AND sha256 IS NULL",
+                )
+                .unwrap();
+            for f in 0..files {
+                stmt.execute(params!["h", 1i64, format!("f{f:06}")])
+                    .unwrap();
+            }
+            stmt.get_status(rusqlite::StatementStatus::VmStep) as f64 / files as f64
+        }
+        let (old_small, old_large) = (old_steps_per_file(500), old_steps_per_file(4_000));
+        assert!(
+            old_large > old_small * 4.0,
+            "the measurement must see the pre-027 quadratic: {old_small:.1} vs {old_large:.1}"
+        );
+    }
+
+    // --- issue #374: a snapshot is all of its rows or none ---
+
+    /// A failure injected partway through the insert loop (a trigger that
+    /// aborts the third `files` INSERT, standing in for a Ctrl-C or a busy
+    /// catalog) leaves no snapshot row, no `files` row and no event: the
+    /// next `snapshot create` mints v1 as if nothing had happened.
+    #[test]
+    fn snapshot_create_failing_mid_insert_leaves_no_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, _config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        for i in 0..6 {
+            fs::write(src.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER inject_mid_insert BEFORE INSERT ON files
+             WHEN (SELECT COUNT(*) FROM files WHERE snapshot_id = NEW.snapshot_id) >= 2
+             BEGIN SELECT RAISE(ABORT, 'injected mid-insert failure'); END;",
+        )
+        .unwrap();
+
+        let err = snapshot_create(&conn, "unit1", &Config::default()).unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        for (what, sql) in [
+            ("snapshots", "SELECT COUNT(*) FROM snapshots"),
+            ("files", "SELECT COUNT(*) FROM files"),
+            (
+                "snapshot events",
+                "SELECT COUNT(*) FROM events WHERE entity_type = 'snapshot'",
+            ),
+        ] {
+            let n: i64 = conn.query_row(sql, [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "a failed snapshot create left {n} {what} row(s)");
+        }
+
+        conn.execute_batch("DROP TRIGGER inject_mid_insert")
+            .unwrap();
+        let outcome = snapshot_create_detailed(&conn, "unit1", &Config::default()).unwrap();
+        assert!(outcome.minted);
+        assert_eq!(
+            outcome.version, 1,
+            "the failed attempt must not burn a version"
+        );
+        let files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
+                params![outcome.snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT file_count FROM snapshots WHERE id = ?1",
+                params![outcome.snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(files, recorded, "the retry records the whole file list");
+        assert!(files >= 6, "positive control: {files} files");
+    }
+
+    /// `stage create` refuses a snapshot whose `files` rows are fewer than
+    /// its `file_count` (one minted before #374 and interrupted), naming
+    /// both numbers and the recovery, before any stage set or dar run.
+    #[test]
+    fn stage_create_refuses_a_snapshot_with_a_short_file_list() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        for i in 0..4 {
+            fs::write(src.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+        }
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT file_count FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // What an interrupted pre-#374 `snapshot create` left behind.
+        conn.execute(
+            "DELETE FROM files WHERE snapshot_id = ?1 AND path = 'f3.txt'",
+            params![snap_id],
+        )
+        .unwrap();
+
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("is incomplete"), "{msg}");
+        assert!(
+            msg.contains(&format!("records {file_count} file(s)")),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("holds {} file row(s)", file_count - 1)),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("tapectl snapshot delete unit1 --version 1")
+                && msg.contains("tapectl snapshot create unit1"),
+            "the message names the recovery: {msg}"
+        );
+        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        let stage_sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
     }
 }

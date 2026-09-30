@@ -8,7 +8,7 @@ use crate::config::{Config, TapectlPaths};
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 
-/// Purge a reclaimable snapshot (remove files/manifests, mark purged).
+/// Purge a reclaimable snapshot (remove its `files` rows, mark purged).
 pub fn snapshot_purge(
     conn: &Connection,
     unit_name: &str,
@@ -34,17 +34,8 @@ pub fn snapshot_purge(
         )));
     }
 
-    // Delete files and manifests atomically — keep the snapshot row as 'purged'
+    // Delete the file list atomically — keep the snapshot row as 'purged'
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM manifest_entries WHERE manifest_id IN
-         (SELECT id FROM manifests WHERE snapshot_id = ?1)",
-        params![snap_id],
-    )?;
-    tx.execute(
-        "DELETE FROM manifests WHERE snapshot_id = ?1",
-        params![snap_id],
-    )?;
     tx.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
     tx.execute(
         "UPDATE snapshots SET status = 'purged' WHERE id = ?1",
@@ -2815,8 +2806,7 @@ pub fn snapshot_delete(
     let interrupted_volumes = interrupted_write_volumes(conn, snap_id)?;
 
     // Cascade delete: verification_results -> write_positions -> writes ->
-    // stage_slices -> stage_sets -> manifest_entries -> manifests -> files
-    // -> snapshot
+    // stage_slices -> stage_sets -> files -> snapshot
     //
     // One transaction, including the event (issue #55): as bare
     // `conn.execute` calls, a failure partway left a half-deleted snapshot —
@@ -2859,15 +2849,6 @@ pub fn snapshot_delete(
     )?;
     tx.execute(
         "DELETE FROM stage_sets WHERE snapshot_id = ?1",
-        params![snap_id],
-    )?;
-    tx.execute(
-        "DELETE FROM manifest_entries WHERE manifest_id IN
-         (SELECT id FROM manifests WHERE snapshot_id = ?1)",
-        params![snap_id],
-    )?;
-    tx.execute(
-        "DELETE FROM manifests WHERE snapshot_id = ?1",
         params![snap_id],
     )?;
     tx.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
@@ -8102,7 +8083,7 @@ mod tests {
     // ── issue #55: snapshot delete — transactional cascade + no orphaned files ──
 
     /// Fixture: unit + snapshot v1 with a `staged` stage_set whose slice
-    /// rows point at real files on disk, plus manifest/file rows, so a
+    /// rows point at real files on disk, plus a `files` row, so a
     /// delete has something to cascade through.
     fn setup_deletable_snapshot(dir: &Path) -> (Connection, i64, Vec<std::path::PathBuf>) {
         // Full ordered migration chain (issue #44) — was a hand-applied
@@ -8121,7 +8102,7 @@ mod tests {
     }
 
     /// Registers one unit + snapshot + staged stage_set (two slices) +
-    /// manifest under an existing connection/tenant. Factored out of
+    /// a `files` row under an existing connection/tenant. Factored out of
     /// `setup_deletable_snapshot` (issue #176) so a multi-unit fixture —
     /// two units sharing one connection and one write session — can be
     /// built without two separate in-memory databases.
@@ -8169,11 +8150,6 @@ mod tests {
             slice_files.push(f);
         }
 
-        conn.execute(
-            "INSERT INTO manifests (snapshot_id) VALUES (?1)",
-            params![snap_id],
-        )
-        .unwrap();
         insert_file(conn, snap_id, &format!("/src/{unit_name}.txt"), 3, "cc");
 
         (snap_id, slice_files)
@@ -8299,7 +8275,6 @@ mod tests {
         for (table, sql) in [
             ("stage_slices", "SELECT COUNT(*) FROM stage_slices"),
             ("stage_sets", "SELECT COUNT(*) FROM stage_sets"),
-            ("manifests", "SELECT COUNT(*) FROM manifests"),
             ("files", "SELECT COUNT(*) FROM files"),
             ("writes", "SELECT COUNT(*) FROM writes"),
             ("write_positions", "SELECT COUNT(*) FROM write_positions"),
@@ -8628,10 +8603,12 @@ mod tests {
         )
         .unwrap();
 
-        // manifest_entries.manifest_id -> manifests: dangling.
+        // files.snapshot_id -> snapshots: dangling. (This edge was
+        // manifest_entries -> manifests until migration 027 dropped both
+        // tables, issue #372.)
         conn.execute(
-            "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime)
-             VALUES (99999, '/nonexistent', 1, '2026-01-01T00:00:00Z')",
+            "INSERT INTO files (snapshot_id, path, size_bytes)
+             VALUES (99999, '/nonexistent', 1)",
             [],
         )
         .unwrap();
@@ -8668,7 +8645,7 @@ mod tests {
             report.issues
         );
         assert!(
-            has_edge("manifest_entries", "manifests"),
+            has_edge("files", "snapshots"),
             "issues: {:?}",
             report.issues
         );

@@ -745,8 +745,6 @@ fn test_schema_has_all_tables() {
         "unit_tags",
         "unit_path_history",
         "snapshots",
-        "manifests",
-        "manifest_entries",
         "files",
         "stage_sets",
         "stage_slices",
@@ -774,6 +772,18 @@ fn test_schema_has_all_tables() {
             )
             .unwrap();
         assert_eq!(count, 1, "table '{}' not found", table);
+    }
+
+    // Migration 027 (issue #372) dropped the write-only manifest tables.
+    for table in ["manifests", "manifest_entries"] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "table '{table}' should be gone since 027");
     }
 }
 

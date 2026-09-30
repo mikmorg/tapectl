@@ -4,7 +4,7 @@
 //! version from the `meta` table, plus every user table (enumerated at
 //! runtime from `sqlite_master`, never hardcoded) as an array of row
 //! objects keyed by column name. Tables can hold millions of rows (`files`,
-//! `manifest_entries`), so this writes incrementally to a `BufWriter` around
+//! `files_fts`), so this writes incrementally to a `BufWriter` around
 //! a locked stdout handle instead of building a `serde_json::Value` (or a
 //! `String`) of the whole database in memory — peak memory tracks one row,
 //! not one table or the whole dump.

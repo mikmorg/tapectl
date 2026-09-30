@@ -406,7 +406,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// `files` is `(path, size_bytes, sha256_baseline)` — the third element
-    /// seeds `files.sha256`/`manifest_entries.sha256` as they'd stand after
+    /// seeds `files.sha256` as it would stand after
     /// a *previous* successful stage (issue #32/H6): `None` simulates a
     /// snapshot that has never been staged (no baseline yet — the
     /// commitment point hasn't happened); `Some(hex)` simulates a re-stage
@@ -440,10 +440,6 @@ mod tests {
         .unwrap();
         let sid = conn.last_insert_rowid();
 
-        conn.execute("INSERT INTO manifests (snapshot_id) VALUES (?1)", [sid])
-            .unwrap();
-        let mid = conn.last_insert_rowid();
-
         for (path, size, sha) in files {
             // file_type = 'regular' unconditionally: every existing caller of
             // this helper plants a genuine regular-file scenario. Symlink/
@@ -454,16 +450,6 @@ mod tests {
                 "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory, file_type)
                  VALUES (?1, ?2, ?3, ?4, 0, 'regular')",
                 params![sid, path, size, sha],
-            )
-            .unwrap();
-            // Mirrors the production backfill target: `manifest_entries`
-            // carries the same baseline and the same never-overwrite
-            // guarantee `backfill_checksums` must provide.
-            conn.execute(
-                "INSERT INTO manifest_entries
-                     (manifest_id, path, size_bytes, mtime, sha256, is_directory, file_type)
-                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 0, 'regular')",
-                params![mid, path, size, sha],
             )
             .unwrap();
         }
@@ -736,21 +722,6 @@ mod tests {
             stored.as_deref(),
             Some("original00baseline"),
             "backfill must never overwrite an existing files.sha256 baseline"
-        );
-
-        let stored_manifest: Option<String> = conn
-            .query_row(
-                "SELECT me.sha256 FROM manifest_entries me
-                 JOIN manifests m ON m.id = me.manifest_id
-                 WHERE m.snapshot_id = ?1 AND me.path = 'a.txt'",
-                params![sid],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            stored_manifest.as_deref(),
-            Some("original00baseline"),
-            "backfill must never overwrite an existing manifest_entries.sha256 baseline"
         );
     }
 
@@ -1045,7 +1016,7 @@ mod tests {
     // to regular files only — symlinks/specials are recorded (file_type +
     // link_target) but excluded from the validation set entirely.
 
-    /// Plants one additional non-regular `files`/`manifest_entries` row
+    /// Plants one additional non-regular `files` row
     /// alongside whatever `setup_conn_with_snapshot` already inserted — that
     /// helper hardcodes `file_type = 'regular'` (every existing caller is a
     /// genuine regular-file scenario), so symlink/special rows need their
@@ -1062,20 +1033,6 @@ mod tests {
             "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type, link_target)
              VALUES (?1, ?2, ?3, 0, ?4, ?5)",
             params![snapshot_id, path, size, file_type, link_target],
-        )
-        .unwrap();
-        let manifest_id: i64 = conn
-            .query_row(
-                "SELECT id FROM manifests WHERE snapshot_id = ?1",
-                params![snapshot_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        conn.execute(
-            "INSERT INTO manifest_entries
-                 (manifest_id, path, size_bytes, mtime, is_directory, file_type, link_target)
-             VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 0, ?4, ?5)",
-            params![manifest_id, path, size, file_type, link_target],
         )
         .unwrap();
     }

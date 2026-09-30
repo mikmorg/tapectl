@@ -2232,4 +2232,80 @@ pub(crate) mod tests {
              about to fix"
         );
     }
+
+    // --- issue #373: the coverage expressions are driven by keys ---
+
+    /// `EXPLAIN QUERY PLAN` detail lines for `sql`, on the live schema with
+    /// no planner statistics (the production shape until `PRAGMA optimize`
+    /// has something to analyze).
+    fn query_plan(sql: &str) -> Vec<String> {
+        query_plan_on(&crate::db::open_memory().unwrap(), sql)
+    }
+
+    fn query_plan_on(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// The pin: in every shape of the copy count (a unit's current versions,
+    /// one snapshot, a unit's every snapshot), `writes` is searched by
+    /// `stage_set_id` and no single-column status index drives any table.
+    /// Before migration 027 the planner started from `idx_snapshots_status`
+    /// and `idx_writes_status`, so each current snapshot's subquery scanned
+    /// every completed write in the catalog.
+    #[test]
+    fn copy_count_searches_writes_by_stage_set_id() {
+        let shapes = [
+            CoverageQuery::current_unit("u.id"),
+            CoverageQuery {
+                scope: CoverageScope::Snapshot { id_expr: "u.id" },
+                exclude_volume: None,
+            },
+            CoverageQuery {
+                scope: CoverageScope::Unit {
+                    id_expr: "u.id",
+                    current_only: false,
+                },
+                exclude_volume: Some("0"),
+            },
+        ];
+        for q in shapes {
+            let plan = query_plan(&format!(
+                "SELECT u.id, {} FROM units u",
+                copy_count_expr(&q)
+            ));
+            let writes: Vec<&String> = plan.iter().filter(|l| l.contains(" cw ")).collect();
+            assert!(
+                !writes.is_empty(),
+                "positive control: writes is in the plan: {plan:#?}"
+            );
+            for line in &writes {
+                assert!(
+                    line.contains("USING INDEX idx_writes_stage_set (stage_set_id=?)"),
+                    "writes must be searched by stage_set_id, got {line:?} in {plan:#?}"
+                );
+            }
+            assert!(
+                !plan.iter().any(|l| l.contains("_status")),
+                "a status index drives the plan: {plan:#?}"
+            );
+        }
+
+        // Positive control: on the schema before 027 the same check sees the
+        // status indexes drive the current-versions count.
+        let old = query_plan_on(
+            &crate::db::open_memory_at_version(26),
+            &format!(
+                "SELECT u.id, {} FROM units u",
+                copy_count_expr(&CoverageQuery::current_unit("u.id"))
+            ),
+        );
+        assert!(
+            old.iter().any(|l| l.contains("idx_writes_status")),
+            "the check must see the pre-027 plan: {old:#?}"
+        );
+    }
 }

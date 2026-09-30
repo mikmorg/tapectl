@@ -637,9 +637,55 @@ sudo -u tapectl -H sqlite3 "$DB" "UPDATE snapshots SET status = 'current' WHERE 
 tapectl-op unit list
 ```
 
+### `migration 027 cannot run`
+
+Migration 027 drops the `manifest_entries` table, an older copy of each
+snapshot's file list that nothing reads; the `files` table keeps every path,
+size and checksum. Before it drops anything it checks that `manifest_entries`
+holds nothing `files` does not. Every tapectl release has kept the two in step,
+so this refusal means the catalog was edited by hand:
+
+```text
+error: failed to open database: migration error: migration 027 cannot run: 1 manifest_entries row(s) with no
+files row for the same snapshot and path (id 77001). Migration 027 drops the manifest_entries table, which every
+tapectl release has kept in step with files, so these rows were set by hand and 027 will not guess which table is
+right. Make each named manifest_entries row agree with its files row (or delete it), then run the command again.
+Nothing has been changed.
+```
+
+The other finding it can name is a `manifest_entries` row carrying a sha256
+that its `files` row lacks or disagrees with. Nothing has been changed. Look at
+the named rows with `sqlite3`, the same way as for migration 026 above, and
+either copy the value into `files` or delete the `manifest_entries` row.
+
+Once 027 applies, the same command compacts the catalog once (SQLite's
+`VACUUM`), which needs free disk about twice the catalog's size. If that fails
+it only warns: the catalog is correct, just larger than it needs to be.
+
 ---
 
 ## Staging
+
+### A snapshot is incomplete
+
+```text
+error: snapshot photos v1 is incomplete: it records 48212 file(s) but the catalog holds 31007 file row(s) for
+it, so an earlier `snapshot create` was interrupted partway. Staging it would put a short file list on tape.
+Recover with `tapectl snapshot delete photos --version 1`, then `tapectl snapshot create photos`
+```
+
+A `snapshot create` from a tapectl before 1.0.2 wrote its file list one row at
+a time, so a Ctrl-C or a busy catalog could leave the snapshot with only part
+of it. `stage create` refuses such a snapshot before running dar. Delete it
+and take it again; nothing has been staged or written from it:
+
+```bash
+tapectl snapshot delete photos --version 1
+tapectl snapshot create photos
+```
+
+Since 1.0.2 a snapshot and its whole file list are recorded together or not
+at all.
 
 ### No escrow recipient is registered
 

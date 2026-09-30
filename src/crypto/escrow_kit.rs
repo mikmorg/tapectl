@@ -167,7 +167,7 @@ fn write_encrypted_catalog(
         .map_err(|e| TapectlError::Encryption(format!("wrap_output failed: {e}")))?;
     let mut reader = fs::File::open(plain.path())?;
     // Streamed, not read-then-encrypt: the catalog grows with the number of
-    // archived files (`files`/`manifest_entries` are one row each), and the
+    // archived files (`files` is one row each), and the
     // H9 class of defect in this repo is exactly whole-object buffering.
     std::io::copy(&mut reader, &mut writer)?;
     writer

@@ -33,6 +33,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     configure(&conn)?;
     migrate(&mut conn)?;
     recover_orphaned_sessions(&conn, path)?;
+    optimize(&conn);
     crate::config::secure_path(path, 0o600);
     // WAL mode (set in `configure`) writes pending pages to `<path>-wal`
     // (and its `-shm` index) — the exact same content as the main db file,
@@ -116,11 +117,41 @@ pub(crate) fn live_status_check(table: &str) -> Vec<String> {
     set
 }
 
+/// Give the query planner statistics (issue #373): `PRAGMA optimize=0x10002`
+/// at open, as SQLite recommends for a connection opened per command. It
+/// runs ANALYZE, under SQLite's default analysis limit, only on a table the
+/// planner would profit from, and records the result in `sqlite_stat1`.
+/// Without statistics SQLite rated `status = ?` as selective as
+/// `stage_set_id = ?` and drove the coverage queries quadratic; migration
+/// 027 dropped the indexes that made that plan possible, and this is the
+/// backstop for the next index that does the same.
+///
+/// Best-effort and never waiting. ANALYZE writes, so it needs the write
+/// lock, and `db::busy`'s rule 1 is that a command which only reads never
+/// waits for it. The busy timeout is 0 for this one statement: if another
+/// process is writing, the statistics wait for the next open, and a failure
+/// of any kind only logs.
+fn optimize(conn: &Connection) {
+    let run = || -> rusqlite::Result<()> {
+        conn.pragma_update(None, "busy_timeout", 0)?;
+        let r = conn.execute_batch("PRAGMA optimize=0x10002");
+        conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+        r
+    };
+    if let Err(e) = run() {
+        tracing::debug!(error = %e, "PRAGMA optimize skipped");
+        let _ = conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS);
+    }
+}
+
+/// The wait for another connection's lock before `SQLITE_BUSY` (`db::busy`).
+const BUSY_TIMEOUT_MS: i64 = 5000;
+
 /// Set WAL mode and other pragmas.
 fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
     Ok(())
 }
 
@@ -362,10 +393,56 @@ fn migrations() -> Migrations<'static> {
         // for the same reason as 003/012/017: seventeen foreign keys point
         // into these three tables. See the migration header.
         M::up(include_str!("migrations/026_drop_unwritten_states.sql")).foreign_key_check(),
+        // 027 drops the write-only `manifests`/`manifest_entries` tables
+        // (issue #372), the two `files` indexes no query plan uses, and the
+        // six single-column status indexes that drove the coverage queries
+        // quadratic (issue #373); `files_au` becomes `AFTER UPDATE OF path`
+        // so a sha256 backfill no longer rewrites the FTS index. No table is
+        // rebuilt and no surviving row is touched, so no
+        // `.foreign_key_check()`. A guard in 026's style refuses by name if
+        // `manifest_entries` holds a path or a sha256 `files` does not.
+        // `migrate()` VACUUMs once after it commits. See the migration
+        // header.
+        M::up(include_str!(
+            "migrations/027_drop_manifests_and_dead_indexes.sql"
+        )),
     ])
 }
 
+/// The migration that dropped the manifest tables and the dead indexes
+/// (issue #372). `migrate()` VACUUMs once right after applying it, so the
+/// space those objects held (about half of the production catalog in 2026-09)
+/// goes back to the filesystem.
+const VACUUM_AFTER_VERSION: i64 = 27;
+
 fn migrate(conn: &mut Connection) -> Result<()> {
+    let before: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    migrate_to(conn, None)?;
+    let after: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Issue #372: once, on the open that applies 027 to an existing
+    // catalog. VACUUM cannot run inside the migration's transaction, and a
+    // fresh catalog (`before == 0`) has nothing to give back. It needs about
+    // twice the database in free disk; a failure (a full disk, another
+    // process holding the catalog) leaves the space unreclaimed but the
+    // schema correct, so it warns rather than failing the command, and the
+    // operator can run `sqlite3 tapectl.db VACUUM` later.
+    if before > 0 && before < VACUUM_AFTER_VERSION && after >= VACUUM_AFTER_VERSION {
+        if let Err(e) = conn.execute_batch("VACUUM") {
+            warn!(
+                error = %e,
+                "migration 027 applied, but the VACUUM that returns the freed space \
+                 failed; the catalog is correct, only larger than it needs to be"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run the production migration list up to `target` (`None` = the latest),
+/// with the foreign-key handling and error mapping every caller needs.
+/// `migrate` is the production entry; tests re-target a claim about one
+/// migration with `Some(version)` so a later migration cannot move it.
+fn migrate_to(conn: &mut Connection, target: Option<usize>) -> Result<()> {
     // Migration 003 does DROP TABLE volumes while five tables (cartridge_volumes,
     // volume_movements, writes, verification_sessions, health_logs) hold rows with a
     // `REFERENCES volumes(id)` foreign key. Migration 012 does the same to `cartridges`,
@@ -385,7 +462,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // Table Schema Changes" procedure (step 10, the pre-commit foreign_key_check, is covered by
     // `.foreign_key_check()` on the 003 and 012 migrations above).
     conn.pragma_update(None, "foreign_keys", "OFF")?;
-    let result = migrations().to_latest(conn).map_err(|e| {
+    let ms = migrations();
+    let run = match target {
+        None => ms.to_latest(conn),
+        Some(v) => ms.to_version(conn, v),
+    };
+    let result = run.map_err(|e| {
         // Issue #233: the message is computed before matching on `e` by
         // value below (matching moves it), and the match is on the typed
         // `rusqlite_migration::Error::ForeignKeyCheck` variant, never on
@@ -1442,7 +1524,7 @@ mod tests {
             )
             .unwrap();
 
-        migrate(&mut conn).unwrap();
+        migrate_to(&mut conn, Some(13)).unwrap();
 
         let fk_violations: i64 = conn
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1495,7 +1577,7 @@ mod tests {
     /// of the migration. A `SELECT` naming either must now fail.
     #[test]
     fn test_migration_013_removes_the_two_flag_columns() {
-        let conn = open_memory().unwrap();
+        let conn = open_memory_at_version(13);
         let names: Vec<String> = table_info(&conn, "manifest_entries")
             .into_iter()
             .map(|c| c.0)
@@ -1515,7 +1597,7 @@ mod tests {
     /// table in the schema, and nothing else in the suite would notice.
     #[test]
     fn test_migration_013_recreates_the_manifest_index() {
-        let conn = open_memory().unwrap();
+        let conn = open_memory_at_version(13);
         assert_eq!(
             index_names(&conn, "manifest_entries"),
             vec!["idx_manifest_entries_manifest"]
@@ -1556,7 +1638,7 @@ mod tests {
     /// column-shape assertion would notice.
     #[test]
     fn test_migration_012_recreates_every_index_and_adds_location() {
-        let conn = open_memory().unwrap();
+        let conn = open_memory_at_version(12);
         assert_eq!(
             index_names(&conn, "cartridges"),
             vec![
@@ -2848,8 +2930,9 @@ mod tests {
         )
         .unwrap();
 
-        // The real production migrate(), with its real FK off/on wrapping.
-        migrate(&mut conn).unwrap();
+        // The real production migration path, with its real FK off/on wrapping,
+        // stopped at 017 so a later migration cannot move this pin.
+        migrate_to(&mut conn, Some(17)).unwrap();
 
         let fk_violations: i64 = conn
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -3105,7 +3188,7 @@ mod tests {
     /// rebuild silently drops whatever its new DDL forgets to restate.
     #[test]
     fn test_migration_017_recreates_every_index_and_pins_uuid_uniqueness() {
-        let conn = open_memory().unwrap();
+        let conn = open_memory_at_version(17);
         assert_eq!(
             index_names(&conn, "volumes"),
             vec![
@@ -3400,13 +3483,9 @@ mod tests {
             .map(|t| table_info(&conn, t))
             .collect();
 
-        migrate(&mut conn).expect("026 must migrate a database carrying only kept states");
-        assert_eq!(
-            user_version(&conn),
-            26,
-            "this is the latest-migration pin: move it (and re-target this test with \
-             open_memory_at_version) when 027 is registered"
-        );
+        migrate_to(&mut conn, Some(26))
+            .expect("026 must migrate a database carrying only kept states");
+        assert_eq!(user_version(&conn), 26, "precondition: stopped at 026");
 
         // Every row, every cell, every table -- including the three rebuilt
         // ones, whose ids the copy must carry verbatim.
@@ -3760,6 +3839,302 @@ mod tests {
             matches!(err, TapectlError::Migration(_)),
             "a non-FK migration failure must stay the generic variant, not \
              DatabaseNeedsRepair: got {err:?}"
+        );
+    }
+
+    // --- Migration 027 (issues #372, #373) ---
+
+    /// Seed a schema-26 catalog shaped like production: `seed_schema_25`'s
+    /// row in every table, then `snapshots` × `per` files, each mirrored in
+    /// `manifests`/`manifest_entries` exactly as `snapshot create` and the
+    /// stage backfill wrote them before 027 (every other file baselined on
+    /// both sides). Returns the number of `files` rows.
+    fn seed_schema_26_catalog(conn: &Connection, snapshots: i64, per: i64) -> i64 {
+        seed_schema_25(conn);
+        assert_eq!(user_version(conn), 26, "precondition: at schema 26");
+        let tx = conn.unchecked_transaction().unwrap();
+        for s in 0..snapshots {
+            let sid = 10_000 + s;
+            tx.execute(
+                "INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count)
+                 VALUES (?1, 500, ?2, 'staged', '/src/a', ?3)",
+                rusqlite::params![sid, 100 + s, per],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO manifests (id, snapshot_id) VALUES (?1, ?1)",
+                [sid],
+            )
+            .unwrap();
+            for f in 0..per {
+                let path = format!("album{s}/photo_{f:05}.jpg");
+                let sha = (f % 2 == 0).then(|| format!("{:064x}", sid * 100_000 + f));
+                tx.execute(
+                    "INSERT INTO files (snapshot_id, path, size_bytes, sha256, modified_at,
+                                        is_directory, file_type)
+                     VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z', 0, 'regular')",
+                    rusqlite::params![sid, path, f, sha],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime, sha256,
+                                                   is_directory, mode, uid, gid, file_type)
+                     VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 0, 420, 1000, 1000,
+                             'regular')",
+                    rusqlite::params![sid, path, f, sha],
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `seed_schema_25` inserts against the schema-25 column list and only
+    /// kept states, which 026 accepts, so it seeds a schema-26 database too.
+    fn open_memory_at_026_seeded(snapshots: i64, per: i64) -> (Connection, i64) {
+        let conn = open_memory_at_version(26);
+        let n = seed_schema_26_catalog(&conn, snapshots, per);
+        (conn, n)
+    }
+
+    fn search(conn: &Connection, fts: &str) -> Vec<String> {
+        conn.prepare(
+            "SELECT f.path FROM files_fts fts JOIN files f ON f.rowid = fts.rowid
+             WHERE files_fts MATCH ?1 ORDER BY f.path",
+        )
+        .unwrap()
+        .query_map([fts], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// THE test for 027: a populated schema-26 catalog (a few thousand
+    /// `files` rows mirrored in `manifest_entries`) migrates with every row
+    /// of every surviving table intact, the two manifest tables and the
+    /// eight dead indexes gone, and FTS search answering as before.
+    #[test]
+    fn test_migrate_026_populated_catalog_to_027_keeps_every_file_and_search() {
+        let (mut conn, files_before) = open_memory_at_026_seeded(12, 300);
+        assert!(
+            files_before > 3_000,
+            "positive control: {files_before} rows"
+        );
+        let rows_before = every_row(&conn);
+        let hits_before = search(&conn, "00042*");
+        assert_eq!(
+            hits_before.len(),
+            12,
+            "positive control: one hit per snapshot"
+        );
+
+        migrate(&mut conn).expect("027 must migrate a catalog whose manifest mirrors files");
+        assert_eq!(user_version(&conn), 27);
+
+        let mut expected = rows_before;
+        assert!(expected.remove("manifests").is_some_and(|r| r.len() == 13));
+        assert!(expected
+            .remove("manifest_entries")
+            .is_some_and(|r| r.len() as i64 == files_before - 1));
+        assert_eq!(
+            expected,
+            every_row(&conn),
+            "027 must not add, drop, renumber or alter a row of any table it keeps \
+             (the FTS shadow tables included)"
+        );
+        for gone in ["manifests", "manifest_entries"] {
+            assert!(table_info(&conn, gone).is_empty(), "{gone} must be dropped");
+        }
+
+        assert_eq!(search(&conn, "00042*"), hits_before);
+        let fts_check = conn.execute(
+            "INSERT INTO files_fts(files_fts) VALUES('integrity-check')",
+            [],
+        );
+        assert!(fts_check.is_ok(), "FTS index consistent: {fts_check:?}");
+
+        assert_eq!(
+            index_names(&conn, "files"),
+            vec!["sqlite_autoindex_files_1"]
+        );
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// Issue #373's migration-replay pin: no single-column status index
+    /// survives 001 through the latest migration, and neither do the two
+    /// dead `files` indexes (#372).
+    #[test]
+    fn test_no_status_index_survives_the_migration_chain() {
+        let conn = open_memory().unwrap();
+        let survivors: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND (name LIKE 'idx\\_%\\_status' ESCAPE '\\'
+                      OR name IN ('idx_files_path', 'idx_files_snapshot',
+                                  'idx_manifest_entries_manifest'))",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(survivors.is_empty(), "dead indexes survived: {survivors:?}");
+
+        // Positive control: the same query sees them at schema 26.
+        let at_26 = open_memory_at_version(26);
+        let n: i64 = at_26
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name LIKE 'idx\\_%\\_status' ESCAPE '\\'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 6, "the six status indexes exist before 027");
+    }
+
+    /// `files_au` fires on a path change only: a sha256 backfill leaves the
+    /// FTS index alone, and a rename still reaches search.
+    #[test]
+    fn test_migration_027_fts_update_trigger_fires_on_path_only() {
+        let conn = open_memory().unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'files_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("AFTER UPDATE OF path ON files"), "{sql}");
+
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
+             INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 1, '/s');
+             INSERT INTO files (snapshot_id, path, size_bytes) VALUES (1, 'old/name.txt', 1);",
+        )
+        .unwrap();
+        let fts_rows = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM files_fts_docsize", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = every_row(&conn)["files_fts_data"].clone();
+        conn.execute("UPDATE files SET sha256 = 'ab' WHERE snapshot_id = 1", [])
+            .unwrap();
+        assert_eq!(
+            every_row(&conn)["files_fts_data"],
+            before,
+            "a sha256-only UPDATE must not touch the FTS index"
+        );
+        assert_eq!(fts_rows(&conn), 1);
+
+        conn.execute(
+            "UPDATE files SET path = 'new/place.txt' WHERE snapshot_id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(search(&conn, "old*").is_empty());
+        assert_eq!(search(&conn, "place*"), vec!["new/place.txt"]);
+    }
+
+    /// The guard, finding (a): an entry with no `files` row is refused by
+    /// id, and nothing changes.
+    #[test]
+    fn test_migration_027_refuses_a_manifest_path_files_lacks() {
+        let (mut conn, _) = open_memory_at_026_seeded(1, 3);
+        conn.execute(
+            "INSERT INTO manifest_entries (id, manifest_id, path, size_bytes, mtime)
+             VALUES (77001, 10000, 'only/in/manifest.txt', 1, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let err = migrate(&mut conn).expect_err("027 must refuse");
+        let msg = match &err {
+            TapectlError::Migration(m) => m.clone(),
+            other => panic!("expected the generic Migration variant, got {other:?}"),
+        };
+        assert!(msg.starts_with("migration 027 cannot run: "), "{msg}");
+        assert!(
+            msg.contains("1 manifest_entries row(s) with no files row"),
+            "{msg}"
+        );
+        assert!(msg.contains("77001"), "{msg}");
+        assert!(msg.contains("Nothing has been changed."), "{msg}");
+        assert!(
+            !msg.contains("DROP TABLE"),
+            "the script must not be dumped: {msg}"
+        );
+        assert_eq!(user_version(&conn), 26, "rolled back");
+        assert!(
+            !table_info(&conn, "manifest_entries").is_empty(),
+            "rolled back"
+        );
+    }
+
+    /// The guard, finding (b): a baseline only the manifest holds.
+    #[test]
+    fn test_migration_027_refuses_a_sha256_only_the_manifest_holds() {
+        let (mut conn, _) = open_memory_at_026_seeded(1, 3);
+        // photo_00001 is un-baselined on both sides by the seed.
+        conn.execute(
+            "UPDATE manifest_entries SET sha256 = 'feed' WHERE path = 'album0/photo_00001.jpg'",
+            [],
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM manifest_entries WHERE path = 'album0/photo_00001.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let msg = migrate(&mut conn).expect_err("027 must refuse").to_string();
+        assert!(
+            msg.contains("1 manifest_entries row(s) carrying a sha256"),
+            "{msg}"
+        );
+        assert!(msg.contains(&format!("(id {id})")), "{msg}");
+        assert_eq!(user_version(&conn), 26, "rolled back");
+    }
+
+    /// `db::open` VACUUMs once after applying 027 to an existing catalog, so
+    /// the dropped tables' pages go back to the filesystem.
+    #[test]
+    fn test_open_vacuums_once_when_it_applies_027() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("tapectl.db");
+        let size_before = {
+            let mut conn = Connection::open(&path).unwrap();
+            configure(&conn).unwrap();
+            migrate_to(&mut conn, Some(26)).unwrap();
+            seed_schema_26_catalog(&conn, 4, 500);
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            let pages: i64 = conn
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap();
+            pages
+        };
+
+        let conn = open(&path).unwrap();
+        assert_eq!(user_version(&conn), 27);
+        let freelist: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(freelist, 0, "VACUUM leaves no free pages");
+        assert!(
+            pages < size_before,
+            "the dropped tables' pages were returned: {pages} >= {size_before}"
         );
     }
 }
