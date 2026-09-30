@@ -67,7 +67,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "9764cae2537e991f3172dcb6613cd79f2a99d49cfd6524d08105170843cd4b57";
+const RESTORE_SH_SHA256: &str = "6b64da4bc941df7baa2f9a79167f7597177f9a56fde0baaefe657f8daf63333f";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {

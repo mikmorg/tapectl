@@ -565,8 +565,15 @@ is_uint() {
   esac
 }
 
-# A byte count as GiB with one decimal, for messages.
-gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
+# A byte count for messages: GiB, MiB or KiB with one decimal, so a small unit
+# does not read as "needs 0.0 GiB, 0.0 GiB free".
+size_str() {
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GiB", b / 1073741824
+    else if (b >= 1048576) printf "%.1f MiB", b / 1048576
+    else printf "%.1f KiB", b / 1024
+  }'
+}
 
 # A failed write must say why. Out of disk space is the likely cause on a
 # restore, and it must never read as a tape fault or a wrong key: the loop that
@@ -594,7 +601,7 @@ free_bytes() {
 
 die_space() { # <directory> <bytes needed> <bytes free>
   die "not enough disk space in $1 to restore this unit:
-       it needs about $(gib "$2"), and $(gib "$3") is free.
+       it needs about $(size_str "$2"), and $(size_str "$3") is free.
        No slice has been read yet. A restore decrypts every slice of the unit to
        disk before dar extracts them, so with the scratch space and --to on one
        disk it needs the unit's size about twice over, plus one slice.
@@ -630,11 +637,11 @@ check_space() { # <destination> <scratch parent> <archive bytes> <largest slice 
   dest_dev=$(stat -c %d -- "$dest" 2>/dev/null || true)
   if [ -z "$scr_dev" ] || [ "$scr_dev" = "$dest_dev" ]; then
     local need=$((need_scr + need_dest))
-    info "Disk space: needs about $(gib "$need") in $dest (decrypted slices, then the files); $(gib "$dest_free") free"
+    info "Disk space: needs about $(size_str "$need") in $dest (decrypted slices, then the files); $(size_str "$dest_free") free"
     [ "$dest_free" -ge "$need" ] || die_space "$dest" "$need" "$dest_free"
   else
-    info "Disk space: needs about $(gib "$need_scr") in $scr (decrypted slices); $(gib "$scr_free") free"
-    info "            and about $(gib "$need_dest") in $dest (the files); $(gib "$dest_free") free"
+    info "Disk space: needs about $(size_str "$need_scr") in $scr (decrypted slices); $(size_str "$scr_free") free"
+    info "            and about $(size_str "$need_dest") in $dest (the files); $(size_str "$dest_free") free"
     [ "$scr_free" -ge "$need_scr" ] || die_space "$scr" "$need_scr" "$scr_free"
     [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
   fi
@@ -3777,6 +3784,34 @@ sha256_encrypted = \"bbb\"
         );
 
         for d in [dir, dir2, dir3] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// Sizes in the space messages pick their unit: a small unit must not read
+    /// as "needs about 0.0 GiB, and 0.0 GiB is free" (seen on a real tape).
+    #[test]
+    fn restore_space_messages_name_small_sizes_in_small_units() {
+        let (dir, path) = heir_harness("sizes", &[]);
+        let (code, text) = heir_run(
+            &dir,
+            &path,
+            "size_str 5000; echo; size_str 3145728; echo; size_str 53687091200",
+        );
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(text, "4.9 KiB\n3.0 MiB\n50.0 GiB", "{text}");
+
+        // And in the refusal itself: 64 KiB free against a one-slice 3 MiB
+        // unit (slices, the slice in flight plus one block, then the files).
+        let df = df_stub(64);
+        let (dir2, path2) = heir_harness("sizes-refuse", &[("df", &df)]);
+        let (code, text) = heir_run(&dir2, &path2, "check_space /d /d 3145728 3145728");
+        assert_ne!(code, 0, "{text}");
+        assert!(
+            text.contains("it needs about 9.5 MiB, and 64.0 KiB is free"),
+            "{text}"
+        );
+        for d in [dir, dir2] {
             let _ = std::fs::remove_dir_all(&d);
         }
     }
