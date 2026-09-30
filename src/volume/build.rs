@@ -27,7 +27,8 @@ use crate::staging;
 use super::format;
 use super::layout::{self, FrontIndexFile, IdThunkV2Params};
 use super::layout_model::{
-    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, ZoneKind,
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, SliceCheck,
+    ZoneKind,
 };
 
 // ── Plain-data inputs ──
@@ -587,7 +588,8 @@ pub const LAYOUT_SIDECAR: &str = "layout.json";
 
 impl BuiltLayout {
     /// The full pre-write predicate: `Layout::validate`'s points (capacity,
-    /// staged-slice full-hash, materialized-zone size/hash, keys —
+    /// staged-slice size — plus full hash under [`SliceCheck::FullHash`],
+    /// `--prewrite-hash` — materialized-zone size/hash, keys —
     /// `layout_model.rs`) plus the parts that need a file read and a
     /// subprocess, which don't belong in that dependency-light module
     /// (`layout-session.md` validation point 4 / plan T5b point 3): the
@@ -597,9 +599,13 @@ impl BuiltLayout {
     /// (`format::parse_seal_marker`), and RESTORE.sh passes `bash -n`.
     /// Collects every failure — never stops at the first, matching
     /// `Layout::validate`'s pre-flight-report convention.
-    pub fn validate(&self, keys: &KeyAvailability) -> std::result::Result<(), Vec<LayoutError>> {
+    pub fn validate(
+        &self,
+        keys: &KeyAvailability,
+        slice_check: SliceCheck,
+    ) -> std::result::Result<(), Vec<LayoutError>> {
         let mut errs = Vec::new();
-        if let Err(mut layout_errs) = self.layout.validate(keys) {
+        if let Err(mut layout_errs) = self.layout.validate(keys, slice_check) {
             errs.append(&mut layout_errs);
         }
         self.check_front_index_parses(&mut errs);
@@ -1468,7 +1474,7 @@ mod tests {
         let (inputs, _src) = two_tenant_inputs("550e8400-e29b-41d4-a716-446655440000");
         let session = tempfile::tempdir().unwrap();
         let built = build(&inputs, session.path()).unwrap();
-        assert!(built.validate(&ok_keys(&inputs)).is_ok());
+        assert!(built.validate(&ok_keys(&inputs), SliceCheck::Size).is_ok());
     }
 
     #[test]
@@ -1477,7 +1483,9 @@ mod tests {
         inputs.usable_bytes = 1; // absurdly small — everything overflows it
         let session = tempfile::tempdir().unwrap();
         let built = build(&inputs, session.path()).unwrap();
-        let errs = built.validate(&ok_keys(&inputs)).unwrap_err();
+        let errs = built
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })));
@@ -1493,7 +1501,9 @@ mod tests {
         // time.
         std::fs::remove_file(src.path().join("slice_1.age")).unwrap();
 
-        let errs = built.validate(&ok_keys(&inputs)).unwrap_err();
+        let errs = built
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::SliceFileMissing(_))));
@@ -1506,14 +1516,18 @@ mod tests {
         let built = build(&inputs, session.path()).unwrap();
 
         // Flip a byte in the on-disk staged slice after build() recorded
-        // its hash — sacred invariant 2: validate() must full-hash from
-        // disk, never trust the recorded checksum alone.
+        // its hash. Size is unchanged, so the default size-only L1 passes it
+        // (L2 catches it while streaming, ADR-0012 2026-09-30 later); under
+        // `--prewrite-hash` validate() full-hashes from disk and refuses.
         let path = src.path().join("slice_1.age");
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[0] ^= 0xFF;
         std::fs::write(&path, bytes).unwrap();
 
-        let errs = built.validate(&ok_keys(&inputs)).unwrap_err();
+        assert!(built.validate(&ok_keys(&inputs), SliceCheck::Size).is_ok());
+        let errs = built
+            .validate(&ok_keys(&inputs), SliceCheck::FullHash)
+            .unwrap_err();
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::SliceChecksumMismatch { .. })));
@@ -1527,7 +1541,7 @@ mod tests {
 
         let mut keys = ok_keys(&inputs);
         keys.escrow_recipient_present = Some(false);
-        let errs = built.validate(&keys).unwrap_err();
+        let errs = built.validate(&keys, SliceCheck::Size).unwrap_err();
         assert!(errs.contains(&LayoutError::EscrowRecipientMissing));
     }
 
@@ -1600,7 +1614,9 @@ mod tests {
         fi_entry.size_bytes = Some(hollow_bytes.len() as u64);
         fi_entry.sha256 = Some(sha_hex(hollow_bytes.as_bytes()));
 
-        let errs = built.validate(&ok_keys(&inputs)).unwrap_err();
+        let errs = built
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
         assert!(
             errs.iter()
                 .any(|e| matches!(e, LayoutError::GeneratedZoneInconsistent { .. })),

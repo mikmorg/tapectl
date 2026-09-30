@@ -51,10 +51,13 @@ the operator.** Do not invent. Do not "pick the reasonable one" silently.
    interrupted, aborted, or resumable tape must have NO seal marker — its
    absence IS the unsealed signal (`volume-format-v2.md` §4). No code path may
    write it except `seal()` after the last content file.
-2. **`Layout::validate` full-hashes staged slices** (tri-layer L1,
-   `layout-session.md` validation point 2). Never "optimize" it to size-only.
-   Execute re-hashes inline (L2) and aborts on mismatch; confirm re-hashes from
-   tape (L3). All three layers exist on purpose; none is redundant.
+2. **`Layout::validate` checks staged slices before the tape moves** (tri-layer
+   L1, `layout-session.md` validation point 2). *Amended 2026-09-30 (ADR-0012,
+   "Amendment, 2026-09-30 (later)"):* by the CTO's ruling the full hash is now
+   opt-in (`--prewrite-hash`) and the default is existence + recorded size; no
+   agent may weaken it further on its own. Execute re-hashes inline (L2) and
+   aborts on mismatch; confirm re-hashes from tape (L3). L2 and L3 are never
+   optional.
 3. **No plaintext file carries tenant/unit names, filenames, `sha256_plain`, or
    key fingerprints** (`volume-format-v2.md` §2). On-tape sizes and ciphertext
    hashes are the only permitted plaintext facts. The leak-scan test (T9) is
@@ -274,8 +277,8 @@ contact.
 3. Envelope permutation (sheet §2.1): stable-sort tenant envelopes by
    hex(`sha256(volume_uuid_bytes ‖ 0x00 ‖ le64(tenant_id))`). Tenant envelopes
    only — operator envelope + backup keep fixed positions after them.
-4. `validate`: keep the existing full-hash of staged slices (sacred invariant
-   2); add: frozen-zone files exist and match recorded size+hash; capacity =
+4. `validate`: keep the existing check of staged slices (sacred invariant
+   2 — a full hash, opt-in since the 2026-09-30 amendment); add: frozen-zone files exist and match recorded size+hash; capacity =
    Σ block-padded + enospc_buffer ≤ oracle (`Store::capacity`); keys + escrow
    per T2; generated zones parse (front index + seal marker TOML round-trip,
    RESTORE.sh `bash -n`).

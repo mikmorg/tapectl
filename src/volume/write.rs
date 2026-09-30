@@ -26,7 +26,7 @@ use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
 use super::format;
 use super::layout;
 use super::layout_model::{
-    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, ZoneKind,
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, SliceCheck, ZoneKind,
 };
 use super::session::{
     self, check_tape_contact, AbortedAdoption, ConfirmOutcome, ContactOutcome, QuarantineReason,
@@ -975,7 +975,13 @@ fn blocking_validation_errors(
 /// `assume_yes` answers the quiet-host pre-flight's question
 /// ([`crate::host_check::preflight`]) — the global `--yes` — and nothing
 /// else: no Tier-3 refusal and no contact check consults it.
-#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + assume_yes
+///
+/// `prewrite_hash` is `--prewrite-hash`: full-hash every staged slice from
+/// disk in the pre-flight validate, before the drive is opened (tri-layer
+/// L1). Off by default since ADR-0012's 2026-09-30 (later) amendment —
+/// validate then checks only that each slice exists at its recorded size,
+/// and a rotted slice is caught by L2 while streaming (clean abort, no seal).
+#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + prewrite_hash + assume_yes
 pub fn volume_write(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -985,6 +991,7 @@ pub fn volume_write(
     block_size: usize,
     force: bool,
     allow_missing_escrow: bool,
+    prewrite_hash: bool,
     assume_yes: bool,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
@@ -1002,6 +1009,7 @@ pub fn volume_write(
         block_size,
         force,
         allow_missing_escrow,
+        prewrite_hash,
         assume_yes,
         &mut contact,
         ContactStore::Device,
@@ -1026,6 +1034,7 @@ fn volume_write_contacted<'c>(
     block_size: usize,
     force: bool,
     allow_missing_escrow: bool,
+    prewrite_hash: bool,
     assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
@@ -1245,6 +1254,7 @@ fn volume_write_contacted<'c>(
         block_size,
         force,
         allow_missing_escrow,
+        SliceCheck::from_prewrite_hash(prewrite_hash),
         StagedWrite {
             backend,
             volume_id,
@@ -1369,6 +1379,7 @@ fn volume_write_in_contact<'c>(
     block_size: usize,
     force: bool,
     allow_missing_escrow: bool,
+    slice_check: SliceCheck,
     staged: StagedWrite<'_>,
     det: &crate::tape::media_detect::Detected,
     contact: &contact::ContactGuard<'c>,
@@ -1527,9 +1538,11 @@ fn volume_write_in_contact<'c>(
     // keyless, or corrupt-staged-slice) refusal here never touches the
     // drive, exactly like the gate it replaces
     // (`docs/design/v2-implementation-plan.md` T8's trap: "do NOT leave two
-    // capacity gates"). Sacred invariant 2 (full-hash staged slices from
-    // disk) runs here, not a size-only shortcut.
-    if let Err(errs) = built.validate(&keys) {
+    // capacity gates"). Staged slices are size-checked here; under
+    // `--prewrite-hash` they are also full-hashed from disk (tri-layer L1,
+    // off by default since ADR-0012's 2026-09-30 later amendment — L2 in
+    // execute is the rot check that always runs).
+    if let Err(errs) = built.validate(&keys, slice_check) {
         let (blocking, waived) = blocking_validation_errors(errs, allow_missing_escrow);
         for e in &waived {
             tracing::warn!(
@@ -1582,15 +1595,21 @@ fn volume_write_in_contact<'c>(
     // start at BOT exactly like an untouched fresh session would.
     store.reposition_for_resume(0)?;
 
-    let validated = built.into_validated(&keys, store).map_err(|errs| {
-        TapectlError::Other(format!(
-            "volume \"{label}\" failed validation at contact: {}",
-            errs.iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ))
-    })?;
+    // Size-only here even under `--prewrite-hash`: the full hash, when asked
+    // for, ran in the pre-flight validate above moments ago, before the drive
+    // opened — which is the whole point of it — and a rot in between is L2's
+    // to catch. Hashing a second time would double L1's cost for nothing.
+    let validated = built
+        .into_validated(&keys, SliceCheck::Size, store)
+        .map_err(|errs| {
+            TapectlError::Other(format!(
+                "volume \"{label}\" failed validation at contact: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        })?;
 
     // ADR-0010's binding ladder, one stage later, for the volume `volume init`
     // could not bind (W3 Change 8) — placed here, after every refusal this
@@ -1670,6 +1689,10 @@ fn volume_write_in_contact<'c>(
 ///
 /// It shares [`assemble_session_keys`] and [`finish_session`] with
 /// `volume_write` rather than copying them.
+///
+/// `prewrite_hash` is `--prewrite-hash`, as on [`volume_write`]: the resume
+/// revalidation full-hashes every staged slice instead of size-checking it.
+/// The frozen generated zones are re-hashed byte-identical either way.
 pub fn volume_resume(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -1677,15 +1700,26 @@ pub fn volume_resume(
     label: &str,
     device: &str,
     block_size: usize,
+    prewrite_hash: bool,
 ) -> Result<()> {
     // See [`ContactSlot`]: resume refuses on the volume's status, on its
     // `writes` rows and on a missing backend long before it reads the MAM,
     // and none of those refusals is a contact.
     let mut contact = ContactSlot::empty();
-    let r = volume_resume_contacted(conn, paths, config, label, device, block_size, &mut contact);
+    let r = volume_resume_contacted(
+        conn,
+        paths,
+        config,
+        label,
+        device,
+        block_size,
+        SliceCheck::from_prewrite_hash(prewrite_hash),
+        &mut contact,
+    );
     contact.finish_result(r)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn volume_resume_contacted<'c>(
     conn: &'c Connection,
     // See `volume_write`'s `_paths` for why this is unused but kept.
@@ -1694,6 +1728,7 @@ fn volume_resume_contacted<'c>(
     label: &str,
     device: &str,
     block_size: usize,
+    slice_check: SliceCheck,
     contact: &mut ContactSlot<'c>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
@@ -1882,6 +1917,7 @@ fn volume_resume_contacted<'c>(
         session,
         &layout_snapshot,
         &keys,
+        slice_check,
     );
 
     // ONE post-command sweep per resume contact (issue #342; ADR-0013),
@@ -1939,6 +1975,7 @@ fn volume_resume_in_contact(
     session: session::InterruptedSession,
     layout_snapshot: &Layout,
     keys: &KeyAvailability,
+    slice_check: SliceCheck,
 ) -> Result<()> {
     binding::corroborate_volume(
         conn,
@@ -1964,7 +2001,7 @@ fn volume_resume_in_contact(
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
 
     info!(label, volume_id, "resuming interrupted volume write");
-    let outcome = session.resume(conn, keys, &mut store)?;
+    let outcome = session.resume(conn, keys, slice_check, &mut store)?;
 
     // Every `Err` above and this one return to the caller's sweep.
     finish_session(
@@ -4682,6 +4719,7 @@ pub fn compact_write(
     device: &str,
     block_size: usize,
     allow_missing_escrow: bool,
+    prewrite_hash: bool,
     assume_yes: bool,
 ) -> Result<()> {
     // The normal volume_write picks up all staged data. `force` is not
@@ -4698,6 +4736,7 @@ pub fn compact_write(
         block_size,
         false,
         allow_missing_escrow,
+        prewrite_hash,
         assume_yes,
     )
 }
@@ -8022,7 +8061,7 @@ mod tests {
             },
             entries: vec![],
         };
-        assert!(layout.validate(&session.keys).is_ok());
+        assert!(layout.validate(&session.keys, SliceCheck::Size).is_ok());
     }
 
     #[test]
@@ -8287,6 +8326,7 @@ mod tests {
             512 * 1024,
             true,  // --force
             false, // --allow-missing-escrow
+            false, // --prewrite-hash
             true,  // --yes: the host pre-flight is not under test here
         )
         .expect_err("force must not bypass pre-write validation");
@@ -8379,6 +8419,7 @@ mod tests {
                 512 * 1024,
                 false, // force
                 false, // allow_missing_escrow
+                false, // --prewrite-hash
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
@@ -8480,6 +8521,7 @@ mod tests {
             512 * 1024,
             false, // force
             false, // allow_missing_escrow
+            false, // --prewrite-hash
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
@@ -8578,6 +8620,7 @@ mod tests {
             512 * 1024,
             false, // force
             false, // allow_missing_escrow
+            false, // --prewrite-hash
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
@@ -8677,6 +8720,7 @@ mod tests {
             "L6-REBUILT-R",
             "/nonexistent/tapectl-resume-rebuilt-test-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err();
 
@@ -8735,6 +8779,7 @@ mod tests {
             "L6-INIT",
             "/nonexistent/tapectl-init-proceeds-test-nst",
             512 * 1024,
+            false,
             false,
             false,
             true,
@@ -8947,6 +8992,7 @@ mod tests {
             512 * 1024,
             false,
             false,
+            false,
             true,
         )
         .expect_err("no backend is configured, so this must fail at backend resolution");
@@ -9025,6 +9071,7 @@ mod tests {
             "L6-QUAR",
             "/nonexistent/tapectl-resume-status-test-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err();
 
@@ -9114,6 +9161,7 @@ mod tests {
             "L6-PLANNED",
             "/nonexistent/tapectl-resume-planned-test-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err();
 
@@ -9171,6 +9219,7 @@ mod tests {
             "L6-INPROG",
             "/nonexistent/tapectl-resume-inprogress-test-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err();
 
@@ -9278,6 +9327,7 @@ mod tests {
                 "L6-LIVE",
                 "/nonexistent/tapectl-resume-live-test-nst",
                 512 * 1024,
+                false,
             )
             .unwrap_err()
         };
@@ -9312,6 +9362,7 @@ mod tests {
             "/nonexistent/tapectl-write-live-test-nst",
             512 * 1024,
             true,
+            false,
             false,
             true,
         )
@@ -9368,6 +9419,7 @@ mod tests {
             "L6-INTR",
             "/nonexistent/tapectl-resume-interrupted-test-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err();
 
@@ -9445,6 +9497,7 @@ mod tests {
             label,
             "/nonexistent/tapectl-resume-pm280-test-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err()
     }
@@ -9598,6 +9651,7 @@ mod tests {
                 512 * 1024,
                 force,
                 false,
+                false,
                 true,
             )
             .unwrap_err();
@@ -9745,6 +9799,7 @@ mod tests {
             "L6-RESUMEGEN",
             "/nonexistent/tapectl-resume-gencheck-nst",
             512 * 1024,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -9817,6 +9872,7 @@ mod tests {
             "L6-BOTH",
             "/nonexistent/tapectl-order-test-nst",
             512 * 1024,
+            false,
             false,
             false,
             true,
@@ -10842,6 +10898,7 @@ mod tests {
                 512 * 1024,
                 false, // --force
                 false, // --allow-missing-escrow
+                false, // --prewrite-hash
                 true,  // --yes: the host pre-flight is not under test here
             )
             .expect_err("the escrow gap must refuse before the device is touched");
@@ -12143,6 +12200,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                false,
                 true,
             )
             .unwrap_err()
@@ -12187,6 +12245,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                false,
                 true,
             )
             .unwrap_err();
@@ -12229,7 +12288,8 @@ mod tests {
                 GENCHK_DEVICE,
                 512 * 1024,
                 false,
-                true, // --yes: the host pre-flight is not under test here
+                false, // --prewrite-hash
+                true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
 
@@ -12281,7 +12341,8 @@ mod tests {
                 &["WC-COLL".to_string()],
                 GENCHK_DEVICE,
                 512 * 1024,
-                true, // --yes: the host pre-flight is not under test here
+                false, // --prewrite-hash
+                true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err()
             .to_string();
@@ -12424,6 +12485,7 @@ mod tests {
                 "JW-GEN",
                 GENCHK_DEVICE,
                 512 * 1024,
+                false,
                 false,
                 false,
                 true,
@@ -13158,7 +13220,7 @@ mod tests {
         /// A write that gets all the way to the store: `genchk_fixture`'s
         /// catalog plus the escrow recipient recorded on the stage set and a
         /// REAL slice file whose `sha256_encrypted` matches, so the
-        /// pre-flight `validate` (sacred invariant 2, full-hash from disk)
+        /// pre-flight `validate` (and its `--prewrite-hash` full hash)
         /// passes and the seam is reached. The volume is LTO-6 and unbound;
         /// the drive in `lto8_config` is retuned to LTO-6 so
         /// `check_drive_can_write` passes; nothing is detectable on the
@@ -13299,6 +13361,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false,
+                false,
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -13369,6 +13432,7 @@ mod tests {
                 "SW-DONE",
                 GENCHK_DEVICE,
                 512 * 1024,
+                false,
                 false,
                 false,
                 true,
@@ -13745,6 +13809,7 @@ mod tests {
             512 * 1024,
             force,
             false, // allow_missing_escrow
+            false, // --prewrite-hash
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err()

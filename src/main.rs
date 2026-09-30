@@ -499,6 +499,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref volume,
             ref tag,
             ref device,
+            prewrite_hash,
         } => {
             cli::operations::quick_archive(
                 &conn,
@@ -509,6 +510,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 volume,
                 tag,
                 device.as_deref(),
+                prewrite_hash,
                 cli.json,
                 cli.dry_run,
                 cli.yes,

@@ -3876,6 +3876,7 @@ pub fn quick_archive(
     volume: &str,
     tag: &[String],
     device: Option<&str>,
+    prewrite_hash: bool,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -3953,6 +3954,7 @@ pub fn quick_archive(
         512 * 1024,
         false,
         false,
+        prewrite_hash,
         assume_yes,
     )?;
     if json_output {
@@ -4085,6 +4087,7 @@ mod tests {
             Some(&device),
             false,
             false,
+            false,
             true,
         )
         .expect_err("a sealed volume is not a write target");
@@ -4120,6 +4123,7 @@ mod tests {
                 "VOL-Q",
                 &[],
                 Some(&device),
+                false,
                 false,
                 false,
                 assume_yes,

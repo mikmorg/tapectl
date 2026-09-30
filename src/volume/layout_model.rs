@@ -180,6 +180,41 @@ pub struct CapacityBudget {
     pub reserve_bytes: u64,
 }
 
+/// How [`Layout::validate`] checks each staged slice before the tape moves —
+/// tri-layer L1 (`v2-open-questions.md` §2.4).
+///
+/// ADR-0012's 2026-09-30 (later) amendment: the default is [`Self::Size`].
+/// L2 (execute's inline re-hash of the very bytes streamed to the store,
+/// clean abort on mismatch, no seal) already guarantees no rotted slice is
+/// ever sealed; a full L1 hash only moves that detection before the tape
+/// starts, at the price of reading every staged byte one extra time — hours
+/// per copy at production sizes. [`Self::FullHash`] (`--prewrite-hash`)
+/// restores it. Only the staged-slice check is affected: materialized
+/// (frozen generated) zones are always size- and hash-checked — they are
+/// small, and resume's "frozen zones re-hash byte-identical" rule depends on
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SliceCheck {
+    /// The staged file exists and its size equals the recorded encrypted
+    /// size. Reads metadata only, never the slice's bytes.
+    #[default]
+    Size,
+    /// Size check plus a full sha256 of the file from disk against the
+    /// recorded ciphertext hash.
+    FullHash,
+}
+
+impl SliceCheck {
+    /// The CLI's `--prewrite-hash` as a mode.
+    pub fn from_prewrite_hash(prewrite_hash: bool) -> Self {
+        if prewrite_hash {
+            Self::FullHash
+        } else {
+            Self::Size
+        }
+    }
+}
+
 /// What the key-resolvability check needs, as plain data so the predicate is
 /// pure and unit-testable. Callers assemble it from the DB and key store.
 #[derive(Debug, Clone)]
@@ -246,6 +281,12 @@ pub enum LayoutError {
     },
     #[error("staged slice file missing: {0}")]
     SliceFileMissing(PathBuf),
+    #[error("staged slice size mismatch for {path}: recorded {expected} bytes, on-disk {actual}")]
+    SliceSizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
     #[error("staged slice checksum mismatch for {path}: expected {expected}, got {actual}")]
     SliceChecksumMismatch {
         path: PathBuf,
@@ -355,9 +396,11 @@ impl Layout {
 
     /// The full pre-write predicate (ADR-0002 / `layout-session.md`
     /// validation points 1-3+5): every entry sized; on-tape total + reserve
-    /// fits the budget; every staged slice exists on disk with a matching
-    /// sha256 (tri-layer L1 — sacred invariant 2, never weakened to
-    /// size-only); every *materialized* zone exists on disk and matches its
+    /// fits the budget; every staged slice has a recorded sha256 (L2
+    /// compares against it) and exists on disk at its recorded size — and,
+    /// under [`SliceCheck::FullHash`] only, with a matching sha256 (tri-layer
+    /// L1; size-only by default since ADR-0012's 2026-09-30 later amendment,
+    /// see [`SliceCheck`]); every *materialized* zone exists on disk and matches its
     /// recorded size (and hash, where one was recorded — the placeholder
     /// seal marker deliberately carries none, see `build::build`); keys
     /// resolvable. Point 4 (generated-zone TOML/consistency/`bash -n`
@@ -366,10 +409,14 @@ impl Layout {
     /// so this module stays free of a `format`/process dependency. Returns
     /// every failure found, never stops at the first (this is a pre-flight
     /// report).
-    pub fn validate(&self, keys: &KeyAvailability) -> Result<(), Vec<LayoutError>> {
+    pub fn validate(
+        &self,
+        keys: &KeyAvailability,
+        slice_check: SliceCheck,
+    ) -> Result<(), Vec<LayoutError>> {
         let mut errs = Vec::new();
         self.check_capacity(&mut errs);
-        self.check_staged_slices(&mut errs);
+        self.check_staged_slices(slice_check, &mut errs);
         self.check_materialized_zones(&mut errs);
         self.check_keys(keys, &mut errs);
         if errs.is_empty() {
@@ -394,7 +441,7 @@ impl Layout {
         }
     }
 
-    fn check_staged_slices(&self, errs: &mut Vec<LayoutError>) {
+    fn check_staged_slices(&self, slice_check: SliceCheck, errs: &mut Vec<LayoutError>) {
         for e in &self.entries {
             let ContentSource::Staged(path) = &e.source else {
                 continue;
@@ -407,6 +454,35 @@ impl Layout {
                 }
                 continue;
             };
+            // Existence and size first, in both modes — metadata only.
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if let Some(expected_size) = e.size_bytes {
+                        if meta.len() != expected_size {
+                            errs.push(LayoutError::SliceSizeMismatch {
+                                path: path.clone(),
+                                expected: expected_size,
+                                actual: meta.len(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    errs.push(LayoutError::SliceFileMissing(path.clone()));
+                    continue;
+                }
+                Err(err) => {
+                    errs.push(LayoutError::Io {
+                        path: path.clone(),
+                        message: err.to_string(),
+                    });
+                    continue;
+                }
+            }
+            if slice_check != SliceCheck::FullHash {
+                continue;
+            }
             match hash_file(path) {
                 Ok(actual) if &actual == expected => {}
                 Ok(actual) => errs.push(LayoutError::SliceChecksumMismatch {
@@ -594,7 +670,7 @@ mod tests {
             gen_entry(1, ZoneKind::SystemGuide, 1000),
         ];
         let l = layout_with(entries, 10 * BS, BS);
-        assert!(l.validate(&keys_ok(&[])).is_ok());
+        assert!(l.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
     }
 
     #[test]
@@ -613,11 +689,11 @@ mod tests {
         );
         // Fits exactly at available = 4*BS, reserve = BS.
         assert!(layout_with(entries.clone(), 4 * BS, BS)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .is_ok());
         // One block short → CapacityExceeded.
         let errs = layout_with(entries, 4 * BS - 1, BS)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(matches!(errs[0], LayoutError::CapacityExceeded { .. }));
     }
@@ -627,7 +703,7 @@ mod tests {
         let mut e = gen_entry(0, ZoneKind::IdThunk, 0);
         e.size_bytes = None;
         let errs = layout_with(vec![e], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(errs
             .iter()
@@ -644,7 +720,7 @@ mod tests {
             source: ContentSource::Staged(PathBuf::from("/nonexistent/tapectl/slice.age")),
         };
         let errs = layout_with(vec![entry], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(errs
             .iter()
@@ -669,7 +745,7 @@ mod tests {
             source: ContentSource::Staged(good.clone()),
         };
         assert!(layout_with(vec![ok], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .is_ok());
 
         let bad = LayoutEntry {
@@ -679,12 +755,68 @@ mod tests {
             sha256: Some(sha_hex(b"different")),
             source: ContentSource::Staged(good),
         };
+        // Default (size-only, ADR-0012 2026-09-30 later): the same-size
+        // corruption is NOT caught here — L2 catches it while streaming.
+        assert!(layout_with(vec![bad.clone()], 10 * BS, 0)
+            .validate(&keys_ok(&[]), SliceCheck::Size)
+            .is_ok());
+        // `--prewrite-hash`: the full hash refuses it before the tape moves.
         let errs = layout_with(vec![bad], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::FullHash)
             .unwrap_err();
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::SliceChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn staged_slice_size_is_checked_in_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.age");
+        let bytes = b"encrypted slice bytes";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let wrong_size = LayoutEntry {
+            position: 4,
+            kind: ZoneKind::Slice { stage_slice_id: 1 },
+            size_bytes: Some(bytes.len() as u64 + 1),
+            sha256: Some(sha_hex(bytes)),
+            source: ContentSource::Staged(path),
+        };
+        for mode in [SliceCheck::Size, SliceCheck::FullHash] {
+            let errs = layout_with(vec![wrong_size.clone()], 10 * BS, 0)
+                .validate(&keys_ok(&[]), mode)
+                .unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    LayoutError::SliceSizeMismatch { expected, actual, .. }
+                        if *expected == bytes.len() as u64 + 1 && *actual == bytes.len() as u64
+                )),
+                "{mode:?}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn size_only_check_still_requires_a_recorded_slice_hash() {
+        // L2 compares the streamed hash against the recorded one, so a
+        // slice with none must still be refused even when L1 does not hash.
+        let entry = LayoutEntry {
+            position: 4,
+            kind: ZoneKind::Slice { stage_slice_id: 1 },
+            size_bytes: Some(10),
+            sha256: None,
+            source: ContentSource::Staged(PathBuf::from("/nonexistent/tapectl/slice.age")),
+        };
+        let errs = layout_with(vec![entry], 10 * BS, 0)
+            .validate(&keys_ok(&[]), SliceCheck::Size)
+            .unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, LayoutError::SliceMissingChecksum { position: 4 })));
     }
 
     #[test]
@@ -697,7 +829,7 @@ mod tests {
             source: ContentSource::Staged(PathBuf::from("/tmp/whatever.age")),
         };
         let errs = layout_with(vec![entry], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(errs
             .iter()
@@ -714,7 +846,7 @@ mod tests {
             escrow_recipient_present: None,
             stage_sets_lacking_escrow: None,
         };
-        let errs = l.validate(&keys).unwrap_err();
+        let errs = l.validate(&keys, SliceCheck::Size).unwrap_err();
         assert!(errs.contains(&LayoutError::TenantHasNoActiveKey(8)));
         assert!(!errs.contains(&LayoutError::TenantHasNoActiveKey(7)));
         assert!(errs.contains(&LayoutError::OperatorKeyMissing));
@@ -726,16 +858,16 @@ mod tests {
         // None = pre-#68: skipped.
         let mut k = keys_ok(&[]);
         k.escrow_recipient_present = None;
-        assert!(l.validate(&k).is_ok());
+        assert!(l.validate(&k, SliceCheck::Size).is_ok());
         // Some(false) = concept exists but recipient missing: fails.
         k.escrow_recipient_present = Some(false);
         assert!(l
-            .validate(&k)
+            .validate(&k, SliceCheck::Size)
             .unwrap_err()
             .contains(&LayoutError::EscrowRecipientMissing));
         // Some(true): passes.
         k.escrow_recipient_present = Some(true);
-        assert!(l.validate(&k).is_ok());
+        assert!(l.validate(&k, SliceCheck::Size).is_ok());
     }
 
     /// Issue #115: an escrow can be registered (so `escrow_recipient_present`
@@ -753,7 +885,7 @@ mod tests {
         // The pass verdict: an escrow exists and every stage set records it.
         k.stage_sets_lacking_escrow = Some(vec![]);
         assert!(
-            l.validate(&k).is_ok(),
+            l.validate(&k, SliceCheck::Size).is_ok(),
             "an empty verdict list is the PASS case and must not error"
         );
 
@@ -763,7 +895,7 @@ mod tests {
             "photos".to_string(),
             "escrow recipient absent from recorded list".to_string(),
         )]);
-        let errs = l.validate(&k).unwrap_err();
+        let errs = l.validate(&k, SliceCheck::Size).unwrap_err();
         let lacking: Vec<&LayoutError> = errs
             .iter()
             .filter(|e| matches!(e, LayoutError::StageSetLacksEscrow { .. }))
@@ -798,7 +930,7 @@ mod tests {
 
         // `None` = the caller did not compute the field: check skipped.
         k.stage_sets_lacking_escrow = None;
-        assert!(l.validate(&k).is_ok());
+        assert!(l.validate(&k, SliceCheck::Size).is_ok());
     }
 
     #[test]
@@ -822,7 +954,7 @@ mod tests {
             escrow_recipient_present: None,
             stage_sets_lacking_escrow: None,
         };
-        let errs = l.validate(&keys).unwrap_err();
+        let errs = l.validate(&keys, SliceCheck::Size).unwrap_err();
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })));
@@ -856,7 +988,7 @@ mod tests {
             Some("deadbeef".into()),
         );
         let errs = layout_with(vec![entry], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(errs
             .iter()
@@ -877,7 +1009,7 @@ mod tests {
         // correct so this isolates the size-mismatch branch.
         let entry = materialized_entry(3, path, bytes.len() as u64 + 1, Some(sha_hex(bytes)));
         let errs = layout_with(vec![entry], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
@@ -897,7 +1029,7 @@ mod tests {
 
         let entry = materialized_entry(3, path, bytes.len() as u64, Some(sha_hex(b"corrupted")));
         let errs = layout_with(vec![entry], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
@@ -920,7 +1052,7 @@ mod tests {
 
         let entry = materialized_entry(9, path, bytes.len() as u64, None);
         assert!(layout_with(vec![entry], 10 * BS, 0)
-            .validate(&keys_ok(&[]))
+            .validate(&keys_ok(&[]), SliceCheck::Size)
             .is_ok());
     }
 

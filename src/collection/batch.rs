@@ -119,6 +119,9 @@ pub struct BatchExecutionReport {
 /// quiet-host pre-flight for every copy (ADR-0012, 2026-09-24 amendment,
 /// item 7) and `stage_create`'s question about a staging directory that may
 /// be too small (issue #354) for every unit staged.
+///
+/// `prewrite_hash` is `collection run --prewrite-hash`, handed to every
+/// copy's `volume_write` (ADR-0012, 2026-09-30 later amendment).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_batch(
     conn: &Connection,
@@ -128,6 +131,7 @@ pub fn execute_batch(
     copy_labels: &[String],
     device: &str,
     block_size: usize,
+    prewrite_hash: bool,
     assume_yes: bool,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
@@ -216,7 +220,16 @@ pub fn execute_batch(
     // silently override (issue #27).
     for label in copy_labels {
         crate::volume::write::volume_write(
-            conn, paths, config, label, device, block_size, false, false, assume_yes,
+            conn,
+            paths,
+            config,
+            label,
+            device,
+            block_size,
+            false,
+            false,
+            prewrite_hash,
+            assume_yes,
         )?;
     }
 
@@ -891,6 +904,7 @@ mod tests {
             &["VOL-B".to_string()],
             &device,
             512 * 1024,
+            false,
             true,
         )
         .expect_err("the sealed destination is not a write target");
@@ -921,6 +935,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
+            false,
         )
         .expect_err("no terminal and no --yes: a stage that may not fit is refused");
         let msg = err.to_string();
@@ -946,6 +961,7 @@ mod tests {
             &labels,
             &device,
             512 * 1024,
+            false,
             true,
         )
         .expect_err("the sealed destination is not a write target");

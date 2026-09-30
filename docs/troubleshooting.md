@@ -1304,7 +1304,30 @@ error: volume "<label>" write aborted: execute failed at position <n>: tape I/O 
 
 The same shape covers any other failure while streaming a file, and a slice
 whose hash no longer matches staging (`hash mismatch at position <n>: …`).
-What that leaves behind:
+
+That hash-mismatch abort is now **how a slice that rotted in staging is
+caught**. Since 1.0.3 the write no longer reads every staged slice in full
+before the tape moves (it checks each one exists at its recorded size); the
+bytes are hashed as they stream to the drive, and a mismatch stops the write
+before anything is sealed (ADR-0012, 2026-09-30). To recover, find the unit
+the slice belongs to: the `expected` hash in the message is that slice's
+recorded hash, and every stage report lists its slices' hashes, so
+`grep -l <expected hash> <home>/stage-reports/*` names the unit and version.
+Re-stage it, then write the cartridge again from the beginning:
+
+```bash
+tapectl staging clean --force --unit <unit> --version <n>
+tapectl stage create <unit> --version <n>
+tapectl volume write <label> --device "$TAPE"
+```
+
+The volume is still `initialized`, so `volume write` starts over from the
+beginning of the same tape; re-initialising it first is not needed. Pass
+`--prewrite-hash` to `volume write` (or `volume resume`) to have every staged
+slice fully hashed before the tape moves — it costs one extra full read of the
+batch, and a mismatch is then refused before any tape I/O.
+
+What an abort leaves behind:
 
 - **On tape:** no seal marker. The tape is unsealed. Nothing half-written is
   ever presented as a finished volume.

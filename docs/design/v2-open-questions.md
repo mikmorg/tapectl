@@ -171,7 +171,15 @@ layers, each covering a window the others can't (now committed in
 `layout-session.md` validation point 2):
 1. **validate** full-hashes staged slices from disk — pre-flight insurance; a
    disk read costs minutes and prevents burning a cartridge + ~7 h on a slice
-   that rotted since stage time.
+   that rotted since stage time. **Off by default since 2026-09-30** (ADR-0012,
+   "Amendment, 2026-09-30 (later)"): the "minutes" did not hold — at production
+   size the read is hours per copy (1.2 TiB at ~136 MB/s single-core on the
+   production host). By default validate now checks only that each staged
+   slice exists at its recorded encrypted size; `--prewrite-hash` (on every
+   command that writes a volume) restores the full hash. L2 below is what
+   guarantees no rotted slice is sealed, so the default loses no protection,
+   only the earlier point of detection. Frozen generated zones stay size- and
+   hash-checked in every mode.
 2. **execute** re-hashes inline on the *same* streaming read that feeds the
    tape (hash is free once streaming lands) and **cleanly aborts to unsealed**
    on mismatch — closes the validate→write TOCTOU window. A tape can't unwrite,
@@ -556,7 +564,9 @@ Layout::build(conn, cfg, label, batch)  -> BuiltLayout
     staging dir (frozen bytes, §2.2); envelope permutation applied (§2.1);
     front index emitted with all hashes; entry order = format order.
 BuiltLayout::validate(keys, oracle)     -> ValidatedLayout | Vec<LayoutError>
-    tri-layer L1: full-hash staged slices; size/hash-check frozen zones;
+    tri-layer L1: staged slices exist at their recorded size (full hash
+    only under --prewrite-hash, ADR-0012 2026-09-30 later); size/hash-check
+    frozen zones;
     capacity = Σ block-padded + enospc_buffer vs oracle; keys + escrow.
 ValidatedLayout::plan(conn)             -> PlannedSession
     writes rows 'planned' + write_positions 'pending' (slices only — schema).

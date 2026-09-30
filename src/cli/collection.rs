@@ -99,6 +99,10 @@ pub enum CollectionCommands {
         /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
+        /// See `volume write --prewrite-hash`: full-hash every staged slice
+        /// before the tape moves, for every copy this run writes.
+        #[arg(long)]
+        prewrite_hash: bool,
     },
 }
 
@@ -160,6 +164,7 @@ pub fn run(
             batch,
             labels,
             device,
+            prewrite_hash,
         } => cmd_run(
             conn,
             paths,
@@ -168,6 +173,7 @@ pub fn run(
             *batch,
             labels,
             &crate::cli::write_device(config, device.as_deref())?,
+            *prewrite_hash,
             json_output,
             global_dry_run,
             assume_yes,
@@ -417,6 +423,7 @@ fn cmd_run(
     batch_idx: usize,
     labels: &[String],
     device: &str,
+    prewrite_hash: bool,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -516,6 +523,7 @@ fn cmd_run(
         labels,
         device,
         DEFAULT_BLOCK_SIZE,
+        prewrite_hash,
         assume_yes,
     )?;
 

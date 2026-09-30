@@ -10,7 +10,9 @@
 //!     staging dir (frozen bytes, §2.2); envelope permutation applied (§2.1);
 //!     front index emitted with all hashes; entry order = format order.
 //! BuiltLayout::validate(keys, oracle)     -> ValidatedLayout | Vec<LayoutError>
-//!     tri-layer L1: full-hash staged slices; size/hash-check frozen zones;
+//!     tri-layer L1: staged slices exist at their recorded size (full hash
+//!     only under `--prewrite-hash`, ADR-0012 2026-09-30 later amendment);
+//!     size/hash-check frozen zones;
 //!     capacity = Σ block-padded + enospc_buffer vs oracle; keys + escrow.
 //! ValidatedLayout::plan(conn)             -> PlannedSession
 //!     writes rows 'planned' + write_positions 'pending' (slices only — schema).
@@ -76,7 +78,9 @@ use crate::util::HashingReader;
 use super::build::{BuildUnit, BuiltLayout};
 use super::format;
 use super::layout;
-use super::layout_model::{ContentSource, KeyAvailability, LayoutEntry, LayoutError, ZoneKind};
+use super::layout_model::{
+    ContentSource, KeyAvailability, LayoutEntry, LayoutError, SliceCheck, ZoneKind,
+};
 
 // ── ValidatedLayout ──
 
@@ -89,8 +93,9 @@ pub struct ValidatedLayout {
 
 impl BuiltLayout {
     /// `BuiltLayout -> ValidatedLayout` (§9's `validate(keys, oracle)`).
-    /// Runs the existing, already-tested `BuiltLayout::validate(keys)` (tri-layer
-    /// L1 full-hash of staged slices, materialized-zone size/hash checks, key
+    /// Runs the existing, already-tested `BuiltLayout::validate(keys, slice_check)`
+    /// (tri-layer L1 — staged slices size-checked, full-hashed only under
+    /// [`SliceCheck::FullHash`] — materialized-zone size/hash checks, key
     /// resolvability — `layout-session.md` validation points 2–3+5), then
     /// additionally cross-checks the Layout's on-tape total against a LIVE
     /// `store.capacity()` read.
@@ -107,10 +112,11 @@ impl BuiltLayout {
     pub fn into_validated(
         self,
         keys: &KeyAvailability,
+        slice_check: SliceCheck,
         store: &mut dyn Store,
     ) -> std::result::Result<ValidatedLayout, Vec<LayoutError>> {
         let mut errs = Vec::new();
-        if let Err(mut e) = self.validate(keys) {
+        if let Err(mut e) = self.validate(keys, slice_check) {
             errs.append(&mut e);
         }
         if let Ok(needed) = self.layout.on_tape_bytes() {
@@ -1057,15 +1063,23 @@ impl InterruptedSession {
         self,
         conn: &Connection,
         keys: &KeyAvailability,
+        slice_check: SliceCheck,
         store: &mut dyn Store,
     ) -> Result<ResumeOutcome> {
-        self.resume_checking(conn, keys, store, crate::signal::is_interrupted)
+        self.resume_checking(
+            conn,
+            keys,
+            slice_check,
+            store,
+            crate::signal::is_interrupted,
+        )
     }
 
     /// Resume the same session against the same tape —
     /// `docs/design/layout-session.md`'s Resume rule, verbatim: revalidate
-    /// the Layout (staged slices unchanged; frozen generated zones re-hash
-    /// byte-identical), rewind, read file 0, require ID-thunk identity match
+    /// the Layout (staged slices present at their recorded size — full-hashed
+    /// only under `slice_check` = [`SliceCheck::FullHash`]; frozen generated
+    /// zones re-hash byte-identical, always), rewind, read file 0, require ID-thunk identity match
     /// (label + uuid) — mismatch = divergence = quarantine, not overwrite —
     /// then the two-case cursor rule
     /// (`write_positions.stage_slice_id` is NOT NULL, so only slices have
@@ -1097,12 +1111,16 @@ impl InterruptedSession {
         self,
         conn: &Connection,
         keys: &KeyAvailability,
+        slice_check: SliceCheck,
         store: &mut dyn Store,
         mut is_interrupted: impl FnMut() -> bool,
     ) -> Result<ResumeOutcome> {
-        // 1. Revalidate: staged slices unchanged, frozen zones re-hash
+        // 1. Revalidate: staged slices present at their recorded size (and
+        // full-hashed under `--prewrite-hash`), frozen zones re-hash
         // byte-identical (re-runs the same tri-layer-L1 + materialized-zone
-        // checks `into_validated` ran originally). Failure here NEVER
+        // checks `into_validated` ran originally). Without the full hash a
+        // slice that rotted in staging is caught by L2 during the resumed
+        // execute, exactly as on a fresh write. Failure here NEVER
         // auto-aborts (issue #94): it reports and leaves the session
         // `interrupted`, so a later `resume` can still adopt it.
         //
@@ -1119,7 +1137,7 @@ impl InterruptedSession {
         // re-stage and re-write. So the operator — who knows whether the disk
         // is unmounted or wiped — judges "unrecoverably", via
         // `tapectl volume abort`.
-        if let Err(errs) = self.built.validate(keys) {
+        if let Err(errs) = self.built.validate(keys, slice_check) {
             let detail = errs
                 .iter()
                 .map(|e| e.to_string())
@@ -1848,9 +1866,11 @@ fn run_entries(
 
         // Tri-layer L2 (`v2-open-questions.md` §2.4): re-hash inline on the
         // same streaming read that fed the store, and clean-abort on
-        // mismatch. This is what closes the validate->execute TOCTOU window
-        // — `validate` already full-hashed this same file from disk, but a
-        // rot between then and now would otherwise land on tape unnoticed.
+        // mismatch. This is what closes the validate->execute TOCTOU window,
+        // and since ADR-0012's 2026-09-30 (later) amendment it is also the
+        // DEFAULT rot check for staged slices: `validate` only size-checks
+        // them unless `--prewrite-hash` asked it to full-hash from disk.
+        // Either way no rotted slice is ever sealed.
         let expected_hash = entry.sha256.as_deref();
         let abort_reason = match &stream_result {
             Err(e) => Some(format!(
@@ -2276,7 +2296,10 @@ mod tests {
     fn confirm_does_not_complete_a_session_aborted_during_its_readback() {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned.execute(&f.conn, &mut store).unwrap() {
             ExecuteOutcome::Ready(r) => r,
@@ -2371,7 +2394,10 @@ mod tests {
             hold: std::time::Duration::from_millis(500),
             holder: None,
         };
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let outcome = planned
             .execute(&f.conn, &mut store)
@@ -2399,7 +2425,7 @@ mod tests {
 
         let validated = f
             .built
-            .into_validated(&f.keys, &mut store)
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
             .expect("validate should pass for a well-formed fixture");
         let planned = validated
             .plan(&f.conn, f.volume_id, &f.units)
@@ -2526,7 +2552,10 @@ mod tests {
         let mut store = MemStore::new(BS as usize);
         let expected = f.built.session_dir.to_string_lossy().to_string();
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         let recorded: Vec<Option<String>> = f
@@ -2559,7 +2588,10 @@ mod tests {
         // TOCTOU window tri-layer L2 exists to close: the file rots AFTER
         // validate/plan, not before — corrupting it before validate would
         // just make validate itself reject it, never reaching execute).
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         // Corrupt one staged slice's on-disk bytes now, after plan.
@@ -2641,6 +2673,209 @@ mod tests {
         assert_eq!(wp_status, "failed");
     }
 
+    /// Flip the first byte of a file in place — same size, different bytes.
+    fn rot_in_place(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    // --- ADR-0012 2026-09-30 (later): the pre-write full hash is off by default
+
+    /// The default L1 reads no slice bytes: a staged slice that rotted
+    /// BEFORE validate (same size) passes it, and L2 — the inline re-hash of
+    /// the bytes streamed to the store — is what catches it: a clean abort
+    /// with the hash-mismatch reason, and no seal marker.
+    #[test]
+    fn default_validate_passes_same_size_rot_and_l2_aborts_it_unsealed() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let seal_position = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .unwrap();
+        rot_in_place(&f.units[0].slices[0].staging_path);
+
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .expect("size-only L1 must not read the slice, so same-size rot passes it");
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let aborted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Aborted(a) => a,
+            ExecuteOutcome::Ready(_) => panic!("L2 must abort on the rotted slice, got Ready"),
+            ExecuteOutcome::Interrupted(_) => panic!("expected Aborted, got Interrupted"),
+        };
+        assert!(
+            aborted.reason.starts_with("hash mismatch at position "),
+            "{}",
+            aborted.reason
+        );
+        assert!(
+            store.files.len() <= seal_position,
+            "no seal marker after an L2 abort: files.len()={}, seal position={seal_position}",
+            store.files.len()
+        );
+        let statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(statuses, vec!["aborted".to_string()]);
+    }
+
+    /// `--prewrite-hash`: the same rot is refused by validate itself, before
+    /// the store sees a single write.
+    #[test]
+    fn prewrite_hash_refuses_same_size_rot_before_any_tape_io() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        rot_in_place(&f.units[0].slices[0].staging_path);
+
+        let errs = match f
+            .built
+            .into_validated(&f.keys, SliceCheck::FullHash, &mut store)
+        {
+            Err(errs) => errs,
+            Ok(_) => panic!("the full pre-write hash must refuse a rotted slice"),
+        };
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, LayoutError::SliceChecksumMismatch { .. })),
+            "{errs:?}"
+        );
+        assert!(store.files.is_empty(), "nothing written to the store");
+    }
+
+    /// Resume without `--prewrite-hash` still re-hashes the frozen generated
+    /// zones byte-identical (only the staged-slice full hash is optional):
+    /// a tampered materialized zone is refused before anything is written.
+    #[test]
+    fn resume_without_prewrite_hash_still_refuses_a_tampered_frozen_zone() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+        let frozen = interrupted
+            .built
+            .layout
+            .entries
+            .iter()
+            .find_map(|e| match (&e.kind, &e.source) {
+                (ZoneKind::SystemGuide, ContentSource::Materialized(p)) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("fixture materializes the system guide");
+        rot_in_place(&frozen);
+
+        let msg = match interrupted.resume_checking(
+            &f.conn,
+            &f.keys,
+            SliceCheck::Size,
+            &mut store,
+            || false,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a tampered frozen zone must fail resume's revalidation"),
+        };
+        assert!(msg.contains("revalidation failed"), "{msg}");
+        assert!(msg.contains("hash mismatch"), "{msg}");
+        assert!(
+            store.files.is_empty(),
+            "nothing written: {}",
+            store.files.len()
+        );
+    }
+
+    /// Resume without `--prewrite-hash`: a slice that rotted in staging while
+    /// the session was interrupted passes revalidation and L2 aborts the
+    /// resumed execute cleanly — the same net as a fresh write.
+    #[test]
+    fn resume_without_prewrite_hash_lets_l2_abort_a_slice_that_rotted_meanwhile() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+        rot_in_place(&f.units[0].slices[0].staging_path);
+
+        match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Aborted(a) => assert!(
+                a.reason.starts_with("hash mismatch at position "),
+                "{}",
+                a.reason
+            ),
+            _ => panic!("expected the resumed execute to abort on L2"),
+        }
+    }
+
+    /// Resume with `--prewrite-hash`: the same rot is refused at
+    /// revalidation, before any write.
+    #[test]
+    fn resume_with_prewrite_hash_refuses_a_slice_that_rotted_meanwhile() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+        rot_in_place(&f.units[0].slices[0].staging_path);
+
+        let msg = match interrupted.resume_checking(
+            &f.conn,
+            &f.keys,
+            SliceCheck::FullHash,
+            &mut store,
+            || false,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the full pre-write hash must refuse the rotted slice"),
+        };
+        assert!(msg.contains("revalidation failed"), "{msg}");
+        assert!(msg.contains("checksum mismatch"), "{msg}");
+        assert!(
+            store.files.is_empty(),
+            "nothing written: {}",
+            store.files.len()
+        );
+    }
+
     // --- behavior 3: ENOSPC mid-execute cleanly aborts (same as mismatch) -
 
     #[test]
@@ -2658,7 +2893,10 @@ mod tests {
             .position(|e| matches!(e.kind, ZoneKind::SealMarker))
             .expect("fixture layout always has a seal marker");
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         let outcome = planned.execute(&f.conn, &mut store).expect(
@@ -2711,7 +2949,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         // The fixture's content entries (seal excluded) are, in order:
@@ -2776,7 +3017,7 @@ mod tests {
 
         // --- Resume, with a predicate that never interrupts ---
         let ready = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume_checking should not error")
         {
             ResumeOutcome::Ready(r) => r,
@@ -2840,7 +3081,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         // Interrupt on the very first check, before entry 0 (id_thunk) is
@@ -2858,7 +3102,7 @@ mod tests {
         assert_eq!(written_slices, 0);
 
         let ready = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .unwrap()
         {
             ResumeOutcome::Ready(r) => r,
@@ -2934,7 +3178,10 @@ mod tests {
             .expect("layout has a seal marker")
             .position as u32;
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let interrupted = match planned
             .execute_checking(&f.conn, &mut store, || true)
@@ -2982,7 +3229,7 @@ mod tests {
         store.files[0] = thunk_padded;
 
         match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error on a matching already-sealed tape")
         {
             ResumeOutcome::Confirming(_) => {}
@@ -3055,7 +3302,10 @@ mod tests {
             .expect("layout has a seal marker")
             .position as u32;
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let interrupted = match planned
             .execute_checking(&f.conn, &mut store, || true)
@@ -3103,7 +3353,7 @@ mod tests {
         store.files[seal_pos as usize] = seal_padded;
 
         let quarantined = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error on a foreign sealed tape")
         {
             ResumeOutcome::Quarantined(q) => q,
@@ -3167,7 +3417,10 @@ mod tests {
         // A position that genuinely disagrees with our own Layout.
         let foreign_seal_pos = our_seal_pos + 1;
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let interrupted = match planned
             .execute_checking(&f.conn, &mut store, || true)
@@ -3217,7 +3470,7 @@ mod tests {
         store.files[foreign_seal_pos as usize] = seal_padded;
 
         let quarantined = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error")
         {
             ResumeOutcome::Quarantined(q) => q,
@@ -3266,7 +3519,10 @@ mod tests {
             .expect("layout has a seal marker")
             .position as u32;
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let interrupted = match planned
             .execute_checking(&f.conn, &mut store, || true)
@@ -3346,7 +3602,7 @@ mod tests {
         }
 
         let quarantined = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error")
         {
             ResumeOutcome::Quarantined(q) => q,
@@ -3372,7 +3628,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let interrupted = match planned
             .execute_checking(&f.conn, &mut store, || true)
@@ -3411,7 +3670,7 @@ mod tests {
         }
 
         let quarantined = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume_checking should not hard-error on a divergent tape")
         {
             ResumeOutcome::Quarantined(q) => q,
@@ -3494,7 +3753,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned.execute(&f.conn, &mut store).unwrap() {
             ExecuteOutcome::Ready(r) => r,
@@ -3619,7 +3881,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned.execute(&f.conn, &mut store).unwrap() {
             ExecuteOutcome::Ready(r) => r,
@@ -3744,7 +4009,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned.execute(&f.conn, &mut store).unwrap() {
             ExecuteOutcome::Ready(r) => r,
@@ -3790,7 +4058,7 @@ mod tests {
             .expect("an Inconclusive confirm must leave the session resumable");
 
         let sealed_pending_again = match rehydrated
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error")
         {
             ResumeOutcome::Confirming(pending) => pending,
@@ -3899,7 +4167,10 @@ mod tests {
         let f = make_fixture();
         let mut inner = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut inner).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut inner)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned
             .execute_checking(&f.conn, &mut inner, || false)
@@ -3954,7 +4225,7 @@ mod tests {
 
         let mut store = NoWriteStore(inner);
         let outcome = interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error, and must not panic via NoWriteStore either");
 
         match outcome {
@@ -3999,7 +4270,10 @@ mod tests {
         let f = make_fixture();
         let mut inner = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut inner).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut inner)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned
             .execute_checking(&f.conn, &mut inner, || false)
@@ -4029,7 +4303,7 @@ mod tests {
 
         let mut store = NoWriteStore(inner);
         match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error, and must not panic via NoWriteStore either")
         {
             ResumeOutcome::Confirming(_) => {}
@@ -4059,7 +4333,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned
             .execute_checking(&f.conn, &mut store, || false)
@@ -4109,7 +4386,7 @@ mod tests {
             .expect("resumable");
 
         let ready_again = match interrupted
-            .resume_checking(&f.conn, &f.keys, &mut store, || false)
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not hard-error")
         {
             ResumeOutcome::Ready(r) => r,
@@ -4160,7 +4437,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned.execute(&f.conn, &mut store).unwrap() {
             ExecuteOutcome::Ready(r) => r,
@@ -4549,7 +4829,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let marker = tmp.path().join("parked");
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         let marker_for_check = marker.clone();
@@ -4602,7 +4885,10 @@ mod tests {
         let f = make_fixture();
         let mut store = MemStore::new(BS as usize);
 
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
 
         let outcome = run_entries(
@@ -4658,7 +4944,10 @@ mod tests {
             )
             .unwrap();
         let mut store = MemStore::new(BS as usize);
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let ready = match planned
             .execute_checking(&f.conn, &mut store, || false)
@@ -4984,7 +5273,7 @@ mod tests {
         let tape_before = sa.store.files.clone();
         let mut store = NoWriteStore(std::mem::replace(&mut sa.store, MemStore::new(BS as usize)));
         let pending = match adopted
-            .resume_checking(&sa.conn, &sa.keys, &mut store, || false)
+            .resume_checking(&sa.conn, &sa.keys, SliceCheck::Size, &mut store, || false)
             .expect("resume must not error, and must not write via NoWriteStore")
         {
             ResumeOutcome::Confirming(p) => p,
@@ -5065,10 +5354,13 @@ mod tests {
         std::fs::remove_file(&slice).unwrap();
 
         let mut store = NoWriteStore(std::mem::replace(&mut sa.store, MemStore::new(BS as usize)));
-        let msg = match adopted.resume_checking(&sa.conn, &sa.keys, &mut store, || false) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("revalidation must fail with a staged slice gone"),
-        };
+        let msg =
+            match adopted
+                .resume_checking(&sa.conn, &sa.keys, SliceCheck::Size, &mut store, || false)
+            {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("revalidation must fail with a staged slice gone"),
+            };
         assert!(msg.contains("revalidation failed"), "{msg}");
         assert!(!msg.contains("volume abort"), "{msg}");
         assert!(!msg.contains("`interrupted` state"), "{msg}");
@@ -5212,7 +5504,10 @@ mod tests {
             )
             .unwrap();
         let mut store = MemStore::new(BS as usize);
-        let validated = f.built.into_validated(&f.keys, &mut store).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
         let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
         let _interrupted = planned
             .execute_checking(&f.conn, &mut store, || true)

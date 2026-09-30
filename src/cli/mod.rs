@@ -262,6 +262,9 @@ pub enum Commands {
         /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
+        /// See `volume write --prewrite-hash`.
+        #[arg(long)]
+        prewrite_hash: bool,
     },
 
     /// Tape drive backends

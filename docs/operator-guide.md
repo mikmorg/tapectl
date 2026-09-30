@@ -509,6 +509,18 @@ select a subset: if the list is not what you want, stop, run `staging clean` to
 release what is already safely on tape, and start again. (`volume write` may
 still ask one question — the quiet-host check below — which `--yes` answers.)
 
+**Integrity while writing.** Every staged slice is hashed as it streams to the
+drive, and a slice whose bytes no longer match what `stage create` recorded
+stops the write before anything is sealed — the tape is left unsealed and
+nothing counts as a copy. Before the tape moves, `volume write` checks only that
+each staged slice exists at its recorded size. `--prewrite-hash` adds a full
+hash of every staged slice from disk first, so a rotted slice is refused before
+any tape I/O, at the cost of one extra full read of the batch (hours for a
+full LTO-6). It is off by default (ADR-0012, 2026-09-30) because the streaming
+hash already keeps a bad slice off a sealed tape; `volume resume`,
+`volume compact-write`, `volume compact`, `collection run` and `quick-archive`
+take the same flag.
+
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
 short of its second copy keeps its staged bytes — the release cannot quietly

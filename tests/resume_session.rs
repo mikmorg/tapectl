@@ -53,7 +53,7 @@ use sha2::{Digest, Sha256};
 use tapectl::db;
 use tapectl::store::{MemStore, Tier};
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, BuiltLayout, TenantInfo};
-use tapectl::volume::layout_model::KeyAvailability;
+use tapectl::volume::layout_model::{KeyAvailability, SliceCheck};
 use tapectl::volume::session::{
     ConfirmOutcome, ExecuteOutcome, InterruptedSession, QuarantineReason, ResumeOutcome,
 };
@@ -318,7 +318,11 @@ fn interrupt_after(f: &Fixture, calls_before: u32) -> MemStore {
     let validated = f
         .built
         .clone()
-        .into_validated(&rebuild_keys(&conn, vec![f.units[0].tenant_id]), &mut store)
+        .into_validated(
+            &rebuild_keys(&conn, vec![f.units[0].tenant_id]),
+            SliceCheck::Size,
+            &mut store,
+        )
         .expect("validate should pass for a well-formed fixture");
     let planned = validated.plan(&conn, f.volume_id, &f.units).unwrap();
 
@@ -385,7 +389,7 @@ fn resume_after_restart_seals_rather_than_quarantines() {
     let keys = rebuild_keys(&conn, tenant_ids);
 
     let ready = match session
-        .resume(&conn, &keys, &mut store)
+        .resume(&conn, &keys, SliceCheck::Size, &mut store)
         .expect("resume should not error")
     {
         ResumeOutcome::Ready(r) => r,
@@ -497,7 +501,10 @@ fn resume_with_zero_slices_written_restarts_from_bot() {
         .expect("an interrupted session for this volume should be resumable");
     let keys = rebuild_keys(&conn, vec![f.units[0].tenant_id]);
 
-    let ready = match session.resume(&conn, &keys, &mut store).unwrap() {
+    let ready = match session
+        .resume(&conn, &keys, SliceCheck::Size, &mut store)
+        .unwrap()
+    {
         ResumeOutcome::Ready(r) => r,
         ResumeOutcome::Quarantined(q) => panic!("unexpected quarantine: {:?}", q.reason),
         ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
@@ -593,7 +600,7 @@ fn revalidation_failure_leaves_the_session_resumable() {
     let session = InterruptedSession::rehydrate(&conn, f.volume_id)
         .unwrap()
         .expect("session should be resumable before the failed attempt");
-    let err = match session.resume(&conn, &keys, &mut store) {
+    let err = match session.resume(&conn, &keys, SliceCheck::Size, &mut store) {
         Err(e) => e,
         Ok(ResumeOutcome::Aborted(a)) => panic!(
             "a revalidation failure must never auto-abort the session: {}",
@@ -632,7 +639,10 @@ fn revalidation_failure_leaves_the_session_resumable() {
     // Fix the transient cause and prove the second attempt goes all the way.
     std::fs::rename(&stashed, &staged).unwrap();
 
-    let ready = match session.resume(&conn, &keys, &mut store).unwrap() {
+    let ready = match session
+        .resume(&conn, &keys, SliceCheck::Size, &mut store)
+        .unwrap()
+    {
         ResumeOutcome::Ready(r) => r,
         ResumeOutcome::Quarantined(q) => panic!("unexpected quarantine: {:?}", q.reason),
         ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),

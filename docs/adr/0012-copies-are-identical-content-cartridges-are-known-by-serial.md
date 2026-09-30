@@ -1082,3 +1082,22 @@ time, and no `volume abort`, `volume resume`, `staging clean --force` or `db imp
 write or its confirm runs. Until #378 lands, no `unit tag`, `unit rename` or hand edit of an
 archived unit's `.tapectl-unit.toml`: the dotfile is counted as content, so any of them
 re-archives the whole unit.
+
+## Amendment, 2026-09-30 (later) — the pre-write full hash is off by default
+
+*Ruled by the CTO on 2026-09-30.*
+
+Tri-layer L1 (`v2-open-questions.md` §2.4) full-hashed every staged slice from disk in the
+write session's `validate`, before the tape moved. It is now **off by default**, restored per
+command by `--prewrite-hash` (`volume write`, `volume resume`, `volume compact-write`,
+`volume compact`, `collection run`, `quick-archive`). By default `validate` checks only that
+each staged slice exists at its recorded encrypted size. Frozen generated zones are still
+size- and hash-checked, so resume's "frozen zones re-hash byte-identical" rule is unchanged.
+
+Why: L2, execute's inline re-hash of the very bytes streamed to the drive, already guarantees
+that no rotted slice is ever sealed (clean abort, tape left unsealed, no copy counted), and L3,
+confirm's readback, is unchanged. L1 only moves the detection before the tape starts, and at
+production size it costs hours per copy: 1.2 TiB at ~136 MB/s single-core on the production
+host. The price of the default is a cartridge pass wasted on the rare slice that rotted in
+staging; the remedy is to re-stage that unit and write the cartridge again. No on-tape byte
+changes; this is a patch release (1.0.3).

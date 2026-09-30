@@ -77,6 +77,13 @@ pub enum VolumeCommands {
         /// cartridge, knowing the copy stays unrecoverable by the escrow key.
         #[arg(long)]
         allow_missing_escrow: bool,
+        /// Full-hash every staged slice from disk before the tape moves
+        /// (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write
+        /// then checks each slice exists at its recorded size, and a slice
+        /// that rotted in staging is caught while streaming (clean abort,
+        /// tape left unsealed). This costs one extra full read of the batch.
+        #[arg(long)]
+        prewrite_hash: bool,
     },
 
     /// Resume an interrupted write session. Reload the SAME
@@ -117,6 +124,11 @@ pub enum VolumeCommands {
         /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
+        /// See `volume write --prewrite-hash`: the revalidation full-hashes
+        /// every staged slice instead of size-checking it. The session's
+        /// frozen generated files are re-hashed either way.
+        #[arg(long)]
+        prewrite_hash: bool,
     },
 
     /// Deliberately abandon a volume's unfinished write session:
@@ -237,6 +249,9 @@ pub enum VolumeCommands {
         /// source volume predates the escrow recipient needs this to proceed.
         #[arg(long)]
         allow_missing_escrow: bool,
+        /// See `volume write --prewrite-hash`.
+        #[arg(long)]
+        prewrite_hash: bool,
     },
 
     /// Show bin-packing plan for pending staged data
@@ -305,6 +320,9 @@ pub enum VolumeCommands {
         /// See `volume write --allow-missing-escrow`.
         #[arg(long)]
         allow_missing_escrow: bool,
+        /// See `volume write --prewrite-hash` (step 2's write).
+        #[arg(long)]
+        prewrite_hash: bool,
         /// See `volume compact-finish --force` — step 3's ADR-0008 Tier-2
         /// gate. With this (or the global `--yes`) step 3 asks nothing; the
         /// cartridge swap after step 1 still waits for you.
@@ -603,6 +621,7 @@ pub fn run(
             device,
             force,
             allow_missing_escrow,
+            prewrite_hash,
         } => {
             // Issue #241: a real preview would have to open the drive and
             // re-derive the whole layout (session build/validate/plan) —
@@ -627,6 +646,7 @@ pub fn run(
                 DEFAULT_BLOCK_SIZE,
                 *force,
                 *allow_missing_escrow,
+                *prewrite_hash,
                 yes,
             )?;
             if json_output {
@@ -639,7 +659,11 @@ pub fn run(
             }
         }
 
-        VolumeCommands::Resume { label, device } => {
+        VolumeCommands::Resume {
+            label,
+            device,
+            prewrite_hash,
+        } => {
             // Issue #241: same reasoning as `volume write` — resuming
             // reopens the drive and revalidates the frozen staging files
             // against it before anything is known about what remains to
@@ -652,7 +676,15 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
-            write::volume_resume(conn, paths, config, label, &device, DEFAULT_BLOCK_SIZE)?;
+            write::volume_resume(
+                conn,
+                paths,
+                config,
+                label,
+                &device,
+                DEFAULT_BLOCK_SIZE,
+                *prewrite_hash,
+            )?;
             if json_output {
                 println!(
                     "{}",
@@ -1262,6 +1294,7 @@ pub fn run(
             destination,
             device,
             allow_missing_escrow,
+            prewrite_hash,
         } => {
             // Issue #241: same reasoning as `volume write` — a real
             // preview would have to open the drive and re-derive the
@@ -1282,6 +1315,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
+                *prewrite_hash,
                 yes,
             )?;
             if json_output {
@@ -1331,6 +1365,7 @@ pub fn run(
             to,
             device,
             allow_missing_escrow,
+            prewrite_hash,
             force,
         } => {
             // Issue #241: the interactive 3-step flow opens the drive
@@ -1410,6 +1445,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
+                *prewrite_hash,
                 yes,
             )?;
             println!("  Write completed");
@@ -2788,6 +2824,7 @@ mod tests {
                 to: Some("L6-DST".into()),
                 device: Some(DEV.into()),
                 allow_missing_escrow: false,
+                prewrite_hash: false,
                 force: true,
             };
             let err = run(&conn, &paths, &config, &cmd, false, true, false)
@@ -3239,6 +3276,7 @@ mod tests {
             VolumeCommands::Resume {
                 label: "L".into(),
                 device: None,
+                prewrite_hash: false,
             },
         ] {
             assert_eq!(

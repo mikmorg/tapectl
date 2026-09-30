@@ -1226,7 +1226,7 @@ the normative design set named in the Policy block below.
   for background jobs** in a non-interactive shell, so a signal sent before
   tapectl's `ctrlc::set_handler` runs is silently dropped; and `volume write`
   spends its first seconds in build/validate (full-hashing every staged
-  slice) with the front zone + envelopes written before any slice — so
+  slice under `--prewrite-hash`, off by default since ADR-0012 2026-09-30) with the front zone + envelopes written before any slice — so
   "sleep N then signal" is unreliable at both ends. Wait on a DB precondition
   instead; the observed wait for one arm varied 4s..30s across runs.
   **There is now a process-level test layer (`tests/cli_smoke.rs`, #44).** It
@@ -1382,7 +1382,8 @@ the normative design set named in the Policy block below.
   write a bare "library".
 - **The three sacred invariants** (playbook preamble — a violation is
   stop-the-line): the seal marker is written only inside the session
-  lifecycle; `Layout::validate` full-hashes staged slices; no plaintext file
+  lifecycle; `Layout::validate` checks staged slices (full hash opt-in via
+  `--prewrite-hash` since ADR-0012 2026-09-30, by the CTO's ruling); no plaintext file
   carries tenant/unit names, filenames, `sha256_plain`, or key fingerprints.
 - **Integration authority: PM review + cherry-pick onto master, then push.**
   Chosen deliberately over merge-on-green: during the v2 regear, CI-green code

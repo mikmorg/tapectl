@@ -34,7 +34,7 @@ use tapectl::staging;
 use tapectl::store::{MemStore, MismatchKind, Store, Tier};
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, BuiltLayout, TenantInfo};
 use tapectl::volume::format;
-use tapectl::volume::layout_model::{KeyAvailability, Layout, ZoneKind};
+use tapectl::volume::layout_model::{KeyAvailability, Layout, SliceCheck, ZoneKind};
 use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
 
 /// Format constant (never scaled, per `v2-open-questions.md` §8) — reused
@@ -318,7 +318,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
 
     let mut store = MemStore::new(BS as usize);
     let validated = built
-        .into_validated(&keys, &mut store)
+        .into_validated(&keys, SliceCheck::Size, &mut store)
         .expect("validate should pass for a well-formed microcosm build");
     let planned = validated
         .plan(&conn, volume_id, &build_units)

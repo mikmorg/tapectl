@@ -36,9 +36,13 @@ total, not an end-reservation).
 1. Capacity: Σ block-padded sizes + ENOSPC buffer ≤ available (per-store
    capacity oracle; tape = §2.8 formula via #28, until then nominal-capacity
    config). This pre-flight gate is the sole capacity defense (ADR-0007).
-2. Every staged slice exists on disk and matches its recorded sha256 (a full
-   streamed hash). This is the first layer of the **tri-layer integrity model**:
-   *validate* full-hashes from disk (cheap read insurance against wasting a
+2. Every staged slice exists on disk at its recorded encrypted size, and has a
+   recorded sha256. Under `--prewrite-hash` it must also match that sha256 (a
+   full streamed hash); by default it is not read (ADR-0012, "Amendment,
+   2026-09-30 (later)" — at production size the read costs hours per copy, and
+   the inline re-hash below already keeps a rotted slice off a sealed tape).
+   This is the first layer of the **tri-layer integrity model**:
+   *validate* checks from disk (with the full hash, insurance against wasting a
    3.5 h tape write on a stale/rotted slice), *execute* re-hashes inline on the
    same streaming read that feeds the tape and cleanly aborts to unsealed on
    mismatch (closes the validate→write TOCTOU window at zero extra I/O), and
@@ -170,7 +174,9 @@ Rules that hold in every path:
   without a seal marker binding it the tape is unsealed — `volume-format-v2.md`
   §4.)
 - **Resume** (same session, same tape): revalidate the Layout (staged slices
-  unchanged; frozen generated zones re-hash byte-identical), rewind, read
+  present at their recorded size — full-hashed only under `--prewrite-hash`,
+  otherwise execute's inline re-hash catches a changed one; frozen generated
+  zones re-hash byte-identical, always), rewind, read
   file 0, require ID-thunk identity match (label + uuid) — mismatch =
   divergence = quarantine, not overwrite (#27; since migration 017 the
   quarantine is written to `observed_condition`, not `status`). Then the **two-case cursor

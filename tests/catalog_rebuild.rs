@@ -45,7 +45,7 @@ fn backend() -> &'static tapectl::config::LtoBackendConfig {
     })
 }
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
-use tapectl::volume::layout_model::KeyAvailability;
+use tapectl::volume::layout_model::{KeyAvailability, SliceCheck};
 use tapectl::volume::rebuild;
 use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
 
@@ -368,7 +368,9 @@ fn build_sealed_volume_full(
     };
 
     let mut store = MemStore::new(BS as usize);
-    let validated = built.into_validated(&keys, &mut store).expect("validate");
+    let validated = built
+        .into_validated(&keys, SliceCheck::Size, &mut store)
+        .expect("validate");
     let planned = validated
         .plan(&conn, volume_id, &build_units)
         .expect("plan");
