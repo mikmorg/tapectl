@@ -1052,9 +1052,11 @@ that must change before the first tape. Its code and catalog findings are issues
 2. **The first production binary is `1.0.0`.** `tapectl_version` on every tape read
    `0.1.0` for every commit before it, so no tape could say which writer made it. The value
    changes; the field does not (the 2026-09-24 ruling against adding a writer-commit field
-   stands). *Proposed with it, awaiting the CTO's word:* the minor version moves whenever
+   stands). **The rule from here (ruled 2026-09-30):** the minor version moves whenever
    generated on-tape bytes change, and the patch version for any other build installed on a
-   production host, so a tape names both its format generation and its writer.
+   production host, so a tape names both its format generation and its writer. Each release
+   installed on a production host is tagged `vX.Y.Z` on the commit it is built from, so
+   `tapectl --version` names the tag.
 3. **A binary change on the production host is a new artifact** (the 2026-09-24 ruling): the
    step-12 rehearsal runs again on the rebuilt binary before the first write. The binary is
    installed only between sessions, never while a stage, write or confirm runs: a binary that

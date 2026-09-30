@@ -182,7 +182,9 @@ issues #373–#385, built after it. Before it, and pinned once (`tests/on_tape_g
 third re-pin): RESTORE.sh decrypts a unit into scratch space inside `--to` (or
 `--scratch DIR`) after a space check, never into /tmp; names a full disk as one; streams
 `--verify`; refuses a layout_version other than 2. The package version is `1.0.0` (it was
-`0.1.0` on every commit before). Units are never split by hand: if a large unit's
+`0.1.0` on every commit before), tagged `v1.0.0`. Version rule (ruled 2026-09-30): the minor
+moves when generated on-tape bytes change, the patch for any other build installed on a
+production host; each such release is tagged `vX.Y.Z` on the commit it is built from. Units are never split by hand: if a large unit's
 re-archiving ever costs too much, the answer is #12's differential-only shape, underneath
 the unit. Until #376/#377/#378 land: one tapectl writer at a time, nothing destructive
 during a write or confirm, and no `unit tag`/`unit rename`/dotfile edit on an archived unit
