@@ -1904,6 +1904,11 @@ not need `tapectl`.
    ./RESTORE.sh --restore --unit UNIT --key your.age.key --to /dest
    ```
 
+   A restore decrypts the unit's slices to disk before dar extracts them, so
+   `/dest` needs about twice the unit's size free, plus one slice
+   (`--scratch DIR` puts the decrypted slices on another disk). The script
+   checks before it reads any slice.
+
    **Bring every key you hold, not just the current one.** `--key` may be
    repeated, and each key is tried on its own for the envelope and for every
    slice. A tape's envelope is sealed with the key that was active when the

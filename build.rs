@@ -3,8 +3,8 @@
 //! `tapectl --version` and every journal row's `tapectl_version` must name
 //! the COMMIT a binary was built from, not just the package version — a
 //! parser bug fixed in a later build is otherwise indistinguishable from a
-//! hardware change (ADR-0013 §7), and "0.1.0" has been the package version
-//! for every commit of this project's life. This script stamps two
+//! hardware change (ADR-0013 §7), and "0.1.0" was the package version for
+//! every commit before the first production binary. This script stamps two
 //! environment variables into the crate at build time:
 //!
 //! - `TAPECTL_GIT_DESCRIBE` — `git describe --tags --always --dirty`, or

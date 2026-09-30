@@ -8,13 +8,14 @@
 //!   `tapectl_version` column stores (`tape::mam_journal`,
 //!   `tape::log_pages`, `tape::health`), because ADR-0013 §7's "parse it
 //!   later" needs to know which build wrote the parsed columns, and the
-//!   package version has read `0.1.0` for every commit of this project.
+//!   package version read `0.1.0` for every commit before the first
+//!   production binary (1.0.0, ADR-0012 2026-09-30 amendment).
 //! - [`PKG_VERSION`] names the RELEASE and is the only one that reaches the
 //!   tape. See its doc comment for why.
 //!
 //! The raw pieces come from `build.rs` (`TAPECTL_GIT_DESCRIBE`,
 //! `TAPECTL_BUILD_DATE`); that script never fails the build, so a source
-//! tarball builds as `0.1.0 (unknown, 2026-09-24)`.
+//! tarball builds as `1.0.0 (unknown, 2026-09-30)`.
 
 /// The package version alone, exactly `CARGO_PKG_VERSION`.
 ///
@@ -43,7 +44,7 @@ pub const GIT_DESCRIBE: &str = env!("TAPECTL_GIT_DESCRIBE");
 /// The build day, UTC, as an RFC 3339 full-date (`YYYY-MM-DD`).
 pub const BUILD_DATE: &str = env!("TAPECTL_BUILD_DATE");
 
-/// The build identity: `0.1.0 (d3c514e, 2026-09-24)`, or with `-dirty`
+/// The build identity: `1.0.0 (d3c514e, 2026-09-30)`, or with `-dirty`
 /// after the hash when the tree had uncommitted changes to tracked files.
 ///
 /// Used by `tapectl --version` and every journal writer that records

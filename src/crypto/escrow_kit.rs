@@ -325,6 +325,12 @@ what every recovery tool takes as its key:
 (/dev/nst0 is only an example: list the drives on the machine you
 are using with `ls -l /dev/tape/by-id/` and use yours everywhere.)
 
+A restore needs free disk space of about twice the unit's size
+where --to points: the decrypted slices, then the files.
+RESTORE.sh measures this before it reads any slice, and
+--scratch DIR puts the decrypted slices on another disk. Do not
+restore into /tmp, which is RAM on many systems.
+
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
   catalog.db.age   An encrypted index of what is on the tapes:

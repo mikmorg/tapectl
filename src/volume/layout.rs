@@ -240,7 +240,10 @@ The easiest way to recover is the RESTORE.sh script (File 2):
     # Find your encrypted envelope
     ./RESTORE.sh --find-envelope --key your-key.age.key
 
-    # Full restore to a directory
+    # Full restore to a directory. Every slice of the unit is decrypted
+    # to disk before dar extracts it, so /destination needs about twice
+    # the unit's size free, plus one slice (--scratch DIR puts the
+    # decrypted slices on another disk). The script checks first.
     ./RESTORE.sh --restore --key your-key.age.key --to /destination
 
 ## Manual Recovery Steps
@@ -263,7 +266,9 @@ If RESTORE.sh is not available, follow these steps:
 6. Parse the MANIFEST.toml in your envelope for slice positions
 7. For each slice: read from tape, trim to the exact size given in
    File 3 (block padding breaks age decryption), verify its sha256
-   against File 3's `sha256_encrypted`, decrypt with age
+   against File 3's `sha256_encrypted`, decrypt with age. Work on a
+   disk with room for all of the unit's decrypted slices at once
+   (about the unit's size), not in /tmp, which is RAM on many systems
 8. Reassemble dar slices: `dar -x restore -R /destination -O -Q`
 
 ## Important: Block Padding
@@ -427,11 +432,17 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --verify                                     Keyless integrity check (no key needed)
 #   ./RESTORE.sh --find-envelope --key KEYFILE [--key K2 ...] Decrypt your envelope
 #   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR [--unit U] [--version N]
+#                [--scratch DIR] [--no-space-check]
 #
 # --key may be repeated. An envelope and the slices it describes can need
 # different keys after a key rotation, so every key is tried independently.
 #
-# Requirements: mt, dd, age, dar, sha256sum, head, truncate
+# Disk space: --restore decrypts a unit's slices to disk before dar extracts
+# them, into a scratch directory inside --to unless --scratch names another.
+# With both on one disk a unit needs about twice its size free there, plus one
+# slice. The script measures this before it reads any slice.
+#
+# Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar
 # Total files on tape: __TOTAL_FILES__
 #
 # Degradation ladder (see the system guide, File 1, "If All Else Fails"):
@@ -453,13 +464,20 @@ BLOCK=524288 # 512 KB — tapectl fixed block size
 # key here is tried independently for the envelope and for every slice.
 KEYS=()
 
+# WORK holds only small files: the tape's text zones and one envelope. A unit's
+# slices never go here — a data slice is up to 10 GiB and /tmp is RAM on many
+# systems. --restore decrypts them into SCRATCH, a directory it creates inside
+# --to (or --scratch) once it knows how much room they need.
+SCRATCH=""
+SKIP_SPACE_CHECK=0
+
 umask 077 # decrypted plaintext and temp files must not be world-readable
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tapectl-restore.XXXXXX")" ||
   {
     echo "FATAL: cannot create temporary directory" >&2
     exit 1
   }
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; [ -z "$SCRATCH" ] || rm -rf "$SCRATCH"' EXIT
 
 die() {
   echo "FATAL: $*" >&2
@@ -547,6 +565,81 @@ is_uint() {
   esac
 }
 
+# A byte count as GiB with one decimal, for messages.
+gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
+
+# A failed write must say why. Out of disk space is the likely cause on a
+# restore, and it must never read as a tape fault or a wrong key: the loop that
+# tries each key used to report a full disk as "key did not decrypt".
+die_io() { # <what failed> <file holding the tool's stderr> <directory written to>
+  local what=$1 errf=$2 where=$3 detail
+  detail=$(grep -v -e 'records in$' -e 'records out$' -e 'bytes.*copied' "$errf" 2>/dev/null | tail -n 3 || true)
+  if grep -qi 'no space left' "$errf" 2>/dev/null; then
+    die "$what: OUT OF DISK SPACE in $where
+       ${detail}
+       This is not a tape or key problem. Free space there and run the same
+       command again. --restore keeps a unit's decrypted slices in its scratch
+       directory (inside --to unless --scratch names another disk); everything
+       else this script reads is small and goes to ${TMPDIR:-/tmp}."
+  fi
+  die "$what
+       ${detail:-(no error text)}"
+}
+
+# Free space in bytes on the filesystem holding directory $1; empty if df
+# cannot say.
+free_bytes() {
+  df -Pk -- "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { printf "%.0f\n", $4 * 1024 }'
+}
+
+die_space() { # <directory> <bytes needed> <bytes free>
+  die "not enough disk space in $1 to restore this unit:
+       it needs about $(gib "$2"), and $(gib "$3") is free.
+       No slice has been read yet. A restore decrypts every slice of the unit to
+       disk before dar extracts them, so with the scratch space and --to on one
+       disk it needs the unit's size about twice over, plus one slice.
+       Free space there, choose a larger disk with --to, or put the decrypted
+       slices on another disk with --scratch DIR.
+       (--no-space-check skips this check, for a filesystem that holds more than
+       df reports, such as a compressed or thin-provisioned one.)"
+}
+
+# Refuse BEFORE the first slice is read when the unit cannot fit. Running out of
+# space mid-restore used to kill the script hours in, silently or as a key error.
+# Scratch holds every decrypted slice (each no larger than its ciphertext) plus
+# the one being read; --to receives the extracted files, about the archive's
+# size again.
+check_space() { # <destination> <scratch parent> <archive bytes> <largest slice bytes>
+  local dest=$1 scr=$2 total=$3 largest=$4
+  if [ "$SKIP_SPACE_CHECK" = 1 ]; then
+    info "Disk space not checked (--no-space-check)"
+    return 0
+  fi
+  local need_scr=$((total + largest + BLOCK)) need_dest=$total
+  local scr_free dest_free
+  scr_free=$(free_bytes "$scr")
+  dest_free=$(free_bytes "$dest")
+  if ! is_uint "$scr_free" || ! is_uint "$dest_free"; then
+    echo "WARNING: cannot measure free disk space (df failed); continuing without the check." >&2
+    return 0
+  fi
+  # One filesystem unless stat proves otherwise, so a failed stat over-asks
+  # rather than under-asks.
+  local scr_dev dest_dev
+  scr_dev=$(stat -c %d -- "$scr" 2>/dev/null || true)
+  dest_dev=$(stat -c %d -- "$dest" 2>/dev/null || true)
+  if [ -z "$scr_dev" ] || [ "$scr_dev" = "$dest_dev" ]; then
+    local need=$((need_scr + need_dest))
+    info "Disk space: needs about $(gib "$need") in $dest (decrypted slices, then the files); $(gib "$dest_free") free"
+    [ "$dest_free" -ge "$need" ] || die_space "$dest" "$need" "$dest_free"
+  else
+    info "Disk space: needs about $(gib "$need_scr") in $scr (decrypted slices); $(gib "$scr_free") free"
+    info "            and about $(gib "$need_dest") in $dest (the files); $(gib "$dest_free") free"
+    [ "$scr_free" -ge "$need_scr" ] || die_space "$scr" "$need_scr" "$scr_free"
+    [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
+  fi
+}
+
 # ---- prerequisite check ----
 
 for tool in mt dd age sha256sum dar head truncate tar; do
@@ -561,12 +654,15 @@ tape_init() {
 }
 
 # Read tape file at position $1 into file $2 (raw bytes, block-padded). Dies
-# on failure — used once a source is already trusted (post-ladder).
+# on failure, naming the cause — used once a source is already trusted
+# (post-ladder). dd's stderr used to go to /dev/null, so a full disk here ended
+# the script with no message at all.
 read_tape_raw() {
   local pos=$1 out=$2
   mt -f "$DEVICE" rewind
   [ "$pos" -gt 0 ] && mt -f "$DEVICE" fsf "$pos"
-  dd if="$DEVICE" of="$out" bs="$BLOCK" 2>/dev/null
+  dd if="$DEVICE" of="$out" bs="$BLOCK" 2>"$WORK/dd.err" ||
+    die_io "reading tape file $pos failed" "$WORK/dd.err" "$(dirname "$out")"
 }
 
 # Same, but never exits: returns 1 on any failure (missing position, I/O
@@ -581,6 +677,33 @@ try_read_tape_raw() {
   fi
   dd if="$DEVICE" of="$out" bs="$BLOCK" 2>/dev/null
   [ -s "$out" ] || return 1
+}
+
+# sha256 of tape file $1, first $2 bytes (all of it when $2 is empty), hashed
+# as it streams off the tape: --verify used to copy each file into WORK first,
+# twice, and a 10 GiB slice in a RAM-backed /tmp made a good tape FAIL as
+# "unreadable". Returns 1 when the file cannot be reached or read, or yields no
+# bytes at all.
+EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+hash_tape_file() {
+  local pos=$1 size=$2 sum
+  mt -f "$DEVICE" rewind 2>/dev/null || return 1
+  if [ "$pos" -gt 0 ]; then
+    mt -f "$DEVICE" fsf "$pos" 2>/dev/null || return 1
+  fi
+  if [ -n "$size" ]; then
+    # head stops at the exact size; cat drains the block padding after it,
+    # so dd never takes a SIGPIPE that pipefail would read as a tape fault.
+    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>/dev/null | {
+      head -c "$size" | sha256sum
+      cat >/dev/null
+    }) || return 1
+  else
+    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>/dev/null | sha256sum) || return 1
+  fi
+  sum=${sum%% *}
+  [ -n "$sum" ] && [ "$sum" != "$EMPTY_SHA256" ] || return 1
+  echo "$sum"
 }
 
 # Read tape file at position $1 into file $2, stripping null padding. Use for
@@ -651,6 +774,8 @@ bootstrap_thunk() {
   read_tape_text 0 "$WORK/id_thunk.txt"
   sed -n '/^\[volume\]/,$p' "$WORK/id_thunk.txt" >"$WORK/thunk.toml"
 
+  check_layout_version "$(toml_val "$WORK/thunk.toml" layout_version)"
+
   FRONT_INDEX=$(toml_val "$WORK/thunk.toml" front_index)
   SEAL_MARKER=$(toml_val "$WORK/thunk.toml" seal_marker)
   TOTAL_FILES=$(toml_val "$WORK/thunk.toml" total_files)
@@ -665,6 +790,25 @@ bootstrap_thunk() {
   # when a different tape is loaded. Only the thunk says what is really there.
   TAPE_LABEL=$(safe_str "$(toml_val "$WORK/thunk.toml" label)")
   check_tape_identity
+}
+
+# This script reads layout v2 only. Every tape carries the script that reads
+# it at file 2, so a tape of another layout is refused with the way to that
+# script, before anything of it is interpreted. A missing value (a damaged
+# thunk) warns and reads on as v2: a damaged thunk, the case where an heir
+# needs this script most, must never become a hard stop.
+check_layout_version() { # <layout_version as File 0 states it>
+  local v=$1
+  if [ -z "$v" ]; then
+    echo "WARNING: File 0 states no layout_version (damaged?); reading this tape as layout v2." >&2
+    return 0
+  fi
+  [ "$v" != 2 ] || return 0
+  die "this tape is layout_version $(safe_str "$v"); this script reads layout v2 only.
+       Use the RESTORE.sh stored on THIS tape — every tape carries the script
+       that reads it, at file 2:
+         mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
+         dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE.sh"
 }
 
 # Always say which device was read and what was found there. A silent default
@@ -915,22 +1059,15 @@ do_verify() {
     [ -z "$hash" ] && continue
 
     require_uint "position(@$type)" "$pos"
+    [ -z "$size" ] || require_uint "size_bytes(@$pos)" "$size"
 
-    if ! try_read_tape_raw "$pos" "$WORK/chk.raw"; then
+    local actual
+    if ! actual=$(hash_tape_file "$pos" "$size"); then
       printf "FAIL  file %3d  %-24s  (unreadable)\n" "$pos" "$type"
       overall_ok=0
       continue
     fi
 
-    local trimmed="$WORK/chk.raw"
-    if [ -n "$size" ]; then
-      require_uint "size_bytes(@$pos)" "$size"
-      head -c "$size" "$WORK/chk.raw" >"$WORK/chk.trim"
-      trimmed="$WORK/chk.trim"
-    fi
-
-    local actual
-    actual=$(sha256sum "$trimmed" | awk '{print $1}')
     if [ "$actual" = "$hash" ]; then
       printf "PASS  file %3d  %-24s\n" "$pos" "$type"
     else
@@ -1047,10 +1184,17 @@ decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number>
     fi
   done
   for k in ${order[@]+"${order[@]}"}; do
-    if age -d -i "$k" <"$in" >"$out"; then
+    if age -d -i "$k" <"$in" >"$out" 2>"$WORK/age.err"; then
+      cat "$WORK/age.err" >&2 || true
       SLICE_KEY="$k"
       info "  key $k decrypted slice $num"
       return 0
+    fi
+    cat "$WORK/age.err" >&2 || true
+    # A full disk makes age fail on EVERY key, which read as a key rotation.
+    if grep -qi 'no space left' "$WORK/age.err" 2>/dev/null; then
+      rm -f "$out"
+      die_io "decrypting slice $num failed" "$WORK/age.err" "$(dirname "$out")"
     fi
     info "  key $k did not decrypt slice $num"
   done
@@ -1064,9 +1208,11 @@ decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number>
 }
 
 do_restore() {
-  local destdir=$1 target_unit=$2 want_version=${3:-}
+  local destdir=$1 target_unit=$2 want_version=${3:-} scratch_parent=${4:-}
 
   mkdir -p "$destdir"
+  [ -n "$scratch_parent" ] || scratch_parent=$destdir
+  mkdir -p "$scratch_parent"
 
   establish_files
 
@@ -1168,8 +1314,22 @@ do_restore() {
   # current.
   info "Restoring '$target_unit' snapshot version ${picked:-unknown} ($nslices slice(s))"
 
-  # Step 4: cross-check each slice against the front index, then verify+decrypt
-  local dar_dir="$WORK/dar"
+  # Step 4: room for it. Sizes come from the file map; a slice missing from it
+  # is refused with its own message in step 5.
+  local total=0 largest=0 spos ssize
+  while IFS='|' read -r _ spos _ _; do
+    ssize=$(file_size_at "$spos" "$FILES_TXT")
+    [ -n "$ssize" ] || continue
+    require_uint "front_index_size(@$spos)" "$ssize"
+    total=$((total + ssize))
+    [ "$ssize" -le "$largest" ] || largest=$ssize
+  done <"$WORK/slices.txt"
+  check_space "$destdir" "$scratch_parent" "$total" "$largest"
+  SCRATCH="$(mktemp -d "$scratch_parent/.tapectl-restore.XXXXXX")" ||
+    die "cannot create a scratch directory in $scratch_parent"
+
+  # Step 5: cross-check each slice against the front index, then verify+decrypt
+  local dar_dir="$SCRATCH/dar"
   mkdir -p "$dar_dir"
   local count=0
 
@@ -1192,31 +1352,32 @@ do_restore() {
       die "slice $num hash mismatch: envelope manifest and file map disagree — tape may be tampered or damaged"
     fi
 
-    read_tape_raw "$tpos" "$WORK/slice.enc"
-    truncate -s "$idx_size" "$WORK/slice.enc"
+    read_tape_raw "$tpos" "$SCRATCH/slice.enc"
+    truncate -s "$idx_size" "$SCRATCH/slice.enc"
 
     local actual
-    actual=$(sha256sum "$WORK/slice.enc" | awk '{print $1}')
+    actual=$(sha256sum "$SCRATCH/slice.enc" | awk '{print $1}')
     if [ "$actual" != "$idx_hash" ]; then
       die "slice $num checksum MISMATCH (expected ${idx_hash:0:16}…, got ${actual:0:16}…)"
     fi
     info "  checksum verified against front index"
 
-    decrypt_slice "$WORK/slice.enc" "$dar_dir/restore.$num.dar" "$num"
+    decrypt_slice "$SCRATCH/slice.enc" "$dar_dir/restore.$num.dar" "$num"
 
     local bytes
     bytes=$(wc -c <"$dar_dir/restore.$num.dar")
     info "  decrypted ($((bytes / 1048576)) MiB)"
-    rm -f "$WORK/slice.enc"
+    rm -f "$SCRATCH/slice.enc"
 
   done <"$WORK/slices.txt"
 
-  # Step 5: extract with dar
+  # Step 6: extract with dar
   info "Extracting archive to $destdir ..."
   dar -x "$dar_dir/restore" -R "$destdir" -O -Q ||
-    die "dar extraction failed"
+    die "dar extraction failed — dar's own message is above (No space left on device means $destdir is full)"
 
-  rm -rf "$dar_dir"
+  rm -rf "$SCRATCH"
+  SCRATCH=""
   echo ""
   info "RESTORE COMPLETE"
   info "Unit '$target_unit' restored to: $destdir"
@@ -1252,33 +1413,38 @@ case "${1:-}" in
 --restore)
   shift
   KEYS=()
-  dest="" unit="" want=""
-  # Every flag here takes a value. `shift 2` on a TRAILING bare flag fails
-  # because $# is 1, `set -e` fires, and the script exits 1 having printed
-  # nothing at all — the usage check below is never reached. Check the arity
-  # first and say which flag was short (#133).
+  dest="" unit="" want="" scratch=""
+  # Every flag but --no-space-check takes a value. `shift 2` on a TRAILING bare
+  # flag fails because $# is 1, `set -e` fires, and the script exits 1 having
+  # printed nothing at all — the usage check below is never reached. Check the
+  # arity first and say which flag was short (#133).
   while [ $# -gt 0 ]; do
     case "$1" in
-    --key | --to | --unit | --version)
+    --key | --to | --unit | --version | --scratch)
       [ $# -ge 2 ] || die "$1 needs a value
 
-       usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+       usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N] [--scratch DIR]"
       case "$1" in
       --key) KEYS+=("$2") ;;
       --to) dest=$2 ;;
       --unit) unit=$2 ;;
       --version) want=$2 ;;
+      --scratch) scratch=$2 ;;
       esac
       shift 2
+      ;;
+    --no-space-check)
+      SKIP_SPACE_CHECK=1
+      shift
       ;;
     *) die "unknown option: $1" ;;
     esac
   done
-  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
-  [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N]"
+  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N] [--scratch DIR]"
+  [ -n "$dest" ] || die "usage: $0 --restore --key KEYFILE --to DIR [--unit U] [--version N] [--scratch DIR]"
   require_key_files
   [ -z "$want" ] || require_uint version "$want"
-  do_restore "$dest" "$unit" "$want"
+  do_restore "$dest" "$unit" "$want" "$scratch"
   ;;
 --help | -h)
   echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL (layout v2)"
@@ -1288,6 +1454,7 @@ case "${1:-}" in
   echo "  $0 --verify                                     Keyless integrity check"
   echo "  $0 --find-envelope --key KEYFILE [--key K2 ...]  Decrypt your envelope"
   echo "  $0 --restore --key KEYFILE [--key K2 ...] --to DIR [--unit U] [--version N]"
+  echo "               [--scratch DIR] [--no-space-check]"
   echo "      Full restore. Without --version the NEWEST version of the unit on"
   echo "      this volume is restored. To see which versions this tape holds,"
   echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
@@ -1298,10 +1465,18 @@ case "${1:-}" in
   echo "      unit and writing the volume seals the two to different key"
   echo "      generations, so no single key opens both."
   echo ""
+  echo "  --scratch DIR   Where the decrypted slices wait for dar (default: a"
+  echo "      directory inside --to, removed afterwards). Every slice of the"
+  echo "      unit is decrypted to disk before dar extracts them, so with both"
+  echo "      on one disk a restore needs about twice the unit's size free,"
+  echo "      plus one slice. The script checks before it reads any slice."
+  echo "  --no-space-check   Skip that check (a compressed or thin-provisioned"
+  echo "      filesystem can hold more than df reports)."
+  echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
   echo ""
-  echo "Requirements: mt, dd, age, dar, sha256sum, head, truncate"
+  echo "Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar"
   ;;
 "")
   echo "RESTORE.sh for tapectl volume $LABEL"
@@ -3323,7 +3498,7 @@ sha256_encrypted = \"bbb\"
     fn slice_decryption_tries_every_key_and_remembers_the_last_one() {
         let s = generate_restore_script_v2("SLICE1", 20);
         assert!(
-            s.contains("decrypt_slice \"$WORK/slice.enc\""),
+            s.contains("decrypt_slice \"$SCRATCH/slice.enc\""),
             "the slice loop must go through the multi-key helper"
         );
         assert!(
@@ -3451,6 +3626,420 @@ sha256_encrypted = \"bbb\"
         assert!(
             section.lines().any(|l| l.starts_with("- `tar`")),
             "Tools Required must list tar:\n{section}"
+        );
+    }
+
+    // ---- the 2026-09-30 heir-path batch (ADR-0012 2026-09-30 amendment) ----
+
+    /// A directory holding the generated script and a `bin/` of stubs that
+    /// shadow the host's tools, one `(name, body)` per stub. Everything not
+    /// stubbed (sha256sum, head, df, stat, awk, mktemp, ...) is the host's
+    /// real tool, which these tests need: they execute the script's own
+    /// helpers rather than grep for them.
+    #[cfg(test)]
+    fn heir_harness(tag: &str, stubs: &[(&str, &str)]) -> (std::path::PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tapectl-heir-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            dir.join("RESTORE.sh"),
+            generate_restore_script_v2("HEIR01", 20),
+        )
+        .unwrap();
+        // The prerequisite loop demands these; inert unless a test says more.
+        let mut all: Vec<(&str, &str)> = vec![
+            ("mt", "#!/bin/sh\nexit 0\n"),
+            ("dd", "#!/bin/sh\nexit 0\n"),
+            ("age", "#!/bin/sh\nexit 0\n"),
+            ("dar", "#!/bin/sh\nexit 0\n"),
+        ];
+        all.retain(|(n, _)| !stubs.iter().any(|(m, _)| m == n));
+        all.extend_from_slice(stubs);
+        for (name, body) in all {
+            let stub = bin.join(name);
+            std::fs::write(&stub, body).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (dir, path)
+    }
+
+    /// Source the harness's script (defining its functions without running a
+    /// mode) and run `snippet` in the same shell.
+    #[cfg(test)]
+    fn heir_run(dir: &std::path::Path, path: &str, snippet: &str) -> (i32, String) {
+        let prog = format!(
+            "source \"{}\" >/dev/null\n{snippet}\n",
+            dir.join("RESTORE.sh").display()
+        );
+        let o = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&prog)
+            .env("PATH", path)
+            .output()
+            .expect("spawn bash -c");
+        let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&o.stderr));
+        (o.status.code().unwrap_or(-1), text)
+    }
+
+    /// A `df -Pk` stub reporting `kib` KiB available on every path.
+    #[cfg(test)]
+    fn df_stub(kib: u64) -> String {
+        format!(
+            "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+             echo \"/dev/x 999999999999 0 {kib} 0% /\"\n"
+        )
+    }
+
+    /// The space check refuses a unit that cannot fit, names the fix, and says
+    /// no slice has been read; with room it passes and says how much it needs.
+    /// A 470 GiB unit restored on a machine whose /tmp is RAM is the case that
+    /// prompted it: the script used to die mid-slice with no message.
+    #[test]
+    fn restore_space_check_refuses_a_unit_that_cannot_fit() {
+        let gib: u64 = 1 << 30;
+        let total = 20 * gib; // two 10 GiB slices
+        let largest = 10 * gib;
+
+        // 8 GiB free, one filesystem: refused.
+        let small = df_stub(8 * (1 << 20));
+        let (dir, path) = heir_harness("space-small", &[("df", &small)]);
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let call = format!(
+            "check_space \"{0}\" \"{0}\" {total} {largest}",
+            dest.display()
+        );
+        let (code, text) = heir_run(&dir, &path, &call);
+        assert_ne!(code, 0, "a unit that cannot fit must be refused:\n{text}");
+        assert!(text.contains("not enough disk space in"), "{text}");
+        assert!(text.contains("No slice has been read yet"), "{text}");
+        assert!(
+            text.contains("--scratch DIR"),
+            "the fix must be named:\n{text}"
+        );
+        assert!(
+            text.contains("--no-space-check"),
+            "the escape must be named:\n{text}"
+        );
+        // Both halves on one disk: slices + one slice in flight + the files.
+        assert!(
+            text.contains("it needs about 50.0 GiB, and 8.0 GiB is free"),
+            "{text}"
+        );
+
+        // Positive control: the same call with room passes and reports.
+        let big = df_stub(100 * (1 << 20));
+        let (dir2, path2) = heir_harness("space-big", &[("df", &big)]);
+        let dest2 = dir2.join("dest");
+        std::fs::create_dir_all(&dest2).unwrap();
+        let call = format!(
+            "check_space \"{0}\" \"{0}\" {total} {largest} && echo PASSED",
+            dest2.display()
+        );
+        let (code, text) = heir_run(&dir2, &path2, &call);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("PASSED"), "{text}");
+        assert!(
+            text.contains("Disk space: needs about 50.0 GiB in"),
+            "{text}"
+        );
+
+        // --no-space-check skips it, even when it would refuse.
+        let call = format!(
+            "SKIP_SPACE_CHECK=1\ncheck_space \"{0}\" \"{0}\" {total} {largest} && echo PASSED",
+            dest.display()
+        );
+        let (code, text) = heir_run(&dir, &path, &call);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("not checked (--no-space-check)") && text.contains("PASSED"),
+            "{text}"
+        );
+
+        // A df that cannot answer warns and carries on: the check must never be
+        // what stops an heir.
+        let (dir3, path3) = heir_harness("space-nodf", &[("df", "#!/bin/sh\nexit 1\n")]);
+        let call = format!("check_space /x /x {total} {largest} && echo PASSED");
+        let (code, text) = heir_run(&dir3, &path3, &call);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("cannot measure free disk space") && text.contains("PASSED"),
+            "{text}"
+        );
+
+        for d in [dir, dir2, dir3] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// With --scratch on another filesystem each disk is asked only for its
+    /// own half: 31 GiB free on each passes a 20 GiB unit (30 GiB of slices in
+    /// flight, 20 GiB of files) that one 31 GiB disk holding both could not.
+    #[test]
+    fn restore_space_check_splits_the_need_across_two_filesystems() {
+        let gib: u64 = 1 << 30;
+        let df = df_stub(31 * (1 << 20));
+        // stat reports a different device per directory name.
+        let stat = "#!/bin/sh\ncase \"$*\" in *scr*) echo 11 ;; *) echo 22 ;; esac\n";
+        let (dir, path) = heir_harness("space-split", &[("df", &df), ("stat", stat)]);
+        let call = format!(
+            "check_space /d/dest /d/scr {} {} && echo PASSED",
+            20 * gib,
+            10 * gib
+        );
+        let (code, text) = heir_run(&dir, &path, &call);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("PASSED"), "{text}");
+        assert!(text.contains("in /d/scr (decrypted slices)"), "{text}");
+        assert!(text.contains("in /d/dest (the files)"), "{text}");
+
+        // Control: the same disks as ONE filesystem must refuse.
+        let same = "#!/bin/sh\necho 11\n";
+        let (dir2, path2) = heir_harness("space-same", &[("df", &df), ("stat", same)]);
+        let (code, text) = heir_run(&dir2, &path2, &call);
+        assert_ne!(code, 0, "one 31 GiB disk cannot hold both halves:\n{text}");
+        for d in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// The check runs after the version is picked and BEFORE the first slice
+    /// is read, and the slices go to SCRATCH, never to WORK (which is /tmp).
+    #[test]
+    fn restore_measures_space_before_the_first_slice_and_keeps_slices_out_of_tmp() {
+        let s = generate_restore_script_v2("ORDER1", 20);
+        let check = s
+            .find("check_space \"$destdir\"")
+            .expect("do_restore calls check_space");
+        let picked = s.find("snapshot version ${picked:-unknown}").unwrap();
+        let first_read = s.find("read_tape_raw \"$tpos\"").expect("slice read");
+        assert!(
+            picked < check && check < first_read,
+            "order: version, space, slices"
+        );
+        assert!(s.contains("read_tape_raw \"$tpos\" \"$SCRATCH/slice.enc\""));
+        assert!(s.contains("local dar_dir=\"$SCRATCH/dar\""));
+        assert!(!s.contains("$WORK/slice.enc") && !s.contains("$WORK/dar"));
+        // --verify hashes as it streams; it copies nothing to WORK.
+        assert!(
+            !s.contains("$WORK/chk."),
+            "--verify must not copy tape files to WORK"
+        );
+        // The trap removes the scratch directory on every exit.
+        assert!(
+            s.contains("trap 'rm -rf \"$WORK\"; [ -z \"$SCRATCH\" ] || rm -rf \"$SCRATCH\"' EXIT")
+        );
+    }
+
+    /// A full disk while age writes a slice is reported as a full disk, on
+    /// the first key, instead of every key failing in turn and the script
+    /// blaming a key rotation.
+    #[test]
+    fn a_full_disk_while_decrypting_is_not_reported_as_a_wrong_key() {
+        let age_full = "#!/bin/sh\necho 'age: error: failed to write output: write /x: no space left on device' >&2\nexit 1\n";
+        let (dir, path) = heir_harness("age-full", &[("age", age_full)]);
+        let snippet = format!(
+            "KEYS=(k1 k2)\n: >\"{0}/in\"\ndecrypt_slice \"{0}/in\" \"{0}/out\" 3",
+            dir.display()
+        );
+        let (code, text) = heir_run(&dir, &path, &snippet);
+        assert_ne!(code, 0, "{text}");
+        assert!(
+            text.contains("decrypting slice 3 failed: OUT OF DISK SPACE"),
+            "{text}"
+        );
+        assert!(text.contains("This is not a tape or key problem"), "{text}");
+        assert!(
+            !text.contains("none of the"),
+            "must not blame the keys:\n{text}"
+        );
+        assert!(
+            !text.contains("key k2"),
+            "a full disk must stop at the first key:\n{text}"
+        );
+        assert!(
+            !dir.join("out").exists(),
+            "the partial plaintext is removed"
+        );
+
+        // Control: a genuinely wrong key still walks every key and ends on the
+        // rotation hint.
+        let age_wrong =
+            "#!/bin/sh\necho 'age: error: no identity matched any of the recipients' >&2\nexit 1\n";
+        let (dir2, path2) = heir_harness("age-wrong", &[("age", age_wrong)]);
+        let snippet = format!(
+            "KEYS=(k1 k2)\n: >\"{0}/in\"\ndecrypt_slice \"{0}/in\" \"{0}/out\" 3",
+            dir2.display()
+        );
+        let (code, text) = heir_run(&dir2, &path2, &snippet);
+        assert_ne!(code, 0, "{text}");
+        assert!(text.contains("key k2 did not decrypt slice 3"), "{text}");
+        assert!(text.contains("none of the 2 key(s) decrypted it"), "{text}");
+        assert!(
+            text.contains("no identity matched"),
+            "age's own stderr stays visible:\n{text}"
+        );
+        for d in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// A full disk while dd copies a slice off the tape names the cause; it
+    /// used to end the script with no message at all (dd's stderr went to
+    /// /dev/null under `set -e`).
+    #[test]
+    fn a_full_disk_while_reading_a_slice_names_the_cause() {
+        let dd_full = "#!/bin/sh\necho \"dd: error writing 'x': No space left on device\" >&2\n\
+                       echo '3+0 records in' >&2\necho '2+0 records out' >&2\nexit 1\n";
+        let (dir, path) = heir_harness("dd-full", &[("dd", dd_full)]);
+        let snippet = format!("read_tape_raw 7 \"{}/slice.enc\"", dir.display());
+        let (code, text) = heir_run(&dir, &path, &snippet);
+        assert_ne!(code, 0, "{text}");
+        assert!(
+            text.contains("reading tape file 7 failed: OUT OF DISK SPACE in"),
+            "{text}"
+        );
+        assert!(
+            text.contains("No space left on device"),
+            "dd's own line is kept:\n{text}"
+        );
+        assert!(
+            !text.contains("records in"),
+            "dd's record counts are noise:\n{text}"
+        );
+
+        // Control: a dd that succeeds returns quietly.
+        let (dir2, path2) = heir_harness("dd-ok", &[]);
+        let snippet = format!(
+            "read_tape_raw 7 \"{}/slice.enc\" && echo READ",
+            dir2.display()
+        );
+        let (code, text) = heir_run(&dir2, &path2, &snippet);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("READ"), "{text}");
+        for d in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// --verify's hash of a tape file: exactly the first `size` bytes, taken
+    /// as the file streams off the tape, with the block padding behind it
+    /// drained so dd never dies of SIGPIPE (which pipefail would report as an
+    /// unreadable file). The padding here is far larger than a pipe buffer, so
+    /// a missing drain fails this test.
+    #[test]
+    fn verify_hashes_a_tape_file_as_it_streams() {
+        use sha2::{Digest, Sha256};
+
+        let dir0 = std::env::temp_dir().join(format!("tapectl-heir-tape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        std::fs::create_dir_all(&dir0).unwrap();
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let mut on_tape = payload.clone();
+        on_tape.resize(payload.len() + 4 * 1024 * 1024, 0); // block padding
+        let tape = dir0.join("tapefile");
+        std::fs::write(&tape, &on_tape).unwrap();
+        let want = format!("{:x}", Sha256::digest(&payload));
+        let want_padded = format!("{:x}", Sha256::digest(&on_tape));
+
+        let dd = format!("#!/bin/sh\ncat \"{}\"\n", tape.display());
+        let (dir, path) = heir_harness("stream", &[("dd", &dd)]);
+        let (code, text) = heir_run(&dir, &path, &format!("hash_tape_file 5 {}", payload.len()));
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(&want),
+            "the hash of exactly size_bytes:\n{text}"
+        );
+        // No size: the whole file, padding included (as before).
+        let (code, text) = heir_run(&dir, &path, "hash_tape_file 5 ''");
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains(&want_padded), "{text}");
+
+        // Nothing off the tape, or a dd that fails, is unreadable (return 1).
+        let (dir2, path2) = heir_harness("stream-empty", &[("dd", "#!/bin/sh\nexit 0\n")]);
+        let (code, text) = heir_run(&dir2, &path2, "hash_tape_file 5 100 || echo UNREADABLE");
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("UNREADABLE"), "{text}");
+        let (dir3, path3) = heir_harness("stream-fail", &[("dd", "#!/bin/sh\nexit 1\n")]);
+        let (code, text) = heir_run(&dir3, &path3, "hash_tape_file 5 100 || echo UNREADABLE");
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("UNREADABLE"), "{text}");
+        for d in [dir0, dir, dir2, dir3] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// The script reads layout v2 only: another layout is refused, before
+    /// anything of it is interpreted, with the way to the tape's own script; a
+    /// missing value (a damaged thunk) warns and carries on; a crafted value is
+    /// sanitised before it is echoed.
+    #[test]
+    fn restore_sh_refuses_another_layout_and_warns_on_a_missing_one() {
+        let (dir, path) = heir_harness("layout", &[]);
+        let (code, text) = heir_run(&dir, &path, "check_layout_version 3");
+        assert_ne!(code, 0, "{text}");
+        assert!(
+            text.contains("this tape is layout_version 3; this script reads layout v2 only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fsf 2") && text.contains("tr -d '\\0' > RESTORE.sh"),
+            "{text}"
+        );
+
+        let (code, text) = heir_run(&dir, &path, "check_layout_version '' && echo GO");
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("states no layout_version") && text.contains("GO"),
+            "{text}"
+        );
+
+        let (code, text) = heir_run(&dir, &path, "check_layout_version 2 && echo GO");
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(text.trim(), "GO", "a v2 tape reads silently:\n{text}");
+
+        let (code, text) = heir_run(&dir, &path, "check_layout_version $'3\\e[2J'");
+        assert_ne!(code, 0, "{text}");
+        assert!(
+            text.contains("(sanitized)") && !text.contains('\u{1b}'),
+            "{text}"
+        );
+
+        // bootstrap_thunk runs it before the pointers it would misread.
+        let s = generate_restore_script_v2("ORDER2", 20);
+        let guard = s.find("check_layout_version \"$(toml_val").unwrap();
+        let pointers = s.find("FRONT_INDEX=$(toml_val").unwrap();
+        assert!(guard < pointers);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// --restore accepts --scratch DIR and --no-space-check, and the help and
+    /// header say what the space is for.
+    #[test]
+    fn restore_sh_documents_scratch_and_the_space_it_needs() {
+        let s = generate_restore_script_v2("DOC01", 20);
+        assert!(s.contains("--scratch) scratch=$2 ;;"));
+        assert!(s.contains("--no-space-check)\n      SKIP_SPACE_CHECK=1"));
+        assert!(s.contains("do_restore \"$dest\" \"$unit\" \"$want\" \"$scratch\""));
+        assert!(s.contains("# Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar\n"));
+        assert!(
+            s.contains("echo \"Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar\"")
+        );
+        assert!(s.contains("# Disk space: --restore decrypts a unit's slices to disk"));
+        let guide = generate_system_guide_v2("DOC01", 20);
+        assert!(guide.contains("--scratch DIR"), "the guide names --scratch");
+        assert!(
+            guide.contains("not in /tmp"),
+            "the manual steps warn off /tmp"
         );
     }
 }

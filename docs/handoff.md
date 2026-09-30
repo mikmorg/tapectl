@@ -31,6 +31,29 @@ It answers one question: **which remaining work needs a person, and which does n
 > 4. `… --from 13` — the first production tape. `volume verify` now exits 2 only when the
 >    medium is proven bad and 3 when inconclusive.
 
+> **2026-09-30 — the structural review; RESTORE.sh fixed before the first tape; 1.0.0**
+> (ADR-0012's 2026-09-30 amendment). Nothing in the schema or the format had to change;
+> the code and catalog findings are issues #373–#385, built after the first write. What
+> did change before it: RESTORE.sh decrypts into scratch space inside `--to` (or
+> `--scratch DIR`) after a space check, names a full disk as one, streams `--verify`, and
+> refuses a layout other than v2; the package version is `1.0.0`. The first collection was
+> staging with binary `6a8d1bf` when this landed. Staged slices are unaffected (every
+> changed byte is generated at `volume write`), so on home2:
+> 1. **Let staging finish.** Step 13 stops at the WRITE confirmation (you type the label):
+>    answer no there. Never pull, build or install while a stage, write or confirm runs.
+> 2. Back up the catalog: `sudo -u tapectl -H tapectl db backup --to /srv/local_backup/tapectl/pre-1.0.0.db`.
+> 3. `git pull`, then `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 3 --to 4`
+>    (the release build and the ungated tests). No migration comes with it.
+> 4. `… --from 12 --to 12` — the rehearsal on the rebuilt binary (it erases EW7VWMVKF6).
+> 5. `… --from 13` — it snapshots again (unchanged units mint nothing), skips what is
+>    staged, and returns to the WRITE confirmation. `tapectl --version` should read `1.0.0`.
+> 6. After the write session, regenerate the Heir Kit (its cover now states the disk space
+>    a restore needs) and back up the catalog.
+>
+> Operator rules until #376/#377/#378 land: one tapectl writer at a time; no
+> `volume abort`, `volume resume`, `staging clean --force` or `db import` during a write or
+> confirm; no `unit tag`, `unit rename` or dotfile edit on an archived unit.
+
 ## The state, in one paragraph
 
 Every pre-production gate the CTO set is met. The `review-2026-09-13` queue is empty

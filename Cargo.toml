@@ -1,6 +1,6 @@
 [package]
 name = "tapectl"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Multi-tenant archival storage management for LTO tape and exportable encrypted directories"
 license = "AGPL-3.0"

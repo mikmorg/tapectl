@@ -1535,6 +1535,43 @@ full `volume verify` on the volume and restore from another copy
 when a restore fails. If tapectl cannot remove it, it warns and names the
 path, because that directory may hold decrypted data.
 
+### RESTORE.sh: not enough disk space, or OUT OF DISK SPACE
+
+```text
+FATAL: not enough disk space in /restore to restore this unit:
+       it needs about 50.0 GiB, and 8.0 GiB is free.
+       No slice has been read yet. ...
+```
+
+The heir script off the tape (`RESTORE.sh --restore`) decrypts every slice of
+the unit to disk before dar extracts them, so with the scratch space and
+`--to` on one disk a unit needs about twice its size free, plus one slice. It
+measures this after it has picked the version and before it reads any slice,
+and prints what it needs either way (`Disk space: needs about …`). Free space,
+choose a larger disk with `--to`, or put the decrypted slices on another disk
+with `--scratch DIR`. `--no-space-check` skips the check, for a compressed or
+thin-provisioned filesystem that holds more than `df` reports.
+
+If the disk fills anyway, the message says `OUT OF DISK SPACE in <dir>` and
+names the step (`reading tape file N` or `decrypting slice N`). That is not a
+tape or key problem: free space and run the same command again. Tapes written
+before tapectl 1.0.0 carry an older RESTORE.sh that put the slices in `/tmp`,
+which is RAM on many systems, and stopped with no message or blamed the keys
+when it filled. For such a tape, use the RESTORE.sh from a newer tape (the
+script reads any layout-v2 tape) or `tapectl restore`.
+
+### RESTORE.sh: `this tape is layout_version N`
+
+```text
+FATAL: this tape is layout_version 3; this script reads layout v2 only.
+```
+
+A RESTORE.sh reads the layout it was written with. Every tape carries its own
+script at file 2, so read that one: `mt -f <dev> rewind && mt -f <dev> fsf 2`,
+then `dd if=<dev> bs=512k | tr -d '\0' > RESTORE.sh`. A tape whose File 0
+states no layout_version at all (a damaged ID thunk) only warns, and is read
+as layout v2.
+
 ---
 
 ## Audit findings

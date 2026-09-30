@@ -1016,3 +1016,65 @@ any fails it refuses, naming the first unmet condition and the command that reso
 Until this is built, the documented remedy stands: back up the catalog at the end of every
 write session, and a volume already stuck is written again to another cartridge or erased
 and reused.
+
+## Amendment, 2026-09-30 — the structural review: what changes before the first tape, and what does not
+
+*Ruled by the CTO on 2026-09-30. The first production collection was still staging on
+home2; nothing had been written to tape. A five-lens structural review (schema, on-tape
+format, data lifecycle, concurrency, keys and identity), measured read-only against the
+production catalog and adversarially verified, found nothing in the schema or the format
+that must change before the first tape. Its code and catalog findings are issues
+#373–#385, to be built after the first write. The rulings:*
+
+1. **RESTORE.sh is fixed before the first production tape, on one re-pin.** `--restore`
+   decrypted a whole unit into `${TMPDIR:-/tmp}` before dar ran, with no space check. On a
+   machine whose /tmp is RAM (Debian 13 and Fedora by default) an heir could restore almost
+   none of the first tape's bytes, and running out of space ended the script with no message
+   (dd's stderr went to /dev/null under `set -e`) or was reported as a wrong key (the loop
+   that tries each key read age's write failure as a key failure). `--verify` copied each
+   tape file into /tmp twice and reported a good 10 GiB slice as unreadable. One batch,
+   pinned once (`tests/on_tape_golden.rs`):
+   - slices are decrypted into a scratch directory inside `--to`, or on another disk with
+     `--scratch DIR`; /tmp holds only the small text zones and one envelope;
+   - a space check runs after the version is picked and before the first slice is read,
+     asking for the unit twice over plus one slice when scratch and `--to` share a disk;
+     `--no-space-check` skips it for filesystems that hold more than df reports, and a df
+     that cannot answer warns and carries on;
+   - an out-of-space failure while reading or decrypting a slice is named as one, never as
+     a tape fault or a key rotation;
+   - `--verify` hashes each tape file as it streams off the tape;
+   - a File 0 stating a layout_version other than 2 is refused, with the commands that read
+     that tape's own RESTORE.sh; a missing layout_version warns and reads on as v2 (a damaged
+     thunk must never become a hard stop);
+   - `tar` joins the two Requirements lines (#363's on-tape item).
+   The system guide (File 1) and the Heir Kit cover state the space requirement too. Staged
+   slices are unaffected: every changed byte is generated at `volume write`.
+2. **The first production binary is `1.0.0`.** `tapectl_version` on every tape read
+   `0.1.0` for every commit before it, so no tape could say which writer made it. The value
+   changes; the field does not (the 2026-09-24 ruling against adding a writer-commit field
+   stands). *Proposed with it, awaiting the CTO's word:* the minor version moves whenever
+   generated on-tape bytes change, and the patch version for any other build installed on a
+   production host, so a tape names both its format generation and its writer.
+3. **A binary change on the production host is a new artifact** (the 2026-09-24 ruling): the
+   step-12 rehearsal runs again on the rebuilt binary before the first write. The binary is
+   installed only between sessions, never while a stage, write or confirm runs: a binary that
+   brings a migration runs it on first open, underneath whatever session is live (#376).
+4. **No unit is split by hand.** The operator does not re-cut units to make re-archiving
+   cheaper. If a large unit ever changes enough that full re-archiving costs too much, the
+   answer is underneath the unit: #12's pre-agreed differential-only shape (the reference is
+   the full's isolated dar catalogue, which every tape's envelope already carries and
+   `catalogs/` keeps on disk; `snapshot_type` and `base_snapshot_id` remain in reserve), with
+   its Copy-as-chain ADR first. Nothing triggers it for the first collection, whose data is
+   frozen, and nothing on the first tape blocks it: its full archives become the bases.
+5. **Probable duplicates inside one unit are accepted** (about 99 GiB by a size-and-name
+   estimate, some 4% of an LTO-6 per copy): the collection fits one cartridge either way, and
+   deduplicating would have meant aborting a running stage and hard-linking family data.
+6. **No personal recipients on the first collection.** The model stays the 2026-09-28
+   ruling's: the family tenant's key files are handed to the people who hold them. Copying
+   them off the host is an operational step after the write.
+
+Until the fixes in #376 and #377 land, one operational rule holds: one tapectl writer at a
+time, and no `volume abort`, `volume resume`, `staging clean --force` or `db import` while a
+write or its confirm runs. Until #378 lands, no `unit tag`, `unit rename` or hand edit of an
+archived unit's `.tapectl-unit.toml`: the dotfile is counted as content, so any of them
+re-archives the whole unit.

@@ -32,8 +32,24 @@
 //! ever be available. RESTORE.sh runs `tar xf -` to unpack an envelope but did
 //! not check for `tar` up front, so an heir on a minimal system met a late,
 //! confusing failure. The ruling covers exactly one line — `tar` appended to
-//! the prerequisite loop — and the test below proves nothing else moved:
-//! undoing that one word reproduces the previous pin.
+//! the prerequisite loop — and the test proved nothing else moved: undoing
+//! that one word reproduced the previous pin (`bb29026c…`).
+//!
+//! **RE-PINNED A THIRD TIME, 2026-09-30, under the CTO's ruling recorded in
+//! ADR-0012's 2026-09-30 amendment**, made while the first production
+//! collection was still staging and before its first tape was written. The
+//! pre-production structural review found that `--restore` decrypted a whole
+//! unit into `${TMPDIR:-/tmp}` before dar ran, with no space check: on a
+//! machine whose /tmp is RAM an heir could restore almost none of that tape's
+//! bytes, and running out of space ended the script with no message or was
+//! reported as a wrong key. The ruling covers one batch, taken on one re-pin:
+//! slices decrypted into a scratch directory inside `--to` (or `--scratch
+//! DIR`); a space check before the first slice is read (`--no-space-check`
+//! skips it); out-of-space failures named as such; `--verify` hashing each
+//! tape file as it streams instead of copying it to /tmp; any layout_version
+//! other than 2 refused with the way to the tape's own script (a missing one
+//! warns); and `tar` in the two Requirements lines (#363). The test checks
+//! each item is present. The previous pin was `299a34c0…`.
 //!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
@@ -51,11 +67,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "299a34c018c131fc04da2ca69a6973a0293a4092ea917596b0a7f10697ca5b3b";
-/// The pin before issue #349 — kept so the test can prove the re-pin moved
-/// only the ruled line.
-const RESTORE_SH_SHA256_PRE_349: &str =
-    "bb29026cdf82975b8fb89e894f70f1dbb335a3ffbcde9e98ac3747d240a97f9a";
+const RESTORE_SH_SHA256: &str = "9764cae2537e991f3172dcb6613cd79f2a99d49cfd6524d08105170843cd4b57";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -69,22 +81,28 @@ fn restore_sh_bytes_are_pinned() {
         "RESTORE.sh bytes changed. That is an on-tape format change and a CTO decision; \
          do not re-pin without one."
     );
-    // Issue #349 moved exactly one line: undo it and the old bytes return.
-    let ruled = "for tool in mt dd age sha256sum dar head truncate tar; do\n";
+    // The #349 line is still the prerequisite loop.
     assert_eq!(
-        script.matches(ruled).count(),
+        script
+            .matches("for tool in mt dd age sha256sum dar head truncate tar; do\n")
+            .count(),
         1,
-        "the ruled prerequisite line"
+        "the #349 prerequisite line"
     );
-    let pre_349 = script.replace(
-        ruled,
-        "for tool in mt dd age sha256sum dar head truncate; do\n",
-    );
-    assert_eq!(
-        sha256_hex(&pre_349),
-        RESTORE_SH_SHA256_PRE_349,
-        "something besides the #349 prerequisite line moved in RESTORE.sh"
-    );
+    // Every item of the 2026-09-30 ruling is in the pinned bytes.
+    for ruled in [
+        "SCRATCH=\"$(mktemp -d \"$scratch_parent/.tapectl-restore.XXXXXX\")\"",
+        "check_space \"$destdir\" \"$scratch_parent\" \"$total\" \"$largest\"",
+        "--scratch) scratch=$2 ;;",
+        "--no-space-check)\n      SKIP_SPACE_CHECK=1",
+        "OUT OF DISK SPACE in $where",
+        "if ! actual=$(hash_tape_file \"$pos\" \"$size\"); then",
+        "check_layout_version \"$(toml_val \"$WORK/thunk.toml\" layout_version)\"",
+        "# Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar\n",
+        "echo \"Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar\"",
+    ] {
+        assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
+    }
     // The two placeholders must both have been substituted.
     assert!(!script.contains("__LABEL__") && !script.contains("__TOTAL_FILES__"));
     assert!(script.contains("LABEL=\"GOLD01\""));

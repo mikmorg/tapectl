@@ -634,6 +634,14 @@ envelope has been read and decrypted.
    specify one with --unit NAME` (exit 1). Run it again with `--unit`.
    Each slice is checked against the front index's hash before it is decrypted.
 
+   **Disk space.** Every slice of the unit is decrypted to disk before dar
+   extracts them, into a scratch directory inside `--to` that is removed
+   afterwards. With both on one disk, a unit needs about twice its size free
+   there, plus one slice. The script measures this before it reads any slice and
+   stops with `not enough disk space` if it will not fit. Choose a larger disk
+   with `--to`, or put the decrypted slices on another disk with
+   `--scratch DIR`. Do not restore into `/tmp`, which is RAM on many systems.
+
 The same steps work with the operator key or the escrow secret, which open every
 tenant's envelope. `--unit` then picks the right one.
 

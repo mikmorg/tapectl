@@ -176,6 +176,18 @@ issues #345–#362, all landed on master except #360, ruled 2026-09-29 and to be
   status (ADR-0012, 2026-09-29 later amendment). To be built after the first production
   write; until then, back up the catalog at the end of every write session.
 
+**2026-09-30 — the structural review** (ADR-0012, "Amendment, 2026-09-30"): nothing in the
+schema or the format had to change before the first tape; the code and catalog findings are
+issues #373–#385, built after it. Before it, and pinned once (`tests/on_tape_golden.rs`, the
+third re-pin): RESTORE.sh decrypts a unit into scratch space inside `--to` (or
+`--scratch DIR`) after a space check, never into /tmp; names a full disk as one; streams
+`--verify`; refuses a layout_version other than 2. The package version is `1.0.0` (it was
+`0.1.0` on every commit before). Units are never split by hand: if a large unit's
+re-archiving ever costs too much, the answer is #12's differential-only shape, underneath
+the unit. Until #376/#377/#378 land: one tapectl writer at a time, nothing destructive
+during a write or confirm, and no `unit tag`/`unit rename`/dotfile edit on an archived unit
+(the dotfile counts as content).
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
