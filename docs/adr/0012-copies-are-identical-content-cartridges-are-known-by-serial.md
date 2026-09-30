@@ -1054,7 +1054,9 @@ that must change before the first tape. Its code and catalog findings are issues
    changes; the field does not (the 2026-09-24 ruling against adding a writer-commit field
    stands). **The rule from here (ruled 2026-09-30):** the minor version moves whenever
    generated on-tape bytes change, and the patch version for any other build installed on a
-   production host, so a tape names both its format generation and its writer. Each release
+   production host, so a tape names both its format generation and its writer. The version
+   string itself, and the catalog schema level stamped into the on-tape `catalog.db`, do not
+   count as on-tape changes (ruled 2026-09-30); only format or content changes do. Each release
    installed on a production host is tagged `vX.Y.Z` on the commit it is built from, so
    `tapectl --version` names the tag.
 3. **A binary change on the production host is a new artifact** (the 2026-09-24 ruling): the
