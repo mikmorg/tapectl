@@ -338,8 +338,14 @@ pub trait Store {
     /// deposit receipt, `layout-session.md`'s Store seam) — TapeStore and
     /// MemStore both take the default.
     fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence> {
+        // Issue #386: every byte read back counts toward the caller's
+        // progress phase (`confirm`, `verify`), and the file being read is
+        // its current item. No-ops with no progress session.
+        let files = layout.entries.len();
         chain_walk(layout, tier, |position, sink| {
-            self.read_file(position, sink)
+            crate::progress::item(format!("file {position} of {files}"));
+            let mut counted = crate::progress::CountingWriter(sink);
+            self.read_file(position, &mut counted)
         })
     }
 

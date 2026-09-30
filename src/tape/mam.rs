@@ -109,7 +109,10 @@ pub struct MamRead {
 /// [`capture_from_output`], which the tests drive by value.
 pub fn read_mam(sg_device: &str) -> MamRead {
     let captured_at = now_sqlite();
-    let output = Command::new(MAM_TOOL).arg(sg_device).output();
+    let output = crate::progress::waited(
+        || format!("{MAM_TOOL} on {sg_device}"),
+        || Command::new(MAM_TOOL).arg(sg_device).output(),
+    );
     capture_from_output(sg_device, captured_at, tool_version(), output)
 }
 

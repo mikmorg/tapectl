@@ -1137,7 +1137,12 @@ impl InterruptedSession {
         // re-stage and re-write. So the operator — who knows whether the disk
         // is unmounted or wiped — judges "unrecoverably", via
         // `tapectl volume abort`.
-        if let Err(errs) = self.built.validate(keys, slice_check) {
+        let phase = crate::progress::phase("revalidate", None);
+        let revalidated = self.built.validate(keys, slice_check);
+        if revalidated.is_ok() {
+            phase.done();
+        }
+        if let Err(errs) = revalidated {
             let detail = errs
                 .iter()
                 .map(|e| e.to_string())
@@ -1189,12 +1194,15 @@ impl InterruptedSession {
             .iter()
             .find(|e| matches!(e.kind, ZoneKind::SealMarker))
             .map(|e| e.position as u32);
-        match check_tape_contact(
+        let phase = crate::progress::phase("positioning", None);
+        let contact = check_tape_contact(
             store,
             &self.built.layout.label,
             &self.built.layout.volume_uuid,
             seal_position,
-        ) {
+        );
+        phase.done();
+        match contact {
             ContactOutcome::Blank | ContactOutcome::Matches => {
                 // ADR-0012's 2026-09-21 correction "the seal is RECORDED,
                 // not inferred" (issue #277). Both `Blank` and `Matches`
@@ -1332,7 +1340,9 @@ impl InterruptedSession {
             first_slice_index + written_slices
         };
 
+        let phase = crate::progress::phase("positioning", None);
         store.reposition_for_resume(start_index as u32)?;
+        phase.done();
 
         for (write_id, _) in &self.write_ids {
             conn.execute(
@@ -1498,7 +1508,11 @@ impl SealedPending {
             })
             .collect::<rusqlite::Result<_>>()?;
 
+        // Issue #386: the readback — hours on a full cartridge — is its own
+        // phase, counted byte by byte through `Store::confirm`.
+        let phase = crate::progress::phase("confirm", self.built.layout.on_tape_bytes().ok());
         let evidence = store.confirm(&self.built.layout, tier)?;
+        phase.done();
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
         // quarantine verdict. `Tier::default()` is `Tier::Integrity`, so a
@@ -1819,7 +1833,22 @@ fn run_entries(
         }
     }
 
+    // Issue #386: the write phase — every byte streamed to the store is
+    // counted, and the file being written is the current item. A resume
+    // counts only what is left to write.
+    let to_write: u64 = content_entries[start_index..]
+        .iter()
+        .filter_map(|e| e.size_bytes)
+        .sum();
+    let file_count = built.layout.entries.len();
+    let phase = crate::progress::phase("write", Some(to_write));
+
     for entry in &content_entries[start_index..] {
+        phase.item(format!(
+            "file {} of {file_count} ({})",
+            entry.position,
+            entry.kind.type_label()
+        ));
         // Checked BETWEEN entries only — a mid-file kill is a crash, handled
         // by the startup sweep (`crate::db::recover_orphaned_sessions`), not
         // here. Checking before every entry (including the very first of
@@ -1859,7 +1888,7 @@ fn run_entries(
                     entry.position
                 ))
             })?;
-            let mut reader = HashingReader::new(file);
+            let mut reader = HashingReader::new(crate::progress::CountingReader(file));
             store.execute(&mut reader, size, false)?;
             Ok(reader.finalize_hex())
         })();
@@ -1934,6 +1963,7 @@ fn run_entries(
         }
     }
 
+    phase.done();
     Ok(ExecuteOutcome::Ready(ReadyToSeal {
         built,
         volume_id,

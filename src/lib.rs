@@ -19,5 +19,6 @@ pub mod volume;
 pub mod media;
 pub mod naming;
 pub mod policy;
+pub mod progress;
 pub mod store;
 pub mod util;

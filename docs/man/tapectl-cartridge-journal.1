@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-cartridge\-journal \- Show the MAM journal: every MAM read taken of a cartridge, verbatim
 .SH SYNOPSIS
-\fBtapectl cartridge journal\fR [\fB\-\-json\fR] [\fB\-\-serial\fR] [\fB\-\-dry\-run\fR] [\fB\-\-raw\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIBARCODE\fR] 
+\fBtapectl cartridge journal\fR [\fB\-\-json\fR] [\fB\-\-serial\fR] [\fB\-\-dry\-run\fR] [\fB\-\-raw\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIBARCODE\fR] 
 .SH DESCRIPTION
 Show the MAM journal: every MAM read taken of a cartridge, verbatim
 .PP
@@ -27,6 +27,9 @@ Print this journal row\*(Aqs raw `sg_read_attr` output, byte for byte
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept

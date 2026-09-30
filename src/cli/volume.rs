@@ -2289,6 +2289,11 @@ struct VolumeInfo {
     writes: Vec<WriteRow>,
     verifications: Vec<VerificationRow>,
     deposits: Vec<DepositRow>,
+    /// The phases of the most recent write, resume, verify or read session
+    /// recorded against this volume (issue #386, migration 028). Human
+    /// output only: `--json`'s shape is unchanged.
+    #[serde(skip)]
+    phase_timings: Vec<crate::db::phase_timings::PhaseRow>,
 }
 
 /// How many of a volume's largest units are named in the summary before
@@ -2530,6 +2535,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         writes,
         verifications,
         deposits,
+        phase_timings: crate::db::phase_timings::latest_for_volume(conn, vol_id)?,
     })
 }
 
@@ -2670,6 +2676,12 @@ fn print_volume_info(info: &VolumeInfo) {
                     .unwrap_or_default(),
             );
         }
+    }
+
+    // Issue #386: where the last session's time went.
+    if !info.phase_timings.is_empty() {
+        println!();
+        print!("{}", crate::db::phase_timings::render(&info.phase_timings));
     }
 }
 

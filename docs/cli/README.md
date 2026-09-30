@@ -15,6 +15,7 @@ Accepted by every command, before or after the subcommand.
 - `--json` — Output in JSON format
 - `--dry-run` — Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 - `-v, --verbose` — Enable verbose output
+- `-q, --quiet` — No live progress on stderr. Long operations (stage create, volume write/resume/verify/read-slices, restore) still write their session log under <home>/logs/
 - `-y, --yes` — Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a Tier-3 refusal — those are facts, not risks to accept
 - `--config <CONFIG>` — Path to config file.
   

@@ -36,6 +36,7 @@ documentation is [docs/README.md](README.md).
   - [Working on a different archive](#working-on-a-different-archive)
 - [Day-to-Day Operations](#day-to-day-operations)
   - [A typical write session](#a-typical-write-session)
+  - [Watching a long operation: progress and the session log](#watching-a-long-operation-progress-and-the-session-log)
   - [Register units](#register-units)
   - [Archive to tape](#archive-to-tape)
   - [A quiet host while the tape runs](#a-quiet-host-while-the-tape-runs)
@@ -386,6 +387,73 @@ media root — a [Collection](cli/collection.md) (`collection sync`,
 `collection plan`, `collection run`) does steps 1–4 for you, and
 `quick-archive` registers, snapshots, stages and writes a single directory
 onto a volume you have already initialised.
+
+### Watching a long operation: progress and the session log
+
+`stage create`, `volume write`, `volume resume`, `volume verify`,
+`volume read-slices`, the compaction reads and writes, `restore`,
+`quick-archive` and `collection run` each run as named **phases**, and show
+where they are on stderr while they run:
+
+- **On a terminal**, one status line is redrawn in place: the phase, bytes
+  done and total, rate, ETA, the unit or file being worked on, and any wait in
+  progress (a rewind, an `sg_logs` run, a busy catalog). A phase that took two
+  seconds or more leaves a `done:` line behind.
+- **When stderr is not a terminal** (a pipe, a log file, cron, systemd), the
+  redraw becomes one plain `progress:` line every 30 seconds, plus a `done:`
+  line for each phase that long. `TAPECTL_PROGRESS_INTERVAL=<seconds>` changes
+  the interval.
+- **`--quiet` (`-q`)** prints no progress at all. Nothing is ever printed on
+  stdout, so `--json` output is exactly what it was.
+
+The phases of a write are `contact-open` (the MAM read, the drive's identity,
+the counters at the contact's open), `build`, `prewrite-check` (the full read
+of every staged slice under `--prewrite-hash`, a size check otherwise),
+`positioning` (opening the drive, the File 0 check, the rewind), `plan`,
+`write`, `seal`, `confirm` (the readback of the whole tape) and
+`health-sweep`; a resume has `revalidate` and `positioning` in place of the
+build and pre-write steps. `stage create` has `validate`, `dar`, `catalog`,
+`encrypt` and `finalize`.
+
+Every such command also writes a **session log**, whether or not anything
+was shown: `<home>/logs/<UTC start>-<command>-<label>-<pid>.log` (mode 0600,
+in the same 0700 directory as the catalog). Each line starts with a UTC
+timestamp. It records each phase's start and end with its duration, bytes and
+rate; a progress line every interval; every tapectl log event at INFO and
+above (DEBUG under `--verbose`), whatever `[logging] level` lets through to
+stderr; and any wait that lasted five seconds or more — when it passed five
+seconds and when it ended — naming what was waited on:
+
+```text
+2026-09-30T14:02:11.402Z phase start: confirm (1.20 TiB)
+2026-09-30T14:02:16.911Z wait start: tape rewind (5.0 s so far)
+2026-09-30T14:03:41.118Z wait end: tape rewind after 1m 29s
+2026-09-30T14:04:11.402Z progress: confirm 12.3 GiB of 1.20 TiB (1.0%), 145.2 MiB/s, ETA 2h 23m, elapsed 2m 00s — file 5 of 43
+```
+
+A phase that counts bytes and moves none for a minute, with no named wait in
+progress, logs a `stall:` line, so a gap nothing thought to name still shows
+up. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
+line per interval.
+
+The durations are kept in the catalog too. `volume info` ends with the phase
+timings of the last session recorded against the volume (write, resume,
+verify, read or restore):
+
+```text
+Phase timings (volume write, session 20260930T120001Z-volume-write-L6-0001-4242):
+    2026-09-30 12:00:01  contact-open       2.4 s
+    2026-09-30 12:00:04  build              1.2 s
+    2026-09-30 12:00:05  prewrite-check      18 ms
+    2026-09-30 12:00:05  positioning       1m 32s
+    2026-09-30 12:01:37  plan               40 ms
+    2026-09-30 12:01:37  write             2h 26m    1.20 TiB  143.8 MiB/s
+    ...
+```
+
+and each stage report (`<home>/stage-reports/`) ends with a `Phase timings:`
+section for the stage it describes. `volume info --json` does not carry them;
+they are in the `phase_timings` table (migration 028) for scripts.
 
 ### Register units
 

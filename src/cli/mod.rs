@@ -45,6 +45,12 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub verbose: bool,
 
+    /// No live progress on stderr. Long operations (stage create, volume
+    /// write/resume/verify/read-slices, restore) still write their session
+    /// log under <home>/logs/
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+
     /// Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a
     /// Tier-3 refusal — those are facts, not risks to accept
     #[arg(long, short, global = true)]
@@ -380,6 +386,44 @@ pub enum ConfigCommands {
     Show,
     /// Check configuration validity
     Check,
+}
+
+/// The name of the progress session `command` opens (issue #386), or `None`
+/// for a command short enough to need none. It names the session log
+/// (`<home>/logs/<UTC>-<name>-<pid>.log`) and heads its first line.
+pub fn progress_session_name(command: &Commands) -> Option<String> {
+    use collection::CollectionCommands as C;
+    use restore::RestoreCommands as R;
+    use stage::StageCommands as S;
+    use volume::VolumeCommands as V;
+    Some(match command {
+        Commands::Stage {
+            command: S::Create { name, .. },
+        } => format!("stage create {name}"),
+        Commands::QuickArchive { volume, .. } => format!("quick-archive {volume}"),
+        Commands::Collection {
+            command: C::Run { collection, .. },
+        } => format!("collection run {collection}"),
+        Commands::Volume { command } => match command {
+            V::Init { label, .. } => format!("volume init {label}"),
+            V::Write { label, .. } => format!("volume write {label}"),
+            V::Resume { label, .. } => format!("volume resume {label}"),
+            V::Verify { label, .. } => format!("volume verify {label}"),
+            V::ReadSlices { from, .. } => format!("volume read-slices {from}"),
+            V::CompactRead { label, .. } => format!("volume compact-read {label}"),
+            V::CompactWrite { destination, .. } => {
+                format!("volume compact-write {destination}")
+            }
+            V::Compact { label, .. } => format!("volume compact {label}"),
+            _ => return None,
+        },
+        Commands::Restore { command } => match command {
+            R::Unit { unit, .. } => format!("restore unit {unit}"),
+            R::File { unit, .. } => format!("restore file {unit}"),
+            R::RawVolume { .. } => "restore raw-volume".to_string(),
+        },
+        _ => return None,
+    })
 }
 
 /// Resolve a `--device` for a WRITE path — STRICT (ADR-0010, "Backends

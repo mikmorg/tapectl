@@ -397,11 +397,16 @@ fn read_sysfs_triple(dir: &Path) -> Option<DriveIdentity> {
 
 /// Fallback serial read: shell out to `sg_inq --page=0x80`.
 fn read_sg_inq_serial(sg_device: &str) -> Option<String> {
-    let output = Command::new("sg_inq")
-        .arg("--page=0x80")
-        .arg(sg_device)
-        .output()
-        .ok()?;
+    let output = crate::progress::waited(
+        || format!("sg_inq --page=0x80 on {sg_device}"),
+        || {
+            Command::new("sg_inq")
+                .arg("--page=0x80")
+                .arg(sg_device)
+                .output()
+        },
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

@@ -164,7 +164,10 @@ impl LogSource for SgLogs {
 
     fn read_page(&mut self, page: u8) -> (Vec<String>, std::io::Result<Output>) {
         let argv = Self::read_argv(&self.device_sg, page);
-        let output = Command::new(&argv[0]).args(&argv[1..]).output();
+        let output = crate::progress::waited(
+            || format!("sg_logs page 0x{page:02x} on {}", self.device_sg),
+            || Command::new(&argv[0]).args(&argv[1..]).output(),
+        );
         (argv, output)
     }
 
@@ -516,10 +519,15 @@ impl Sweep {
 /// page, so it carries no read-to-clear hazard. `None` when it could not be
 /// taken; the header is an addition to the record, never a precondition.
 pub fn inquiry_header(device_sg: &str) -> Option<String> {
-    let out = Command::new("sg_inq")
-        .args(["--len=36", "--only", "--raw", device_sg])
-        .output()
-        .ok()?;
+    let out = crate::progress::waited(
+        || format!("sg_inq on {device_sg}"),
+        || {
+            Command::new("sg_inq")
+                .args(["--len=36", "--only", "--raw", device_sg])
+                .output()
+        },
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }

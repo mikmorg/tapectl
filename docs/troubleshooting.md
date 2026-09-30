@@ -1282,6 +1282,36 @@ tapectl volume resume L6-0003 --device "$TAPE"
 - `has no write sessions at all` / `its write sessions are all resolved`: use
   `volume write`.
 
+### The write seems stuck: nothing moves
+
+A write that shows no progress for a long time is in a phase that moves no
+bytes, or waiting on something. Its session log names which:
+
+```bash
+ls -t ~/.tapectl/logs/ | head -3          # the newest session first
+tail -f ~/.tapectl/logs/<session>.log
+```
+
+(On a service-user install the home is the service user's; see
+[install.md](install.md).) The last `phase start:` line without a matching
+`phase end:` is the phase it is in. A `wait start: <what> (5.0 s so far)`
+line with no `wait end:` names what it is blocked on right now: a tape rewind
+or space, opening the device, an `sg_read_attr`/`sg_logs`/`sg_inq` run, a busy
+catalog, or the operator's answer to the quiet-host question. A `stall:` line
+means a byte-counting phase moved nothing for a minute with no named wait:
+look at the drive (`sg_logs`, the host's own `dmesg`) and at the staging disk.
+`slow: one tape block write took …` lines mean the drive itself held single
+blocks for seconds.
+
+Hours in `prewrite-check` are the full read of the staged slices that
+`--prewrite-hash` asks for; without the flag that phase is a size check and
+takes moments. Hours in `confirm` are the readback of the whole tape, which
+every write ends with.
+
+When the command has finished, `volume info <label>` shows the same phases
+with their durations and rates (see the operator guide, [Watching a long
+operation](operator-guide.md#watching-a-long-operation-progress-and-the-session-log)).
+
 ### You pressed Ctrl-C
 
 ```text

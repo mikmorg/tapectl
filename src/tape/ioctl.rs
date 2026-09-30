@@ -53,6 +53,20 @@ pub struct TapePosition {
     pub block_number: i32,
 }
 
+/// What an `MTIOCTOP` op does, for the session log's wait lines.
+fn mt_op_name(op: i16, count: i32) -> String {
+    match op {
+        MTREW => "rewind".to_string(),
+        MTWEOF => "filemark (synchronous)".to_string(),
+        MTWEOFI => "filemark".to_string(),
+        MTSETBLK => format!("set block size {count}"),
+        MTFSF => format!("space forward {count} file(s)"),
+        MTEOM => "space to end of data".to_string(),
+        MTCOMP => "set compression".to_string(),
+        other => format!("ioctl op {other} count {count}"),
+    }
+}
+
 /// A wrapper around a tape device file descriptor.
 pub struct TapeDevice {
     file: File,
@@ -62,11 +76,13 @@ pub struct TapeDevice {
 impl TapeDevice {
     /// Open a tape device for read+write with the given block size.
     pub fn open(device_path: &str, block_size: usize) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(device_path)
-            .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
+        // Issue #386: an open blocks while the drive loads and settles a
+        // cartridge — a wait worth naming if it is long.
+        let file = crate::progress::waited(
+            || format!("opening tape device {device_path} for writing"),
+            || OpenOptions::new().read(true).write(true).open(device_path),
+        )
+        .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
 
         let mut dev = Self { file, block_size };
         dev.set_block_size(block_size)?;
@@ -75,10 +91,11 @@ impl TapeDevice {
 
     /// Open read-only.
     pub fn open_read(device_path: &str, block_size: usize) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(device_path)
-            .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
+        let file = crate::progress::waited(
+            || format!("opening tape device {device_path} for reading"),
+            || OpenOptions::new().read(true).open(device_path),
+        )
+        .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
 
         let mut dev = Self { file, block_size };
         dev.set_block_size(block_size)?;
@@ -95,7 +112,13 @@ impl TapeDevice {
             _pad: 0,
             mt_count: count,
         };
-        let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCTOP, &mtop as *const MtOp) };
+        // Issue #386: a rewind, a space or a synchronous filemark can hold
+        // the process for minutes with no byte moving; it names itself in
+        // the session log when it passes the wait threshold.
+        let rc = crate::progress::waited(
+            || format!("tape {}", mt_op_name(op, count)),
+            || unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCTOP, &mtop as *const MtOp) },
+        );
         if rc != 0 {
             return Err(TapectlError::TapeIo(format!(
                 "ioctl op={op} count={count}: {}",
@@ -257,9 +280,11 @@ impl TapeDevice {
                     *b = 0;
                 }
             }
+            let started = std::time::Instant::now();
             self.file
                 .write_all(&buf[..bs])
                 .map_err(|e| TapectlError::TapeIo(format!("write: {e}")))?;
+            crate::progress::note_if_slow("one tape block write", started.elapsed());
             committed += bs as u64;
             remaining -= want as u64;
         }
@@ -288,7 +313,10 @@ impl TapeDevice {
         };
         let mut buf = vec![0u8; read_size];
         loop {
-            match self.file.read(&mut buf) {
+            let started = std::time::Instant::now();
+            let got = self.file.read(&mut buf);
+            crate::progress::note_if_slow("one tape block read", started.elapsed());
+            match got {
                 Ok(0) => break, // file mark
                 Ok(n) => {
                     sink.write_all(&buf[..n])
@@ -345,10 +373,13 @@ impl TapeDevice {
 /// motion and changes no drive state, unlike that. `None` means "not
 /// reported" (an unloaded drive, or one whose driver leaves the field 0).
 pub fn density_code(device: &str) -> Result<Option<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .open(device)
-        .map_err(|e| TapectlError::TapeIo(format!("open {device}: {e}")))?;
+    // A blocking open: on an empty drive it waits out the st driver's
+    // no-medium timeout, so it is a named wait (issue #386).
+    let file = crate::progress::waited(
+        || format!("opening {device} to read its density register"),
+        || OpenOptions::new().read(true).open(device),
+    )
+    .map_err(|e| TapectlError::TapeIo(format!("open {device}: {e}")))?;
     let mut mtget = MtGet::default();
     let rc = unsafe { nix::libc::ioctl(file.as_raw_fd(), MTIOCGET, &mut mtget as *mut MtGet) };
     if rc != 0 {

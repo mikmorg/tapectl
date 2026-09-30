@@ -109,9 +109,17 @@ pub fn is_catalog_busy(err: &anyhow::Error) -> bool {
 pub fn retry<T>(policy: BusyPolicy, what: &str, mut op: impl FnMut() -> Result<T>) -> Result<T> {
     let started = Instant::now();
     let mut pause = policy.first_pause;
+    // Issue #386: from the first busy answer until the operation lands (or
+    // gives up), this is a named wait in the session log.
+    let mut waiting: Option<crate::progress::Wait> = None;
     loop {
         match op() {
             Err(e) if is_busy_error(&e) => {
+                if waiting.is_none() {
+                    waiting = Some(crate::progress::wait(|| {
+                        format!("a busy catalog, to record {what}")
+                    }));
+                }
                 if started.elapsed() >= policy.budget {
                     return Err(TapectlError::CatalogBusy(format!(
                         "could not record {what} within {}s ({e})",

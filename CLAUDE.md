@@ -324,4 +324,9 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 
 - System config: `~/.tapectl/config.toml` (dar path, backends, defaults incl. exclusions and copy policy, archive sets, staging, collections, host check); locations are catalog rows from `location add`, not config — a `[locations]` table is refused
 - Database: `~/.tapectl/tapectl.db`
+- Session logs: `~/.tapectl/logs/<UTC>-<command>-<pid>.log`, one per long operation
+  (issue #386, `src/progress.rs`): phases, waits over 5 s, stalls, and the INFO tracing
+  tee. Library code calls `progress::phase`/`wait`/`add_bytes` unconditionally — they
+  are no-ops on a thread with no session; phase durations land in `phase_timings`
+  (migration 028). Progress goes to stderr only; `--quiet` silences it.
 - Per-unit config: `.tapectl-unit.toml` in each archival directory

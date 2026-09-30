@@ -2715,3 +2715,168 @@ fn version_flag_prints_the_build_identity() {
         "the build identity names the commit and the build day: {text:?}"
     );
 }
+
+// --- issue #386: progress and the session log ---------------------------
+
+/// The one session log a command left in `<home>/.tapectl/logs/`.
+fn only_session_log(home: &std::path::Path, needle: &str) -> String {
+    let logs: Vec<std::path::PathBuf> = std::fs::read_dir(home.join(".tapectl").join("logs"))
+        .expect("logs dir")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().contains(needle))
+        .collect();
+    assert_eq!(logs.len(), 1, "one session, one log: {logs:?}");
+    std::fs::read_to_string(&logs[0]).expect("read session log")
+}
+
+/// Issue #386: `stage create --json` prints exactly the object it printed
+/// before progress existed — one line, the same five keys — while the
+/// session log under `<home>/logs/` records every phase with UTC
+/// timestamps, and progress (plain lines, stderr not being a terminal)
+/// never reaches stdout. A one-second interval makes a line likely; the
+/// assertions do not depend on one being printed.
+#[test]
+fn stage_create_json_is_unchanged_and_its_session_is_logged() {
+    let home = TempDir::new().expect("home tempdir");
+    let staging_dir = TempDir::new().expect("staging tempdir");
+    let source_dir = TempDir::new().expect("source tempdir");
+    std::fs::write(source_dir.path().join("a.txt"), b"progress").unwrap();
+    let unit_name = prepare_home_for_staging(home.path(), source_dir.path(), staging_dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--json", "stage", "create", &unit_name])
+        .env("HOME", home.path())
+        .env("TAPECTL_PROGRESS_INTERVAL", "1")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("spawn stage create");
+    assert!(
+        out.status.success(),
+        "stage create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "one JSON line: {stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout is JSON");
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "num_slices",
+            "stage_set_id",
+            "total_dar_size",
+            "total_encrypted_size",
+            "unit"
+        ]
+    );
+
+    let log = only_session_log(home.path(), "-stage-create-unit1-");
+    for want in [
+        "session start: stage create unit1",
+        "phase start: validate",
+        "phase end: validate",
+        "phase start: dar",
+        "phase end: catalog",
+        "phase end: encrypt",
+        "phase end: finalize",
+        "session end after",
+    ] {
+        assert!(log.contains(want), "missing {want:?} in:\n{log}");
+    }
+    for line in log.lines() {
+        let ts = line.split(' ').next().unwrap_or("");
+        assert!(
+            ts.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+            "every log line leads with a UTC timestamp: {line}"
+        );
+    }
+}
+
+/// Issue #386: `--quiet` keeps progress off stderr entirely, and the
+/// session log is still written. `volume info --json` keeps its exact key
+/// set while the human output shows the recorded phase timings.
+#[test]
+fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
+    let home = TempDir::new().expect("home tempdir");
+    let staging_dir = TempDir::new().expect("staging tempdir");
+    let source_dir = TempDir::new().expect("source tempdir");
+    std::fs::write(source_dir.path().join("a.txt"), b"quiet").unwrap();
+    let unit_name = prepare_home_for_staging(home.path(), source_dir.path(), staging_dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--quiet", "stage", "create", &unit_name])
+        .env("HOME", home.path())
+        .env("TAPECTL_PROGRESS_INTERVAL", "1")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("spawn stage create");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("progress:"), "--quiet: {stderr}");
+    let log = only_session_log(home.path(), "-stage-create-unit1-");
+    assert!(log.contains("display Off"), "{log}");
+    assert!(log.contains("phase end: finalize"), "{log}");
+
+    let import = run_tapectl(
+        home.path(),
+        &["import", "--label", "PH-1", "--generation", "LTO-6"],
+    );
+    assert!(import.status.success());
+    let conn = tapectl::db::open(&home.path().join(".tapectl").join("tapectl.db")).unwrap();
+    conn.execute(
+        "INSERT INTO phase_timings
+             (session, operation, volume_id, seq, phase, started_at, duration_ms, bytes, outcome)
+         SELECT 'S1', 'volume write', id, 1, 'write', '2026-09-30 12:00:00', 8420000,
+                1319413953331, 'ok'
+         FROM volumes WHERE label = 'PH-1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let human = run_tapectl(home.path(), &["volume", "info", "PH-1"]);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("Phase timings (volume write, session S1):"),
+        "{text}"
+    );
+    assert!(text.contains("2h 20m"), "{text}");
+    assert!(text.contains("1.20 TiB"), "{text}");
+
+    let json = run_tapectl(home.path(), &["--json", "volume", "info", "PH-1"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).expect("volume info --json");
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "backend_name",
+            "backend_type",
+            "bytes_written",
+            "capacity_bytes",
+            "cartridge_barcode",
+            "cartridge_serial",
+            "condition",
+            "created_at",
+            "deposits",
+            "first_write",
+            "label",
+            "largest_units",
+            "last_write",
+            "location",
+            "media_type",
+            "notes",
+            "status",
+            "tenants",
+            "unit_count",
+            "unit_total_bytes",
+            "units",
+            "units_first_seen",
+            "units_last_seen",
+            "verifications",
+            "writes",
+        ],
+        "volume info --json is unchanged by issue #386"
+    );
+}

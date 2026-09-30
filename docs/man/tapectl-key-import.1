@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-key\-import \- Import a public key from a file, or adopt an existing one as the permanent escrow recipient with \-\-escrow (ADR\-0005)
 .SH SYNOPSIS
-\fBtapectl key import\fR [\fB\-\-json\fR] [\fB\-\-tenant\fR] [\fB\-\-alias\fR] [\fB\-\-dry\-run\fR] [\fB\-\-key\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-escrow\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-reactivate\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
+\fBtapectl key import\fR [\fB\-\-json\fR] [\fB\-\-tenant\fR] [\fB\-\-alias\fR] [\fB\-\-dry\-run\fR] [\fB\-\-key\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-escrow\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-reactivate\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
 .SH DESCRIPTION
 Import a public key from a file, or adopt an existing one as the permanent escrow recipient with \-\-escrow (ADR\-0005)
 .SH OPTIONS
@@ -30,6 +30,12 @@ Enable verbose output
 \fB\-\-escrow\fR
 Adopt this public key as the permanent escrow recipient (ADR\-0005). Refuses if one is already registered
 .TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-\-reactivate\fR
+Make this public key a recipient of new writes again when the catalog already has it for this tenant, deactivated (as `key rotate` leaves every key it replaces). The key keeps the alias it was registered under. Refuses for a key that is active, unknown, another tenant\*(Aqs, or the escrow identity
+.TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
 .TP
@@ -37,9 +43,6 @@ Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal 
 Path to config file.
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-reactivate\fR
-Make this public key a recipient of new writes again when the catalog already has it for this tenant, deactivated (as `key rotate` leaves every key it replaces). The key keeps the alias it was registered under. Refuses for a key that is active, unknown, another tenant\*(Aqs, or the escrow identity
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.

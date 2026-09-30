@@ -15,6 +15,7 @@ use crate::dar;
 use crate::db::busy::{self, BusyPolicy};
 use crate::db::{events, models, queries};
 use crate::error::{Result, TapectlError};
+use crate::progress;
 use crate::util::{HashingReader, HashingWriter};
 
 /// Outcome of `snapshot_create_detailed` (issue #159 / ADR-0012): whether a
@@ -329,6 +330,13 @@ pub(crate) fn stage_create_reporting(
         Ok(id) => Ok(id),
         Err(e) => {
             if let Some(stage_set_id) = stage_set_id_holder.get() {
+                // Issue #386: the phases up to the failure, the failed one
+                // included, are exactly the record a failed stage needs.
+                crate::db::phase_timings::record_drained(
+                    conn,
+                    "stage create",
+                    crate::db::phase_timings::Subject::StageSet(stage_set_id),
+                );
                 after_failed_stage(conn, config, stage_set_id, &e);
             }
             Err(e)
@@ -531,6 +539,10 @@ fn stage_create_inner(
 
     // Step 1: SHA256 source validation
     info!("validating source checksums");
+    // Issue #386: each step below is a named phase — live progress, the
+    // session log, and a `phase_timings` row plus a stage-report line.
+    let phase = progress::phase("validate", None);
+    phase.item(unit.name.clone());
     let validate::SourceValidation {
         checksums,
         nonzero_bytes,
@@ -540,6 +552,7 @@ fn stage_create_inner(
         &snapshot.source_path,
         &config.defaults.global_excludes,
     )?;
+    phase.done();
 
     conn.execute(
         "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
@@ -584,6 +597,23 @@ fn stage_create_inner(
     // matched nothing in dar and the subtree reached tape uncatalogued.
     let dar_masks = exclude::dar_masks(&dar_exclude_patterns);
 
+    // dar is a subprocess, so no byte of its work passes through tapectl:
+    // the phase's count is the size of the slices it has written so far,
+    // polled from the staging directory, against the source's non-zero
+    // bytes (compression makes the total an upper bound, not a promise).
+    let phase = progress::phase("dar", Some(nonzero_bytes.max(0) as u64));
+    phase.item(unit.name.clone());
+    {
+        let dir = staging_dir.to_path_buf();
+        let prefix = format!(
+            "{}.",
+            archive_base
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        phase.poll(move || Some(dar_output_bytes(&dir, &prefix)));
+    }
     let dar_result = dar::create::create_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
         source_path: Path::new(&snapshot.source_path),
@@ -596,6 +626,7 @@ fn stage_create_inner(
         preserve_fsa: resolved.preserve_fsa,
     })?;
 
+    phase.done();
     info!(slices = dar_result.num_slices, "dar archive created");
 
     conn.execute(
@@ -618,6 +649,7 @@ fn stage_create_inner(
     // stage_set_id "for consistency" with archive_base.
     let catalog_dir = paths.catalogs_dir.join(&unit.uuid[..8]);
     let catalog_base = catalog_dir.join(format!("{}_v{}", &unit.uuid[..8], snapshot.version));
+    let phase = progress::phase("catalog", None);
     if existing_catalogs == 0 {
         info!("extracting dar catalog");
         // Issue #41: `catalogs_dir` itself is secured by `ensure_dirs`, but
@@ -638,6 +670,7 @@ fn stage_create_inner(
         "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
         params![catalog_base.to_string_lossy().to_string(), stage_set_id],
     )?;
+    phase.done();
 
     // Step 4: Encrypt slices, to the recipient list built (and checked)
     // before dar ran.
@@ -653,8 +686,17 @@ fn stage_create_inner(
     let mut total_dar_size: i64 = 0;
     let mut total_encrypted_size: i64 = 0;
 
+    let plain_total: u64 = dar_result
+        .slice_paths
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let phase = progress::phase("encrypt", Some(plain_total));
+    let slice_count = dar_result.slice_paths.len();
     for (i, slice_path) in dar_result.slice_paths.iter().enumerate() {
         let slice_num = (i + 1) as i64;
+        phase.item(format!("{} slice {slice_num} of {slice_count}", unit.name));
 
         // Streams the plaintext slice straight to its `.age` file, hashing
         // both sides as they flow — peak RAM is the copy buffer, never the
@@ -682,6 +724,7 @@ fn stage_create_inner(
             "encrypted slice"
         );
     }
+    phase.done();
 
     // Also remove any leftover sha512 hash files. dar no longer creates
     // these (create.rs dropped `-3`/`--hash sha512`, issues #50/#51 — the
@@ -732,6 +775,7 @@ fn stage_create_inner(
     // already encrypted, and a 5-second lock wait must not throw them away.
     // A dropped transaction rolls back, and every statement here is guarded
     // or idempotent, so each attempt starts clean.
+    let phase = progress::phase("finalize", None);
     busy::retry(BusyPolicy::DEFAULT, "the stage set's finalization", || {
         let tx = busy::immediate_tx(conn)?;
 
@@ -784,9 +828,25 @@ fn stage_create_inner(
         Ok(())
     })?;
 
+    phase.done();
+
+    // Issue #386: this stage's phases, recorded against the stage set and
+    // written into its report. A session-less caller (a test, a library
+    // user) records nothing, and the report then has no timings section.
+    let timings = progress::drain();
+    if let Err(e) = crate::db::phase_timings::record(
+        conn,
+        "stage create",
+        crate::db::phase_timings::Subject::StageSet(stage_set_id),
+        &timings,
+    ) {
+        tracing::warn!(error = %e, stage_set_id, "could not record the stage's phase timings");
+    }
+
     // The stage report is filesystem work and must not sit inside a DB
     // transaction — done here, after commit, along with the creation event.
-    let report = generate_stage_report(conn, stage_set_id, &unit, &snapshot, &tenant)?;
+    let mut report = generate_stage_report(conn, stage_set_id, &unit, &snapshot, &tenant)?;
+    report.push_str(&render_phase_timings(&timings));
     let _report_path = write_stage_report(paths, stage_set_id, &report)?;
 
     busy::retry(
@@ -1676,8 +1736,46 @@ fn stream_copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64>
         }
         writer.write_all(&buf[..n])?;
         total += n as u64;
+        progress::add_bytes(n as u64);
     }
     Ok(total)
+}
+
+/// The bytes dar has written so far for one archive: every `{prefix}N.dar`
+/// in `dir`. Polled by the `dar` phase's progress (issue #386); a directory
+/// that cannot be read counts as nothing yet.
+fn dar_output_bytes(dir: &Path, prefix: &str) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(prefix) && name.ends_with(".dar")
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// The stage report's "Phase timings" section (issue #386): one line per
+/// phase this stage ran, or nothing when no session recorded any.
+fn render_phase_timings(timings: &[progress::PhaseTiming]) -> String {
+    if timings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nPhase timings:\n");
+    for t in timings {
+        out.push_str(&format!(
+            "  {}  {}\n",
+            t.started_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            t.summary()
+        ));
+    }
+    out
 }
 
 /// Establish the sha256 baseline for every `(path, hash)` pair — but ONLY
@@ -4801,6 +4899,55 @@ mod tests {
             "positive control: this is the report of the stage just made: {text}"
         );
         assert!(!text.to_lowercase().contains("receipt"), "{text}");
+        assert!(
+            !text.contains("Phase timings"),
+            "no session, no timings section: {text}"
+        );
+    }
+
+    /// Issue #386: inside a progress session, `stage create` records its
+    /// five phases in order against the stage set and writes them into the
+    /// stage report; validate and encrypt count the bytes they read.
+    #[test]
+    fn stage_create_records_its_phases_in_the_catalog_and_the_report() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let content = b"content whose phases are timed";
+        fs::write(src.join("f.txt"), content).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let session = progress::start_capture();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        drop(session);
+
+        let rows = crate::db::phase_timings::latest_for_stage_set(&conn, stage_set_id).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.phase.as_str()).collect();
+        assert_eq!(names, ["validate", "dar", "catalog", "encrypt", "finalize"]);
+        assert!(rows
+            .iter()
+            .all(|r| r.outcome == "ok" && r.operation == "stage create"));
+        // The unit's dotfile is source content too, so at least the file.
+        assert!(
+            rows[0].bytes.unwrap_or(0) >= content.len() as i64,
+            "validate reads the source: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[3].bytes.unwrap_or(0) > 0,
+            "encrypt counts the plaintext it reads"
+        );
+
+        let report = fs::read_dir(&paths.stage_reports_dir)
+            .unwrap()
+            .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+            .next()
+            .unwrap();
+        let section = report
+            .split("\nPhase timings:\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("the report has a timings section: {report}"));
+        for name in names {
+            assert!(section.contains(name), "{name} in:\n{section}");
+        }
     }
 
     /// Issue #41: `write_stage_report` and `secure_catalog_files` tested

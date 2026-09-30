@@ -157,6 +157,10 @@ fn is_volume_verify_invocation(args: &[OsString]) -> bool {
 /// already set a subscriber — is silently ignored rather than panicking a
 /// command that would otherwise work fine.
 fn init_tracing(verbose: bool, logging: &config::LoggingConfig) {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, Layer, Registry};
+
     let configured = logging.tracing_level();
     let level = if verbose {
         configured.max(tracing::Level::DEBUG)
@@ -173,25 +177,53 @@ fn init_tracing(verbose: bool, logging: &config::LoggingConfig) {
             std::env::var_os("NO_COLOR").as_deref(),
         )
     };
-    let builder = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_ansi(ansi)
-        .with_writer(std::io::stderr);
-
-    // Each `tracing_subscriber::fmt` formatter method returns a distinct
-    // builder type, so the four `logging.format` values each need their own
-    // `try_init()` call rather than one shared one — there is no common
-    // supertype to build once and format last. `Config::load`'s
+    // Issue #386: the stderr writer clears a drawn progress line before an
+    // event lands, so a warning printed mid-phase starts on a clean line.
+    //
+    // Each `fmt` formatter method returns a distinct layer type, so the four
+    // `logging.format` values are boxed to one. `Config::load`'s
     // `validate_closed_sets` already rejects anything outside
     // `config::VALID_LOG_FORMATS`, so the wildcard arm is "full" (the
     // default) plus the bootstrap-before-any-config-file case, never a
     // silent fallback for a typo that should have failed at load.
-    let _ = match logging.format.as_str() {
-        "compact" => builder.compact().try_init(),
-        "pretty" => builder.pretty().try_init(),
-        "json" => builder.json().try_init(),
-        _ => builder.try_init(),
+    let stderr_writer = || tapectl::progress::ClearingStderr;
+    let stderr_layer: Box<dyn Layer<Registry> + Send + Sync> = match logging.format.as_str() {
+        "compact" => fmt::layer()
+            .compact()
+            .with_ansi(ansi)
+            .with_writer(stderr_writer)
+            .boxed(),
+        "pretty" => fmt::layer()
+            .pretty()
+            .with_ansi(ansi)
+            .with_writer(stderr_writer)
+            .boxed(),
+        "json" => fmt::layer()
+            .json()
+            .with_ansi(ansi)
+            .with_writer(stderr_writer)
+            .boxed(),
+        _ => fmt::layer()
+            .with_ansi(ansi)
+            .with_writer(stderr_writer)
+            .boxed(),
     };
+
+    // Issue #386: every event at INFO and above (DEBUG under `--verbose`,
+    // never less than the configured level) is also teed into the session
+    // log of a long operation, whatever stderr shows — the log is where an
+    // unexplained gap is looked up afterwards. It writes nowhere while no
+    // session is open.
+    let file_level = level.max(tracing::Level::INFO);
+    let file_layer = fmt::layer()
+        .with_ansi(false)
+        .with_writer(|| tapectl::progress::SessionLogWriter)
+        .with_filter(LevelFilter::from_level(file_level));
+
+    let _ = tracing_subscriber::registry()
+        .with(stderr_layer.with_filter(LevelFilter::from_level(level)))
+        .with(file_layer)
+        .try_init();
 }
 
 /// Flush stdout, then exit with `code` if it is non-zero (issue #45/H10).
@@ -203,6 +235,7 @@ fn init_tracing(verbose: bool, logging: &config::LoggingConfig) {
 fn exit_if_nonzero(code: i32) {
     if code > 0 {
         use std::io::Write;
+        tapectl::progress::note_exit(code);
         let _ = std::io::stdout().flush();
         std::process::exit(code);
     }
@@ -286,6 +319,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     paths
         .ensure_dirs()
         .context("failed to secure tapectl home directories")?;
+
+    // Issue #386: a long operation — stage create, volume write/resume/
+    // verify/read-slices, restore — runs inside a progress session: live
+    // progress on stderr (a redrawn line on a terminal, plain periodic lines
+    // otherwise, nothing under `--quiet`) and a session log under
+    // `<home>/logs/`. Never under `--dry-run`, which moves nothing. Held
+    // until `run` returns, so the log's last line is the session's end.
+    let _progress = match cli::progress_session_name(&cli.command) {
+        Some(name) if !cli.dry_run => {
+            use std::io::IsTerminal;
+            let display = tapectl::progress::Display::choose(
+                cli.quiet,
+                std::io::stderr().is_terminal(),
+                std::env::var("TERM").ok().as_deref(),
+            );
+            let session =
+                tapectl::progress::start_session(Some(&paths.logs_dir), &name, display, true);
+            if let Some(log) = session.log_path() {
+                tracing::debug!(log = %log.display(), "session log");
+            }
+            Some(session)
+        }
+        _ => None,
+    };
 
     // Issue #173: `config check`'s whole job is diagnosing a config that
     // fails to load — so it must not be gated behind the strict

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-unit\-init \- Initialize a directory as an archival unit
 .SH SYNOPSIS
-\fBtapectl unit init\fR [\fB\-\-json\fR] <\fB\-\-tenant\fR> [\fB\-\-dry\-run\fR] [\fB\-\-name\fR] [\fB\-t\fR|\fB\-\-tag\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-archive\-set\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
+\fBtapectl unit init\fR [\fB\-\-json\fR] <\fB\-\-tenant\fR> [\fB\-\-dry\-run\fR] [\fB\-\-name\fR] [\fB\-t\fR|\fB\-\-tag\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-archive\-set\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
 .SH DESCRIPTION
 Initialize a directory as an archival unit
 .SH OPTIONS
@@ -29,6 +29,9 @@ Enable verbose output
 .TP
 \fB\-\-archive\-set\fR \fI<ARCHIVE_SET>\fR
 Archive set name
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept

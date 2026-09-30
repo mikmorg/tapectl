@@ -5,6 +5,7 @@ pub mod export;
 #[allow(dead_code)]
 pub mod models;
 pub mod ontape_catalog;
+pub mod phase_timings;
 pub mod queries;
 
 use std::path::Path;
@@ -406,6 +407,14 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!(
             "migrations/027_drop_manifests_and_dead_indexes.sql"
         )),
+        // 028 creates `phase_timings` (issue #386): one row per phase of a
+        // long operation -- stage create, volume write/resume, verify --
+        // with its duration and bytes, grouped by the session whose log
+        // (`<home>/logs/<session>.log`) holds the same phases and their
+        // waits. Plain CREATE touching no other table, so no
+        // `.foreign_key_check()`; both subject keys are `ON DELETE SET
+        // NULL` so a snapshot delete never trips on them. See the header.
+        M::up(include_str!("migrations/028_phase_timings.sql")),
     ])
 }
 
@@ -3930,7 +3939,8 @@ mod tests {
             "positive control: one hit per snapshot"
         );
 
-        migrate(&mut conn).expect("027 must migrate a catalog whose manifest mirrors files");
+        migrate_to(&mut conn, Some(27))
+            .expect("027 must migrate a catalog whose manifest mirrors files");
         assert_eq!(user_version(&conn), 27);
 
         let mut expected = rows_before;
@@ -4124,7 +4134,7 @@ mod tests {
         };
 
         let conn = open(&path).unwrap();
-        assert_eq!(user_version(&conn), 27);
+        assert_eq!(user_version(&conn), 28, "027 and then 028 (issue #386)");
         let freelist: i64 = conn
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
             .unwrap();

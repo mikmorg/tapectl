@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-raw\-volume \- Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
 .SH SYNOPSIS
-\fBtapectl restore raw\-volume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-to\fR> [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore raw\-volume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-to\fR> [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
 .SH OPTIONS
@@ -26,6 +26,9 @@ Refuse unless the tape\*(Aqs own reported label matches (wrong\-tape guard) — 
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept

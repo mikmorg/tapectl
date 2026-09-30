@@ -186,6 +186,7 @@ pub fn validate_source(
         total_mb = total_bytes / (1024 * 1024),
         "validating source checksums"
     );
+    crate::progress::set_total(total_bytes.max(0) as u64);
 
     let mut checksums = Vec::new();
     let mut validated = 0;
@@ -219,8 +220,10 @@ pub fn validate_source(
         // The same read counts the file's non-zero bytes (issue #354) —
         // nothing short of reading the content can bound what dar stores.
         let mut nonzero: i64 = 0;
+        crate::progress::item(format!("file {} of {total_files}", validated + 1));
         let (hex, streamed, meta) = stream_source_file(&full_path, rel_path, &mut |chunk| {
             nonzero += count_nonzero(chunk);
+            crate::progress::add_bytes(chunk.len() as u64);
         })?;
 
         // TOCTOU guard: `check_source_size` and the streaming read above are

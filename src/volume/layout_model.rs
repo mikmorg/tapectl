@@ -442,6 +442,18 @@ impl Layout {
     }
 
     fn check_staged_slices(&self, slice_check: SliceCheck, errs: &mut Vec<LayoutError>) {
+        // Issue #386: a full hash reads every staged byte — the caller's
+        // progress phase learns the total here and counts in `hash_file`.
+        if slice_check == SliceCheck::FullHash {
+            crate::progress::set_total(
+                self.entries
+                    .iter()
+                    .filter(|e| matches!(e.source, ContentSource::Staged(_)))
+                    .filter_map(|e| e.size_bytes)
+                    .sum(),
+            );
+        }
+        let files = self.entries.len();
         for e in &self.entries {
             let ContentSource::Staged(path) = &e.source else {
                 continue;
@@ -483,6 +495,7 @@ impl Layout {
             if slice_check != SliceCheck::FullHash {
                 continue;
             }
+            crate::progress::item(format!("hashing file {} of {files}", e.position));
             match hash_file(path) {
                 Ok(actual) if &actual == expected => {}
                 Ok(actual) => errs.push(LayoutError::SliceChecksumMismatch {
@@ -603,6 +616,7 @@ pub(crate) fn hash_file(path: &Path) -> std::io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+        crate::progress::add_bytes(n as u64);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

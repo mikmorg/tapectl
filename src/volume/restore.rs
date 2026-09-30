@@ -11,6 +11,7 @@ use crate::dar;
 use crate::dar::restore::DarReport;
 use crate::db::queries;
 use crate::error::{Result, TapectlError};
+use crate::progress;
 use crate::store::{Store, TapeStore};
 use crate::tape::contact::{self, ContactSite, Medium, Operation};
 use crate::tape::mam_journal::MamReads;
@@ -230,7 +231,9 @@ fn restore_through_drive(
     // absence, which is the DR machine with keys and no `backend add`.
     let observed = crate::volume::binding::loaded_medium(config, device, &reads);
     // Open the store read-only, positioned at BOT.
+    let phase = progress::phase("drive-open", None);
     let mut store = TapeStore::open_read(device, block_size)?;
+    phase.done();
     restore_unit_from_store(
         conn,
         paths,
@@ -293,9 +296,17 @@ pub fn restore_raw_volume(
     site: ContactSite<'_>,
 ) -> Result<crate::volume::raw::RawRestoreReport> {
     let started_at = restore_record::now_sqlite();
+    let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, None);
+    phase.done();
     let contact_id = guard.id();
+    let phase = progress::phase("dump", None);
     let r = crate::volume::raw::restore_raw(store, dest, expect_label);
+    if r.is_ok() {
+        phase.done();
+    } else {
+        drop(phase);
+    }
     // A dump whose checksums did not all verify is how this contact ENDED,
     // even though the function returns `Ok` — the CLI's exit status says the
     // same thing (`RawRestoreReport::all_verified`).
@@ -341,7 +352,12 @@ pub fn restore_raw_volume(
     // The post-command health reading (issue #320), on every outcome — a
     // dump that failed its checksums is exactly when the read-error
     // counters matter. The heir's dump itself stays `Connection`-free.
+    let phase = progress::phase("health-sweep", None);
     crate::volume::write::health_after_read_contact(conn, &site, None, contact_id);
+    phase.done();
+    // Issue #386: the phases are in the session log; a raw dump names no
+    // catalog volume to record them against, so they go no further.
+    let _ = progress::drain();
     r
 }
 
@@ -387,7 +403,9 @@ pub(crate) fn restore_unit_from_store(
         )
         .optional()?;
     let started_at = restore_record::now_sqlite();
+    let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, volume_id);
+    phase.done();
     let contact_id = guard.id();
     let mut trace = RestoreTrace::default();
     let r = guard.finish_result(restore_unit_contacted(
@@ -443,7 +461,17 @@ pub(crate) fn restore_unit_from_store(
     // every outcome, naming the volume the contact names. This seam is the
     // only place `restore unit` — and `restore file`, which reaches the
     // drive through it — takes one, so a contact cannot get two.
+    let phase = progress::phase("health-sweep", None);
     crate::volume::write::health_after_read_contact(conn, &site, volume_id, contact_id);
+    phase.done();
+    // Issue #386: this restore's phases, on every outcome.
+    if let Some(id) = volume_id {
+        crate::db::phase_timings::record_drained(
+            conn,
+            &format!("restore {}", target.kind()),
+            crate::db::phase_timings::Subject::Volume(id),
+        );
+    }
     r
 }
 
@@ -484,11 +512,13 @@ fn restore_unit_contacted(
             |r| r.get(0),
         )
         .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
+    let phase = progress::phase("identify", None);
     let medium = crate::volume::binding::MediumFacts::new(
         medium_serial.map(str::to_string),
         crate::volume::binding::read_file0_facts(store),
     );
     crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
+    phase.done();
 
     // Scratch dir for decrypted slices. The guard removes it on EVERY path
     // out of this function, not just the happy one — see `RestoreScratch`.
@@ -520,9 +550,24 @@ fn restore_unit_contacted(
 
     let mut dar_slices: Vec<PathBuf> = Vec::new();
 
+    // Issue #386: the tape read and decrypt, counted as ciphertext off the
+    // tape, then dar's extract as a phase of its own.
+    let phase = progress::phase(
+        "read",
+        Some(
+            positions
+                .iter()
+                .map(|wp| wp.encrypted_bytes.max(0) as u64)
+                .sum(),
+        ),
+    );
     for (i, wp) in positions.iter().enumerate() {
         let position: u32 = wp.position.parse().unwrap_or(0);
-
+        phase.item(format!(
+            "{unit_name} slice {} of {} (file {position})",
+            i + 1,
+            positions.len()
+        ));
         info!(
             slice = i + 1,
             total = positions.len(),
@@ -560,8 +605,12 @@ fn restore_unit_contacted(
     // Run dar extract. Its report is kept whenever it ran, on both verdicts
     // (issue #306); the version is read only once dar has actually run, so
     // a restore that never reached dar records no version either.
+    phase.done();
+
     let archive_base = restore_tmp.join("restore");
     info!("extracting dar archive to {dest_dir}");
+    let phase = progress::phase("extract", None);
+    phase.item(unit_name.to_string());
     let (report, verdict) =
         dar::restore::extract_reported(&config.dar.binary, &archive_base, Path::new(dest_dir));
     if report.is_some() {
@@ -571,6 +620,7 @@ fn restore_unit_contacted(
     }
     trace.dar = report;
     verdict?;
+    phase.done();
 
     // No explicit cleanup here on purpose: `_scratch` removes the whole
     // directory on the way out. The hand-rolled version this replaces walked
@@ -690,7 +740,7 @@ fn restore_one_slice_inner(
     // those bytes — never the whole slice in RAM.
     let ct_file = fs::File::create(ciphertext_tmp_path)?;
     let mut bounded = TruncatingWriter::new(HashingWriter::new(ct_file), wp.encrypted_bytes as u64);
-    store.read_file(position, &mut bounded)?;
+    store.read_file(position, &mut progress::CountingWriter(&mut bounded))?;
     let hashing_ct = bounded.into_inner();
     let actual_hash = hashing_ct.finalize_hex();
     drop(hashing_ct); // closes ciphertext_tmp_path before pass 2 reopens it

@@ -7,9 +7,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{Config, TapectlPaths};
-use crate::db::{events, queries};
+use crate::db::{events, phase_timings, queries};
 use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
+use crate::progress;
 use crate::staging;
 use crate::tape::contact::{self, ContactSite, ContactSlot, Medium, Operation};
 use crate::tape::drive_identity;
@@ -1201,11 +1202,22 @@ fn volume_write_contacted<'c>(
     // contact, no MAM read and no sweep behind. Consent is the ADR-0008
     // Tier-2 helper: `--yes` answers it, and a session with no terminal and
     // no `--yes` declines rather than hanging.
-    crate::host_check::preflight(
-        &config.host_check(),
-        &format!("volume write \"{label}\""),
-        assume_yes,
+    // Issue #386: the preflight may ask the operator; a long answer is a
+    // wait on the operator, and names itself as one.
+    progress::waited(
+        || "the operator to answer the quiet-host check".to_string(),
+        || {
+            crate::host_check::preflight(
+                &config.host_check(),
+                &format!("volume write \"{label}\""),
+                assume_yes,
+            )
+        },
     )?;
+
+    // Issue #386: the contact's opening reads — the MAM, the drive's
+    // identity, the st counters — are the "sweep at open" phase.
+    let phase = progress::phase("contact-open", None);
 
     // One read of the loaded medium, serving three purposes (ADR-0010): the
     // wrong-cartridge and wrong-generation checks immediately below, the MAM
@@ -1245,6 +1257,7 @@ fn volume_write_contacted<'c>(
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &det.capture);
+    phase.done();
 
     let result = volume_write_in_contact(
         conn,
@@ -1280,6 +1293,7 @@ fn volume_write_contacted<'c>(
     // `TapeStore` was dropped when that function returned, so the st close
     // is inside the swept window, as it is for `volume init`. Best-effort:
     // nothing here can fail or refuse the write.
+    let phase = progress::phase("health-sweep", None);
     collect_health_best_effort(
         conn,
         config,
@@ -1290,6 +1304,7 @@ fn volume_write_contacted<'c>(
         Operation::VolumeWrite,
         probe,
     );
+    phase.done();
 
     // Issue #338: native tape consumed per byte of data this write sent,
     // from the sweep above — read back from `log_page_journal` by contact
@@ -1341,6 +1356,13 @@ fn volume_write_contacted<'c>(
             }
         }
     }
+
+    // Issue #386: this session's phases, on every outcome the contact saw.
+    phase_timings::record_drained(
+        conn,
+        "volume write",
+        phase_timings::Subject::Volume(volume_id),
+    );
 
     result.map(|_| ())
 }
@@ -1494,6 +1516,7 @@ fn volume_write_in_contact<'c>(
     // rows below, and nothing else is staged at this instant (the
     // unresolved-write-session check above refuses a second concurrent
     // write). `build()` appends it to the OPERATOR envelope only.
+    let phase = progress::phase("build", None);
     fs::create_dir_all(&session_dir)?;
     let catalog_db_path = session_dir.join("catalog_snapshot.db");
     crate::db::catalog_snapshot::build_catalog_snapshot(conn, &stage_set_ids, &catalog_db_path)?;
@@ -1527,6 +1550,7 @@ fn volume_write_in_contact<'c>(
     };
 
     let built = build::build(&inputs, &session_dir)?;
+    phase.done();
     // Snapshot the Layout before the typestate chain consumes `built` — the
     // terminal `SealedSession` only exposes `volume_id`/`label`, not the
     // entries, and `bytes_written`/`num_data_files` bookkeeping (below) needs
@@ -1542,7 +1566,12 @@ fn volume_write_in_contact<'c>(
     // `--prewrite-hash` they are also full-hashed from disk (tri-layer L1,
     // off by default since ADR-0012's 2026-09-30 later amendment — L2 in
     // execute is the rot check that always runs).
-    if let Err(errs) = built.validate(&keys, slice_check) {
+    // Issue #386: under `--prewrite-hash` this is the full read of every
+    // staged slice — L6-0001's hours — so it is a phase that counts bytes.
+    let phase = progress::phase("prewrite-check", None);
+    let validated_pre = built.validate(&keys, slice_check);
+    phase.done();
+    if let Err(errs) = validated_pre {
         let (blocking, waived) = blocking_validation_errors(errs, allow_missing_escrow);
         for e in &waived {
             tracing::warn!(
@@ -1565,6 +1594,7 @@ fn volume_write_in_contact<'c>(
     // The tape device opens HERE and not a line earlier (the pre-flight
     // `validate` above and every fact check run first); an injected store
     // is never opened (issue #342, the seam `volume init` has).
+    let phase = progress::phase("positioning", None);
     let mut opened;
     let store: &mut dyn Store = match store {
         ContactStore::Device => {
@@ -1610,6 +1640,7 @@ fn volume_write_in_contact<'c>(
                     .join("; ")
             ))
         })?;
+    phase.done();
 
     // ADR-0010's binding ladder, one stage later, for the volume `volume init`
     // could not bind (W3 Change 8) — placed here, after every refusal this
@@ -1646,7 +1677,9 @@ fn volume_write_in_contact<'c>(
         contact.record_cartridge(cartridge_id);
     }
 
+    let phase = progress::phase("plan", None);
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
+    phase.done();
     let execute_outcome = planned.execute(conn, store)?;
 
     // The Layout comes back with `Ok` so the caller's feed ratio (issue
@@ -1878,6 +1911,7 @@ fn volume_resume_contacted<'c>(
     // ~2 minute no-medium timeout. Nothing about the session is touched by
     // this refusal — reload the cartridge and resume again.
     crate::tape::media_detect::ensure_medium_loaded(device)?;
+    let phase = progress::phase("contact-open", None);
     let det = crate::tape::media_detect::detect(device, &backend.device_sg);
     // The health probe's two test seams, off the slot BEFORE it opens
     // (issue #342) — see `volume_write_contacted`.
@@ -1903,6 +1937,7 @@ fn volume_resume_contacted<'c>(
     // The same one read, verbatim, into the journal (issue #297) — against
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeResume, Hook::VolumeResume, &det.capture);
+    phase.done();
 
     let result = volume_resume_in_contact(
         conn,
@@ -1938,6 +1973,7 @@ fn volume_resume_contacted<'c>(
     // CHECK, and this is that literal flipped. "Free TEXT so a new value
     // costs no migration" was true only AFTER the migration that made it
     // free (the #295 hazard note).
+    let phase = progress::phase("health-sweep", None);
     collect_health_best_effort(
         conn,
         config,
@@ -1947,6 +1983,14 @@ fn volume_resume_contacted<'c>(
         health::Reading::Resume,
         Operation::VolumeResume,
         probe,
+    );
+    phase.done();
+
+    // Issue #386: this session's phases, on every outcome the contact saw.
+    phase_timings::record_drained(
+        conn,
+        "volume resume",
+        phase_timings::Subject::Volume(volume_id),
     );
 
     result
@@ -1998,7 +2042,9 @@ fn volume_resume_in_contact(
         crate::tape::media_detect::check_drive_can_write(backend, m)?;
     }
 
+    let phase = progress::phase("drive-open", None);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+    phase.done();
 
     info!(label, volume_id, "resuming interrupted volume write");
     let outcome = session.resume(conn, keys, slice_check, &mut store)?;
@@ -2596,6 +2642,7 @@ fn finish_session(
 ) -> Result<()> {
     match outcome {
         ResumeOutcome::Ready(ready) => {
+            let phase = progress::phase("seal", None);
             let sealed_pending = ready.seal(store)?;
             // ADR-0012's 2026-09-21 correction "the seal is RECORDED, not
             // inferred" (issue #277, migration 018): the moment `seal()`
@@ -2622,6 +2669,7 @@ fn finish_session(
                     params![volume_id],
                 )?)
             })?;
+            phase.done();
 
             // Issue #276: sibling to `session`'s `TAPECTL_TEST_PAUSE_AFTER_PLAN`
             // hook, for a state that one cannot reach -- it parks BEFORE any
@@ -3834,7 +3882,9 @@ pub fn volume_verify(
     // LENIENT — an unconfigured backend yields `None`, which is an absence
     // and proceeds (ADR-0010's read-path leniency).
     let observed = binding::loaded_medium(config, device, &reads);
+    let phase = progress::phase("drive-open", None);
     let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+    phase.done();
 
     // The post-command sweep is INSIDE the seam since issue #342 — see
     // `volume_verify_with_store`. Nothing here may run between the seam
@@ -3887,7 +3937,9 @@ pub(crate) fn volume_verify_with_store(
     tier: Tier,
     site: ContactSite<'_>,
 ) -> Result<VerifyReport> {
+    let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, Some(volume_id));
+    phase.done();
     let contact_id = guard.id();
     let mut r = verify_contacted(
         conn,
@@ -3935,6 +3987,7 @@ pub(crate) fn volume_verify_with_store(
     // no `backend add`, ADR-0005: the verify itself is unaffected).
     // `session_id` (issue #295) names the `verification_sessions` row a
     // completed verify made; a failed one made none.
+    let phase = progress::phase("health-sweep", None);
     match health_backend(site.config(), site.device()) {
         Ok(bk) => collect_and_record_health(
             conn,
@@ -3960,6 +4013,13 @@ pub(crate) fn volume_verify_with_store(
             }
         }
     }
+    phase.done();
+    // Issue #386: this verify's phases, on every outcome.
+    phase_timings::record_drained(
+        conn,
+        "volume verify",
+        phase_timings::Subject::Volume(volume_id),
+    );
     r
 }
 
@@ -3991,6 +4051,7 @@ fn verify_contacted(
     // Unlike the write path this DOES offer File 0: verify has no consent
     // gate to pre-empt, and File 0's label/uuid is the cheapest statement
     // there is of "this is not the tape you named".
+    let phase = progress::phase("identify", None);
     let medium = binding::MediumFacts::new(
         medium_serial.map(str::to_string),
         binding::read_file0_facts(store),
@@ -4055,7 +4116,17 @@ fn verify_contacted(
         entries,
     };
 
+    phase.done();
+
+    // Issue #386: the readback is the phase that takes hours; a quick
+    // verify reads no content file, so only a full one has a byte total.
+    let total = match tier {
+        Tier::Integrity => layout.on_tape_bytes().ok(),
+        Tier::Navigable => None,
+    };
+    let phase = progress::phase("verify", total);
     let evidence = store.confirm(&layout, tier)?;
+    phase.done();
 
     let verify_type = match tier {
         Tier::Integrity => "full",
@@ -4306,7 +4377,8 @@ fn stream_verify_slice_to_staging(
 ) -> Result<SliceStreamOutcome> {
     let file = fs::File::create(dest_path)?;
     let mut bounded = TruncatingWriter::new(HashingWriter::new(file), true_len);
-    let read_result = store.read_file(position, &mut bounded);
+    // Issue #386: every byte off the tape counts toward the caller's phase.
+    let read_result = store.read_file(position, &mut progress::CountingWriter(&mut bounded));
     let hashing = bounded.into_inner();
     let actual = hashing.finalize_hex();
     drop(hashing); // close dest_path's handle before any removal below
@@ -4356,7 +4428,9 @@ pub fn read_slices(
             |row| row.get(0),
         )
         .optional()?;
+    let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, from_vol_id);
+    phase.done();
     let contact_id = guard.id();
     let r = guard.finish_result(read_slices_contacted(
         conn,
@@ -4367,7 +4441,17 @@ pub fn read_slices(
         site.medium_serial(),
     ));
     // The post-command health reading (issue #320), on every outcome.
+    let phase = progress::phase("health-sweep", None);
     health_after_read_contact(conn, &site, from_vol_id, contact_id);
+    phase.done();
+    // Issue #386: this read's phases, on every outcome.
+    if let Some(id) = from_vol_id {
+        phase_timings::record_drained(
+            conn,
+            "volume read-slices",
+            phase_timings::Subject::Volume(id),
+        );
+    }
     r
 }
 
@@ -4451,6 +4535,11 @@ fn read_slices_contacted(
     let mut slices_read: i64 = 0;
     let mut affected_stage_sets = HashSet::new();
 
+    let phase = progress::phase(
+        "read",
+        Some(source_slices.iter().map(|s| s.3.max(0) as u64).sum()),
+    );
+    let slice_count = source_slices.len();
     for (
         pos_str,
         sha_on_vol,
@@ -4462,6 +4551,10 @@ fn read_slices_contacted(
     ) in &source_slices
     {
         let pos: u32 = pos_str.parse().unwrap_or(0);
+        phase.item(format!(
+            "{unit_name} slice {} of {slice_count} (file {pos})",
+            slices_read + 1
+        ));
         let slice_path = clone_dir.join(format!("slice_{slice_db_id}.dat"));
 
         match stream_verify_slice_to_staging(
@@ -4498,6 +4591,7 @@ fn read_slices_contacted(
 
     // Restore stage_sets status so find_staged_data() picks them up.
     // Guard: only promote sets that were previously successfully staged.
+    phase.done();
     for ss_id in &affected_stage_sets {
         conn.execute(
             "UPDATE stage_sets SET status = 'staged' WHERE id = ?1 AND status IN ('staged', 'cleaned')",
@@ -4558,7 +4652,9 @@ pub fn compact_read(
             |row| row.get(0),
         )
         .optional()?;
+    let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, volume_id);
+    phase.done();
     let contact_id = guard.id();
     let r = guard.finish_result(compact_read_contacted(
         conn,
@@ -4570,7 +4666,17 @@ pub fn compact_read(
     // The post-command health reading (issue #320), on every outcome — for
     // `volume compact` this is step 1's contact; step 2's write contact
     // takes its own through `volume_write`.
+    let phase = progress::phase("health-sweep", None);
     health_after_read_contact(conn, &site, volume_id, contact_id);
+    phase.done();
+    // Issue #386: this read's phases, on every outcome.
+    if let Some(id) = volume_id {
+        phase_timings::record_drained(
+            conn,
+            "volume compact-read",
+            phase_timings::Subject::Volume(id),
+        );
+    }
     r
 }
 
@@ -4641,10 +4747,19 @@ fn compact_read_contacted(
     let mut slices_skipped: i64 = 0;
     let mut affected_stage_sets = HashSet::new();
 
+    let phase = progress::phase(
+        "read",
+        Some(live_slices.iter().map(|s| s.3.max(0) as u64).sum()),
+    );
+    let slice_count = live_slices.len();
     for (pos_str, sha_on_vol, _slice_id, enc_bytes, sha_encrypted, ss_id, slice_db_id) in
         &live_slices
     {
         let pos: u32 = pos_str.parse().unwrap_or(0);
+        phase.item(format!(
+            "slice {} of {slice_count} (file {pos})",
+            slices_read + slices_skipped + 1
+        ));
         let slice_path = compact_dir.join(format!("slice_{slice_db_id}.dat"));
 
         match stream_verify_slice_to_staging(
@@ -4680,6 +4795,7 @@ fn compact_read_contacted(
         slices_read += 1;
         info!(position = pos, slice_id = slice_db_id, "read live slice");
     }
+    phase.done();
 
     // Restore stage_sets status so find_staged_data() picks them up.
     // Guard: only promote sets that were previously successfully staged.
@@ -13470,6 +13586,141 @@ mod tests {
                 feed_ratio_events(&conn),
                 1,
                 "one feed ratio, from this sweep's page 0x0c (issue #338)"
+            );
+        }
+
+        /// Issue #386: a MemStore write inside a progress session records
+        /// every phase, in order, against the volume — the rows `volume
+        /// info` shows — with the write and confirm phases counting bytes.
+        /// Under `--prewrite-hash` the pre-write check counts the staged
+        /// bytes it hashed.
+        #[test]
+        fn a_memstore_write_records_its_phases_in_order() {
+            for prewrite_hash in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (conn, mut config, volume_id) = swept_write_fixture("SW-PH", tmp.path());
+                config.backends.lto[0].capacity_override = Some("2400G".into());
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let mut slot = ContactSlot::empty();
+                let mut store = MemStore::new(512 * 1024);
+                let session = crate::progress::start_capture();
+
+                let r = volume_write_contacted(
+                    &conn,
+                    &paths,
+                    &config,
+                    "SW-PH",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    prewrite_hash,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(&mut store),
+                );
+                slot.finish_result(r)
+                    .expect("a write to a blank MemStore completes");
+                drop(session);
+
+                let rows = phase_timings::latest_for_volume(&conn, volume_id).unwrap();
+                let names: Vec<&str> = rows.iter().map(|r| r.phase.as_str()).collect();
+                assert_eq!(
+                    names,
+                    [
+                        "contact-open",
+                        "build",
+                        "prewrite-check",
+                        "positioning",
+                        "plan",
+                        "write",
+                        "seal",
+                        "confirm",
+                        "health-sweep",
+                    ],
+                    "the phase sequence of a fresh write ({prewrite_hash})"
+                );
+                assert!(rows.iter().all(|r| r.outcome == "ok"), "{rows:?}");
+                assert!(rows.iter().all(|r| r.operation == "volume write"));
+                let bytes = |name: &str| rows.iter().find(|r| r.phase == name).unwrap().bytes;
+                let sent: i64 = store.files.iter().map(|f| f.len() as i64).sum::<i64>();
+                let written = bytes("write").expect("the write phase counts bytes");
+                assert!(
+                    written > 0 && written <= sent,
+                    "the write phase counts the true bytes streamed ({written} of {sent} padded)"
+                );
+                assert!(
+                    bytes("confirm").unwrap_or(0) > 0,
+                    "the readback counts bytes"
+                );
+                // The frozen generated zones are re-hashed in both modes;
+                // only `--prewrite-hash` adds the staged slice's bytes.
+                // The frozen generated zones are re-hashed in both modes, so
+                // the pre-write check reads every file the write sends but
+                // the staged slice, and `--prewrite-hash` adds that too.
+                let slice_len = fs::metadata(tmp.path().join("slices").join("slice_1.age"))
+                    .unwrap()
+                    .len() as i64;
+                let checked = bytes("prewrite-check").unwrap_or(0);
+                let expected = if prewrite_hash {
+                    written
+                } else {
+                    written - slice_len
+                };
+                assert_eq!(
+                    checked, expected,
+                    "pre-write check bytes (--prewrite-hash {prewrite_hash})"
+                );
+            }
+        }
+
+        /// Issue #386: a write that aborts records the phase it died in as
+        /// `failed`, and still records the sweep that follows.
+        #[test]
+        fn an_aborted_memstore_write_records_the_failed_phase() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-PHX", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let slice_path = tmp.path().join("slices").join("slice_1.age");
+            let mut bytes = fs::read(&slice_path).unwrap();
+            bytes[0] ^= 0xFF;
+            fs::write(&slice_path, bytes).unwrap();
+            let mut slot = ContactSlot::empty();
+            let mut store = MemStore::new(512 * 1024);
+            let session = crate::progress::start_capture();
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-PHX",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            assert!(slot.finish_result(r).is_err());
+            drop(session);
+            let rows = phase_timings::latest_for_volume(&conn, volume_id).unwrap();
+            let summary: Vec<(&str, &str)> = rows
+                .iter()
+                .map(|r| (r.phase.as_str(), r.outcome.as_str()))
+                .collect();
+            assert_eq!(
+                summary,
+                [
+                    ("contact-open", "ok"),
+                    ("build", "ok"),
+                    ("prewrite-check", "ok"),
+                    ("positioning", "ok"),
+                    ("plan", "ok"),
+                    ("write", "failed"),
+                    ("health-sweep", "ok"),
+                ]
             );
         }
 
