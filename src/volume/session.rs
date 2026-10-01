@@ -1194,7 +1194,7 @@ impl InterruptedSession {
             .iter()
             .find(|e| matches!(e.kind, ZoneKind::SealMarker))
             .map(|e| e.position as u32);
-        let phase = crate::progress::phase("positioning", None);
+        let phase = crate::progress::phase("identify", None);
         let contact = check_tape_contact(
             store,
             &self.built.layout.label,
@@ -1881,6 +1881,7 @@ fn run_entries(
         // is caught rather than propagated: a full medium has no salvage
         // path (ADR-0007), so it becomes the same clean abort as a hash
         // mismatch, not a hard `Err` out of the whole session.
+        let entry_started = std::time::Instant::now();
         let stream_result: Result<String> = (|| {
             let file = File::open(path).map_err(|e| {
                 TapectlError::Other(format!(
@@ -1953,6 +1954,21 @@ fn run_entries(
                 Ok(())
             })?;
         }
+
+        // Issue #386: one session-log line per file written, so a log
+        // always says which file a long write was on, and how fast each went.
+        let took = entry_started.elapsed();
+        crate::progress::log(&format!(
+            "wrote file {} ({}): {} in {}{}",
+            entry.position,
+            entry.kind.type_label(),
+            crate::progress::format_bytes(size),
+            crate::progress::format_duration(took),
+            match &abort_reason {
+                Some(_) => " — ABORTED",
+                None => "",
+            }
+        ));
 
         if let Some(reason) = abort_reason {
             mark_writes(conn, &write_ids, "aborted")?;

@@ -2784,7 +2784,14 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
     ] {
         assert!(log.contains(want), "missing {want:?} in:\n{log}");
     }
-    for line in log.lines() {
+    // The module's own lines; a teed tracing event may span lines.
+    let own = ["session ", "phase ", "wait ", "progress: "];
+    let stamped: Vec<&str> = log
+        .lines()
+        .filter(|l| own.iter().any(|w| l.contains(w)))
+        .collect();
+    assert!(stamped.len() >= 8, "{log}");
+    for line in stamped {
         let ts = line.split(' ').next().unwrap_or("");
         assert!(
             ts.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(ts).is_ok(),

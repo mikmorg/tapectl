@@ -411,8 +411,9 @@ the counters at the contact's open), `build`, `prewrite-check` (the full read
 of every staged slice under `--prewrite-hash`, a size check otherwise),
 `positioning` (opening the drive, the File 0 check, the rewind), `plan`,
 `write`, `seal`, `confirm` (the readback of the whole tape) and
-`health-sweep`; a resume has `revalidate` and `positioning` in place of the
-build and pre-write steps. `stage create` has `validate`, `dar`, `catalog`,
+`health-sweep`; a resume has `drive-open`, `revalidate`, `identify` (the File 0
+and seal checks) and `positioning` in place of the build and pre-write steps,
+and the log names each file as it is written. `stage create` has `validate`, `dar`, `catalog`,
 `encrypt` and `finalize`.
 
 Every such command also writes a **session log**, whether or not anything
