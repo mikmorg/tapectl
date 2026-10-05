@@ -665,6 +665,8 @@ fn stage_create_inner(
         // dar wrote the catalog file(s) itself via subprocess, with no mode
         // of its own — tighten what it produced after the fact.
         secure_catalog_files(&catalog_dir);
+        // ...and nor did it sync them (issue #409).
+        sync_catalogue(&catalog_base)?;
     }
     conn.execute(
         "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
@@ -905,10 +907,16 @@ fn record_encrypted_slice(
         let _ = fs::remove_file(encrypted_path);
         return Err(e);
     }
+    #[cfg(test)]
+    durability::note(durability::Event::Recorded(encrypted_path.to_path_buf()));
 
-    // Remove unencrypted slice
+    // Remove unencrypted slice. Safe only because `encrypt_file_streaming`
+    // synced the `.age` before returning (issue #409).
     fs::remove_file(slice_path)
-        .map_err(|e| staging_io_error("cannot remove plaintext slice", slice_path, e))
+        .map_err(|e| staging_io_error("cannot remove plaintext slice", slice_path, e))?;
+    #[cfg(test)]
+    durability::note(durability::Event::Unlinked(slice_path.to_path_buf()));
+    Ok(())
 }
 
 /// The `archive_base` file-name stem for one stage set: `{uuid12}_v{version}_s{stage_set_id}`.
@@ -1681,7 +1689,89 @@ fn encrypt_file_streaming_inner(
     let encryptor = build_encryptor(pubkey_strings)?;
     let input = fs::File::open(input_path)?;
     let output = fs::File::create(output_path)?;
-    encrypt_stream(encryptor, input, output)
+    let info = encrypt_stream(encryptor, input, &output)?;
+    // Issue #409: on stable storage before anything trusts it. The caller
+    // records the slice and then DELETES its plaintext; with the `.age`
+    // still dirty in the page cache, a power loss inside the writeback
+    // window left a short (or zero-filled) slice and no plaintext to
+    // re-encrypt it from. One flush per slice (~10 GiB) costs nothing.
+    make_durable(&output, output_path)?;
+    Ok(info)
+}
+
+/// Force `file`'s bytes, then the directory entry that names it, to stable
+/// storage (issue #409). The entry matters as much as the bytes: a new file
+/// whose data is synced but whose name is not can vanish whole after a crash.
+fn make_durable(file: &fs::File, path: &Path) -> Result<()> {
+    file.sync_all()
+        .map_err(|e| staging_io_error("cannot sync", path, e))?;
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| staging_io_error("cannot sync directory", dir, e))?;
+    }
+    #[cfg(test)]
+    durability::note(durability::Event::Synced(path.to_path_buf()));
+    Ok(())
+}
+
+/// Sync the isolated dar catalogue `dar -C` just wrote at `catalog_base`
+/// (`{catalog_base}.N.dar`; other snapshots' catalogues share the directory
+/// and are left alone) — issue #409. Every later stage set of the snapshot
+/// reuses this file instead of extracting it again, so it is written once
+/// and must survive a power loss like the slices it indexes.
+fn sync_catalogue(catalog_base: &Path) -> Result<()> {
+    let (Some(dir), Some(base)) = (catalog_base.parent(), catalog_base.file_name()) else {
+        return Ok(());
+    };
+    let prefix = format!("{}.", base.to_string_lossy());
+    let entries = fs::read_dir(dir)
+        .map_err(|e| staging_io_error("cannot read catalogue directory", dir, e))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| staging_io_error("cannot read catalogue directory", dir, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".dar") {
+            let path = entry.path();
+            let file = fs::File::open(&path)
+                .map_err(|e| staging_io_error("cannot open catalogue", &path, e))?;
+            make_durable(&file, &path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Test-only: what the staging pipeline made durable, recorded and
+/// unlinked, in order, on this thread (issue #409) — how a test asserts
+/// that every `.age` is synced before its row is written and its plaintext
+/// deleted.
+#[cfg(test)]
+pub(crate) mod durability {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Event {
+        /// The file's bytes and its directory entry were synced.
+        Synced(PathBuf),
+        /// The `stage_slices` row naming this `.age` was inserted.
+        Recorded(PathBuf),
+        /// This plaintext slice was deleted.
+        Unlinked(PathBuf),
+    }
+
+    thread_local! {
+        static LOG: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(event: Event) {
+        LOG.with(|l| l.borrow_mut().push(event));
+    }
+
+    /// Everything recorded on this thread so far, clearing the log.
+    pub(crate) fn take() -> Vec<Event> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
 }
 
 /// The body of [`encrypt_file_streaming`] over any reader and writer — the
@@ -4948,6 +5038,97 @@ mod tests {
         for name in names {
             assert!(section.contains(name), "{name} in:\n{section}");
         }
+    }
+
+    /// Issue #409: every `.age` reaches stable storage BEFORE its
+    /// `stage_slices` row is written and its plaintext deleted, and the
+    /// isolated dar catalogue is synced right after `dar -C`, before any
+    /// slice is encrypted. Nothing was synced before: a power loss inside
+    /// the writeback window left a short slice and no plaintext. Driven
+    /// through a real stage (real dar) cut into several slices; the order is
+    /// read off the pipeline's own durability log.
+    #[test]
+    fn every_slice_is_synced_before_it_is_recorded_and_its_plaintext_deleted() {
+        use durability::Event;
+
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.defaults.slice_size = "64K".to_string();
+        // Incompressible, so dar's slicing is not undone by compression.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let noise: Vec<u8> = (0..200 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        fs::write(src.join("noise.bin"), &noise).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let _ = durability::take();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let log = durability::take();
+
+        let ages: Vec<PathBuf> = conn
+            .prepare(
+                "SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1
+                 ORDER BY slice_number",
+            )
+            .unwrap()
+            .query_map(params![stage_set_id], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|p| PathBuf::from(p.unwrap()))
+            .collect();
+        assert!(
+            ages.len() >= 2,
+            "positive control: the stage was cut into several slices, got {}",
+            ages.len()
+        );
+        let at = |e: &Event| {
+            log.iter()
+                .position(|x| x == e)
+                .unwrap_or_else(|| panic!("{e:?} is not in the durability log: {log:?}"))
+        };
+        for age in &ages {
+            // `{base}.N.dar.age` -> `{base}.N.dar`, the plaintext it came from.
+            let plain = age.with_extension("");
+            let synced = at(&Event::Synced(age.clone()));
+            let recorded = at(&Event::Recorded(age.clone()));
+            let unlinked = at(&Event::Unlinked(plain.clone()));
+            assert!(
+                synced < recorded && recorded < unlinked,
+                "{}: synced at {synced}, recorded at {recorded}, plaintext unlinked at \
+                 {unlinked} — the sync must come first: {log:?}",
+                age.display()
+            );
+            assert!(
+                !plain.exists(),
+                "the plaintext is gone: {}",
+                plain.display()
+            );
+        }
+
+        let catalogue: String = conn
+            .query_row(
+                "SELECT catalog_path FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let catalogue_synced = log
+            .iter()
+            .position(|e| {
+                matches!(e, Event::Synced(p)
+                    if p.to_string_lossy().starts_with(&format!("{catalogue}."))
+                        && p.to_string_lossy().ends_with(".dar"))
+            })
+            .unwrap_or_else(|| panic!("the dar catalogue was never synced: {log:?}"));
+        assert!(
+            catalogue_synced < at(&Event::Synced(ages[0].clone())),
+            "the catalogue is synced after `dar -C`, before the slices are encrypted: {log:?}"
+        );
     }
 
     /// Issue #41: `write_stage_report` and `secure_catalog_files` tested
